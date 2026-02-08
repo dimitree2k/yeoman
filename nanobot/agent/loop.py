@@ -6,8 +6,9 @@ import asyncio
 import json
 import re
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -107,6 +108,8 @@ class AgentLoop:
         self._created_at_epoch = time.time()
         self._started_at_epoch: float | None = None
         self._last_usage_by_session: dict[str, dict[str, int]] = {}
+        self._zai_usage_cache: dict[str, tuple[float, str]] = {}
+        self._zai_usage_cache_ttl_seconds = 30.0
 
         self._running = False
         self._register_default_tools()
@@ -269,7 +272,7 @@ class AgentLoop:
             return None
         persona_text = policy_ctx.persona_text
 
-        fast_status = self._try_fast_status(msg.content, msg, session, policy_ctx)
+        fast_status = await self._try_fast_status(msg.content, msg, session, policy_ctx)
         if fast_status is not None:
             logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_status[:120]}")
             session.add_message("user", msg.content)
@@ -490,7 +493,7 @@ class AgentLoop:
             return response
         return None
 
-    def _try_fast_status(
+    async def _try_fast_status(
         self,
         text: str,
         msg: InboundMessage,
@@ -507,7 +510,8 @@ class AgentLoop:
         provider_name = type(self.provider).__name__
         api_key = getattr(self.provider, "api_key", None)
         api_key_masked = self._mask_secret(str(api_key)) if api_key else "-"
-        api_base = getattr(self.provider, "api_base", None) or "-"
+        raw_api_base = getattr(self.provider, "api_base", None)
+        api_base = raw_api_base or "-"
         gateway = getattr(self.provider, "_gateway", None)
         gateway_name = getattr(gateway, "name", "-") if gateway else "-"
         raw_headers = getattr(self.provider, "extra_headers", None)
@@ -527,26 +531,23 @@ class AgentLoop:
 
         updated_at = session.updated_at.isoformat(timespec="seconds")
         uptime_seconds = int(time.time() - (self._started_at_epoch or self._created_at_epoch))
+        zai_usage = await self._build_zai_usage_status(
+            api_key=str(api_key) if isinstance(api_key, str) else None,
+            api_base=raw_api_base if isinstance(raw_api_base, str) else None,
+            gateway_name=gateway_name,
+        )
 
         rows = [
             ("model", self.model),
             ("provider", f"{provider_name} gateway={gateway_name}"),
             ("api_base", str(api_base)),
             ("api_key", api_key_masked),
-            ("headers", headers_text),
             ("session", f"{msg.session_key} msgs={len(session.messages)} updated={updated_at}"),
             ("channel", f"{msg.channel} chat={msg.chat_id} sender={msg.sender_id}"),
             (
                 "policy",
                 f"accept={context.decision.accept_message} reply={context.decision.should_respond} "
                 f"who={who_mode} when={reply_mode} reason={context.decision.reason}",
-            ),
-            ("policy_src", f"{context.source} path={self.policy_path or '-'}"),
-            ("tools", f"{len(allowed_tools)}/{len(self.tools.tool_names)} [{allowed_text}]"),
-            (
-                "runtime",
-                f"running={self._running} iterations={self.max_iterations} "
-                f"isolation={self.exec_config.isolation.enabled} timing_logs={self.timing_logs_enabled}",
             ),
             ("queue", f"in={self.bus.inbound_size} out={self.bus.outbound_size}"),
             (
@@ -556,7 +557,15 @@ class AgentLoop:
                 f"block_tools={self.policy_counters['blocked_tool_call']}",
             ),
             ("usage", f"in={prompt_tokens} out={completion_tokens} total={total_tokens}"),
+            ("zai_usage", zai_usage or "-"),
             ("uptime", self._format_duration(uptime_seconds)),
+            (
+                "runtime",
+                f"running={self._running} iterations={self.max_iterations} "
+                f"isolation={self.exec_config.isolation.enabled} timing_logs={self.timing_logs_enabled}",
+            ),
+            ("tools", f"{len(allowed_tools)}/{len(self.tools.tool_names)} [{allowed_text}]"),
+            ("headers", headers_text),
         ]
         lines = [f"{key:<10} {value}" for key, value in rows]
         return "```\n" + "\n".join(lines) + "\n```"
@@ -592,6 +601,268 @@ class AgentLoop:
                 normalized[key] = value
         if normalized:
             self._last_usage_by_session[session_key] = normalized
+
+    async def _build_zai_usage_status(
+        self,
+        api_key: str | None,
+        api_base: str | None,
+        gateway_name: str,
+    ) -> str | None:
+        """Fetch and cache usage stats from Z.AI monitoring endpoints for /status."""
+        if not self._should_query_zai_usage(api_key, api_base, gateway_name):
+            return None
+        if not api_key:
+            return None
+
+        monitor_base = self._resolve_zai_monitor_base(api_base)
+        cache_key = f"{monitor_base}|{api_key}"
+        now = time.monotonic()
+        cached = self._zai_usage_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        summary = await self._fetch_zai_usage_status(monitor_base, api_key)
+        if summary is None:
+            return None
+        self._zai_usage_cache[cache_key] = (now + self._zai_usage_cache_ttl_seconds, summary)
+        return summary
+
+    def _should_query_zai_usage(
+        self,
+        api_key: str | None,
+        api_base: str | None,
+        gateway_name: str,
+    ) -> bool:
+        """Only query Z.AI monitor APIs for direct Z.AI/Zhipu configurations."""
+        if not api_key:
+            return False
+        if gateway_name and gateway_name != "-":
+            return False
+
+        base_lower = (api_base or "").lower()
+        model_lower = self.model.lower()
+        if "api.z.ai" in base_lower or "open.bigmodel.cn" in base_lower:
+            return True
+        return "glm" in model_lower or "zai/" in model_lower
+
+    @staticmethod
+    def _resolve_zai_monitor_base(api_base: str | None) -> str:
+        """Resolve monitor host from configured base URL."""
+        base_lower = (api_base or "").lower()
+        if "open.bigmodel.cn" in base_lower:
+            return "https://open.bigmodel.cn"
+        return "https://api.z.ai"
+
+    async def _fetch_zai_usage_status(self, monitor_base: str, api_key: str) -> str | None:
+        """Query Z.AI internal usage endpoints and return a compact summary."""
+        now = datetime.now(UTC)
+        # Z.AI monitor endpoints expect: yyyy-MM-dd HH:mm:ss
+        start = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+        headers = {
+            "Authorization": api_key,
+            "Accept-Language": "en-US,en",
+            "Content-Type": "application/json",
+        }
+        requests: list[tuple[str, str, dict[str, str] | None, tuple[str, ...]]] = [
+            (
+                "quota",
+                f"{monitor_base}/api/monitor/usage/quota/limit",
+                None,
+                ("quota", "limit", "used", "percent", "rate"),
+            ),
+            (
+                "model24h",
+                f"{monitor_base}/api/monitor/usage/model-usage",
+                {"startTime": start, "endTime": end},
+                ("token", "request", "count", "input", "output", "usage"),
+            ),
+            (
+                "tool24h",
+                f"{monitor_base}/api/monitor/usage/tool-usage",
+                {"startTime": start, "endTime": end},
+                ("tool", "request", "count", "success", "fail"),
+            ),
+        ]
+
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                tasks = [
+                    client.get(url, headers=headers, params=params)
+                    for _, url, params, _ in requests
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            return None
+
+        parts: list[str] = []
+        for (name, _, _, hints), response in zip(requests, responses, strict=False):
+            if isinstance(response, Exception):
+                continue
+            if response.status_code != 200:
+                parts.append(f"{name}=http{response.status_code}")
+                continue
+            try:
+                payload = response.json()
+            except Exception:
+                parts.append(f"{name}=invalid_json")
+                continue
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                if isinstance(code, int) and code != 200:
+                    msg = payload.get("msg") or payload.get("message") or "error"
+                    short_msg = str(msg).replace("\n", " ").strip()
+                    if len(short_msg) > 42:
+                        short_msg = short_msg[:39] + "..."
+                    parts.append(f"{name}=err{code}({short_msg})")
+                    continue
+            if name == "quota":
+                summary = self._summarize_zai_quota(payload)
+            elif name == "model24h":
+                summary = self._summarize_zai_model_usage(payload)
+            elif name == "tool24h":
+                summary = self._summarize_zai_tool_usage(payload)
+            else:
+                summary = self._summarize_usage_payload(payload, hints)
+            parts.append(f"{name}={summary}")
+
+        return " ; ".join(parts) if parts else None
+
+    def _summarize_zai_quota(self, payload: Any) -> str:
+        """Summarize Z.AI quota/limit payload."""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        limits = data.get("limits") if isinstance(data, dict) else None
+        if not isinstance(limits, list):
+            return self._summarize_usage_payload(payload, ("limit", "usage", "remaining", "percentage"))
+
+        parts: list[str] = []
+        for item in limits[:2]:
+            if not isinstance(item, dict):
+                continue
+            limit_type = str(item.get("type", "LIMIT")).replace("_LIMIT", "")
+            remaining = item.get("remaining")
+            current = item.get("currentValue")
+            percentage = item.get("percentage")
+            chunk = f"{limit_type}:"
+            if isinstance(current, (int, float)):
+                chunk += f" used={int(current) if float(current).is_integer() else current}"
+            if isinstance(remaining, (int, float)):
+                chunk += f" rem={int(remaining) if float(remaining).is_integer() else remaining}"
+            if isinstance(percentage, (int, float)):
+                pct = int(percentage) if float(percentage).is_integer() else percentage
+                chunk += f" pct={pct}"
+            parts.append(chunk)
+        return " | ".join(parts) if parts else self._summarize_usage_payload(
+            payload,
+            ("limit", "usage", "remaining", "percentage"),
+        )
+
+    def _summarize_zai_model_usage(self, payload: Any) -> str:
+        """Summarize Z.AI model usage payload."""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return self._summarize_usage_payload(payload, ("model", "tokens", "usage", "count"))
+        calls = data.get("modelCallCount", data.get("totalModelCallCount"))
+        tokens = data.get("tokensUsage", data.get("totalTokensUsage"))
+        total = data.get("totalUsage")
+        parts: list[str] = []
+        if isinstance(calls, (int, float)):
+            parts.append(f"calls={int(calls) if float(calls).is_integer() else calls}")
+        if isinstance(tokens, (int, float)):
+            parts.append(f"tokens={int(tokens) if float(tokens).is_integer() else tokens}")
+        if isinstance(total, (int, float)):
+            parts.append(f"total={int(total) if float(total).is_integer() else total}")
+        return " ".join(parts) if parts else self._summarize_usage_payload(
+            payload,
+            ("model", "tokens", "usage", "count"),
+        )
+
+    def _summarize_zai_tool_usage(self, payload: Any) -> str:
+        """Summarize Z.AI tool usage payload."""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return self._summarize_usage_payload(payload, ("tool", "count", "usage", "search", "read"))
+        search = data.get("networkSearchCount", data.get("totalNetworkSearchCount"))
+        web_read = data.get("webReadMcpCount", data.get("totalWebReadMcpCount"))
+        zread = data.get("zreadMcpCount", data.get("totalZreadMcpCount"))
+        total = data.get("totalUsage")
+        parts: list[str] = []
+        if isinstance(search, (int, float)):
+            parts.append(f"search={int(search) if float(search).is_integer() else search}")
+        if isinstance(web_read, (int, float)):
+            parts.append(f"web_read={int(web_read) if float(web_read).is_integer() else web_read}")
+        if isinstance(zread, (int, float)):
+            parts.append(f"zread={int(zread) if float(zread).is_integer() else zread}")
+        if isinstance(total, (int, float)):
+            parts.append(f"total={int(total) if float(total).is_integer() else total}")
+        return " ".join(parts) if parts else self._summarize_usage_payload(
+            payload,
+            ("tool", "count", "usage", "search", "read"),
+        )
+
+    def _summarize_usage_payload(self, payload: Any, key_hints: tuple[str, ...]) -> str:
+        """Pick a few numeric facts from payload; fall back to compact JSON."""
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        pairs = self._extract_numeric_pairs(data, key_hints, max_pairs=3)
+        if pairs:
+            return " ".join(f"{k}={v}" for k, v in pairs)
+        try:
+            compact = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
+        except Exception:
+            compact = str(data)
+        if len(compact) > 96:
+            return compact[:93] + "..."
+        return compact
+
+    def _extract_numeric_pairs(
+        self,
+        data: Any,
+        key_hints: tuple[str, ...],
+        max_pairs: int,
+    ) -> list[tuple[str, str]]:
+        """Extract numeric key/value pairs recursively with key-hint preference."""
+        found: list[tuple[str, float]] = []
+
+        def walk(node: Any, prefix: str = "") -> None:
+            if len(found) >= 64:
+                return
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                    walk(value, next_prefix)
+                return
+            if isinstance(node, list):
+                for idx, value in enumerate(node[:8]):
+                    next_prefix = f"{prefix}[{idx}]"
+                    walk(value, next_prefix)
+                return
+            if isinstance(node, bool):
+                return
+            if isinstance(node, (int, float)):
+                found.append((prefix, float(node)))
+
+        walk(data)
+        if not found:
+            return []
+
+        hints_lower = tuple(h.lower() for h in key_hints)
+        prioritized = [
+            (path, value)
+            for path, value in found
+            if any(h in path.lower() for h in hints_lower)
+        ]
+        selected = prioritized or found
+        pairs: list[tuple[str, str]] = []
+        for path, value in selected[:max_pairs]:
+            key = path.rsplit(".", 1)[-1] if path else "value"
+            if "[" in key:
+                key = key.split("[", 1)[0] or "value"
+            if value.is_integer():
+                value_text = str(int(value))
+            else:
+                value_text = f"{value:.2f}".rstrip("0").rstrip(".")
+            pairs.append((key, value_text))
+        return pairs
 
     async def _try_fast_weather(self, text: str) -> str | None:
         """Handle simple current-weather prompts with one direct wttr.in request."""
