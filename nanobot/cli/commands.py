@@ -260,82 +260,125 @@ def _pid_has_env(pid: int, key: str, value: str | None = None) -> bool:
     return False
 
 
-def _is_gateway_process(pid: int) -> bool:
-    if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
+def _gateway_cmd_port(command: str) -> int | None:
+    import shlex
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    if "gateway" not in tokens:
+        return None
+
+    # Default CLI port if omitted.
+    resolved = 18790
+    for i, tok in enumerate(tokens):
+        if tok == "--port" and i + 1 < len(tokens):
+            try:
+                resolved = int(tokens[i + 1])
+            except ValueError:
+                return None
+        elif tok == "-p" and i + 1 < len(tokens):
+            try:
+                resolved = int(tokens[i + 1])
+            except ValueError:
+                return None
+    return resolved
+
+
+def _is_nanobot_gateway_command(command: str) -> bool:
+    import shlex
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    if "gateway" not in tokens:
+        return False
+
+    if "-m" in tokens:
+        i = tokens.index("-m")
+        if i + 1 < len(tokens) and tokens[i + 1] == "nanobot.cli.commands":
+            return True
+
+    exe = tokens[0] if tokens else ""
+    if exe == "nanobot" or exe.endswith("/nanobot"):
         return True
 
-    cmd = _command_for_pid(pid).lower()
-    if not cmd:
+    # Script entrypoint style: python /path/to/nanobot gateway ...
+    if "python" in exe and len(tokens) > 1:
+        script = tokens[1]
+        if script == "nanobot" or script.endswith("/nanobot"):
+            return True
+
+    return False
+
+
+def _is_gateway_process_on_port(pid: int, port: int) -> bool:
+    import os
+
+    if pid == os.getpid():
         return False
-    return (
-        " nanobot gateway" in cmd
-        or "nanobot.cli.commands gateway" in cmd
-        or "-m nanobot.cli.commands gateway" in cmd
-    )
 
+    command = _command_for_pid(pid)
+    if not command:
+        return False
 
-def _gateway_listener_pids(port: int) -> set[int]:
-    import shutil
-    import subprocess
+    if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
+        cmd_port = _gateway_cmd_port(command)
+        return cmd_port == port
 
-    listener_pids: set[int] = set()
-    if not shutil.which("lsof"):
-        return listener_pids
+    if not _is_nanobot_gateway_command(command):
+        return False
 
-    result = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return listener_pids
-
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            listener_pids.add(int(line))
-        except ValueError:
-            continue
-    return listener_pids
+    cmd_port = _gateway_cmd_port(command)
+    return cmd_port == port
 
 
 def _find_gateway_pids(port: int) -> list[int]:
+    import subprocess
+
     pids: set[int] = set()
-    listeners = _gateway_listener_pids(port)
 
     pid_file = _gateway_pid_path()
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
-            if _pid_alive(pid) and (pid in listeners or _is_gateway_process(pid)):
+            if _pid_alive(pid) and _is_gateway_process_on_port(pid, port):
                 pids.add(pid)
         except ValueError:
             pass
 
-    for pid in listeners:
-        if _pid_alive(pid) and _is_gateway_process(pid):
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return sorted(pids)
+
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        parts = text.split(maxsplit=1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if _pid_alive(pid) and _is_gateway_process_on_port(pid, port):
             pids.add(pid)
 
     return sorted(pids)
 
 
-def _signal_pid_or_group(pid: int, sig: int) -> None:
+def _signal_gateway_pid(pid: int, sig: int) -> None:
     import os
-
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        pgid = None
-
-    if pgid is not None and pgid > 0:
-        try:
-            os.killpg(pgid, sig)
-            return
-        except OSError:
-            pass
 
     try:
         os.kill(pid, sig)
@@ -353,7 +396,7 @@ def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
         return 0
 
     for pid in pids:
-        _signal_pid_or_group(pid, signal.SIGTERM)
+        _signal_gateway_pid(pid, signal.SIGTERM)
 
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -364,9 +407,9 @@ def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
         time.sleep(0.2)
     else:
         for pid in [pid for pid in pids if _pid_alive(pid)]:
-            _signal_pid_or_group(pid, signal.SIGKILL)
+            _signal_gateway_pid(pid, signal.SIGKILL)
         for pid in _find_gateway_pids(port):
-            _signal_pid_or_group(pid, signal.SIGKILL)
+            _signal_gateway_pid(pid, signal.SIGKILL)
 
     _gateway_pid_path().unlink(missing_ok=True)
     return len(pids)
@@ -401,12 +444,12 @@ def _start_gateway_daemon(port: int, verbose: bool) -> None:
             start_new_session=True,
         )
 
-    # Wait briefly for either process failure or listener readiness.
+    # Wait briefly for either process failure or process registration.
     started = False
     for _ in range(20):
         if proc.poll() is not None:
             break
-        if _find_gateway_pids(port):
+        if proc.pid in _find_gateway_pids(port):
             started = True
             break
         time.sleep(0.2)
@@ -916,7 +959,8 @@ def _signal_bridge_pid(pid: int, sig: int) -> None:
         pgid = None
 
     # Prefer process-group signaling so npm wrappers + child node both stop.
-    if pgid is not None and pgid > 0:
+    current_pgid = os.getpgrp()
+    if pgid is not None and pgid > 0 and pgid != current_pgid:
         try:
             os.killpg(pgid, sig)
             return
