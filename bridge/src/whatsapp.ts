@@ -24,6 +24,9 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  mentionedBot: boolean;
+  replyToBot: boolean;
+  mentionedJids: string[];
 }
 
 export interface WhatsAppClientOptions {
@@ -120,6 +123,7 @@ export class WhatsAppClient {
         if (!content) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
+        const mentionMeta = this.extractMentionMeta(msg);
 
         this.options.onMessage({
           id: msg.key.id || '',
@@ -128,9 +132,45 @@ export class WhatsAppClient {
           content,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          mentionedBot: mentionMeta.mentionedBot,
+          replyToBot: mentionMeta.replyToBot,
+          mentionedJids: mentionMeta.mentionedJids,
         });
       }
     });
+  }
+
+  private normalizeJid(jid: string): string {
+    const [left, right = ''] = jid.split('@');
+    const normalizedLeft = left.split(':')[0];
+    return right ? `${normalizedLeft}@${right}` : normalizedLeft;
+  }
+
+  private extractContextInfo(msg: any): any {
+    const message = msg?.message || {};
+    return (
+      message.extendedTextMessage?.contextInfo ||
+      message.imageMessage?.contextInfo ||
+      message.videoMessage?.contextInfo ||
+      message.documentMessage?.contextInfo ||
+      message.audioMessage?.contextInfo ||
+      null
+    );
+  }
+
+  private extractMentionMeta(msg: any): { mentionedBot: boolean; replyToBot: boolean; mentionedJids: string[] } {
+    const contextInfo = this.extractContextInfo(msg) || {};
+    const mentionedJidsRaw = Array.isArray(contextInfo.mentionedJid) ? contextInfo.mentionedJid : [];
+    const mentionedJids = mentionedJidsRaw.map((jid: string) => this.normalizeJid(jid));
+
+    const botJidRaw = this.sock?.user?.id || '';
+    const botJid = botJidRaw ? this.normalizeJid(botJidRaw) : '';
+
+    const mentionedBot = botJid ? mentionedJids.includes(botJid) : false;
+    const replyParticipant = contextInfo.participant ? this.normalizeJid(contextInfo.participant) : '';
+    const replyToBot = !!(botJid && replyParticipant && replyParticipant === botJid);
+
+    return { mentionedBot, replyToBot, mentionedJids };
   }
 
   private extractMessageContent(msg: any): string | null {

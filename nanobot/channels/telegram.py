@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 from telegram import BotCommand, Update
+from telegram.constants import MessageEntityType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from nanobot.bus.events import OutboundMessage
@@ -112,6 +113,8 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._bot_id: int | None = None
+        self._bot_username: str = ""
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -150,6 +153,8 @@ class TelegramChannel(BaseChannel):
         # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
         logger.info(f"Telegram bot @{bot_info.username} connected")
+        self._bot_id = bot_info.id
+        self._bot_username = (bot_info.username or "").lower()
 
         try:
             await self._app.bot.set_my_commands(self.BOT_COMMANDS)
@@ -289,7 +294,7 @@ class TelegramChannel(BaseChannel):
             content_parts.append(message.caption)
 
         # Handle media files
-        media_file = None
+        media_file: object | None = None
         media_type = None
 
         if message.photo:
@@ -344,6 +349,7 @@ class TelegramChannel(BaseChannel):
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
 
         str_chat_id = str(chat_id)
+        mention_meta = self._mention_metadata(message)
 
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
@@ -359,9 +365,42 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "mentioned_bot": mention_meta["mentioned_bot"],
+                "reply_to_bot": mention_meta["reply_to_bot"],
             }
         )
+
+    def _mention_metadata(self, message) -> dict[str, bool]:
+        """Extract mention/reply-to-bot metadata for policy decisions."""
+        text = message.text or message.caption or ""
+        entities = list(message.entities or []) + list(message.caption_entities or [])
+
+        mentioned_bot = False
+        if self._bot_username:
+            for ent in entities:
+                if ent.type == MessageEntityType.MENTION:
+                    mention = text[ent.offset: ent.offset + ent.length].lstrip("@").lower()
+                    if mention == self._bot_username:
+                        mentioned_bot = True
+                        break
+                if ent.type == MessageEntityType.TEXT_MENTION and ent.user and self._bot_id:
+                    if ent.user.id == self._bot_id:
+                        mentioned_bot = True
+                        break
+
+        reply_to_bot = False
+        if message.reply_to_message and message.reply_to_message.from_user:
+            reply_user = message.reply_to_message.from_user
+            if self._bot_id is not None:
+                reply_to_bot = reply_user.id == self._bot_id
+            else:
+                reply_to_bot = bool(reply_user.is_bot)
+
+        return {
+            "mentioned_bot": mentioned_bot,
+            "reply_to_bot": reply_to_bot,
+        }
 
     def _start_typing(self, chat_id: str) -> None:
         """Start sending 'typing...' indicator for a chat."""

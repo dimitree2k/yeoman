@@ -44,6 +44,7 @@ def onboard():
     """Initialize nanobot configuration and workspace."""
     from nanobot.config.loader import get_config_path, save_config
     from nanobot.config.schema import Config
+    from nanobot.policy.loader import ensure_policy_file
     from nanobot.utils.helpers import get_workspace_path
 
     config_path = get_config_path()
@@ -57,6 +58,8 @@ def onboard():
     config = Config()
     save_config(config)
     console.print(f"[green]✓[/green] Created config at {config_path}")
+    policy_path = ensure_policy_file()
+    console.print(f"[green]✓[/green] Created policy at {policy_path}")
 
     # Create workspace
     workspace = get_workspace_path()
@@ -164,6 +167,29 @@ def _make_provider(config):
     )
 
 
+def _make_policy_engine(config):
+    """Create policy engine from ~/.nanobot/policy.json."""
+    from nanobot.policy.engine import PolicyEngine
+    from nanobot.policy.loader import load_policy, warn_legacy_allow_from
+
+    warn_legacy_allow_from(config)
+    try:
+        policy = load_policy()
+        apply_channels: set[str] = set()
+        if getattr(config.channels.telegram, "enabled", False):
+            apply_channels.add("telegram")
+        if getattr(config.channels.whatsapp, "enabled", False):
+            apply_channels.add("whatsapp")
+        return PolicyEngine(
+            policy=policy,
+            workspace=config.workspace_path,
+            apply_channels=apply_channels,
+        )
+    except ValueError as e:
+        console.print(f"[red]Policy validation error:[/red] {e}")
+        raise typer.Exit(1)
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -193,6 +219,7 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
+    policy_engine = _make_policy_engine(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -200,18 +227,23 @@ def gateway(
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
-    agent = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-    )
+    try:
+        agent = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            policy_engine=policy_engine,
+        )
+    except ValueError as e:
+        console.print(f"[red]Policy validation error:[/red] {e}")
+        raise typer.Exit(1)
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
@@ -297,15 +329,21 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    policy_engine = _make_policy_engine(config)
 
-    agent_loop = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-    )
+    try:
+        agent_loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            policy_engine=policy_engine,
+        )
+    except ValueError as e:
+        console.print(f"[red]Policy validation error:[/red] {e}")
+        raise typer.Exit(1)
 
     if message:
         # Single message mode

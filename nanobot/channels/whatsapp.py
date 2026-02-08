@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from typing import Any
 
 from loguru import logger
 
@@ -24,7 +25,7 @@ class WhatsAppChannel(BaseChannel):
     def __init__(self, config: WhatsAppConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
-        self._ws = None
+        self._ws: Any | None = None
         self._connected = False
 
     async def start(self) -> None:
@@ -122,7 +123,10 @@ class WhatsAppChannel(BaseChannel):
                 metadata={
                     "message_id": data.get("id"),
                     "timestamp": data.get("timestamp"),
-                    "is_group": data.get("isGroup", False)
+                    "is_group": data.get("isGroup", False),
+                    "mentioned_bot": data.get("mentionedBot", False),
+                    "reply_to_bot": data.get("replyToBot", False),
+                    "mentioned_jids": data.get("mentionedJids", []),
                 }
             )
 

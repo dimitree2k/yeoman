@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from urllib.parse import quote
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import httpx
 from loguru import logger
@@ -15,6 +15,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
+    from nanobot.policy.engine import PolicyEngine
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
@@ -27,6 +28,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.policy.engine import ActorContext, PolicyDecision
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
 
@@ -55,6 +57,7 @@ class AgentLoop:
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        policy_engine: "PolicyEngine | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -86,9 +89,18 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
         )
+        self.policy_engine = policy_engine
+        self.policy_counters = {
+            "dropped_by_access": 0,
+            "dropped_by_reply": 0,
+            "blocked_tool_call": 0,
+        }
+        self._warned_missing_wa_mention_meta: set[str] = set()
 
         self._running = False
         self._register_default_tools()
+        if self.policy_engine:
+            self.policy_engine.validate(set(self.tools.tool_names))
 
     _WEATHER_KEYWORDS = ("weather", "wetter", "temperature", "temp")
     _WEATHER_BLOCKLIST = (
@@ -198,6 +210,17 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
+        # Policy evaluation (access/reply/tool persona)
+        decision = self._policy_decision(msg)
+        self._log_policy_decision(msg, decision)
+        if not decision.accept_message:
+            self.policy_counters["dropped_by_access"] += 1
+            return None
+        if not decision.should_respond:
+            self.policy_counters["dropped_by_reply"] += 1
+            return None
+        persona_text = self._persona_text(decision)
+
         # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
         fast_weather = await self._try_fast_weather(msg.content)
         if fast_weather is not None:
@@ -232,6 +255,7 @@ class AgentLoop:
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
+            persona_text=persona_text,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -247,7 +271,7 @@ class AgentLoop:
             # Call LLM
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self._tool_definitions(decision.allowed_tools),
                 model=self.model
             )
 
@@ -273,7 +297,11 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tool_call.name not in decision.allowed_tools:
+                        self.policy_counters["blocked_tool_call"] += 1
+                        result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
+                    else:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -298,6 +326,83 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content
+        )
+
+    @staticmethod
+    def _sender_aliases(sender_id: str) -> tuple[str, list[str]]:
+        """Normalize sender identifier and aliases."""
+        raw_parts = [p.strip() for p in str(sender_id).split("|") if p.strip()]
+        if not raw_parts:
+            return "", []
+        primary = raw_parts[0]
+        aliases = list(dict.fromkeys(raw_parts))
+        return primary, aliases
+
+    def _policy_decision(self, msg: InboundMessage) -> PolicyDecision:
+        """Evaluate policy for inbound message, defaulting to allow-all."""
+        default_allowed = set(self.tools.tool_names)
+        if not self.policy_engine:
+            return PolicyDecision(
+                accept_message=True,
+                should_respond=True,
+                allowed_tools=default_allowed,
+                persona_file=None,
+                reason="policy_disabled",
+            )
+
+        sender_primary, sender_aliases = self._sender_aliases(msg.sender_id)
+        metadata = msg.metadata or {}
+        actor = ActorContext(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            sender_primary=sender_primary,
+            sender_aliases=sender_aliases,
+            is_group=bool(metadata.get("is_group", False)),
+            mentioned_bot=bool(metadata.get("mentioned_bot", False)),
+            reply_to_bot=bool(metadata.get("reply_to_bot", False)),
+        )
+        decision = self.policy_engine.evaluate(actor, default_allowed)
+        if (
+            msg.channel == "whatsapp"
+            and actor.is_group
+            and "mentioned_bot" not in metadata
+            and "reply_to_bot" not in metadata
+            and decision.reason.endswith("when_to_reply:mention_only_group")
+        ):
+            warning_key = f"{msg.channel}:{msg.chat_id}"
+            if warning_key not in self._warned_missing_wa_mention_meta:
+                logger.warning(
+                    "whatsapp mention metadata missing; mention_only groups will fail-closed until bridge metadata is available"
+                )
+                self._warned_missing_wa_mention_meta.add(warning_key)
+        return decision
+
+    def _persona_text(self, decision: PolicyDecision) -> str | None:
+        if not self.policy_engine:
+            return None
+        return self.policy_engine.persona_text(decision.persona_file)
+
+    def _tool_definitions(self, allowed_tools: set[str]) -> list[dict]:
+        """Filter tool schemas by policy."""
+        return [
+            schema
+            for schema in self.tools.get_definitions()
+            if schema.get("function", {}).get("name") in allowed_tools
+        ]
+
+    def _log_policy_decision(self, msg: InboundMessage, decision: PolicyDecision) -> None:
+        """Structured policy debug line for observability."""
+        logger.debug(
+            "policy_decision channel={} chat={} sender={} accepted={} replied={} "
+            "reason={} tools_count={} persona={}",
+            msg.channel,
+            msg.chat_id,
+            msg.sender_id,
+            decision.accept_message,
+            decision.should_respond,
+            decision.reason,
+            len(decision.allowed_tools),
+            decision.persona_file or "-",
         )
 
     async def _try_fast_weather(self, text: str) -> str | None:

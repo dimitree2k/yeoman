@@ -190,14 +190,13 @@ Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime,
   "channels": {
     "telegram": {
       "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
+      "token": "YOUR_BOT_TOKEN"
     }
   }
 }
 ```
 
-> Get your user ID from `@userinfobot` on Telegram.
+> Access/reply/tool/persona rules now live in `~/.nanobot/policy.json` (not `allowFrom`).
 
 **3. Run**
 
@@ -230,8 +229,7 @@ nanobot gateway
   "channels": {
     "discord": {
       "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
+      "token": "YOUR_BOT_TOKEN"
     }
   }
 }
@@ -269,8 +267,7 @@ nanobot channels login
 {
   "channels": {
     "whatsapp": {
-      "enabled": true,
-      "allowFrom": ["+1234567890"]
+      "enabled": true
     }
   }
 }
@@ -316,15 +313,14 @@ pip install nanobot-ai[feishu]
       "appId": "cli_xxx",
       "appSecret": "xxx",
       "encryptKey": "",
-      "verificationToken": "",
-      "allowFrom": []
+      "verificationToken": ""
     }
   }
 }
 ```
 
 > `encryptKey` and `verificationToken` are optional for Long Connection mode.
-> `allowFrom`: Leave empty to allow all users, or add `["ou_xxx"]` to restrict access.
+> Access/reply/tool/persona rules now live in `~/.nanobot/policy.json`.
 
 **3. Run**
 
@@ -339,7 +335,58 @@ nanobot gateway
 
 ## ⚙️ Configuration
 
-Config file: `~/.nanobot/config.json`
+Config files:
+- Runtime/API config: `~/.nanobot/config.json`
+- Access/reply/tool/persona policy: `~/.nanobot/policy.json`
+
+### Chat Policy (`policy.json`)
+
+`policy.json` controls four things per Telegram/WhatsApp DM or group:
+1. Who can talk
+2. When the bot replies
+3. Which tools are allowed
+4. Which persona file is used
+
+Merge precedence is:
+`defaults -> channels.<channel>.default -> channels.<channel>.chats.<chat_id>`
+
+```json
+{
+  "version": 1,
+  "owners": {
+    "telegram": ["453897507"],
+    "whatsapp": ["491757070305"]
+  },
+  "defaults": {
+    "whoCanTalk": { "mode": "everyone", "senders": [] },
+    "whenToReply": { "mode": "all", "senders": [] },
+    "allowedTools": { "mode": "all", "tools": [], "deny": ["exec", "spawn"] },
+    "personaFile": null
+  },
+  "channels": {
+    "telegram": {
+      "default": {
+        "whenToReply": { "mode": "mention_only", "senders": [] }
+      },
+      "chats": {
+        "-1001234567890": {
+          "whoCanTalk": { "mode": "owner_only", "senders": [] },
+          "allowedTools": { "mode": "allowlist", "tools": ["read_file", "web_search", "web_fetch"], "deny": ["exec", "spawn"] },
+          "personaFile": "memory/personas/serious.md"
+        }
+      }
+    },
+    "whatsapp": {
+      "default": {
+        "whenToReply": { "mode": "mention_only", "senders": [] }
+      },
+      "chats": {}
+    }
+  }
+}
+```
+
+> `channels.*.allowFrom` is deprecated and ignored.
 
 ### Providers
 
@@ -417,7 +464,7 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | `tools.exec.isolation.batchSessionIdleSeconds` | `600` | Recycle a session sandbox after inactivity timeout. |
 | `tools.exec.isolation.maxContainers` | `5` | Global cap for active session sandboxes. |
 | `tools.exec.isolation.pressurePolicy` | `"preempt_oldest_active"` | Capacity policy when all sandboxes are busy. |
-| `channels.*.allowFrom` | `[]` (allow all) | Whitelist of user IDs. Empty = allow everyone; non-empty = only listed users can interact. |
+| `~/.nanobot/policy.json` | auto-created | Per-channel and per-chat access, reply rules, tool ACL, and persona selection. |
 
 #### Linux Exec Isolation (bubblewrap)
 
