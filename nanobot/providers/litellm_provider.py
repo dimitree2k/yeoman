@@ -32,7 +32,7 @@ class LiteLLMProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
 
         # Detect gateway / local deployment from api_key and api_base
-        self._gateway = find_gateway(api_key, api_base)
+        self._gateway = find_gateway(api_key, api_base, default_model)
 
         # Backwards-compatible flags (used by tests and possibly external code)
         self.is_openrouter = bool(self._gateway and self._gateway.name == "openrouter")

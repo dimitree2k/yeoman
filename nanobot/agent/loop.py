@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from urllib.parse import quote
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -86,6 +89,23 @@ class AgentLoop:
 
         self._running = False
         self._register_default_tools()
+
+    _WEATHER_KEYWORDS = ("weather", "wetter", "temperature", "temp")
+    _WEATHER_BLOCKLIST = (
+        "forecast",
+        "tomorrow",
+        "next week",
+        "this week",
+        "compare",
+        "historical",
+        "yesterday",
+        "rain tomorrow",
+    )
+    _WEATHER_LOCATION_PATTERNS = (
+        re.compile(r"\bweather\s+in\s+([^\n\?\.,;:!]+)", re.IGNORECASE),
+        re.compile(r"\bin\s+([^\n\?\.,;:!]+)\s+(?:now|today|currently)\b", re.IGNORECASE),
+        re.compile(r"\bfor\s+([^\n\?\.,;:!]+)\b", re.IGNORECASE),
+    )
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -178,6 +198,19 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
+        # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
+        fast_weather = await self._try_fast_weather(msg.content)
+        if fast_weather is not None:
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_weather[:120]}")
+            session.add_message("user", msg.content)
+            session.add_message("assistant", fast_weather)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=fast_weather,
+            )
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
@@ -266,6 +299,68 @@ class AgentLoop:
             chat_id=msg.chat_id,
             content=final_content
         )
+
+    async def _try_fast_weather(self, text: str) -> str | None:
+        """Handle simple current-weather prompts with one direct wttr.in request."""
+        lowered = text.lower()
+        if not any(k in lowered for k in self._WEATHER_KEYWORDS):
+            return None
+        if any(b in lowered for b in self._WEATHER_BLOCKLIST):
+            return None
+
+        location = self._extract_weather_location(text)
+        encoded_location = quote(location) if location else ""
+        url = f"https://wttr.in/{encoded_location}?format=%l:+%c+%t+%h+%w"
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers={"User-Agent": "nanobot-weather/1.0"})
+            raw = (resp.text or "").strip()
+            if not raw:
+                return None
+            if raw.startswith("<!DOCTYPE") or raw.startswith("<html"):
+                return None
+            return self._format_weather_line(raw)
+        except Exception:
+            return None
+
+    def _extract_weather_location(self, text: str) -> str:
+        """Extract a likely location from a weather question."""
+        cleaned = text.strip().strip("\"'")
+        for pattern in self._WEATHER_LOCATION_PATTERNS:
+            m = pattern.search(cleaned)
+            if m:
+                location = m.group(1).strip()
+                location = re.sub(
+                    r"\s+(right\s+now|now|today|currently)\s*$",
+                    "",
+                    location,
+                    flags=re.IGNORECASE,
+                ).strip()
+                return location
+        return ""
+
+    @staticmethod
+    def _format_weather_line(line: str) -> str:
+        """Format wttr compact output into a user-friendly reply."""
+        if ":" in line:
+            location, rest = line.split(":", 1)
+            location = location.strip()
+            rest = " ".join(rest.split())
+            parts = rest.split()
+            if len(parts) >= 4:
+                condition = parts[0]
+                temp = parts[1]
+                humidity = parts[2]
+                wind = " ".join(parts[3:])
+                return (
+                    f"Current weather in {location}:\n\n"
+                    f"{condition} **{temp}**\n"
+                    f"Humidity: {humidity}\n"
+                    f"Wind: {wind}"
+                )
+            return f"Current weather in {location}: {rest}"
+        return f"Current weather: {line}"
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """

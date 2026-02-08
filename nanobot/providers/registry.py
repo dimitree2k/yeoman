@@ -302,14 +302,23 @@ def find_by_model(model: str) -> ProviderSpec | None:
     return None
 
 
-def find_gateway(api_key: str | None, api_base: str | None) -> ProviderSpec | None:
+def find_gateway(
+    api_key: str | None,
+    api_base: str | None,
+    model: str | None = None,
+) -> ProviderSpec | None:
     """Detect gateway/local by api_key prefix or api_base substring.
-    Fallback: unknown api_base → treat as local (vLLM)."""
+
+    If model clearly matches a standard provider (e.g. zai/glm-*), avoid
+    forcing local/vLLM fallback even when api_base is set.
+    """
     for spec in PROVIDERS:
         if spec.detect_by_key_prefix and api_key and api_key.startswith(spec.detect_by_key_prefix):
             return spec
         if spec.detect_by_base_keyword and api_base and spec.detect_by_base_keyword in api_base:
             return spec
+    if model and find_by_model(model):
+        return None
     if api_base:
         return next((s for s in PROVIDERS if s.is_local), None)
     return None

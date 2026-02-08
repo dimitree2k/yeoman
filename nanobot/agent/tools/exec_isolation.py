@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+
 DEFAULT_BLOCKED_HOST_PATTERNS = [
     ".ssh",
     ".aws",
@@ -377,6 +379,11 @@ class ExecSandboxManager:
             session = BubblewrapSandboxSession(session_key=session_key, workspace=self.workspace)
             await session.start()
             self._sessions[session_key] = session
+            logger.debug(
+                "exec sandbox created session={} total={}",
+                session_key,
+                len(self._sessions),
+            )
             return session
 
     async def _expire_idle_locked(self, now: float) -> None:
