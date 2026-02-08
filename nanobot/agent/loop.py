@@ -104,6 +104,9 @@ class AgentLoop:
             "dropped_by_reply": 0,
             "blocked_tool_call": 0,
         }
+        self._created_at_epoch = time.time()
+        self._started_at_epoch: float | None = None
+        self._last_usage_by_session: dict[str, dict[str, int]] = {}
 
         self._running = False
         self._register_default_tools()
@@ -133,15 +136,6 @@ class AgentLoop:
         re.compile(r"\bweather\s+in\s+([^\n\?\.,;:!]+)", re.IGNORECASE),
         re.compile(r"\bin\s+([^\n\?\.,;:!]+)\s+(?:now|today|currently)\b", re.IGNORECASE),
         re.compile(r"\bfor\s+([^\n\?\.,;:!]+)\b", re.IGNORECASE),
-    )
-    _MODEL_QUERY_PATTERNS = (
-        re.compile(
-            r"(?:what|which)\s+model(?:\s+(?:are|r)\s+you(?:\s+using)?|\s+do\s+you\s+use)?[?!.]?",
-            re.IGNORECASE,
-        ),
-        re.compile(r"welches\s+modell(?:\s+(?:nutzt|verwendest)\s+du)?[?!.]?", re.IGNORECASE),
-        re.compile(r"welches\s+model(?:\s+(?:nutzt|verwendest)\s+du)?[?!.]?", re.IGNORECASE),
-        re.compile(r"mit\s+welchem\s+modell\s+(?:arbeitest|läufst)\s+du[?!.]?", re.IGNORECASE),
     )
 
     def _register_default_tools(self) -> None:
@@ -180,6 +174,8 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
+        if self._started_at_epoch is None:
+            self._started_at_epoch = time.time()
         logger.info("Agent loop started")
 
         while self._running:
@@ -273,6 +269,19 @@ class AgentLoop:
             return None
         persona_text = policy_ctx.persona_text
 
+        fast_status = self._try_fast_status(msg.content, msg, session, policy_ctx)
+        if fast_status is not None:
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_status[:120]}")
+            session.add_message("user", msg.content)
+            session.add_message("assistant", fast_status)
+            self.sessions.save(session)
+            log_timing(iterations=0)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=fast_status,
+            )
+
         fast_model_info = self._try_fast_model_info(msg.content)
         if fast_model_info is not None:
             logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_model_info[:120]}")
@@ -346,6 +355,7 @@ class AgentLoop:
                 tools=self._tool_definitions(policy_ctx.decision.allowed_tools),
                 model=self.model
             )
+            self._record_usage(msg.session_key, response.usage)
             llm_ms += (time.perf_counter() - llm_started) * 1000
 
             # Handle tool calls
@@ -471,13 +481,117 @@ class AgentLoop:
         )
 
     def _try_fast_model_info(self, text: str) -> str | None:
-        """Return configured model for direct model-identity questions."""
+        """Return configured model for explicit model commands only."""
         normalized = " ".join(text.split()).strip().lower()
         if not normalized:
             return None
-        if any(pattern.fullmatch(normalized) for pattern in self._MODEL_QUERY_PATTERNS):
-            return f"Configured model: {self.model} (from ~/.nanobot/config.json)."
+        response = f"Configured model: {self.model} (from ~/.nanobot/config.json)."
+        if normalized == "/model" or normalized.startswith("/model@"):
+            return response
         return None
+
+    def _try_fast_status(
+        self,
+        text: str,
+        msg: InboundMessage,
+        session,
+        context: MessagePolicyContext,
+    ) -> str | None:
+        """Return runtime status for explicit /status commands."""
+        normalized = " ".join(text.split()).strip().lower()
+        if not normalized:
+            return None
+        if normalized != "/status" and not normalized.startswith("/status@"):
+            return None
+
+        provider_name = type(self.provider).__name__
+        api_key = getattr(self.provider, "api_key", None)
+        api_key_masked = self._mask_secret(str(api_key)) if api_key else "-"
+        api_base = getattr(self.provider, "api_base", None) or "-"
+        gateway = getattr(self.provider, "_gateway", None)
+        gateway_name = getattr(gateway, "name", "-") if gateway else "-"
+        raw_headers = getattr(self.provider, "extra_headers", None)
+        header_names = sorted(raw_headers.keys()) if isinstance(raw_headers, dict) else []
+        headers_text = ", ".join(header_names) if header_names else "-"
+
+        usage = self._last_usage_by_session.get(msg.session_key, {})
+        prompt_tokens = usage.get("prompt_tokens", "-")
+        completion_tokens = usage.get("completion_tokens", "-")
+        total_tokens = usage.get("total_tokens", "-")
+
+        effective = context.effective_policy
+        who_mode = effective.who_can_talk_mode if effective else "-"
+        reply_mode = effective.when_to_reply_mode if effective else "-"
+        allowed_tools = sorted(context.decision.allowed_tools)
+        allowed_text = ", ".join(allowed_tools) if allowed_tools else "-"
+
+        updated_at = session.updated_at.isoformat(timespec="seconds")
+        uptime_seconds = int(time.time() - (self._started_at_epoch or self._created_at_epoch))
+
+        rows = [
+            ("model", self.model),
+            ("provider", f"{provider_name} gateway={gateway_name}"),
+            ("api_base", str(api_base)),
+            ("api_key", api_key_masked),
+            ("headers", headers_text),
+            ("session", f"{msg.session_key} msgs={len(session.messages)} updated={updated_at}"),
+            ("channel", f"{msg.channel} chat={msg.chat_id} sender={msg.sender_id}"),
+            (
+                "policy",
+                f"accept={context.decision.accept_message} reply={context.decision.should_respond} "
+                f"who={who_mode} when={reply_mode} reason={context.decision.reason}",
+            ),
+            ("policy_src", f"{context.source} path={self.policy_path or '-'}"),
+            ("tools", f"{len(allowed_tools)}/{len(self.tools.tool_names)} [{allowed_text}]"),
+            (
+                "runtime",
+                f"running={self._running} iterations={self.max_iterations} "
+                f"isolation={self.exec_config.isolation.enabled} timing_logs={self.timing_logs_enabled}",
+            ),
+            ("queue", f"in={self.bus.inbound_size} out={self.bus.outbound_size}"),
+            (
+                "counters",
+                f"drop_access={self.policy_counters['dropped_by_access']} "
+                f"drop_reply={self.policy_counters['dropped_by_reply']} "
+                f"block_tools={self.policy_counters['blocked_tool_call']}",
+            ),
+            ("usage", f"in={prompt_tokens} out={completion_tokens} total={total_tokens}"),
+            ("uptime", self._format_duration(uptime_seconds)),
+        ]
+        lines = [f"{key:<10} {value}" for key, value in rows]
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        """Mask secrets for status output."""
+        if not value:
+            return "-"
+        if len(value) <= 8:
+            return f"{value[:1]}...{value[-1:]}" if len(value) > 1 else "*"
+        return f"{value[:6]}...{value[-6:]}"
+
+    @staticmethod
+    def _format_duration(total_seconds: int) -> str:
+        """Format seconds into a compact duration string."""
+        hours, rem = divmod(max(total_seconds, 0), 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours:
+            return f"{hours}h{minutes:02d}m{seconds:02d}s"
+        if minutes:
+            return f"{minutes}m{seconds:02d}s"
+        return f"{seconds}s"
+
+    def _record_usage(self, session_key: str, usage: dict[str, int]) -> None:
+        """Track last provider token usage per session."""
+        if not usage:
+            return
+        normalized: dict[str, int] = {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                normalized[key] = value
+        if normalized:
+            self._last_usage_by_session[session_key] = normalized
 
     async def _try_fast_weather(self, text: str) -> str | None:
         """Handle simple current-weather prompts with one direct wttr.in request."""
@@ -601,6 +715,7 @@ class AgentLoop:
                 tools=self.tools.get_definitions(),
                 model=self.model
             )
+            self._record_usage(session_key, response.usage)
 
             if response.has_tool_calls:
                 tool_call_dicts = [
