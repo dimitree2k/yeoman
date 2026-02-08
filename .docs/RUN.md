@@ -77,6 +77,10 @@ nanobot status
 nanobot channels status
 ```
 
+For deeper troubleshooting and runtime diagnostics, use:
+
+- `.docs/OBSERVABILITY_RUNBOOK.md`
+
 ## 8. Optional: WhatsApp bridge
 
 Terminal 1:

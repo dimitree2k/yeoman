@@ -1,6 +1,8 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -168,23 +170,26 @@ def _make_provider(config):
 
 
 def _make_policy_engine(config):
-    """Create policy engine from ~/.nanobot/policy.json."""
+    """Create policy engine + path from ~/.nanobot/policy.json."""
+    from nanobot.config.loader import get_config_path
     from nanobot.policy.engine import PolicyEngine
-    from nanobot.policy.loader import load_policy, warn_legacy_allow_from
+    from nanobot.policy.loader import get_policy_path, load_policy, warn_legacy_allow_from
 
-    warn_legacy_allow_from(config)
+    warn_legacy_allow_from(get_config_path())
     try:
-        policy = load_policy()
+        policy_path = get_policy_path()
+        policy = load_policy(policy_path)
         apply_channels: set[str] = set()
         if getattr(config.channels.telegram, "enabled", False):
             apply_channels.add("telegram")
         if getattr(config.channels.whatsapp, "enabled", False):
             apply_channels.add("whatsapp")
-        return PolicyEngine(
+        engine = PolicyEngine(
             policy=policy,
             workspace=config.workspace_path,
             apply_channels=apply_channels,
         )
+        return engine, policy_path
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")
         raise typer.Exit(1)
@@ -219,7 +224,7 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
-    policy_engine = _make_policy_engine(config)
+    policy_engine, policy_path = _make_policy_engine(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -240,6 +245,7 @@ def gateway(
             restrict_to_workspace=config.tools.restrict_to_workspace,
             session_manager=session_manager,
             policy_engine=policy_engine,
+            policy_path=policy_path,
         )
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")
@@ -329,7 +335,7 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    policy_engine = _make_policy_engine(config)
+    policy_engine, policy_path = _make_policy_engine(config)
 
     try:
         agent_loop = AgentLoop(
@@ -340,6 +346,7 @@ def agent(
             exec_config=config.tools.exec,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             policy_engine=policy_engine,
+            policy_path=policy_path,
         )
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")
@@ -494,6 +501,117 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+# ============================================================================
+# Policy Commands
+# ============================================================================
+
+policy_app = typer.Typer(help="Manage chat policy")
+app.add_typer(policy_app, name="policy")
+
+
+def _policy_known_tools() -> set[str]:
+    """Known top-level tools for policy diagnostics."""
+    return {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "message",
+        "spawn",
+        "cron",
+    }
+
+
+@policy_app.command("path")
+def policy_path_cmd():
+    """Show policy file location."""
+    from nanobot.policy.loader import get_policy_path
+
+    console.print(get_policy_path())
+
+
+@policy_app.command("explain")
+def policy_explain(
+    channel: str = typer.Option(..., "--channel", "-c", help="Channel: telegram or whatsapp"),
+    chat_id: str = typer.Option(..., "--chat", help="Chat ID"),
+    sender_id: str = typer.Option(..., "--sender", "-s", help="Sender ID"),
+    is_group: bool = typer.Option(False, "--group", help="Treat as group chat"),
+    mentioned_bot: bool = typer.Option(False, "--mentioned", help="Message mentions the bot"),
+    reply_to_bot: bool = typer.Option(False, "--reply-to-bot", help="Message is a reply to bot"),
+):
+    """Explain merged policy + decision for one actor/chat."""
+    from nanobot.config.loader import load_config
+    from nanobot.policy.middleware import PolicyMiddleware
+
+    config = load_config()
+    policy_engine, policy_path = _make_policy_engine(config)
+    policy_engine.validate(_policy_known_tools())
+    middleware = PolicyMiddleware(
+        engine=policy_engine,
+        known_tools=_policy_known_tools(),
+        policy_path=policy_path,
+        reload_on_change=False,
+    )
+    report = middleware.explain(
+        channel=channel,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        is_group=is_group,
+        mentioned_bot=mentioned_bot,
+        reply_to_bot=reply_to_bot,
+    )
+    console.print_json(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+@policy_app.command("migrate-allowfrom")
+def policy_migrate_allowfrom(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show migration result without writing policy.json"),
+):
+    """Migrate legacy channels.*.allowFrom into policy defaults."""
+    import shutil
+
+    from nanobot.config.loader import get_config_path
+    from nanobot.policy.loader import (
+        get_policy_path,
+        load_legacy_allow_from,
+        load_policy,
+        migrate_allow_from,
+        save_policy,
+    )
+
+    config_path = get_config_path()
+    policy_path = get_policy_path()
+    legacy_allow_from = load_legacy_allow_from(config_path)
+    policy = load_policy(policy_path)
+    migrated, notes, changed = migrate_allow_from(policy, legacy_allow_from)
+
+    if notes:
+        console.print("Migration notes:")
+        for note in notes:
+            console.print(f"- {note}")
+    else:
+        console.print("No legacy allowFrom entries found.")
+
+    if not changed:
+        return
+
+    if dry_run:
+        console.print("[yellow]Dry run only. No files were changed.[/yellow]")
+        return
+
+    if policy_path.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = policy_path.with_name(f"{policy_path.name}.bak-{stamp}")
+        shutil.copy2(policy_path, backup_path)
+        console.print(f"[green]✓[/green] Backup written: {backup_path}")
+
+    save_policy(migrated, policy_path)
+    console.print(f"[green]✓[/green] Updated policy: {policy_path}")
 
 
 # ============================================================================
@@ -662,14 +780,17 @@ def cron_run(
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import get_config_path, load_config
+    from nanobot.policy.loader import get_policy_path
 
     config_path = get_config_path()
+    policy_path = get_policy_path()
     config = load_config()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")
 
     console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
+    console.print(f"Policy: {policy_path} {'[green]✓[/green]' if policy_path.exists() else '[red]✗[/red]'}")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():

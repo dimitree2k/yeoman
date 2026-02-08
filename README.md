@@ -352,7 +352,11 @@ Merge precedence is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "runtime": {
+    "reloadOnChange": true,
+    "reloadCheckIntervalSeconds": 1.0
+  },
   "owners": {
     "telegram": ["453897507"],
     "whatsapp": ["491757070305"]
@@ -386,7 +390,9 @@ Merge precedence is:
 }
 ```
 
-> `channels.*.allowFrom` is deprecated and ignored.
+> `channels.*.allowFrom` has been removed from `config.json`.
+> Use `policy.json` and run `nanobot policy migrate-allowfrom` if you still have legacy entries.
+> `policy.json` is hot-reloaded by default (no gateway restart needed after edits).
 
 ### Providers
 
@@ -497,6 +503,30 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot status` | Show status |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |
+| `nanobot policy path` | Print the active `policy.json` location |
+| `nanobot policy explain` | Show merged policy + decision for a specific channel/chat/sender |
+| `nanobot policy migrate-allowfrom` | Migrate legacy `channels.*.allowFrom` into `policy.json` |
+
+### Policy Command Examples
+
+```bash
+# Show where policy file lives
+nanobot policy path
+
+# Explain why a Telegram group message would be ignored/replied
+nanobot policy explain \
+  --channel telegram \
+  --chat -1001234567890 \
+  --sender "453897507|DietmarDude" \
+  --group \
+  --mentioned
+
+# Migrate old allowFrom entries (preview only)
+nanobot policy migrate-allowfrom --dry-run
+
+# Apply migration (creates policy backup automatically)
+nanobot policy migrate-allowfrom
+```
 
 <details>
 <summary><b>Scheduled Tasks (Cron)</b></summary>

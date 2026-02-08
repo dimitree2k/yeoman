@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
     from nanobot.policy.engine import PolicyEngine
+    from nanobot.policy.middleware import PolicyMiddleware
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
@@ -29,6 +30,7 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.policy.engine import ActorContext, PolicyDecision
+from nanobot.policy.middleware import MessagePolicyContext, PolicyMiddleware
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
 
@@ -58,6 +60,8 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         policy_engine: "PolicyEngine | None" = None,
+        policy_middleware: "PolicyMiddleware | None" = None,
+        policy_path: Path | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -90,17 +94,26 @@ class AgentLoop:
             restrict_to_workspace=self.effective_restrict_to_workspace,
         )
         self.policy_engine = policy_engine
+        self.policy: "PolicyMiddleware | None" = policy_middleware
+        self.policy_path = policy_path
         self.policy_counters = {
             "dropped_by_access": 0,
             "dropped_by_reply": 0,
             "blocked_tool_call": 0,
         }
-        self._warned_missing_wa_mention_meta: set[str] = set()
 
         self._running = False
         self._register_default_tools()
-        if self.policy_engine:
-            self.policy_engine.validate(set(self.tools.tool_names))
+        tool_names = set(self.tools.tool_names)
+        if self.policy is not None:
+            self.policy.engine.validate(tool_names)
+        elif self.policy_engine:
+            self.policy_engine.validate(tool_names)
+            self.policy = PolicyMiddleware(
+                engine=self.policy_engine,
+                known_tools=tool_names,
+                policy_path=self.policy_path,
+            )
 
     _WEATHER_KEYWORDS = ("weather", "wetter", "temperature", "temp")
     _WEATHER_BLOCKLIST = (
@@ -210,19 +223,22 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
-        # Policy evaluation (access/reply/tool persona)
-        decision = self._policy_decision(msg)
-        self._log_policy_decision(msg, decision)
-        if not decision.accept_message:
+        # Policy evaluation (access/reply/tool/persona)
+        policy_ctx = self._policy_context(msg)
+        self._log_policy_decision(msg, policy_ctx)
+        if not policy_ctx.decision.accept_message:
             self.policy_counters["dropped_by_access"] += 1
             return None
-        if not decision.should_respond:
+        if not policy_ctx.decision.should_respond:
             self.policy_counters["dropped_by_reply"] += 1
             return None
-        persona_text = self._persona_text(decision)
+        persona_text = policy_ctx.persona_text
 
         # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
-        fast_weather = await self._try_fast_weather(msg.content)
+        # This remains policy-aware through capability gating.
+        fast_weather = None
+        if self._allow_internal_capability("weather_fastpath", policy_ctx):
+            fast_weather = await self._try_fast_weather(msg.content)
         if fast_weather is not None:
             logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_weather[:120]}")
             session.add_message("user", msg.content)
@@ -271,7 +287,7 @@ class AgentLoop:
             # Call LLM
             response = await self.provider.chat(
                 messages=messages,
-                tools=self._tool_definitions(decision.allowed_tools),
+                tools=self._tool_definitions(policy_ctx.decision.allowed_tools),
                 model=self.model
             )
 
@@ -297,7 +313,7 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    if tool_call.name not in decision.allowed_tools:
+                    if not self._is_tool_allowed(tool_call.name, policy_ctx):
                         self.policy_counters["blocked_tool_call"] += 1
                         result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                     else:
@@ -328,81 +344,70 @@ class AgentLoop:
             content=final_content
         )
 
-    @staticmethod
-    def _sender_aliases(sender_id: str) -> tuple[str, list[str]]:
-        """Normalize sender identifier and aliases."""
-        raw_parts = [p.strip() for p in str(sender_id).split("|") if p.strip()]
-        if not raw_parts:
-            return "", []
-        primary = raw_parts[0]
-        aliases = list(dict.fromkeys(raw_parts))
-        return primary, aliases
-
-    def _policy_decision(self, msg: InboundMessage) -> PolicyDecision:
-        """Evaluate policy for inbound message, defaulting to allow-all."""
-        default_allowed = set(self.tools.tool_names)
-        if not self.policy_engine:
-            return PolicyDecision(
-                accept_message=True,
-                should_respond=True,
-                allowed_tools=default_allowed,
-                persona_file=None,
-                reason="policy_disabled",
+    def _policy_context(self, msg: InboundMessage) -> MessagePolicyContext:
+        """Evaluate policy context for one message."""
+        if self.policy is None:
+            allowed = set(self.tools.tool_names)
+            fallback_actor = ActorContext(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                sender_primary=str(msg.sender_id),
+                sender_aliases=[str(msg.sender_id)],
+                is_group=bool((msg.metadata or {}).get("is_group", False)),
+                mentioned_bot=bool((msg.metadata or {}).get("mentioned_bot", False)),
+                reply_to_bot=bool((msg.metadata or {}).get("reply_to_bot", False)),
             )
-
-        sender_primary, sender_aliases = self._sender_aliases(msg.sender_id)
-        metadata = msg.metadata or {}
-        actor = ActorContext(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            sender_primary=sender_primary,
-            sender_aliases=sender_aliases,
-            is_group=bool(metadata.get("is_group", False)),
-            mentioned_bot=bool(metadata.get("mentioned_bot", False)),
-            reply_to_bot=bool(metadata.get("reply_to_bot", False)),
-        )
-        decision = self.policy_engine.evaluate(actor, default_allowed)
-        if (
-            msg.channel == "whatsapp"
-            and actor.is_group
-            and "mentioned_bot" not in metadata
-            and "reply_to_bot" not in metadata
-            and decision.reason.endswith("when_to_reply:mention_only_group")
-        ):
-            warning_key = f"{msg.channel}:{msg.chat_id}"
-            if warning_key not in self._warned_missing_wa_mention_meta:
-                logger.warning(
-                    "whatsapp mention metadata missing; mention_only groups will fail-closed until bridge metadata is available"
-                )
-                self._warned_missing_wa_mention_meta.add(warning_key)
-        return decision
-
-    def _persona_text(self, decision: PolicyDecision) -> str | None:
-        if not self.policy_engine:
-            return None
-        return self.policy_engine.persona_text(decision.persona_file)
+            return MessagePolicyContext(
+                actor=fallback_actor,
+                decision=PolicyDecision(
+                    accept_message=True,
+                    should_respond=True,
+                    allowed_tools=allowed,
+                    persona_file=None,
+                    reason="policy_disabled",
+                ),
+                effective_policy=None,
+                persona_text=None,
+                source="disabled",
+            )
+        return self.policy.evaluate_message(msg)
 
     def _tool_definitions(self, allowed_tools: set[str]) -> list[dict]:
         """Filter tool schemas by policy."""
+        definitions = self.tools.get_definitions()
+        if self.policy:
+            return self.policy.filter_tool_definitions(definitions, allowed_tools)
         return [
             schema
-            for schema in self.tools.get_definitions()
+            for schema in definitions
             if schema.get("function", {}).get("name") in allowed_tools
         ]
 
-    def _log_policy_decision(self, msg: InboundMessage, decision: PolicyDecision) -> None:
+    def _is_tool_allowed(self, tool_name: str, context: MessagePolicyContext) -> bool:
+        if self.policy:
+            return self.policy.is_tool_allowed(tool_name, context)
+        return tool_name in context.decision.allowed_tools
+
+    def _allow_internal_capability(self, capability: str, context: MessagePolicyContext) -> bool:
+        if self.policy:
+            return self.policy.allows_capability(capability, context)
+        return True
+
+    def _log_policy_decision(self, msg: InboundMessage, context: MessagePolicyContext) -> None:
         """Structured policy debug line for observability."""
         logger.debug(
             "policy_decision channel={} chat={} sender={} accepted={} replied={} "
-            "reason={} tools_count={} persona={}",
+            "reason={} tools_count={} persona={} source={} actor_primary={}",
             msg.channel,
             msg.chat_id,
             msg.sender_id,
-            decision.accept_message,
-            decision.should_respond,
-            decision.reason,
-            len(decision.allowed_tools),
-            decision.persona_file or "-",
+            context.decision.accept_message,
+            context.decision.should_respond,
+            context.decision.reason,
+            len(context.decision.allowed_tools),
+            context.decision.persona_file or "-",
+            context.source,
+            context.actor.sender_primary,
         )
 
     async def _try_fast_weather(self, text: str) -> str | None:

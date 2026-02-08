@@ -87,6 +87,13 @@ class ChannelPolicy(PolicyModel):
     chats: dict[str, ChatPolicyOverride] = Field(default_factory=dict)
 
 
+class RuntimePolicy(PolicyModel):
+    """Runtime behavior for policy handling."""
+
+    reload_on_change: bool = Field(default=True, alias="reloadOnChange")
+    reload_check_interval_seconds: float = Field(default=1.0, alias="reloadCheckIntervalSeconds", ge=0.1)
+
+
 def _default_owners() -> dict[str, list[str]]:
     return {
         "telegram": [],
@@ -129,7 +136,8 @@ def _default_channels() -> dict[str, ChannelPolicy]:
 class PolicyConfig(PolicyModel):
     """Root policy configuration."""
 
-    version: int = 1
+    version: int = 2
     owners: dict[str, list[str]] = Field(default_factory=_default_owners)
+    runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
     defaults: ChatPolicy = Field(default_factory=_default_policy_defaults)
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)

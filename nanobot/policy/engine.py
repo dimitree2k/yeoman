@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.policy.identity import normalize_identity_token, normalize_sender_list
 from nanobot.policy.persona import load_persona_text, resolve_persona_path
 from nanobot.policy.schema import ChatPolicy, ChatPolicyOverride, PolicyConfig
 
@@ -19,6 +20,11 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = val
     return merged
+
+
+def _normalize_tool_names(values: list[str]) -> frozenset[str]:
+    normalized = {value.strip() for value in values if value.strip()}
+    return frozenset(normalized)
 
 
 @dataclass(slots=True)
@@ -59,6 +65,18 @@ class PolicyDecision:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CompiledPolicy:
+    who_can_talk_mode: str
+    who_can_talk_senders: frozenset[str]
+    when_to_reply_mode: str
+    when_to_reply_senders: frozenset[str]
+    allowed_tools_mode: str
+    allowed_tools_tools: frozenset[str]
+    allowed_tools_deny: frozenset[str]
+    persona_file: str | None
+
+
 class PolicyEngine:
     """Evaluates per-channel/per-chat policy rules."""
 
@@ -71,6 +89,62 @@ class PolicyEngine:
         self.policy = policy
         self.workspace = workspace.expanduser().resolve()
         self.apply_channels = {"telegram", "whatsapp"} if apply_channels is None else set(apply_channels)
+        self._owner_index: dict[str, frozenset[str]] = {}
+        self._channel_defaults: dict[str, _CompiledPolicy] = {}
+        self._chat_rules: dict[tuple[str, str], _CompiledPolicy] = {}
+        self._resolved_cache: dict[tuple[str, str], _CompiledPolicy] = {}
+        self._compile()
+
+    def _compile(self) -> None:
+        self._owner_index = {
+            channel: normalize_sender_list(channel, owners)
+            for channel, owners in self.policy.owners.items()
+        }
+
+        channels_to_compile = set(self.apply_channels) | set(self.policy.channels.keys())
+        for channel in channels_to_compile:
+            merged = self.policy.defaults.model_dump()
+            channel_policy = self.policy.channels.get(channel)
+            if channel_policy:
+                merged = _deep_merge(merged, channel_policy.default.model_dump(exclude_none=True))
+            resolved = ChatPolicy.model_validate(merged)
+            compiled_default = self._compile_chat_policy(channel, resolved)
+            self._channel_defaults[channel] = compiled_default
+
+            if channel_policy:
+                for chat_id, override in channel_policy.chats.items():
+                    chat_merged = _deep_merge(merged, override.model_dump(exclude_none=True))
+                    chat_resolved = ChatPolicy.model_validate(chat_merged)
+                    self._chat_rules[(channel, chat_id)] = self._compile_chat_policy(channel, chat_resolved)
+
+        self._resolved_cache.clear()
+
+    @staticmethod
+    def _compile_chat_policy(channel: str, resolved: ChatPolicy) -> _CompiledPolicy:
+        return _CompiledPolicy(
+            who_can_talk_mode=resolved.who_can_talk.mode,
+            who_can_talk_senders=normalize_sender_list(channel, resolved.who_can_talk.senders),
+            when_to_reply_mode=resolved.when_to_reply.mode,
+            when_to_reply_senders=normalize_sender_list(channel, resolved.when_to_reply.senders),
+            allowed_tools_mode=resolved.allowed_tools.mode,
+            allowed_tools_tools=_normalize_tool_names(resolved.allowed_tools.tools),
+            allowed_tools_deny=_normalize_tool_names(resolved.allowed_tools.deny),
+            persona_file=resolved.persona_file,
+        )
+
+    def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
+        """Resolve compiled policy with precedence defaults -> channel default -> chat override."""
+        key = (channel, chat_id)
+        cached = self._resolved_cache.get(key)
+        if cached is not None:
+            return cached
+
+        compiled = self._chat_rules.get(key)
+        if compiled is None:
+            compiled = self._channel_defaults[channel]
+
+        self._resolved_cache[key] = compiled
+        return compiled
 
     def validate(self, known_tools: set[str]) -> None:
         """Validate high-risk policy issues at startup."""
@@ -82,16 +156,14 @@ class PolicyEngine:
         default_mode = self.policy.defaults.who_can_talk.mode
         reply_default_mode = self.policy.defaults.when_to_reply.mode
         for channel in self.apply_channels:
-            owners = self.policy.owners.get(channel, [])
+            owners = self._owner_index.get(channel, frozenset())
             if not owners and (default_mode == "owner_only" or reply_default_mode == "owner_only"):
-                raise ValueError(
-                    f"policy owner_only configured but owners.{channel} is empty"
-                )
+                raise ValueError(f"policy owner_only configured but owners.{channel} is empty")
 
         for channel, channel_policy in self.policy.channels.items():
             if channel not in self.apply_channels:
                 continue
-            owners = self.policy.owners.get(channel, [])
+            owners = self._owner_index.get(channel, frozenset())
             if not owners and self._channel_uses_owner_only(channel_policy):
                 raise ValueError(
                     f"policy owner_only configured for {channel} but owners.{channel} is empty"
@@ -135,11 +207,25 @@ class PolicyEngine:
         for channel, cp in self.policy.channels.items():
             if cp.default.allowed_tools:
                 ad = cp.default.allowed_tools
-                refs.append((ad.mode or "all", ad.tools or [], ad.deny or [], f"channels.{channel}.default.allowedTools"))
+                refs.append(
+                    (
+                        ad.mode or "all",
+                        ad.tools or [],
+                        ad.deny or [],
+                        f"channels.{channel}.default.allowedTools",
+                    )
+                )
             for chat, ov in cp.chats.items():
                 if ov.allowed_tools:
                     ao = ov.allowed_tools
-                    refs.append((ao.mode or "all", ao.tools or [], ao.deny or [], f"channels.{channel}.chats.{chat}.allowedTools"))
+                    refs.append(
+                        (
+                            ao.mode or "all",
+                            ao.tools or [],
+                            ao.deny or [],
+                            f"channels.{channel}.chats.{chat}.allowedTools",
+                        )
+                    )
         return refs
 
     def _iter_persona_refs(self) -> list[tuple[str | None, str]]:
@@ -151,38 +237,35 @@ class PolicyEngine:
         return refs
 
     def resolve_policy(self, channel: str, chat_id: str) -> EffectivePolicy:
-        """Resolve policy with precedence defaults -> channel default -> chat override."""
-        merged = self.policy.defaults.model_dump()
-        channel_policy = self.policy.channels.get(channel)
-        if channel_policy:
-            merged = _deep_merge(merged, channel_policy.default.model_dump(exclude_none=True))
-            chat_override = channel_policy.chats.get(chat_id)
-            if chat_override:
-                merged = _deep_merge(merged, chat_override.model_dump(exclude_none=True))
-        resolved = ChatPolicy.model_validate(merged)
+        """Return resolved policy in non-compiled form."""
+        resolved = self.resolve_compiled_policy(channel, chat_id)
         return EffectivePolicy(
-            who_can_talk_mode=resolved.who_can_talk.mode,
-            who_can_talk_senders=resolved.who_can_talk.senders,
-            when_to_reply_mode=resolved.when_to_reply.mode,
-            when_to_reply_senders=resolved.when_to_reply.senders,
-            allowed_tools_mode=resolved.allowed_tools.mode,
-            allowed_tools_tools=resolved.allowed_tools.tools,
-            allowed_tools_deny=resolved.allowed_tools.deny,
+            who_can_talk_mode=resolved.who_can_talk_mode,
+            who_can_talk_senders=sorted(resolved.who_can_talk_senders),
+            when_to_reply_mode=resolved.when_to_reply_mode,
+            when_to_reply_senders=sorted(resolved.when_to_reply_senders),
+            allowed_tools_mode=resolved.allowed_tools_mode,
+            allowed_tools_tools=sorted(resolved.allowed_tools_tools),
+            allowed_tools_deny=sorted(resolved.allowed_tools_deny),
             persona_file=resolved.persona_file,
         )
 
     @staticmethod
-    def _sender_match(sender_primary: str, sender_aliases: list[str], allowed: list[str]) -> bool:
+    def _sender_match(sender_primary: str, sender_aliases: list[str], allowed: frozenset[str]) -> bool:
         if not allowed:
             return False
-        normalized = {sender_primary.strip(), *[a.strip() for a in sender_aliases if a.strip()]}
-        return any(item.strip() in normalized for item in allowed if item.strip())
+        normalized = {
+            normalize_identity_token(sender_primary),
+            *[normalize_identity_token(a) for a in sender_aliases],
+        }
+        normalized.discard("")
+        return any(item in allowed for item in normalized)
 
     def _owner_match(self, actor: ActorContext) -> bool:
-        owners = self.policy.owners.get(actor.channel, [])
+        owners = self._owner_index.get(actor.channel, frozenset())
         return self._sender_match(actor.sender_primary, actor.sender_aliases, owners)
 
-    def _evaluate_who_can_talk(self, actor: ActorContext, policy: EffectivePolicy) -> tuple[bool, str]:
+    def _evaluate_who_can_talk(self, actor: ActorContext, policy: _CompiledPolicy) -> tuple[bool, str]:
         mode = policy.who_can_talk_mode
         if mode == "everyone":
             return True, "who_can_talk:everyone"
@@ -193,7 +276,7 @@ class PolicyEngine:
             return self._owner_match(actor), "who_can_talk:owner_only"
         return False, f"who_can_talk:unknown_mode:{mode}"
 
-    def _evaluate_when_to_reply(self, actor: ActorContext, policy: EffectivePolicy) -> tuple[bool, str]:
+    def _evaluate_when_to_reply(self, actor: ActorContext, policy: _CompiledPolicy) -> tuple[bool, str]:
         mode = policy.when_to_reply_mode
         if mode == "all":
             return True, "when_to_reply:all"
@@ -212,7 +295,7 @@ class PolicyEngine:
         return False, f"when_to_reply:unknown_mode:{mode}"
 
     @staticmethod
-    def _resolve_allowed_tools(policy: EffectivePolicy, all_tools: set[str]) -> set[str]:
+    def _resolve_allowed_tools(policy: _CompiledPolicy, all_tools: set[str]) -> set[str]:
         if policy.allowed_tools_mode == "all":
             allowed = set(all_tools)
         else:
@@ -226,7 +309,6 @@ class PolicyEngine:
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:
         """Evaluate policy decision for an actor."""
-        # Policy currently applies to Telegram/WhatsApp only.
         if actor.channel not in self.apply_channels:
             return PolicyDecision(
                 accept_message=True,
@@ -236,7 +318,7 @@ class PolicyEngine:
                 reason="policy_not_applied",
             )
 
-        policy = self.resolve_policy(actor.channel, actor.chat_id)
+        policy = self.resolve_compiled_policy(actor.channel, actor.chat_id)
         accepted, accept_reason = self._evaluate_who_can_talk(actor, policy)
         if not accepted:
             return PolicyDecision(
@@ -268,3 +350,4 @@ class PolicyEngine:
     def persona_text(self, persona_file: str | None) -> str | None:
         """Load persona text for a decision."""
         return load_persona_text(persona_file, self.workspace)
+

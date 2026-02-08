@@ -123,6 +123,8 @@ class WhatsAppChannel(BaseChannel):
                 metadata={
                     "message_id": data.get("id"),
                     "timestamp": data.get("timestamp"),
+                    "sender": sender,
+                    "pn": pn,
                     "is_group": data.get("isGroup", False),
                     "mentioned_bot": data.get("mentionedBot", False),
                     "reply_to_bot": data.get("replyToBot", False),
