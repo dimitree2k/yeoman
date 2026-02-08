@@ -71,6 +71,12 @@ The `exec` tool can execute shell commands. While dangerous command patterns are
 - ❌ Don't disable security checks
 - ❌ Don't run on systems with sensitive data without careful review
 
+**Optional Linux hardening (recommended for production):**
+- Enable `tools.exec.isolation.enabled` to run `exec` in per-session bubblewrap sandboxes
+- Keep `tools.exec.isolation.failClosed = true` (default)
+- Maintain `~/.config/nanobot/mount-allowlist.json` outside project root
+- Note: v1 isolation scope is `exec` only; file tools are restricted to workspace when isolation is enabled
+
 **Blocked patterns:**
 - `rm -rf /` - Root filesystem deletion
 - Fork bombs

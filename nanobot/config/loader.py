@@ -21,15 +21,15 @@ def get_data_dir() -> Path:
 def load_config(config_path: Path | None = None) -> Config:
     """
     Load configuration from file or create default.
-    
+
     Args:
         config_path: Optional path to config file. Uses default if not provided.
-    
+
     Returns:
         Loaded configuration object.
     """
     path = config_path or get_config_path()
-    
+
     if path.exists():
         try:
             with open(path) as f:
@@ -39,25 +39,25 @@ def load_config(config_path: Path | None = None) -> Config:
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
-    
+
     return Config()
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
     """
     Save configuration to file.
-    
+
     Args:
         config: Configuration to save.
         config_path: Optional path to save to. Uses default if not provided.
     """
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Convert to camelCase format
     data = config.model_dump()
     data = convert_to_camel(data)
-    
+
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -66,9 +66,31 @@ def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
+    if not isinstance(tools, dict):
+        return data
+
     exec_cfg = tools.get("exec", {})
+    if not isinstance(exec_cfg, dict):
+        return data
+
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Legacy shortcuts → tools.exec.isolation.*
+    isolation_cfg = exec_cfg.get("isolation")
+    if not isinstance(isolation_cfg, dict):
+        isolation_cfg = {}
+        exec_cfg["isolation"] = isolation_cfg
+
+    if "isolationEnabled" in exec_cfg and "enabled" not in isolation_cfg:
+        isolation_cfg["enabled"] = exec_cfg.pop("isolationEnabled")
+
+    if "isolationBackend" in exec_cfg and "backend" not in isolation_cfg:
+        isolation_cfg["backend"] = exec_cfg.pop("isolationBackend")
+
+    if "allowlist" in isolation_cfg and "allowlistPath" not in isolation_cfg:
+        isolation_cfg["allowlistPath"] = isolation_cfg.pop("allowlist")
+
     return data
 
 

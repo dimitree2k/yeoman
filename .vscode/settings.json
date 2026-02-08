@@ -1,0 +1,4 @@
+{
+    "mypy.runUsingActiveInterpreter": false,
+    "mypy.targets": ["nanobot"]
+}

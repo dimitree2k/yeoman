@@ -41,6 +41,8 @@ exec(command: str, working_dir: str = None) -> str
 - Dangerous commands are blocked (rm -rf, format, dd, shutdown, etc.)
 - Output is truncated at 10,000 characters
 - Optional `restrictToWorkspace` config to limit paths
+- Optional Linux bubblewrap isolation (`tools.exec.isolation.enabled`)
+- Isolation uses batch-session sandboxes (idle recycle + global cap + preemption policy)
 
 ## Web Access
 

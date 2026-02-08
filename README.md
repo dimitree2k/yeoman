@@ -413,7 +413,30 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | Option | Default | Description |
 |--------|---------|-------------|
 | `tools.restrictToWorkspace` | `false` | When `true`, restricts **all** agent tools (shell, file read/write/edit, list) to the workspace directory. Prevents path traversal and out-of-scope access. |
+| `tools.exec.isolation.enabled` | `false` | Enable Linux-only bubblewrap isolation for `exec` with per-session batch sandboxes. |
+| `tools.exec.isolation.batchSessionIdleSeconds` | `600` | Recycle a session sandbox after inactivity timeout. |
+| `tools.exec.isolation.maxContainers` | `5` | Global cap for active session sandboxes. |
+| `tools.exec.isolation.pressurePolicy` | `"preempt_oldest_active"` | Capacity policy when all sandboxes are busy. |
 | `channels.*.allowFrom` | `[]` (allow all) | Whitelist of user IDs. Empty = allow everyone; non-empty = only listed users can interact. |
+
+#### Linux Exec Isolation (bubblewrap)
+
+- Scope: `exec` tool only (file tools remain host-side but are forced to workspace scope when isolation is enabled).
+- Platform: Linux only (recommended target: Raspberry Pi/Linux servers).
+- Lifecycle: one sandbox per session; sandbox expires after idle timeout.
+- Capacity: max 5 by default; when full and all busy, oldest active sandbox is preempted.
+- Warm pool: not enabled in v1 (keeps implementation lean).
+
+Add a host allowlist file at `~/.config/nanobot/mount-allowlist.json`:
+
+```json
+{
+  "allowedRoots": ["~/.nanobot/workspace"],
+  "blockedHostPatterns": [".ssh", ".aws", ".env", "id_rsa", "id_ed25519"]
+}
+```
+
+If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fail-closed by default.
 
 
 ## CLI Reference

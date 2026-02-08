@@ -1,6 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -100,9 +102,23 @@ class WebToolsConfig(BaseModel):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class ExecIsolationConfig(BaseModel):
+    """Container isolation configuration for exec tool."""
+
+    enabled: bool = False
+    backend: Literal["bubblewrap"] = "bubblewrap"
+    fail_closed: bool = True
+    batch_session_idle_seconds: int = 600
+    max_containers: int = 5
+    pressure_policy: Literal["preempt_oldest_active"] = "preempt_oldest_active"
+    force_workspace_restriction: bool = True
+    allowlist_path: str = "~/.config/nanobot/mount-allowlist.json"
+
+
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
     timeout: int = 60
+    isolation: ExecIsolationConfig = Field(default_factory=ExecIsolationConfig)
 
 
 class ToolsConfig(BaseModel):
@@ -119,12 +135,12 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
-    
+
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
         from nanobot.providers.registry import PROVIDERS
@@ -147,7 +163,7 @@ class Config(BaseSettings):
         """Get API key for the given model. Falls back to first available key."""
         p = self.get_provider(model)
         return p.api_key if p else None
-    
+
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""
         from nanobot.providers.registry import PROVIDERS
@@ -161,7 +177,7 @@ class Config(BaseSettings):
             if spec.is_gateway and spec.default_api_base and p == getattr(self.providers, spec.name, None):
                 return spec.default_api_base
         return None
-    
+
     class Config:
         env_prefix = "NANOBOT_"
         env_nested_delimiter = "__"

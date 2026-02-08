@@ -1,7 +1,28 @@
+import asyncio
+import os
+import platform
+import shutil
+import time
+from pathlib import Path
 from typing import Any
 
+import pytest
+
+from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.exec_isolation import (
+    CommandResult,
+    ExecSandboxManager,
+    MountAllowlist,
+    SandboxPreemptedError,
+    SandboxTimeoutError,
+)
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.bus.queue import MessageBus
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.loader import _migrate_config, convert_keys, convert_to_camel
+from nanobot.config.schema import Config, ExecToolConfig
+from nanobot.providers.base import LLMProvider, LLMResponse
 
 
 class SampleTool(Tool):
@@ -86,3 +107,318 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+async def test_exec_tool_blocks_dangerous_command(tmp_path: Path) -> None:
+    tool = ExecTool(timeout=1, working_dir=str(tmp_path))
+    result = await tool.execute("rm -rf /")
+    assert "blocked by safety guard" in result
+
+
+async def test_exec_tool_timeout_and_recovery(tmp_path: Path) -> None:
+    tool = ExecTool(timeout=1, working_dir=str(tmp_path))
+    timed_out = await tool.execute("sleep 2")
+    assert "timed out" in timed_out
+
+    recovered = await tool.execute("echo ok")
+    assert "ok" in recovered
+
+
+def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
+    cfg = Config()
+    iso = cfg.tools.exec.isolation
+    assert iso.enabled is False
+    assert iso.backend == "bubblewrap"
+    assert iso.batch_session_idle_seconds == 600
+    assert iso.max_containers == 5
+    assert iso.pressure_policy == "preempt_oldest_active"
+
+    data = {
+        "tools": {
+            "exec": {
+                "isolation": {
+                    "enabled": True,
+                    "batchSessionIdleSeconds": 123,
+                    "maxContainers": 7,
+                }
+            }
+        }
+    }
+    loaded = Config.model_validate(convert_keys(data))
+    assert loaded.tools.exec.isolation.enabled is True
+    assert loaded.tools.exec.isolation.batch_session_idle_seconds == 123
+    assert loaded.tools.exec.isolation.max_containers == 7
+
+    dumped = convert_to_camel(loaded.model_dump())
+    assert dumped["tools"]["exec"]["isolation"]["batchSessionIdleSeconds"] == 123
+    assert dumped["tools"]["exec"]["isolation"]["maxContainers"] == 7
+
+
+def test_config_migration_for_legacy_isolation_keys() -> None:
+    raw = {
+        "tools": {
+            "exec": {
+                "isolationEnabled": True,
+                "isolationBackend": "bubblewrap",
+                "isolation": {"allowlist": "/tmp/allow.json"},
+            }
+        }
+    }
+    migrated = _migrate_config(raw)
+    isolation = migrated["tools"]["exec"]["isolation"]
+    assert isolation["enabled"] is True
+    assert isolation["backend"] == "bubblewrap"
+    assert isolation["allowlistPath"] == "/tmp/allow.json"
+
+
+class DummyProvider(LLMProvider):
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> LLMResponse:
+        return LLMResponse(content="ok")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+async def test_isolation_forces_workspace_restriction(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    exec_cfg = ExecToolConfig()
+    exec_cfg.isolation.enabled = True
+    exec_cfg.isolation.force_workspace_restriction = True
+    exec_cfg.isolation.fail_closed = False
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=DummyProvider(),
+        workspace=workspace,
+        exec_config=exec_cfg,
+        restrict_to_workspace=False,
+    )
+
+    assert loop.effective_restrict_to_workspace is True
+
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    result = await read_tool.execute(str(outside))
+    assert "outside allowed directory" in result
+
+    loop.stop()
+
+
+class FakeSandboxSession:
+    counter = 0
+    by_key: dict[str, "FakeSandboxSession"] = {}
+
+    def __init__(self, session_key: str, workspace: Path):
+        type(self).counter += 1
+        self.instance_id = type(self).counter
+        self.session_key = session_key
+        self.workspace = workspace
+        self.last_used_at = time.monotonic()
+        self.active_since: float | None = None
+        self._preempt_reason: str | None = None
+        self._hold = asyncio.Event()
+        self._stopped = False
+        type(self).by_key[session_key] = self
+
+    @property
+    def active(self) -> bool:
+        return self.active_since is not None
+
+    async def start(self) -> None:
+        return None
+
+    async def run_command(self, command: str, cwd: str, timeout: int) -> CommandResult:
+        if self._preempt_reason:
+            raise SandboxPreemptedError(self._preempt_reason)
+
+        self.active_since = time.monotonic()
+        self.last_used_at = self.active_since
+        try:
+            if command == "hold":
+                await self._hold.wait()
+                if self._preempt_reason:
+                    raise SandboxPreemptedError(self._preempt_reason)
+                return CommandResult(output="held", exit_code=0)
+            if command == "timeout":
+                raise SandboxTimeoutError("timeout")
+            return CommandResult(output=f"{self.session_key}:{cwd}", exit_code=0)
+        finally:
+            self.active_since = None
+            self.last_used_at = time.monotonic()
+
+    async def preempt(self, reason: str) -> None:
+        self._preempt_reason = reason
+        self._hold.set()
+        await self.stop(reason=reason)
+
+    async def stop(self, reason: str | None = None) -> None:
+        self._stopped = True
+        self._hold.set()
+
+    def stop_now(self) -> None:
+        self._stopped = True
+        self._hold.set()
+
+
+def _build_fake_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExecSandboxManager:
+    FakeSandboxSession.counter = 0
+    FakeSandboxSession.by_key = {}
+
+    allowlist = MountAllowlist(allowed_roots=[tmp_path.resolve()], blocked_patterns=[])
+    monkeypatch.setattr(
+        "nanobot.agent.tools.exec_isolation.ExecSandboxManager._check_runtime",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr(
+        "nanobot.agent.tools.exec_isolation.MountAllowlist.load",
+        staticmethod(lambda _path: allowlist),
+    )
+    monkeypatch.setattr("nanobot.agent.tools.exec_isolation.BubblewrapSandboxSession", FakeSandboxSession)
+
+    return ExecSandboxManager(
+        workspace=tmp_path / "workspace",
+        max_containers=2,
+        idle_seconds=600,
+        pressure_policy="preempt_oldest_active",
+        allowlist_path=tmp_path / "allowlist.json",
+    )
+
+
+async def test_manager_reuses_session_within_idle_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _build_fake_manager(monkeypatch, tmp_path)
+
+    r1 = await manager.execute("s1", "echo", str(workspace), timeout=3)
+    assert "s1" in r1.output
+    first = manager._sessions["s1"]
+
+    await manager.execute("s1", "echo", str(workspace), timeout=3)
+    second = manager._sessions["s1"]
+    assert first is second
+
+    await manager.aclose()
+
+
+async def test_manager_rotates_session_after_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _build_fake_manager(monkeypatch, tmp_path)
+
+    await manager.execute("s1", "echo", str(workspace), timeout=3)
+    first = manager._sessions["s1"]
+    first.last_used_at -= manager.idle_seconds + 1
+
+    await manager.execute("s1", "echo", str(workspace), timeout=3)
+    second = manager._sessions["s1"]
+    assert first is not second
+
+    await manager.aclose()
+
+
+async def test_manager_evicts_idle_lru_at_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _build_fake_manager(monkeypatch, tmp_path)
+
+    await manager.execute("s1", "echo", str(workspace), timeout=3)
+    await manager.execute("s2", "echo", str(workspace), timeout=3)
+    manager._sessions["s1"].last_used_at -= 1000
+
+    await manager.execute("s3", "echo", str(workspace), timeout=3)
+    assert "s1" not in manager._sessions
+    assert "s2" in manager._sessions
+    assert "s3" in manager._sessions
+
+    await manager.aclose()
+
+
+async def test_manager_preempts_oldest_active_when_full(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _build_fake_manager(monkeypatch, tmp_path)
+
+    t1 = asyncio.create_task(manager.execute("s1", "hold", str(workspace), timeout=30))
+    await asyncio.sleep(0.05)
+    t2 = asyncio.create_task(manager.execute("s2", "hold", str(workspace), timeout=30))
+    await asyncio.sleep(0.05)
+
+    r3 = await manager.execute("s3", "echo", str(workspace), timeout=3)
+    assert "s3" in r3.output
+
+    with pytest.raises(SandboxPreemptedError):
+        await t1
+
+    fake_s2 = FakeSandboxSession.by_key["s2"]
+    fake_s2._hold.set()
+    await t2
+
+    await manager.aclose()
+
+
+async def test_manager_drops_broken_session_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _build_fake_manager(monkeypatch, tmp_path)
+
+    with pytest.raises(SandboxTimeoutError):
+        await manager.execute("s1", "timeout", str(workspace), timeout=3)
+    assert "s1" not in manager._sessions
+
+    await manager.execute("s1", "echo", str(workspace), timeout=3)
+    assert "s1" in manager._sessions
+
+    await manager.aclose()
+
+
+async def test_bubblewrap_smoke_if_available(tmp_path: Path) -> None:
+    if platform.system() != "Linux" or shutil.which("bwrap") is None or os.geteuid() == 0:
+        pytest.skip("requires non-root Linux with bubblewrap")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    allowlist = tmp_path / "allowlist.json"
+    allowlist.write_text(
+        '{"allowedRoots": ["%s"], "blockedHostPatterns": []}' % str(tmp_path),
+        encoding="utf-8",
+    )
+
+    manager = ExecSandboxManager(
+        workspace=workspace,
+        max_containers=2,
+        idle_seconds=60,
+        pressure_policy="preempt_oldest_active",
+        allowlist_path=allowlist,
+    )
+
+    result = await manager.execute("smoke", "pwd", str(workspace), timeout=5)
+    assert "/workspace" in result.output
+    await manager.aclose()

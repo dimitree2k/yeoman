@@ -1,17 +1,25 @@
 """Shell execution tool."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.config.schema import ExecIsolationConfig
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.exec_isolation import ExecSandboxManager
 
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
-    
+
     def __init__(
         self,
         timeout: int = 60,
@@ -19,7 +27,10 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        isolation_config: "ExecIsolationConfig | None" = None,
     ):
+
+
         self.timeout = timeout
         self.working_dir = working_dir
         self.deny_patterns = deny_patterns or [
@@ -34,15 +45,21 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
-    
+        self.isolation_config = isolation_config or ExecIsolationConfig()
+
+        self._session_key = "cli:default"
+        self._sandbox_manager: "ExecSandboxManager | None" = None
+        self._isolation_error: str | None = None
+        self._init_isolation()
+
     @property
     def name(self) -> str:
         return "exec"
-    
+
     @property
     def description(self) -> str:
         return "Execute a shell command and return its output. Use with caution."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -59,54 +76,34 @@ class ExecTool(Tool):
             },
             "required": ["command"]
         }
-    
+
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
-        
-        try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                return f"Error: Command timed out after {self.timeout} seconds"
-            
-            output_parts = []
-            
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-            
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-            
-            if process.returncode != 0:
-                output_parts.append(f"\nExit code: {process.returncode}")
-            
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-            
-            # Truncate very long output
-            max_len = 10000
-            if len(result) > max_len:
-                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
-            
-            return result
-            
-        except Exception as e:
-            return f"Error executing command: {str(e)}"
+
+        if self._sandbox_manager:
+            return await self._execute_isolated(command=command, cwd=cwd)
+
+        if self.isolation_config.enabled and self.isolation_config.fail_closed and self._isolation_error:
+            return f"Error: Exec isolation unavailable: {self._isolation_error}"
+
+        return await self._execute_local(command=command, cwd=cwd)
+
+    def set_session_context(self, session_key: str) -> None:
+        """Bind exec calls to a session key for batch-session isolation."""
+        self._session_key = session_key or "cli:default"
+
+    def close(self) -> None:
+        """Close isolation resources synchronously."""
+        if self._sandbox_manager:
+            self._sandbox_manager.close()
+
+    async def aclose(self) -> None:
+        """Close isolation resources asynchronously."""
+        if self._sandbox_manager:
+            await self._sandbox_manager.aclose()
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
@@ -139,3 +136,113 @@ class ExecTool(Tool):
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None
+
+    def _init_isolation(self) -> None:
+        """Initialize optional isolation manager based on config."""
+        if not self.isolation_config.enabled:
+            return
+
+        if not self.working_dir:
+            self._isolation_error = "working_dir is required when exec isolation is enabled"
+            return
+
+        from nanobot.agent.tools.exec_isolation import ExecSandboxManager
+
+        allowlist_path = Path(self.isolation_config.allowlist_path).expanduser()
+        try:
+            self._sandbox_manager = ExecSandboxManager(
+                workspace=Path(self.working_dir).expanduser().resolve(),
+                max_containers=self.isolation_config.max_containers,
+                idle_seconds=self.isolation_config.batch_session_idle_seconds,
+                pressure_policy=self.isolation_config.pressure_policy,
+                allowlist_path=allowlist_path,
+            )
+        except Exception as e:
+            self._isolation_error = str(e)
+            self._sandbox_manager = None
+            if self.isolation_config.fail_closed:
+                logger.error(f"Exec isolation unavailable (fail-closed): {self._isolation_error}")
+            else:
+                logger.warning(
+                    f"Exec isolation unavailable, falling back to host execution: {self._isolation_error}"
+                )
+
+    async def _execute_local(self, command: str, cwd: str) -> str:
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                return f"Error: Command timed out after {self.timeout} seconds"
+
+            output_parts = []
+
+            if stdout:
+                output_parts.append(stdout.decode("utf-8", errors="replace"))
+
+            if stderr:
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                if stderr_text.strip():
+                    output_parts.append(f"STDERR:\n{stderr_text}")
+
+            result = "\n".join(output_parts) if output_parts else "(no output)"
+            if process.returncode != 0:
+                result = f"{result}\n\nExit code: {process.returncode}"
+            return self._truncate_result(result)
+
+        except Exception as e:
+            return f"Error executing command: {str(e)}"
+
+    async def _execute_isolated(self, command: str, cwd: str) -> str:
+        from nanobot.agent.tools.exec_isolation import (
+            IsolationUnavailableError,
+            SandboxExecutionError,
+            SandboxPreemptedError,
+            SandboxTimeoutError,
+        )
+
+        if not self._sandbox_manager:
+            if self.isolation_config.fail_closed:
+                return f"Error: Exec isolation unavailable: {self._isolation_error or 'unknown error'}"
+            return await self._execute_local(command=command, cwd=cwd)
+
+        try:
+            result = await self._sandbox_manager.execute(
+                session_key=self._session_key,
+                command=command,
+                host_cwd=cwd,
+                timeout=self.timeout,
+            )
+        except SandboxTimeoutError:
+            return f"Error: Command timed out after {self.timeout} seconds"
+        except SandboxPreemptedError as e:
+            return f"Error: Command interrupted due to sandbox preemption ({e})"
+        except (IsolationUnavailableError, SandboxExecutionError) as e:
+            if self.isolation_config.fail_closed:
+                return f"Error: Exec isolation unavailable: {str(e)}"
+            return await self._execute_local(command=command, cwd=cwd)
+        except Exception as e:
+            return f"Error executing command: {str(e)}"
+
+        output = result.output if result.output else "(no output)"
+        if result.exit_code != 0:
+            output = f"{output}\n\nExit code: {result.exit_code}"
+        return self._truncate_result(output)
+
+    @staticmethod
+    def _truncate_result(result: str) -> str:
+        """Truncate very long outputs to stay within context budget."""
+        max_len = 10000
+        if len(result) > max_len:
+            return result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
+        return result
