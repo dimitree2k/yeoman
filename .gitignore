@@ -18,3 +18,5 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 tests/
+.mypy_cache
+.ruff_cache
