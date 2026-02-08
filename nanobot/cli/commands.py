@@ -505,6 +505,251 @@ def channels_login():
         console.print("[red]npm not found. Please install Node.js.[/red]")
 
 
+# WhatsApp bridge process manager
+bridge_app = typer.Typer(help="Manage WhatsApp bridge process")
+channels_app.add_typer(bridge_app, name="bridge")
+
+
+def _bridge_pid_path() -> Path:
+    from nanobot.config.loader import get_data_dir
+
+    run_dir = get_data_dir() / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / "whatsapp-bridge.pid"
+
+
+def _bridge_log_path() -> Path:
+    from nanobot.config.loader import get_data_dir
+
+    logs_dir = get_data_dir() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir / "whatsapp-bridge.log"
+
+
+def _bridge_port_from_config() -> int:
+    from urllib.parse import urlparse
+
+    from nanobot.config.loader import load_config
+
+    bridge_url = load_config().channels.whatsapp.bridge_url
+    parsed = urlparse(bridge_url)
+    if parsed.port is not None:
+        return parsed.port
+    if parsed.scheme == "wss":
+        return 443
+    if parsed.scheme == "ws":
+        return 80
+    return 3001
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _command_for_pid(pid: int) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _is_bridge_process(pid: int) -> bool:
+    cmd = _command_for_pid(pid).lower()
+    if not cmd:
+        return False
+    if "dist/index.js" not in cmd:
+        return False
+    return "node" in cmd or "npm start" in cmd or "nanobot-whatsapp-bridge" in cmd
+
+
+def _find_bridge_pids(port: int) -> list[int]:
+    import shutil
+    import subprocess
+
+    pids: set[int] = set()
+
+    pid_file = _bridge_pid_path()
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _pid_alive(pid):
+                pids.add(pid)
+        except ValueError:
+            pass
+
+    if shutil.which("lsof"):
+        result = subprocess.run(
+            ["lsof", "-nP", "-tiTCP:{0}".format(port), "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pids.add(int(line))
+                except ValueError:
+                    continue
+
+    # Fallback for environments where lsof is unavailable or bridge is booting.
+    if not pids and shutil.which("pgrep"):
+        result = subprocess.run(
+            ["pgrep", "-f", "node .*dist/index.js|npm start"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pids.add(int(line))
+                except ValueError:
+                    continue
+
+    return sorted(pid for pid in pids if _pid_alive(pid) and _is_bridge_process(pid))
+
+
+def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
+    import os
+    import signal
+    import time
+
+    pids = _find_bridge_pids(port)
+    if not pids:
+        _bridge_pid_path().unlink(missing_ok=True)
+        return 0
+
+    stopped = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        remaining = [pid for pid in pids if _pid_alive(pid)]
+        if not remaining:
+            stopped = len(pids)
+            break
+        time.sleep(0.2)
+    else:
+        remaining = [pid for pid in pids if _pid_alive(pid)]
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        stopped = len(pids)
+
+    _bridge_pid_path().unlink(missing_ok=True)
+    return stopped
+
+
+@bridge_app.command("start")
+def bridge_start(
+    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+):
+    """Start WhatsApp bridge in background."""
+    import os
+    import shutil
+    import subprocess
+    import time
+
+    if not shutil.which("node"):
+        console.print("[red]node not found. Please install Node.js >= 18.[/red]")
+        raise typer.Exit(1)
+
+    bridge_dir = _get_bridge_dir()
+    resolved_port = _bridge_port_from_config() if port is None else port
+
+    running = _find_bridge_pids(resolved_port)
+    if running:
+        console.print(f"[yellow]Bridge already running (pid {running[0]})[/yellow]")
+        console.print(f"Log: {_bridge_log_path()}")
+        return
+
+    log_path = _bridge_log_path()
+    with open(log_path, "a") as log_file:
+        env = dict(os.environ)
+        env["BRIDGE_PORT"] = str(resolved_port)
+        proc = subprocess.Popen(
+            ["node", "dist/index.js"],
+            cwd=bridge_dir,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        console.print("[red]Bridge failed to start. Check log:[/red]")
+        console.print(log_path)
+        raise typer.Exit(1)
+
+    _bridge_pid_path().write_text(str(proc.pid))
+    console.print(f"[green]✓[/green] Bridge started (pid {proc.pid}, port {resolved_port})")
+    console.print(f"Log: {log_path}")
+
+
+@bridge_app.command("stop")
+def bridge_stop(
+    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+):
+    """Stop WhatsApp bridge."""
+    resolved_port = _bridge_port_from_config() if port is None else port
+    stopped = _stop_bridge_processes(resolved_port)
+    if stopped == 0:
+        console.print("[yellow]Bridge is not running[/yellow]")
+        return
+    console.print(f"[green]✓[/green] Bridge stopped ({stopped} process{'es' if stopped != 1 else ''})")
+
+
+@bridge_app.command("restart")
+def bridge_restart(
+    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+):
+    """Restart WhatsApp bridge."""
+    resolved_port = _bridge_port_from_config() if port is None else port
+    _stop_bridge_processes(resolved_port)
+    bridge_start(port=resolved_port)
+
+
+@bridge_app.command("status")
+def bridge_status(
+    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+):
+    """Show WhatsApp bridge status."""
+    resolved_port = _bridge_port_from_config() if port is None else port
+    running = _find_bridge_pids(resolved_port)
+    if not running:
+        console.print(f"[yellow]Bridge not running on port {resolved_port}[/yellow]")
+        return
+    console.print(f"[green]Bridge running[/green] on port {resolved_port} (pid {running[0]})")
+    console.print(f"Log: {_bridge_log_path()}")
+
+
 # ============================================================================
 # Policy Commands
 # ============================================================================

@@ -283,6 +283,15 @@ nanobot channels login
 nanobot gateway
 ```
 
+After linking once, you can run the bridge in background and restart it without `Ctrl-C`:
+
+```bash
+nanobot channels bridge start
+nanobot channels bridge status
+nanobot channels bridge restart
+nanobot channels bridge stop
+```
+
 </details>
 
 <details>
@@ -518,6 +527,7 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot gateway` | Start the gateway |
 | `nanobot status` | Show status |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
+| `nanobot channels bridge restart` | Restart WhatsApp bridge daemon |
 | `nanobot channels status` | Show channel status |
 | `nanobot policy path` | Print the active `policy.json` location |
 | `nanobot policy explain` | Show merged policy + decision for a specific channel/chat/sender |
