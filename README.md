@@ -526,6 +526,7 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot agent` | Interactive chat mode |
 | `nanobot gateway` | Start the gateway |
 | `nanobot gateway restart` | Restart gateway in background |
+| `nanobot logs` | Open gateway/bridge logs in lnav |
 | `nanobot status` | Show status |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels bridge restart` | Restart WhatsApp bridge daemon |

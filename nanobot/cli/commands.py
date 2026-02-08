@@ -1373,6 +1373,50 @@ def cron_run(
 
 
 @app.command()
+def logs(
+    follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow log output"),
+    lines: int = typer.Option(200, "--lines", "-n", min=1, help="Initial lines for tail mode"),
+    gateway: bool = typer.Option(True, "--gateway/--no-gateway", help="Include gateway log"),
+    bridge: bool = typer.Option(True, "--bridge/--no-bridge", help="Include WhatsApp bridge log"),
+    raw: bool = typer.Option(False, "--raw", help="Use tail instead of lnav"),
+):
+    """View nanobot logs (uses lnav when available)."""
+    import shutil
+    import subprocess
+
+    paths: list[Path] = []
+    if gateway:
+        paths.append(_gateway_log_path())
+    if bridge:
+        paths.append(_bridge_log_path())
+
+    if not paths:
+        console.print("[red]No logs selected. Enable --gateway and/or --bridge.[/red]")
+        raise typer.Exit(1)
+
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+
+    if not raw and shutil.which("lnav"):
+        cmd = ["lnav", *[str(path) for path in paths]]
+        try:
+            subprocess.run(cmd, check=False)
+        except KeyboardInterrupt:
+            return
+        return
+
+    cmd = ["tail", "-n", str(lines)]
+    if follow:
+        cmd.append("-F")
+    cmd.extend(str(path) for path in paths)
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        return
+
+
+@app.command()
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import get_config_path, load_config
