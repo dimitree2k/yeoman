@@ -200,12 +200,229 @@ def _make_policy_engine(config):
 # ============================================================================
 
 
-@app.command()
-def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-):
-    """Start the nanobot gateway."""
+def _gateway_pid_path() -> Path:
+    from nanobot.config.loader import get_data_dir
+
+    run_dir = get_data_dir() / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / "gateway.pid"
+
+
+def _gateway_log_path() -> Path:
+    from nanobot.config.loader import get_data_dir
+
+    logs_dir = get_data_dir() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir / "gateway.log"
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _command_for_pid(pid: int) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _pid_has_env(pid: int, key: str, value: str | None = None) -> bool:
+    env_path = Path(f"/proc/{pid}/environ")
+    try:
+        raw = env_path.read_bytes()
+    except OSError:
+        return False
+
+    marker = f"{key}={value}" if value is not None else f"{key}="
+    for item in raw.split(b"\x00"):
+        if not item:
+            continue
+        text = item.decode(errors="ignore")
+        if value is None:
+            if text.startswith(marker):
+                return True
+        elif text == marker:
+            return True
+    return False
+
+
+def _is_gateway_process(pid: int) -> bool:
+    if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
+        return True
+
+    cmd = _command_for_pid(pid).lower()
+    if not cmd:
+        return False
+    return (
+        " nanobot gateway" in cmd
+        or "nanobot.cli.commands gateway" in cmd
+        or "-m nanobot.cli.commands gateway" in cmd
+    )
+
+
+def _gateway_listener_pids(port: int) -> set[int]:
+    import shutil
+    import subprocess
+
+    listener_pids: set[int] = set()
+    if not shutil.which("lsof"):
+        return listener_pids
+
+    result = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return listener_pids
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            listener_pids.add(int(line))
+        except ValueError:
+            continue
+    return listener_pids
+
+
+def _find_gateway_pids(port: int) -> list[int]:
+    pids: set[int] = set()
+    listeners = _gateway_listener_pids(port)
+
+    pid_file = _gateway_pid_path()
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _pid_alive(pid) and (pid in listeners or _is_gateway_process(pid)):
+                pids.add(pid)
+        except ValueError:
+            pass
+
+    for pid in listeners:
+        if _pid_alive(pid) and _is_gateway_process(pid):
+            pids.add(pid)
+
+    return sorted(pids)
+
+
+def _signal_pid_or_group(pid: int, sig: int) -> None:
+    import os
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+
+    if pgid is not None and pgid > 0:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
+    import signal
+    import time
+
+    pids = _find_gateway_pids(port)
+    if not pids:
+        _gateway_pid_path().unlink(missing_ok=True)
+        return 0
+
+    for pid in pids:
+        _signal_pid_or_group(pid, signal.SIGTERM)
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        remaining = [pid for pid in pids if _pid_alive(pid)]
+        listeners = _find_gateway_pids(port)
+        if not remaining and not listeners:
+            break
+        time.sleep(0.2)
+    else:
+        for pid in [pid for pid in pids if _pid_alive(pid)]:
+            _signal_pid_or_group(pid, signal.SIGKILL)
+        for pid in _find_gateway_pids(port):
+            _signal_pid_or_group(pid, signal.SIGKILL)
+
+    _gateway_pid_path().unlink(missing_ok=True)
+    return len(pids)
+
+
+def _start_gateway_daemon(port: int, verbose: bool) -> None:
+    import os
+    import subprocess
+    import sys
+    import time
+
+    running = _find_gateway_pids(port)
+    if running:
+        console.print(f"[yellow]Gateway already running (pid {running[0]})[/yellow]")
+        console.print(f"Log: {_gateway_log_path()}")
+        return
+
+    log_path = _gateway_log_path()
+    cmd = [sys.executable, "-m", "nanobot.cli.commands", "gateway", "--port", str(port)]
+    if verbose:
+        cmd.append("--verbose")
+
+    with open(log_path, "a") as log_file:
+        env = dict(os.environ)
+        env["NANOBOT_GATEWAY_DAEMON"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    # Wait briefly for either process failure or listener readiness.
+    started = False
+    for _ in range(20):
+        if proc.poll() is not None:
+            break
+        if _find_gateway_pids(port):
+            started = True
+            break
+        time.sleep(0.2)
+
+    if not started:
+        console.print("[red]Gateway failed to start. Check log:[/red]")
+        console.print(log_path)
+        raise typer.Exit(1)
+
+    _gateway_pid_path().write_text(str(proc.pid))
+    console.print(f"[green]✓[/green] Gateway started (pid {proc.pid}, port {port})")
+    console.print(f"Log: {log_path}")
+
+
+def _run_gateway_foreground(port: int, verbose: bool) -> None:
+    """Start the nanobot gateway in foreground."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
@@ -313,6 +530,82 @@ def gateway(
             await channels.stop_all()
 
     asyncio.run(run())
+
+
+@app.command()
+def gateway(
+    action: str | None = typer.Argument(
+        None,
+        help="Action: start|stop|restart|status (default: run in foreground)",
+    ),
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    daemon: bool = typer.Option(False, "--daemon", help="Run gateway in background"),
+    stop: bool = typer.Option(False, "--stop", help="Stop gateway"),
+    restart: bool = typer.Option(False, "--restart", help="Restart gateway in background"),
+    status: bool = typer.Option(False, "--status", help="Show gateway status"),
+):
+    """Start or control the nanobot gateway."""
+    action_mode: str | None = None
+    if action:
+        normalized = action.strip().lower()
+        if normalized in {"start", "stop", "restart", "status"}:
+            action_mode = normalized
+        else:
+            console.print("[red]Invalid action. Use: start, stop, restart, status[/red]")
+            raise typer.Exit(1)
+
+    selected_modes: list[str] = []
+    if daemon:
+        selected_modes.append("start")
+    if stop:
+        selected_modes.append("stop")
+    if restart:
+        selected_modes.append("restart")
+    if status:
+        selected_modes.append("status")
+    if action_mode:
+        selected_modes.append(action_mode)
+
+    resolved_modes = sorted(set(selected_modes))
+    if len(resolved_modes) > 1:
+        console.print("[red]Use one control mode only (start/stop/restart/status)[/red]")
+        raise typer.Exit(1)
+    mode = resolved_modes[0] if resolved_modes else None
+
+    if mode == "status":
+        running = _find_gateway_pids(port)
+        if not running:
+            console.print(f"[yellow]Gateway not running on port {port}[/yellow]")
+            return
+        console.print(f"[green]Gateway running[/green] on port {port} (pid {running[0]})")
+        console.print(f"Log: {_gateway_log_path()}")
+        return
+
+    if mode == "stop":
+        stopped = _stop_gateway_processes(port)
+        if stopped == 0:
+            console.print("[yellow]Gateway is not running[/yellow]")
+            return
+        console.print(f"[green]✓[/green] Gateway stopped ({stopped} process{'es' if stopped != 1 else ''})")
+        return
+
+    if mode == "restart":
+        import time
+
+        _stop_gateway_processes(port)
+        time.sleep(0.2)
+        if _find_gateway_pids(port):
+            console.print(f"[red]Gateway restart failed: port {port} is still in use[/red]")
+            raise typer.Exit(1)
+        _start_gateway_daemon(port, verbose)
+        return
+
+    if mode == "start":
+        _start_gateway_daemon(port, verbose)
+        return
+
+    _run_gateway_foreground(port, verbose)
 
 
 
@@ -542,53 +835,42 @@ def _bridge_port_from_config() -> int:
     return 3001
 
 
-def _pid_alive(pid: int) -> bool:
-    import os
-
+def _process_cwd(pid: int) -> Path | None:
+    proc_cwd = Path(f"/proc/{pid}/cwd")
     try:
-        os.kill(pid, 0)
-        return True
+        if proc_cwd.exists():
+            return proc_cwd.resolve()
     except OSError:
+        return None
+    return None
+
+
+def _is_bridge_dir(path: Path) -> bool:
+    package_json = path / "package.json"
+    if not package_json.exists():
         return False
-
-
-def _command_for_pid(pid: int) -> str:
-    import subprocess
-
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    try:
+        data = json.loads(package_json.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return data.get("name") == "nanobot-whatsapp-bridge"
 
 
 def _is_bridge_process(pid: int) -> bool:
     cmd = _command_for_pid(pid).lower()
     if not cmd:
         return False
-    if "dist/index.js" not in cmd:
-        return False
-    return "node" in cmd or "npm start" in cmd or "nanobot-whatsapp-bridge" in cmd
+    cwd = _process_cwd(pid)
+    if cwd and _is_bridge_dir(cwd):
+        return True
+    return "nanobot-whatsapp-bridge" in cmd
 
 
-def _find_bridge_pids(port: int) -> list[int]:
+def _listener_pids_for_port(port: int) -> set[int]:
     import shutil
     import subprocess
 
-    pids: set[int] = set()
-
-    pid_file = _bridge_pid_path()
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _pid_alive(pid):
-                pids.add(pid)
-        except ValueError:
-            pass
+    listener_pids: set[int] = set()
 
     if shutil.which("lsof"):
         result = subprocess.run(
@@ -603,33 +885,51 @@ def _find_bridge_pids(port: int) -> list[int]:
                 if not line:
                     continue
                 try:
-                    pids.add(int(line))
+                    pid = int(line)
+                    listener_pids.add(pid)
                 except ValueError:
                     continue
+    return listener_pids
 
-    # Fallback for environments where lsof is unavailable or bridge is booting.
-    if not pids and shutil.which("pgrep"):
-        result = subprocess.run(
-            ["pgrep", "-f", "node .*dist/index.js|npm start"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pids.add(int(line))
-                except ValueError:
-                    continue
 
-    return sorted(pid for pid in pids if _pid_alive(pid) and _is_bridge_process(pid))
+def _find_bridge_pids(port: int) -> list[int]:
+    pids: set[int] = set(_listener_pids_for_port(port))
+
+    pid_file = _bridge_pid_path()
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _pid_alive(pid) and (pid in pids or _is_bridge_process(pid)):
+                pids.add(pid)
+        except ValueError:
+            pass
+
+    return sorted(pid for pid in pids if _pid_alive(pid))
+
+
+def _signal_bridge_pid(pid: int, sig: int) -> None:
+    import os
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+
+    # Prefer process-group signaling so npm wrappers + child node both stop.
+    if pgid is not None and pgid > 0:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
 
 
 def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
-    import os
     import signal
     import time
 
@@ -640,25 +940,23 @@ def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
 
     stopped = 0
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            continue
+        _signal_bridge_pid(pid, signal.SIGTERM)
 
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         remaining = [pid for pid in pids if _pid_alive(pid)]
-        if not remaining:
+        listeners = _find_bridge_pids(port)
+        if not remaining and not listeners:
             stopped = len(pids)
             break
         time.sleep(0.2)
     else:
         remaining = [pid for pid in pids if _pid_alive(pid)]
         for pid in remaining:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            _signal_bridge_pid(pid, signal.SIGKILL)
+        # Final sweep for any remaining listener process on the bridge port.
+        for pid in _find_bridge_pids(port):
+            _signal_bridge_pid(pid, signal.SIGKILL)
         stopped = len(pids)
 
     _bridge_pid_path().unlink(missing_ok=True)
@@ -731,8 +1029,15 @@ def bridge_restart(
     port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
 ):
     """Restart WhatsApp bridge."""
+    import time
+
     resolved_port = _bridge_port_from_config() if port is None else port
     _stop_bridge_processes(resolved_port)
+    # Give OS/socket state a brief moment before re-check/start.
+    time.sleep(0.2)
+    if _find_bridge_pids(resolved_port):
+        console.print(f"[red]Bridge restart failed: port {resolved_port} is still in use[/red]")
+        raise typer.Exit(1)
     bridge_start(port=resolved_port)
 
 
