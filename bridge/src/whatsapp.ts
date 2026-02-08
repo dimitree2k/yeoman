@@ -19,7 +19,9 @@ const VERSION = '0.1.0';
 
 export interface InboundMessage {
   id: string;
+  chat: string;
   sender: string;
+  participant: string;
   pn: string;
   content: string;
   timestamp: number;
@@ -124,11 +126,24 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
         const mentionMeta = this.extractMentionMeta(msg);
+        const chatJid = this.normalizeJid(msg.key.remoteJid || '');
+        const participantJid = this.normalizeJid(
+          msg.key.participant ||
+          msg.participant ||
+          msg.message?.extendedTextMessage?.contextInfo?.participant ||
+          msg.key.remoteJidAlt ||
+          msg.key.remoteJid ||
+          ''
+        );
 
         this.options.onMessage({
           id: msg.key.id || '',
-          sender: msg.key.remoteJid || '',
-          pn: msg.key.remoteJidAlt || '',
+          // Keep sender as chat for backward compatibility with older Python handlers.
+          chat: chatJid,
+          sender: chatJid,
+          participant: participantJid,
+          // Keep pn as the human sender identity (legacy field consumed by Python).
+          pn: participantJid,
           content,
           timestamp: msg.messageTimestamp as number,
           isGroup,

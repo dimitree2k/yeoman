@@ -102,14 +102,20 @@ class WhatsAppChannel(BaseChannel):
             # Incoming message from WhatsApp
             # Deprecated by whatsapp: old phone number style typically: <phone>@s.whatspp.net
             pn = data.get("pn", "")
-            # New LID sytle typically:
+            # Bridge compatibility:
+            # - sender: legacy chat jid from older bridge payloads
+            # - chat: explicit chat/group jid (new payload)
+            # - participant: explicit human sender jid in group messages (new payload)
             sender = data.get("sender", "")
+            chat = data.get("chat", "") or sender
+            participant = data.get("participant", "")
             content = data.get("content", "")
 
-            # Extract just the phone number or lid as chat_id
-            user_id = pn if pn else sender
+            # Extract just the phone number or lid as sender_id.
+            # Prefer explicit participant (new bridge), then legacy pn.
+            user_id = participant if participant else (pn if pn else sender)
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info(f"Sender {sender}")
+            logger.info(f"Sender {sender_id} in chat {chat}")
 
             # Handle voice transcription if it's a voice message
             if content == "[Voice Message]":
@@ -118,12 +124,14 @@ class WhatsAppChannel(BaseChannel):
 
             await self._handle_message(
                 sender_id=sender_id,
-                chat_id=sender,  # Use full LID for replies
+                chat_id=chat,
                 content=content,
                 metadata={
                     "message_id": data.get("id"),
                     "timestamp": data.get("timestamp"),
                     "sender": sender,
+                    "chat": chat,
+                    "participant": participant,
                     "pn": pn,
                     "is_group": data.get("isGroup", False),
                     "mentioned_bot": data.get("mentionedBot", False),
