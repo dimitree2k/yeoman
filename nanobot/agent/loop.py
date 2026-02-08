@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -62,6 +63,7 @@ class AgentLoop:
         policy_engine: "PolicyEngine | None" = None,
         policy_middleware: "PolicyMiddleware | None" = None,
         policy_path: Path | None = None,
+        timing_logs_enabled: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -96,6 +98,7 @@ class AgentLoop:
         self.policy_engine = policy_engine
         self.policy: "PolicyMiddleware | None" = policy_middleware
         self.policy_path = policy_path
+        self.timing_logs_enabled = timing_logs_enabled
         self.policy_counters = {
             "dropped_by_access": 0,
             "dropped_by_reply": 0,
@@ -130,6 +133,15 @@ class AgentLoop:
         re.compile(r"\bweather\s+in\s+([^\n\?\.,;:!]+)", re.IGNORECASE),
         re.compile(r"\bin\s+([^\n\?\.,;:!]+)\s+(?:now|today|currently)\b", re.IGNORECASE),
         re.compile(r"\bfor\s+([^\n\?\.,;:!]+)\b", re.IGNORECASE),
+    )
+    _MODEL_QUERY_PATTERNS = (
+        re.compile(
+            r"(?:what|which)\s+model(?:\s+(?:are|r)\s+you(?:\s+using)?|\s+do\s+you\s+use)?[?!.]?",
+            re.IGNORECASE,
+        ),
+        re.compile(r"welches\s+modell(?:\s+(?:nutzt|verwendest)\s+du)?[?!.]?", re.IGNORECASE),
+        re.compile(r"welches\s+model(?:\s+(?:nutzt|verwendest)\s+du)?[?!.]?", re.IGNORECASE),
+        re.compile(r"mit\s+welchem\s+modell\s+(?:arbeitest|läufst)\s+du[?!.]?", re.IGNORECASE),
     )
 
     def _register_default_tools(self) -> None:
@@ -217,6 +229,29 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
+        total_started = time.perf_counter()
+        policy_ms = 0.0
+        context_ms = 0.0
+        llm_ms = 0.0
+        tools_ms = 0.0
+
+        def log_timing(iterations: int) -> None:
+            if not self.timing_logs_enabled:
+                return
+            total_ms = (time.perf_counter() - total_started) * 1000
+            logger.info(
+                "timing channel={} chat={} total_ms={:.1f} policy_ms={:.1f} "
+                "context_ms={:.1f} llm_ms={:.1f} tools_ms={:.1f} iterations={}",
+                msg.channel,
+                msg.chat_id,
+                total_ms,
+                policy_ms,
+                context_ms,
+                llm_ms,
+                tools_ms,
+                iterations,
+            )
+
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
 
@@ -224,15 +259,32 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
 
         # Policy evaluation (access/reply/tool/persona)
+        policy_started = time.perf_counter()
         policy_ctx = self._policy_context(msg)
+        policy_ms = (time.perf_counter() - policy_started) * 1000
         self._log_policy_decision(msg, policy_ctx)
         if not policy_ctx.decision.accept_message:
             self.policy_counters["dropped_by_access"] += 1
+            log_timing(iterations=0)
             return None
         if not policy_ctx.decision.should_respond:
             self.policy_counters["dropped_by_reply"] += 1
+            log_timing(iterations=0)
             return None
         persona_text = policy_ctx.persona_text
+
+        fast_model_info = self._try_fast_model_info(msg.content)
+        if fast_model_info is not None:
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_model_info[:120]}")
+            session.add_message("user", msg.content)
+            session.add_message("assistant", fast_model_info)
+            self.sessions.save(session)
+            log_timing(iterations=0)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=fast_model_info,
+            )
 
         # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
         # This remains policy-aware through capability gating.
@@ -244,6 +296,7 @@ class AgentLoop:
             session.add_message("user", msg.content)
             session.add_message("assistant", fast_weather)
             self.sessions.save(session)
+            log_timing(iterations=0)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -268,6 +321,7 @@ class AgentLoop:
             cron_tool.set_context(msg.channel, msg.chat_id)
 
         # Build initial messages (use get_history for LLM-formatted messages)
+        context_started = time.perf_counter()
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
@@ -276,6 +330,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        context_ms = (time.perf_counter() - context_started) * 1000
 
         # Agent loop
         iteration = 0
@@ -285,11 +340,13 @@ class AgentLoop:
             iteration += 1
 
             # Call LLM
+            llm_started = time.perf_counter()
             response = await self.provider.chat(
                 messages=messages,
                 tools=self._tool_definitions(policy_ctx.decision.allowed_tools),
                 model=self.model
             )
+            llm_ms += (time.perf_counter() - llm_started) * 1000
 
             # Handle tool calls
             if response.has_tool_calls:
@@ -313,11 +370,13 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    tool_started = time.perf_counter()
                     if not self._is_tool_allowed(tool_call.name, policy_ctx):
                         self.policy_counters["blocked_tool_call"] += 1
                         result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                     else:
                         result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    tools_ms += (time.perf_counter() - tool_started) * 1000
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -337,6 +396,7 @@ class AgentLoop:
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+        log_timing(iterations=iteration)
 
         return OutboundMessage(
             channel=msg.channel,
@@ -409,6 +469,15 @@ class AgentLoop:
             context.source,
             context.actor.sender_primary,
         )
+
+    def _try_fast_model_info(self, text: str) -> str | None:
+        """Return configured model for direct model-identity questions."""
+        normalized = " ".join(text.split()).strip().lower()
+        if not normalized:
+            return None
+        if any(pattern.fullmatch(normalized) for pattern in self._MODEL_QUERY_PATTERNS):
+            return f"Configured model: {self.model} (from ~/.nanobot/config.json)."
+        return None
 
     async def _try_fast_weather(self, text: str) -> str | None:
         """Handle simple current-weather prompts with one direct wttr.in request."""

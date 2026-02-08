@@ -246,6 +246,7 @@ def gateway(
             session_manager=session_manager,
             policy_engine=policy_engine,
             policy_path=policy_path,
+            timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
         )
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")
@@ -347,6 +348,7 @@ def agent(
             restrict_to_workspace=config.tools.restrict_to_workspace,
             policy_engine=policy_engine,
             policy_path=policy_path,
+            timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
         )
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")

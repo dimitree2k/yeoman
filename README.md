@@ -339,6 +339,22 @@ Config files:
 - Runtime/API config: `~/.nanobot/config.json`
 - Access/reply/tool/persona policy: `~/.nanobot/policy.json`
 
+### Agent Runtime Options (`config.json`)
+
+`agents.defaults.timingLogsEnabled` controls optional per-message timing summaries.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "timingLogsEnabled": false
+    }
+  }
+}
+```
+
+Default is `false` (no timing summary logs).
+
 ### Chat Policy (`policy.json`)
 
 `policy.json` controls four things per Telegram/WhatsApp DM or group:

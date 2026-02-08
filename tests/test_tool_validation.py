@@ -132,8 +132,14 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert iso.batch_session_idle_seconds == 600
     assert iso.max_containers == 5
     assert iso.pressure_policy == "preempt_oldest_active"
+    assert cfg.agents.defaults.timing_logs_enabled is False
 
     data = {
+        "agents": {
+            "defaults": {
+                "timingLogsEnabled": True,
+            }
+        },
         "tools": {
             "exec": {
                 "isolation": {
@@ -148,10 +154,12 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert loaded.tools.exec.isolation.enabled is True
     assert loaded.tools.exec.isolation.batch_session_idle_seconds == 123
     assert loaded.tools.exec.isolation.max_containers == 7
+    assert loaded.agents.defaults.timing_logs_enabled is True
 
     dumped = convert_to_camel(loaded.model_dump())
     assert dumped["tools"]["exec"]["isolation"]["batchSessionIdleSeconds"] == 123
     assert dumped["tools"]["exec"]["isolation"]["maxContainers"] == 7
+    assert dumped["agents"]["defaults"]["timingLogsEnabled"] is True
 
 
 def test_config_migration_for_legacy_isolation_keys() -> None:

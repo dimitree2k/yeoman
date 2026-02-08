@@ -60,6 +60,7 @@ class AgentDefaults(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
+    timing_logs_enabled: bool = False
 
 
 class AgentsConfig(BaseModel):
