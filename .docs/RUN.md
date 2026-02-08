@@ -11,7 +11,7 @@ This guide shows the fastest way to run this repository locally.
 ## 2. Clone and install
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
+git clone https://github.com/dimitree2k/nanobot.git
 cd nanobot
 uv sync
 ```
@@ -112,4 +112,3 @@ If you enable `tools.exec.isolation.enabled`, create this file first:
   "blockedHostPatterns": [".ssh", ".aws", ".env", "id_rsa", "id_ed25519"]
 }
 ```
-
