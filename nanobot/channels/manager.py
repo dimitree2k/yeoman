@@ -164,6 +164,28 @@ class ChannelManager:
             except asyncio.CancelledError:
                 break
 
+    async def set_typing(self, channel_name: str, chat_id: str, enabled: bool) -> None:
+        """Best-effort typing indicator dispatch to a specific channel."""
+        channel = self.channels.get(channel_name)
+        if channel is None:
+            return
+
+        method_name = "start_typing" if enabled else "stop_typing"
+        method = getattr(channel, method_name, None)
+        if not callable(method):
+            return
+
+        try:
+            await method(chat_id)
+        except Exception as e:
+            logger.debug(
+                "Failed to toggle typing channel={} chat={} enabled={}: {}",
+                channel_name,
+                chat_id,
+                enabled,
+                e,
+            )
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)

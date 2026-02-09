@@ -86,6 +86,7 @@ export interface PresenceUpdateInput {
 
 export interface WhatsAppClientOptions {
   authDir: string;
+  readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void;
   onQR: (qr: string) => void;
@@ -645,6 +646,13 @@ export class WhatsAppClient {
         const reply = this.extractReplyMeta(msg);
         const tsRaw = msg?.messageTimestamp;
         const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
+
+        if (this.options.readReceipts !== false) {
+          void this.sock.readMessages([msg.key]).catch((err: unknown) => {
+            this.lastError = safeErrorMessage(err);
+            this.options.onError(`read_receipt_failed: ${this.lastError}`);
+          });
+        }
 
         this.lastMessageAt = nowMs();
 

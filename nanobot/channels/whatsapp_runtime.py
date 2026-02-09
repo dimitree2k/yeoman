@@ -429,6 +429,7 @@ class WhatsAppRuntimeManager:
             env["BRIDGE_HOST"] = wa.bridge_host
             env["BRIDGE_TOKEN"] = token
             env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
+            env["WHATSAPP_READ_RECEIPTS"] = "1" if wa.read_receipts else "0"
             proc = subprocess.Popen(
                 ["node", "dist/index.js"],
                 cwd=bridge_dir,

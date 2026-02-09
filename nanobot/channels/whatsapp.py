@@ -241,6 +241,14 @@ class WhatsAppChannel(BaseChannel):
             timeout_seconds=20.0,
         )
 
+    async def start_typing(self, chat_id: str) -> None:
+        """Public typing API used by policy-aware orchestration."""
+        await self._start_typing(chat_id)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Public typing API used by policy-aware orchestration."""
+        await self._stop_typing(chat_id)
+
     async def _verify_bridge_health(self, token: str, timeout_seconds: float) -> None:
         response = await self._send_command(
             "health",
@@ -512,10 +520,6 @@ class WhatsAppChannel(BaseChannel):
         if text == "[Voice Message]":
             text = "[Voice Message: Transcription not available for WhatsApp yet]"
 
-        # Best-effort typing indicator while the agent is processing this message.
-        if self._should_start_typing(event):
-            await self._start_typing(event.chat_jid)
-
         await self._handle_message(
             sender_id=event.sender_id,
             chat_id=event.chat_jid,
@@ -539,13 +543,6 @@ class WhatsAppChannel(BaseChannel):
                 "media_kind": event.media_kind,
             },
         )
-
-    def _should_start_typing(self, event: InboundEvent) -> bool:
-        if not event.is_group:
-            return True
-        if event.mentioned_bot or event.reply_to_bot:
-            return True
-        return False
 
     async def _start_typing(self, chat_jid: str) -> None:
         if not chat_jid:

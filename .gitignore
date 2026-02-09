@@ -20,3 +20,4 @@ poetry.lock
 tests/
 .mypy_cache
 .ruff_cache
+node_modules/

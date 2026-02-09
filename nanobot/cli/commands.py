@@ -582,6 +582,7 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
         session_manager=session_manager,
         inbound_archive=inbound_archive,
     )
+    agent.set_typing_notifier(channels.set_typing)
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")

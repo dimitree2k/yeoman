@@ -8,7 +8,7 @@ import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
@@ -67,6 +67,7 @@ class AgentLoop:
         policy_path: Path | None = None,
         timing_logs_enabled: bool = False,
         inbound_archive: "InboundArchive | None" = None,
+        typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -103,6 +104,7 @@ class AgentLoop:
         self.policy_path = policy_path
         self.timing_logs_enabled = timing_logs_enabled
         self.inbound_archive = inbound_archive
+        self.typing_notifier = typing_notifier
         self.policy_counters = {
             "dropped_by_access": 0,
             "dropped_by_reply": 0,
@@ -125,6 +127,36 @@ class AgentLoop:
                 engine=self.policy_engine,
                 known_tools=tool_names,
                 policy_path=self.policy_path,
+            )
+
+    def set_typing_notifier(
+        self,
+        notifier: Callable[[str, str, bool], Awaitable[None]] | None,
+    ) -> None:
+        """Set or replace runtime typing notifier callback."""
+        self.typing_notifier = notifier
+
+    async def _set_typing(self, channel: str, chat_id: str, enabled: bool) -> None:
+        """Toggle typing indicator through channel manager callback."""
+        if self.typing_notifier is None:
+            return
+        if channel != "whatsapp":
+            return
+        try:
+            logger.debug(
+                "typing_request channel={} chat={} enabled={}",
+                channel,
+                chat_id,
+                enabled,
+            )
+            await self.typing_notifier(channel, chat_id, enabled)
+        except Exception as e:
+            logger.debug(
+                "typing_notifier failed channel={} chat={} enabled={}: {}",
+                channel,
+                chat_id,
+                enabled,
+                e,
             )
 
     _WEATHER_KEYWORDS = ("weather", "wetter", "temperature", "temp")
@@ -274,154 +306,161 @@ class AgentLoop:
             log_timing(iterations=0)
             return None
         persona_text = policy_ctx.persona_text
+        typing_started = False
+        await self._set_typing(msg.channel, msg.chat_id, True)
+        typing_started = True
 
-        fast_status = await self._try_fast_status(msg.content, msg, session, policy_ctx)
-        if fast_status is not None:
-            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_status[:120]}")
-            session.add_message("user", msg.content)
-            session.add_message("assistant", fast_status)
-            self.sessions.save(session)
-            log_timing(iterations=0)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=fast_status,
-            )
-
-        fast_model_info = self._try_fast_model_info(msg.content)
-        if fast_model_info is not None:
-            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_model_info[:120]}")
-            session.add_message("user", msg.content)
-            session.add_message("assistant", fast_model_info)
-            self.sessions.save(session)
-            log_timing(iterations=0)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=fast_model_info,
-            )
-
-        # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
-        # This remains policy-aware through capability gating.
-        fast_weather = None
-        if self._allow_internal_capability("weather_fastpath", policy_ctx):
-            fast_weather = await self._try_fast_weather(msg.content)
-        if fast_weather is not None:
-            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_weather[:120]}")
-            session.add_message("user", msg.content)
-            session.add_message("assistant", fast_weather)
-            self.sessions.save(session)
-            log_timing(iterations=0)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=fast_weather,
-            )
-
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-
-        exec_tool = self.tools.get("exec")
-        if isinstance(exec_tool, ExecTool):
-            exec_tool.set_session_context(msg.session_key)
-
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-
-        self._resolve_reply_context(msg)
-
-        # Build initial messages (use get_history for LLM-formatted messages)
-        context_started = time.perf_counter()
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=msg.content,
-            current_metadata=msg.metadata if msg.metadata else None,
-            persona_text=persona_text,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-        )
-        context_ms = (time.perf_counter() - context_started) * 1000
-
-        # Agent loop
-        iteration = 0
-        final_content = None
-
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            # Call LLM
-            llm_started = time.perf_counter()
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self._tool_definitions(policy_ctx.decision.allowed_tools),
-                model=self.model
-            )
-            self._record_usage(msg.session_key, response.usage)
-            llm_ms += (time.perf_counter() - llm_started) * 1000
-
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+        try:
+            fast_status = await self._try_fast_status(msg.content, msg, session, policy_ctx)
+            if fast_status is not None:
+                logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_status[:120]}")
+                session.add_message("user", msg.content)
+                session.add_message("assistant", fast_status)
+                self.sessions.save(session)
+                log_timing(iterations=0)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=fast_status,
                 )
 
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    tool_started = time.perf_counter()
-                    if not self._is_tool_allowed(tool_call.name, policy_ctx):
-                        self.policy_counters["blocked_tool_call"] += 1
-                        result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
-                    else:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    tools_ms += (time.perf_counter() - tool_started) * 1000
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+            fast_model_info = self._try_fast_model_info(msg.content)
+            if fast_model_info is not None:
+                logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_model_info[:120]}")
+                session.add_message("user", msg.content)
+                session.add_message("assistant", fast_model_info)
+                self.sessions.save(session)
+                log_timing(iterations=0)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=fast_model_info,
+                )
+
+            # Fast path: avoid slow multi-step tool chains for simple weather-now queries.
+            # This remains policy-aware through capability gating.
+            fast_weather = None
+            if self._allow_internal_capability("weather_fastpath", policy_ctx):
+                fast_weather = await self._try_fast_weather(msg.content)
+            if fast_weather is not None:
+                logger.info(f"Response to {msg.channel}:{msg.sender_id}: {fast_weather[:120]}")
+                session.add_message("user", msg.content)
+                session.add_message("assistant", fast_weather)
+                self.sessions.save(session)
+                log_timing(iterations=0)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=fast_weather,
+                )
+
+            # Update tool contexts
+            message_tool = self.tools.get("message")
+            if isinstance(message_tool, MessageTool):
+                message_tool.set_context(msg.channel, msg.chat_id)
+
+            spawn_tool = self.tools.get("spawn")
+            if isinstance(spawn_tool, SpawnTool):
+                spawn_tool.set_context(msg.channel, msg.chat_id)
+
+            exec_tool = self.tools.get("exec")
+            if isinstance(exec_tool, ExecTool):
+                exec_tool.set_session_context(msg.session_key)
+
+            cron_tool = self.tools.get("cron")
+            if isinstance(cron_tool, CronTool):
+                cron_tool.set_context(msg.channel, msg.chat_id)
+
+            self._resolve_reply_context(msg)
+
+            # Build initial messages (use get_history for LLM-formatted messages)
+            context_started = time.perf_counter()
+            messages = self.context.build_messages(
+                history=session.get_history(),
+                current_message=msg.content,
+                current_metadata=msg.metadata if msg.metadata else None,
+                persona_text=persona_text,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
+            context_ms = (time.perf_counter() - context_started) * 1000
+
+            # Agent loop
+            iteration = 0
+            final_content = None
+
+            while iteration < self.max_iterations:
+                iteration += 1
+
+                # Call LLM
+                llm_started = time.perf_counter()
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self._tool_definitions(policy_ctx.decision.allowed_tools),
+                    model=self.model
+                )
+                self._record_usage(msg.session_key, response.usage)
+                llm_ms += (time.perf_counter() - llm_started) * 1000
+
+                # Handle tool calls
+                if response.has_tool_calls:
+                    # Add assistant message with tool calls
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments)  # Must be JSON string
+                            }
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages = self.context.add_assistant_message(
+                        messages, response.content, tool_call_dicts
                     )
-            else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+                    # Execute tools
+                    for tool_call in response.tool_calls:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                        tool_started = time.perf_counter()
+                        if not self._is_tool_allowed(tool_call.name, policy_ctx):
+                            self.policy_counters["blocked_tool_call"] += 1
+                            result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
+                        else:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        tools_ms += (time.perf_counter() - tool_started) * 1000
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                else:
+                    # No tool calls, we're done
+                    final_content = response.content
+                    break
 
-        # Log response preview
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
 
-        # Save to session
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
-        self.sessions.save(session)
-        log_timing(iterations=iteration)
+            # Log response preview
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
 
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=final_content
-        )
+            # Save to session
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_content)
+            self.sessions.save(session)
+            log_timing(iterations=iteration)
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content
+            )
+        finally:
+            if typing_started:
+                await self._set_typing(msg.channel, msg.chat_id, False)
 
     def _policy_context(self, msg: InboundMessage) -> MessagePolicyContext:
         """Evaluate policy context for one message."""

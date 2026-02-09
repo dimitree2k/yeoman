@@ -20,6 +20,14 @@ function resolveLoopbackHost(value: string | undefined): string {
   throw new Error(`Invalid BRIDGE_HOST="${value}". Only loopback addresses are allowed.`);
 }
 
+function parseBoolEnv(value: string | undefined, fallback: boolean): boolean {
+  if (!value) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
 let HOST = '127.0.0.1';
 try {
@@ -31,6 +39,7 @@ try {
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
 const BRIDGE_TOKEN = (process.env.BRIDGE_TOKEN || '').trim();
 const MANIFEST_PATH = process.env.BRIDGE_MANIFEST_PATH || join(process.cwd(), 'bridge.manifest.json');
+const READ_RECEIPTS = parseBoolEnv(process.env.WHATSAPP_READ_RECEIPTS, true);
 
 function loadManifestIdentity(path: string): { bridgeVersion: string; buildId: string } {
   try {
@@ -61,6 +70,7 @@ const server = new BridgeServer(
   BRIDGE_TOKEN,
   identity.bridgeVersion,
   identity.buildId,
+  READ_RECEIPTS,
 );
 
 process.on('SIGINT', async () => {

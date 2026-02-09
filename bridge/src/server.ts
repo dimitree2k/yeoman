@@ -74,6 +74,7 @@ export class BridgeServer {
     private readonly token: string,
     private readonly bridgeVersion: string,
     private readonly buildId: string,
+    private readonly readReceipts: boolean,
     private readonly accountId = 'default',
   ) {}
 
@@ -88,6 +89,7 @@ export class BridgeServer {
 
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
+      readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => this.broadcastMessage(msg),
       onQR: (qr) =>
