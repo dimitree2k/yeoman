@@ -37,6 +37,9 @@ try {
   process.exit(1);
 }
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
+const MEDIA_DIR = process.env.MEDIA_DIR || join(homedir(), '.nanobot', 'media');
+const MEDIA_INCOMING_DIR = process.env.MEDIA_INCOMING_DIR || join(MEDIA_DIR, 'incoming', 'whatsapp');
+const MEDIA_OUTGOING_DIR = process.env.MEDIA_OUTGOING_DIR || join(MEDIA_DIR, 'outgoing', 'whatsapp');
 const BRIDGE_TOKEN = (process.env.BRIDGE_TOKEN || '').trim();
 const MANIFEST_PATH = process.env.BRIDGE_MANIFEST_PATH || join(process.cwd(), 'bridge.manifest.json');
 const READ_RECEIPTS = parseBoolEnv(process.env.WHATSAPP_READ_RECEIPTS, true);
@@ -61,12 +64,15 @@ if (!BRIDGE_TOKEN) {
 console.log('nanobot WhatsApp Bridge');
 console.log('=======================');
 console.log(`host=${HOST} port=${PORT} authDir=${AUTH_DIR}`);
+console.log(`mediaIncomingDir=${MEDIA_INCOMING_DIR} mediaOutgoingDir=${MEDIA_OUTGOING_DIR}`);
 
 const identity = loadManifestIdentity(MANIFEST_PATH);
 const server = new BridgeServer(
   HOST,
   PORT,
   AUTH_DIR,
+  MEDIA_INCOMING_DIR,
+  MEDIA_OUTGOING_DIR,
   BRIDGE_TOKEN,
   identity.bridgeVersion,
   identity.buildId,

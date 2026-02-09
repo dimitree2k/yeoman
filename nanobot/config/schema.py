@@ -4,8 +4,74 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
+
+from nanobot.config.defaults import (
+    DEFAULT_WHATSAPP_MEDIA,
+    default_model_profiles,
+    default_model_routes,
+)
+
+
+def _default_model_profiles() -> dict[str, "ModelProfile"]:
+    return {
+        name: ModelProfile.model_validate(payload)
+        for name, payload in default_model_profiles().items()
+    }
+
+
+class ModelProfile(BaseModel):
+    """One model profile used for a specific capability route."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["chat", "vision", "asr", "ocr", "video"]
+    model: str | None = None
+    provider: str | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    timeout_ms: int | None = None
+
+
+class ModelRoutingConfig(BaseModel):
+    """Capability-oriented model routing configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    profiles: dict[str, ModelProfile] = Field(default_factory=_default_model_profiles)
+    routes: dict[str, str] = Field(default_factory=default_model_routes)
+
+    @model_validator(mode="after")
+    def _validate_routes(self) -> "ModelRoutingConfig":
+        missing = sorted({name for name in self.routes.values() if name not in self.profiles})
+        if missing:
+            raise ValueError(
+                "models.routes references unknown profiles: " + ", ".join(missing)
+            )
+        return self
+
+
+class WhatsAppMediaConfig(BaseModel):
+    """WhatsApp media processing and retention settings."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_WHATSAPP_MEDIA["enabled"])
+    incoming_dir: str = str(DEFAULT_WHATSAPP_MEDIA["incoming_dir"])
+    outgoing_dir: str = str(DEFAULT_WHATSAPP_MEDIA["outgoing_dir"])
+    retention_days: int = int(DEFAULT_WHATSAPP_MEDIA["retention_days"])
+    describe_images: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_images"])
+    pass_image_to_assistant: bool = bool(DEFAULT_WHATSAPP_MEDIA["pass_image_to_assistant"])
+    max_image_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_image_bytes_mb"])
+
+    @property
+    def incoming_path(self) -> Path:
+        return Path(self.incoming_dir).expanduser()
+
+    @property
+    def outgoing_path(self) -> Path:
+        return Path(self.outgoing_dir).expanduser()
 
 
 class WhatsAppConfig(BaseModel):
@@ -31,6 +97,7 @@ class WhatsAppConfig(BaseModel):
     reconnect_jitter: float = 0.25
     reconnect_max_attempts: int = 0  # 0 means unlimited retries
     max_payload_bytes: int = 262144
+    media: WhatsAppMediaConfig = Field(default_factory=WhatsAppMediaConfig)
 
     @property
     def resolved_bridge_port(self) -> int:
@@ -203,6 +270,7 @@ class BusConfig(BaseModel):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     config_version: int = 2
+    models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)

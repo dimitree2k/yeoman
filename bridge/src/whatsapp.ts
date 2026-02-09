@@ -1,9 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
+import { extname, join } from 'path';
 
 import makeWASocket, {
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
@@ -23,6 +25,8 @@ export interface InboundMedia {
   kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
   mimeType?: string;
   fileName?: string;
+  path?: string;
+  bytes?: number;
 }
 
 export interface InboundMessageV2 {
@@ -86,6 +90,8 @@ export interface PresenceUpdateInput {
 
 export interface WhatsAppClientOptions {
   authDir: string;
+  mediaIncomingDir?: string;
+  mediaOutgoingDir?: string;
   readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void;
@@ -150,6 +156,37 @@ async function ensureAuthSecurity(authDir: string): Promise<void> {
       // Ignore stat/chmod races.
     }
   }
+}
+
+async function ensureDirPrivate(path: string): Promise<void> {
+  await fs.mkdir(path, { recursive: true, mode: 0o700 });
+  try {
+    const st = await fs.stat(path);
+    if ((st.mode & 0o077) !== 0) {
+      await fs.chmod(path, 0o700);
+    }
+  } catch {
+    // Ignore chmod failures on unsupported environments.
+  }
+}
+
+function mediaExtension(kind: InboundMedia['kind'], mimeType: string | undefined, fileName?: string): string {
+  const known = extname(String(fileName || '').trim()).toLowerCase();
+  if (known) return known;
+
+  const mime = String(mimeType || '').toLowerCase();
+  if (mime.includes('jpeg') || mime.includes('jpg')) return '.jpg';
+  if (mime.includes('png')) return '.png';
+  if (mime.includes('webp')) return '.webp';
+  if (mime.includes('gif')) return '.gif';
+  if (mime.includes('heic')) return '.heic';
+  if (mime.includes('bmp')) return '.bmp';
+  if (mime.includes('tiff')) return '.tiff';
+
+  if (kind === 'image') return '.jpg';
+  if (kind === 'video') return '.mp4';
+  if (kind === 'audio') return '.ogg';
+  return '.bin';
 }
 
 function mediaKindFromMime(mimeType: string | undefined): InboundMedia['kind'] {
@@ -239,8 +276,67 @@ export class WhatsAppClient {
     this.options = options;
   }
 
+  private get mediaIncomingDir(): string {
+    return this.options.mediaIncomingDir || join(process.cwd(), 'media', 'incoming', 'whatsapp');
+  }
+
+  private get mediaOutgoingDir(): string {
+    return this.options.mediaOutgoingDir || join(process.cwd(), 'media', 'outgoing', 'whatsapp');
+  }
+
+  private async ensureMediaDirs(): Promise<void> {
+    await ensureDirPrivate(this.mediaIncomingDir);
+    await ensureDirPrivate(this.mediaOutgoingDir);
+  }
+
+  private async persistInboundImage(msg: any, messageId: string, media: InboundMedia): Promise<InboundMedia> {
+    if (!this.sock || media.kind !== 'image') return media;
+
+    const now = new Date();
+    const yyyy = String(now.getUTCFullYear());
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const dayDir = join(this.mediaIncomingDir, yyyy, mm, dd);
+    await ensureDirPrivate(dayDir);
+
+    const ext = mediaExtension(media.kind, media.mimeType, media.fileName);
+    const filePath = join(dayDir, `${messageId}${ext}`);
+
+    const downloaded = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: pino({ level: 'silent' }),
+        reuploadRequest: this.sock.updateMediaMessage,
+      },
+    );
+
+    const downloadedAny: unknown = downloaded;
+    let buffer: Buffer | null = null;
+    if (Buffer.isBuffer(downloadedAny)) {
+      buffer = downloadedAny;
+    } else if (downloadedAny && typeof downloadedAny === 'object' && ArrayBuffer.isView(downloadedAny)) {
+      buffer = Buffer.from(downloadedAny as Uint8Array);
+    }
+    if (!buffer || buffer.length === 0) return media;
+
+    await fs.writeFile(filePath, buffer);
+    try {
+      await fs.chmod(filePath, 0o600);
+    } catch {
+      // Ignore chmod failures on unsupported environments.
+    }
+    return {
+      ...media,
+      path: filePath,
+      bytes: buffer.length,
+    };
+  }
+
   async start(): Promise<void> {
     if (this.running) return;
+    await this.ensureMediaDirs();
     this.running = true;
     this.loopTask = this.runLoop();
   }
@@ -641,6 +737,15 @@ export class WhatsAppClient {
 
         const extracted = this.extractMessageTextAndMedia(msg);
         if (!extracted.text) continue;
+        let inboundMedia = extracted.media;
+        if (inboundMedia?.kind === 'image') {
+          try {
+            inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
+          } catch (err) {
+            this.lastError = safeErrorMessage(err);
+            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+          }
+        }
 
         const mention = this.extractMentionMeta(msg, extracted.text);
         const reply = this.extractReplyMeta(msg);
@@ -670,7 +775,7 @@ export class WhatsAppClient {
           replyToMessageId: reply.replyToMessageId,
           replyToParticipantJid: reply.replyToParticipantJid,
           replyToText: reply.replyToText,
-          media: extracted.media,
+          media: inboundMedia,
         });
       }
     });

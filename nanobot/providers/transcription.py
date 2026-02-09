@@ -14,9 +14,17 @@ class GroqTranscriptionProvider:
     Groq offers extremely fast transcription with a generous free tier.
     """
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        model: str = "whisper-large-v3",
+        timeout_seconds: float = 60.0,
+    ):
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
         self.api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        self.model = model
+        self.timeout_seconds = timeout_seconds
 
     async def transcribe(self, file_path: str | Path) -> str:
         """
@@ -42,7 +50,7 @@ class GroqTranscriptionProvider:
                 with open(path, "rb") as f:
                     files = {
                         "file": (path.name, f),
-                        "model": (None, "whisper-large-v3"),
+                        "model": (None, self.model),
                     }
                     headers = {
                         "Authorization": f"Bearer {self.api_key}",
@@ -52,7 +60,7 @@ class GroqTranscriptionProvider:
                         self.api_url,
                         headers=headers,
                         files=files,
-                        timeout=60.0
+                        timeout=self.timeout_seconds
                     )
 
                     response.raise_for_status()

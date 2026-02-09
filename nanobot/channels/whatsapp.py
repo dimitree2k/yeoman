@@ -7,7 +7,7 @@ import contextlib
 import json
 import random
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -17,8 +17,13 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from nanobot.config.schema import WhatsAppConfig
+from nanobot.media.asr import ASRTranscriber
+from nanobot.media.storage import MediaStorage
+from nanobot.media.vision import VisionDescriber
 
 if TYPE_CHECKING:
+    from nanobot.media.router import ModelRouter
+    from nanobot.providers.factory import ProviderFactory
     from nanobot.storage.inbound_archive import InboundArchive
 
 PROTOCOL_VERSION = 2
@@ -58,6 +63,9 @@ class InboundEvent:
     reply_to_text: str | None
     media_kind: str | None
     media_type: str | None
+    media_path: str | None
+    media_bytes: int | None
+    media_description: str | None
 
 
 class WhatsAppChannel(BaseChannel):
@@ -70,13 +78,27 @@ class WhatsAppChannel(BaseChannel):
         config: WhatsAppConfig,
         bus: MessageBus,
         inbound_archive: "InboundArchive | None" = None,
+        model_router: "ModelRouter | None" = None,
+        media_storage: MediaStorage | None = None,
+        provider_factory: "ProviderFactory | None" = None,
+        groq_api_key: str | None = None,
     ):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
         self.inbound_archive = inbound_archive
+        self._model_router = model_router
+        self._media_storage = media_storage or MediaStorage(
+            incoming_dir=self.config.media.incoming_path,
+            outgoing_dir=self.config.media.outgoing_path,
+        )
+        self._vision_describer = (
+            VisionDescriber(provider_factory) if provider_factory is not None else None
+        )
+        self._asr_transcriber = ASRTranscriber(groq_api_key=groq_api_key)
         self._ws: Any | None = None
         self._connected = False
         self._reader_task: asyncio.Task[None] | None = None
+        self._media_cleanup_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
@@ -120,6 +142,9 @@ class WhatsAppChannel(BaseChannel):
             logger.error(f"WhatsApp runtime preparation failed: {e}")
             self._running = False
             return
+        await self._run_media_cleanup_once()
+        if self.config.media.enabled:
+            self._media_cleanup_task = asyncio.create_task(self._media_cleanup_loop())
 
         while self._running:
             try:
@@ -221,6 +246,11 @@ class WhatsAppChannel(BaseChannel):
         if self._ws:
             await self._ws.close()
             self._ws = None
+        if self._media_cleanup_task:
+            self._media_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._media_cleanup_task
+            self._media_cleanup_task = None
 
         self._fail_pending("Channel stopped")
 
@@ -363,6 +393,13 @@ class WhatsAppChannel(BaseChannel):
             if isinstance(media, dict) and media.get("mimeType")
             else None
         )
+        media_path = (
+            str(media.get("path")).strip()
+            if isinstance(media, dict) and isinstance(media.get("path"), str)
+            else ""
+        )
+        media_bytes_raw = media.get("bytes") if isinstance(media, dict) else None
+        media_bytes = int(media_bytes_raw) if isinstance(media_bytes_raw, (int, float)) else None
 
         reply_to_message_id = str(payload.get("replyToMessageId") or "").strip() or None
         reply_to_participant = str(payload.get("replyToParticipantJid") or "").strip() or None
@@ -397,12 +434,16 @@ class WhatsAppChannel(BaseChannel):
             reply_to_text=reply_to_text,
             media_kind=media_kind,
             media_type=media_type,
+            media_path=media_path or None,
+            media_bytes=media_bytes,
+            media_description=None,
         )
 
     async def _ingest_inbound_event(self, event: InboundEvent) -> None:
         if self._is_duplicate(event.chat_jid, event.message_id):
             return
 
+        event = await self._enrich_media_event(event)
         self._archive_inbound_event(event)
 
         if self.config.debounce_ms <= 0 or event.media_kind is not None:
@@ -483,6 +524,9 @@ class WhatsAppChannel(BaseChannel):
             reply_to_text=reply_to_text,
             media_kind=last.media_kind,
             media_type=last.media_type,
+            media_path=last.media_path,
+            media_bytes=last.media_bytes,
+            media_description=last.media_description,
         )
 
         await self._publish_event(merged)
@@ -515,15 +559,103 @@ class WhatsAppChannel(BaseChannel):
         except Exception as e:
             logger.warning(f"Failed to archive inbound WhatsApp message {event.message_id}: {e}")
 
+    async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
+        if (
+            not self.config.media.enabled
+            or not self.config.media.describe_images
+            or event.media_kind != "image"
+            or not event.media_path
+            or self._vision_describer is None
+            or self._model_router is None
+        ):
+            return event
+
+        validated_path = self._media_storage.validate_incoming_path(event.media_path)
+        if validated_path is None:
+            logger.warning(
+                "Skipping WhatsApp image description due to invalid media path: {}",
+                event.media_path,
+            )
+            return event
+        try:
+            size_bytes = validated_path.stat().st_size
+        except OSError:
+            return event
+        max_bytes = max(1, int(self.config.media.max_image_bytes_mb)) * 1024 * 1024
+        if size_bytes > max_bytes:
+            logger.info(
+                "Skipping WhatsApp image description due to size limit: path={} bytes={} limit={}",
+                validated_path,
+                size_bytes,
+                max_bytes,
+            )
+            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+        try:
+            profile = self._model_router.resolve("vision.describe_image", channel=self.name)
+        except KeyError as e:
+            logger.warning(f"Skipping WhatsApp image description due to missing route: {e}")
+            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+        try:
+            description = await self._vision_describer.describe(validated_path, profile)
+        except Exception as e:
+            logger.warning("WhatsApp image description failed {}: {}", e.__class__.__name__, e)
+            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+        if not description:
+            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+        if "[image_description]" in event.text:
+            enriched_text = event.text
+        else:
+            enriched_text = f"{event.text}\n[image_description] {description}"
+        return replace(
+            event,
+            text=enriched_text,
+            media_path=str(validated_path),
+            media_bytes=size_bytes,
+            media_description=description,
+        )
+
+    async def _run_media_cleanup_once(self) -> None:
+        if not self.config.media.enabled:
+            return
+        try:
+            deleted = await asyncio.to_thread(
+                self._media_storage.cleanup_expired,
+                self.name,
+                self.config.media.retention_days,
+            )
+            if deleted > 0:
+                logger.info(
+                    "WhatsApp media cleanup removed {} files (retention={}d)",
+                    deleted,
+                    self.config.media.retention_days,
+                )
+        except Exception as e:
+            logger.warning("WhatsApp media cleanup failed {}: {}", e.__class__.__name__, e)
+
+    async def _media_cleanup_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(3600)
+                await self._run_media_cleanup_once()
+            except asyncio.CancelledError:
+                break
+
     async def _publish_event(self, event: InboundEvent) -> None:
         text = event.text
         if text == "[Voice Message]":
             text = "[Voice Message: Transcription not available for WhatsApp yet]"
+        media_for_assistant: list[str] = []
+        if self.config.media.pass_image_to_assistant and event.media_path and event.media_kind == "image":
+            media_for_assistant = [event.media_path]
 
         await self._handle_message(
             sender_id=event.sender_id,
             chat_id=event.chat_jid,
             content=text,
+            media=media_for_assistant,
             metadata={
                 "message_id": event.message_id,
                 "timestamp": event.timestamp,
@@ -538,9 +670,11 @@ class WhatsAppChannel(BaseChannel):
                 "reply_to_participant": event.reply_to_participant,
                 "reply_to_text": event.reply_to_text,
                 "mentioned_jids": event.mentioned_jids,
-                "media_path": None,
+                "media_path": event.media_path,
+                "media_bytes": event.media_bytes,
                 "media_type": event.media_type,
                 "media_kind": event.media_kind,
+                "media_description": event.media_description,
             },
         )
 

@@ -12,6 +12,9 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
 
 if TYPE_CHECKING:
+    from nanobot.media.router import ModelRouter
+    from nanobot.media.storage import MediaStorage
+    from nanobot.providers.factory import ProviderFactory
     from nanobot.session.manager import SessionManager
     from nanobot.storage.inbound_archive import InboundArchive
 
@@ -32,11 +35,17 @@ class ChannelManager:
         bus: MessageBus,
         session_manager: "SessionManager | None" = None,
         inbound_archive: "InboundArchive | None" = None,
+        model_router: "ModelRouter | None" = None,
+        media_storage: "MediaStorage | None" = None,
+        provider_factory: "ProviderFactory | None" = None,
     ):
         self.config = config
         self.bus = bus
         self.session_manager = session_manager
         self.inbound_archive = inbound_archive
+        self.model_router = model_router
+        self.media_storage = media_storage
+        self.provider_factory = provider_factory
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -67,6 +76,10 @@ class ChannelManager:
                     self.config.channels.whatsapp,
                     self.bus,
                     inbound_archive=self.inbound_archive,
+                    model_router=self.model_router,
+                    media_storage=self.media_storage,
+                    provider_factory=self.provider_factory,
+                    groq_api_key=self.config.providers.groq.api_key or None,
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:

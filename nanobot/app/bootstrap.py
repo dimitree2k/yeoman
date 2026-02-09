@@ -29,6 +29,9 @@ from nanobot.core.orchestrator import Orchestrator
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob
 from nanobot.heartbeat.service import HeartbeatService
+from nanobot.media.router import ModelRouter
+from nanobot.media.storage import MediaStorage
+from nanobot.providers.factory import ProviderFactory
 from nanobot.session.manager import SessionManager
 from nanobot.storage.inbound_archive import InboundArchive
 
@@ -178,12 +181,26 @@ def build_gateway_runtime(
         retention_days=30,
     )
     inbound_archive.purge_older_than(days=30)
+    model_router = ModelRouter(config.models)
+    media_storage = MediaStorage(
+        incoming_dir=config.channels.whatsapp.media.incoming_path,
+        outgoing_dir=config.channels.whatsapp.media.outgoing_path,
+    )
+    provider_factory = ProviderFactory(config=config)
+
+    assistant_model = config.agents.defaults.model
+    try:
+        assistant_profile = model_router.resolve("assistant.reply")
+        if assistant_profile.model:
+            assistant_model = assistant_profile.model
+    except KeyError:
+        pass
 
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
         bus=bus,
-        model=config.agents.defaults.model,
+        model=assistant_model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
@@ -203,6 +220,9 @@ def build_gateway_runtime(
         bus,
         session_manager=session_manager,
         inbound_archive=inbound_archive,
+        model_router=model_router,
+        media_storage=media_storage,
+        provider_factory=provider_factory,
     )
 
     telemetry = InMemoryTelemetry()

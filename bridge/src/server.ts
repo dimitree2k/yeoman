@@ -71,6 +71,8 @@ export class BridgeServer {
     private readonly host: string,
     private readonly port: number,
     private readonly authDir: string,
+    private readonly mediaIncomingDir: string,
+    private readonly mediaOutgoingDir: string,
     private readonly token: string,
     private readonly bridgeVersion: string,
     private readonly buildId: string,
@@ -89,6 +91,8 @@ export class BridgeServer {
 
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
+      mediaIncomingDir: this.mediaIncomingDir,
+      mediaOutgoingDir: this.mediaOutgoingDir,
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => this.broadcastMessage(msg),

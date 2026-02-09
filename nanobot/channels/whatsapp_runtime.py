@@ -430,6 +430,14 @@ class WhatsAppRuntimeManager:
             env["BRIDGE_TOKEN"] = token
             env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
             env["WHATSAPP_READ_RECEIPTS"] = "1" if wa.read_receipts else "0"
+            incoming_media = wa.media.incoming_path.expanduser().resolve()
+            outgoing_media = wa.media.outgoing_path.expanduser().resolve()
+            media_root = Path(
+                os.path.commonpath([str(incoming_media), str(outgoing_media)])
+            )
+            env["MEDIA_DIR"] = str(media_root)
+            env["MEDIA_INCOMING_DIR"] = str(incoming_media)
+            env["MEDIA_OUTGOING_DIR"] = str(outgoing_media)
             proc = subprocess.Popen(
                 ["node", "dist/index.js"],
                 cwd=bridge_dir,

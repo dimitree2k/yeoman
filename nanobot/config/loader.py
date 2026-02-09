@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from nanobot.config.defaults import apply_missing_defaults
 from nanobot.config.schema import Config
 
 CONFIG_VERSION = 2
@@ -167,6 +168,7 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
             whatsapp_cfg.get("max_payload_bytes", 262144),
         )
 
+    apply_missing_defaults(snake)
     snake["config_version"] = CONFIG_VERSION
 
     migrated = convert_to_camel(snake)
