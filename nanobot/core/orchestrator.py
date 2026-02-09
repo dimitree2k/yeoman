@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from typing import Awaitable, Callable
 
 from nanobot.core.intents import (
     OrchestratorIntent,
@@ -26,10 +27,12 @@ class Orchestrator:
         responder: ResponderPort,
         reply_archive: ReplyArchivePort | None = None,
         dedupe_ttl_seconds: int = 20 * 60,
+        typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ) -> None:
         self._policy = policy
         self._responder = responder
         self._reply_archive = reply_archive
+        self._typing_notifier = typing_notifier
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -88,13 +91,16 @@ class Orchestrator:
         typing_started = False
         try:
             if event.channel == "whatsapp":
-                intents.append(
-                    SetTypingIntent(
-                        channel=event.channel,
-                        chat_id=event.chat_id,
-                        enabled=True,
+                if self._typing_notifier is None:
+                    intents.append(
+                        SetTypingIntent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            enabled=True,
+                        )
                     )
-                )
+                else:
+                    await self._typing_notifier(event.channel, event.chat_id, True)
                 typing_started = True
 
             reply = await self._responder.generate_reply(event, decision)
@@ -137,13 +143,16 @@ class Orchestrator:
             return intents
         finally:
             if typing_started:
-                intents.append(
-                    SetTypingIntent(
-                        channel=event.channel,
-                        chat_id=event.chat_id,
-                        enabled=False,
+                if self._typing_notifier is None:
+                    intents.append(
+                        SetTypingIntent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            enabled=False,
+                        )
                     )
-                )
+                else:
+                    await self._typing_notifier(event.channel, event.chat_id, False)
 
     def _dedupe_key(self, event: InboundEvent) -> str | None:
         if not event.message_id:

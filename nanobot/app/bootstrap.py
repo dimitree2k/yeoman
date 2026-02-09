@@ -197,11 +197,22 @@ def build_gateway_runtime(
         known_tools=set(responder.tool_names),
         policy_path=policy_path,
     )
+
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        inbound_archive=inbound_archive,
+    )
+
+    telemetry = InMemoryTelemetry()
+    typing_adapter = ChannelManagerTypingAdapter(channels)
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
         policy=policy_adapter,
         responder=responder,
         reply_archive=archive_adapter,
+        typing_notifier=typing_adapter,
     )
 
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -241,15 +252,6 @@ def build_gateway_runtime(
         enabled=True,
     )
 
-    channels = ChannelManager(
-        config,
-        bus,
-        session_manager=session_manager,
-        inbound_archive=inbound_archive,
-    )
-
-    telemetry = InMemoryTelemetry()
-    typing_adapter = ChannelManagerTypingAdapter(channels)
     orchestrator_service = OrchestratorService(
         bus=bus,
         orchestrator=orchestrator,
