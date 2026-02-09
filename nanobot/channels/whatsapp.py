@@ -137,7 +137,12 @@ class WhatsAppChannel(BaseChannel):
 
         self._running = True
         try:
-            await asyncio.to_thread(self._runtime.ensure_runtime)
+            await asyncio.to_thread(
+                self._runtime.ensure_ready,
+                auto_repair=self.config.bridge_auto_repair,
+                start_if_needed=True,
+                timeout_s=startup_timeout_s,
+            )
         except Exception as e:
             logger.error(f"WhatsApp runtime preparation failed: {e}")
             self._running = False

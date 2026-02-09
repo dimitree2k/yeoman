@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from telegram import BotCommand, Update
 from telegram.constants import MessageEntityType
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from nanobot.bus.events import OutboundMessage
@@ -165,7 +166,9 @@ class TelegramChannel(BaseChannel):
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=True,  # Ignore old messages on startup
+            bootstrap_retries=3,
+            error_callback=self._on_polling_error,
         )
 
         # Keep running until stopped
@@ -437,3 +440,17 @@ class TelegramChannel(BaseChannel):
 
         type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
         return type_map.get(media_type, "")
+
+    def _on_polling_error(self, error: TelegramError) -> None:
+        """Handle polling loop errors without noisy stack traces."""
+        if isinstance(error, RetryAfter):
+            logger.warning(f"Telegram rate limited; retrying after {error.retry_after}s")
+            return
+        if isinstance(error, (TimedOut, NetworkError)):
+            logger.warning(
+                "Telegram polling transient network error {}: {}",
+                error.__class__.__name__,
+                error,
+            )
+            return
+        logger.error("Telegram polling error {}: {}", error.__class__.__name__, error)
