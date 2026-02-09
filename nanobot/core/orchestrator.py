@@ -107,9 +107,17 @@ class Orchestrator:
                 )
                 return intents
 
+            outbound_channel = event.channel
+            outbound_chat_id = event.chat_id
+            if event.channel == "system" and ":" in event.chat_id:
+                route_channel, route_chat_id = event.chat_id.split(":", 1)
+                if route_channel and route_chat_id:
+                    outbound_channel = route_channel
+                    outbound_chat_id = route_chat_id
+
             outbound = OutboundEvent(
-                channel=event.channel,
-                chat_id=event.chat_id,
+                channel=outbound_channel,
+                chat_id=outbound_chat_id,
                 content=reply,
             )
             intents.append(SendOutboundIntent(event=outbound))

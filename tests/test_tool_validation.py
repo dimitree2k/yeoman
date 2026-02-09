@@ -8,7 +8,8 @@ from typing import Any
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
+from nanobot.adapters.responder_llm import LLMResponder
+from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.exec_isolation import (
     CommandResult,
     ExecSandboxManager,
@@ -16,10 +17,9 @@ from nanobot.agent.tools.exec_isolation import (
     SandboxPreemptedError,
     SandboxTimeoutError,
 )
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.bus.queue import MessageBus
-from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.loader import _migrate_config, convert_keys, convert_to_camel
 from nanobot.config.schema import Config, ExecToolConfig
 from nanobot.providers.base import LLMProvider, LLMResponse
@@ -206,7 +206,7 @@ async def test_isolation_forces_workspace_restriction(tmp_path: Path) -> None:
     exec_cfg.isolation.force_workspace_restriction = True
     exec_cfg.isolation.fail_closed = False
 
-    loop = AgentLoop(
+    responder = LLMResponder(
         bus=MessageBus(),
         provider=DummyProvider(),
         workspace=workspace,
@@ -214,14 +214,14 @@ async def test_isolation_forces_workspace_restriction(tmp_path: Path) -> None:
         restrict_to_workspace=False,
     )
 
-    assert loop.effective_restrict_to_workspace is True
+    assert responder.effective_restrict_to_workspace is True
 
-    read_tool = loop.tools.get("read_file")
+    read_tool = responder.tools.get("read_file")
     assert read_tool is not None
     result = await read_tool.execute(str(outside))
     assert "outside allowed directory" in result
 
-    loop.stop()
+    await responder.aclose()
 
 
 class FakeSandboxSession:

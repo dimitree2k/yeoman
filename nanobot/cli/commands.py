@@ -171,11 +171,8 @@ def _make_provider(config):
 
 def _make_policy_engine(config):
     """Create policy engine + path from ~/.nanobot/policy.json."""
-    from nanobot.config.loader import get_config_path
     from nanobot.policy.engine import PolicyEngine
-    from nanobot.policy.loader import get_policy_path, load_policy, warn_legacy_allow_from
-
-    warn_legacy_allow_from(get_config_path())
+    from nanobot.policy.loader import get_policy_path, load_policy
     try:
         policy_path = get_policy_path()
         policy = load_policy(policy_path)
@@ -632,7 +629,7 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
-    from nanobot.agent.loop import AgentLoop
+    from nanobot.adapters.responder_llm import LLMResponder
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
 
@@ -643,31 +640,27 @@ def agent(
         outbound_maxsize=config.bus.outbound_maxsize,
     )
     provider = _make_provider(config)
-    policy_engine, policy_path = _make_policy_engine(config)
-
-    try:
-        agent_loop = AgentLoop(
-            bus=bus,
-            provider=provider,
-            workspace=config.workspace_path,
-            brave_api_key=config.tools.web.search.api_key or None,
-            exec_config=config.tools.exec,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            policy_engine=policy_engine,
-            policy_path=policy_path,
-            timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
-        )
-    except ValueError as e:
-        console.print(f"[red]Policy validation error:[/red] {e}")
-        raise typer.Exit(1)
+    responder = LLMResponder(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+    )
 
     if message:
         # Single message mode
         async def run_once():
-            response = await agent_loop.process_direct(message, session_id)
+            response = await responder.process_direct(message, session_key=session_id)
             console.print(f"\n{__logo__} {response}")
 
-        asyncio.run(run_once())
+        try:
+            asyncio.run(run_once())
+        finally:
+            responder.close()
     else:
         # Interactive mode
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
@@ -679,13 +672,16 @@ def agent(
                     if not user_input.strip():
                         continue
 
-                    response = await agent_loop.process_direct(user_input, session_id)
+                    response = await responder.process_direct(user_input, session_key=session_id)
                     console.print(f"\n{__logo__} {response}\n")
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
                     break
 
-        asyncio.run(run_interactive())
+        try:
+            asyncio.run(run_interactive())
+        finally:
+            responder.close()
 
 
 # ============================================================================
@@ -1203,19 +1199,18 @@ def policy_explain(
     reply_to_bot: bool = typer.Option(False, "--reply-to-bot", help="Message is a reply to bot"),
 ):
     """Explain merged policy + decision for one actor/chat."""
+    from nanobot.adapters.policy_engine import EnginePolicyAdapter
     from nanobot.config.loader import load_config
-    from nanobot.policy.middleware import PolicyMiddleware
 
     config = load_config()
     policy_engine, policy_path = _make_policy_engine(config)
-    policy_engine.validate(_policy_known_tools())
-    middleware = PolicyMiddleware(
+    policy_adapter = EnginePolicyAdapter(
         engine=policy_engine,
         known_tools=_policy_known_tools(),
         policy_path=policy_path,
         reload_on_change=False,
     )
-    report = middleware.explain(
+    report = policy_adapter.explain(
         channel=channel,
         chat_id=chat_id,
         sender_id=sender_id,
@@ -1224,52 +1219,6 @@ def policy_explain(
         reply_to_bot=reply_to_bot,
     )
     console.print_json(json.dumps(report, ensure_ascii=False, indent=2))
-
-
-@policy_app.command("migrate-allowfrom")
-def policy_migrate_allowfrom(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show migration result without writing policy.json"),
-):
-    """Migrate legacy channels.*.allowFrom into policy defaults."""
-    import shutil
-
-    from nanobot.config.loader import get_config_path
-    from nanobot.policy.loader import (
-        get_policy_path,
-        load_legacy_allow_from,
-        load_policy,
-        migrate_allow_from,
-        save_policy,
-    )
-
-    config_path = get_config_path()
-    policy_path = get_policy_path()
-    legacy_allow_from = load_legacy_allow_from(config_path)
-    policy = load_policy(policy_path)
-    migrated, notes, changed = migrate_allow_from(policy, legacy_allow_from)
-
-    if notes:
-        console.print("Migration notes:")
-        for note in notes:
-            console.print(f"- {note}")
-    else:
-        console.print("No legacy allowFrom entries found.")
-
-    if not changed:
-        return
-
-    if dry_run:
-        console.print("[yellow]Dry run only. No files were changed.[/yellow]")
-        return
-
-    if policy_path.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = policy_path.with_name(f"{policy_path.name}.bak-{stamp}")
-        shutil.copy2(policy_path, backup_path)
-        console.print(f"[green]✓[/green] Backup written: {backup_path}")
-
-    save_policy(migrated, policy_path)
-    console.print(f"[green]✓[/green] Updated policy: {policy_path}")
 
 
 @policy_app.command("annotate-whatsapp-comments")

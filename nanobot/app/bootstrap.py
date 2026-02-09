@@ -9,12 +9,11 @@ from typing import TYPE_CHECKING, assert_never
 
 from loguru import logger
 
-from nanobot.adapters.policy_legacy import LegacyPolicyAdapter
+from nanobot.adapters.policy_engine import EnginePolicyAdapter
 from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
-from nanobot.adapters.responder_legacy import LegacyResponderAdapter
+from nanobot.adapters.responder_llm import LLMResponder
 from nanobot.adapters.telemetry import InMemoryTelemetry
 from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
-from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.manager import ChannelManager
@@ -125,7 +124,7 @@ class OrchestratorService:
                         )
                     )
                 case PersistSessionIntent():
-                    # Persistence remains delegated to legacy responder path.
+                    # Sessions are persisted by the responder implementation.
                     continue
                 case RecordMetricIntent():
                     self._telemetry.incr(intent.name, intent.value, intent.labels)
@@ -142,6 +141,7 @@ class GatewayRuntime:
     cron: CronService
     heartbeat: HeartbeatService
     inbound_archive: InboundArchive
+    responder: LLMResponder
 
     async def run(self) -> None:
         try:
@@ -156,6 +156,7 @@ class GatewayRuntime:
             self.cron.stop()
             self.orchestrator.stop()
             await self.channels.stop_all()
+            await self.responder.aclose()
             self.inbound_archive.close()
 
 
@@ -170,7 +171,6 @@ def build_gateway_runtime(
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
     from nanobot.config.loader import get_data_dir
-    from nanobot.policy.middleware import PolicyMiddleware
 
     session_manager = SessionManager(workspace)
     inbound_archive = InboundArchive(
@@ -179,32 +179,28 @@ def build_gateway_runtime(
     )
     inbound_archive.purge_older_than(days=30)
 
-    # Legacy execution engine is retained as an adapter for LLM/tools while
-    # orchestration, typing, and reply-context lifecycle are owned by vNext.
-    legacy_agent = AgentLoop(
-        bus=bus,
+    responder = LLMResponder(
         provider=provider,
         workspace=workspace,
+        bus=bus,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
-        policy_engine=policy_engine,
-        policy_path=policy_path,
-        timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
-        inbound_archive=None,
-        typing_notifier=None,
     )
-
-    policy_middleware: PolicyMiddleware | None = legacy_agent.policy
-    policy_adapter = LegacyPolicyAdapter(policy_middleware)
-    responder_adapter = LegacyResponderAdapter(legacy_agent)
+    if policy_engine is not None:
+        policy_engine.validate(set(responder.tool_names))
+    policy_adapter = EnginePolicyAdapter(
+        engine=policy_engine,
+        known_tools=set(responder.tool_names),
+        policy_path=policy_path,
+    )
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
         policy=policy_adapter,
-        responder=responder_adapter,
+        responder=responder,
         reply_archive=archive_adapter,
     )
 
@@ -212,7 +208,7 @@ def build_gateway_runtime(
     cron = CronService(cron_store_path)
 
     async def on_cron_job(job: CronJob) -> str | None:
-        response = await legacy_agent.process_direct(
+        response = await responder.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
@@ -231,7 +227,12 @@ def build_gateway_runtime(
     cron.on_job = on_cron_job
 
     async def on_heartbeat(prompt: str) -> str:
-        return await legacy_agent.process_direct(prompt, session_key="heartbeat")
+        return await responder.process_direct(
+            prompt,
+            session_key="heartbeat",
+            channel="heartbeat",
+            chat_id="direct",
+        )
 
     heartbeat = HeartbeatService(
         workspace=workspace,
@@ -262,4 +263,5 @@ def build_gateway_runtime(
         cron=cron,
         heartbeat=heartbeat,
         inbound_archive=inbound_archive,
+        responder=responder,
     )
