@@ -77,6 +77,13 @@ export interface ReactInput {
   fromMe?: boolean;
 }
 
+export type PresenceState = 'available' | 'unavailable' | 'composing' | 'paused' | 'recording';
+
+export interface PresenceUpdateInput {
+  state: PresenceState;
+  chatJid?: string;
+}
+
 export interface WhatsAppClientOptions {
   authDir: string;
   accountId?: string;
@@ -545,7 +552,7 @@ export class WhatsAppClient {
       printQRInTerminal: false,
       browser: ['nanobot', 'bridge', VERSION],
       syncFullHistory: false,
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true,
     });
 
     let closedResolve: ((reason: unknown) => void) | null = null;
@@ -578,6 +585,10 @@ export class WhatsAppClient {
         this.connected = true;
         this.reconnectAttempts = 0;
         this.lastError = undefined;
+        // Keep this companion marked online to reduce phone push notifications.
+        void this.sock.sendPresenceUpdate('available').catch((err: unknown) => {
+          this.lastError = safeErrorMessage(err);
+        });
         this.options.onStatus('connected');
         this.resolveConnected(true);
       }
@@ -745,6 +756,33 @@ export class WhatsAppClient {
     });
 
     return { chatJid: input.chatJid, messageId: input.messageId };
+  }
+
+  async updatePresence(input: PresenceUpdateInput): Promise<{ state: PresenceState; chatJid?: string }> {
+    if (!this.sock || !this.connected) {
+      throw new Error('Not connected');
+    }
+
+    const needsChatJid = input.state === 'composing' || input.state === 'paused' || input.state === 'recording';
+    if (needsChatJid && !input.chatJid) {
+      throw new Error(`Presence state '${input.state}' requires chatJid`);
+    }
+
+    // Some deployments/states can stall presence ACKs; don't block bridge responses indefinitely.
+    const sendOp = (async (): Promise<void> => {
+      if (input.chatJid) {
+        await this.sock.sendPresenceUpdate(input.state, input.chatJid);
+      } else {
+        await this.sock.sendPresenceUpdate(input.state);
+      }
+    })();
+    void sendOp.catch((err: unknown) => {
+      this.lastError = safeErrorMessage(err);
+      this.options.onError(`presence_update_failed: ${this.lastError}`);
+    });
+    await Promise.race([sendOp, sleep(1500)]);
+
+    return { state: input.state, chatJid: input.chatJid };
   }
 
   async listGroups(ids?: string[]): Promise<Array<{ id: string; subject: string }>> {

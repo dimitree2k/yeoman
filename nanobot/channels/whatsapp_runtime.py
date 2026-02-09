@@ -139,6 +139,7 @@ class WhatsAppRuntimeManager:
         self.config = config or load_config()
         self._source_bridge_dir = source_bridge_dir
         self._user_bridge_dir = user_bridge_dir or (get_data_dir() / "bridge")
+        self._runtime_refreshed = False
 
     @property
     def user_bridge_dir(self) -> Path:
@@ -269,6 +270,7 @@ class WhatsAppRuntimeManager:
         source = self._resolve_source_bridge_dir()
         source_manifest = self._validate_bridge_artifacts(source)
         source_fingerprint = self._runtime_fingerprint(source, source_manifest)
+        self._runtime_refreshed = False
 
         target = self.user_bridge_dir
         if target.exists():
@@ -311,6 +313,7 @@ class WhatsAppRuntimeManager:
                 shutil.rmtree(backup_dir)
             target.rename(backup_dir)
         tmp_dir.rename(target)
+        self._runtime_refreshed = True
         self._ensure_runtime_dependencies(target)
         return target
 
@@ -534,6 +537,10 @@ class WhatsAppRuntimeManager:
                     health={},
                 )
             status = self.start_bridge()
+            started = True
+        elif self._runtime_refreshed:
+            logger.info("Bridge runtime was refreshed; restarting running bridge process")
+            status = self.repair_once(status.port)
             started = True
 
         repaired = False

@@ -8,6 +8,7 @@ export type BridgeCommandType =
   | 'send_media'
   | 'send_poll'
   | 'react'
+  | 'presence_update'
   | 'list_groups'
   | 'login_start'
   | 'login_wait'
@@ -56,6 +57,11 @@ export interface ReactPayload {
   emoji: string;
   participantJid?: string;
   fromMe?: boolean;
+}
+
+export interface PresenceUpdatePayload {
+  state: 'available' | 'unavailable' | 'composing' | 'paused' | 'recording';
+  chatJid?: string;
 }
 
 export interface ListGroupsPayload {
@@ -180,6 +186,28 @@ function parseReact(payload: Record<string, unknown>): ReactPayload | null {
   return { chatJid, messageId, emoji, participantJid, fromMe };
 }
 
+function parsePresenceUpdate(payload: Record<string, unknown>): PresenceUpdatePayload | null {
+  const stateRaw = asString(payload.state);
+  const chatJid = asOptionalString(payload.chatJid);
+  if (!stateRaw) return null;
+
+  const state = stateRaw as PresenceUpdatePayload['state'];
+  const validStates = new Set<PresenceUpdatePayload['state']>([
+    'available',
+    'unavailable',
+    'composing',
+    'paused',
+    'recording',
+  ]);
+  if (!validStates.has(state)) return null;
+
+  if ((state === 'composing' || state === 'paused' || state === 'recording') && !chatJid) {
+    return null;
+  }
+
+  return { state, chatJid };
+}
+
 function parseListGroups(payload: Record<string, unknown>): ListGroupsPayload | null {
   const ids = asOptionalStringArray(payload.ids);
   if (payload.ids !== undefined && !ids) return null;
@@ -239,6 +267,7 @@ export function parseBridgeCommand(
   else if (typed === 'send_media') validPayload = Boolean(parseSendMedia(payload));
   else if (typed === 'send_poll') validPayload = Boolean(parseSendPoll(payload));
   else if (typed === 'react') validPayload = Boolean(parseReact(payload));
+  else if (typed === 'presence_update') validPayload = Boolean(parsePresenceUpdate(payload));
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
   else if (typed === 'login_start') validPayload = Boolean(parseLoginStart(payload));
   else if (typed === 'login_wait') validPayload = Boolean(parseLoginWait(payload));
@@ -283,6 +312,12 @@ export function parseSendPollPayload(payload: Record<string, unknown>): SendPoll
 export function parseReactPayload(payload: Record<string, unknown>): ReactPayload {
   const parsed = parseReact(payload);
   if (!parsed) throw new Error('Invalid react payload');
+  return parsed;
+}
+
+export function parsePresenceUpdatePayload(payload: Record<string, unknown>): PresenceUpdatePayload {
+  const parsed = parsePresenceUpdate(payload);
+  if (!parsed) throw new Error('Invalid presence_update payload');
   return parsed;
 }
 

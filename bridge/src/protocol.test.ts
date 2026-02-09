@@ -68,6 +68,39 @@ test('parseBridgeCommand rejects non-object payload', () => {
   }
 });
 
+test('parseBridgeCommand accepts valid presence_update command', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'presence_update',
+    token: 'secret',
+    payload: {
+      state: 'composing',
+      chatJid: '12345@g.us',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'presence_update');
+  }
+});
+
+test('parseBridgeCommand rejects invalid presence_update payload', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'presence_update',
+    token: 'secret',
+    payload: {
+      state: 'composing',
+    },
+  });
+
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.error.code, 'ERR_SCHEMA');
+  }
+});
+
 test('response envelope uses protocol v2', () => {
   const ok = createOkResponse({ requestId: 'req', accountId: 'default', result: { a: 1 } });
   const err = createErrorResponse({

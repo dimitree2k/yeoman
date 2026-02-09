@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 PROTOCOL_VERSION = 2
 DEDUPE_TTL_SECONDS = 20 * 60
 DEDUPE_CLEANUP_INTERVAL_SECONDS = 30
+TYPING_LOOP_INTERVAL_SECONDS = 4.0
+TYPING_MAX_DURATION_SECONDS = 45.0
 
 
 class BridgeProtocolMismatchError(RuntimeError):
@@ -80,6 +82,8 @@ class WhatsAppChannel(BaseChannel):
         self._recent_message_ids: dict[str, float] = {}
         self._debounce_buffers: dict[str, list[InboundEvent]] = {}
         self._debounce_tasks: dict[str, asyncio.Task[None]] = {}
+        self._inbound_tasks: set[asyncio.Task[None]] = set()
+        self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconnect_attempts = 0
         self._repair_attempted = False
         self._next_dedupe_cleanup_at = 0.0
@@ -87,6 +91,8 @@ class WhatsAppChannel(BaseChannel):
         self._max_debounce_buckets = max(1, int(self.config.max_debounce_buckets))
         self._dedupe_evictions = 0
         self._debounce_overflow = 0
+        self._presence_supported = True
+        self._presence_unsupported_logged = False
         self._runtime = WhatsAppRuntimeManager()
 
     def _require_token(self) -> str:
@@ -194,6 +200,13 @@ class WhatsAppChannel(BaseChannel):
         self._running = False
         self._connected = False
 
+        for chat_id in list(self._typing_tasks):
+            await self._stop_typing(chat_id)
+
+        for task in list(self._inbound_tasks):
+            task.cancel()
+        self._inbound_tasks.clear()
+
         for task in self._debounce_tasks.values():
             task.cancel()
         self._debounce_tasks.clear()
@@ -216,6 +229,8 @@ class WhatsAppChannel(BaseChannel):
         if not self._connected:
             logger.warning("WhatsApp bridge not connected")
             return
+
+        await self._stop_typing(msg.chat_id)
 
         await self._send_command(
             "send_text",
@@ -292,7 +307,11 @@ class WhatsAppChannel(BaseChannel):
             event = self._parse_inbound_event(payload)
             if not event:
                 return
-            await self._ingest_inbound_event(event)
+            # Keep reader loop free so bridge command responses can be consumed
+            # while inbound events are being ingested/published.
+            task = asyncio.create_task(self._ingest_inbound_event(event))
+            self._inbound_tasks.add(task)
+            task.add_done_callback(self._on_inbound_task_done)
             return
 
         if msg_type == "status":
@@ -401,6 +420,14 @@ class WhatsAppChannel(BaseChannel):
 
         self._debounce_tasks[key] = asyncio.create_task(self._flush_debounce_bucket(key))
 
+    def _on_inbound_task_done(self, task: asyncio.Task[None]) -> None:
+        self._inbound_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"WhatsApp inbound task failed: {exc}")
+
     async def _flush_debounce_bucket(self, key: str) -> None:
         try:
             await asyncio.sleep(self.config.debounce_ms / 1000.0)
@@ -485,6 +512,10 @@ class WhatsAppChannel(BaseChannel):
         if text == "[Voice Message]":
             text = "[Voice Message: Transcription not available for WhatsApp yet]"
 
+        # Best-effort typing indicator while the agent is processing this message.
+        if self._should_start_typing(event):
+            await self._start_typing(event.chat_jid)
+
         await self._handle_message(
             sender_id=event.sender_id,
             chat_id=event.chat_jid,
@@ -508,6 +539,70 @@ class WhatsAppChannel(BaseChannel):
                 "media_kind": event.media_kind,
             },
         )
+
+    def _should_start_typing(self, event: InboundEvent) -> bool:
+        if not event.is_group:
+            return True
+        if event.mentioned_bot or event.reply_to_bot:
+            return True
+        return False
+
+    async def _start_typing(self, chat_jid: str) -> None:
+        if not chat_jid:
+            return
+        await self._stop_typing(chat_jid, send_paused=False)
+        self._typing_tasks[chat_jid] = asyncio.create_task(self._typing_loop(chat_jid))
+
+    async def _stop_typing(self, chat_jid: str, *, send_paused: bool = True) -> None:
+        task = self._typing_tasks.pop(chat_jid, None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if send_paused:
+            await self._send_presence(chat_jid, "paused")
+
+    async def _typing_loop(self, chat_jid: str) -> None:
+        task = asyncio.current_task()
+        started_at = asyncio.get_running_loop().time()
+        while (
+            self._running
+            and self._connected
+            and asyncio.get_running_loop().time() - started_at < TYPING_MAX_DURATION_SECONDS
+        ):
+            await self._send_presence(chat_jid, "composing")
+            await asyncio.sleep(TYPING_LOOP_INTERVAL_SECONDS)
+
+        if self._typing_tasks.get(chat_jid) is task:
+            self._typing_tasks.pop(chat_jid, None)
+
+    async def _send_presence(self, chat_jid: str, state: str) -> None:
+        if not self._connected or not self._presence_supported:
+            return
+
+        payload: dict[str, Any] = {"state": state}
+        if chat_jid:
+            payload["chatJid"] = chat_jid
+        try:
+            await self._send_command("presence_update", payload, timeout_seconds=6.0)
+        except BridgeProtocolError as e:
+            if e.code == "ERR_UNSUPPORTED":
+                self._presence_supported = False
+                if not self._presence_unsupported_logged:
+                    self._presence_unsupported_logged = True
+                    logger.warning(
+                        "WhatsApp bridge presence_update unsupported; typing indicator disabled until restart"
+                    )
+                return
+            logger.debug(f"WhatsApp presence update failed ({state}) for {chat_jid}: {e}")
+        except Exception as e:
+            logger.debug(
+                "WhatsApp presence update failed ({}) for {}: {} {}",
+                state,
+                chat_jid,
+                e.__class__.__name__,
+                e,
+            )
 
     def _is_duplicate(self, chat_jid: str, message_id: str) -> bool:
         now = asyncio.get_running_loop().time()

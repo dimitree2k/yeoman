@@ -12,6 +12,7 @@ import {
   parseListGroupsPayload,
   parseLoginStartPayload,
   parseLoginWaitPayload,
+  parsePresenceUpdatePayload,
   parseReactPayload,
   parseSendMediaPayload,
   parseSendPollPayload,
@@ -279,6 +280,12 @@ export class BridgeServer {
       const parsed = parseReactPayload(payload);
       const reacted = await this.wa.react(parsed);
       return { reacted };
+    }
+
+    if (type === 'presence_update') {
+      const parsed = parsePresenceUpdatePayload(payload);
+      const presence = await this.wa.updatePresence(parsed);
+      return { presence };
     }
 
     if (type === 'list_groups') {
