@@ -198,7 +198,14 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         if not reply_to_text:
             return text
 
-        lines = ["[Reply Context]"]
+        reply_context_source = str(metadata.get("reply_context_source") or "").strip()
+        lines = [
+            "[Reply Context]",
+            "usage: Treat quoted_message as the content of the replied-to message.",
+            "usage: Do not claim you cannot see the replied message when quoted_message is present.",
+        ]
+        if reply_context_source:
+            lines.append(f"source: {reply_context_source}")
         if reply_to_message_id:
             lines.append(f"reply_to_message_id: {reply_to_message_id}")
         if reply_to_participant:

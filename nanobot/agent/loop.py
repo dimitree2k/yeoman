@@ -460,29 +460,74 @@ class AgentLoop:
         reply_to_message_id = str(
             metadata.get("reply_to_message_id") or metadata.get("reply_to") or ""
         ).strip()
+        event_text = str(metadata.get("reply_to_text") or "").strip()
         if not reply_to_message_id:
+            if event_text:
+                metadata["reply_context_source"] = "whatsapp_event"
+                msg.metadata = metadata
+                logger.debug(
+                    "reply_context source=whatsapp_event chat={} message_id=- text_len={}",
+                    msg.chat_id,
+                    len(event_text),
+                )
             return
 
         archive_text = None
+        archive_source = None
         if self.inbound_archive is not None:
             try:
                 row = self.inbound_archive.lookup_message(msg.channel, msg.chat_id, reply_to_message_id)
             except Exception as e:
                 logger.warning(f"Reply context archive lookup failed for {reply_to_message_id}: {e}")
                 row = None
+            if row is None:
+                try:
+                    row = self.inbound_archive.lookup_message_any_chat(
+                        msg.channel,
+                        reply_to_message_id,
+                        preferred_chat_id=msg.chat_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Reply context archive fallback lookup failed for {}: {}",
+                        reply_to_message_id,
+                        e,
+                    )
+                    row = None
             if row:
                 archive_text = str(row.get("text") or "").strip() or None
+                row_chat_id = str(row.get("chat_id") or "").strip()
+                archive_source = "archive" if row_chat_id == msg.chat_id else "archive_cross_chat"
 
         if archive_text:
             metadata["reply_to_text"] = archive_text
-            metadata["reply_context_source"] = "archive"
+            metadata["reply_context_source"] = archive_source or "archive"
             msg.metadata = metadata
+            logger.debug(
+                "reply_context source={} chat={} message_id={} text_len={}",
+                metadata["reply_context_source"],
+                msg.chat_id,
+                reply_to_message_id,
+                len(archive_text),
+            )
             return
 
-        event_text = str(metadata.get("reply_to_text") or "").strip()
         if event_text:
             metadata["reply_context_source"] = "whatsapp_event"
             msg.metadata = metadata
+            logger.debug(
+                "reply_context source=whatsapp_event chat={} message_id={} text_len={}",
+                msg.chat_id,
+                reply_to_message_id,
+                len(event_text),
+            )
+            return
+
+        logger.debug(
+            "reply_context source=none chat={} message_id={} text_len=0",
+            msg.chat_id,
+            reply_to_message_id,
+        )
 
     def _tool_definitions(self, allowed_tools: set[str]) -> list[dict]:
         """Filter tool schemas by policy."""

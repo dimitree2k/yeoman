@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -223,6 +224,30 @@ class WhatsAppRuntimeManager:
             raise RuntimeError(f"Incomplete bridge runtime artifacts: {', '.join(missing)}")
         return manifest
 
+    def _runtime_fingerprint(self, root: Path, manifest: BridgeManifest) -> str:
+        """Content fingerprint for bridge runtime artifact parity checks."""
+        hasher = hashlib.sha256()
+        hasher.update(f"bridgeVersion={manifest.bridge_version}\n".encode())
+        hasher.update(f"protocolVersion={manifest.protocol_version}\n".encode())
+        hasher.update(f"buildId={manifest.build_id}\n".encode())
+
+        files = [
+            root / "bridge.manifest.json",
+            root / "package.json",
+            root / "dist" / "index.js",
+            root / "dist" / "server.js",
+            root / "dist" / "protocol.js",
+            root / "dist" / "whatsapp.js",
+        ]
+        for file_path in files:
+            if not file_path.exists():
+                hasher.update(f"missing:{file_path.name}\n".encode())
+                continue
+            hasher.update(f"name:{file_path.name}\n".encode())
+            hasher.update(file_path.read_bytes())
+            hasher.update(b"\n")
+        return hasher.hexdigest()
+
     def _ensure_runtime_dependencies(self, root: Path) -> None:
         node_modules = root / "node_modules"
         if node_modules.exists():
@@ -243,6 +268,7 @@ class WhatsAppRuntimeManager:
     def ensure_runtime(self) -> Path:
         source = self._resolve_source_bridge_dir()
         source_manifest = self._validate_bridge_artifacts(source)
+        source_fingerprint = self._runtime_fingerprint(source, source_manifest)
 
         target = self.user_bridge_dir
         if target.exists():
@@ -255,8 +281,16 @@ class WhatsAppRuntimeManager:
                 and target_manifest.build_id == source_manifest.build_id
                 and target_manifest.protocol_version == source_manifest.protocol_version
             ):
-                self._ensure_runtime_dependencies(target)
-                return target
+                target_fingerprint = self._runtime_fingerprint(target, target_manifest)
+                if target_fingerprint == source_fingerprint:
+                    self._ensure_runtime_dependencies(target)
+                    return target
+                logger.info(
+                    "Bridge runtime fingerprint mismatch; refreshing artifacts "
+                    "(buildId={}, protocol={})",
+                    source_manifest.build_id,
+                    source_manifest.protocol_version,
+                )
 
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = target.parent / f"{target.name}.tmp-{uuid.uuid4().hex[:8]}"

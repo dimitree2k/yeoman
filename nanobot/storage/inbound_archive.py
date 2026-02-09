@@ -117,6 +117,36 @@ class InboundArchive:
             return None
         return dict(row)
 
+    def lookup_message_any_chat(
+        self,
+        channel: str,
+        message_id: str,
+        *,
+        preferred_chat_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find a message by id within a channel, preferring a specific chat when provided."""
+        if not channel or not message_id:
+            return None
+
+        preferred = str(preferred_chat_id or "")
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at
+                FROM inbound_messages
+                WHERE channel = ? AND message_id = ?
+                ORDER BY
+                    CASE WHEN chat_id = ? THEN 0 ELSE 1 END,
+                    created_at DESC
+                LIMIT 1
+                """,
+                (str(channel), str(message_id), preferred),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return dict(row)
+
     def purge_older_than(self, days: int = DEFAULT_RETENTION_DAYS) -> int:
         """Delete rows older than the retention window."""
         effective_days = max(1, int(days))

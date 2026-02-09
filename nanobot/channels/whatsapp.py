@@ -337,6 +337,23 @@ class WhatsAppChannel(BaseChannel):
             else None
         )
 
+        reply_to_message_id = str(payload.get("replyToMessageId") or "").strip() or None
+        reply_to_participant = str(payload.get("replyToParticipantJid") or "").strip() or None
+        reply_to_text = str(payload.get("replyToText") or "").strip() or None
+        reply_to_bot = bool(payload.get("replyToBot", False))
+
+        if reply_to_bot or reply_to_message_id or reply_to_text:
+            logger.debug(
+                "whatsapp_inbound_reply_meta chat={} message_id={} reply_to_bot={} "
+                "reply_to_message_id={} has_reply_to_text={} reply_to_participant={}",
+                chat_jid,
+                message_id,
+                reply_to_bot,
+                reply_to_message_id or "-",
+                bool(reply_to_text),
+                reply_to_participant or "-",
+            )
+
         return InboundEvent(
             message_id=message_id,
             chat_jid=chat_jid,
@@ -347,10 +364,10 @@ class WhatsAppChannel(BaseChannel):
             timestamp=timestamp,
             mentioned_jids=mentioned_jids,
             mentioned_bot=bool(payload.get("mentionedBot", False)),
-            reply_to_bot=bool(payload.get("replyToBot", False)),
-            reply_to_message_id=str(payload.get("replyToMessageId") or "").strip() or None,
-            reply_to_participant=str(payload.get("replyToParticipantJid") or "").strip() or None,
-            reply_to_text=str(payload.get("replyToText") or "").strip() or None,
+            reply_to_bot=reply_to_bot,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_participant=reply_to_participant,
+            reply_to_text=reply_to_text,
             media_kind=media_kind,
             media_type=media_type,
         )
@@ -448,6 +465,18 @@ class WhatsAppChannel(BaseChannel):
                 text=event.text,
                 timestamp=event.timestamp,
             )
+            # Seed quoted target text when available so reply lookups can work
+            # even if the original inbound message was not captured by this runtime.
+            if event.reply_to_message_id and event.reply_to_text:
+                self.inbound_archive.record_inbound(
+                    channel=self.name,
+                    chat_id=event.chat_jid,
+                    message_id=event.reply_to_message_id,
+                    participant=event.reply_to_participant,
+                    sender_id=None,
+                    text=event.reply_to_text,
+                    timestamp=event.timestamp,
+                )
         except Exception as e:
             logger.warning(f"Failed to archive inbound WhatsApp message {event.message_id}: {e}")
 
