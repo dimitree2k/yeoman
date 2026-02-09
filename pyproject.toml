@@ -86,6 +86,12 @@ warn_unused_configs = true
 ignore_missing_imports = true
 disable_error_code = ["override", "union-attr", "no-any-return", "dict-item", "arg-type", "import-untyped"]
 
+[[tool.mypy.overrides]]
+module = ["nanobot.core.*", "nanobot.adapters.*", "nanobot.app.*"]
+strict = true
+ignore_missing_imports = false
+disable_error_code = []
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

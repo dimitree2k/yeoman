@@ -1,0 +1,265 @@
+"""Application bootstrap and runtime wiring for the vNext orchestrator."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, assert_never
+
+from loguru import logger
+
+from nanobot.adapters.policy_legacy import LegacyPolicyAdapter
+from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
+from nanobot.adapters.responder_legacy import LegacyResponderAdapter
+from nanobot.adapters.telemetry import InMemoryTelemetry
+from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.manager import ChannelManager
+from nanobot.core.intents import (
+    OrchestratorIntent,
+    PersistSessionIntent,
+    RecordMetricIntent,
+    SendOutboundIntent,
+    SetTypingIntent,
+)
+from nanobot.core.models import InboundEvent
+from nanobot.core.orchestrator import Orchestrator
+from nanobot.cron.service import CronService
+from nanobot.cron.types import CronJob
+from nanobot.heartbeat.service import HeartbeatService
+from nanobot.session.manager import SessionManager
+from nanobot.storage.inbound_archive import InboundArchive
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from nanobot.config.schema import Config
+    from nanobot.policy.engine import PolicyEngine
+    from nanobot.providers.base import LLMProvider
+
+
+def _normalize_timestamp(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
+def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
+    meta = msg.metadata
+    return InboundEvent(
+        channel=msg.channel,
+        chat_id=msg.chat_id,
+        sender_id=msg.sender_id,
+        content=msg.content,
+        message_id=str(meta.get("message_id") or "").strip() or None,
+        timestamp=_normalize_timestamp(msg.timestamp),
+        participant=str(meta.get("participant") or "").strip() or None,
+        is_group=bool(meta.get("is_group", False)),
+        mentioned_bot=bool(meta.get("mentioned_bot", False)),
+        reply_to_bot=bool(meta.get("reply_to_bot", False)),
+        reply_to_message_id=str(meta.get("reply_to_message_id") or "").strip() or None,
+        reply_to_participant=str(meta.get("reply_to_participant") or "").strip() or None,
+        reply_to_text=str(meta.get("reply_to_text") or "").strip() or None,
+        media=tuple(msg.media),
+    )
+
+
+class OrchestratorService:
+    """Consumes inbound messages and executes typed orchestrator intents."""
+
+    def __init__(
+        self,
+        *,
+        bus: MessageBus,
+        orchestrator: Orchestrator,
+        typing_adapter: ChannelManagerTypingAdapter,
+        telemetry: InMemoryTelemetry,
+    ) -> None:
+        self._bus = bus
+        self._orchestrator = orchestrator
+        self._typing_adapter = typing_adapter
+        self._telemetry = telemetry
+        self._running = False
+
+    async def run(self) -> None:
+        self._running = True
+        while self._running:
+            try:
+                msg = await asyncio.wait_for(self._bus.consume_inbound(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            event = _inbound_message_to_event(msg)
+            try:
+                intents = await self._orchestrator.handle(event)
+                await self._dispatch_intents(intents)
+            except Exception as e:
+                logger.error("vnext orchestrator failure channel={} chat={}: {}", event.channel, event.chat_id, e)
+                await self._bus.publish_outbound(
+                    OutboundMessage(
+                        channel=event.channel,
+                        chat_id=event.chat_id,
+                        content=f"Sorry, I encountered an error: {e}",
+                    )
+                )
+
+    def stop(self) -> None:
+        self._running = False
+
+    async def _dispatch_intents(self, intents: list[OrchestratorIntent]) -> None:
+        for intent in intents:
+            match intent:
+                case SetTypingIntent():
+                    await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
+                case SendOutboundIntent():
+                    await self._bus.publish_outbound(
+                        OutboundMessage(
+                            channel=intent.event.channel,
+                            chat_id=intent.event.chat_id,
+                            content=intent.event.content,
+                            reply_to=intent.event.reply_to,
+                            media=list(intent.event.media),
+                        )
+                    )
+                case PersistSessionIntent():
+                    # Persistence remains delegated to legacy responder path.
+                    continue
+                case RecordMetricIntent():
+                    self._telemetry.incr(intent.name, intent.value, intent.labels)
+                case _:
+                    assert_never(intent)
+
+
+@dataclass(slots=True)
+class GatewayRuntime:
+    """Lifecycle holder for the composed gateway runtime."""
+
+    orchestrator: OrchestratorService
+    channels: ChannelManager
+    cron: CronService
+    heartbeat: HeartbeatService
+    inbound_archive: InboundArchive
+
+    async def run(self) -> None:
+        try:
+            await self.cron.start()
+            await self.heartbeat.start()
+            await asyncio.gather(
+                self.orchestrator.run(),
+                self.channels.start_all(),
+            )
+        finally:
+            self.heartbeat.stop()
+            self.cron.stop()
+            self.orchestrator.stop()
+            await self.channels.stop_all()
+            self.inbound_archive.close()
+
+
+def build_gateway_runtime(
+    *,
+    config: "Config",
+    provider: "LLMProvider",
+    policy_engine: "PolicyEngine | None",
+    policy_path: "Path | None",
+    workspace: "Path",
+    bus: MessageBus,
+) -> GatewayRuntime:
+    """Compose full gateway runtime around vNext orchestrator."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.policy.middleware import PolicyMiddleware
+
+    session_manager = SessionManager(workspace)
+    inbound_archive = InboundArchive(
+        db_path=get_data_dir() / "inbound" / "reply_context.db",
+        retention_days=30,
+    )
+    inbound_archive.purge_older_than(days=30)
+
+    # Legacy execution engine is retained as an adapter for LLM/tools while
+    # orchestration, typing, and reply-context lifecycle are owned by vNext.
+    legacy_agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        session_manager=session_manager,
+        policy_engine=policy_engine,
+        policy_path=policy_path,
+        timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
+        inbound_archive=None,
+        typing_notifier=None,
+    )
+
+    policy_middleware: PolicyMiddleware | None = legacy_agent.policy
+    policy_adapter = LegacyPolicyAdapter(policy_middleware)
+    responder_adapter = LegacyResponderAdapter(legacy_agent)
+    archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
+    orchestrator = Orchestrator(
+        policy=policy_adapter,
+        responder=responder_adapter,
+        reply_archive=archive_adapter,
+    )
+
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    async def on_cron_job(job: CronJob) -> str | None:
+        response = await legacy_agent.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        if job.payload.deliver and job.payload.to:
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response or "",
+                )
+            )
+        return response
+
+    cron.on_job = on_cron_job
+
+    async def on_heartbeat(prompt: str) -> str:
+        return await legacy_agent.process_direct(prompt, session_key="heartbeat")
+
+    heartbeat = HeartbeatService(
+        workspace=workspace,
+        on_heartbeat=on_heartbeat,
+        interval_s=30 * 60,
+        enabled=True,
+    )
+
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        inbound_archive=inbound_archive,
+    )
+
+    telemetry = InMemoryTelemetry()
+    typing_adapter = ChannelManagerTypingAdapter(channels)
+    orchestrator_service = OrchestratorService(
+        bus=bus,
+        orchestrator=orchestrator,
+        typing_adapter=typing_adapter,
+        telemetry=telemetry,
+    )
+
+    return GatewayRuntime(
+        orchestrator=orchestrator_service,
+        channels=channels,
+        cron=cron,
+        heartbeat=heartbeat,
+        inbound_archive=inbound_archive,
+    )

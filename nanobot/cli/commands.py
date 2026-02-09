@@ -481,16 +481,10 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
 
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     """Start the nanobot gateway in foreground."""
-    from nanobot.agent.loop import AgentLoop
+    from nanobot.app.bootstrap import build_gateway_runtime
     from nanobot.bus.queue import MessageBus
-    from nanobot.channels.manager import ChannelManager
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import get_data_dir, load_config
-    from nanobot.cron.service import CronService
-    from nanobot.cron.types import CronJob
-    from nanobot.heartbeat.service import HeartbeatService
-    from nanobot.session.manager import SessionManager
-    from nanobot.storage.inbound_archive import InboundArchive
+    from nanobot.config.loader import load_config
 
     if verbose:
         import logging
@@ -511,85 +505,21 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
     )
     provider = _make_provider(config)
     policy_engine, policy_path = _make_policy_engine(config)
-    session_manager = SessionManager(config.workspace_path)
-    inbound_archive = InboundArchive(
-        db_path=get_data_dir() / "inbound" / "reply_context.db",
-        retention_days=30,
-    )
-    inbound_archive.purge_older_than(days=30)
-
-    # Create cron service first (callback set after agent creation)
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
-
-    # Create agent with cron service
-    try:
-        agent = AgentLoop(
-            bus=bus,
-            provider=provider,
-            workspace=config.workspace_path,
-            model=config.agents.defaults.model,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            brave_api_key=config.tools.web.search.api_key or None,
-            exec_config=config.tools.exec,
-            cron_service=cron,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            session_manager=session_manager,
-            policy_engine=policy_engine,
-            policy_path=policy_path,
-            timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
-            inbound_archive=inbound_archive,
-        )
-    except ValueError as e:
-        console.print(f"[red]Policy validation error:[/red] {e}")
-        raise typer.Exit(1)
-
-    # Set cron callback (needs agent)
-    async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
-        response = await agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
-        )
-        if job.payload.deliver and job.payload.to:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response or ""
-            ))
-        return response
-    cron.on_job = on_cron_job
-
-    # Create heartbeat service
-    async def on_heartbeat(prompt: str) -> str:
-        """Execute heartbeat through the agent."""
-        return await agent.process_direct(prompt, session_key="heartbeat")
-
-    heartbeat = HeartbeatService(
+    runtime = build_gateway_runtime(
+        config=config,
+        provider=provider,
+        policy_engine=policy_engine,
+        policy_path=policy_path,
         workspace=config.workspace_path,
-        on_heartbeat=on_heartbeat,
-        interval_s=30 * 60,  # 30 minutes
-        enabled=True
+        bus=bus,
     )
 
-    # Create channel manager
-    channels = ChannelManager(
-        config,
-        bus,
-        session_manager=session_manager,
-        inbound_archive=inbound_archive,
-    )
-    agent.set_typing_notifier(channels.set_typing)
-
-    if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+    if runtime.channels.enabled_channels:
+        console.print(f"[green]✓[/green] Channels enabled: {', '.join(runtime.channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
 
-    cron_status = cron.status()
+    cron_status = runtime.cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
@@ -597,23 +527,15 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
 
     async def run():
         try:
-            await cron.start()
-            await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            await runtime.run()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
-            heartbeat.stop()
-            cron.stop()
-            agent.stop()
-            await channels.stop_all()
+            runtime.heartbeat.stop()
+            runtime.cron.stop()
+            runtime.orchestrator.stop()
+            await runtime.channels.stop_all()
 
-    try:
-        asyncio.run(run())
-    finally:
-        inbound_archive.close()
+    asyncio.run(run())
 
 
 @app.command()

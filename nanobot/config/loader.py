@@ -1,11 +1,16 @@
 """Configuration loading utilities."""
 
 import json
+import os
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from nanobot.config.schema import Config
+
+CONFIG_VERSION = 2
 
 
 def get_config_path() -> Path:
@@ -34,9 +39,14 @@ def load_config(config_path: Path | None = None) -> Config:
     if path.exists():
         try:
             with open(path) as f:
-                data = json.load(f)
-            data = _migrate_config(data)
-            return Config.model_validate(convert_keys(data))
+                raw = json.load(f)
+
+            migrated_raw, changed = _migrate_config_with_change(raw)
+            validated = Config.model_validate(convert_keys(migrated_raw))
+            if changed:
+                _backup_config(path)
+                _atomic_write_config(path, validated)
+            return validated
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
@@ -55,29 +65,38 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Convert to camelCase format
-    data = config.model_dump()
-    data = convert_to_camel(data)
-
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        # Best effort across platforms/filesystems.
-        pass
+    _atomic_write_config(path, config)
 
 
-def _migrate_config(data: dict) -> dict:
-    """Migrate old config formats to current."""
+def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible migration helper returning migrated payload only."""
+    migrated, _ = _migrate_config_with_change(data)
+    return migrated
+
+
+def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Migrate old config formats to current schema version.
+
+    Returns:
+        (migrated_data, changed)
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Config root must be a JSON object")
+
+    original = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    data = json.loads(json.dumps(data))
+
+    # Legacy key migrations on camelCase payload before snake_case normalization.
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
     if not isinstance(tools, dict):
-        return data
+        tools = {}
+        data["tools"] = tools
 
     exec_cfg = tools.get("exec", {})
     if not isinstance(exec_cfg, dict):
-        return data
+        exec_cfg = {}
+        tools["exec"] = exec_cfg
 
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
@@ -109,7 +128,82 @@ def _migrate_config(data: dict) -> dict:
                 if "bridgePort" not in wa and parsed.port is not None:
                     wa["bridgePort"] = parsed.port
 
-    return data
+    # Normalize to snake_case for semantic migrations.
+    snake = convert_keys(data)
+    if not isinstance(snake, dict):
+        raise ValueError("Config migration produced invalid root payload")
+
+    version = snake.get("config_version")
+    try:
+        version_num = int(version) if version is not None else 1
+    except (TypeError, ValueError):
+        version_num = 1
+
+    if version_num < 2:
+        runtime = snake.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            snake["runtime"] = runtime
+        wa_runtime = runtime.get("whatsapp_bridge")
+        if not isinstance(wa_runtime, dict):
+            wa_runtime = {}
+            runtime["whatsapp_bridge"] = wa_runtime
+
+        channels_cfg = snake.get("channels")
+        whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else {}
+        if not isinstance(whatsapp_cfg, dict):
+            whatsapp_cfg = {}
+
+        wa_runtime.setdefault("host", whatsapp_cfg.get("bridge_host", "127.0.0.1"))
+        wa_runtime.setdefault("port", whatsapp_cfg.get("bridge_port", 3001))
+        wa_runtime.setdefault("token", whatsapp_cfg.get("bridge_token", ""))
+        wa_runtime.setdefault("auto_repair", whatsapp_cfg.get("bridge_auto_repair", True))
+        wa_runtime.setdefault(
+            "startup_timeout_ms",
+            whatsapp_cfg.get("bridge_startup_timeout_ms", 15000),
+        )
+        wa_runtime.setdefault(
+            "max_payload_bytes",
+            whatsapp_cfg.get("max_payload_bytes", 262144),
+        )
+
+    snake["config_version"] = CONFIG_VERSION
+
+    migrated = convert_to_camel(snake)
+    changed = original != json.dumps(migrated, sort_keys=True, separators=(",", ":"))
+    return migrated, changed
+
+
+def _backup_config(path: Path) -> None:
+    """Create timestamped backup of config before migration rewrite."""
+    if not path.exists():
+        return
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.stem}.backup.{timestamp}{path.suffix}")
+    shutil.copy2(path, backup)
+    try:
+        backup.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _atomic_write_config(path: Path, config: Config) -> None:
+    """Atomically write config as camelCase JSON with secure permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = convert_to_camel(config.model_dump())
+    tmp_name = f".{path.name}.tmp-{os.getpid()}"
+    tmp_path = path.with_name(tmp_name)
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        tmp_path.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def convert_keys(data: Any) -> Any:
