@@ -101,19 +101,23 @@ class PolicyEngine:
             for channel, owners in self.policy.owners.items()
         }
 
+        def dump_override(override: ChatPolicyOverride) -> dict[str, Any]:
+            # Human-only fields (like comment) must not affect evaluation.
+            return override.model_dump(exclude_none=True, exclude={"comment"})
+
         channels_to_compile = set(self.apply_channels) | set(self.policy.channels.keys())
         for channel in channels_to_compile:
             merged = self.policy.defaults.model_dump()
             channel_policy = self.policy.channels.get(channel)
             if channel_policy:
-                merged = _deep_merge(merged, channel_policy.default.model_dump(exclude_none=True))
+                merged = _deep_merge(merged, dump_override(channel_policy.default))
             resolved = ChatPolicy.model_validate(merged)
             compiled_default = self._compile_chat_policy(channel, resolved)
             self._channel_defaults[channel] = compiled_default
 
             if channel_policy:
                 for chat_id, override in channel_policy.chats.items():
-                    chat_merged = _deep_merge(merged, override.model_dump(exclude_none=True))
+                    chat_merged = _deep_merge(merged, dump_override(override))
                     chat_resolved = ChatPolicy.model_validate(chat_merged)
                     self._chat_rules[(channel, chat_id)] = self._compile_chat_policy(channel, chat_resolved)
 
@@ -350,4 +354,3 @@ class PolicyEngine:
     def persona_text(self, persona_file: str | None) -> str | None:
         """Load persona text for a decision."""
         return load_persona_text(persona_file, self.workspace)
-

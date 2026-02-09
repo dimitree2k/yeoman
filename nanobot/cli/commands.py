@@ -415,11 +415,26 @@ def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
     return len(pids)
 
 
-def _start_gateway_daemon(port: int, verbose: bool) -> None:
+def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     import os
     import subprocess
     import sys
     import time
+
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    if ensure_whatsapp and config.channels.whatsapp.enabled:
+        runtime = WhatsAppRuntimeManager(config=config)
+        try:
+            runtime.ensure_ready(
+                auto_repair=config.channels.whatsapp.bridge_auto_repair,
+                start_if_needed=True,
+            )
+        except Exception as e:
+            console.print(f"[red]WhatsApp ensure failed:[/red] {e}")
+            raise typer.Exit(1)
 
     running = _find_gateway_pids(port)
     if running:
@@ -464,16 +479,18 @@ def _start_gateway_daemon(port: int, verbose: bool) -> None:
     console.print(f"Log: {log_path}")
 
 
-def _run_gateway_foreground(port: int, verbose: bool) -> None:
+def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     """Start the nanobot gateway in foreground."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from nanobot.config.loader import get_data_dir, load_config
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.session.manager import SessionManager
+    from nanobot.storage.inbound_archive import InboundArchive
 
     if verbose:
         import logging
@@ -482,10 +499,24 @@ def _run_gateway_foreground(port: int, verbose: bool) -> None:
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
     config = load_config()
-    bus = MessageBus()
+    if ensure_whatsapp and config.channels.whatsapp.enabled:
+        runtime = WhatsAppRuntimeManager(config=config)
+        runtime.ensure_ready(
+            auto_repair=config.channels.whatsapp.bridge_auto_repair,
+            start_if_needed=True,
+        )
+    bus = MessageBus(
+        inbound_maxsize=config.bus.inbound_maxsize,
+        outbound_maxsize=config.bus.outbound_maxsize,
+    )
     provider = _make_provider(config)
     policy_engine, policy_path = _make_policy_engine(config)
     session_manager = SessionManager(config.workspace_path)
+    inbound_archive = InboundArchive(
+        db_path=get_data_dir() / "inbound" / "reply_context.db",
+        retention_days=30,
+    )
+    inbound_archive.purge_older_than(days=30)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -507,6 +538,7 @@ def _run_gateway_foreground(port: int, verbose: bool) -> None:
             policy_engine=policy_engine,
             policy_path=policy_path,
             timing_logs_enabled=config.agents.defaults.timing_logs_enabled,
+            inbound_archive=inbound_archive,
         )
     except ValueError as e:
         console.print(f"[red]Policy validation error:[/red] {e}")
@@ -544,7 +576,12 @@ def _run_gateway_foreground(port: int, verbose: bool) -> None:
     )
 
     # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        inbound_archive=inbound_archive,
+    )
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -572,7 +609,10 @@ def _run_gateway_foreground(port: int, verbose: bool) -> None:
             agent.stop()
             await channels.stop_all()
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        inbound_archive.close()
 
 
 @app.command()
@@ -587,6 +627,11 @@ def gateway(
     stop: bool = typer.Option(False, "--stop", help="Stop gateway"),
     restart: bool = typer.Option(False, "--restart", help="Restart gateway in background"),
     status: bool = typer.Option(False, "--status", help="Show gateway status"),
+    ensure_whatsapp: bool = typer.Option(
+        True,
+        "--ensure-whatsapp/--no-ensure-whatsapp",
+        help="Ensure WhatsApp runtime/health before starting gateway",
+    ),
 ):
     """Start or control the nanobot gateway."""
     action_mode: str | None = None
@@ -641,14 +686,14 @@ def gateway(
         if _find_gateway_pids(port):
             console.print(f"[red]Gateway restart failed: port {port} is still in use[/red]")
             raise typer.Exit(1)
-        _start_gateway_daemon(port, verbose)
+        _start_gateway_daemon(port, verbose, ensure_whatsapp=ensure_whatsapp)
         return
 
     if mode == "start":
-        _start_gateway_daemon(port, verbose)
+        _start_gateway_daemon(port, verbose, ensure_whatsapp=ensure_whatsapp)
         return
 
-    _run_gateway_foreground(port, verbose)
+    _run_gateway_foreground(port, verbose, ensure_whatsapp=ensure_whatsapp)
 
 
 
@@ -670,7 +715,10 @@ def agent(
 
     config = load_config()
 
-    bus = MessageBus()
+    bus = MessageBus(
+        inbound_maxsize=config.bus.inbound_maxsize,
+        outbound_maxsize=config.bus.outbound_maxsize,
+    )
     provider = _make_provider(config)
     policy_engine, policy_path = _make_policy_engine(config)
 
@@ -743,7 +791,7 @@ def channels_status():
     table.add_row(
         "WhatsApp",
         "✓" if wa.enabled else "✗",
-        wa.bridge_url
+        f"{wa.resolved_bridge_url} (host={wa.bridge_host}, port={wa.resolved_bridge_port})"
     )
 
     dc = config.channels.discord
@@ -765,68 +813,103 @@ def channels_status():
     console.print(table)
 
 
-def _get_bridge_dir() -> Path:
-    """Get the bridge directory, setting it up if needed."""
-    import shutil
-    import subprocess
+whatsapp_app = typer.Typer(help="Manage WhatsApp channel runtime")
+channels_app.add_typer(whatsapp_app, name="whatsapp")
 
-    # User's bridge location
-    user_bridge = Path.home() / ".nanobot" / "bridge"
 
-    # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
-        return user_bridge
+@whatsapp_app.command("ensure")
+def whatsapp_ensure(
+    no_auto_repair: bool = typer.Option(
+        False,
+        "--no-auto-repair",
+        help="Disable one-shot auto-repair on health/protocol mismatch",
+    ),
+):
+    """Ensure WhatsApp runtime, bridge process and protocol health are ready."""
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
 
-    # Check for npm
-    if not shutil.which("npm"):
-        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
-        raise typer.Exit(1)
-
-    # Find source bridge: first check package data, then source dir
-    pkg_bridge = Path(__file__).parent.parent / "bridge"  # nanobot/bridge (installed)
-    src_bridge = Path(__file__).parent.parent.parent / "bridge"  # repo root/bridge (dev)
-
-    source = None
-    if (pkg_bridge / "package.json").exists():
-        source = pkg_bridge
-    elif (src_bridge / "package.json").exists():
-        source = src_bridge
-
-    if not source:
-        console.print("[red]Bridge source not found.[/red]")
-        console.print("Try reinstalling: pip install --force-reinstall nanobot")
-        raise typer.Exit(1)
-
-    console.print(f"{__logo__} Setting up bridge...")
-
-    # Copy to user directory
-    user_bridge.parent.mkdir(parents=True, exist_ok=True)
-    if user_bridge.exists():
-        shutil.rmtree(user_bridge)
-    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
-
-    # Install and build
+    config = load_config()
+    runtime = WhatsAppRuntimeManager(config=config)
     try:
-        console.print("  Installing dependencies...")
-        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
-
-        console.print("  Building...")
-        subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
-
-        console.print("[green]✓[/green] Bridge ready\n")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Build failed: {e}[/red]")
-        if e.stderr:
-            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
+        report = runtime.ensure_ready(
+            auto_repair=False if no_auto_repair else config.channels.whatsapp.bridge_auto_repair,
+            start_if_needed=True,
+        )
+    except Exception as e:
+        console.print(f"[red]WhatsApp ensure failed:[/red] {e}")
         raise typer.Exit(1)
 
-    return user_bridge
+    status_bits = []
+    if report.started:
+        status_bits.append("started bridge")
+    if report.repaired:
+        status_bits.append("auto-repaired")
+    status_suffix = f" ({', '.join(status_bits)})" if status_bits else ""
+    console.print(
+        f"[green]✓[/green] WhatsApp runtime ready{status_suffix}: "
+        f"bridge pid {report.status.pids[0]} port {report.status.port}"
+    )
+    console.print(f"Runtime: {report.runtime_dir}")
+    console.print(f"Log: {report.status.log_path}")
+
+
+def _get_bridge_dir() -> Path:
+    """Get the prepared user bridge runtime directory."""
+    try:
+        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+
+        runtime = WhatsAppRuntimeManager()
+        bridge_dir = runtime.ensure_runtime()
+        return bridge_dir
+    except Exception as e:
+        console.print(f"[red]Failed to prepare WhatsApp bridge runtime:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _ensure_whatsapp_bridge_token(config=None, *, quiet: bool = False) -> str:
+    """Ensure channels.whatsapp.bridgeToken exists, generating and saving if missing."""
+    try:
+        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+
+        runtime = WhatsAppRuntimeManager(config=config)
+        return runtime.ensure_bridge_token(quiet=quiet)
+    except Exception as e:
+        console.print(f"[red]Failed to ensure generated bridge token:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _rotate_whatsapp_bridge_token(config=None) -> tuple[str, str]:
+    """Rotate channels.whatsapp.bridgeToken and persist it."""
+    try:
+        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+
+        runtime = WhatsAppRuntimeManager(config=config)
+        old_token, new_token = runtime.rotate_bridge_token()
+    except Exception as e:
+        console.print(f"[red]Failed to save rotated bridge token:[/red] {e}")
+        raise typer.Exit(1)
+
+    from nanobot.config.loader import get_config_path
+
+    console.print(
+        "[green]✓[/green] Rotated channels.whatsapp.bridgeToken and saved to "
+        f"{get_config_path()}"
+    )
+    return old_token, new_token
 
 
 @channels_app.command("login")
 def channels_login():
     """Link device via QR code."""
+    import os
     import subprocess
+
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    wa = config.channels.whatsapp
+    token = _ensure_whatsapp_bridge_token(config=config)
 
     bridge_dir = _get_bridge_dir()
 
@@ -834,11 +917,16 @@ def channels_login():
     console.print("Scan the QR code to connect.\n")
 
     try:
-        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True)
+        env = dict(os.environ)
+        env["BRIDGE_PORT"] = str(wa.bridge_port or _bridge_port_from_config())
+        env["BRIDGE_HOST"] = wa.bridge_host
+        env["BRIDGE_TOKEN"] = token
+        env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
+        subprocess.run(["node", "dist/index.js"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
-        console.print("[red]npm not found. Please install Node.js.[/red]")
+        console.print("[red]node not found. Please install Node.js >= 20.[/red]")
 
 
 # WhatsApp bridge process manager
@@ -863,19 +951,10 @@ def _bridge_log_path() -> Path:
 
 
 def _bridge_port_from_config() -> int:
-    from urllib.parse import urlparse
-
     from nanobot.config.loader import load_config
 
-    bridge_url = load_config().channels.whatsapp.bridge_url
-    parsed = urlparse(bridge_url)
-    if parsed.port is not None:
-        return parsed.port
-    if parsed.scheme == "wss":
-        return 443
-    if parsed.scheme == "ws":
-        return 80
-    return 3001
+    wa = load_config().channels.whatsapp
+    return wa.resolved_bridge_port
 
 
 def _process_cwd(pid: int) -> Path | None:
@@ -1012,47 +1091,26 @@ def bridge_start(
     port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
 ):
     """Start WhatsApp bridge in background."""
-    import os
-    import shutil
-    import subprocess
-    import time
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
 
-    if not shutil.which("node"):
-        console.print("[red]node not found. Please install Node.js >= 18.[/red]")
-        raise typer.Exit(1)
-
-    bridge_dir = _get_bridge_dir()
+    runtime = WhatsAppRuntimeManager(config=load_config())
     resolved_port = _bridge_port_from_config() if port is None else port
-
-    running = _find_bridge_pids(resolved_port)
-    if running:
-        console.print(f"[yellow]Bridge already running (pid {running[0]})[/yellow]")
-        console.print(f"Log: {_bridge_log_path()}")
+    status_before = runtime.status_bridge(resolved_port)
+    if status_before.running:
+        console.print(f"[yellow]Bridge already running (pid {status_before.pids[0]})[/yellow]")
+        console.print(f"Log: {status_before.log_path}")
         return
 
-    log_path = _bridge_log_path()
-    with open(log_path, "a") as log_file:
-        env = dict(os.environ)
-        env["BRIDGE_PORT"] = str(resolved_port)
-        proc = subprocess.Popen(
-            ["node", "dist/index.js"],
-            cwd=bridge_dir,
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-    time.sleep(0.6)
-    if proc.poll() is not None:
-        console.print("[red]Bridge failed to start. Check log:[/red]")
-        console.print(log_path)
+    try:
+        status = runtime.start_bridge(resolved_port)
+    except Exception as e:
+        console.print(f"[red]Bridge failed to start:[/red] {e}")
+        console.print(f"Log: {runtime.bridge_log_path}")
         raise typer.Exit(1)
 
-    _bridge_pid_path().write_text(str(proc.pid))
-    console.print(f"[green]✓[/green] Bridge started (pid {proc.pid}, port {resolved_port})")
-    console.print(f"Log: {log_path}")
+    console.print(f"[green]✓[/green] Bridge started (pid {status.pids[0]}, port {status.port})")
+    console.print(f"Log: {status.log_path}")
 
 
 @bridge_app.command("stop")
@@ -1060,8 +1118,12 @@ def bridge_stop(
     port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
 ):
     """Stop WhatsApp bridge."""
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
+
+    runtime = WhatsAppRuntimeManager(config=load_config())
     resolved_port = _bridge_port_from_config() if port is None else port
-    stopped = _stop_bridge_processes(resolved_port)
+    stopped = runtime.stop_bridge(resolved_port)
     if stopped == 0:
         console.print("[yellow]Bridge is not running[/yellow]")
         return
@@ -1073,16 +1135,18 @@ def bridge_restart(
     port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
 ):
     """Restart WhatsApp bridge."""
-    import time
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
 
+    runtime = WhatsAppRuntimeManager(config=load_config())
     resolved_port = _bridge_port_from_config() if port is None else port
-    _stop_bridge_processes(resolved_port)
-    # Give OS/socket state a brief moment before re-check/start.
-    time.sleep(0.2)
-    if _find_bridge_pids(resolved_port):
-        console.print(f"[red]Bridge restart failed: port {resolved_port} is still in use[/red]")
+    try:
+        status = runtime.restart_bridge(resolved_port)
+    except Exception as e:
+        console.print(f"[red]Bridge restart failed:[/red] {e}")
         raise typer.Exit(1)
-    bridge_start(port=resolved_port)
+    console.print(f"[green]✓[/green] Bridge started (pid {status.pids[0]}, port {status.port})")
+    console.print(f"Log: {status.log_path}")
 
 
 @bridge_app.command("status")
@@ -1090,13 +1154,88 @@ def bridge_status(
     port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
 ):
     """Show WhatsApp bridge status."""
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
+
+    runtime = WhatsAppRuntimeManager(config=load_config())
     resolved_port = _bridge_port_from_config() if port is None else port
-    running = _find_bridge_pids(resolved_port)
-    if not running:
+    status = runtime.status_bridge(resolved_port)
+    if not status.running:
         console.print(f"[yellow]Bridge not running on port {resolved_port}[/yellow]")
         return
-    console.print(f"[green]Bridge running[/green] on port {resolved_port} (pid {running[0]})")
-    console.print(f"Log: {_bridge_log_path()}")
+    console.print(f"[green]Bridge running[/green] on port {status.port} (pid {status.pids[0]})")
+    console.print(f"Log: {status.log_path}")
+
+
+@bridge_app.command("rotate")
+@bridge_app.command("rotate-token")
+def bridge_rotate_token(
+    port: int = typer.Option(
+        None, "--port", "-p", help="Bridge port (default: from config bridge_url)"
+    ),
+    restart_bridge: bool = typer.Option(
+        True,
+        "--restart-bridge/--no-restart-bridge",
+        help="Restart bridge if it is currently running",
+    ),
+    restart_gateway: bool = typer.Option(
+        True,
+        "--restart-gateway/--no-restart-gateway",
+        help="Restart gateway if it is currently running",
+    ),
+    start_bridge_if_stopped: bool = typer.Option(
+        False,
+        "--start-bridge-if-stopped",
+        help="Also start bridge when it is not currently running",
+    ),
+    start_gateway_if_stopped: bool = typer.Option(
+        False,
+        "--start-gateway-if-stopped",
+        help="Also start gateway when it is not currently running",
+    ),
+):
+    """Rotate WhatsApp bridge token and restart affected processes."""
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    runtime = WhatsAppRuntimeManager(config=config)
+    resolved_port = _bridge_port_from_config() if port is None else port
+    gateway_port = config.gateway.port
+
+    bridge_running = runtime.status_bridge(resolved_port).running
+    gateway_running = bool(_find_gateway_pids(gateway_port))
+
+    old_token, new_token = _rotate_whatsapp_bridge_token(config=config)
+    if old_token and old_token == new_token:
+        console.print("[yellow]Token value did not change unexpectedly; retry rotation.[/yellow]")
+        raise typer.Exit(1)
+
+    if restart_bridge:
+        if bridge_running:
+            runtime.restart_bridge(resolved_port)
+            status = runtime.status_bridge(resolved_port)
+            console.print(f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})")
+            console.print(f"Log: {status.log_path}")
+        elif start_bridge_if_stopped:
+            status = runtime.start_bridge(resolved_port)
+            console.print(f"[green]✓[/green] Bridge started (pid {status.pids[0]}, port {status.port})")
+            console.print(f"Log: {status.log_path}")
+        else:
+            console.print(
+                f"[dim]Bridge was not running on port {resolved_port}; skipped restart.[/dim]"
+            )
+
+    if restart_gateway:
+        if gateway_running:
+            _stop_gateway_processes(gateway_port)
+            _start_gateway_daemon(gateway_port, verbose=False)
+        elif start_gateway_if_stopped:
+            _start_gateway_daemon(gateway_port, verbose=False)
+        else:
+            console.print(
+                f"[dim]Gateway was not running on port {gateway_port}; skipped restart.[/dim]"
+            )
 
 
 # ============================================================================
@@ -1208,6 +1347,132 @@ def policy_migrate_allowfrom(
 
     save_policy(migrated, policy_path)
     console.print(f"[green]✓[/green] Updated policy: {policy_path}")
+
+
+@policy_app.command("annotate-whatsapp-comments")
+def policy_annotate_whatsapp_comments(
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing comment fields"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show changes without writing policy.json"),
+    bridge_url: str | None = typer.Option(None, "--bridge-url", help="WhatsApp bridge ws:// URL (default: from config)"),
+):
+    """Fill WhatsApp group chat comments in policy.json using the running bridge."""
+    import asyncio
+    import shutil
+    import time
+    import uuid
+
+    import websockets
+
+    from nanobot.config.loader import load_config
+    from nanobot.policy.loader import get_policy_path, load_policy, save_policy
+
+    async def _list_groups(url: str, ids: list[str], token: str) -> dict[str, str]:
+        request_id = uuid.uuid4().hex
+        payload = {
+            "version": 2,
+            "type": "list_groups",
+            "token": token,
+            "requestId": request_id,
+            "accountId": "default",
+            "payload": {"ids": ids},
+        }
+        async with websockets.connect(url) as ws:
+            await ws.send(json.dumps(payload))
+            deadline = time.monotonic() + 10.0
+            while True:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("bridge did not reply in time")
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                data = json.loads(raw)
+                if data.get("version") != 2:
+                    continue
+                if data.get("type") != "response":
+                    continue
+                if data.get("requestId") != request_id:
+                    continue
+                response_payload = data.get("payload")
+                if not isinstance(response_payload, dict):
+                    raise RuntimeError("bridge response payload malformed")
+                if not bool(response_payload.get("ok")):
+                    error = response_payload.get("error")
+                    raise RuntimeError(f"bridge returned error: {error}")
+                result = response_payload.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError("bridge response result malformed")
+                groups = result.get("groups", [])
+                out: dict[str, str] = {}
+                if isinstance(groups, list):
+                    for item in groups:
+                        if not isinstance(item, dict):
+                            continue
+                        gid = str(item.get("chatJid", "")).strip()
+                        subj = str(item.get("subject", "")).strip()
+                        if gid and subj:
+                            out[gid] = subj
+                return out
+
+    config = load_config()
+    resolved_bridge_url = bridge_url or config.channels.whatsapp.resolved_bridge_url
+    bridge_token = _ensure_whatsapp_bridge_token(config=config)
+
+    policy_path = get_policy_path()
+    policy = load_policy(policy_path)
+
+    wa = policy.channels.get("whatsapp")
+    if not wa or not wa.chats:
+        console.print("[yellow]No WhatsApp chats found in policy.json[/yellow]")
+        return
+
+    chat_ids = [cid for cid in wa.chats.keys() if isinstance(cid, str) and cid.endswith("@g.us")]
+    if not chat_ids:
+        console.print("[yellow]No WhatsApp group chat IDs (*@g.us) found in policy.json[/yellow]")
+        return
+
+    targets: list[str] = []
+    for chat_id in chat_ids:
+        ov = wa.chats.get(chat_id)
+        current = getattr(ov, "comment", None) if ov else None
+        if overwrite or not (isinstance(current, str) and current.strip()):
+            targets.append(chat_id)
+
+    if not targets:
+        console.print("[green]✓[/green] Nothing to do (all groups already have comments).")
+        return
+
+    try:
+        names = asyncio.run(_list_groups(resolved_bridge_url, targets, bridge_token))
+    except Exception as e:
+        console.print(f"[red]Failed to fetch group names from bridge:[/red] {e}")
+        console.print("[dim]Tip: ensure the WhatsApp bridge is running and connected (nanobot channels bridge status).[/dim]")
+        raise typer.Exit(1)
+
+    updated = 0
+    missing: list[str] = []
+    for chat_id in targets:
+        name = names.get(chat_id)
+        if not name:
+            missing.append(chat_id)
+            continue
+        wa.chats[chat_id].comment = name
+        updated += 1
+
+    if dry_run:
+        console.print(f"[yellow]Dry run.[/yellow] Would update {updated} group(s).")
+        if missing:
+            console.print(f"[dim]No name returned for {len(missing)} group(s).[/dim]")
+        return
+
+    if policy_path.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = policy_path.with_name(f"{policy_path.name}.bak-{stamp}")
+        shutil.copy2(policy_path, backup_path)
+        console.print(f"[green]✓[/green] Backup written: {backup_path}")
+
+    save_policy(policy, policy_path)
+    console.print(f"[green]✓[/green] Updated policy comments for {updated} group(s): {policy_path}")
+    if missing:
+        console.print(f"[yellow]Warning:[/yellow] no name returned for {len(missing)} group(s).")
 
 
 # ============================================================================

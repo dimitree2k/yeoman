@@ -13,6 +13,7 @@ from nanobot.config.schema import Config
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
+    from nanobot.storage.inbound_archive import InboundArchive
 
 
 class ChannelManager:
@@ -25,10 +26,17 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus, session_manager: "SessionManager | None" = None):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None,
+        inbound_archive: "InboundArchive | None" = None,
+    ):
         self.config = config
         self.bus = bus
         self.session_manager = session_manager
+        self.inbound_archive = inbound_archive
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -56,7 +64,9 @@ class ChannelManager:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
                 self.channels["whatsapp"] = WhatsAppChannel(
-                    self.config.channels.whatsapp, self.bus
+                    self.config.channels.whatsapp,
+                    self.bus,
+                    inbound_archive=self.inbound_archive,
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:

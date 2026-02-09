@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
     from nanobot.policy.engine import PolicyEngine
     from nanobot.policy.middleware import PolicyMiddleware
+    from nanobot.storage.inbound_archive import InboundArchive
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
@@ -65,6 +66,7 @@ class AgentLoop:
         policy_middleware: "PolicyMiddleware | None" = None,
         policy_path: Path | None = None,
         timing_logs_enabled: bool = False,
+        inbound_archive: "InboundArchive | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -100,6 +102,7 @@ class AgentLoop:
         self.policy: "PolicyMiddleware | None" = policy_middleware
         self.policy_path = policy_path
         self.timing_logs_enabled = timing_logs_enabled
+        self.inbound_archive = inbound_archive
         self.policy_counters = {
             "dropped_by_access": 0,
             "dropped_by_reply": 0,
@@ -332,11 +335,14 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
 
+        self._resolve_reply_context(msg)
+
         # Build initial messages (use get_history for LLM-formatted messages)
         context_started = time.perf_counter()
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
+            current_metadata=msg.metadata if msg.metadata else None,
             persona_text=persona_text,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -444,6 +450,39 @@ class AgentLoop:
                 source="disabled",
             )
         return self.policy.evaluate_message(msg)
+
+    def _resolve_reply_context(self, msg: InboundMessage) -> None:
+        """Enrich WhatsApp reply metadata from full inbound archive when possible."""
+        if msg.channel != "whatsapp":
+            return
+
+        metadata = dict(msg.metadata or {})
+        reply_to_message_id = str(
+            metadata.get("reply_to_message_id") or metadata.get("reply_to") or ""
+        ).strip()
+        if not reply_to_message_id:
+            return
+
+        archive_text = None
+        if self.inbound_archive is not None:
+            try:
+                row = self.inbound_archive.lookup_message(msg.channel, msg.chat_id, reply_to_message_id)
+            except Exception as e:
+                logger.warning(f"Reply context archive lookup failed for {reply_to_message_id}: {e}")
+                row = None
+            if row:
+                archive_text = str(row.get("text") or "").strip() or None
+
+        if archive_text:
+            metadata["reply_to_text"] = archive_text
+            metadata["reply_context_source"] = "archive"
+            msg.metadata = metadata
+            return
+
+        event_text = str(metadata.get("reply_to_text") or "").strip()
+        if event_text:
+            metadata["reply_context_source"] = "whatsapp_event"
+            msg.metadata = metadata
 
     def _tool_definitions(self, allowed_tools: set[str]) -> list[dict]:
         """Filter tool schemas by policy."""
@@ -970,6 +1009,7 @@ class AgentLoop:
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
+            current_metadata=msg.metadata if msg.metadata else None,
             channel=origin_channel,
             chat_id=origin_chat_id,
         )

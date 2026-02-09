@@ -78,6 +78,7 @@ class ChatPolicyOverride(PolicyModel):
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     persona_file: str | None = Field(default=None, alias="personaFile")
+    comment: str | None = Field(default=None, alias="comment")
 
 
 class ChannelPolicy(PolicyModel):

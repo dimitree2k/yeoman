@@ -375,6 +375,8 @@ Default is `false` (no timing summary logs).
 Merge precedence is:
 `defaults -> channels.<channel>.default -> channels.<channel>.chats.<chat_id>`
 
+All supported options are documented in `.docs/POLICY.md`.
+
 ```json
 {
   "version": 2,
@@ -418,6 +420,13 @@ Merge precedence is:
 > `channels.*.allowFrom` has been removed from `config.json`.
 > Use `policy.json` and run `nanobot policy migrate-allowfrom` if you still have legacy entries.
 > `policy.json` is hot-reloaded by default (no gateway restart needed after edits).
+
+Quick reference for modes:
+- `whoCanTalk.mode`: `everyone` | `allowlist` | `owner_only`
+- `whenToReply.mode`: `all` | `off` | `mention_only` | `allowed_senders` | `owner_only`
+- `allowedTools.mode`: `all` | `allowlist`
+
+Tip: use `nanobot policy explain` to debug "why didn’t the bot reply?" for a specific chat/sender.
 
 ### Providers
 
@@ -534,6 +543,7 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot policy path` | Print the active `policy.json` location |
 | `nanobot policy explain` | Show merged policy + decision for a specific channel/chat/sender |
 | `nanobot policy migrate-allowfrom` | Migrate legacy `channels.*.allowFrom` into `policy.json` |
+| `nanobot policy annotate-whatsapp-comments` | Auto-fill WhatsApp `*@g.us` chat IDs with human-readable `comment` names |
 
 ### Policy Command Examples
 
@@ -554,6 +564,9 @@ nanobot policy migrate-allowfrom --dry-run
 
 # Apply migration (creates policy backup automatically)
 nanobot policy migrate-allowfrom
+
+# Auto-fill WhatsApp group names into policy chat comments (creates policy backup automatically)
+nanobot policy annotate-whatsapp-comments
 ```
 
 <details>

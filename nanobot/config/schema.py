@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
@@ -13,6 +14,44 @@ class WhatsAppConfig(BaseModel):
 
     enabled: bool = False
     bridge_url: str = "ws://localhost:3001"
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = 3001
+    bridge_token: str = ""
+    bridge_auto_repair: bool = True
+    bridge_startup_timeout_ms: int = 15000
+    auth_dir: str = "~/.nanobot/whatsapp-auth"
+    debounce_ms: int = 0
+    read_receipts: bool = True
+    media_max_mb: int = 50
+    max_dedupe_entries: int = 5000
+    max_debounce_buckets: int = 2000
+    reconnect_initial_ms: int = 1000
+    reconnect_max_ms: int = 30000
+    reconnect_factor: float = 2.0
+    reconnect_jitter: float = 0.25
+    reconnect_max_attempts: int = 0  # 0 means unlimited retries
+    max_payload_bytes: int = 262144
+
+    @property
+    def resolved_bridge_port(self) -> int:
+        if self.bridge_port:
+            return self.bridge_port
+        parsed = urlparse(self.bridge_url)
+        if parsed.port is not None:
+            return parsed.port
+        if parsed.scheme == "wss":
+            return 443
+        if parsed.scheme == "ws":
+            return 80
+        return 3001
+
+    @property
+    def resolved_bridge_url(self) -> str:
+        host = (self.bridge_host or "").strip()
+        if not host:
+            parsed = urlparse(self.bridge_url)
+            host = parsed.hostname or "127.0.0.1"
+        return f"ws://{host}:{self.resolved_bridge_port}"
 
 
 class TelegramConfig(BaseModel):
@@ -133,6 +172,13 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
+class BusConfig(BaseModel):
+    """Message bus configuration."""
+
+    inbound_maxsize: int = 2000
+    outbound_maxsize: int = 2000
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -140,6 +186,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    bus: BusConfig = Field(default_factory=BusConfig)
 
     @property
     def workspace_path(self) -> Path:

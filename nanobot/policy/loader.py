@@ -31,7 +31,12 @@ def save_policy(policy: PolicyConfig, path: Path | None = None) -> None:
     policy_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = policy_path.with_suffix(f"{policy_path.suffix}.tmp")
     with open(tmp_path, "w") as f:
-        json.dump(policy.model_dump(by_alias=True, exclude_none=True), f, indent=2)
+        json.dump(
+            policy.model_dump(by_alias=True, exclude_none=True),
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
     tmp_path.replace(policy_path)
 
 

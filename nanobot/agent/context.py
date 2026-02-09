@@ -125,6 +125,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         self,
         history: list[dict[str, Any]],
         current_message: str,
+        current_metadata: dict[str, Any] | None = None,
         skill_names: list[str] | None = None,
         persona_text: str | None = None,
         media: list[str] | None = None,
@@ -157,15 +158,21 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages.extend(history)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
+        user_content = self._build_user_content(current_message, media, metadata=current_metadata)
         messages.append({"role": "user", "content": user_content})
 
         return messages
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
+    def _build_user_content(
+        self,
+        text: str,
+        media: list[str] | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
+        text_with_context = self._with_reply_context(text, metadata)
         if not media:
-            return text
+            return text_with_context
 
         images = []
         for path in media:
@@ -177,8 +184,32 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
         if not images:
+            return text_with_context
+        return images + [{"type": "text", "text": text_with_context}]
+
+    def _with_reply_context(self, text: str, metadata: dict[str, Any] | None) -> str:
+        """Append compact reply metadata so models can resolve quoted-message intent."""
+        if not metadata:
             return text
-        return images + [{"type": "text", "text": text}]
+
+        reply_to_message_id = str(metadata.get("reply_to_message_id") or metadata.get("reply_to") or "").strip()
+        reply_to_participant = str(metadata.get("reply_to_participant") or "").strip()
+        reply_to_text = str(metadata.get("reply_to_text") or "").strip()
+        if not reply_to_text:
+            return text
+
+        lines = ["[Reply Context]"]
+        if reply_to_message_id:
+            lines.append(f"reply_to_message_id: {reply_to_message_id}")
+        if reply_to_participant:
+            lines.append(f"reply_to_participant: {reply_to_participant}")
+        if reply_to_text:
+            compact_text = " ".join(reply_to_text.split())
+            if len(compact_text) > 600:
+                compact_text = compact_text[:600] + "..."
+            lines.append(f"quoted_message: {compact_text}")
+
+        return f"{text}\n\n" + "\n".join(lines)
 
     def add_tool_result(
         self,

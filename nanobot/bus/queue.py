@@ -16,15 +16,33 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    def __init__(self, *, inbound_maxsize: int = 0, outbound_maxsize: int = 0):
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=max(0, inbound_maxsize))
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(maxsize=max(0, outbound_maxsize))
         self._outbound_subscribers: dict[str, list[Callable[[OutboundMessage], Awaitable[None]]]] = {}
         self._running = False
+        self._inbound_dropped = 0
+        self._outbound_dropped = 0
+
+    async def _put_bounded(self, queue: asyncio.Queue, msg: object, channel: str) -> None:
+        if queue.maxsize > 0 and queue.full():
+            try:
+                queue.get_nowait()
+                if channel == "inbound":
+                    self._inbound_dropped += 1
+                    dropped = self._inbound_dropped
+                else:
+                    self._outbound_dropped += 1
+                    dropped = self._outbound_dropped
+                if dropped == 1 or dropped % 100 == 0:
+                    logger.warning(f"MessageBus {channel} queue overflow: dropped={dropped}")
+            except asyncio.QueueEmpty:
+                pass
+        await queue.put(msg)
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
-        await self.inbound.put(msg)
+        await self._put_bounded(self.inbound, msg, "inbound")
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
@@ -32,7 +50,7 @@ class MessageBus:
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
-        await self.outbound.put(msg)
+        await self._put_bounded(self.outbound, msg, "outbound")
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""
@@ -79,3 +97,13 @@ class MessageBus:
     def outbound_size(self) -> int:
         """Number of pending outbound messages."""
         return self.outbound.qsize()
+
+    @property
+    def inbound_dropped(self) -> int:
+        """Number of dropped inbound messages due to queue overflow."""
+        return self._inbound_dropped
+
+    @property
+    def outbound_dropped(self) -> int:
+        """Number of dropped outbound messages due to queue overflow."""
+        return self._outbound_dropped

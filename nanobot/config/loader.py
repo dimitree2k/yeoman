@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from nanobot.config.schema import Config
 
@@ -60,6 +61,11 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Best effort across platforms/filesystems.
+        pass
 
 
 def _migrate_config(data: dict) -> dict:
@@ -90,6 +96,18 @@ def _migrate_config(data: dict) -> dict:
 
     if "allowlist" in isolation_cfg and "allowlistPath" not in isolation_cfg:
         isolation_cfg["allowlistPath"] = isolation_cfg.pop("allowlist")
+
+    channels = data.get("channels")
+    if isinstance(channels, dict):
+        wa = channels.get("whatsapp")
+        if isinstance(wa, dict):
+            bridge_url = wa.get("bridgeUrl")
+            if isinstance(bridge_url, str) and bridge_url.strip():
+                parsed = urlparse(bridge_url)
+                if "bridgeHost" not in wa and parsed.hostname:
+                    wa["bridgeHost"] = parsed.hostname
+                if "bridgePort" not in wa and parsed.port is not None:
+                    wa["bridgePort"] = parsed.port
 
     return data
 
