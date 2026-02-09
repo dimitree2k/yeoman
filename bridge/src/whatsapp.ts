@@ -117,6 +117,16 @@ function jidUserToken(jidRaw: string): string {
   return normalized.split('@', 1)[0] || '';
 }
 
+export function resolveParticipantJid(msg: any, remoteJidRaw: string, isGroup: boolean): string {
+  if (!isGroup) {
+    // In 1:1 chats, contextInfo.participant can point to quoted-message author,
+    // so it must never be used to determine the current sender.
+    return normalizeJid(remoteJidRaw);
+  }
+  const participantJidRaw = msg?.key?.participant || msg?.participant || remoteJidRaw;
+  return normalizeJid(String(participantJidRaw || ''));
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -727,12 +737,7 @@ export class WhatsAppClient {
         }
 
         const isGroup = chatJid.endsWith('@g.us');
-        const participantJidRaw =
-          msg?.key?.participant ||
-          msg?.participant ||
-          msg?.message?.extendedTextMessage?.contextInfo?.participant ||
-          remoteJidRaw;
-        const participantJid = normalizeJid(String(participantJidRaw || ''));
+        const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
         const senderId = jidUserToken(participantJid || chatJid);
 
         const extracted = this.extractMessageTextAndMedia(msg);

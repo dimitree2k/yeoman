@@ -61,8 +61,8 @@ class Orchestrator:
             return intents
 
         self._record_archive(event)
-        event, archive_hit = self._resolve_reply_context(event)
-        if event.channel == "whatsapp":
+        event, lookup_attempted, archive_hit = self._resolve_reply_context(event)
+        if event.channel == "whatsapp" and lookup_attempted:
             intents.append(
                 RecordMetricIntent(
                     name="reply_ctx_archive_hit" if archive_hit else "reply_ctx_archive_miss",
@@ -186,16 +186,16 @@ class Orchestrator:
             )
             self._reply_archive.record_inbound(seeded)
 
-    def _resolve_reply_context(self, event: InboundEvent) -> tuple[InboundEvent, bool]:
+    def _resolve_reply_context(self, event: InboundEvent) -> tuple[InboundEvent, bool, bool]:
         if self._reply_archive is None:
-            return event, False
+            return event, False, False
         if event.channel != "whatsapp":
-            return event, False
+            return event, False, False
         if event.reply_to_text:
-            return event, False
+            return event, False, False
         reply_to_message_id = (event.reply_to_message_id or "").strip()
         if not reply_to_message_id:
-            return event, False
+            return event, False, False
 
         row = self._reply_archive.lookup_message(event.channel, event.chat_id, reply_to_message_id)
         if row is None:
@@ -205,9 +205,9 @@ class Orchestrator:
                 preferred_chat_id=event.chat_id,
             )
         if row is None:
-            return event, False
+            return event, True, False
 
         text = row.text.strip()
         if not text:
-            return event, False
-        return replace(event, reply_to_text=text), True
+            return event, True, False
+        return replace(event, reply_to_text=text), True, True
