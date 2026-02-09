@@ -20,13 +20,14 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.core.models import InboundEvent, PolicyDecision
-from nanobot.core.ports import ResponderPort
+from nanobot.core.ports import ResponderPort, TelemetryPort
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
+    from nanobot.memory.service import MemoryService
 
 
 class LLMResponder(ResponderPort):
@@ -45,6 +46,8 @@ class LLMResponder(ResponderPort):
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        memory_service: "MemoryService | None" = None,
+        telemetry: TelemetryPort | None = None,
     ) -> None:
         from nanobot.config.schema import ExecToolConfig
 
@@ -56,6 +59,8 @@ class LLMResponder(ResponderPort):
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self.memory = memory_service
+        self.telemetry = telemetry
 
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
@@ -110,6 +115,19 @@ class LLMResponder(ResponderPort):
         if self.cron_service is not None:
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
+
+    def _metric(
+        self,
+        name: str,
+        value: int = 1,
+        labels: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        if self.telemetry is None:
+            return
+        try:
+            self.telemetry.incr(name, value, labels)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.debug("telemetry incr failed {}={}: {}", name, value, exc)
 
     def _set_tool_context(self, *, channel: str, chat_id: str, session_key: str) -> None:
         message_tool = self.tools.get("message")
@@ -221,6 +239,7 @@ class LLMResponder(ResponderPort):
         channel: str,
         chat_id: str,
         content: str,
+        sender_id: str | None,
         media: tuple[str, ...],
         metadata: dict[str, object],
         allowed_tools: set[str],
@@ -229,10 +248,45 @@ class LLMResponder(ResponderPort):
         session = self.sessions.get_or_create(session_key)
         self._set_tool_context(channel=channel, chat_id=chat_id, session_key=session_key)
 
+        if self.memory is not None:
+            try:
+                self.memory.pre_write_session_state(
+                    session_key=session_key,
+                    channel=channel,
+                    chat_id=chat_id,
+                    user_message=content,
+                    metadata=metadata,
+                )
+            except Exception as e:
+                logger.warning("memory wal pre-write failed: {}", e)
+
+        retrieved_memory_text = ""
+        retrieved_hits_count = 0
+        if self.memory is not None:
+            try:
+                retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    query=content,
+                    reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
+                )
+                retrieved_hits_count = len(retrieved_hits)
+            except Exception as e:
+                logger.warning("memory recall failed: {}", e)
+
+            if retrieved_hits_count > 0:
+                self._metric("memory_recall_hit")
+            else:
+                self._metric("memory_recall_miss")
+            if retrieved_memory_text:
+                self._metric("memory_prompt_chars", len(retrieved_memory_text))
+
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=content,
             current_metadata=metadata,
+            retrieved_memory_text=retrieved_memory_text,
             persona_text=persona_text,
             media=list(media),
             channel=channel,
@@ -240,6 +294,47 @@ class LLMResponder(ResponderPort):
         )
 
         final_content = await self._chat_loop(messages=messages, allowed_tools=allowed_tools)
+
+        if self.memory is not None:
+            try:
+                capture_result = self.memory.capture_from_turn(
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    user_message=content,
+                    source_message_id=str(metadata.get("message_id") or "").strip() or None,
+                    assistant_reply=final_content,
+                )
+                logger.info(
+                    "memory capture: saved={} deduped={} dropped_low_conf={} dropped_safety={}",
+                    len(capture_result.saved),
+                    capture_result.deduped,
+                    capture_result.dropped_low_confidence,
+                    capture_result.dropped_safety,
+                )
+                if capture_result.saved:
+                    self._metric("memory_capture_saved", len(capture_result.saved))
+                if capture_result.dropped_low_confidence:
+                    self._metric(
+                        "memory_capture_dropped_low_conf",
+                        capture_result.dropped_low_confidence,
+                    )
+                if capture_result.dropped_safety:
+                    self._metric("memory_capture_dropped_safety", capture_result.dropped_safety)
+                if capture_result.deduped:
+                    self._metric("memory_capture_deduped", capture_result.deduped)
+            except Exception as e:
+                logger.warning("memory capture failed: {}", e)
+
+            try:
+                self.memory.post_write_session_state(
+                    session_key=session_key,
+                    assistant_reply=final_content,
+                    pending_actions=[],
+                )
+            except Exception as e:
+                logger.warning("memory wal post-write failed: {}", e)
+
         session.add_message("user", content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
@@ -254,6 +349,7 @@ class LLMResponder(ResponderPort):
             channel=route_channel,
             chat_id=route_chat_id,
             content=event.content,
+            sender_id=event.sender_id,
             media=event.media,
             metadata=self._metadata_for_event(event),
             allowed_tools=set(decision.allowed_tools),
@@ -275,6 +371,7 @@ class LLMResponder(ResponderPort):
             channel=channel,
             chat_id=chat_id,
             content=content,
+            sender_id=chat_id,
             media=(),
             metadata={},
             allowed_tools=set(allowed_tools or self.tool_names),

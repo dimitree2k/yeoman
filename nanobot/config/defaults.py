@@ -49,6 +49,40 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "max_image_bytes_mb": 8,
 }
 
+DEFAULT_MEMORY: dict[str, Any] = {
+    "enabled": True,
+    "db_path": "~/.nanobot/memory/longterm.db",
+    "backend": "sqlite_fts",
+    "recall": {
+        "max_results": 8,
+        "max_prompt_chars": 2400,
+        "user_preference_layer_results": 2,
+    },
+    "capture": {
+        "enabled": True,
+        "mode": "heuristic",
+        "min_confidence": 0.78,
+        "min_importance": 0.60,
+        "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],
+        "capture_assistant": False,
+        "max_entries_per_turn": 4,
+    },
+    "retention": {
+        "episodic_days": 90,
+        "fact_days": 3650,
+        "preference_days": 3650,
+        "decision_days": 3650,
+    },
+    "wal": {
+        "enabled": True,
+        "state_dir": "memory/session-state",
+    },
+    "embedding": {
+        "enabled": False,
+        "backend": "reserved_hybrid",
+    },
+}
+
 
 def default_model_profiles() -> dict[str, dict[str, Any]]:
     """Return a deep-copied models.profiles payload."""
@@ -63,6 +97,11 @@ def default_model_routes() -> dict[str, str]:
 def default_whatsapp_media() -> dict[str, Any]:
     """Return a deep-copied channels.whatsapp.media payload."""
     return deepcopy(DEFAULT_WHATSAPP_MEDIA)
+
+
+def default_memory() -> dict[str, Any]:
+    """Return a deep-copied memory payload."""
+    return deepcopy(DEFAULT_MEMORY)
 
 
 def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
@@ -102,6 +141,23 @@ def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
             if isinstance(media, dict):
                 for k, v in default_whatsapp_media().items():
                     media.setdefault(k, v)
+
+    memory = snake_config.setdefault("memory", {})
+    if isinstance(memory, dict):
+        seeded_memory = default_memory()
+        for k, v in seeded_memory.items():
+            if isinstance(v, dict):
+                nested = memory.setdefault(k, {})
+                if isinstance(nested, dict):
+                    for nk, nv in v.items():
+                        nested.setdefault(nk, nv)
+                else:
+                    memory[k] = deepcopy(v)
+            elif isinstance(v, list):
+                if not isinstance(memory.get(k), list):
+                    memory[k] = list(v)
+            else:
+                memory.setdefault(k, v)
 
 
 def _resolve_assistant_model(snake_config: dict[str, Any]) -> str:

@@ -31,6 +31,7 @@ from nanobot.cron.types import CronJob
 from nanobot.heartbeat.service import HeartbeatService
 from nanobot.media.router import ModelRouter
 from nanobot.media.storage import MediaStorage
+from nanobot.memory import MemoryService
 from nanobot.providers.factory import ProviderFactory
 from nanobot.session.manager import SessionManager
 from nanobot.storage.inbound_archive import InboundArchive
@@ -145,6 +146,7 @@ class GatewayRuntime:
     heartbeat: HeartbeatService
     inbound_archive: InboundArchive
     responder: LLMResponder
+    memory: MemoryService
 
     async def run(self) -> None:
         try:
@@ -161,6 +163,7 @@ class GatewayRuntime:
             await self.channels.stop_all()
             await self.responder.aclose()
             self.inbound_archive.close()
+            self.memory.close()
 
 
 def build_gateway_runtime(
@@ -196,6 +199,19 @@ def build_gateway_runtime(
     except KeyError:
         pass
 
+    telemetry = InMemoryTelemetry()
+
+    memory_service = MemoryService(
+        workspace=workspace,
+        config=config.memory,
+    )
+    try:
+        imported = memory_service.backfill_from_workspace_files(force=False)
+        if imported > 0:
+            logger.info("memory backfill imported {} entries", imported)
+    except Exception as e:
+        logger.warning("memory backfill failed: {}", e)
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -206,6 +222,8 @@ def build_gateway_runtime(
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        memory_service=memory_service,
+        telemetry=telemetry,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
@@ -225,7 +243,6 @@ def build_gateway_runtime(
         provider_factory=provider_factory,
     )
 
-    telemetry = InMemoryTelemetry()
     typing_adapter = ChannelManagerTypingAdapter(channels)
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
@@ -286,4 +303,5 @@ def build_gateway_runtime(
         heartbeat=heartbeat,
         inbound_archive=inbound_archive,
         responder=responder,
+        memory=memory_service,
     )

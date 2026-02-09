@@ -178,6 +178,13 @@ def _make_provider(config):
     )
 
 
+def _make_memory_service(config):
+    """Create memory service from config/workspace."""
+    from nanobot.memory import MemoryService
+
+    return MemoryService(workspace=config.workspace_path, config=config.memory)
+
+
 def _make_policy_engine(config):
     """Create policy engine + path from ~/.nanobot/policy.json."""
     from nanobot.policy.engine import PolicyEngine
@@ -639,10 +646,13 @@ def agent(
 ):
     """Interact with the agent directly."""
     from nanobot.adapters.responder_llm import LLMResponder
+    from nanobot.adapters.telemetry import InMemoryTelemetry
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
 
     config = load_config()
+    memory_service = _make_memory_service(config)
+    telemetry = InMemoryTelemetry()
 
     bus = MessageBus(
         inbound_maxsize=config.bus.inbound_maxsize,
@@ -658,6 +668,8 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        memory_service=memory_service,
+        telemetry=telemetry,
     )
 
     if message:
@@ -670,6 +682,7 @@ def agent(
             asyncio.run(run_once())
         finally:
             responder.close()
+            memory_service.close()
     else:
         # Interactive mode
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
@@ -691,6 +704,7 @@ def agent(
             asyncio.run(run_interactive())
         finally:
             responder.close()
+            memory_service.close()
 
 
 # ============================================================================
@@ -1511,6 +1525,258 @@ def cron_run(
         console.print("[green]✓[/green] Job executed")
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
+
+
+# ============================================================================
+# Memory Commands
+# ============================================================================
+
+
+memory_app = typer.Typer(help="Manage long-term memory")
+app.add_typer(memory_app, name="memory")
+
+
+def _memory_scope_keys(
+    service,
+    *,
+    scope: str,
+    channel: str | None,
+    chat_id: str | None,
+    sender_id: str | None,
+) -> list[str]:
+    keys: list[str] = []
+    if scope in {"chat", "all"} and channel and chat_id:
+        keys.append(service.chat_scope_key(channel, chat_id))
+    if scope in {"user", "all"} and channel and (sender_id or chat_id):
+        keys.append(service.user_scope_key(channel, (sender_id or chat_id or "").strip()))
+    if scope in {"global", "all"}:
+        keys.append(service.global_scope_key())
+    return keys
+
+
+@memory_app.command("status")
+def memory_status():
+    """Show long-term memory status and counters."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        stats = service.stats()
+    finally:
+        service.close()
+
+    console.print("[bold]Memory Status[/bold]")
+    console.print(f"enabled: {stats.get('enabled')}")
+    console.print(f"backend: {stats.get('backend')}")
+    console.print(f"wal_enabled: {stats.get('wal_enabled')}")
+    console.print(f"db_path: {stats.get('db_path')}")
+    console.print(f"state_dir: {stats.get('state_dir')}")
+    console.print(f"total_active: {stats.get('total_active')}")
+    console.print(f"total_deleted: {stats.get('total_deleted')}")
+    console.print(f"wal_files: {stats.get('wal_files')}")
+    marker = str(stats.get("backfill_marker") or "")
+    console.print(f"backfill_marker: {marker or '(not set)'}")
+
+    kind_table = Table(title="By Kind")
+    kind_table.add_column("Kind")
+    kind_table.add_column("Count", justify="right")
+    for kind, count in sorted((stats.get("by_kind") or {}).items()):
+        kind_table.add_row(str(kind), str(count))
+    console.print(kind_table)
+
+    scope_table = Table(title="By Scope")
+    scope_table.add_column("Scope")
+    scope_table.add_column("Count", justify="right")
+    for scope_name, count in sorted((stats.get("by_scope") or {}).items()):
+        scope_table.add_row(str(scope_name), str(count))
+    console.print(scope_table)
+
+
+@memory_app.command("search")
+def memory_search(
+    query: str = typer.Option(..., "--query", "-q", help="Search query"),
+    channel: str | None = typer.Option(None, "--channel", help="Channel for scoped search"),
+    chat_id: str | None = typer.Option(None, "--chat-id", help="Chat id for scoped search"),
+    sender_id: str | None = typer.Option(None, "--sender-id", help="Sender id for user scope"),
+    scope: str = typer.Option("all", "--scope", help="chat|user|global|all"),
+    limit: int = typer.Option(8, "--limit", "-n", min=1, max=100),
+):
+    """Search long-term memory with scope filters."""
+    from nanobot.config.loader import load_config
+
+    scope_value = scope.strip().lower()
+    if scope_value not in {"chat", "user", "global", "all"}:
+        console.print("[red]Invalid --scope. Use: chat|user|global|all[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        hits = service.search(
+            query=query,
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            scope=scope_value,
+            limit=limit,
+        )
+    finally:
+        service.close()
+
+    if not hits:
+        console.print("No memory hits.")
+        return
+
+    table = Table(title="Memory Search Results")
+    table.add_column("Score", justify="right")
+    table.add_column("Kind")
+    table.add_column("Scope")
+    table.add_column("Updated")
+    table.add_column("Content")
+    for hit in hits:
+        content = " ".join(hit.entry.content.split())
+        if len(content) > 120:
+            content = content[:117] + "..."
+        table.add_row(
+            f"{hit.final_score:.2f}",
+            hit.entry.kind,
+            hit.entry.scope_type,
+            hit.entry.updated_at[:19],
+            content,
+        )
+    console.print(table)
+
+
+@memory_app.command("add")
+def memory_add(
+    text: str = typer.Option(..., "--text", "-t", help="Memory text"),
+    kind: str = typer.Option(..., "--kind", "-k", help="preference|decision|fact|episodic"),
+    scope: str = typer.Option("chat", "--scope", help="chat|user|global"),
+    channel: str = typer.Option("cli", "--channel", help="Channel for chat/user scope"),
+    chat_id: str = typer.Option("direct", "--chat-id", help="Chat id for chat/user scope"),
+    sender_id: str | None = typer.Option(None, "--sender-id", help="Sender id for user scope"),
+    importance: float = typer.Option(0.8, "--importance", min=0.0, max=1.0),
+    confidence: float = typer.Option(1.0, "--confidence", min=0.0, max=1.0),
+):
+    """Add one manual memory entry."""
+    from nanobot.config.loader import load_config
+
+    kind_value = kind.strip().lower()
+    if kind_value not in {"preference", "decision", "fact", "episodic"}:
+        console.print("[red]Invalid --kind. Use: preference|decision|fact|episodic[/red]")
+        raise typer.Exit(1)
+    scope_value = scope.strip().lower()
+    if scope_value not in {"chat", "user", "global"}:
+        console.print("[red]Invalid --scope. Use: chat|user|global[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        entry, inserted = service.record_manual(
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            scope_type=scope_value,
+            kind=kind_value,
+            text=text,
+            importance=importance,
+            confidence=confidence,
+        )
+    finally:
+        service.close()
+
+    action = "Inserted" if inserted else "Merged"
+    console.print(f"[green]✓[/green] {action} memory entry: {entry.id}")
+    console.print(f"scope={entry.scope_type}:{entry.scope_key}")
+
+
+@memory_app.command("prune")
+def memory_prune(
+    older_than_days: int | None = typer.Option(
+        None,
+        "--older-than-days",
+        help="Prune entries older than N days by updated_at",
+    ),
+    kind: str | None = typer.Option(None, "--kind", help="Optional kind filter"),
+    scope: str = typer.Option("all", "--scope", help="chat|user|global|all"),
+    channel: str | None = typer.Option(None, "--channel", help="Channel for scope filter"),
+    chat_id: str | None = typer.Option(None, "--chat-id", help="Chat id for scope filter"),
+    sender_id: str | None = typer.Option(None, "--sender-id", help="Sender id for user scope"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only"),
+):
+    """Prune long-term memory entries safely."""
+    from nanobot.config.loader import load_config
+
+    scope_value = scope.strip().lower()
+    if scope_value not in {"chat", "user", "global", "all"}:
+        console.print("[red]Invalid --scope. Use: chat|user|global|all[/red]")
+        raise typer.Exit(1)
+
+    kinds: set[str] | None = None
+    if kind:
+        k = kind.strip().lower()
+        if k not in {"preference", "decision", "fact", "episodic"}:
+            console.print("[red]Invalid --kind. Use: preference|decision|fact|episodic[/red]")
+            raise typer.Exit(1)
+        kinds = {k}
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        scope_keys = _memory_scope_keys(
+            service,
+            scope=scope_value,
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+        )
+        pruned = service.prune(
+            older_than_days=older_than_days,
+            kinds=kinds,
+            scope_keys=scope_keys or None,
+            dry_run=dry_run,
+        )
+    finally:
+        service.close()
+
+    if dry_run:
+        console.print(f"[yellow]Dry run:[/yellow] {pruned} entries would be pruned.")
+    else:
+        console.print(f"[green]✓[/green] Pruned {pruned} entries.")
+
+
+@memory_app.command("backfill")
+def memory_backfill(
+    force: bool = typer.Option(False, "--force", help="Run backfill even if marker exists"),
+):
+    """Backfill legacy memory files into long-term memory DB."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        imported = service.backfill_from_workspace_files(force=force)
+    finally:
+        service.close()
+
+    console.print(f"[green]✓[/green] Backfill imported {imported} entries.")
+
+
+@memory_app.command("reindex")
+def memory_reindex():
+    """Rebuild memory full-text index."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    service = _make_memory_service(config)
+    try:
+        service.reindex()
+    finally:
+        service.close()
+
+    console.print("[green]✓[/green] Memory FTS index rebuilt.")
 
 
 # ============================================================================

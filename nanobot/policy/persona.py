@@ -7,11 +7,30 @@ from pathlib import Path
 from loguru import logger
 
 
+def _legacy_persona_relative(raw: Path) -> Path | None:
+    """Map legacy memory/personas/* paths to personas/*."""
+    parts = raw.parts
+    if len(parts) >= 2 and parts[0] == "memory" and parts[1] == "personas":
+        return Path("personas", *parts[2:])
+    return None
+
+
 def resolve_persona_path(persona_file: str, workspace: Path) -> Path:
     """Resolve a persona path and ensure it stays inside workspace."""
     workspace_resolved = workspace.expanduser().resolve()
     raw = Path(persona_file).expanduser()
-    path = (workspace_resolved / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        primary = (workspace_resolved / raw).resolve()
+        legacy = _legacy_persona_relative(raw)
+        # Backward compatibility: if old memory/personas path is configured
+        # but files moved to workspace/personas, use the new location.
+        if legacy is not None and not primary.exists():
+            fallback = (workspace_resolved / legacy).resolve()
+            path = fallback if fallback.exists() else primary
+        else:
+            path = primary
     try:
         path.relative_to(workspace_resolved)
     except ValueError as e:
@@ -33,4 +52,3 @@ def load_persona_text(persona_file: str | None, workspace: Path) -> str | None:
         logger.warning(f"persona path is not a file: {path}")
         return None
     return path.read_text(encoding="utf-8")
-

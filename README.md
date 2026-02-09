@@ -403,7 +403,7 @@ All supported options are documented in `.docs/POLICY.md`.
         "-1001234567890": {
           "whoCanTalk": { "mode": "owner_only", "senders": [] },
           "allowedTools": { "mode": "allowlist", "tools": ["read_file", "web_search", "web_fetch"], "deny": ["exec", "spawn"] },
-          "personaFile": "memory/personas/serious.md"
+          "personaFile": "personas/serious.md"
         }
       }
     },
@@ -544,6 +544,32 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot policy explain` | Show merged policy + decision for a specific channel/chat/sender |
 | `nanobot policy migrate-allowfrom` | Migrate legacy `channels.*.allowFrom` into `policy.json` |
 | `nanobot policy annotate-whatsapp-comments` | Auto-fill WhatsApp `*@g.us` chat IDs with human-readable `comment` names |
+| `nanobot memory status` | Show long-term memory backend and counters |
+| `nanobot memory search --query ...` | Search long-term memory |
+| `nanobot memory add --text ... --kind ...` | Insert one manual memory entry |
+| `nanobot memory prune --dry-run` | Preview or run memory cleanup |
+| `nanobot memory backfill` | Import legacy `memory/*.md` files into DB |
+| `nanobot memory reindex` | Rebuild memory FTS index |
+
+### Memory Operator Playbook
+
+```bash
+# Inspect backend/counters
+nanobot memory status
+
+# Verify recall for a chat/user scope
+nanobot memory search --query "preferred coding style" --channel cli --chat-id direct --scope all
+
+# Add operator-curated memory
+nanobot memory add --text "Use concise answers by default" --kind preference --scope user --channel cli --chat-id direct
+
+# Preview retention cleanup
+nanobot memory prune --older-than-days 365 --dry-run
+
+# Run cleanup / rebuild index if needed
+nanobot memory prune --older-than-days 365
+nanobot memory reindex
+```
 
 ### Policy Command Examples
 

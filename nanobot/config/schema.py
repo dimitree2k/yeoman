@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
 
 from nanobot.config.defaults import (
+    DEFAULT_MEMORY,
     DEFAULT_WHATSAPP_MEDIA,
     default_model_profiles,
     default_model_routes,
@@ -234,6 +235,76 @@ class WebToolsConfig(BaseModel):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class MemoryRecallConfig(BaseModel):
+    """Recall configuration for long-term memory retrieval."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    max_results: int = int(DEFAULT_MEMORY["recall"]["max_results"])
+    max_prompt_chars: int = int(DEFAULT_MEMORY["recall"]["max_prompt_chars"])
+    user_preference_layer_results: int = int(
+        DEFAULT_MEMORY["recall"]["user_preference_layer_results"]
+    )
+
+
+class MemoryCaptureConfig(BaseModel):
+    """Capture configuration for automatic memory extraction."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["capture"]["enabled"])
+    mode: Literal["heuristic"] = str(DEFAULT_MEMORY["capture"]["mode"])
+    min_confidence: float = float(DEFAULT_MEMORY["capture"]["min_confidence"])
+    min_importance: float = float(DEFAULT_MEMORY["capture"]["min_importance"])
+    channels: list[str] = Field(default_factory=lambda: list(DEFAULT_MEMORY["capture"]["channels"]))
+    capture_assistant: bool = bool(DEFAULT_MEMORY["capture"]["capture_assistant"])
+    max_entries_per_turn: int = int(DEFAULT_MEMORY["capture"]["max_entries_per_turn"])
+
+
+class MemoryRetentionConfig(BaseModel):
+    """Retention policy by memory kind."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    episodic_days: int = int(DEFAULT_MEMORY["retention"]["episodic_days"])
+    fact_days: int = int(DEFAULT_MEMORY["retention"]["fact_days"])
+    preference_days: int = int(DEFAULT_MEMORY["retention"]["preference_days"])
+    decision_days: int = int(DEFAULT_MEMORY["retention"]["decision_days"])
+
+
+class MemoryWalConfig(BaseModel):
+    """Write-ahead log config for session state durability."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["wal"]["enabled"])
+    state_dir: str = str(DEFAULT_MEMORY["wal"]["state_dir"])
+
+
+class MemoryEmbeddingConfig(BaseModel):
+    """Reserved embedding config for future hybrid retrieval."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["embedding"]["enabled"])
+    backend: Literal["reserved_hybrid", "sqlite_fts"] = str(DEFAULT_MEMORY["embedding"]["backend"])
+
+
+class MemoryConfig(BaseModel):
+    """Long-term memory system configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["enabled"])
+    db_path: str = str(DEFAULT_MEMORY["db_path"])
+    backend: Literal["sqlite_fts", "reserved_hybrid"] = str(DEFAULT_MEMORY["backend"])
+    recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
+    capture: MemoryCaptureConfig = Field(default_factory=MemoryCaptureConfig)
+    retention: MemoryRetentionConfig = Field(default_factory=MemoryRetentionConfig)
+    wal: MemoryWalConfig = Field(default_factory=MemoryWalConfig)
+    embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)
+
+
 class ExecIsolationConfig(BaseModel):
     """Container isolation configuration for exec tool."""
 
@@ -277,6 +348,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     bus: BusConfig = Field(default_factory=BusConfig)
 
     @property

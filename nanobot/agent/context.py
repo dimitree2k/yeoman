@@ -8,6 +8,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.memory.render import render_legacy_memory_header
 
 
 class ContextBuilder:
@@ -54,9 +55,10 @@ class ContextBuilder:
             parts.append(f"# Channel Persona\n\n{persona_text}")
 
         # Memory context
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        legacy_long_term = self.memory.read_long_term()
+        legacy_header = render_legacy_memory_header(legacy_long_term, max_chars=800)
+        if legacy_header:
+            parts.append(f"# Memory\n\n{legacy_header}")
 
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
@@ -126,6 +128,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         history: list[dict[str, Any]],
         current_message: str,
         current_metadata: dict[str, Any] | None = None,
+        retrieved_memory_text: str | None = None,
         skill_names: list[str] | None = None,
         persona_text: str | None = None,
         media: list[str] | None = None,
@@ -156,6 +159,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
 
         # History
         messages.extend(history)
+
+        # Retrieved long-term memory (bounded, synthetic system context)
+        if retrieved_memory_text:
+            messages.append({"role": "system", "content": retrieved_memory_text})
 
         # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media, metadata=current_metadata)
