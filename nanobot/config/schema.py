@@ -214,7 +214,9 @@ class Config(BaseSettings):
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        base = Path.home() / ".nanobot"
+        candidate = Path(self.agents.defaults.workspace).expanduser()
+        return candidate if candidate.is_absolute() else base / candidate
 
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""

@@ -25,10 +25,12 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     Returns:
         Expanded and ensured workspace path.
     """
+    base = get_data_path()
     if workspace:
-        path = Path(workspace).expanduser()
+        candidate = Path(workspace).expanduser()
+        path = candidate if candidate.is_absolute() else base / candidate
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = base / "workspace"
     return ensure_dir(path)
 
 

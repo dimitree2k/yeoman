@@ -23,6 +23,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import _migrate_config, convert_keys, convert_to_camel
 from nanobot.config.schema import Config, ExecToolConfig
 from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.utils.helpers import get_workspace_path
 
 
 class SampleTool(Tool):
@@ -177,6 +178,29 @@ def test_config_migration_for_legacy_isolation_keys() -> None:
     assert isolation["enabled"] is True
     assert isolation["backend"] == "bubblewrap"
     assert isolation["allowlistPath"] == "/tmp/allow.json"
+
+
+def test_workspace_path_relative_is_scoped_under_nanobot_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = Config.model_validate(convert_keys({"agents": {"defaults": {"workspace": "workspace"}}}))
+    assert cfg.workspace_path == tmp_path / ".nanobot" / "workspace"
+
+
+def test_get_workspace_path_relative_is_scoped_under_nanobot_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    relative = get_workspace_path("workspace")
+    absolute_target = tmp_path / "custom-workspace"
+    absolute = get_workspace_path(str(absolute_target))
+
+    assert relative == tmp_path / ".nanobot" / "workspace"
+    assert relative.exists()
+    assert absolute == absolute_target
+    assert absolute.exists()
 
 
 class DummyProvider(LLMProvider):
