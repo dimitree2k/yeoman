@@ -67,6 +67,7 @@ def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
         reply_to_participant=str(meta.get("reply_to_participant") or "").strip() or None,
         reply_to_text=str(meta.get("reply_to_text") or "").strip() or None,
         media=tuple(msg.media),
+        raw_metadata=dict(meta),
     )
 
 
@@ -249,6 +250,8 @@ def build_gateway_runtime(
         policy=policy_adapter,
         responder=responder,
         reply_archive=archive_adapter,
+        reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
+        reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         typing_notifier=typing_adapter,
     )
 

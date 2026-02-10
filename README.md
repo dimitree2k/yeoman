@@ -553,6 +553,9 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 
 ### Memory Operator Playbook
 
+Full architecture and tuning guide:
+- `.docs/MEMORY_SYSTEM.md`
+
 ```bash
 # Inspect backend/counters
 nanobot memory status

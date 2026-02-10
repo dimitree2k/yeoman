@@ -66,6 +66,7 @@ class InboundEvent:
     reply_to_participant: str | None = None
     reply_to_text: str | None = None
     media: tuple[str, ...] = ()
+    raw_metadata: dict[str, object] = field(default_factory=dict)
 
     def normalized_content(self) -> str:
         """Normalized text used for dedupe and downstream processing."""

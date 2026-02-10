@@ -53,6 +53,23 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
             return None
         return self._to_archived(row)
 
+    @override
+    def lookup_messages_before(
+        self,
+        channel: str,
+        chat_id: str,
+        anchor_message_id: str,
+        *,
+        limit: int,
+    ) -> list[ArchivedMessage]:
+        rows = self._archive.lookup_messages_before(
+            channel,
+            chat_id,
+            anchor_message_id,
+            limit=limit,
+        )
+        return [self._to_archived(row) for row in rows]
+
     def _to_archived(self, row: dict[str, object]) -> ArchivedMessage:
         raw_timestamp = row.get("timestamp")
         timestamp: int | None

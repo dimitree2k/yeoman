@@ -159,8 +159,10 @@ class LLMResponder(ResponderPort):
 
     @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
-        return {
+        metadata = dict(event.raw_metadata)
+        metadata.update({
             "message_id": event.message_id,
+            "sender_id": event.sender_id,
             "participant": event.participant,
             "is_group": event.is_group,
             "mentioned_bot": event.mentioned_bot,
@@ -168,7 +170,8 @@ class LLMResponder(ResponderPort):
             "reply_to_message_id": event.reply_to_message_id,
             "reply_to_participant": event.reply_to_participant,
             "reply_to_text": event.reply_to_text,
-        }
+        })
+        return metadata
 
     def _tool_definitions(self, allowed_tools: set[str]) -> list[dict[str, Any]]:
         return [

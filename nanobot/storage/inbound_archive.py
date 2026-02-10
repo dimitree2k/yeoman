@@ -147,6 +147,71 @@ class InboundArchive:
             return None
         return dict(row)
 
+    def lookup_messages_before(
+        self,
+        channel: str,
+        chat_id: str,
+        anchor_message_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return up to `limit` messages before one anchor message in the same chat."""
+        if not channel or not chat_id or not anchor_message_id:
+            return []
+        effective_limit = max(1, int(limit))
+
+        with self._lock:
+            anchor = self._conn.execute(
+                """
+                SELECT timestamp, created_at
+                FROM inbound_messages
+                WHERE channel = ? AND chat_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (str(channel), str(chat_id), str(anchor_message_id)),
+            ).fetchone()
+            if anchor is None:
+                return []
+
+            anchor_timestamp = anchor["timestamp"]
+            anchor_created_at = str(anchor["created_at"] or "")
+
+            if isinstance(anchor_timestamp, int):
+                rows = self._conn.execute(
+                    """
+                    SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at
+                    FROM inbound_messages
+                    WHERE channel = ? AND chat_id = ?
+                      AND (
+                        timestamp < ?
+                        OR (timestamp = ? AND created_at < ?)
+                      )
+                    ORDER BY timestamp DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    (
+                        str(channel),
+                        str(chat_id),
+                        anchor_timestamp,
+                        anchor_timestamp,
+                        anchor_created_at,
+                        effective_limit,
+                    ),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at
+                    FROM inbound_messages
+                    WHERE channel = ? AND chat_id = ? AND created_at < ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (str(channel), str(chat_id), anchor_created_at, effective_limit),
+                ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def purge_older_than(self, days: int = DEFAULT_RETENTION_DAYS) -> int:
         """Delete rows older than the retention window."""
         effective_days = max(1, int(days))

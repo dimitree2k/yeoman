@@ -51,12 +51,31 @@ class SessionStateStore:
                 encoding="utf-8",
             )
 
+        message_id = str(metadata.get("message_id") or "").strip()
+        sender_id = str(metadata.get("sender_id") or metadata.get("sender") or "").strip()
+        participant = str(metadata.get("participant") or "").strip()
+        speaker = participant or sender_id
         reply_to = str(metadata.get("reply_to_message_id") or "").strip()
+        reply_to_participant = str(metadata.get("reply_to_participant") or "").strip()
+        media_kind = str(metadata.get("media_kind") or "").strip()
+        media_type = str(metadata.get("media_type") or "").strip()
+
         with path.open("a", encoding="utf-8") as f:
             f.write(f"### {now_iso} PRE\n")
+            if speaker:
+                f.write(f"- speaker: {speaker}\n")
+            if sender_id and sender_id != speaker:
+                f.write(f"- sender_id: {sender_id}\n")
+            if message_id:
+                f.write(f"- message_id: {message_id}\n")
+            if media_kind or media_type:
+                media_label = " / ".join(part for part in [media_kind, media_type] if part)
+                f.write(f"- media: {media_label}\n")
             f.write(f"- user: {user_preview}\n")
             if reply_to:
                 f.write(f"- reply_to_message_id: {reply_to}\n")
+            if reply_to_participant:
+                f.write(f"- reply_to_participant: {reply_to_participant}\n")
             f.write("\n")
         return path
 

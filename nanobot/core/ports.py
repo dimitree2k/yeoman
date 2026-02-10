@@ -25,6 +25,16 @@ class ReplyArchivePort(Protocol):
     ) -> ArchivedMessage | None:
         """Look up archived message across channel chats."""
 
+    def lookup_messages_before(
+        self,
+        channel: str,
+        chat_id: str,
+        anchor_message_id: str,
+        *,
+        limit: int,
+    ) -> list[ArchivedMessage]:
+        """Look up archived messages before one anchor message in a chat."""
+
 
 class PolicyPort(Protocol):
     """Policy evaluation port."""

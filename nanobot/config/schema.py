@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings
 from nanobot.config.defaults import (
     DEFAULT_MEMORY,
     DEFAULT_WHATSAPP_MEDIA,
+    DEFAULT_WHATSAPP_REPLY_CONTEXT,
     default_model_profiles,
     default_model_routes,
 )
@@ -98,6 +99,8 @@ class WhatsAppConfig(BaseModel):
     reconnect_jitter: float = 0.25
     reconnect_max_attempts: int = 0  # 0 means unlimited retries
     max_payload_bytes: int = 262144
+    reply_context_window_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["window_limit"])
+    reply_context_line_max_chars: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["line_max_chars"])
     media: WhatsAppMediaConfig = Field(default_factory=WhatsAppMediaConfig)
 
     @property

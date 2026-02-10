@@ -206,6 +206,18 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             return text
 
         reply_context_source = str(metadata.get("reply_context_source") or "").strip()
+        raw_window = metadata.get("reply_context_window")
+        window_lines: list[str] = []
+        if isinstance(raw_window, list):
+            for item in raw_window[:8]:
+                if not isinstance(item, str):
+                    continue
+                compact = " ".join(item.split())
+                if not compact:
+                    continue
+                if len(compact) > 220:
+                    compact = compact[:220] + "..."
+                window_lines.append(compact)
         lines = [
             "[Reply Context]",
             "usage: Treat quoted_message as the content of the replied-to message.",
@@ -222,6 +234,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             if len(compact_text) > 600:
                 compact_text = compact_text[:600] + "..."
             lines.append(f"quoted_message: {compact_text}")
+        if window_lines:
+            lines.append("topic_window_before_reply:")
+            for index, line in enumerate(window_lines, 1):
+                lines.append(f"{index}. {line}")
 
         return f"{text}\n\n" + "\n".join(lines)
 

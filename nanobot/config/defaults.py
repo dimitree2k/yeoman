@@ -49,6 +49,11 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "max_image_bytes_mb": 8,
 }
 
+DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
+    "window_limit": 6,
+    "line_max_chars": 256,
+}
+
 DEFAULT_MEMORY: dict[str, Any] = {
     "enabled": True,
     "db_path": "~/.nanobot/memory/longterm.db",
@@ -99,6 +104,11 @@ def default_whatsapp_media() -> dict[str, Any]:
     return deepcopy(DEFAULT_WHATSAPP_MEDIA)
 
 
+def default_whatsapp_reply_context() -> dict[str, Any]:
+    """Return a copied channels.whatsapp reply-context payload."""
+    return dict(DEFAULT_WHATSAPP_REPLY_CONTEXT)
+
+
 def default_memory() -> dict[str, Any]:
     """Return a deep-copied memory payload."""
     return deepcopy(DEFAULT_MEMORY)
@@ -141,6 +151,8 @@ def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
             if isinstance(media, dict):
                 for k, v in default_whatsapp_media().items():
                     media.setdefault(k, v)
+            for k, v in default_whatsapp_reply_context().items():
+                whatsapp.setdefault(k, v)
 
     memory = snake_config.setdefault("memory", {})
     if isinstance(memory, dict):

@@ -13,7 +13,7 @@ from nanobot.core.intents import (
     SendOutboundIntent,
     SetTypingIntent,
 )
-from nanobot.core.models import InboundEvent, OutboundEvent
+from nanobot.core.models import ArchivedMessage, InboundEvent, OutboundEvent
 from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort
 
 
@@ -26,12 +26,16 @@ class Orchestrator:
         policy: PolicyPort,
         responder: ResponderPort,
         reply_archive: ReplyArchivePort | None = None,
+        reply_context_window_limit: int,
+        reply_context_line_max_chars: int,
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ) -> None:
         self._policy = policy
         self._responder = responder
         self._reply_archive = reply_archive
+        self._reply_context_window_limit = max(1, int(reply_context_window_limit))
+        self._reply_context_line_max_chars = max(32, int(reply_context_line_max_chars))
         self._typing_notifier = typing_notifier
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
@@ -191,10 +195,13 @@ class Orchestrator:
             return event, False, False
         if event.channel != "whatsapp":
             return event, False, False
-        if event.reply_to_text:
-            return event, False, False
         reply_to_message_id = (event.reply_to_message_id or "").strip()
+        has_payload_reply_text = bool((event.reply_to_text or "").strip())
         if not reply_to_message_id:
+            if has_payload_reply_text:
+                raw = dict(event.raw_metadata)
+                raw.setdefault("reply_context_source", "payload")
+                return replace(event, raw_metadata=raw), False, False
             return event, False, False
 
         row = self._reply_archive.lookup_message(event.channel, event.chat_id, reply_to_message_id)
@@ -205,9 +212,56 @@ class Orchestrator:
                 preferred_chat_id=event.chat_id,
             )
         if row is None:
+            if has_payload_reply_text:
+                raw = dict(event.raw_metadata)
+                raw.setdefault("reply_context_source", "payload")
+                return replace(event, raw_metadata=raw), True, False
             return event, True, False
+
+        raw = dict(event.raw_metadata)
+        raw.setdefault("reply_context_source", "payload" if has_payload_reply_text else "archive")
+        window_lines = self._build_reply_context_window(event=event, anchor=row)
+        if window_lines:
+            raw["reply_context_window"] = window_lines
+
+        if has_payload_reply_text:
+            return replace(event, raw_metadata=raw), True, True
 
         text = row.text.strip()
         if not text:
             return event, True, False
-        return replace(event, reply_to_text=text), True, True
+        raw["reply_context_source"] = "archive"
+        return replace(event, reply_to_text=text, raw_metadata=raw), True, True
+
+    def _build_reply_context_window(self, *, event: InboundEvent, anchor: ArchivedMessage) -> list[str]:
+        if self._reply_archive is None:
+            return []
+        if not anchor.message_id:
+            return []
+        # Rows with missing sender are usually synthetic seed rows from reply payloads,
+        # which do not carry a reliable anchor point for earlier context.
+        if not anchor.sender_id:
+            return []
+
+        try:
+            before = self._reply_archive.lookup_messages_before(
+                event.channel,
+                anchor.chat_id or event.chat_id,
+                anchor.message_id,
+                limit=self._reply_context_window_limit,
+            )
+        except Exception:
+            return []
+        if not before:
+            return []
+
+        lines: list[str] = []
+        for row in reversed(before):
+            compact = " ".join(row.text.split())
+            if not compact:
+                continue
+            if len(compact) > self._reply_context_line_max_chars:
+                compact = compact[: self._reply_context_line_max_chars] + "..."
+            speaker = (row.sender_id or row.participant or "unknown").strip() or "unknown"
+            lines.append(f"[{speaker}] {compact}")
+        return lines[: self._reply_context_window_limit]
