@@ -51,6 +51,7 @@ class EffectivePolicy:
     allowed_tools_mode: str
     allowed_tools_tools: list[str]
     allowed_tools_deny: list[str]
+    tool_access: dict[str, dict[str, Any]]
     persona_file: str | None
 
 
@@ -66,6 +67,12 @@ class PolicyDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class _CompiledToolAccessRule:
+    mode: str
+    senders: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class _CompiledPolicy:
     who_can_talk_mode: str
     who_can_talk_senders: frozenset[str]
@@ -74,6 +81,7 @@ class _CompiledPolicy:
     allowed_tools_mode: str
     allowed_tools_tools: frozenset[str]
     allowed_tools_deny: frozenset[str]
+    tool_access_rules: dict[str, _CompiledToolAccessRule]
     persona_file: str | None
 
 
@@ -133,6 +141,14 @@ class PolicyEngine:
             allowed_tools_mode=resolved.allowed_tools.mode,
             allowed_tools_tools=_normalize_tool_names(resolved.allowed_tools.tools),
             allowed_tools_deny=_normalize_tool_names(resolved.allowed_tools.deny),
+            tool_access_rules={
+                tool_name.strip(): _CompiledToolAccessRule(
+                    mode=rule.mode,
+                    senders=normalize_sender_list(channel, rule.senders),
+                )
+                for tool_name, rule in resolved.tool_access.items()
+                if tool_name.strip()
+            },
             persona_file=resolved.persona_file,
         )
 
@@ -159,9 +175,10 @@ class PolicyEngine:
     def _validate_owner_only(self) -> None:
         default_mode = self.policy.defaults.who_can_talk.mode
         reply_default_mode = self.policy.defaults.when_to_reply.mode
+        default_tool_owner_only = any(rule.mode == "owner_only" for rule in self.policy.defaults.tool_access.values())
         for channel in self.apply_channels:
             owners = self._owner_index.get(channel, frozenset())
-            if not owners and (default_mode == "owner_only" or reply_default_mode == "owner_only"):
+            if not owners and (default_mode == "owner_only" or reply_default_mode == "owner_only" or default_tool_owner_only):
                 raise ValueError(f"policy owner_only configured but owners.{channel} is empty")
 
         for channel, channel_policy in self.policy.channels.items():
@@ -183,7 +200,11 @@ class PolicyEngine:
     def _override_uses_owner_only(override: ChatPolicyOverride) -> bool:
         who = override.who_can_talk.mode if override.who_can_talk else None
         rep = override.when_to_reply.mode if override.when_to_reply else None
-        return who == "owner_only" or rep == "owner_only"
+        tool_owner_only = any(
+            rule.mode == "owner_only"
+            for rule in (override.tool_access or {}).values()
+        )
+        return who == "owner_only" or rep == "owner_only" or tool_owner_only
 
     def _validate_tools(self, known_tools: set[str]) -> None:
         for mode, allow, deny, path in self._iter_tool_policy_refs():
@@ -194,6 +215,10 @@ class PolicyEngine:
             unknown_deny = sorted(set(deny) - known_tools)
             if unknown_deny:
                 raise ValueError(f"unknown tools in deny list at {path}: {unknown_deny}")
+        for tools, path in self._iter_tool_access_refs():
+            unknown = sorted({tool.strip() for tool in tools if tool.strip()} - known_tools)
+            if unknown:
+                raise ValueError(f"unknown tools in toolAccess at {path}: {unknown}")
 
     def _validate_persona_paths(self) -> None:
         for persona_file, path in self._iter_persona_refs():
@@ -232,6 +257,17 @@ class PolicyEngine:
                     )
         return refs
 
+    def _iter_tool_access_refs(self) -> list[tuple[list[str], str]]:
+        refs: list[tuple[list[str], str]] = []
+        refs.append((list(self.policy.defaults.tool_access.keys()), "defaults.toolAccess"))
+        for channel, cp in self.policy.channels.items():
+            if cp.default.tool_access:
+                refs.append((list(cp.default.tool_access.keys()), f"channels.{channel}.default.toolAccess"))
+            for chat, ov in cp.chats.items():
+                if ov.tool_access:
+                    refs.append((list(ov.tool_access.keys()), f"channels.{channel}.chats.{chat}.toolAccess"))
+        return refs
+
     def _iter_persona_refs(self) -> list[tuple[str | None, str]]:
         refs: list[tuple[str | None, str]] = [(self.policy.defaults.persona_file, "defaults.personaFile")]
         for channel, cp in self.policy.channels.items():
@@ -251,6 +287,13 @@ class PolicyEngine:
             allowed_tools_mode=resolved.allowed_tools_mode,
             allowed_tools_tools=sorted(resolved.allowed_tools_tools),
             allowed_tools_deny=sorted(resolved.allowed_tools_deny),
+            tool_access={
+                tool_name: {
+                    "mode": rule.mode,
+                    "senders": sorted(rule.senders),
+                }
+                for tool_name, rule in sorted(resolved.tool_access_rules.items())
+            },
             persona_file=resolved.persona_file,
         )
 
@@ -298,8 +341,24 @@ class PolicyEngine:
             return self._owner_match(actor), "when_to_reply:owner_only"
         return False, f"when_to_reply:unknown_mode:{mode}"
 
-    @staticmethod
-    def _resolve_allowed_tools(policy: _CompiledPolicy, all_tools: set[str]) -> set[str]:
+    def _is_tool_allowed_for_actor(
+        self,
+        actor: ActorContext,
+        tool_name: str,
+        policy: _CompiledPolicy,
+    ) -> bool:
+        rule = policy.tool_access_rules.get(tool_name)
+        if rule is None:
+            return True
+        if rule.mode == "everyone":
+            return True
+        if rule.mode == "allowlist":
+            return self._sender_match(actor.sender_primary, actor.sender_aliases, rule.senders)
+        if rule.mode == "owner_only":
+            return self._owner_match(actor)
+        return False
+
+    def _resolve_allowed_tools(self, actor: ActorContext, policy: _CompiledPolicy, all_tools: set[str]) -> set[str]:
         if policy.allowed_tools_mode == "all":
             allowed = set(all_tools)
         else:
@@ -309,7 +368,7 @@ class PolicyEngine:
         # Guardrail: deny spawn whenever exec is denied.
         if "exec" not in allowed:
             allowed.discard("spawn")
-        return allowed
+        return {tool for tool in allowed if self._is_tool_allowed_for_actor(actor, tool, policy)}
 
     def evaluate(self, actor: ActorContext, all_tools: set[str]) -> PolicyDecision:
         """Evaluate policy decision for an actor."""
@@ -346,7 +405,7 @@ class PolicyEngine:
         return PolicyDecision(
             accept_message=True,
             should_respond=True,
-            allowed_tools=self._resolve_allowed_tools(policy, all_tools),
+            allowed_tools=self._resolve_allowed_tools(actor, policy, all_tools),
             persona_file=policy.persona_file,
             reason=f"{accept_reason}|{reply_reason}",
         )

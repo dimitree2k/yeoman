@@ -16,6 +16,7 @@ class PolicyModel(BaseModel):
 WhoCanTalkMode = Literal["everyone", "allowlist", "owner_only"]
 WhenToReplyMode = Literal["all", "mention_only", "allowed_senders", "owner_only", "off"]
 AllowedToolsMode = Literal["all", "allowlist"]
+ToolAccessMode = Literal["everyone", "allowlist", "owner_only"]
 
 
 class WhoCanTalkPolicy(PolicyModel):
@@ -62,12 +63,27 @@ class AllowedToolsPolicyOverride(PolicyModel):
     deny: list[str] | None = None
 
 
+class ToolAccessRule(PolicyModel):
+    """Per-tool sender access rule."""
+
+    mode: ToolAccessMode = "everyone"
+    senders: list[str] = Field(default_factory=list)
+
+
+class ToolAccessRuleOverride(PolicyModel):
+    """Partial override for per-tool sender access rule."""
+
+    mode: ToolAccessMode | None = None
+    senders: list[str] | None = None
+
+
 class ChatPolicy(PolicyModel):
     """Resolved chat policy (no optional fields)."""
 
     who_can_talk: WhoCanTalkPolicy = Field(default_factory=WhoCanTalkPolicy, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicy = Field(default_factory=WhenToReplyPolicy, alias="whenToReply")
     allowed_tools: AllowedToolsPolicy = Field(default_factory=AllowedToolsPolicy, alias="allowedTools")
+    tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
 
 
@@ -77,6 +93,7 @@ class ChatPolicyOverride(PolicyModel):
     who_can_talk: WhoCanTalkPolicyOverride | None = Field(default=None, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
+    tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
     comment: str | None = Field(default=None, alias="comment")
 

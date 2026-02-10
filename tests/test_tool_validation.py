@@ -18,11 +18,11 @@ from nanobot.agent.tools.exec_isolation import (
     SandboxPreemptedError,
     SandboxTimeoutError,
 )
-from nanobot.agent.tools.web import _validate_url
-from nanobot.app.bootstrap import _resolve_security_tool_settings
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.web import _validate_url
+from nanobot.app.bootstrap import _resolve_security_tool_settings
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import _migrate_config, convert_keys, convert_to_camel
 from nanobot.config.schema import Config, ExecToolConfig, SecurityConfig
@@ -143,6 +143,8 @@ async def test_pi_stats_tool_json_format() -> None:
     assert "cpu_usage_pct" in data
     assert "memory_total_mb" in data
     assert "disk_root_used_gb" in data
+    assert "top_processes" in data
+    assert isinstance(data["top_processes"], list)
 
 
 async def test_pi_stats_tool_text_format() -> None:
@@ -151,6 +153,14 @@ async def test_pi_stats_tool_text_format() -> None:
     assert "Raspberry Pi Stats" in result
     assert "temperature_c:" in result
     assert "cpu_usage_pct:" in result
+    assert "top_processes:" in result
+
+
+async def test_pi_stats_tool_top_n_limit() -> None:
+    tool = PiStatsTool()
+    result = await tool.execute(format="json", top_n=3)
+    data = json.loads(result)
+    assert len(data.get("top_processes", [])) <= 3
 
 
 def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:

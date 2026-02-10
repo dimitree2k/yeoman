@@ -227,6 +227,9 @@ def build_gateway_runtime(
     except Exception as e:
         logger.warning("memory backfill failed: {}", e)
 
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -240,6 +243,7 @@ def build_gateway_runtime(
         memory_service=memory_service,
         telemetry=telemetry,
         security=security,
+        cron_service=cron,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
@@ -271,9 +275,6 @@ def build_gateway_runtime(
         security=security,
         security_block_message=config.security.block_user_message,
     )
-
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
 
     async def on_cron_job(job: CronJob) -> str | None:
         response = await responder.process_direct(

@@ -176,6 +176,7 @@ class EnginePolicyAdapter(PolicyPort):
                         "tools": effective.allowed_tools_tools,
                         "deny": effective.allowed_tools_deny,
                     },
+                    "toolAccess": effective.tool_access,
                     "personaFile": effective.persona_file,
                 }
                 if effective is not None
