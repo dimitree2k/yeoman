@@ -1196,6 +1196,7 @@ def _policy_known_tools() -> set[str]:
         "edit_file",
         "list_dir",
         "exec",
+        "pi_stats",
         "web_search",
         "web_fetch",
         "message",

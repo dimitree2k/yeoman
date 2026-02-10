@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
 
 from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -123,6 +124,7 @@ class SubagentManager:
             )
             exec_tool.set_session_context(f"subagent:{task_id}")
             tools.register(exec_tool)
+            tools.register(PiStatsTool())
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
 

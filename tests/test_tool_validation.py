@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import platform
 import shutil
@@ -17,6 +18,7 @@ from nanobot.agent.tools.exec_isolation import (
     SandboxPreemptedError,
     SandboxTimeoutError,
 )
+from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.bus.queue import MessageBus
@@ -123,6 +125,24 @@ async def test_exec_tool_timeout_and_recovery(tmp_path: Path) -> None:
 
     recovered = await tool.execute("echo ok")
     assert "ok" in recovered
+
+
+async def test_pi_stats_tool_json_format() -> None:
+    tool = PiStatsTool()
+    result = await tool.execute(format="json")
+    data = json.loads(result)
+    assert "temperature_c" in data
+    assert "cpu_usage_pct" in data
+    assert "memory_total_mb" in data
+    assert "disk_root_used_gb" in data
+
+
+async def test_pi_stats_tool_text_format() -> None:
+    tool = PiStatsTool()
+    result = await tool.execute(format="text")
+    assert "Raspberry Pi Stats" in result
+    assert "temperature_c:" in result
+    assert "cpu_usage_pct:" in result
 
 
 def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
