@@ -14,7 +14,7 @@ from nanobot.core.intents import (
     SetTypingIntent,
 )
 from nanobot.core.models import ArchivedMessage, InboundEvent, OutboundEvent
-from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort
+from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
 
 
 class Orchestrator:
@@ -30,6 +30,8 @@ class Orchestrator:
         reply_context_line_max_chars: int,
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
+        security: SecurityPort | None = None,
+        security_block_message: str = "Request blocked for security reasons.",
     ) -> None:
         self._policy = policy
         self._responder = responder
@@ -37,6 +39,8 @@ class Orchestrator:
         self._reply_context_window_limit = max(1, int(reply_context_window_limit))
         self._reply_context_line_max_chars = max(32, int(reply_context_line_max_chars))
         self._typing_notifier = typing_notifier
+        self._security = security
+        self._security_block_message = security_block_message
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -92,6 +96,34 @@ class Orchestrator:
             )
             return intents
 
+        if self._security is not None:
+            security_input = self._security.check_input(
+                event.content,
+                context={
+                    "channel": event.channel,
+                    "chat_id": event.chat_id,
+                    "sender_id": event.sender_id,
+                    "message_id": event.message_id or "",
+                },
+            )
+            if security_input.decision.action == "block":
+                intents.append(
+                    RecordMetricIntent(
+                        name="security_input_blocked",
+                        labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                    )
+                )
+                intents.append(
+                    SendOutboundIntent(
+                        event=OutboundEvent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            content=security_input.sanitized_text or self._security_block_message,
+                        )
+                    )
+                )
+                return intents
+
         typing_started = False
         try:
             if event.channel == "whatsapp":
@@ -116,6 +148,33 @@ class Orchestrator:
                     )
                 )
                 return intents
+
+            if self._security is not None:
+                output_result = self._security.check_output(
+                    reply,
+                    context={
+                        "channel": event.channel,
+                        "chat_id": event.chat_id,
+                        "sender_id": event.sender_id,
+                        "message_id": event.message_id or "",
+                    },
+                )
+                if output_result.decision.action == "sanitize":
+                    reply = output_result.sanitized_text or self._security_block_message
+                    intents.append(
+                        RecordMetricIntent(
+                            name="security_output_sanitized",
+                            labels=(("channel", event.channel),),
+                        )
+                    )
+                elif output_result.decision.action == "block":
+                    reply = output_result.sanitized_text or self._security_block_message
+                    intents.append(
+                        RecordMetricIntent(
+                            name="security_output_blocked",
+                            labels=(("channel", event.channel), ("reason", output_result.decision.reason)),
+                        )
+                    )
 
             outbound_channel = event.channel
             outbound_chat_id = event.chat_id

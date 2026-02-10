@@ -649,6 +649,7 @@ def agent(
     from nanobot.adapters.telemetry import InMemoryTelemetry
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
+    from nanobot.security import NoopSecurity, SecurityEngine
 
     config = load_config()
     memory_service = _make_memory_service(config)
@@ -659,6 +660,13 @@ def agent(
         outbound_maxsize=config.bus.outbound_maxsize,
     )
     provider = _make_provider(config)
+    security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
+    restrict_to_workspace = bool(config.tools.restrict_to_workspace)
+    exec_config = config.tools.exec.model_copy(deep=True)
+    if config.security.strict_profile:
+        restrict_to_workspace = True
+        exec_config.isolation.enabled = True
+        exec_config.isolation.fail_closed = True
     responder = LLMResponder(
         bus=bus,
         provider=provider,
@@ -666,10 +674,11 @@ def agent(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
+        exec_config=exec_config,
+        restrict_to_workspace=restrict_to_workspace,
         memory_service=memory_service,
         telemetry=telemetry,
+        security=security,
     )
 
     if message:

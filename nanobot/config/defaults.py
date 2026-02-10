@@ -88,6 +88,19 @@ DEFAULT_MEMORY: dict[str, Any] = {
     },
 }
 
+DEFAULT_SECURITY: dict[str, Any] = {
+    "enabled": True,
+    "fail_mode": "mixed",
+    "stages": {
+        "input": True,
+        "tool": True,
+        "output": False,
+    },
+    "block_user_message": "Request blocked for security reasons.",
+    "strict_profile": False,
+    "redact_placeholder": "[REDACTED]",
+}
+
 
 def default_model_profiles() -> dict[str, dict[str, Any]]:
     """Return a deep-copied models.profiles payload."""
@@ -112,6 +125,11 @@ def default_whatsapp_reply_context() -> dict[str, Any]:
 def default_memory() -> dict[str, Any]:
     """Return a deep-copied memory payload."""
     return deepcopy(DEFAULT_MEMORY)
+
+
+def default_security() -> dict[str, Any]:
+    """Return a deep-copied security payload."""
+    return deepcopy(DEFAULT_SECURITY)
 
 
 def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
@@ -170,6 +188,20 @@ def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
                     memory[k] = list(v)
             else:
                 memory.setdefault(k, v)
+
+    security = snake_config.setdefault("security", {})
+    if isinstance(security, dict):
+        seeded_security = default_security()
+        for k, v in seeded_security.items():
+            if isinstance(v, dict):
+                nested = security.setdefault(k, {})
+                if isinstance(nested, dict):
+                    for nk, nv in v.items():
+                        nested.setdefault(nk, nv)
+                else:
+                    security[k] = deepcopy(v)
+            else:
+                security.setdefault(k, v)
 
 
 def _resolve_assistant_model(snake_config: dict[str, Any]) -> str:

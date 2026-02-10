@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings
 
 from nanobot.config.defaults import (
     DEFAULT_MEMORY,
+    DEFAULT_SECURITY,
     DEFAULT_WHATSAPP_MEDIA,
     DEFAULT_WHATSAPP_REPLY_CONTEXT,
     default_model_profiles,
@@ -334,6 +335,25 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
+class SecurityStagesConfig(BaseModel):
+    """Enable/disable security checks by stage."""
+
+    input: bool = bool(DEFAULT_SECURITY["stages"]["input"])
+    tool: bool = bool(DEFAULT_SECURITY["stages"]["tool"])
+    output: bool = bool(DEFAULT_SECURITY["stages"]["output"])
+
+
+class SecurityConfig(BaseModel):
+    """Security middleware configuration."""
+
+    enabled: bool = bool(DEFAULT_SECURITY["enabled"])
+    fail_mode: Literal["open", "closed", "mixed"] = str(DEFAULT_SECURITY["fail_mode"])
+    stages: SecurityStagesConfig = Field(default_factory=SecurityStagesConfig)
+    block_user_message: str = str(DEFAULT_SECURITY["block_user_message"])
+    strict_profile: bool = bool(DEFAULT_SECURITY["strict_profile"])
+    redact_placeholder: str = str(DEFAULT_SECURITY["redact_placeholder"])
+
+
 class BusConfig(BaseModel):
     """Message bus configuration."""
 
@@ -351,6 +371,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     bus: BusConfig = Field(default_factory=BusConfig)
 

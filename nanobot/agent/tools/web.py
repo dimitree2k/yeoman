@@ -1,9 +1,11 @@
 """Web tools: web_search and web_fetch."""
 
 import html
+import ipaddress
 import json
 import os
 import re
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +16,7 @@ from nanobot.agent.tools.base import Tool
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
+_LOCAL_HOSTS = {"localhost", "localhost.localdomain"}
 
 
 def _strip_tags(text: str) -> str:
@@ -30,14 +33,57 @@ def _normalize(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', text).strip()
 
 
+def _is_private_ip(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _host_resolves_private(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    except Exception:
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip = sockaddr[0]
+        if _is_private_ip(ip):
+            return True
+    return False
+
+
 def _validate_url(url: str) -> tuple[bool, str]:
-    """Validate URL: must be http(s) with valid domain."""
+    """Validate URL and block SSRF to local/private targets."""
     try:
         p = urlparse(url)
         if p.scheme not in ('http', 'https'):
             return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
         if not p.netloc:
             return False, "Missing domain"
+
+        host = (p.hostname or "").strip().lower()
+        if not host:
+            return False, "Missing hostname"
+        if host in _LOCAL_HOSTS or host.endswith(".local"):
+            return False, f"Blocked local host target: {host}"
+        if _is_private_ip(host):
+            return False, f"Blocked private IP target: {host}"
+        if _host_resolves_private(host):
+            return False, f"Blocked private-network DNS target: {host}"
+
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -120,12 +166,30 @@ class WebFetchTool(Tool):
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
-                max_redirects=MAX_REDIRECTS,
+                follow_redirects=False,
                 timeout=30.0
             ) as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT})
-                r.raise_for_status()
+                next_url = url
+                redirects = 0
+                while True:
+                    is_valid, error_msg = _validate_url(next_url)
+                    if not is_valid:
+                        return json.dumps({"error": f"URL validation failed: {error_msg}", "url": next_url})
+
+                    r = await client.get(next_url, headers={"User-Agent": USER_AGENT})
+
+                    if r.status_code in {301, 302, 303, 307, 308} and "location" in r.headers:
+                        redirects += 1
+                        if redirects > MAX_REDIRECTS:
+                            return json.dumps({"error": "Too many redirects", "url": url})
+                        location = r.headers.get("location", "")
+                        if not location:
+                            return json.dumps({"error": "Redirect missing location header", "url": next_url})
+                        next_url = str(r.url.join(location))
+                        continue
+
+                    r.raise_for_status()
+                    break
 
             ctype = r.headers.get("content-type", "")
 

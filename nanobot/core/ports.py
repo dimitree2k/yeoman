@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from nanobot.core.models import ArchivedMessage, InboundEvent, PolicyDecision
+from nanobot.core.models import ArchivedMessage, InboundEvent, PolicyDecision, SecurityResult
 
 
 class ReplyArchivePort(Protocol):
@@ -55,6 +55,24 @@ class TelemetryPort(Protocol):
 
     def incr(self, name: str, value: int = 1, labels: tuple[tuple[str, str], ...] = ()) -> None:
         """Increase named counter with optional labels."""
+
+
+class SecurityPort(Protocol):
+    """Security middleware stage checks."""
+
+    def check_input(self, event_text: str, context: dict[str, object] | None = None) -> SecurityResult:
+        """Evaluate inbound user text."""
+
+    def check_tool(
+        self,
+        tool_name: str,
+        args: dict[str, object],
+        context: dict[str, object] | None = None,
+    ) -> SecurityResult:
+        """Evaluate one tool call before execution."""
+
+    def check_output(self, text: str, context: dict[str, object] | None = None) -> SecurityResult:
+        """Evaluate assistant output before outbound send."""
 
 
 class RuntimeSupervisorPort(Protocol):

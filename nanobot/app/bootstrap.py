@@ -33,13 +33,14 @@ from nanobot.media.router import ModelRouter
 from nanobot.media.storage import MediaStorage
 from nanobot.memory import MemoryService
 from nanobot.providers.factory import ProviderFactory
+from nanobot.security import NoopSecurity, SecurityEngine
 from nanobot.session.manager import SessionManager
 from nanobot.storage.inbound_archive import InboundArchive
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from nanobot.config.schema import Config
+    from nanobot.config.schema import Config, ExecToolConfig
     from nanobot.policy.engine import PolicyEngine
     from nanobot.providers.base import LLMProvider
 
@@ -48,6 +49,17 @@ def _normalize_timestamp(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=UTC)
     return ts.astimezone(UTC)
+
+
+def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolConfig"]:
+    """Apply strict-profile hardening overrides for tool runtime settings."""
+    restrict_to_workspace = bool(config.tools.restrict_to_workspace)
+    exec_config = config.tools.exec.model_copy(deep=True)
+    if config.security.strict_profile:
+        restrict_to_workspace = True
+        exec_config.isolation.enabled = True
+        exec_config.isolation.fail_closed = True
+    return restrict_to_workspace, exec_config
 
 
 def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
@@ -201,6 +213,8 @@ def build_gateway_runtime(
         pass
 
     telemetry = InMemoryTelemetry()
+    restrict_to_workspace, exec_config = _resolve_security_tool_settings(config)
+    security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
 
     memory_service = MemoryService(
         workspace=workspace,
@@ -220,11 +234,12 @@ def build_gateway_runtime(
         model=assistant_model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
-        exec_config=config.tools.exec,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
+        exec_config=exec_config,
+        restrict_to_workspace=restrict_to_workspace,
         session_manager=session_manager,
         memory_service=memory_service,
         telemetry=telemetry,
+        security=security,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
@@ -253,6 +268,8 @@ def build_gateway_runtime(
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         typing_notifier=typing_adapter,
+        security=security,
+        security_block_message=config.security.block_user_message,
     )
 
     cron_store_path = get_data_dir() / "cron" / "jobs.json"

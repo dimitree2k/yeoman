@@ -19,6 +19,9 @@ type ChannelName = Literal[
 type MessageId = str
 type ChatId = str
 type SenderId = str
+type SecurityStage = Literal["input", "tool", "output"]
+type SecurityAction = Literal["allow", "warn", "block", "sanitize"]
+type SecuritySeverity = Literal["safe", "low", "medium", "high", "critical"]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -46,6 +49,25 @@ class PolicyDecision:
     persona_text: str | None = None
     persona_file: str | None = None
     source: str = "disabled"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SecurityDecision:
+    """Decision emitted by the security middleware for one stage."""
+
+    action: SecurityAction
+    reason: str
+    severity: SecuritySeverity = "safe"
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SecurityResult:
+    """Security middleware result for one stage check."""
+
+    stage: SecurityStage
+    decision: SecurityDecision
+    sanitized_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -21,7 +21,7 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.core.models import InboundEvent, PolicyDecision
-from nanobot.core.ports import ResponderPort, TelemetryPort
+from nanobot.core.ports import ResponderPort, SecurityPort, TelemetryPort
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
 
@@ -49,6 +49,7 @@ class LLMResponder(ResponderPort):
         session_manager: SessionManager | None = None,
         memory_service: "MemoryService | None" = None,
         telemetry: TelemetryPort | None = None,
+        security: SecurityPort | None = None,
     ) -> None:
         from nanobot.config.schema import ExecToolConfig
 
@@ -62,6 +63,7 @@ class LLMResponder(ResponderPort):
         self.cron_service = cron_service
         self.memory = memory_service
         self.telemetry = telemetry
+        self.security = security
 
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
@@ -187,6 +189,7 @@ class LLMResponder(ResponderPort):
         *,
         messages: list[dict[str, Any]],
         allowed_tools: set[str],
+        security_context: dict[str, object] | None = None,
     ) -> str:
         iteration = 0
         final_content: str | None = None
@@ -223,7 +226,30 @@ class LLMResponder(ResponderPort):
                     if tool_call.name not in allowed_tools:
                         result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                     else:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        if self.security is not None:
+                            tool_security = self.security.check_tool(
+                                tool_call.name,
+                                tool_call.arguments,
+                                context=security_context,
+                            )
+                            if tool_security.decision.action == "block":
+                                self._metric(
+                                    "security_tool_blocked",
+                                    labels=(("tool", tool_call.name),),
+                                )
+                                result = (
+                                    "Error: Tool call blocked by security middleware "
+                                    f"({tool_security.decision.reason})."
+                                )
+                            else:
+                                if tool_security.decision.action == "warn":
+                                    self._metric(
+                                        "security_tool_warn",
+                                        labels=(("tool", tool_call.name),),
+                                    )
+                                result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        else:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages,
                         tool_call.id,
@@ -298,7 +324,16 @@ class LLMResponder(ResponderPort):
             chat_id=chat_id,
         )
 
-        final_content = await self._chat_loop(messages=messages, allowed_tools=allowed_tools)
+        final_content = await self._chat_loop(
+            messages=messages,
+            allowed_tools=allowed_tools,
+            security_context={
+                "channel": channel,
+                "chat_id": chat_id,
+                "sender_id": sender_id or "",
+                "session_key": session_key,
+            },
+        )
 
         if self.memory is not None:
             try:
