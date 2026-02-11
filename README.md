@@ -428,6 +428,15 @@ Quick reference for modes:
 
 Tip: use `nanobot policy explain` to debug "why didn’t the bot reply?" for a specific chat/sender.
 
+#### WhatsApp Owner DM Policy Commands
+
+Deterministic policy commands in chat are **slash-only** and currently use the `/policy` namespace.
+
+- Owner DM example: `/policy help`
+- Owner DM example: `/policy allow-group 120363400000000000@g.us`
+- Non-slash text like `policy allow-group ...` is treated as normal LLM input (not deterministic command routing).
+- Non-owner `/policy ...` is ignored silently (no command-surface disclosure).
+
 ### Providers
 
 > [!NOTE]
@@ -542,6 +551,7 @@ If isolation is enabled and `bubblewrap`/allowlist checks fail, execution is fai
 | `nanobot channels status` | Show channel status |
 | `nanobot policy path` | Print the active `policy.json` location |
 | `nanobot policy explain` | Show merged policy + decision for a specific channel/chat/sender |
+| `nanobot policy cmd "/policy ..."` | Execute shared deterministic policy command backend from CLI |
 | `nanobot policy migrate-allowfrom` | Migrate legacy `channels.*.allowFrom` into `policy.json` |
 | `nanobot policy annotate-whatsapp-comments` | Auto-fill WhatsApp `*@g.us` chat IDs with human-readable `comment` names |
 | `nanobot memory status` | Show long-term memory backend and counters |

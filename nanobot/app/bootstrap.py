@@ -252,6 +252,9 @@ def build_gateway_runtime(
         known_tools=set(responder.tool_names),
         policy_path=policy_path,
     )
+    admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
+    if admin_command_handler is None:
+        admin_command_handler = getattr(policy_adapter, "maybe_handle_admin_command", None)
 
     channels = ChannelManager(
         config,
@@ -274,6 +277,7 @@ def build_gateway_runtime(
         typing_notifier=typing_adapter,
         security=security,
         security_block_message=config.security.block_user_message,
+        policy_admin_handler=admin_command_handler,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:

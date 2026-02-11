@@ -63,6 +63,18 @@ class AllowedToolsPolicyOverride(PolicyModel):
     deny: list[str] | None = None
 
 
+class BlockedSendersPolicy(PolicyModel):
+    """Explicit sender deny-list evaluated before whoCanTalk."""
+
+    senders: list[str] = Field(default_factory=list)
+
+
+class BlockedSendersPolicyOverride(PolicyModel):
+    """Partial override for blocked senders deny-list."""
+
+    senders: list[str] | None = None
+
+
 class ToolAccessRule(PolicyModel):
     """Per-tool sender access rule."""
 
@@ -82,6 +94,7 @@ class ChatPolicy(PolicyModel):
 
     who_can_talk: WhoCanTalkPolicy = Field(default_factory=WhoCanTalkPolicy, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicy = Field(default_factory=WhenToReplyPolicy, alias="whenToReply")
+    blocked_senders: BlockedSendersPolicy = Field(default_factory=BlockedSendersPolicy, alias="blockedSenders")
     allowed_tools: AllowedToolsPolicy = Field(default_factory=AllowedToolsPolicy, alias="allowedTools")
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
@@ -92,6 +105,7 @@ class ChatPolicyOverride(PolicyModel):
 
     who_can_talk: WhoCanTalkPolicyOverride | None = Field(default=None, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
+    blocked_senders: BlockedSendersPolicyOverride | None = Field(default=None, alias="blockedSenders")
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
@@ -110,6 +124,9 @@ class RuntimePolicy(PolicyModel):
 
     reload_on_change: bool = Field(default=True, alias="reloadOnChange")
     reload_check_interval_seconds: float = Field(default=1.0, alias="reloadCheckIntervalSeconds", ge=0.1)
+    feature_flags: dict[str, bool] = Field(default_factory=dict, alias="featureFlags")
+    admin_command_rate_limit_per_minute: int = Field(default=30, alias="adminCommandRateLimitPerMinute", ge=1)
+    admin_require_confirm_for_risky: bool = Field(default=False, alias="adminRequireConfirmForRisky")
 
 
 def _default_owners() -> dict[str, list[str]]:
@@ -124,8 +141,9 @@ def _default_policy_defaults() -> ChatPolicy:
     return ChatPolicy.model_validate(
         {
             "allowedTools": {
-                "mode": "all",
-                "deny": ["exec", "spawn"],
+                "mode": "allowlist",
+                "tools": ["list_dir", "read_file", "web_search", "web_fetch"],
+                "deny": [],
             }
         }
     )

@@ -33,7 +33,10 @@ For a given message, policy is resolved in this order:
   "version": 2,
   "runtime": {
     "reloadOnChange": true,
-    "reloadCheckIntervalSeconds": 1.0
+    "reloadCheckIntervalSeconds": 1.0,
+    "featureFlags": {},
+    "adminCommandRateLimitPerMinute": 30,
+    "adminRequireConfirmForRisky": false
   },
   "owners": {
     "telegram": ["453897507"],
@@ -42,7 +45,12 @@ For a given message, policy is resolved in this order:
   "defaults": {
     "whoCanTalk": { "mode": "everyone", "senders": [] },
     "whenToReply": { "mode": "all", "senders": [] },
-    "allowedTools": { "mode": "all", "tools": [], "deny": ["exec", "spawn"] },
+    "blockedSenders": { "senders": [] },
+    "allowedTools": {
+      "mode": "allowlist",
+      "tools": ["list_dir", "read_file", "web_search", "web_fetch"],
+      "deny": []
+    },
     "personaFile": null
   },
   "channels": {
@@ -57,6 +65,7 @@ For a given message, policy is resolved in this order:
         "-1001234567890": {
           "whoCanTalk": { "mode": "allowlist", "senders": ["453897507", "@my_username"] },
           "whenToReply": { "mode": "allowed_senders", "senders": ["453897507"] },
+          "blockedSenders": { "senders": ["+491234567890"] },
           "allowedTools": { "mode": "allowlist", "tools": ["read_file", "web_fetch"], "deny": ["exec", "spawn"] },
           "personaFile": "memory/personas/professional.md",
           "comment": "My private admin group"
@@ -83,6 +92,9 @@ Notes:
 - The file is parsed **strictly**: unknown keys cause validation to fail.
 - If hot-reload fails, the gateway keeps the **previous** working policy and logs an error.
 - `reloadCheckIntervalSeconds` has a minimum of `0.1`.
+- `featureFlags` is reserved for optional future rule families.
+- `adminCommandRateLimitPerMinute` limits owner-DM deterministic policy command throughput.
+- `adminRequireConfirmForRisky` requires `--confirm` for risky commands (for example `rollback`).
 - `comment` is optional everywhere a chat override exists; it is ignored by the policy engine and meant for humans.
 - Policy is written as UTF-8 JSON. Older versions may have escaped emoji sequences like `\\ud83d...`; both forms load fine, but re-saving with current versions keeps the readable characters.
 
@@ -108,6 +120,10 @@ Notes:
 
 Tool safety notes:
 - If `exec` is denied, `spawn` is automatically denied as well (guardrail).
+
+#### `blockedSenders`
+- `blockedSenders.senders`: deny-list evaluated before `whoCanTalk`.
+- Useful for \"everyone except X\" group behavior without complex allowlist rewrites.
 
 #### `personaFile`
 - `null`: no persona override.
@@ -219,6 +235,20 @@ nanobot policy explain \
   --group \
   --mentioned
 ```
+
+### Deterministic Policy Commands (DM + CLI)
+
+- Owner DM syntax is slash-first: `/policy ...`.
+- Canonical CLI entrypoint uses the same shared parser/backend:
+
+```bash
+nanobot policy cmd "/policy list-groups"
+nanobot policy cmd "/policy set-when 120363407040317023@g.us mention_only --dry-run"
+nanobot policy cmd "/policy rollback <change_id> --confirm"
+```
+
+- Non-slash text (`policy ...`) is not deterministic command routing.
+- Use `/policy history` to inspect recent audited mutations.
 
 ### Annotating WhatsApp Group Names
 

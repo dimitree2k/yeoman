@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from typing import Awaitable, Callable
 
+from nanobot.core.admin_commands import AdminCommandResult
 from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
@@ -32,6 +33,7 @@ class Orchestrator:
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
         security: SecurityPort | None = None,
         security_block_message: str = "Request blocked for security reasons.",
+        policy_admin_handler: Callable[[InboundEvent], AdminCommandResult | str | None] | None = None,
     ) -> None:
         self._policy = policy
         self._responder = responder
@@ -41,6 +43,7 @@ class Orchestrator:
         self._typing_notifier = typing_notifier
         self._security = security
         self._security_block_message = security_block_message
+        self._policy_admin_handler = policy_admin_handler
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -77,6 +80,58 @@ class Orchestrator:
                     labels=(("channel", event.channel),),
                 )
             )
+
+        if self._policy_admin_handler is not None:
+            admin_result = self._policy_admin_handler(event)
+            if isinstance(admin_result, str):
+                admin_result = AdminCommandResult(status="handled", response=admin_result)
+            if admin_result is not None:
+                for metric in admin_result.metric_events:
+                    intents.append(
+                        RecordMetricIntent(
+                            name=metric.name,
+                            value=metric.value,
+                            labels=metric.labels,
+                        )
+                    )
+                if admin_result.status == "ignored":
+                    intents.append(
+                        RecordMetricIntent(
+                            name="admin_command_denied_or_ignored",
+                            labels=(
+                                ("channel", event.channel),
+                                ("command", admin_result.command_name or "unknown"),
+                            ),
+                        )
+                    )
+                elif admin_result.intercepts_normal_flow:
+                    metric_name = "admin_command_handled" if admin_result.status == "handled" else "admin_command_unknown"
+                    intents.append(
+                        RecordMetricIntent(
+                            name=metric_name,
+                            labels=(
+                                ("channel", event.channel),
+                                ("command", admin_result.command_name or "unknown"),
+                            ),
+                        )
+                    )
+                    intents.append(
+                        RecordMetricIntent(
+                            name="policy_admin_command",
+                            labels=(("channel", event.channel),),
+                        )
+                    )
+                    if admin_result.response:
+                        intents.append(
+                            SendOutboundIntent(
+                                event=OutboundEvent(
+                                    channel=event.channel,
+                                    chat_id=event.chat_id,
+                                    content=admin_result.response,
+                                )
+                            )
+                        )
+                    return intents
 
         decision = self._policy.evaluate(event)
         if not decision.accept_message:

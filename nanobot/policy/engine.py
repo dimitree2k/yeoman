@@ -48,6 +48,7 @@ class EffectivePolicy:
     who_can_talk_senders: list[str]
     when_to_reply_mode: str
     when_to_reply_senders: list[str]
+    blocked_senders: list[str]
     allowed_tools_mode: str
     allowed_tools_tools: list[str]
     allowed_tools_deny: list[str]
@@ -78,6 +79,7 @@ class _CompiledPolicy:
     who_can_talk_senders: frozenset[str]
     when_to_reply_mode: str
     when_to_reply_senders: frozenset[str]
+    blocked_senders: frozenset[str]
     allowed_tools_mode: str
     allowed_tools_tools: frozenset[str]
     allowed_tools_deny: frozenset[str]
@@ -138,6 +140,7 @@ class PolicyEngine:
             who_can_talk_senders=normalize_sender_list(channel, resolved.who_can_talk.senders),
             when_to_reply_mode=resolved.when_to_reply.mode,
             when_to_reply_senders=normalize_sender_list(channel, resolved.when_to_reply.senders),
+            blocked_senders=normalize_sender_list(channel, resolved.blocked_senders.senders),
             allowed_tools_mode=resolved.allowed_tools.mode,
             allowed_tools_tools=_normalize_tool_names(resolved.allowed_tools.tools),
             allowed_tools_deny=_normalize_tool_names(resolved.allowed_tools.deny),
@@ -284,6 +287,7 @@ class PolicyEngine:
             who_can_talk_senders=sorted(resolved.who_can_talk_senders),
             when_to_reply_mode=resolved.when_to_reply_mode,
             when_to_reply_senders=sorted(resolved.when_to_reply_senders),
+            blocked_senders=sorted(resolved.blocked_senders),
             allowed_tools_mode=resolved.allowed_tools_mode,
             allowed_tools_tools=sorted(resolved.allowed_tools_tools),
             allowed_tools_deny=sorted(resolved.allowed_tools_deny),
@@ -322,6 +326,10 @@ class PolicyEngine:
         if mode == "owner_only":
             return self._owner_match(actor), "who_can_talk:owner_only"
         return False, f"who_can_talk:unknown_mode:{mode}"
+
+    def _evaluate_blocked_sender(self, actor: ActorContext, policy: _CompiledPolicy) -> tuple[bool, str]:
+        blocked = self._sender_match(actor.sender_primary, actor.sender_aliases, policy.blocked_senders)
+        return blocked, "blocked_sender"
 
     def _evaluate_when_to_reply(self, actor: ActorContext, policy: _CompiledPolicy) -> tuple[bool, str]:
         mode = policy.when_to_reply_mode
@@ -382,6 +390,16 @@ class PolicyEngine:
             )
 
         policy = self.resolve_compiled_policy(actor.channel, actor.chat_id)
+        is_blocked, blocked_reason = self._evaluate_blocked_sender(actor, policy)
+        if is_blocked:
+            return PolicyDecision(
+                accept_message=False,
+                should_respond=False,
+                allowed_tools=set(),
+                persona_file=policy.persona_file,
+                reason=blocked_reason,
+            )
+
         accepted, accept_reason = self._evaluate_who_can_talk(actor, policy)
         if not accepted:
             return PolicyDecision(

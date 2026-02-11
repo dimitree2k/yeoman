@@ -1254,6 +1254,51 @@ def policy_explain(
     console.print_json(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+@policy_app.command("cmd")
+def policy_cmd(
+    command: str = typer.Argument(..., help='Canonical slash command, e.g. \"/policy list-groups\"'),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Run command in dry-run mode"),
+    confirm: bool = typer.Option(False, "--confirm", help="Confirm risky command execution"),
+):
+    """Execute one shared policy admin command via CLI."""
+    import getpass
+
+    from nanobot.config.loader import load_config
+    from nanobot.policy.admin.contracts import PolicyActorContext, PolicyExecutionOptions
+    from nanobot.policy.admin.service import PolicyAdminService
+
+    config = load_config()
+    policy_engine, policy_path = _make_policy_engine(config)
+    if policy_path is None:
+        console.print("[red]Policy path unavailable[/red]")
+        raise typer.Exit(1)
+
+    apply_channels = policy_engine.apply_channels if policy_engine is not None else {"telegram", "whatsapp"}
+    service = PolicyAdminService(
+        policy_path=policy_path,
+        workspace=config.workspace_path,
+        known_tools=_policy_known_tools(),
+        apply_channels=apply_channels,
+        on_policy_applied=None,
+    )
+    result = service.execute_from_text(
+        command,
+        actor=PolicyActorContext(
+            source="cli",
+            channel="cli",
+            chat_id="local",
+            sender_id=getpass.getuser(),
+            is_group=False,
+            is_owner=True,
+        ),
+        options=PolicyExecutionOptions(dry_run=dry_run, confirm=confirm),
+    )
+    if result.message:
+        console.print(result.message)
+    if result.outcome in {"invalid", "error", "denied"}:
+        raise typer.Exit(1)
+
+
 @policy_app.command("annotate-whatsapp-comments")
 def policy_annotate_whatsapp_comments(
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing comment fields"),

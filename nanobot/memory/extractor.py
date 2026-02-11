@@ -40,6 +40,8 @@ def _is_command_only(text: str) -> bool:
     compact = text.strip()
     if not compact:
         return True
+    if compact.startswith("/"):
+        return True
     if compact.startswith("$"):
         return True
     if compact.startswith(("bash ", "sh ", "zsh ", "python ", "node ")):
