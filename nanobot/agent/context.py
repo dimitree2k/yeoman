@@ -20,6 +20,8 @@ class ContextBuilder:
     """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    MAX_INLINE_IMAGES = 4
+    MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -45,28 +47,42 @@ class ContextBuilder:
         # Core identity
         parts.append(self._get_identity())
 
+        # Channel persona override (style/voice for this specific chat)
+        if persona_text:
+            parts.append(
+                "\n".join(
+                    [
+                        "# Persona Override",
+                        "A channel persona is active for this chat.",
+                        "For user-facing replies, follow the channel persona's identity, voice, and style.",
+                        "This overrides generic tone defaults from AGENTS.md, SOUL.md, and USER.md.",
+                        "Keep safety/tool/runtime constraints unchanged.",
+                    ]
+                )
+            )
+            parts.append(f"# Channel Persona\n\n{persona_text}")
+
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        # Persona profile (channel/chat specific)
-        if persona_text:
-            parts.append(f"# Channel Persona\n\n{persona_text}")
-
         # Memory context
         legacy_long_term = self.memory.read_long_term()
+        if persona_text:
+            # Prevent global MEMORY persona notes from competing with chat policy persona.
+            legacy_long_term = self._strip_markdown_section(legacy_long_term, "## Active Persona")
         legacy_header = render_legacy_memory_header(legacy_long_term, max_chars=800)
         if legacy_header:
             parts.append(f"# Memory\n\n{legacy_header}")
 
         # Skills - progressive loading
-        # 1. Always-loaded skills: include full content
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        # 1. Active skills: always-loaded + explicitly requested skills
+        active_skills = self._resolve_active_skills(skill_names)
+        if active_skills:
+            active_content = self.skills.load_skills_for_context(active_skills)
+            if active_content:
+                parts.append(f"# Active Skills\n\n{active_content}")
 
         # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
@@ -79,6 +95,41 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
 
         return "\n\n---\n\n".join(parts)
+
+    def _resolve_active_skills(self, skill_names: list[str] | None) -> list[str]:
+        """Resolve active skills with stable order and de-duplication."""
+        existing = {item["name"] for item in self.skills.list_skills(filter_unavailable=False)}
+        requested = [str(name).strip() for name in (skill_names or []) if str(name).strip()]
+        merged = [*self.skills.get_always_skills(), *requested]
+
+        active: list[str] = []
+        for name in merged:
+            if name in existing and name not in active:
+                active.append(name)
+        return active
+
+    @staticmethod
+    def _strip_markdown_section(text: str, heading: str) -> str:
+        """Remove one level-2 markdown section (from heading until next level-2 heading)."""
+        if not text:
+            return text
+
+        target = heading.strip().lower()
+        lines = text.splitlines()
+        out: list[str] = []
+        skip = False
+
+        for line in lines:
+            stripped = line.strip()
+            if skip and stripped.startswith("## "):
+                skip = False
+            if not skip and stripped.lower() == target:
+                skip = True
+                continue
+            if not skip:
+                out.append(line)
+
+        return "\n".join(out)
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
@@ -104,13 +155,11 @@ Your workspace is at: {workspace_path}
 - Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
-For Raspberry Pi/system metrics (temperature, RAM, disk, uptime), prefer the 'pi_stats' tool over 'exec'.
+IMPORTANT: For the current chat turn, normally reply with assistant text.
+Only use the 'message' tool for explicit out-of-band delivery to a specific channel/chat.
+For Raspberry Pi/system metrics (temperature, RAM, disk, uptime), prefer the 'pi_stats' tool when available.
 
-Always be helpful, accurate, and concise. When using tools, explain what you're doing.
-When remembering something, write to {workspace_path}/memory/MEMORY.md"""
+Always be helpful, accurate, and concise. When using tools, explain what you're doing."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -183,17 +232,25 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             return text_with_context
 
         images = []
-        for path in media:
+        for path in media[: self.MAX_INLINE_IMAGES]:
             p = Path(path)
             mime, _ = mimetypes.guess_type(path)
             if not p.is_file() or not mime or not mime.startswith("image/"):
                 continue
-            b64 = base64.b64encode(p.read_bytes()).decode()
+            try:
+                if p.stat().st_size > self.MAX_INLINE_IMAGE_BYTES:
+                    continue
+            except OSError:
+                continue
+            try:
+                b64 = base64.b64encode(p.read_bytes()).decode()
+            except OSError:
+                continue
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
         if not images:
             return text_with_context
-        return images + [{"type": "text", "text": text_with_context}]
+        return [{"type": "text", "text": text_with_context}, *images]
 
     def _with_reply_context(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append compact reply metadata so models can resolve quoted-message intent."""
@@ -286,7 +343,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         Returns:
             Updated message list.
         """
-        msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
+        assistant_content: str | None = content
+        if assistant_content is None and not tool_calls:
+            assistant_content = ""
+        msg: dict[str, Any] = {"role": "assistant", "content": assistant_content}
 
         if tool_calls:
             msg["tool_calls"] = tool_calls

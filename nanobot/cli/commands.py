@@ -805,6 +805,119 @@ def whatsapp_ensure(
     console.print(f"Log: {report.status.log_path}")
 
 
+@whatsapp_app.command("repair-sender")
+def whatsapp_repair_sender(
+    sender_id: str = typer.Option(..., "--sender-id", help="Sender numeric id (e.g. 34596062240904)"),
+    chat_id: str | None = typer.Option(
+        None,
+        "--chat-id",
+        help="Optional chat id scope (e.g. 120363...@g.us). When set, sender-key cleanup is limited to this chat.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview matching auth files without deleting"),
+    restart_bridge: bool = typer.Option(
+        True,
+        "--restart-bridge/--no-restart-bridge",
+        help="Restart WhatsApp bridge after cleanup",
+    ),
+    restart_gateway: bool = typer.Option(
+        True,
+        "--restart-gateway/--no-restart-gateway",
+        help="Restart gateway if it is currently running",
+    ),
+):
+    """Repair WhatsApp decrypt issues for one sender by resetting sender/session auth artifacts."""
+    import shutil
+
+    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from nanobot.config.loader import load_config
+
+    raw_sender = (sender_id or "").strip()
+    sender_token = raw_sender.split("@", 1)[0].split(":", 1)[0].strip()
+    if not sender_token.isdigit():
+        console.print("[red]Invalid --sender-id. Use numeric sender id (digits only).[/red]")
+        raise typer.Exit(1)
+
+    chat_scope = (chat_id or "").strip()
+    if chat_scope and "@" not in chat_scope:
+        console.print("[red]Invalid --chat-id. Expected WhatsApp JID like ...@g.us[/red]")
+        raise typer.Exit(1)
+
+    config = load_config()
+    auth_dir = Path(config.channels.whatsapp.auth_dir).expanduser()
+    if not auth_dir.exists():
+        console.print(f"[red]Auth dir not found:[/red] {auth_dir}")
+        raise typer.Exit(1)
+
+    names = [p.name for p in auth_dir.glob("*.json")]
+    targets: list[str] = []
+    for name in names:
+        if name == f"device-list-{sender_token}.json":
+            targets.append(name)
+            continue
+        if name.startswith(f"lid-mapping-{sender_token}") and name.endswith(".json"):
+            targets.append(name)
+            continue
+        if name.startswith(f"session-{sender_token}_1.") and name.endswith(".json"):
+            targets.append(name)
+            continue
+        if name.startswith("sender-key-") and name.endswith(".json"):
+            if f"--{sender_token}_1--" not in name:
+                continue
+            if chat_scope and not name.startswith(f"sender-key-{chat_scope}--"):
+                continue
+            targets.append(name)
+
+    # Sender-key-memory caches mapping for a chat; clear only when chat scope is explicit.
+    if chat_scope:
+        memory_name = f"sender-key-memory-{chat_scope}.json"
+        if (auth_dir / memory_name).exists():
+            targets.append(memory_name)
+
+    targets = sorted(set(targets))
+    if not targets:
+        console.print("[yellow]No matching auth artifacts found for that sender.[/yellow]")
+        return
+
+    if dry_run:
+        console.print(f"[yellow]Dry run:[/yellow] would remove {len(targets)} file(s):")
+        for name in targets:
+            console.print(f"  - {name}")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = auth_dir / f"repair-backup-sender-{sender_token}-{stamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    removed = 0
+    for name in targets:
+        src = auth_dir / name
+        if not src.exists():
+            continue
+        shutil.copy2(src, backup_dir / name)
+        src.unlink(missing_ok=True)
+        removed += 1
+
+    console.print(f"[green]✓[/green] Backed up and removed {removed} file(s)")
+    console.print(f"Backup: {backup_dir}")
+
+    runtime = WhatsAppRuntimeManager(config=config)
+    if restart_bridge:
+        try:
+            status = runtime.restart_bridge()
+            console.print(f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})")
+        except Exception as e:
+            console.print(f"[red]Bridge restart failed:[/red] {e}")
+            raise typer.Exit(1)
+
+    if restart_gateway:
+        gateway_port = config.gateway.port
+        if _find_gateway_pids(gateway_port):
+            _stop_gateway_processes(gateway_port)
+            _start_gateway_daemon(gateway_port, verbose=False)
+        else:
+            console.print(f"[dim]Gateway not running on port {gateway_port}; skipped restart.[/dim]")
+
+
 def _get_bridge_dir() -> Path:
     """Get the prepared user bridge runtime directory."""
     try:
