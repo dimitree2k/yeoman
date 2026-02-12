@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import random
+import re
 import uuid
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -25,6 +26,47 @@ if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
     from nanobot.providers.factory import ProviderFactory
     from nanobot.storage.inbound_archive import InboundArchive
+
+
+def _markdown_to_whatsapp(text: str) -> str:
+    """Convert markdown to WhatsApp-compatible format."""
+    if not text:
+        return ""
+
+    code_blocks: list[str] = []
+
+    def save_code_block(m: re.Match) -> str:
+        code_blocks.append(m.group(1))
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = re.sub(r"```[\w]*\n?([\s\S]*?)```", save_code_block, text)
+
+    inline_codes: list[str] = []
+
+    def save_inline_code(m: re.Match) -> str:
+        inline_codes.append(m.group(1))
+        return f"\x00IC{len(inline_codes) - 1}\x00"
+
+    text = re.sub(r"`([^`]+)`", save_inline_code, text)
+
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"__(.+?)__", r"_\1_", text)
+    text = re.sub(r"~~(.+?)~~", r"~\1~", text)
+
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*(.*)$", r"> \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^[-*]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"^\d+\.\s+", lambda m: f"{m.group(0)}", text, flags=re.MULTILINE)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"\x00IC{i}\x00", code)
+
+    for i, code in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{i}\x00", f"```\n{code}\n```")
+
+    return text.strip()
+
 
 PROTOCOL_VERSION = 2
 DEDUPE_TTL_SECONDS = 20 * 60
@@ -120,9 +162,7 @@ class WhatsAppChannel(BaseChannel):
     def _require_token(self) -> str:
         token = (self.config.bridge_token or "").strip()
         if not token:
-            raise RuntimeError(
-                "channels.whatsapp.bridgeToken is required for protocol v2"
-            )
+            raise RuntimeError("channels.whatsapp.bridgeToken is required for protocol v2")
         return token
 
     async def start(self) -> None:
@@ -271,7 +311,7 @@ class WhatsAppChannel(BaseChannel):
             "send_text",
             {
                 "to": msg.chat_id,
-                "text": msg.content,
+                "text": _markdown_to_whatsapp(msg.content),
             },
             timeout_seconds=20.0,
         )
@@ -392,7 +432,9 @@ class WhatsAppChannel(BaseChannel):
         )
 
         media = payload.get("media") if isinstance(payload.get("media"), dict) else None
-        media_kind = str(media.get("kind")) if isinstance(media, dict) and media.get("kind") else None
+        media_kind = (
+            str(media.get("kind")) if isinstance(media, dict) and media.get("kind") else None
+        )
         media_type = (
             str(media.get("mimeType"))
             if isinstance(media, dict) and media.get("mimeType")
@@ -456,7 +498,10 @@ class WhatsAppChannel(BaseChannel):
             return
 
         key = f"{event.chat_jid}:{event.sender_id}"
-        if key not in self._debounce_buffers and len(self._debounce_buffers) >= self._max_debounce_buckets:
+        if (
+            key not in self._debounce_buffers
+            and len(self._debounce_buffers) >= self._max_debounce_buckets
+        ):
             self._debounce_overflow += 1
             if self._debounce_overflow == 1 or self._debounce_overflow % 100 == 0:
                 logger.warning(
@@ -505,7 +550,11 @@ class WhatsAppChannel(BaseChannel):
             None,
         )
         reply_to_participant = next(
-            (event.reply_to_participant for event in reversed(events) if event.reply_to_participant),
+            (
+                event.reply_to_participant
+                for event in reversed(events)
+                if event.reply_to_participant
+            ),
             None,
         )
         reply_to_text = next(
@@ -653,7 +702,11 @@ class WhatsAppChannel(BaseChannel):
         if text == "[Voice Message]":
             text = "[Voice Message: Transcription not available for WhatsApp yet]"
         media_for_assistant: list[str] = []
-        if self.config.media.pass_image_to_assistant and event.media_path and event.media_kind == "image":
+        if (
+            self.config.media.pass_image_to_assistant
+            and event.media_path
+            and event.media_kind == "image"
+        ):
             media_for_assistant = [event.media_path]
 
         await self._handle_message(
