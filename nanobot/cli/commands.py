@@ -28,9 +28,7 @@ def version_callback(value: bool):
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        None, "--version", "-v", callback=version_callback, is_eager=True
-    ),
+    version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
     """nanobot - Personal AI Assistant."""
     pass
@@ -74,10 +72,10 @@ def onboard():
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
-    console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
-
-
+    console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
+    console.print(
+        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+    )
 
 
 def _create_workspace_templates(workspace: Path):
@@ -128,29 +126,6 @@ Information about the user goes here.
             file_path.write_text(content)
             console.print(f"  [dim]Created {filename}[/dim]")
 
-    # Create memory directory and MEMORY.md
-    memory_dir = workspace / "memory"
-    memory_dir.mkdir(exist_ok=True)
-    memory_file = memory_dir / "MEMORY.md"
-    if not memory_file.exists():
-        memory_file.write_text("""# Long-term Memory
-
-This file stores important information that should persist across sessions.
-
-## User Information
-
-(Important facts about the user)
-
-## Preferences
-
-(User preferences learned over time)
-
-## Important Notes
-
-(Things to remember)
-""")
-        console.print("  [dim]Created memory/MEMORY.md[/dim]")
-
 
 def _make_provider(config):
     """Create LiteLLMProvider from config. Exits if no API key found."""
@@ -189,6 +164,7 @@ def _make_policy_engine(config):
     """Create policy engine + path from ~/.nanobot/policy.json."""
     from nanobot.policy.engine import PolicyEngine
     from nanobot.policy.loader import get_policy_path, load_policy
+
     try:
         policy_path = get_policy_path()
         policy = load_policy(policy_path)
@@ -501,6 +477,7 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
 
     if verbose:
         import logging
+
         logging.basicConfig(level=logging.DEBUG)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
@@ -528,7 +505,9 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
     )
 
     if runtime.channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(runtime.channels.enabled_channels)}")
+        console.print(
+            f"[green]✓[/green] Channels enabled: {', '.join(runtime.channels.enabled_channels)}"
+        )
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
 
@@ -611,7 +590,9 @@ def gateway(
         if stopped == 0:
             console.print("[yellow]Gateway is not running[/yellow]")
             return
-        console.print(f"[green]✓[/green] Gateway stopped ({stopped} process{'es' if stopped != 1 else ''})")
+        console.print(
+            f"[green]✓[/green] Gateway stopped ({stopped} process{'es' if stopped != 1 else ''})"
+        )
         return
 
     if mode == "restart":
@@ -630,8 +611,6 @@ def gateway(
         return
 
     _run_gateway_foreground(port, verbose, ensure_whatsapp=ensure_whatsapp)
-
-
 
 
 # ============================================================================
@@ -742,24 +721,16 @@ def channels_status():
     table.add_row(
         "WhatsApp",
         "✓" if wa.enabled else "✗",
-        f"{wa.resolved_bridge_url} (host={wa.bridge_host}, port={wa.resolved_bridge_port})"
+        f"{wa.resolved_bridge_url} (host={wa.bridge_host}, port={wa.resolved_bridge_port})",
     )
 
     dc = config.channels.discord
-    table.add_row(
-        "Discord",
-        "✓" if dc.enabled else "✗",
-        dc.gateway_url
-    )
+    table.add_row("Discord", "✓" if dc.enabled else "✗", dc.gateway_url)
 
     # Telegram
     tg = config.channels.telegram
     tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Telegram",
-        "✓" if tg.enabled else "✗",
-        tg_config
-    )
+    table.add_row("Telegram", "✓" if tg.enabled else "✗", tg_config)
 
     console.print(table)
 
@@ -807,13 +778,17 @@ def whatsapp_ensure(
 
 @whatsapp_app.command("repair-sender")
 def whatsapp_repair_sender(
-    sender_id: str = typer.Option(..., "--sender-id", help="Sender numeric id (e.g. 34596062240904)"),
+    sender_id: str = typer.Option(
+        ..., "--sender-id", help="Sender numeric id (e.g. 34596062240904)"
+    ),
     chat_id: str | None = typer.Option(
         None,
         "--chat-id",
         help="Optional chat id scope (e.g. 120363...@g.us). When set, sender-key cleanup is limited to this chat.",
     ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview matching auth files without deleting"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview matching auth files without deleting"
+    ),
     restart_bridge: bool = typer.Option(
         True,
         "--restart-bridge/--no-restart-bridge",
@@ -904,7 +879,9 @@ def whatsapp_repair_sender(
     if restart_bridge:
         try:
             status = runtime.restart_bridge()
-            console.print(f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})")
+            console.print(
+                f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})"
+            )
         except Exception as e:
             console.print(f"[red]Bridge restart failed:[/red] {e}")
             raise typer.Exit(1)
@@ -915,7 +892,9 @@ def whatsapp_repair_sender(
             _stop_gateway_processes(gateway_port)
             _start_gateway_daemon(gateway_port, verbose=False)
         else:
-            console.print(f"[dim]Gateway not running on port {gateway_port}; skipped restart.[/dim]")
+            console.print(
+                f"[dim]Gateway not running on port {gateway_port}; skipped restart.[/dim]"
+            )
 
 
 def _get_bridge_dir() -> Path:
@@ -957,8 +936,7 @@ def _rotate_whatsapp_bridge_token(config=None) -> tuple[str, str]:
     from nanobot.config.loader import get_config_path
 
     console.print(
-        "[green]✓[/green] Rotated channels.whatsapp.bridgeToken and saved to "
-        f"{get_config_path()}"
+        f"[green]✓[/green] Rotated channels.whatsapp.bridgeToken and saved to {get_config_path()}"
     )
     return old_token, new_token
 
@@ -1152,7 +1130,9 @@ def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
 
 @bridge_app.command("start")
 def bridge_start(
-    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+    port: int = typer.Option(
+        None, "--port", "-p", help="Bridge port (default: from config bridge_url)"
+    ),
 ):
     """Start WhatsApp bridge in background."""
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
@@ -1179,7 +1159,9 @@ def bridge_start(
 
 @bridge_app.command("stop")
 def bridge_stop(
-    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+    port: int = typer.Option(
+        None, "--port", "-p", help="Bridge port (default: from config bridge_url)"
+    ),
 ):
     """Stop WhatsApp bridge."""
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
@@ -1191,12 +1173,16 @@ def bridge_stop(
     if stopped == 0:
         console.print("[yellow]Bridge is not running[/yellow]")
         return
-    console.print(f"[green]✓[/green] Bridge stopped ({stopped} process{'es' if stopped != 1 else ''})")
+    console.print(
+        f"[green]✓[/green] Bridge stopped ({stopped} process{'es' if stopped != 1 else ''})"
+    )
 
 
 @bridge_app.command("restart")
 def bridge_restart(
-    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+    port: int = typer.Option(
+        None, "--port", "-p", help="Bridge port (default: from config bridge_url)"
+    ),
 ):
     """Restart WhatsApp bridge."""
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
@@ -1215,7 +1201,9 @@ def bridge_restart(
 
 @bridge_app.command("status")
 def bridge_status(
-    port: int = typer.Option(None, "--port", "-p", help="Bridge port (default: from config bridge_url)"),
+    port: int = typer.Option(
+        None, "--port", "-p", help="Bridge port (default: from config bridge_url)"
+    ),
 ):
     """Show WhatsApp bridge status."""
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
@@ -1279,11 +1267,15 @@ def bridge_rotate_token(
         if bridge_running:
             runtime.restart_bridge(resolved_port)
             status = runtime.status_bridge(resolved_port)
-            console.print(f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})")
+            console.print(
+                f"[green]✓[/green] Bridge restarted (pid {status.pids[0]}, port {status.port})"
+            )
             console.print(f"Log: {status.log_path}")
         elif start_bridge_if_stopped:
             status = runtime.start_bridge(resolved_port)
-            console.print(f"[green]✓[/green] Bridge started (pid {status.pids[0]}, port {status.port})")
+            console.print(
+                f"[green]✓[/green] Bridge started (pid {status.pids[0]}, port {status.port})"
+            )
             console.print(f"Log: {status.log_path}")
         else:
             console.print(
@@ -1369,7 +1361,7 @@ def policy_explain(
 
 @policy_app.command("cmd")
 def policy_cmd(
-    command: str = typer.Argument(..., help='Canonical slash command, e.g. \"/policy list-groups\"'),
+    command: str = typer.Argument(..., help='Canonical slash command, e.g. "/policy list-groups"'),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run command in dry-run mode"),
     confirm: bool = typer.Option(False, "--confirm", help="Confirm risky command execution"),
 ):
@@ -1386,7 +1378,9 @@ def policy_cmd(
         console.print("[red]Policy path unavailable[/red]")
         raise typer.Exit(1)
 
-    apply_channels = policy_engine.apply_channels if policy_engine is not None else {"telegram", "whatsapp"}
+    apply_channels = (
+        policy_engine.apply_channels if policy_engine is not None else {"telegram", "whatsapp"}
+    )
     service = PolicyAdminService(
         policy_path=policy_path,
         workspace=config.workspace_path,
@@ -1415,8 +1409,12 @@ def policy_cmd(
 @policy_app.command("annotate-whatsapp-comments")
 def policy_annotate_whatsapp_comments(
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing comment fields"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show changes without writing policy.json"),
-    bridge_url: str | None = typer.Option(None, "--bridge-url", help="WhatsApp bridge ws:// URL (default: from config)"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show changes without writing policy.json"
+    ),
+    bridge_url: str | None = typer.Option(
+        None, "--bridge-url", help="WhatsApp bridge ws:// URL (default: from config)"
+    ),
 ):
     """Fill WhatsApp group chat comments in policy.json using the running bridge."""
     import asyncio
@@ -1507,7 +1505,9 @@ def policy_annotate_whatsapp_comments(
         names = asyncio.run(_list_groups(resolved_bridge_url, targets, bridge_token))
     except Exception as e:
         console.print(f"[red]Failed to fetch group names from bridge:[/red] {e}")
-        console.print("[dim]Tip: ensure the WhatsApp bridge is running and connected (nanobot channels bridge status).[/dim]")
+        console.print(
+            "[dim]Tip: ensure the WhatsApp bridge is running and connected (nanobot channels bridge status).[/dim]"
+        )
         raise typer.Exit(1)
 
     updated = 0
@@ -1571,6 +1571,7 @@ def cron_list(
     table.add_column("Next Run")
 
     import time
+
     for job in jobs:
         # Format schedule
         if job.schedule.kind == "every":
@@ -1583,7 +1584,9 @@ def cron_list(
         # Format next run
         next_run = ""
         if job.state.next_run_at_ms:
-            next_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(job.state.next_run_at_ms / 1000))
+            next_time = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(job.state.next_run_at_ms / 1000)
+            )
             next_run = next_time
 
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
@@ -1602,7 +1605,9 @@ def cron_add(
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
     deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
     to: str = typer.Option(None, "--to", help="Recipient for delivery"),
-    channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
+    channel: str = typer.Option(
+        None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"
+    ),
 ):
     """Add a scheduled job."""
     from nanobot.config.loader import get_data_dir
@@ -1616,6 +1621,7 @@ def cron_add(
         schedule = CronSchedule(kind="cron", expr=cron_expr)
     elif at:
         import datetime
+
         dt = datetime.datetime.fromisoformat(at)
         schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
     else:
@@ -2009,9 +2015,15 @@ def status():
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Policy: {policy_path} {'[green]✓[/green]' if policy_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    console.print(
+        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Policy: {policy_path} {'[green]✓[/green]' if policy_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+    )
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -2031,7 +2043,9 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(
+                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
+                )
 
 
 if __name__ == "__main__":
