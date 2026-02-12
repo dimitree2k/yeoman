@@ -38,11 +38,3 @@ def render_memory_hits(hits: list[MemoryHit], max_chars: int = 2400) -> str:
     if len(rendered) <= max_chars:
         return rendered
     return rendered[:max_chars]
-
-
-def render_legacy_memory_header(text: str, max_chars: int = 800) -> str:
-    """Render compact legacy MEMORY.md header text."""
-    compact = _compact(text, max_chars)
-    if not compact:
-        return ""
-    return "[Legacy MEMORY.md]\n" + compact
