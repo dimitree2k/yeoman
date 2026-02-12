@@ -6,9 +6,7 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.memory.render import render_legacy_memory_header
 
 
 class ContextBuilder:
@@ -25,7 +23,6 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(
@@ -66,15 +63,6 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-
-        # Memory context
-        legacy_long_term = self.memory.read_long_term()
-        if persona_text:
-            # Prevent global MEMORY persona notes from competing with chat policy persona.
-            legacy_long_term = self._strip_markdown_section(legacy_long_term, "## Active Persona")
-        legacy_header = render_legacy_memory_header(legacy_long_term, max_chars=800)
-        if legacy_header:
-            parts.append(f"# Memory\n\n{legacy_header}")
 
         # Skills - progressive loading
         # 1. Active skills: always-loaded + explicitly requested skills
@@ -151,8 +139,6 @@ You are nanobot, a helpful AI assistant. You have access to tools that allow you
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Memory files: {workspace_path}/memory/MEMORY.md
-- Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
@@ -257,7 +243,9 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         if not metadata:
             return text
 
-        reply_to_message_id = str(metadata.get("reply_to_message_id") or metadata.get("reply_to") or "").strip()
+        reply_to_message_id = str(
+            metadata.get("reply_to_message_id") or metadata.get("reply_to") or ""
+        ).strip()
         reply_to_participant = str(metadata.get("reply_to_participant") or "").strip()
         reply_to_text = str(metadata.get("reply_to_text") or "").strip()
         if not reply_to_text:
@@ -300,11 +288,7 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         return f"{text}\n\n" + "\n".join(lines)
 
     def add_tool_result(
-        self,
-        messages: list[dict[str, Any]],
-        tool_call_id: str,
-        tool_name: str,
-        result: str
+        self, messages: list[dict[str, Any]], tool_call_id: str, tool_name: str, result: str
     ) -> list[dict[str, Any]]:
         """
         Add a tool result to the message list.
@@ -318,19 +302,16 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         Returns:
             Updated message list.
         """
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": result
-        })
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        )
         return messages
 
     def add_assistant_message(
         self,
         messages: list[dict[str, Any]],
         content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
