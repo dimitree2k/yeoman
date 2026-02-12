@@ -49,9 +49,7 @@ class ModelRoutingConfig(BaseModel):
     def _validate_routes(self) -> "ModelRoutingConfig":
         missing = sorted({name for name in self.routes.values() if name not in self.profiles})
         if missing:
-            raise ValueError(
-                "models.routes references unknown profiles: " + ", ".join(missing)
-            )
+            raise ValueError("models.routes references unknown profiles: " + ", ".join(missing))
         return self
 
 
@@ -79,6 +77,7 @@ class WhatsAppMediaConfig(BaseModel):
 
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
+
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
@@ -128,15 +127,19 @@ class WhatsAppConfig(BaseModel):
 
 class TelegramConfig(BaseModel):
     """Telegram channel configuration."""
+
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     token: str = ""  # Bot token from @BotFather
-    proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+    proxy: str | None = (
+        None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+    )
 
 
 class FeishuConfig(BaseModel):
     """Feishu/Lark channel configuration using WebSocket long connection."""
+
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
@@ -148,6 +151,7 @@ class FeishuConfig(BaseModel):
 
 class DiscordConfig(BaseModel):
     """Discord channel configuration."""
+
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
@@ -158,6 +162,7 @@ class DiscordConfig(BaseModel):
 
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
+
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -166,6 +171,7 @@ class ChannelsConfig(BaseModel):
 
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
+
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
@@ -176,33 +182,44 @@ class AgentDefaults(BaseModel):
 
 class AgentsConfig(BaseModel):
     """Agent configuration."""
+
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 
 class ProviderConfig(BaseModel):
     """LLM provider configuration."""
+
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
+def _get_provider_names() -> list[str]:
+    """Get provider names from registry."""
+    from nanobot.providers.registry import PROVIDERS
+
+    return [spec.name for spec in PROVIDERS]
+
+
 class ProvidersConfig(BaseModel):
     """Configuration for LLM providers."""
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
-    openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
-    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
-    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
-    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+
+    model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="after")
+    def _inject_provider_defaults(self) -> "ProvidersConfig":
+        """Auto-generate provider fields from registry."""
+        from nanobot.providers.registry import PROVIDERS
+
+        for spec in PROVIDERS:
+            if not hasattr(self, spec.name):
+                setattr(self, spec.name, ProviderConfig())
+        return self
 
 
 class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
+
     host: str = "0.0.0.0"
     port: int = 18790
 
@@ -225,17 +242,21 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    whatsapp_bridge: WhatsAppBridgeRuntimeConfig = Field(default_factory=WhatsAppBridgeRuntimeConfig)
+    whatsapp_bridge: WhatsAppBridgeRuntimeConfig = Field(
+        default_factory=WhatsAppBridgeRuntimeConfig
+    )
 
 
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
+
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
 
 
 class WebToolsConfig(BaseModel):
     """Web tools configuration."""
+
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
@@ -324,12 +345,14 @@ class ExecIsolationConfig(BaseModel):
 
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
+
     timeout: int = 60
     isolation: ExecIsolationConfig = Field(default_factory=ExecIsolationConfig)
 
 
 class ToolsConfig(BaseModel):
     """Tools configuration."""
+
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
@@ -363,6 +386,7 @@ class BusConfig(BaseModel):
 
 class Config(BaseSettings):
     """Root configuration for nanobot."""
+
     config_version: int = 2
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -385,6 +409,7 @@ class Config(BaseSettings):
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
         from nanobot.providers.registry import PROVIDERS
+
         model_lower = (model or self.agents.defaults.model).lower()
 
         # Match by keyword (order follows PROVIDERS registry)
@@ -408,6 +433,7 @@ class Config(BaseSettings):
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""
         from nanobot.providers.registry import PROVIDERS
+
         p = self.get_provider(model)
         if p and p.api_base:
             return p.api_base
@@ -415,7 +441,11 @@ class Config(BaseSettings):
         # handle their base URL via env vars in _setup_env, NOT via api_base —
         # otherwise find_gateway() would misdetect them as local/vLLM.
         for spec in PROVIDERS:
-            if spec.is_gateway and spec.default_api_base and p == getattr(self.providers, spec.name, None):
+            if (
+                spec.is_gateway
+                and spec.default_api_base
+                and p == getattr(self.providers, spec.name, None)
+            ):
                 return spec.default_api_base
         return None
 
