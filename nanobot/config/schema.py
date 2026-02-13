@@ -204,7 +204,7 @@ def _get_provider_names() -> list[str]:
 class ProvidersConfig(BaseModel):
     """Configuration for LLM providers."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="allow")
 
     @model_validator(mode="after")
     def _inject_provider_defaults(self) -> "ProvidersConfig":
@@ -212,8 +212,11 @@ class ProvidersConfig(BaseModel):
         from nanobot.providers.registry import PROVIDERS
 
         for spec in PROVIDERS:
-            if not hasattr(self, spec.name):
+            value = getattr(self, spec.name, None)
+            if value is None:
                 setattr(self, spec.name, ProviderConfig())
+            elif isinstance(value, dict):
+                setattr(self, spec.name, ProviderConfig.model_validate(value))
         return self
 
 

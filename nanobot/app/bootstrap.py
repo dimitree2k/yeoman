@@ -251,6 +251,9 @@ def build_gateway_runtime(
         engine=policy_engine,
         known_tools=set(responder.tool_names),
         policy_path=policy_path,
+        session_manager=session_manager,
+        workspace=workspace,
+        memory_state_dir=config.memory.wal.state_dir,
     )
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
     if admin_command_handler is None:

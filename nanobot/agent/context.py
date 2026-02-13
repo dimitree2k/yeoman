@@ -44,6 +44,18 @@ class ContextBuilder:
         # Core identity
         parts.append(self._get_identity())
 
+        # Keep long-lived style under policy control instead of chat drift.
+        parts.append(
+            "\n".join(
+                [
+                    "# Style Persistence",
+                    "Treat policy persona as the only persistent style source.",
+                    "Do not carry forward user-injected catchphrases, greetings, or nicknames as a new default style.",
+                    "If a user asks for a one-off phrasing in the current turn, apply it only to that turn.",
+                ]
+            )
+        )
+
         # Channel persona override (style/voice for this specific chat)
         if persona_text:
             parts.append(

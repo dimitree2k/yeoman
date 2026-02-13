@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, override
 
 import websockets
 
@@ -45,6 +45,10 @@ from nanobot.policy.schema import (
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
 )
+from nanobot.utils.helpers import safe_filename
+
+if TYPE_CHECKING:
+    from nanobot.session.manager import SessionManager
 
 _POLICY_ADMIN_USAGE = (
     "Policy commands (owner DM only):\n"
@@ -106,12 +110,28 @@ class EnginePolicyAdapter(PolicyPort):
         policy_path: Path | None = None,
         reload_on_change: bool | None = None,
         reload_check_interval_seconds: float | None = None,
+        session_manager: "SessionManager | None" = None,
+        workspace: Path | None = None,
+        memory_state_dir: str = "memory/session-state",
     ) -> None:
         self._engine = engine
         self._known_tools = set(known_tools)
         self._policy_path = policy_path
+        self._session_manager = session_manager
+        if workspace is not None:
+            self._workspace = workspace.expanduser().resolve()
+        elif self._engine is not None:
+            self._workspace = self._engine.workspace
+        else:
+            self._workspace = (Path.home() / ".nanobot" / "workspace").resolve()
+        self._memory_state_dir = str(memory_state_dir or "memory/session-state")
         self._policy_admin_service: PolicyAdminService | None = None
-        self._admin_router = AdminCommandRouter([PolicyAdminCommandHandler(self)])
+        self._admin_router = AdminCommandRouter(
+            [
+                PolicyAdminCommandHandler(self),
+                ResetSessionCommandHandler(self),
+            ]
+        )
         self._last_reload_check = 0.0
         self._last_mtime_ns = self._stat_mtime_ns()
 
@@ -289,6 +309,8 @@ class EnginePolicyAdapter(PolicyPort):
 
     def route_admin_command(self, event: InboundEvent) -> AdminCommandResult | None:
         """Route one deterministic slash command and return structured outcome."""
+        if event.channel != "whatsapp":
+            return None
         return self._admin_router.route(_to_admin_context(event))
 
     def policy_admin_is_applicable(self, ctx: AdminCommandContext) -> bool:
@@ -298,6 +320,66 @@ class EnginePolicyAdapter(PolicyPort):
         if policy is None:
             return False
         return self._is_whatsapp_owner(ctx, policy)
+
+    def session_reset_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        if ctx.channel != "whatsapp":
+            return False
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return False
+        return self._is_whatsapp_owner(ctx, policy)
+
+    def session_reset_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if argv:
+            return AdminCommandResult(status="handled", response="Usage: /reset")
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session reset unavailable: policy engine is not active.",
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+        if self._session_manager is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session reset unavailable: session manager is not configured.",
+            )
+
+        session_key = f"{ctx.channel}:{ctx.chat_id}"
+        try:
+            session = self._session_manager.get_or_create(session_key)
+            cleared_messages = len(session.messages)
+            session.clear()
+            self._session_manager.save(session)
+        except Exception as e:
+            return AdminCommandResult(status="handled", response=f"Session reset failed: {e}")
+
+        wal_path = self._session_wal_path(session_key)
+        wal_cleared = False
+        try:
+            wal_path.unlink()
+            wal_cleared = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # WAL cleanup is best-effort; session history reset already succeeded.
+            wal_cleared = False
+
+        message = f"Conversation history cleared for {ctx.chat_id} ({cleared_messages} messages)."
+        if wal_cleared:
+            message += " Session state cleared."
+        return AdminCommandResult(
+            status="handled",
+            response=message,
+            command_name="reset",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(name="session_reset_total", labels=(("channel", ctx.channel),)),
+            ),
+        )
 
     def policy_admin_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         policy = self._load_policy_for_admin()
@@ -336,6 +418,13 @@ class EnginePolicyAdapter(PolicyPort):
             return load_policy(self._policy_path)
         except Exception:
             return None
+
+    def _session_wal_path(self, session_key: str) -> Path:
+        state_dir = Path(self._memory_state_dir).expanduser()
+        if not state_dir.is_absolute():
+            state_dir = self._workspace / state_dir
+        safe_key = safe_filename(session_key.replace(":", "_"))
+        return state_dir / f"{safe_key}.md"
 
     def _execution_to_admin_result(self, execution: PolicyExecutionResult) -> AdminCommandResult:
         status = "handled"
@@ -843,3 +932,22 @@ class PolicyAdminCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/policy help"
+
+
+class ResetSessionCommandHandler(AdminCommandHandler):
+    """Deterministic `/reset` command for clearing chat session context."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "reset"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.session_reset_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.session_reset_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/reset"
