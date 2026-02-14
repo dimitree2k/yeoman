@@ -177,6 +177,31 @@ class LLMResponder(ResponderPort):
         })
         return metadata
 
+    @staticmethod
+    def _is_inbound_voice(event: InboundEvent) -> bool:
+        return bool(event.raw_metadata.get("is_voice", False)) or (
+            str(event.raw_metadata.get("media_kind") or "").strip().lower() == "audio"
+        )
+
+    @classmethod
+    def _voice_reply_expected(
+        cls,
+        *,
+        event: InboundEvent,
+        decision: PolicyDecision,
+        outbound_channel: str,
+    ) -> bool:
+        if outbound_channel != "whatsapp":
+            return False
+        mode = str(getattr(decision, "voice_output_mode", "text") or "text").strip().lower()
+        if mode in {"", "off", "text"}:
+            return False
+        if mode == "always":
+            return True
+        if mode == "in_kind":
+            return cls._is_inbound_voice(event)
+        return False
+
     def _tool_definitions(self, allowed_tools: set[str]) -> list[dict[str, Any]]:
         return [
             schema
@@ -384,6 +409,19 @@ class LLMResponder(ResponderPort):
     async def generate_reply(self, event: InboundEvent, decision: PolicyDecision) -> str | None:
         route_channel, route_chat_id = self._route_for_event(event)
         session_key = f"{route_channel}:{route_chat_id}"
+        metadata = self._metadata_for_event(event)
+        if self._voice_reply_expected(
+            event=event,
+            decision=decision,
+            outbound_channel=route_channel,
+        ):
+            metadata["voice_reply_expected"] = True
+            metadata["voice_reply_max_sentences"] = int(
+                getattr(decision, "voice_output_max_sentences", 2) or 2
+            )
+            metadata["voice_reply_max_chars"] = int(
+                getattr(decision, "voice_output_max_chars", 150) or 150
+            )
         return await self._generate(
             session_key=session_key,
             channel=route_channel,
@@ -391,7 +429,7 @@ class LLMResponder(ResponderPort):
             content=event.content,
             sender_id=event.sender_id,
             media=event.media,
-            metadata=self._metadata_for_event(event),
+            metadata=metadata,
             allowed_tools=set(decision.allowed_tools),
             persona_text=decision.persona_text,
         )

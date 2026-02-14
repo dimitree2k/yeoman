@@ -226,6 +226,8 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
     ) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
         text_with_context = self._with_reply_context(text, metadata)
+        text_with_context = self._with_input_modality_context(text_with_context, metadata)
+        text_with_context = self._with_voice_reply_guidance(text_with_context, metadata)
         if not media:
             return text_with_context
 
@@ -249,6 +251,39 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         if not images:
             return text_with_context
         return [{"type": "text", "text": text_with_context}, *images]
+
+    def _with_input_modality_context(self, text: str, metadata: dict[str, Any] | None) -> str:
+        """Append compact modality hint when input originated from voice."""
+        if not metadata:
+            return text
+        is_voice = bool(metadata.get("is_voice", False)) or (
+            str(metadata.get("media_kind") or "").strip().lower() == "audio"
+        )
+        if not is_voice:
+            return text
+        prefix = (
+            "[Input Modality]\n"
+            "source: voice_message_transcript\n"
+            "note: User sent a voice message; text is automatic transcription.\n"
+        )
+        return f"{prefix}\n{text}"
+
+    def _with_voice_reply_guidance(self, text: str, metadata: dict[str, Any] | None) -> str:
+        """Append compact guidance to keep voice replies short before TTS."""
+        if not metadata or not bool(metadata.get("voice_reply_expected", False)):
+            return text
+
+        max_sentences = max(1, int(metadata.get("voice_reply_max_sentences") or 2))
+        max_chars = max(1, int(metadata.get("voice_reply_max_chars") or 150))
+
+        prefix = (
+            "[Voice Reply Guidance]\n"
+            "target: concise_for_tts\n"
+            f"limit_sentences: {max_sentences}\n"
+            f"limit_chars: {max_chars}\n"
+            "instruction: Keep the answer naturally short and direct to fit these limits.\n"
+        )
+        return f"{prefix}\n{text}"
 
     def _with_reply_context(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append compact reply metadata so models can resolve quoted-message intent."""
