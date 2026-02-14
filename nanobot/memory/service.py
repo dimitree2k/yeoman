@@ -8,9 +8,11 @@ import math
 import queue
 import re
 import threading
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
@@ -29,6 +31,26 @@ from nanobot.policy.loader import load_policy
 
 if TYPE_CHECKING:
     from nanobot.config.schema import Config, MemoryConfig
+
+
+@dataclass(slots=True)
+class _BackgroundNoteEvent:
+    sender_id: str
+    message_id: str | None
+    content: str
+    ts: float
+    mode: Literal["adaptive", "heuristic", "hybrid"]
+
+
+@dataclass(slots=True)
+class _BackgroundNoteBuffer:
+    channel: str
+    chat_id: str
+    is_group: bool
+    events: list[_BackgroundNoteEvent]
+    first_ts: float
+    batch_interval_seconds: int
+    batch_max_messages: int
 
 
 class MemoryService:
@@ -85,6 +107,20 @@ class MemoryService:
             daemon=True,
         )
         self._capture_thread.start()
+        self._background_notes_lock = threading.RLock()
+        self._background_notes: dict[str, _BackgroundNoteBuffer] = {}
+        self._background_notes_stop = threading.Event()
+        self._background_notes_thread = threading.Thread(
+            target=self._background_notes_loop,
+            name="memory-notes-batch",
+            daemon=True,
+        )
+        self._background_notes_thread.start()
+        self._background_notes_enqueued_total = 0
+        self._background_notes_flushed_total = 0
+        self._background_notes_mode_hybrid_total = 0
+        self._background_notes_mode_heuristic_total = 0
+        self._background_notes_saved_total = 0
 
     @staticmethod
     def chat_scope_key(channel: str, chat_id: str) -> str:
@@ -169,6 +205,167 @@ class MemoryService:
             assistant_reply=assistant_reply,
             pending_actions=pending_actions,
         )
+
+    def enqueue_background_note(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sender_id: str,
+        message_id: str | None,
+        content: str,
+        is_group: bool,
+        mode: Literal["adaptive", "heuristic", "hybrid"] = "adaptive",
+        batch_interval_seconds: int = 1800,
+        batch_max_messages: int = 100,
+    ) -> None:
+        """Queue one inbound message for batched background notes capture."""
+        if not self.config.enabled or not self.config.capture.enabled:
+            return
+        compact = self._normalize_content(content)
+        if not compact:
+            return
+        if channel not in set(self.config.capture.channels):
+            return
+
+        key = f"{channel}:{chat_id}"
+        now = time.monotonic()
+        event = _BackgroundNoteEvent(
+            sender_id=sender_id,
+            message_id=message_id,
+            content=compact,
+            ts=now,
+            mode=mode,
+        )
+
+        flush_targets: list[tuple[str, _BackgroundNoteBuffer]] = []
+        with self._background_notes_lock:
+            buf = self._background_notes.get(key)
+            if buf is None:
+                buf = _BackgroundNoteBuffer(
+                    channel=channel,
+                    chat_id=chat_id,
+                    is_group=is_group,
+                    events=[],
+                    first_ts=now,
+                    batch_interval_seconds=max(1, int(batch_interval_seconds)),
+                    batch_max_messages=max(1, int(batch_max_messages)),
+                )
+                self._background_notes[key] = buf
+            buf.events.append(event)
+            self._background_notes_enqueued_total += 1
+            if len(buf.events) >= buf.batch_max_messages:
+                target = self._background_notes.pop(key, None)
+                if target is not None:
+                    flush_targets.append((key, target))
+
+        for _, target in flush_targets:
+            self._flush_background_buffer(target)
+
+    def flush_background_notes(self, now: float | None = None) -> int:
+        """Flush expired background note buffers. Returns flushed chat-buffer count."""
+        now_ts = time.monotonic() if now is None else float(now)
+        to_flush: list[tuple[str, _BackgroundNoteBuffer]] = []
+        with self._background_notes_lock:
+            for key, buf in list(self._background_notes.items()):
+                if not buf.events:
+                    continue
+                if now_ts - buf.first_ts >= float(buf.batch_interval_seconds):
+                    target = self._background_notes.pop(key, None)
+                    if target is not None:
+                        to_flush.append((key, target))
+
+        for _, buf in to_flush:
+            self._flush_background_buffer(buf)
+        return len(to_flush)
+
+    def _background_notes_loop(self) -> None:
+        while not self._background_notes_stop.is_set():
+            try:
+                self.flush_background_notes()
+            except Exception as exc:
+                logger.warning("memory background notes flush failed: {}", exc)
+            self._background_notes_stop.wait(timeout=2.0)
+
+    def _flush_background_buffer(self, buf: _BackgroundNoteBuffer) -> None:
+        if not buf.events:
+            return
+        self._background_notes_flushed_total += 1
+        payload = self._build_background_payload(buf)
+        if not payload:
+            return
+        requested_mode = buf.events[-1].mode if buf.events else "adaptive"
+        effective_mode = self._resolve_background_mode(requested_mode, payload, len(buf.events))
+        if effective_mode == "hybrid":
+            self._background_notes_mode_hybrid_total += 1
+            logger.debug("memory notes flush mode=hybrid chat={} events={}", buf.chat_id, len(buf.events))
+        else:
+            self._background_notes_mode_heuristic_total += 1
+            logger.debug("memory notes flush mode=heuristic chat={} events={}", buf.chat_id, len(buf.events))
+
+        source_message_id = next(
+            (event.message_id for event in reversed(buf.events) if event.message_id),
+            None,
+        )
+        sender_id = next(
+            (event.sender_id for event in reversed(buf.events) if event.sender_id),
+            "",
+        )
+        accepted = self._capture_text(
+            channel=buf.channel,
+            chat_id=buf.chat_id,
+            sender_id=sender_id or None,
+            text=payload,
+            role="user",
+            source_message_id=source_message_id,
+            mode_override=effective_mode,
+        )
+        self._background_notes_saved_total += max(0, int(accepted))
+
+    def _build_background_payload(self, buf: _BackgroundNoteBuffer) -> str:
+        lines = ["[group_notes_batch]"]
+        for event in buf.events:
+            sender = event.sender_id.strip() or "unknown"
+            content = self._normalize_content(event.content)
+            if not content:
+                continue
+            if len(content) > 280:
+                content = content[:277] + "..."
+            lines.append(f"[{sender}] {content}")
+            if len(lines) >= 120:
+                break
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _has_mixed_script(text: str) -> bool:
+        latin = bool(re.search(r"[A-Za-z]", text))
+        non_latin = bool(
+            re.search(
+                r"[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]",
+                text,
+            )
+        )
+        return latin and non_latin
+
+    def _resolve_background_mode(
+        self,
+        requested_mode: Literal["adaptive", "heuristic", "hybrid"],
+        payload: str,
+        message_count: int,
+    ) -> Literal["heuristic", "hybrid"]:
+        if requested_mode in {"heuristic", "hybrid"}:
+            return requested_mode
+
+        # Adaptive escalation for noisy/multilingual/high-entropy batches.
+        if message_count >= 25:
+            return "hybrid"
+        if len(payload) >= 900:
+            return "hybrid"
+        if self._has_mixed_script(payload):
+            return "hybrid"
+        if len(re.findall(r"https?://", payload.lower())) >= 4:
+            return "hybrid"
+        return "heuristic"
 
     def build_retrieved_context(
         self,
@@ -339,6 +536,7 @@ class MemoryService:
         user_message: str,
         source_message_id: str | None,
         assistant_reply: str | None = None,
+        mode_override: Literal["heuristic", "llm", "hybrid"] | None = None,
     ) -> MemoryCaptureResult:
         result = MemoryCaptureResult()
         if not self.config.enabled or not self.config.capture.enabled:
@@ -353,6 +551,7 @@ class MemoryService:
             "user_message": user_message,
             "source_message_id": source_message_id,
             "assistant_reply": assistant_reply,
+            "mode_override": mode_override,
         }
         try:
             self._capture_queue.put_nowait(task)
@@ -396,6 +595,12 @@ class MemoryService:
         source_message_id = str(task.get("source_message_id") or "").strip() or None
         user_message = str(task.get("user_message") or "")
         assistant_reply = str(task.get("assistant_reply") or "")
+        mode_override = task.get("mode_override")
+        capture_mode_override: Literal["heuristic", "llm", "hybrid"] | None
+        if isinstance(mode_override, str) and mode_override in {"heuristic", "llm", "hybrid"}:
+            capture_mode_override = mode_override
+        else:
+            capture_mode_override = None
 
         if user_message:
             self._capture_text(
@@ -405,6 +610,7 @@ class MemoryService:
                 text=user_message,
                 role="user",
                 source_message_id=source_message_id,
+                mode_override=capture_mode_override,
             )
         if assistant_reply and self.config.capture.capture_assistant:
             self._capture_text(
@@ -414,6 +620,7 @@ class MemoryService:
                 text=assistant_reply,
                 role="assistant",
                 source_message_id=source_message_id,
+                mode_override=capture_mode_override,
             )
 
     def _capture_text(
@@ -425,11 +632,12 @@ class MemoryService:
         text: str,
         role: str,
         source_message_id: str | None,
-    ) -> None:
+        mode_override: Literal["heuristic", "llm", "hybrid"] | None = None,
+    ) -> int:
         compact = self._normalize_content(text)
         if not compact:
-            return
-        mode = self.config.capture.mode
+            return 0
+        mode = mode_override or self.config.capture.mode
         max_candidates = max(1, int(self.config.capture.max_candidates_per_message))
         min_confidence = float(self.config.capture.min_confidence)
         min_salience = float(self.config.capture.min_salience)
@@ -455,6 +663,7 @@ class MemoryService:
                 candidate=candidate,
             ):
                 accepted += 1
+        return accepted
 
     def _persist_candidate(
         self,
@@ -639,10 +848,24 @@ class MemoryService:
             "by_kind": {},
             "by_scope": {},
             "queue_size": self._capture_queue.qsize(),
+            "background_note_buffers": len(self._background_notes),
+            "background_notes_enqueued_total": self._background_notes_enqueued_total,
+            "background_notes_flushed_total": self._background_notes_flushed_total,
+            "background_notes_mode_hybrid_total": self._background_notes_mode_hybrid_total,
+            "background_notes_mode_heuristic_total": self._background_notes_mode_heuristic_total,
+            "background_notes_saved_total": self._background_notes_saved_total,
             "embeddings": int(base.get("embeddings", 0)),
         }
 
     def close(self) -> None:
+        self._background_notes_stop.set()
+        # Best effort final flush before shutdown.
+        try:
+            self.flush_background_notes(now=time.monotonic() + 10_000.0)
+        except Exception:
+            pass
+        if self._background_notes_thread.is_alive():
+            self._background_notes_thread.join(timeout=2.0)
         self._capture_stop.set()
         if self._capture_thread.is_alive():
             self._capture_thread.join(timeout=2.0)

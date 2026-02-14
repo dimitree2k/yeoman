@@ -20,6 +20,7 @@ from nanobot.channels.manager import ChannelManager
 from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
+    QueueMemoryNotesCaptureIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -93,11 +94,13 @@ class OrchestratorService:
         orchestrator: Orchestrator,
         typing_adapter: ChannelManagerTypingAdapter,
         telemetry: InMemoryTelemetry,
+        memory: MemoryService,
     ) -> None:
         self._bus = bus
         self._orchestrator = orchestrator
         self._typing_adapter = typing_adapter
         self._telemetry = telemetry
+        self._memory = memory
         self._running = False
 
     async def run(self) -> None:
@@ -143,6 +146,18 @@ class OrchestratorService:
                 case PersistSessionIntent():
                     # Sessions are persisted by the responder implementation.
                     continue
+                case QueueMemoryNotesCaptureIntent():
+                    self._memory.enqueue_background_note(
+                        channel=intent.channel,
+                        chat_id=intent.chat_id,
+                        sender_id=intent.sender_id,
+                        message_id=intent.message_id,
+                        content=intent.content,
+                        is_group=intent.is_group,
+                        mode=intent.mode,
+                        batch_interval_seconds=intent.batch_interval_seconds,
+                        batch_max_messages=intent.batch_max_messages,
+                    )
                 case RecordMetricIntent():
                     self._telemetry.incr(intent.name, intent.value, intent.labels)
                 case _:
@@ -320,6 +335,7 @@ def build_gateway_runtime(
         orchestrator=orchestrator,
         typing_adapter=typing_adapter,
         telemetry=telemetry,
+        memory=memory_service,
     )
 
     return GatewayRuntime(

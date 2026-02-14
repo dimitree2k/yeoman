@@ -17,6 +17,7 @@ WhoCanTalkMode = Literal["everyone", "allowlist", "owner_only"]
 WhenToReplyMode = Literal["all", "mention_only", "allowed_senders", "owner_only", "off"]
 AllowedToolsMode = Literal["all", "allowlist"]
 ToolAccessMode = Literal["everyone", "allowlist", "owner_only"]
+MemoryNotesMode = Literal["adaptive", "heuristic", "hybrid"]
 
 
 class WhoCanTalkPolicy(PolicyModel):
@@ -129,6 +130,57 @@ class RuntimePolicy(PolicyModel):
     admin_require_confirm_for_risky: bool = Field(default=False, alias="adminRequireConfirmForRisky")
 
 
+class MemoryNotesBatchPolicy(PolicyModel):
+    """Batch ingestion controls for background group notes."""
+
+    interval_seconds: int = Field(default=1800, alias="intervalSeconds", ge=1)
+    max_messages: int = Field(default=100, alias="maxMessages", ge=1)
+
+
+class MemoryNotesDefaultsPolicy(PolicyModel):
+    """Default behavior for background memory-notes capture."""
+
+    groups_enabled: bool = Field(default=True, alias="groupsEnabled")
+    dms_enabled: bool = Field(default=False, alias="dmsEnabled")
+    mode: MemoryNotesMode = "adaptive"
+    allow_blocked_senders: bool = Field(default=False, alias="allowBlockedSenders")
+
+
+class MemoryNotesOverride(PolicyModel):
+    """Per-channel/chat override for memory-notes capture."""
+
+    enabled: bool | None = None
+    mode: MemoryNotesMode | None = None
+    allow_blocked_senders: bool | None = Field(default=None, alias="allowBlockedSenders")
+
+
+class MemoryNotesChannelPolicy(PolicyModel):
+    """Per-channel defaults and per-chat overrides for memory-notes capture."""
+
+    default: MemoryNotesOverride = Field(default_factory=MemoryNotesOverride)
+    chats: dict[str, MemoryNotesOverride] = Field(default_factory=dict)
+
+
+def _default_memory_notes_channels() -> dict[str, MemoryNotesChannelPolicy]:
+    return {
+        "whatsapp": MemoryNotesChannelPolicy(),
+        "telegram": MemoryNotesChannelPolicy(),
+    }
+
+
+class MemoryNotesPolicy(PolicyModel):
+    """Top-level background memory-notes policy."""
+
+    enabled: bool = True
+    apply_channels: list[str] = Field(
+        default_factory=lambda: ["whatsapp", "telegram"],
+        alias="applyChannels",
+    )
+    batch: MemoryNotesBatchPolicy = Field(default_factory=MemoryNotesBatchPolicy)
+    defaults: MemoryNotesDefaultsPolicy = Field(default_factory=MemoryNotesDefaultsPolicy)
+    channels: dict[str, MemoryNotesChannelPolicy] = Field(default_factory=_default_memory_notes_channels)
+
+
 def _default_owners() -> dict[str, list[str]]:
     return {
         "telegram": [],
@@ -177,3 +229,4 @@ class PolicyConfig(PolicyModel):
     runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
     defaults: ChatPolicy = Field(default_factory=_default_policy_defaults)
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)
+    memory_notes: MemoryNotesPolicy = Field(default_factory=MemoryNotesPolicy, alias="memoryNotes")

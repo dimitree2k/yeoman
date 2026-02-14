@@ -216,12 +216,22 @@ class EnginePolicyAdapter(PolicyPort):
                 should_respond=True,
                 allowed_tools=frozenset(self._known_tools),
                 reason="policy_disabled",
+                notes_enabled=False,
+                notes_mode="adaptive",
+                notes_allow_blocked_senders=False,
+                notes_batch_interval_seconds=1800,
+                notes_batch_max_messages=100,
                 source="disabled",
             )
 
         self._maybe_reload()
         actor = _to_actor(event)
         decision = self._engine.evaluate(actor, self._known_tools)
+        notes = self._engine.resolve_memory_notes(
+            channel=event.channel,
+            chat_id=event.chat_id,
+            is_group=event.is_group,
+        )
         return PolicyDecision(
             accept_message=decision.accept_message,
             should_respond=decision.should_respond,
@@ -229,6 +239,11 @@ class EnginePolicyAdapter(PolicyPort):
             reason=decision.reason,
             persona_file=decision.persona_file,
             persona_text=self._engine.persona_text(decision.persona_file),
+            notes_enabled=notes.enabled,
+            notes_mode=notes.mode,
+            notes_allow_blocked_senders=notes.allow_blocked_senders,
+            notes_batch_interval_seconds=notes.batch_interval_seconds,
+            notes_batch_max_messages=notes.batch_max_messages,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )
 
@@ -256,8 +271,15 @@ class EnginePolicyAdapter(PolicyPort):
         decision = self.evaluate(event)
 
         effective = None
+        notes = None
         if self._engine is not None and channel in self._engine.apply_channels:
             effective = self._engine.resolve_policy(channel, chat_id)
+        if self._engine is not None:
+            notes = self._engine.resolve_memory_notes(
+                channel=channel,
+                chat_id=chat_id,
+                is_group=is_group,
+            )
 
         return {
             "policySource": decision.source,
@@ -297,7 +319,22 @@ class EnginePolicyAdapter(PolicyPort):
                 "reason": decision.reason,
                 "allowedTools": sorted(decision.allowed_tools),
                 "personaFile": decision.persona_file,
+                "memoryNotesEnabled": decision.notes_enabled,
+                "memoryNotesMode": decision.notes_mode,
+                "memoryNotesAllowBlockedSenders": decision.notes_allow_blocked_senders,
             },
+            "memoryNotes": (
+                {
+                    "enabled": notes.enabled,
+                    "mode": notes.mode,
+                    "allowBlockedSenders": notes.allow_blocked_senders,
+                    "batchIntervalSeconds": notes.batch_interval_seconds,
+                    "batchMaxMessages": notes.batch_max_messages,
+                    "source": notes.source,
+                }
+                if notes is not None
+                else None
+            ),
         }
 
     def maybe_handle_admin_command(self, event: InboundEvent) -> str | None:

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from nanobot.policy.identity import normalize_identity_token, normalize_sender_list
 from nanobot.policy.persona import load_persona_text, resolve_persona_path
-from nanobot.policy.schema import ChatPolicy, ChatPolicyOverride, PolicyConfig
+from nanobot.policy.schema import ChatPolicy, ChatPolicyOverride, MemoryNotesMode, PolicyConfig
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -67,6 +67,18 @@ class PolicyDecision:
     reason: str
 
 
+@dataclass(slots=True)
+class MemoryNotesDecision:
+    """Resolved background memory-notes settings for one chat context."""
+
+    enabled: bool
+    mode: MemoryNotesMode
+    allow_blocked_senders: bool
+    batch_interval_seconds: int
+    batch_max_messages: int
+    source: dict[str, str] = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class _CompiledToolAccessRule:
     mode: str
@@ -87,6 +99,13 @@ class _CompiledPolicy:
     persona_file: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _CompiledMemoryNotesSettings:
+    enabled: bool | None
+    mode: MemoryNotesMode | None
+    allow_blocked_senders: bool | None
+
+
 class PolicyEngine:
     """Evaluates per-channel/per-chat policy rules."""
 
@@ -103,6 +122,16 @@ class PolicyEngine:
         self._channel_defaults: dict[str, _CompiledPolicy] = {}
         self._chat_rules: dict[tuple[str, str], _CompiledPolicy] = {}
         self._resolved_cache: dict[tuple[str, str], _CompiledPolicy] = {}
+        self._memory_notes_apply_channels: set[str] = set()
+        self._memory_notes_batch_interval_seconds = 1800
+        self._memory_notes_batch_max_messages = 100
+        self._memory_notes_defaults = _CompiledMemoryNotesSettings(
+            enabled=True,
+            mode="adaptive",
+            allow_blocked_senders=False,
+        )
+        self._memory_notes_channel_defaults: dict[str, _CompiledMemoryNotesSettings] = {}
+        self._memory_notes_chat_overrides: dict[tuple[str, str], _CompiledMemoryNotesSettings] = {}
         self._compile()
 
     def _compile(self) -> None:
@@ -132,6 +161,40 @@ class PolicyEngine:
                     self._chat_rules[(channel, chat_id)] = self._compile_chat_policy(channel, chat_resolved)
 
         self._resolved_cache.clear()
+        self._compile_memory_notes()
+
+    @staticmethod
+    def _compile_memory_notes_override(override: Any) -> _CompiledMemoryNotesSettings:
+        return _CompiledMemoryNotesSettings(
+            enabled=override.enabled,
+            mode=override.mode,
+            allow_blocked_senders=override.allow_blocked_senders,
+        )
+
+    def _compile_memory_notes(self) -> None:
+        notes = self.policy.memory_notes
+        self._memory_notes_apply_channels = {
+            str(channel).strip()
+            for channel in notes.apply_channels
+            if str(channel).strip()
+        }
+        self._memory_notes_batch_interval_seconds = int(notes.batch.interval_seconds)
+        self._memory_notes_batch_max_messages = int(notes.batch.max_messages)
+        self._memory_notes_defaults = _CompiledMemoryNotesSettings(
+            enabled=bool(notes.defaults.groups_enabled),
+            mode=notes.defaults.mode,
+            allow_blocked_senders=bool(notes.defaults.allow_blocked_senders),
+        )
+        self._memory_notes_channel_defaults.clear()
+        self._memory_notes_chat_overrides.clear()
+        for channel, cfg in notes.channels.items():
+            self._memory_notes_channel_defaults[channel] = self._compile_memory_notes_override(
+                cfg.default
+            )
+            for chat_id, override in cfg.chats.items():
+                self._memory_notes_chat_overrides[(channel, chat_id)] = (
+                    self._compile_memory_notes_override(override)
+                )
 
     @staticmethod
     def _compile_chat_policy(channel: str, resolved: ChatPolicy) -> _CompiledPolicy:
@@ -431,3 +494,84 @@ class PolicyEngine:
     def persona_text(self, persona_file: str | None) -> str | None:
         """Load persona text for a decision."""
         return load_persona_text(persona_file, self.workspace)
+
+    def resolve_memory_notes(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        is_group: bool,
+    ) -> MemoryNotesDecision:
+        """Resolve memory-notes settings with precedence defaults -> channel -> chat."""
+        notes = self.policy.memory_notes
+        source: dict[str, str] = {}
+        if not notes.enabled:
+            return MemoryNotesDecision(
+                enabled=False,
+                mode="adaptive",
+                allow_blocked_senders=False,
+                batch_interval_seconds=self._memory_notes_batch_interval_seconds,
+                batch_max_messages=self._memory_notes_batch_max_messages,
+                source={"enabled": "memoryNotes.enabled=false"},
+            )
+        if channel not in self._memory_notes_apply_channels:
+            return MemoryNotesDecision(
+                enabled=False,
+                mode="adaptive",
+                allow_blocked_senders=False,
+                batch_interval_seconds=self._memory_notes_batch_interval_seconds,
+                batch_max_messages=self._memory_notes_batch_max_messages,
+                source={"enabled": f"memoryNotes.applyChannels excludes {channel}"},
+            )
+
+        enabled = (
+            bool(notes.defaults.groups_enabled) if is_group else bool(notes.defaults.dms_enabled)
+        )
+        source["enabled"] = (
+            "memoryNotes.defaults.groupsEnabled"
+            if is_group
+            else "memoryNotes.defaults.dmsEnabled"
+        )
+        mode = self._memory_notes_defaults.mode or "adaptive"
+        source["mode"] = "memoryNotes.defaults.mode"
+        allow_blocked = bool(self._memory_notes_defaults.allow_blocked_senders)
+        source["allowBlockedSenders"] = "memoryNotes.defaults.allowBlockedSenders"
+
+        channel_override = self._memory_notes_channel_defaults.get(channel)
+        if channel_override is not None:
+            if channel_override.enabled is not None:
+                enabled = bool(channel_override.enabled)
+                source["enabled"] = f"memoryNotes.channels.{channel}.default.enabled"
+            if channel_override.mode is not None:
+                mode = channel_override.mode
+                source["mode"] = f"memoryNotes.channels.{channel}.default.mode"
+            if channel_override.allow_blocked_senders is not None:
+                allow_blocked = bool(channel_override.allow_blocked_senders)
+                source["allowBlockedSenders"] = (
+                    f"memoryNotes.channels.{channel}.default.allowBlockedSenders"
+                )
+
+        chat_override = self._memory_notes_chat_overrides.get((channel, chat_id))
+        if chat_override is not None:
+            if chat_override.enabled is not None:
+                enabled = bool(chat_override.enabled)
+                source["enabled"] = (
+                    f"memoryNotes.channels.{channel}.chats.{chat_id}.enabled"
+                )
+            if chat_override.mode is not None:
+                mode = chat_override.mode
+                source["mode"] = f"memoryNotes.channels.{channel}.chats.{chat_id}.mode"
+            if chat_override.allow_blocked_senders is not None:
+                allow_blocked = bool(chat_override.allow_blocked_senders)
+                source["allowBlockedSenders"] = (
+                    f"memoryNotes.channels.{channel}.chats.{chat_id}.allowBlockedSenders"
+                )
+
+        return MemoryNotesDecision(
+            enabled=enabled,
+            mode=mode,
+            allow_blocked_senders=allow_blocked,
+            batch_interval_seconds=self._memory_notes_batch_interval_seconds,
+            batch_max_messages=self._memory_notes_batch_max_messages,
+            source=source,
+        )

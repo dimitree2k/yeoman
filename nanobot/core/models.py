@@ -48,6 +48,11 @@ class PolicyDecision:
     reason: str
     persona_text: str | None = None
     persona_file: str | None = None
+    notes_enabled: bool = False
+    notes_mode: Literal["adaptive", "heuristic", "hybrid"] = "adaptive"
+    notes_allow_blocked_senders: bool = False
+    notes_batch_interval_seconds: int = 1800
+    notes_batch_max_messages: int = 100
     source: str = "disabled"
 
 
