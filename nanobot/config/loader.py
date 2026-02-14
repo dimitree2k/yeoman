@@ -168,6 +168,18 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
             whatsapp_cfg.get("max_payload_bytes", 262144),
         )
 
+    # Collapse deprecated memory2 config into single memory config.
+    memory_cfg = snake.get("memory")
+    memory2_cfg = snake.get("memory2")
+    if isinstance(memory2_cfg, dict):
+        if not isinstance(memory_cfg, dict):
+            memory_cfg = {}
+            snake["memory"] = memory_cfg
+        for key in ("enabled", "mode", "db_path", "capture", "recall", "embedding", "scoring", "acl", "wal"):
+            if key in memory2_cfg:
+                memory_cfg[key] = memory2_cfg[key]
+        snake.pop("memory2", None)
+
     apply_missing_defaults(snake)
     snake["config_version"] = CONFIG_VERSION
 

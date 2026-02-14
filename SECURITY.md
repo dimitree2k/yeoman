@@ -2,269 +2,229 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in nanobot, please report it by:
+If you discover a security issue in nanobot:
 
-1. **DO NOT** open a public GitHub issue
-2. Create a private security advisory on GitHub or contact the repository maintainers
+1. Do not open a public issue.
+2. Open a private GitHub security advisory or contact maintainers directly.
 3. Include:
-   - Description of the vulnerability
-   - Steps to reproduce
-   - Potential impact
-   - Suggested fix (if any)
+   - Impact and affected component
+   - Reproduction steps
+   - Suggested remediation (if available)
 
-We aim to respond to security reports within 48 hours.
+Target initial response time: within 48 hours.
 
-## Security Best Practices
+## Security Model (Current)
 
-### 1. API Key Management
+nanobot uses a layered security model:
 
-**CRITICAL**: Never commit API keys to version control.
+1. Policy layer (`~/.nanobot/policy.json`)
+   - Controls who can talk, when the bot replies, and which tools can run.
+   - Supports per-channel and per-chat overrides.
+2. Runtime security middleware (`security.*` in `~/.nanobot/config.json`)
+   - Staged checks for input, tool calls, and optional output sanitization.
+3. Tool guardrails
+   - `exec` has deny-pattern filters, timeout, output truncation, and optional sandbox isolation.
+4. OS-level hardening
+   - File permissions, non-root runtime, process/network isolation.
+
+## Secret Management
+
+Critical rules:
+
+- Never commit API keys or bridge tokens.
+- Assume `~/.nanobot/config.json` contains sensitive material.
+
+Recommended permissions:
 
 ```bash
-# ✅ Good: Store in config file with restricted permissions
+chmod 700 ~/.nanobot
 chmod 600 ~/.nanobot/config.json
-
-# ❌ Bad: Hardcoding keys in code or committing them
+chmod 700 ~/.nanobot/whatsapp-auth
 ```
 
-**Recommendations:**
-- Store API keys in `~/.nanobot/config.json` with file permissions set to `0600`
-- Consider using environment variables for sensitive keys
-- Use OS keyring/credential manager for production deployments
-- Rotate API keys regularly
-- Use separate API keys for development and production
+Notes:
 
-### 2. Channel Access Control
+- Provider API keys are stored as plain text in config by default.
+- For stronger production security, use a secret manager or environment-injection workflow.
+- Rotate keys after suspected exposure.
 
-**IMPORTANT**: Always configure `allowFrom` lists for production use.
+## Access Control (Policy, Not `allowFrom`)
+
+`channels.*.allowFrom` has been removed from `config.json`.
+Access control now lives in `~/.nanobot/policy.json`.
+
+Key controls:
+
+- `whoCanTalk`: `everyone | allowlist | owner_only`
+- `whenToReply`: `all | mention_only | allowed_senders | owner_only | off`
+- `blockedSenders`: explicit deny list
+- `allowedTools`: allow-all or allowlist + deny list
+- `toolAccess`: per-tool sender ACL
+
+Example:
 
 ```json
 {
+  "owners": {
+    "telegram": ["123456789"],
+    "whatsapp": ["+1234567890"]
+  },
   "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["123456789", "987654321"]
-    },
     "whatsapp": {
-      "enabled": true,
-      "allowFrom": ["+1234567890"]
+      "default": {
+        "whoCanTalk": { "mode": "allowlist", "senders": ["+1234567890"] },
+        "whenToReply": { "mode": "mention_only", "senders": [] },
+        "allowedTools": {
+          "mode": "allowlist",
+          "tools": ["list_dir", "read_file", "web_search", "web_fetch"],
+          "deny": []
+        }
+      }
     }
   }
 }
 ```
 
-**Security Notes:**
-- Empty `allowFrom` list will **ALLOW ALL** users (open by default for personal use)
-- Get your Telegram user ID from `@userinfobot`
-- Use full phone numbers with country code for WhatsApp
-- Review access logs regularly for unauthorized access attempts
-
-### 3. Shell Command Execution
-
-The `exec` tool can execute shell commands. While dangerous command patterns are blocked, you should:
-
-- ✅ Review all tool usage in agent logs
-- ✅ Understand what commands the agent is running
-- ✅ Use a dedicated user account with limited privileges
-- ✅ Never run nanobot as root
-- ❌ Don't disable security checks
-- ❌ Don't run on systems with sensitive data without careful review
-
-**Optional Linux hardening (recommended for production):**
-- Enable `tools.exec.isolation.enabled` to run `exec` in per-session bubblewrap sandboxes
-- Keep `tools.exec.isolation.failClosed = true` (default)
-- Maintain `~/.config/nanobot/mount-allowlist.json` outside project root
-- Note: v1 isolation scope is `exec` only; file tools are restricted to workspace when isolation is enabled
-
-**Blocked patterns:**
-- `rm -rf /` - Root filesystem deletion
-- Fork bombs
-- Filesystem formatting (`mkfs.*`)
-- Raw disk writes
-- Other destructive operations
-
-### 4. File System Access
-
-File operations have path traversal protection, but:
-
-- ✅ Run nanobot with a dedicated user account
-- ✅ Use filesystem permissions to protect sensitive directories
-- ✅ Regularly audit file operations in logs
-- ❌ Don't give unrestricted access to sensitive files
-
-### 5. Network Security
-
-**API Calls:**
-- All external API calls use HTTPS by default
-- Timeouts are configured to prevent hanging requests
-- Consider using a firewall to restrict outbound connections if needed
-
-**WhatsApp Bridge:**
-- The bridge runs on `localhost:3001` by default
-- If exposing to network, use proper authentication and TLS
-- Keep authentication data in `~/.nanobot/whatsapp-auth` secure (mode 0700)
-
-### 6. Dependency Security
-
-**Critical**: Keep dependencies updated!
+Legacy migration:
 
 ```bash
-# Check for vulnerable dependencies
-pip install pip-audit
-pip-audit
-
-# Update to latest secure versions
-pip install --upgrade nanobot-ai
+nanobot policy migrate-allowfrom --dry-run
+nanobot policy migrate-allowfrom
 ```
 
-For Node.js dependencies (WhatsApp bridge):
+## Admin Command Security
+
+Deterministic slash admin commands (`/policy ...`, `/reset`) are restricted:
+
+- Channel scope: WhatsApp
+- `/policy`: owner DM only
+- `/reset`: owner-only (WhatsApp)
+
+Built-in protections:
+
+- Admin command rate limiting (`runtime.adminCommandRateLimitPerMinute`, default `30`/minute)
+- Optional confirm gate for risky commands (`runtime.adminRequireConfirmForRisky`)
+- Policy mutation backups + append-only audit log under:
+  - `~/.nanobot/policy/audit/policy_changes.jsonl`
+  - `~/.nanobot/policy/audit/backups/`
+
+## Tool and Execution Security
+
+### `exec` tool
+
+Current protections:
+
+- Dangerous command deny patterns (for example disk wipe/fork bomb patterns)
+- Timeout (default: `60s`)
+- Output truncation (10,000 characters)
+- Optional per-session sandbox isolation via Bubblewrap (`tools.exec.isolation.*`)
+
+Recommended for production:
+
+- Enable `tools.exec.isolation.enabled=true`
+- Keep `tools.exec.isolation.failClosed=true`
+- Keep mount allowlist outside repo (default `~/.config/nanobot/mount-allowlist.json`)
+
+### File tools
+
+- Path traversal protections are enforced.
+- Workspace restriction can be enforced with `tools.restrictToWorkspace=true`.
+- `security.strictProfile=true` forces workspace restriction and enables fail-closed exec isolation.
+
+## Network and Channel Security
+
+- External provider calls use HTTPS endpoints.
+- WhatsApp bridge defaults to local binding (`127.0.0.1:3001`) with token authentication.
+- Keep bridge auth state protected in `~/.nanobot/whatsapp-auth` (mode `0700`).
+
+If you expose bridge or gateway outside localhost:
+
+- Put it behind authenticated reverse proxy
+- Enforce TLS
+- Restrict source IPs/firewall egress and ingress
+
+## Data Privacy and Storage
+
+Sensitive local data may exist in:
+
+- `~/.nanobot/config.json` (API keys/tokens)
+- `~/.nanobot/policy.json` (owner IDs, ACLs)
+- `~/.nanobot/sessions/*.jsonl` (conversation history)
+- `~/.nanobot/memory/memory.db` (long-term memory)
+- `~/.nanobot/inbound/reply_context.db` (message archive)
+- `~/.nanobot/logs/*` (runtime logs)
+
+Operational guidance:
+
+- Limit host access to the nanobot user.
+- Define retention/rotation policy for logs and memory databases.
+- Treat prompts and chat history as sensitive data.
+
+## Dependency Security
+
+Run regular vulnerability checks:
+
+```bash
+pip install pip-audit
+pip-audit
+```
+
+For WhatsApp bridge dependencies:
+
 ```bash
 cd bridge
 npm audit
 npm audit fix
 ```
 
-**Important Notes:**
-- Keep `litellm` updated to the latest version for security fixes
-- We've updated `ws` to `>=8.17.1` to fix DoS vulnerability
-- Run `pip-audit` or `npm audit` regularly
-- Subscribe to security advisories for nanobot and its dependencies
-
-### 7. Production Deployment
-
-For production use:
-
-1. **Isolate the Environment**
-   ```bash
-   # Run in a container or VM
-   docker run --rm -it python:3.11
-   pip install nanobot-ai
-   ```
-
-2. **Use a Dedicated User**
-   ```bash
-   sudo useradd -m -s /bin/bash nanobot
-   sudo -u nanobot nanobot gateway
-   ```
-
-3. **Set Proper Permissions**
-   ```bash
-   chmod 700 ~/.nanobot
-   chmod 600 ~/.nanobot/config.json
-   chmod 700 ~/.nanobot/whatsapp-auth
-   ```
-
-4. **Enable Logging**
-   ```bash
-   # Configure log monitoring
-   tail -f ~/.nanobot/logs/nanobot.log
-   ```
-
-5. **Use Rate Limiting**
-   - Configure rate limits on your API providers
-   - Monitor usage for anomalies
-   - Set spending limits on LLM APIs
-
-6. **Regular Updates**
-   ```bash
-   # Check for updates weekly
-   pip install --upgrade nanobot-ai
-   ```
-
-### 8. Development vs Production
-
-**Development:**
-- Use separate API keys
-- Test with non-sensitive data
-- Enable verbose logging
-- Use a test Telegram bot
-
-**Production:**
-- Use dedicated API keys with spending limits
-- Restrict file system access
-- Enable audit logging
-- Regular security reviews
-- Monitor for unusual activity
-
-### 9. Data Privacy
-
-- **Logs may contain sensitive information** - secure log files appropriately
-- **LLM providers see your prompts** - review their privacy policies
-- **Chat history is stored locally** - protect the `~/.nanobot` directory
-- **API keys are in plain text** - use OS keyring for production
-
-### 10. Incident Response
-
-If you suspect a security breach:
-
-1. **Immediately revoke compromised API keys**
-2. **Review logs for unauthorized access**
-   ```bash
-   grep "Access denied" ~/.nanobot/logs/nanobot.log
-   ```
-3. **Check for unexpected file modifications**
-4. **Rotate all credentials**
-5. **Update to latest version**
-6. **Report the incident** to maintainers
-
-## Security Features
-
-### Built-in Security Controls
-
-✅ **Input Validation**
-- Path traversal protection on file operations
-- Dangerous command pattern detection
-- Input length limits on HTTP requests
-
-✅ **Authentication**
-- Allow-list based access control
-- Failed authentication attempt logging
-- Open by default (configure allowFrom for production use)
-
-✅ **Resource Protection**
-- Command execution timeouts (60s default)
-- Output truncation (10KB limit)
-- HTTP request timeouts (10-30s)
-
-✅ **Secure Communication**
-- HTTPS for all external API calls
-- TLS for Telegram API
-- WebSocket security for WhatsApp bridge
+Also keep `litellm` and websocket-related dependencies current.
 
 ## Known Limitations
 
-⚠️ **Current Security Limitations:**
+Current limitations to account for:
 
-1. **No Rate Limiting** - Users can send unlimited messages (add your own if needed)
-2. **Plain Text Config** - API keys stored in plain text (use keyring for production)
-3. **No Session Management** - No automatic session expiry
-4. **Limited Command Filtering** - Only blocks obvious dangerous patterns
-5. **No Audit Trail** - Limited security event logging (enhance as needed)
+1. No global inbound message rate limiting across all channels.
+2. Secrets are plain text in config by default.
+3. No automatic session expiration model.
+4. Security rules are deterministic/pattern-based and can miss novel attacks.
+5. Exec/file protection is defense-in-depth, not a complete sandbox unless isolation is enabled.
+6. Audit trail is strong for policy admin mutations, but not a full SIEM-grade security event pipeline.
 
-## Security Checklist
+## Production Hardening Checklist
 
-Before deploying nanobot:
+Before production deployment:
 
-- [ ] API keys stored securely (not in code)
-- [ ] Config file permissions set to 0600
-- [ ] `allowFrom` lists configured for all channels
-- [ ] Running as non-root user
-- [ ] File system permissions properly restricted
-- [ ] Dependencies updated to latest secure versions
-- [ ] Logs monitored for security events
-- [ ] Rate limits configured on API providers
-- [ ] Backup and disaster recovery plan in place
-- [ ] Security review of custom skills/tools
+- [ ] Run as non-root dedicated user
+- [ ] `~/.nanobot` permissions hardened (`700`)
+- [ ] `~/.nanobot/config.json` permissions hardened (`600`)
+- [ ] Owners and per-chat ACLs configured in `policy.json`
+- [ ] High-risk tools (`exec`, `spawn`) denied or tightly scoped
+- [ ] Exec isolation enabled and fail-closed
+- [ ] Logs and policy audit files monitored
+- [ ] Dependency audit integrated into update cadence
+- [ ] Key rotation and incident runbook documented
+
+## Incident Response
+
+If compromise is suspected:
+
+1. Revoke and rotate API keys and bridge tokens immediately.
+2. Review runtime logs and policy audit history.
+3. Inspect `~/.nanobot/policy.json` for unauthorized ACL/persona/tool changes.
+4. Review `~/.nanobot/sessions/` and memory DB for prompt-injection persistence.
+5. Update dependencies and redeploy from a trusted baseline.
+6. Report confirmed vulnerabilities to maintainers.
 
 ## Updates
 
-**Last Updated**: 2026-02-03
+Last updated: 2026-02-14
 
-For the latest security updates and announcements, check:
-- GitHub Security Advisories: https://github.com/HKUDS/nanobot/security/advisories
-- Release Notes: https://github.com/HKUDS/nanobot/releases
+Project references:
+
+- This repository advisories: `/security/advisories`
+- This repository releases: `/releases`
+- Upstream project: https://github.com/HKUDS/nanobot
 
 ## License
 
-See LICENSE file for details.
+See `LICENSE`.

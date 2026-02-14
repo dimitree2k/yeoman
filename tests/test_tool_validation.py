@@ -173,10 +173,15 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert iso.pressure_policy == "preempt_oldest_active"
     assert cfg.agents.defaults.timing_logs_enabled is False
     assert cfg.memory.enabled is True
-    assert cfg.memory.backend == "sqlite_fts"
+    assert cfg.memory.mode == "primary"
     assert cfg.memory.capture.enabled is True
+    assert cfg.memory.capture.mode == "hybrid"
     assert cfg.memory.recall.max_results == 8
-    assert cfg.memory.embedding.enabled is False
+    assert cfg.memory.embedding.enabled is True
+    assert cfg.models.routes["memory.embed"] == "memory_embed_fast"
+    assert cfg.models.profiles["memory_embed_fast"].kind == "embedding"
+    assert cfg.models.routes["memory.capture.extract"] == "memory_capture_fast"
+    assert cfg.memory.capture.extract_route == "memory.capture.extract"
 
     data = {
         "agents": {
@@ -194,7 +199,6 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
             }
         },
         "memory": {
-            "backend": "reserved_hybrid",
             "capture": {
                 "enabled": False,
                 "minConfidence": 0.9,
@@ -206,7 +210,6 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert loaded.tools.exec.isolation.batch_session_idle_seconds == 123
     assert loaded.tools.exec.isolation.max_containers == 7
     assert loaded.agents.defaults.timing_logs_enabled is True
-    assert loaded.memory.backend == "reserved_hybrid"
     assert loaded.memory.capture.enabled is False
     assert loaded.memory.capture.min_confidence == 0.9
 
@@ -214,9 +217,10 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert dumped["tools"]["exec"]["isolation"]["batchSessionIdleSeconds"] == 123
     assert dumped["tools"]["exec"]["isolation"]["maxContainers"] == 7
     assert dumped["agents"]["defaults"]["timingLogsEnabled"] is True
-    assert dumped["memory"]["backend"] == "reserved_hybrid"
     assert dumped["memory"]["capture"]["enabled"] is False
     assert dumped["memory"]["capture"]["minConfidence"] == 0.9
+    assert dumped["models"]["routes"]["memory.embed"] == "memory_embed_fast"
+    assert dumped["models"]["routes"]["memory.capture.extract"] == "memory_capture_fast"
 
 
 def test_config_migration_for_legacy_isolation_keys() -> None:

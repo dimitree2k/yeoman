@@ -20,6 +20,7 @@ from nanobot.channels.manager import ChannelManager
 from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
+    QueueMemoryNotesCaptureIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -93,11 +94,13 @@ class OrchestratorService:
         orchestrator: Orchestrator,
         typing_adapter: ChannelManagerTypingAdapter,
         telemetry: InMemoryTelemetry,
+        memory: MemoryService,
     ) -> None:
         self._bus = bus
         self._orchestrator = orchestrator
         self._typing_adapter = typing_adapter
         self._telemetry = telemetry
+        self._memory = memory
         self._running = False
 
     async def run(self) -> None:
@@ -143,6 +146,18 @@ class OrchestratorService:
                 case PersistSessionIntent():
                     # Sessions are persisted by the responder implementation.
                     continue
+                case QueueMemoryNotesCaptureIntent():
+                    self._memory.enqueue_background_note(
+                        channel=intent.channel,
+                        chat_id=intent.chat_id,
+                        sender_id=intent.sender_id,
+                        message_id=intent.message_id,
+                        content=intent.content,
+                        is_group=intent.is_group,
+                        mode=intent.mode,
+                        batch_interval_seconds=intent.batch_interval_seconds,
+                        batch_max_messages=intent.batch_max_messages,
+                    )
                 case RecordMetricIntent():
                     self._telemetry.incr(intent.name, intent.value, intent.labels)
                 case _:
@@ -216,10 +231,8 @@ def build_gateway_runtime(
     restrict_to_workspace, exec_config = _resolve_security_tool_settings(config)
     security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
 
-    memory_service = MemoryService(
-        workspace=workspace,
-        config=config.memory,
-    )
+    memory_service = MemoryService(workspace=workspace, config=config.memory, root_config=config)
+    memory_state_dir = config.memory.wal.state_dir
     try:
         imported = memory_service.backfill_from_workspace_files(force=False)
         if imported > 0:
@@ -253,7 +266,7 @@ def build_gateway_runtime(
         policy_path=policy_path,
         session_manager=session_manager,
         workspace=workspace,
-        memory_state_dir=config.memory.wal.state_dir,
+        memory_state_dir=memory_state_dir,
     )
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
     if admin_command_handler is None:
@@ -322,6 +335,7 @@ def build_gateway_runtime(
         orchestrator=orchestrator,
         typing_adapter=typing_adapter,
         telemetry=telemetry,
+        memory=memory_service,
     )
 
     return GatewayRuntime(

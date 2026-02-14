@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import typer
 from rich.console import Console
@@ -13,7 +14,7 @@ from nanobot import __logo__, __version__
 
 app = typer.Typer(
     name="nanobot",
-    help=f"{__logo__} nanobot - Personal AI Assistant",
+    help=f"{__logo__} nanobot-stack (compat: nanobot) - Personal AI Assistant",
     no_args_is_help=True,
 )
 
@@ -22,7 +23,7 @@ console = Console()
 
 def version_callback(value: bool):
     if value:
-        console.print(f"{__logo__} nanobot v{__version__}")
+        console.print(f"{__logo__} nanobot-stack v{__version__} (compat command: nanobot)")
         raise typer.Exit()
 
 
@@ -30,7 +31,7 @@ def version_callback(value: bool):
 def main(
     version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
-    """nanobot - Personal AI Assistant."""
+    """nanobot-stack (compat: nanobot) - Personal AI Assistant."""
     pass
 
 
@@ -41,7 +42,7 @@ def main(
 
 @app.command()
 def onboard():
-    """Initialize nanobot configuration and workspace."""
+    """Initialize nanobot-stack configuration and workspace."""
     from nanobot.config.loader import get_config_path, save_config
     from nanobot.config.schema import Config
     from nanobot.policy.loader import ensure_policy_file
@@ -68,13 +69,13 @@ def onboard():
     # Create default bootstrap files
     _create_workspace_templates(workspace)
 
-    console.print(f"\n{__logo__} nanobot is ready!")
+    console.print(f"\n{__logo__} nanobot-stack is ready!")
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
     console.print(
-        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+        "\n[dim]Want Telegram/WhatsApp? See project README > Chat Apps[/dim]"
     )
 
 
@@ -94,7 +95,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 """,
         "SOUL.md": """# Soul
 
-I am nanobot, a lightweight AI assistant.
+I am nanobot-stack, a lightweight AI assistant.
 
 ## Personality
 
@@ -157,7 +158,7 @@ def _make_memory_service(config):
     """Create memory service from config/workspace."""
     from nanobot.memory import MemoryService
 
-    return MemoryService(workspace=config.workspace_path, config=config.memory)
+    return MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
 
 
 def _make_policy_engine(config):
@@ -1708,6 +1709,8 @@ def cron_run(
 
 memory_app = typer.Typer(help="Manage long-term memory")
 app.add_typer(memory_app, name="memory")
+notes_app = typer.Typer(help="Manage background group notes capture")
+memory_app.add_typer(notes_app, name="notes")
 
 
 def _memory_scope_keys(
@@ -1726,6 +1729,127 @@ def _memory_scope_keys(
     if scope in {"global", "all"}:
         keys.append(service.global_scope_key())
     return keys
+
+
+def _notes_channel_guard(channel: str) -> str:
+    value = channel.strip().lower()
+    if value not in {"whatsapp", "telegram"}:
+        console.print("[red]Only whatsapp/telegram are supported for memory notes in v1.[/red]")
+        raise typer.Exit(1)
+    return value
+
+
+def _notes_parse_optional_bool(raw: str) -> bool | None:
+    value = raw.strip().lower()
+    if value == "inherit":
+        return None
+    if value == "on":
+        return True
+    if value == "off":
+        return False
+    raise ValueError("must be one of: on, off, inherit")
+
+
+def _notes_parse_optional_mode(raw: str) -> Literal["adaptive", "heuristic", "hybrid"] | None:
+    value = raw.strip().lower()
+    if value == "inherit":
+        return None
+    if value in {"adaptive", "heuristic", "hybrid"}:
+        return value
+    raise ValueError("must be one of: adaptive, heuristic, hybrid, inherit")
+
+
+@notes_app.command("status")
+def memory_notes_status(
+    channel: str = typer.Option(..., "--channel", help="Channel name"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Chat id"),
+    is_group: bool = typer.Option(True, "--is-group/--is-dm", help="Resolve as group or DM"),
+):
+    """Show effective background memory-notes settings for one chat."""
+    from nanobot.config.loader import load_config
+    from nanobot.policy.engine import PolicyEngine
+    from nanobot.policy.loader import load_policy
+
+    resolved_channel = _notes_channel_guard(channel)
+    config = load_config()
+    policy = load_policy()
+    engine = PolicyEngine(
+        policy=policy,
+        workspace=config.workspace_path,
+        apply_channels={"telegram", "whatsapp"},
+    )
+    resolved = engine.resolve_memory_notes(
+        channel=resolved_channel,
+        chat_id=chat_id,
+        is_group=is_group,
+    )
+    console.print("[bold]Memory Notes Status[/bold]")
+    console.print(f"channel: {resolved_channel}")
+    console.print(f"chat_id: {chat_id}")
+    console.print(f"is_group: {is_group}")
+    console.print(f"enabled: {resolved.enabled}")
+    console.print(f"mode: {resolved.mode}")
+    console.print(f"allow_blocked_senders: {resolved.allow_blocked_senders}")
+    console.print(f"batch_interval_seconds: {resolved.batch_interval_seconds}")
+    console.print(f"batch_max_messages: {resolved.batch_max_messages}")
+    source_table = Table(title="Resolution Source")
+    source_table.add_column("Field")
+    source_table.add_column("Source")
+    for key in ("enabled", "mode", "allowBlockedSenders"):
+        source_table.add_row(key, str(resolved.source.get(key, "-")))
+    console.print(source_table)
+
+
+@notes_app.command("set")
+def memory_notes_set(
+    channel: str = typer.Option(..., "--channel", help="Channel name"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Chat id"),
+    enabled: str = typer.Option("inherit", "--enabled", help="on|off|inherit"),
+    mode: str = typer.Option("inherit", "--mode", help="adaptive|hybrid|heuristic|inherit"),
+    allow_blocked: str = typer.Option(
+        "inherit",
+        "--allow-blocked",
+        help="on|off|inherit",
+    ),
+):
+    """Set per-chat memory-notes override in policy.json."""
+    from nanobot.policy.loader import load_policy, save_policy
+    from nanobot.policy.schema import MemoryNotesChannelPolicy, MemoryNotesOverride
+
+    resolved_channel = _notes_channel_guard(channel)
+    try:
+        enabled_value = _notes_parse_optional_bool(enabled)
+        mode_value = _notes_parse_optional_mode(mode)
+        allow_blocked_value = _notes_parse_optional_bool(allow_blocked)
+    except ValueError as e:
+        console.print(f"[red]Invalid value:[/red] {e}")
+        raise typer.Exit(1)
+
+    policy = load_policy()
+    channel_cfg = policy.memory_notes.channels.get(resolved_channel)
+    if channel_cfg is None:
+        channel_cfg = MemoryNotesChannelPolicy()
+        policy.memory_notes.channels[resolved_channel] = channel_cfg
+
+    override = channel_cfg.chats.get(chat_id)
+    if override is None:
+        override = MemoryNotesOverride()
+        channel_cfg.chats[chat_id] = override
+
+    override.enabled = enabled_value
+    override.mode = mode_value
+    override.allow_blocked_senders = allow_blocked_value
+
+    if (
+        override.enabled is None
+        and override.mode is None
+        and override.allow_blocked_senders is None
+    ):
+        channel_cfg.chats.pop(chat_id, None)
+
+    save_policy(policy)
+    console.print("[green]✓[/green] Updated memory notes policy override.")
+    console.print(f"channel={resolved_channel} chat_id={chat_id}")
 
 
 @memory_app.command("status")

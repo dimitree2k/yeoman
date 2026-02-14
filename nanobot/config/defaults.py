@@ -29,6 +29,18 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "model": DEFAULT_ASR_MODEL,
         "timeout_ms": 60000,
     },
+    "memory_embed_fast": {
+        "kind": "embedding",
+        "model": "openai/text-embedding-3-small",
+        "timeout_ms": 12000,
+    },
+    "memory_capture_fast": {
+        "kind": "chat",
+        "model": "openai/gpt-4o-mini",
+        "max_tokens": 700,
+        "temperature": 0.0,
+        "timeout_ms": 15000,
+    },
 }
 
 DEFAULT_MODEL_ROUTES: dict[str, str] = {
@@ -37,6 +49,8 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "asr.transcribe_audio": "asr_default",
     "whatsapp.vision.describe_image": "vision_whatsapp_cheap",
     "whatsapp.asr.transcribe_audio": "asr_default",
+    "memory.embed": "memory_embed_fast",
+    "memory.capture.extract": "memory_capture_fast",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
@@ -56,35 +70,43 @@ DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
 
 DEFAULT_MEMORY: dict[str, Any] = {
     "enabled": True,
-    "db_path": "~/.nanobot/memory/longterm.db",
-    "backend": "sqlite_fts",
+    "mode": "primary",
+    "db_path": "~/.nanobot/memory/memory.db",
+    "capture": {
+        "enabled": True,
+        "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],
+        "capture_assistant": False,
+        "queue_maxsize": 1000,
+        "mode": "hybrid",
+        "extract_route": "memory.capture.extract",
+        "max_candidates_per_message": 4,
+        "min_confidence": 0.6,
+        "min_salience": 0.45,
+    },
     "recall": {
         "max_results": 8,
         "max_prompt_chars": 2400,
-        "user_preference_layer_results": 2,
+        "lexical_limit": 24,
+        "vector_limit": 24,
+        "vector_candidate_limit": 256,
+        "include_trace": True,
     },
-    "capture": {
+    "embedding": {
         "enabled": True,
-        "mode": "heuristic",
-        "min_confidence": 0.78,
-        "min_importance": 0.60,
-        "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],
-        "capture_assistant": False,
-        "max_entries_per_turn": 4,
+        "route": "memory.embed",
     },
-    "retention": {
-        "episodic_days": 90,
-        "fact_days": 3650,
-        "preference_days": 3650,
-        "decision_days": 3650,
+    "scoring": {
+        "lexical_weight": 0.45,
+        "vector_weight": 0.35,
+        "salience_weight": 0.1,
+        "recency_weight": 0.1,
+    },
+    "acl": {
+        "owner_only_preference": True,
     },
     "wal": {
         "enabled": True,
         "state_dir": "memory/session-state",
-    },
-    "embedding": {
-        "enabled": False,
-        "backend": "reserved_hybrid",
     },
 }
 

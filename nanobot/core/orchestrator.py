@@ -10,6 +10,7 @@ from nanobot.core.admin_commands import AdminCommandResult
 from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
+    QueueMemoryNotesCaptureIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -134,7 +135,82 @@ class Orchestrator:
                     return intents
 
         decision = self._policy.evaluate(event)
+        notes_capture_allowed = bool(decision.notes_enabled)
+        notes_mode = decision.notes_mode
+
         if not decision.accept_message:
+            if notes_capture_allowed and decision.notes_allow_blocked_senders:
+                if self._security is not None:
+                    security_input = self._security.check_input(
+                        event.content,
+                        context={
+                            "channel": event.channel,
+                            "chat_id": event.chat_id,
+                            "sender_id": event.sender_id,
+                            "message_id": event.message_id or "",
+                            "path": "memory_notes_background",
+                        },
+                    )
+                    if security_input.decision.action == "block":
+                        intents.append(
+                            RecordMetricIntent(
+                                name="security_input_blocked",
+                                labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                            )
+                        )
+                        intents.append(
+                            RecordMetricIntent(
+                                name="memory_notes_dropped_security",
+                                labels=(("channel", event.channel),),
+                            )
+                        )
+                    else:
+                        intents.append(
+                            QueueMemoryNotesCaptureIntent(
+                                channel=event.channel,
+                                chat_id=event.chat_id,
+                                sender_id=event.sender_id,
+                                message_id=event.message_id,
+                                content=event.content,
+                                is_group=event.is_group,
+                                mode=notes_mode,
+                                batch_interval_seconds=decision.notes_batch_interval_seconds,
+                                batch_max_messages=decision.notes_batch_max_messages,
+                            )
+                        )
+                        intents.append(
+                            RecordMetricIntent(
+                                name="memory_notes_enqueued",
+                                labels=(("channel", event.channel),),
+                            )
+                        )
+                else:
+                    intents.append(
+                        QueueMemoryNotesCaptureIntent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            sender_id=event.sender_id,
+                            message_id=event.message_id,
+                            content=event.content,
+                            is_group=event.is_group,
+                            mode=notes_mode,
+                            batch_interval_seconds=decision.notes_batch_interval_seconds,
+                            batch_max_messages=decision.notes_batch_max_messages,
+                        )
+                    )
+                    intents.append(
+                        RecordMetricIntent(
+                            name="memory_notes_enqueued",
+                            labels=(("channel", event.channel),),
+                        )
+                    )
+            elif notes_capture_allowed:
+                intents.append(
+                    RecordMetricIntent(
+                        name="memory_notes_dropped_policy",
+                        labels=(("channel", event.channel),),
+                    )
+                )
             intents.append(
                 RecordMetricIntent(
                     name="policy_drop_access",
@@ -143,6 +219,71 @@ class Orchestrator:
             )
             return intents
         if not decision.should_respond:
+            if notes_capture_allowed:
+                if self._security is not None:
+                    security_input = self._security.check_input(
+                        event.content,
+                        context={
+                            "channel": event.channel,
+                            "chat_id": event.chat_id,
+                            "sender_id": event.sender_id,
+                            "message_id": event.message_id or "",
+                            "path": "memory_notes_background",
+                        },
+                    )
+                    if security_input.decision.action == "block":
+                        intents.append(
+                            RecordMetricIntent(
+                                name="security_input_blocked",
+                                labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                            )
+                        )
+                        intents.append(
+                            RecordMetricIntent(
+                                name="memory_notes_dropped_security",
+                                labels=(("channel", event.channel),),
+                            )
+                        )
+                    else:
+                        intents.append(
+                            QueueMemoryNotesCaptureIntent(
+                                channel=event.channel,
+                                chat_id=event.chat_id,
+                                sender_id=event.sender_id,
+                                message_id=event.message_id,
+                                content=event.content,
+                                is_group=event.is_group,
+                                mode=notes_mode,
+                                batch_interval_seconds=decision.notes_batch_interval_seconds,
+                                batch_max_messages=decision.notes_batch_max_messages,
+                            )
+                        )
+                        intents.append(
+                            RecordMetricIntent(
+                                name="memory_notes_enqueued",
+                                labels=(("channel", event.channel),),
+                            )
+                        )
+                else:
+                    intents.append(
+                        QueueMemoryNotesCaptureIntent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            sender_id=event.sender_id,
+                            message_id=event.message_id,
+                            content=event.content,
+                            is_group=event.is_group,
+                            mode=notes_mode,
+                            batch_interval_seconds=decision.notes_batch_interval_seconds,
+                            batch_max_messages=decision.notes_batch_max_messages,
+                        )
+                    )
+                    intents.append(
+                        RecordMetricIntent(
+                            name="memory_notes_enqueued",
+                            labels=(("channel", event.channel),),
+                        )
+                    )
             intents.append(
                 RecordMetricIntent(
                     name="policy_drop_reply",

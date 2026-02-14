@@ -1,36 +1,37 @@
 <div align="center">
   <img src="nanobot_logo.png" alt="nanobot" width="500">
-  <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
+  <h1>nanobot-stack: Professional Personal AI Assistant Stack</h1>
   <p>
-    <a href="https://pypi.org/project/nanobot-ai/"><img src="https://img.shields.io/pypi/v/nanobot-ai" alt="PyPI"></a>
-    <a href="https://pepy.tech/project/nanobot-ai"><img src="https://static.pepy.tech/badge/nanobot-ai" alt="Downloads"></a>
-    <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
+    <img src="https://img.shields.io/badge/PyPI-nanobot--stack%20(pending)-orange" alt="PyPI status">
+    <img src="https://img.shields.io/badge/python-≥3.14-blue" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
-    <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white" alt="WeChat"></a>
-    <a href="https://discord.gg/MnCvHqpUGB"><img src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
+    <a href="#chat-apps"><img src="https://img.shields.io/badge/channels-Telegram%20%7C%20WhatsApp%20%7C%20Discord%20%7C%20Feishu-5865F2" alt="Channels"></a>
   </p>
 </div>
 
-🐈 **nanobot** is an **ultra-lightweight** personal AI assistant inspired by [Clawdbot](https://github.com/openclaw/openclaw) 
+🐈 **nanobot-stack** is an **ultra-lightweight** personal AI assistant runtime inspired by [Clawdbot](https://github.com/openclaw/openclaw).
 
-⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
+## Fork Provenance
 
-📏 Real-time line count: **3,423 lines** (run `bash core_agent_lines.sh` to verify anytime)
+This project is an independent fork of [HKUDS/nanobot](https://github.com/HKUDS/nanobot), maintained as **nanobot-stack**.
+
+- Original upstream: `HKUDS/nanobot`
+- License: MIT (preserved)
+- Runtime compatibility: existing `nanobot` command remains supported
+
+⚡️ Delivers core agent functionality in about **13,000** lines of code.
+
+📏 Real-time line count: **~13,000 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
 
-- **2026-02-08** 🔧 Refactored Providers—adding a new LLM provider now takes just 2 simple steps! Check [here](#providers).
-- **2026-02-07** 🚀 Released v0.1.3.post5 with Qwen support & several key improvements! Check [here](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post5) for details.
-- **2026-02-06** ✨ Added Moonshot/Kimi provider, Discord integration, and enhanced security hardening!
-- **2026-02-05** ✨ Added Feishu channel, DeepSeek provider, and enhanced scheduled tasks support!
-- **2026-02-04** 🚀 Released v0.1.3.post4 with multi-provider & Docker support! Check [here](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post4) for details.
-- **2026-02-03** ⚡ Integrated vLLM for local LLM support and improved natural language task scheduling!
-- **2026-02-02** 🎉 nanobot officially launched! Welcome to try 🐈 nanobot!
+- **2026-02 (major runtime cycle)**: moved to a policy-first security model with deterministic admin commands, policy audit/rollback, and stricter operational hardening.
+- **2026-02 (platform expansion)**: matured multi-channel runtime (WhatsApp bridge lifecycle, Telegram/Discord/Feishu support), plus better reconnect, dedupe, and message context handling.
+- **2026-02 (memory and ops)**: landed memory v2 improvements (semantic capture/recall + background notes), plus stronger CLI/operator workflows for policy and diagnostics.
 
 ## Key Features of nanobot:
 
-🪶 **Ultra-Lightweight**: Just ~4,000 lines of core agent code — 99% smaller than Clawdbot.
+🪶 **Lean Runtime**: About 13k lines of core runtime code with clear module boundaries.
 
 🔬 **Research-Ready**: Clean, readable code that's easy to understand, modify, and extend for research.
 
@@ -44,49 +45,26 @@
   <img src="nanobot_arch.png" alt="nanobot architecture" width="800">
 </p>
 
-## ✨ Features
-
-<table align="center">
-  <tr align="center">
-    <th><p align="center">📈 24/7 Real-Time Market Analysis</p></th>
-    <th><p align="center">🚀 Full-Stack Software Engineer</p></th>
-    <th><p align="center">📅 Smart Daily Routine Manager</p></th>
-    <th><p align="center">📚 Personal Knowledge Assistant</p></th>
-  </tr>
-  <tr>
-    <td align="center"><p align="center"><img src="case/search.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/code.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/scedule.gif" width="180" height="400"></p></td>
-    <td align="center"><p align="center"><img src="case/memory.gif" width="180" height="400"></p></td>
-  </tr>
-  <tr>
-    <td align="center">Discovery • Insights • Trends</td>
-    <td align="center">Develop • Deploy • Scale</td>
-    <td align="center">Schedule • Automate • Organize</td>
-    <td align="center">Learn • Memory • Reasoning</td>
-  </tr>
-</table>
-
 ## 📦 Install
 
 **Install from source** (latest features, recommended for development)
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
-cd nanobot
+git clone https://github.com/dimitree2k/nanobot-stack.git
+cd nanobot-stack
 pip install -e .
 ```
 
 **Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
 
 ```bash
-uv tool install nanobot-ai
+uv tool install nanobot-stack
 ```
 
-**Install from PyPI** (stable)
+**Install from PyPI** (once published)
 
 ```bash
-pip install nanobot-ai
+pip install nanobot-stack
 ```
 
 ## 🚀 Quick Start
@@ -127,6 +105,9 @@ nanobot agent -m "What is 2+2?"
 
 That's it! You have a working AI assistant in 2 minutes.
 
+> [!NOTE]
+> CLI compatibility is preserved: both `nanobot` and `nanobot-stack` entrypoints are available.
+
 ## 🖥️ Local Models (vLLM)
 
 Run nanobot with your own local models using vLLM or any OpenAI-compatible server.
@@ -164,6 +145,7 @@ nanobot agent -m "Hello from my local LLM!"
 > [!TIP]
 > The `apiKey` can be any non-empty string for local servers that don't require authentication.
 
+<a id="chat-apps"></a>
 ## 💬 Chat Apps
 
 Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime, anywhere.
@@ -300,7 +282,7 @@ nanobot channels bridge stop
 Uses **WebSocket** long connection — no public IP required.
 
 ```bash
-pip install nanobot-ai[feishu]
+pip install nanobot-stack[feishu]
 ```
 
 **1. Create a Feishu bot**
@@ -676,7 +658,7 @@ nanobot/
 
 PRs welcome! The codebase is intentionally small and readable. 🤗
 
-**Roadmap** — Pick an item and [open a PR](https://github.com/HKUDS/nanobot/pulls)!
+**Roadmap** — Pick an item and open a PR in this repository.
 
 - [x] **Voice Transcription** — Support for Groq Whisper (Issue #13)
 - [ ] **Multi-modal** — See and hear (images, voice, video)
@@ -685,31 +667,13 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 - [ ] **More integrations** — Discord, Slack, email, calendar
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
-### Contributors
-
-<a href="https://github.com/HKUDS/nanobot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=HKUDS/nanobot&max=100&columns=12" />
-</a>
-
-
-## ⭐ Star History
-
-<div align="center">
-  <a href="https://star-history.com/#HKUDS/nanobot&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date" style="border-radius: 15px; box-shadow: 0 0 30px rgba(0, 217, 255, 0.3);" />
-    </picture>
-  </a>
-</div>
+For upstream relationship and sync strategy, see `UPSTREAM.md`.
 
 <p align="center">
-  <em> Thanks for visiting ✨ nanobot!</em><br><br>
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=HKUDS.nanobot&style=for-the-badge&color=00d4ff" alt="Views">
+  <em>Thanks for visiting nanobot-stack.</em>
 </p>
 
 
 <p align="center">
-  <sub>nanobot is for educational, research, and technical exchange purposes only</sub>
+  <sub>nanobot-stack is for educational, research, and technical exchange purposes only.</sub>
 </p>
