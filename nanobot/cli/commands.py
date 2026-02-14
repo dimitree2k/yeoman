@@ -14,7 +14,7 @@ from nanobot import __logo__, __version__
 
 app = typer.Typer(
     name="nanobot",
-    help=f"{__logo__} nanobot - Personal AI Assistant",
+    help=f"{__logo__} nanobot-stack (compat: nanobot) - Personal AI Assistant",
     no_args_is_help=True,
 )
 
@@ -23,7 +23,7 @@ console = Console()
 
 def version_callback(value: bool):
     if value:
-        console.print(f"{__logo__} nanobot v{__version__}")
+        console.print(f"{__logo__} nanobot-stack v{__version__} (compat command: nanobot)")
         raise typer.Exit()
 
 
@@ -31,7 +31,7 @@ def version_callback(value: bool):
 def main(
     version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
-    """nanobot - Personal AI Assistant."""
+    """nanobot-stack (compat: nanobot) - Personal AI Assistant."""
     pass
 
 
@@ -42,7 +42,7 @@ def main(
 
 @app.command()
 def onboard():
-    """Initialize nanobot configuration and workspace."""
+    """Initialize nanobot-stack configuration and workspace."""
     from nanobot.config.loader import get_config_path, save_config
     from nanobot.config.schema import Config
     from nanobot.policy.loader import ensure_policy_file
@@ -69,13 +69,13 @@ def onboard():
     # Create default bootstrap files
     _create_workspace_templates(workspace)
 
-    console.print(f"\n{__logo__} nanobot is ready!")
+    console.print(f"\n{__logo__} nanobot-stack is ready!")
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
     console.print(
-        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+        "\n[dim]Want Telegram/WhatsApp? See project README > Chat Apps[/dim]"
     )
 
 
@@ -95,7 +95,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 """,
         "SOUL.md": """# Soul
 
-I am nanobot, a lightweight AI assistant.
+I am nanobot-stack, a lightweight AI assistant.
 
 ## Personality
 
