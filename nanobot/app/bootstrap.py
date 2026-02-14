@@ -216,10 +216,8 @@ def build_gateway_runtime(
     restrict_to_workspace, exec_config = _resolve_security_tool_settings(config)
     security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
 
-    memory_service = MemoryService(
-        workspace=workspace,
-        config=config.memory,
-    )
+    memory_service = MemoryService(workspace=workspace, config=config.memory, root_config=config)
+    memory_state_dir = config.memory.wal.state_dir
     try:
         imported = memory_service.backfill_from_workspace_files(force=False)
         if imported > 0:
@@ -253,7 +251,7 @@ def build_gateway_runtime(
         policy_path=policy_path,
         session_manager=session_manager,
         workspace=workspace,
-        memory_state_dir=config.memory.wal.state_dir,
+        memory_state_dir=memory_state_dir,
     )
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
     if admin_command_handler is None:

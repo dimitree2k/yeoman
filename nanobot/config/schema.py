@@ -29,7 +29,7 @@ class ModelProfile(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    kind: Literal["chat", "vision", "asr", "ocr", "video"]
+    kind: Literal["chat", "vision", "asr", "ocr", "video", "embedding"]
     model: str | None = None
     provider: str | None = None
     max_tokens: int | None = None
@@ -263,45 +263,65 @@ class WebToolsConfig(BaseModel):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class MemoryCaptureConfig(BaseModel):
+    """Capture configuration for semantic memory pipeline."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["capture"]["enabled"])
+    channels: list[str] = Field(default_factory=lambda: list(DEFAULT_MEMORY["capture"]["channels"]))
+    capture_assistant: bool = bool(DEFAULT_MEMORY["capture"]["capture_assistant"])
+    queue_maxsize: int = int(DEFAULT_MEMORY["capture"]["queue_maxsize"])
+    mode: Literal["heuristic", "llm", "hybrid"] = str(DEFAULT_MEMORY["capture"]["mode"])
+    extract_route: str = str(DEFAULT_MEMORY["capture"]["extract_route"])
+    max_candidates_per_message: int = int(DEFAULT_MEMORY["capture"]["max_candidates_per_message"])
+    min_confidence: float = float(DEFAULT_MEMORY["capture"]["min_confidence"])
+    min_salience: float = float(DEFAULT_MEMORY["capture"]["min_salience"])
+
+
 class MemoryRecallConfig(BaseModel):
-    """Recall configuration for long-term memory retrieval."""
+    """Recall configuration for semantic memory retrieval."""
 
     model_config = ConfigDict(extra="ignore")
 
     max_results: int = int(DEFAULT_MEMORY["recall"]["max_results"])
     max_prompt_chars: int = int(DEFAULT_MEMORY["recall"]["max_prompt_chars"])
-    user_preference_layer_results: int = int(
-        DEFAULT_MEMORY["recall"]["user_preference_layer_results"]
-    )
+    lexical_limit: int = int(DEFAULT_MEMORY["recall"]["lexical_limit"])
+    vector_limit: int = int(DEFAULT_MEMORY["recall"]["vector_limit"])
+    vector_candidate_limit: int = int(DEFAULT_MEMORY["recall"]["vector_candidate_limit"])
+    include_trace: bool = bool(DEFAULT_MEMORY["recall"]["include_trace"])
 
 
-class MemoryCaptureConfig(BaseModel):
-    """Capture configuration for automatic memory extraction."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = bool(DEFAULT_MEMORY["capture"]["enabled"])
-    mode: Literal["heuristic"] = str(DEFAULT_MEMORY["capture"]["mode"])
-    min_confidence: float = float(DEFAULT_MEMORY["capture"]["min_confidence"])
-    min_importance: float = float(DEFAULT_MEMORY["capture"]["min_importance"])
-    channels: list[str] = Field(default_factory=lambda: list(DEFAULT_MEMORY["capture"]["channels"]))
-    capture_assistant: bool = bool(DEFAULT_MEMORY["capture"]["capture_assistant"])
-    max_entries_per_turn: int = int(DEFAULT_MEMORY["capture"]["max_entries_per_turn"])
-
-
-class MemoryRetentionConfig(BaseModel):
-    """Retention policy by memory kind."""
+class MemoryEmbeddingConfig(BaseModel):
+    """Embedding configuration for semantic recall."""
 
     model_config = ConfigDict(extra="ignore")
 
-    episodic_days: int = int(DEFAULT_MEMORY["retention"]["episodic_days"])
-    fact_days: int = int(DEFAULT_MEMORY["retention"]["fact_days"])
-    preference_days: int = int(DEFAULT_MEMORY["retention"]["preference_days"])
-    decision_days: int = int(DEFAULT_MEMORY["retention"]["decision_days"])
+    enabled: bool = bool(DEFAULT_MEMORY["embedding"]["enabled"])
+    route: str = str(DEFAULT_MEMORY["embedding"]["route"])
+
+
+class MemoryScoringConfig(BaseModel):
+    """Scoring weights for composite ranking."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    lexical_weight: float = float(DEFAULT_MEMORY["scoring"]["lexical_weight"])
+    vector_weight: float = float(DEFAULT_MEMORY["scoring"]["vector_weight"])
+    salience_weight: float = float(DEFAULT_MEMORY["scoring"]["salience_weight"])
+    recency_weight: float = float(DEFAULT_MEMORY["scoring"]["recency_weight"])
+
+
+class MemoryAclConfig(BaseModel):
+    """ACL controls for capture."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    owner_only_preference: bool = bool(DEFAULT_MEMORY["acl"]["owner_only_preference"])
 
 
 class MemoryWalConfig(BaseModel):
-    """Write-ahead log config for session state durability."""
+    """Session-state WAL config."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -309,28 +329,20 @@ class MemoryWalConfig(BaseModel):
     state_dir: str = str(DEFAULT_MEMORY["wal"]["state_dir"])
 
 
-class MemoryEmbeddingConfig(BaseModel):
-    """Reserved embedding config for future hybrid retrieval."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = bool(DEFAULT_MEMORY["embedding"]["enabled"])
-    backend: Literal["reserved_hybrid", "sqlite_fts"] = str(DEFAULT_MEMORY["embedding"]["backend"])
-
-
 class MemoryConfig(BaseModel):
-    """Long-term memory system configuration."""
+    """Single active semantic memory system configuration."""
 
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = bool(DEFAULT_MEMORY["enabled"])
+    mode: Literal["primary", "shadow"] = str(DEFAULT_MEMORY["mode"])
     db_path: str = str(DEFAULT_MEMORY["db_path"])
-    backend: Literal["sqlite_fts", "reserved_hybrid"] = str(DEFAULT_MEMORY["backend"])
-    recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     capture: MemoryCaptureConfig = Field(default_factory=MemoryCaptureConfig)
-    retention: MemoryRetentionConfig = Field(default_factory=MemoryRetentionConfig)
-    wal: MemoryWalConfig = Field(default_factory=MemoryWalConfig)
+    recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)
+    scoring: MemoryScoringConfig = Field(default_factory=MemoryScoringConfig)
+    acl: MemoryAclConfig = Field(default_factory=MemoryAclConfig)
+    wal: MemoryWalConfig = Field(default_factory=MemoryWalConfig)
 
 
 class ExecIsolationConfig(BaseModel):

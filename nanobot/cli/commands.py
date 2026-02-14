@@ -157,7 +157,7 @@ def _make_memory_service(config):
     """Create memory service from config/workspace."""
     from nanobot.memory import MemoryService
 
-    return MemoryService(workspace=config.workspace_path, config=config.memory)
+    return MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
 
 
 def _make_policy_engine(config):

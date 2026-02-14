@@ -1,156 +1,228 @@
-"""Heuristic extraction pipeline for memory capture."""
+"""LLM-backed semantic extractor for memory capture."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
-from nanobot.memory.models import MemoryCaptureCandidate
+from loguru import logger
 
-_PREFERENCE_PATTERNS = [
-    re.compile(r"\b(i\s+prefer|my\s+preference\s+is|i\s+like|i\s+usually\s+use)\b", re.IGNORECASE),
-    re.compile(r"\b(don't\s+use|do\s+not\s+use|always\s+use)\b", re.IGNORECASE),
-]
+from nanobot.memory.models import MemorySector
+from nanobot.providers.litellm_provider import LiteLLMProvider
 
-_FACT_PATTERNS = [
-    re.compile(r"\b(my\s+timezone\s+is|i\s+am\s+in|my\s+name\s+is)\b", re.IGNORECASE),
-    re.compile(r"\b(i\s+work\s+with|my\s+language\s+is|i\s+speak)\b", re.IGNORECASE),
-]
+if TYPE_CHECKING:
+    from nanobot.config.schema import Config, ModelProfile
 
-_DECISION_PATTERNS = [
-    re.compile(r"\b(let's\s+use|we\s+decided|from\s+now\s+on\s+use|we\s+will\s+use)\b", re.IGNORECASE),
-    re.compile(r"\b(do\s+.+\s+not\s+.+)\b", re.IGNORECASE),
-]
-
-_UNSAFE_SUBSTRINGS = {
-    "ignore previous",
-    "system prompt",
-    "developer message",
-    "tool call",
-    "function_call",
-    "jailbreak",
-    "sudo rm -rf",
-}
+VALID_SECTORS: set[str] = {"episodic", "semantic", "procedural", "emotional", "reflective"}
 
 
-def _normalize_text(text: str) -> str:
-    return " ".join(text.split()).strip()
+@dataclass(slots=True)
+class ExtractedCandidate:
+    """Structured memory candidate extracted from one message."""
+
+    sector: MemorySector
+    kind: str
+    content: str
+    salience: float
+    confidence: float
+    language: str | None = None
+    valid_to: str | None = None
 
 
-def _is_command_only(text: str) -> bool:
-    compact = text.strip()
-    if not compact:
-        return True
-    if compact.startswith("/"):
-        return True
-    if compact.startswith("$"):
-        return True
-    if compact.startswith(("bash ", "sh ", "zsh ", "python ", "node ")):
-        return True
-    return False
+class MemoryExtractorService:
+    """Extract semantic memory candidates using a routed chat model."""
 
+    def __init__(self, *, config: "Config", route_key: str) -> None:
+        self._config = config
+        self._route_key = route_key
+        self._profile_name, self._profile = self._resolve_profile()
+        self._model = (self._profile.model or "").strip()
+        self._max_tokens = int(self._profile.max_tokens or 700)
+        self._temperature = float(self._profile.temperature if self._profile.temperature is not None else 0.0)
+        self._provider = self._create_provider(self._model)
 
-def _is_unsafe(text: str) -> bool:
-    lowered = text.lower()
-    if "```" in lowered:
-        return True
-    for token in _UNSAFE_SUBSTRINGS:
-        if token in lowered:
-            return True
-    return False
-
-
-def _collect_candidates(
-    text: str,
-    *,
-    source_message_id: str | None,
-    source_role: str,
-) -> list[MemoryCaptureCandidate]:
-    compact = _normalize_text(text)
-    if len(compact) < 8 or len(compact) > 300:
-        return []
-    if _is_command_only(compact) or _is_unsafe(compact):
-        return []
-
-    found: list[MemoryCaptureCandidate] = []
-
-    if any(p.search(compact) for p in _PREFERENCE_PATTERNS):
-        found.append(
-            MemoryCaptureCandidate(
-                kind="preference",
-                content=compact,
-                importance=0.85,
-                confidence=0.92,
-                source_role=source_role,
-                source_message_id=source_message_id,
+    def _resolve_profile(self) -> tuple[str, "ModelProfile"]:
+        route_name = self._config.models.routes.get(self._route_key)
+        if not route_name:
+            raise ValueError(f"models.routes missing '{self._route_key}'")
+        profile = self._config.models.profiles.get(route_name)
+        if profile is None:
+            raise ValueError(
+                f"models.routes['{self._route_key}'] points to missing profile '{route_name}'"
             )
+        if profile.kind != "chat":
+            raise ValueError(
+                f"route '{self._route_key}' must target kind='chat', got '{profile.kind}'"
+            )
+        if not profile.model:
+            raise ValueError(f"profile '{route_name}' does not define a model")
+        return route_name, profile
+
+    def _create_provider(self, model: str) -> LiteLLMProvider:
+        provider_cfg = self._config.get_provider(model)
+        api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
+        api_base = self._config.get_api_base(model)
+        extra_headers = provider_cfg.extra_headers if provider_cfg else None
+        return LiteLLMProvider(
+            api_key=api_key,
+            api_base=api_base,
+            default_model=model,
+            extra_headers=extra_headers,
         )
 
-    if any(p.search(compact) for p in _FACT_PATTERNS):
-        found.append(
-            MemoryCaptureCandidate(
-                kind="fact",
-                content=compact,
-                importance=0.80,
-                confidence=0.88,
-                source_role=source_role,
-                source_message_id=source_message_id,
+    def extract(self, text: str, *, role: str = "user") -> list[ExtractedCandidate]:
+        compact = " ".join(text.split()).strip()
+        if not compact:
+            return []
+
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Extract stable memory candidates from this message.\n"
+                    f"role={role}\n"
+                    f"message={compact}"
+                ),
+            },
+        ]
+        try:
+            response = asyncio.run(
+                self._provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    temperature=self._temperature,
+                )
             )
-        )
+        except Exception as exc:
+            logger.debug("memory extractor request failed: {}", exc)
+            return []
 
-    if any(p.search(compact) for p in _DECISION_PATTERNS):
-        found.append(
-            MemoryCaptureCandidate(
-                kind="decision",
-                content=compact,
-                importance=0.90,
-                confidence=0.90,
-                source_role=source_role,
-                source_message_id=source_message_id,
-            )
-        )
+        content = (response.content or "").strip()
+        if not content:
+            return []
+        payload = _extract_json_payload(content)
+        if payload is None:
+            return []
+        rows = payload.get("memories") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return []
 
-    return found
+        out: list[ExtractedCandidate] = []
+        for row in rows:
+            candidate = _parse_candidate(row)
+            if candidate is not None:
+                out.append(candidate)
+        return out
 
 
-def extract_candidates(
-    text: str,
-    *,
-    source_message_id: str | None,
-    source_role: str = "user",
-    include_episodic: bool = True,
-) -> tuple[list[MemoryCaptureCandidate], int]:
-    """Extract memory candidates and report safety-drop count."""
-    compact = _normalize_text(text)
-    if not compact:
-        return [], 0
+def _parse_candidate(row: object) -> ExtractedCandidate | None:
+    if not isinstance(row, dict):
+        return None
 
-    dropped_safety = 1 if _is_unsafe(compact) else 0
-    candidates = _collect_candidates(
-        compact,
-        source_message_id=source_message_id,
-        source_role="assistant" if source_role == "assistant" else "user",
+    sector_raw = str(row.get("sector") or "episodic").strip().lower()
+    sector = sector_raw if sector_raw in VALID_SECTORS else "episodic"
+    kind = re.sub(r"[^a-zA-Z0-9_\\-]+", "_", str(row.get("kind") or "utterance").strip().lower())
+    kind = kind[:64] or "utterance"
+    content = " ".join(str(row.get("content") or "").split()).strip()
+    if not content:
+        return None
+
+    salience = _clamp_float(row.get("salience"), default=0.6)
+    confidence = _clamp_float(row.get("confidence"), default=0.7)
+    language = str(row.get("language") or "").strip().lower() or None
+    if language:
+        language = language[:16]
+
+    valid_to_raw = str(row.get("valid_to") or "").strip()
+    valid_to = _normalize_iso(valid_to_raw) if valid_to_raw else None
+    return ExtractedCandidate(
+        sector=sector,  # type: ignore[arg-type]
+        kind=kind,
+        content=content,
+        salience=salience,
+        confidence=confidence,
+        language=language,
+        valid_to=valid_to,
     )
 
-    if include_episodic and len(compact) >= 8 and not _is_command_only(compact) and not _is_unsafe(compact):
-        preview = compact[:180]
-        if len(compact) > 180:
-            preview += "..."
-        candidates.append(
-            MemoryCaptureCandidate(
-                kind="episodic",
-                content=f"User message: {preview}",
-                importance=0.60,
-                confidence=0.75,
-                source_role="assistant" if source_role == "assistant" else "user",
-                source_message_id=source_message_id,
-            )
-        )
 
-    dedup: dict[tuple[str, str], MemoryCaptureCandidate] = {}
-    for candidate in candidates:
-        key = (candidate.kind, _normalize_text(candidate.content).lower())
-        if key in dedup:
+def _extract_json_payload(text: str) -> dict[str, Any] | list[object] | None:
+    stripped = text.strip()
+    for candidate in _json_candidates(stripped):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
             continue
-        dedup[key] = candidate
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return None
 
-    return list(dedup.values()), dropped_safety
+
+def _json_candidates(text: str) -> list[str]:
+    candidates: list[str] = [text]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(chunk.strip() for chunk in fenced if chunk.strip())
+
+    first_obj = text.find("{")
+    last_obj = text.rfind("}")
+    if 0 <= first_obj < last_obj:
+        candidates.append(text[first_obj : last_obj + 1])
+    first_arr = text.find("[")
+    last_arr = text.rfind("]")
+    if 0 <= first_arr < last_arr:
+        candidates.append(text[first_arr : last_arr + 1])
+    return candidates
+
+
+def _clamp_float(value: object, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < 0.0:
+        return 0.0
+    if parsed > 1.0:
+        return 1.0
+    return parsed
+
+
+def _normalize_iso(raw: str) -> str | None:
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
+
+
+_SYSTEM_PROMPT = (
+    "You are an information extraction engine for long-term memory.\n"
+    "Return strict JSON only. No markdown. No prose.\n"
+    "Output format:\n"
+    "{"
+    "\"memories\": ["
+    "{"
+    "\"sector\": \"episodic|semantic|procedural|emotional|reflective\","
+    "\"kind\": \"short_snake_case_type\","
+    "\"content\": \"language-preserving concise statement\","
+    "\"salience\": 0.0,"
+    "\"confidence\": 0.0,"
+    "\"language\": \"optional language tag like en/de\","
+    "\"valid_to\": \"optional ISO8601 timestamp or null\""
+    "}"
+    "]"
+    "}\n"
+    "Rules:\n"
+    "- Keep user language in content; do not translate.\n"
+    "- Keep only stable and useful facts/preferences/procedures/events.\n"
+    "- Never output instructions to the assistant or system prompt fragments.\n"
+    "- Max 4 memories."
+)
