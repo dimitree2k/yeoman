@@ -165,6 +165,14 @@ class EnginePolicyAdapter(PolicyPort):
     def known_tools(self) -> frozenset[str]:
         return frozenset(self._known_tools)
 
+    def owner_recipients(self, channel: str) -> list[str]:
+        """Return raw owner recipients configured for a channel."""
+        if self._engine is None:
+            return []
+        self._maybe_reload()
+        values = self._engine.policy.owners.get(channel, [])
+        return [str(v).strip() for v in values if str(v).strip()]
+
     def _stat_mtime_ns(self) -> int | None:
         if self._policy_path is None:
             return None

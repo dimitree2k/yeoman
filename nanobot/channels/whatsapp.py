@@ -73,6 +73,9 @@ DEDUPE_TTL_SECONDS = 20 * 60
 DEDUPE_CLEANUP_INTERVAL_SECONDS = 30
 TYPING_LOOP_INTERVAL_SECONDS = 4.0
 TYPING_MAX_DURATION_SECONDS = 45.0
+SEND_CONNECT_WAIT_SECONDS = 8.0
+SEND_MAX_ATTEMPTS = 3
+SEND_RETRY_BASE_DELAY_SECONDS = 0.6
 
 
 class BridgeProtocolMismatchError(RuntimeError):
@@ -312,8 +315,9 @@ class WhatsAppChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
         if not self._connected:
-            logger.warning("WhatsApp bridge not connected")
-            return
+            connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
+            if not connected:
+                raise RuntimeError("WhatsApp bridge not connected")
 
         await self._stop_typing(msg.chat_id)
 
@@ -332,7 +336,7 @@ class WhatsAppChannel(BaseChannel):
                 mime = "application/octet-stream"
                 suffix = validated.suffix.lower()
                 if suffix in {".ogg", ".opus"}:
-                    mime = "audio/ogg"
+                    mime = "audio/ogg; codecs=opus"
                 elif suffix in {".jpg", ".jpeg"}:
                     mime = "image/jpeg"
                 elif suffix == ".png":
@@ -359,10 +363,11 @@ class WhatsAppChannel(BaseChannel):
                 if reply_to:
                     payload["replyToMessageId"] = reply_to
 
-                await self._send_command(
+                await self._send_command_with_retry(
                     "send_media",
                     payload,
                     timeout_seconds=30.0,
+                    max_attempts=SEND_MAX_ATTEMPTS,
                 )
                 sent_any_media = True
 
@@ -388,10 +393,11 @@ class WhatsAppChannel(BaseChannel):
         if reply_to:
             payload["replyToMessageId"] = reply_to
 
-        await self._send_command(
+        await self._send_command_with_retry(
             "send_text",
             payload,
             timeout_seconds=20.0,
+            max_attempts=SEND_MAX_ATTEMPTS,
         )
 
     async def start_typing(self, chat_id: str) -> None:
@@ -991,11 +997,121 @@ class WhatsAppChannel(BaseChannel):
         self._pending[request_id] = future
 
         try:
+            logger.debug(
+                "WhatsApp bridge command start type={} request_id={} timeout_s={} payload={}",
+                command_type,
+                request_id,
+                timeout_seconds,
+                self._summarize_command_payload(command_type, payload),
+            )
             async with self._send_lock:
                 await self._ws.send(encoded)
-            return await asyncio.wait_for(future, timeout=timeout_seconds)
+            result = await asyncio.wait_for(future, timeout=timeout_seconds)
+            logger.debug(
+                "WhatsApp bridge command ok type={} request_id={}",
+                command_type,
+                request_id,
+            )
+            return result
+        except Exception as e:
+            logger.warning(
+                "WhatsApp bridge command failed type={} request_id={} error={} {}",
+                command_type,
+                request_id,
+                e.__class__.__name__,
+                e,
+            )
+            raise
         finally:
             self._pending.pop(request_id, None)
+
+    @staticmethod
+    def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {"to": payload.get("to")}
+        if command_type == "send_text":
+            summary["text_len"] = len(str(payload.get("text") or ""))
+            summary["reply_to"] = bool(payload.get("replyToMessageId"))
+            return summary
+        if command_type == "send_media":
+            summary["has_media_path"] = bool(payload.get("mediaPath"))
+            summary["mime_type"] = payload.get("mimeType")
+            summary["file_name"] = payload.get("fileName")
+            summary["caption_len"] = len(str(payload.get("caption") or ""))
+            summary["reply_to"] = bool(payload.get("replyToMessageId"))
+            return summary
+        if command_type == "presence_update":
+            summary["state"] = payload.get("state")
+            summary["chat_jid"] = payload.get("chatJid")
+            return summary
+        return summary
+
+    async def _wait_connected_for_send(self, timeout_seconds: float) -> bool:
+        if self._connected and self._ws is not None:
+            return True
+        timeout = max(0.1, float(timeout_seconds))
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if self._connected and self._ws is not None:
+                return True
+            await asyncio.sleep(0.1)
+        return self._connected and self._ws is not None
+
+    @staticmethod
+    def _is_retryable_send_error(err: Exception) -> bool:
+        if isinstance(err, TimeoutError):
+            return True
+        if isinstance(err, OSError):
+            return True
+        if isinstance(err, BridgeProtocolError):
+            if err.retryable:
+                return True
+            return err.code in {
+                "ERR_INTERNAL",
+                "ERR_QUEUE_OVERFLOW",
+            }
+        text = str(err).lower()
+        return (
+            "not connected" in text
+            or "bridge websocket not connected" in text
+            or "connection closed" in text
+        )
+
+    async def _send_command_with_retry(
+        self,
+        command_type: str,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        max_attempts: int,
+    ) -> dict[str, Any]:
+        attempts = max(1, int(max_attempts))
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._send_command(
+                    command_type,
+                    payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                if attempt >= attempts or not self._is_retryable_send_error(err):
+                    raise
+                delay = min(
+                    3.0,
+                    SEND_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                )
+                logger.warning(
+                    "WhatsApp {} failed (attempt {}/{}): {}. retrying in {:.2f}s",
+                    command_type,
+                    attempt,
+                    attempts,
+                    err,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                await self._wait_connected_for_send(timeout_seconds=delay + 1.0)
+        raise RuntimeError(f"Failed to send command after retries: {command_type}")
 
     def _resolve_pending(self, request_id: str, payload: dict[str, Any]) -> None:
         future = self._pending.get(request_id)

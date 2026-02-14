@@ -202,6 +202,7 @@ def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
     if isinstance(channels, dict):
         whatsapp = channels.setdefault("whatsapp", {})
         if isinstance(whatsapp, dict):
+            whatsapp.setdefault("accept_from_me", False)
             media = whatsapp.setdefault("media", {})
             if isinstance(media, dict):
                 for k, v in default_whatsapp_media().items():

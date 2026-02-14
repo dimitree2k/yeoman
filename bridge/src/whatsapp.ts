@@ -21,6 +21,9 @@ const INBOUND_DEDUPE_CLEANUP_INTERVAL_MS = 30_000;
 const INBOUND_QUOTE_TTL_MS = 20 * 60_000;
 const INBOUND_QUOTE_MAX = 2_000;
 const INBOUND_QUOTE_CLEANUP_INTERVAL_MS = 30_000;
+const OUTBOUND_SELF_FILTER_TTL_MS = 10 * 60_000;
+const OUTBOUND_SELF_FILTER_MAX = 5_000;
+const OUTBOUND_SELF_FILTER_CLEANUP_INTERVAL_MS = 30_000;
 const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 
@@ -98,6 +101,7 @@ export interface WhatsAppClientOptions {
   mediaIncomingDir?: string;
   mediaOutgoingDir?: string;
   persistInboundAudio?: boolean;
+  acceptFromMe?: boolean;
   readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void;
@@ -108,6 +112,16 @@ export interface WhatsAppClientOptions {
 
 function nowMs(): number {
   return Date.now();
+}
+
+export function shouldIgnoreFromMeInbound(
+  fromMe: boolean,
+  acceptFromMe: boolean | undefined,
+  sentByBridge: boolean,
+): boolean {
+  if (!fromMe) return false;
+  if (!acceptFromMe) return true;
+  return sentByBridge;
 }
 
 function normalizeJid(jidRaw: string): string {
@@ -221,7 +235,7 @@ function limitText(value: string, max = 10_000): string {
 
 function mediaMimeFromFileName(pathOrName: string): string | undefined {
   const ext = extname(pathOrName).toLowerCase();
-  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg; codecs=opus';
   if (ext === '.mp3') return 'audio/mpeg';
   if (ext === '.wav') return 'audio/wav';
   if (ext === '.m4a') return 'audio/mp4';
@@ -360,6 +374,8 @@ export class WhatsAppClient {
 
   private readonly recentInbound = new Map<string, number>();
   private nextInboundCleanupAt = 0;
+  private readonly recentOutboundSelf = new Map<string, number>();
+  private nextOutboundSelfCleanupAt = 0;
   private readonly quoteCache = new Map<string, { msg: any; expiresAt: number }>();
   private nextQuoteCleanupAt = 0;
   private latestQr: string | null = null;
@@ -561,6 +577,50 @@ export class WhatsAppClient {
     return false;
   }
 
+  private cleanupRecentOutboundSelf(): void {
+    const now = nowMs();
+    if (now < this.nextOutboundSelfCleanupAt && this.recentOutboundSelf.size <= OUTBOUND_SELF_FILTER_MAX) return;
+    this.nextOutboundSelfCleanupAt = now + OUTBOUND_SELF_FILTER_CLEANUP_INTERVAL_MS;
+    for (const [key, expiresAt] of this.recentOutboundSelf.entries()) {
+      if (expiresAt <= now) this.recentOutboundSelf.delete(key);
+    }
+    if (this.recentOutboundSelf.size <= OUTBOUND_SELF_FILTER_MAX) return;
+    const entries = Array.from(this.recentOutboundSelf.entries()).sort((a, b) => a[1] - b[1]);
+    const overflow = this.recentOutboundSelf.size - OUTBOUND_SELF_FILTER_MAX;
+    for (let i = 0; i < overflow; i += 1) {
+      this.recentOutboundSelf.delete(entries[i][0]);
+    }
+  }
+
+  private outboundSelfKey(chatJidRaw: string, messageIdRaw: string): string | null {
+    const chatJid = normalizeJid(chatJidRaw);
+    const messageId = String(messageIdRaw || '').trim();
+    if (!chatJid || !messageId) return null;
+    return `${chatJid}:${messageId}`;
+  }
+
+  private rememberOutboundSelfMessage(chatJidRaw: string, sendResult: any): void {
+    const messageId = String(sendResult?.key?.id || '').trim();
+    if (!messageId) return;
+    const key = this.outboundSelfKey(chatJidRaw, messageId);
+    if (!key) return;
+    this.cleanupRecentOutboundSelf();
+    this.recentOutboundSelf.set(key, nowMs() + OUTBOUND_SELF_FILTER_TTL_MS);
+  }
+
+  private wasOutboundSelfMessage(chatJidRaw: string, messageIdRaw: string): boolean {
+    const key = this.outboundSelfKey(chatJidRaw, messageIdRaw);
+    if (!key) return false;
+    this.cleanupRecentOutboundSelf();
+    const now = nowMs();
+    const expiresAt = this.recentOutboundSelf.get(key);
+    if (!expiresAt || expiresAt <= now) {
+      if (expiresAt) this.recentOutboundSelf.delete(key);
+      return false;
+    }
+    return true;
+  }
+
   private cleanupQuoteCache(): void {
     const now = nowMs();
     if (now < this.nextQuoteCleanupAt && this.quoteCache.size <= INBOUND_QUOTE_MAX) return;
@@ -608,7 +668,7 @@ export class WhatsAppClient {
   }
 
   private extractContextInfo(msg: any): any {
-    const message = msg?.message || {};
+    const message = this.unwrapNestedMessage(msg?.message) || {};
     return (
       message.extendedTextMessage?.contextInfo ||
       message.imageMessage?.contextInfo ||
@@ -734,7 +794,7 @@ export class WhatsAppClient {
   }
 
   private extractMessageTextAndMedia(msg: any): { text: string | null; media?: InboundMedia } {
-    const message = msg?.message;
+    const message = this.unwrapNestedMessage(msg?.message);
     if (!message) return { text: null };
 
     if (typeof message.conversation === 'string' && message.conversation.trim()) {
@@ -901,8 +961,6 @@ export class WhatsAppClient {
       if (type !== 'notify' && type !== 'append') return;
       for (const msg of messages) {
         if (!this.running) return;
-        if (msg?.key?.fromMe) continue;
-
         const remoteJidRaw = String(msg?.key?.remoteJid || '');
         if (!remoteJidRaw || remoteJidRaw === 'status@broadcast') continue;
 
@@ -911,6 +969,9 @@ export class WhatsAppClient {
 
         const messageId = String(msg?.key?.id || '').trim();
         if (!messageId) continue;
+        const fromMe = Boolean(msg?.key?.fromMe);
+        const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
+        if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) continue;
 
         this.storeInboundForQuote(chatJid, messageId, msg);
 
@@ -984,11 +1045,13 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
     const quoted = this.resolveQuotedMessage(to, replyToMessageId);
+    let sent: any;
     if (quoted) {
-      await this.sock.sendMessage(to, { text: limitText(text, 8_000) }, { quoted });
+      sent = await this.sock.sendMessage(to, { text: limitText(text, 8_000) }, { quoted });
     } else {
-      await this.sock.sendMessage(to, { text: limitText(text, 8_000) });
+      sent = await this.sock.sendMessage(to, { text: limitText(text, 8_000) });
     }
+    this.rememberOutboundSelfMessage(to, sent);
     return { to };
   }
 
@@ -1006,25 +1069,31 @@ export class WhatsAppClient {
 
     if (kind === 'image') {
       const payload = { image: media.buffer, caption, mimetype: media.mimeType };
+      let sent: any;
       if (quoted) {
-        await this.sock.sendMessage(input.to, payload, { quoted });
+        sent = await this.sock.sendMessage(input.to, payload, { quoted });
       } else {
-        await this.sock.sendMessage(input.to, payload);
+        sent = await this.sock.sendMessage(input.to, payload);
       }
+      this.rememberOutboundSelfMessage(input.to, sent);
     } else if (kind === 'video') {
       const payload = { video: media.buffer, caption, mimetype: media.mimeType };
+      let sent: any;
       if (quoted) {
-        await this.sock.sendMessage(input.to, payload, { quoted });
+        sent = await this.sock.sendMessage(input.to, payload, { quoted });
       } else {
-        await this.sock.sendMessage(input.to, payload);
+        sent = await this.sock.sendMessage(input.to, payload);
       }
+      this.rememberOutboundSelfMessage(input.to, sent);
     } else if (kind === 'audio') {
       const payload = { audio: media.buffer, ptt: true, mimetype: media.mimeType };
+      let sent: any;
       if (quoted) {
-        await this.sock.sendMessage(input.to, payload, { quoted });
+        sent = await this.sock.sendMessage(input.to, payload, { quoted });
       } else {
-        await this.sock.sendMessage(input.to, payload);
+        sent = await this.sock.sendMessage(input.to, payload);
       }
+      this.rememberOutboundSelfMessage(input.to, sent);
     } else {
       const payload = {
         document: media.buffer,
@@ -1032,11 +1101,13 @@ export class WhatsAppClient {
         caption,
         mimetype: media.mimeType,
       };
+      let sent: any;
       if (quoted) {
-        await this.sock.sendMessage(input.to, payload, { quoted });
+        sent = await this.sock.sendMessage(input.to, payload, { quoted });
       } else {
-        await this.sock.sendMessage(input.to, payload);
+        sent = await this.sock.sendMessage(input.to, payload);
       }
+      this.rememberOutboundSelfMessage(input.to, sent);
     }
 
     return { to: input.to, mimeType: media.mimeType, bytes: media.buffer.length };
@@ -1052,13 +1123,14 @@ export class WhatsAppClient {
       throw new Error('Poll requires at least 2 options');
     }
 
-    await this.sock.sendMessage(input.to, {
+    const sent = await this.sock.sendMessage(input.to, {
       poll: {
         name: limitText(input.question, 512),
         values: options.slice(0, 12),
         selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
       },
     });
+    this.rememberOutboundSelfMessage(input.to, sent);
 
     return { to: input.to, options: options.length };
   }

@@ -45,6 +45,8 @@ class Orchestrator:
         tts: TTSSynthesizer | None = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        owner_alert_resolver: Callable[[str], list[str]] | None = None,
+        owner_alert_cooldown_seconds: int = 300,
     ) -> None:
         self._policy = policy
         self._responder = responder
@@ -59,6 +61,9 @@ class Orchestrator:
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
+        self._owner_alert_resolver = owner_alert_resolver
+        self._owner_alert_cooldown_seconds = max(30, int(owner_alert_cooldown_seconds))
+        self._recent_owner_alert_keys: dict[str, float] = {}
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -405,6 +410,7 @@ class Orchestrator:
                 outbound_channel=outbound_channel,
                 outbound_chat_id=outbound_chat_id,
                 decision=decision,
+                intents=intents,
             )
             if voice_outbound is not None:
                 outbound = voice_outbound
@@ -459,6 +465,7 @@ class Orchestrator:
         outbound_channel: str,
         outbound_chat_id: str,
         decision: PolicyDecision,
+        intents: list[OrchestratorIntent],
     ) -> OutboundEvent | None:
         if self._tts is None or self._whatsapp_tts_outgoing_dir is None:
             return None
@@ -478,6 +485,12 @@ class Orchestrator:
         route = str(getattr(decision, "voice_output_tts_route", "") or "").strip() or "tts.speak"
         profile = self._resolve_tts_profile(route=route, channel=outbound_channel)
         if profile is None:
+            self._append_owner_alert(
+                intents,
+                channel=outbound_channel,
+                chat_id=outbound_chat_id,
+                reason=f"tts_route_unresolved:{route}",
+            )
             return None
 
         voice = str(getattr(decision, "voice_output_voice", "") or "").strip() or "alloy"
@@ -490,12 +503,35 @@ class Orchestrator:
             return None
 
         try:
-            audio = await self._tts.synthesize(limited, profile=profile, voice=voice, format=fmt)
+            audio, tts_error = await self._tts.synthesize_with_status(
+                limited,
+                profile=profile,
+                voice=voice,
+                format=fmt,
+            )
         except Exception:
+            self._append_owner_alert(
+                intents,
+                channel=outbound_channel,
+                chat_id=outbound_chat_id,
+                reason="tts_exception",
+            )
             return None
         if not audio:
+            self._append_owner_alert(
+                intents,
+                channel=outbound_channel,
+                chat_id=outbound_chat_id,
+                reason=tts_error or "tts_empty_audio",
+            )
             return None
         if len(audio) > self._whatsapp_tts_max_raw_bytes:
+            self._append_owner_alert(
+                intents,
+                channel=outbound_channel,
+                chat_id=outbound_chat_id,
+                reason=f"tts_audio_too_large:{len(audio)}>{self._whatsapp_tts_max_raw_bytes}",
+            )
             return None
 
         out_dir = self._whatsapp_tts_outgoing_dir / "tts"
@@ -507,6 +543,69 @@ class Orchestrator:
             reply_to=event.message_id,
             media=(str(path),),
         )
+
+    def _append_owner_alert(
+        self,
+        intents: list[OrchestratorIntent],
+        *,
+        channel: str,
+        chat_id: str,
+        reason: str,
+    ) -> None:
+        if self._owner_alert_resolver is None:
+            return
+        targets_raw = self._owner_alert_resolver(channel)
+        if not targets_raw:
+            return
+
+        now = time.monotonic()
+        for key, expires_at in list(self._recent_owner_alert_keys.items()):
+            if expires_at <= now:
+                self._recent_owner_alert_keys.pop(key, None)
+
+        normalized_targets: list[str] = []
+        for raw in targets_raw:
+            target = self._normalize_owner_target(channel, raw)
+            if target:
+                normalized_targets.append(target)
+        if not normalized_targets:
+            return
+
+        reason_compact = " ".join(str(reason or "unknown").split()).strip() or "unknown"
+        key = f"{channel}:{reason_compact}"
+        if key in self._recent_owner_alert_keys:
+            return
+        self._recent_owner_alert_keys[key] = now + float(self._owner_alert_cooldown_seconds)
+
+        content = (
+            "⚠️ Nano diagnostic\n"
+            f"voice fallback in {channel}:{chat_id}\n"
+            f"reason={reason_compact}"
+        )
+        for target in sorted(set(normalized_targets)):
+            intents.append(
+                SendOutboundIntent(
+                    event=OutboundEvent(
+                        channel=channel,
+                        chat_id=target,
+                        content=content,
+                    )
+                )
+            )
+
+    @staticmethod
+    def _normalize_owner_target(channel: str, raw: str) -> str | None:
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        if channel != "whatsapp":
+            return value
+        if "@" in value:
+            return value
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if not digits:
+            return None
+        return f"{digits}@s.whatsapp.net"
 
     def _dedupe_key(self, event: InboundEvent) -> str | None:
         if not event.message_id:

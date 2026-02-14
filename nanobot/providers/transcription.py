@@ -1,6 +1,10 @@
 """Voice transcription providers."""
 
+import base64
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -105,9 +109,10 @@ class OpenAITranscriptionProvider:
             "Authorization": f"Bearer {self.api_key}",
             **(self.extra_headers or {}),
         }
+        if "openrouter.ai" in self.api_url:
+            return await self._transcribe_openrouter(path, headers=headers)
+
         models = [self.model]
-        if "openrouter.ai" in self.api_url and "/" not in self.model:
-            models.append(f"openai/{self.model}")
 
         response: httpx.Response | None = None
         try:
@@ -137,4 +142,141 @@ class OpenAITranscriptionProvider:
             response.raise_for_status()
         except Exception as e:
             logger.error(f"OpenAI transcription error: {e}")
+        return ""
+
+    async def _transcribe_openrouter(self, path: Path, *, headers: dict[str, str]) -> str:
+        chat_url = self.api_url.rsplit("/audio/transcriptions", 1)[0] + "/chat/completions"
+        model_value = self._resolve_openrouter_model()
+        audio_format, audio_bytes = self._prepare_openrouter_audio(path)
+        if not audio_bytes:
+            return ""
+
+        payload = {
+            "model": model_value,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Transcribe this audio exactly. "
+                                "Return only transcript text without explanations."
+                            ),
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(audio_bytes).decode("ascii"),
+                                "format": audio_format,
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    chat_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            response.raise_for_status()
+            data = response.json()
+            return self._extract_chat_content(data)
+        except Exception as e:
+            logger.error(f"OpenRouter transcription error: {e}")
+            return ""
+
+    def _resolve_openrouter_model(self) -> str:
+        model_value = str(self.model or "").strip()
+        if not model_value:
+            return "google/gemini-2.5-flash-lite"
+        normalized = model_value.lower()
+        if normalized in {"whisper-1", "whisper-large-v3"} or normalized.startswith("openai/whisper"):
+            return "google/gemini-2.5-flash-lite"
+        return model_value
+
+    def _prepare_openrouter_audio(self, path: Path) -> tuple[str, bytes]:
+        suffix = path.suffix.lower().lstrip(".")
+        if suffix in {"wav", "mp3"}:
+            try:
+                return suffix, path.read_bytes()
+            except OSError:
+                return suffix, b""
+
+        converted = self._convert_audio_to_wav(path)
+        if converted:
+            return "wav", converted
+
+        try:
+            fallback = path.read_bytes()
+        except OSError:
+            return suffix or "wav", b""
+        return suffix or "wav", fallback
+
+    def _convert_audio_to_wav(self, path: Path) -> bytes | None:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return None
+
+        fd, tmp_name = tempfile.mkstemp(prefix="nanobot-asr-", suffix=".wav")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    str(path),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(tmp_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=max(5, int(self.timeout_seconds)),
+            )
+            if result.returncode != 0:
+                return None
+            return tmp_path.read_bytes()
+        except Exception:
+            return None
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _extract_chat_content(payload: dict) -> str:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        message = first.get("message")
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            return " ".join(parts).strip()
         return ""

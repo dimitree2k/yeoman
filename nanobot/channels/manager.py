@@ -171,7 +171,20 @@ class ChannelManager:
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
+                        logger.debug(
+                            "Outbound dispatch start channel={} chat={} reply_to={} media_count={} content_len={}",
+                            msg.channel,
+                            msg.chat_id,
+                            bool(msg.reply_to),
+                            len(msg.media or []),
+                            len(msg.content or ""),
+                        )
                         await channel.send(msg)
+                        logger.debug(
+                            "Outbound dispatch success channel={} chat={}",
+                            msg.channel,
+                            msg.chat_id,
+                        )
                     except Exception as e:
                         logger.error(f"Error sending to {msg.channel}: {e}")
                 else:

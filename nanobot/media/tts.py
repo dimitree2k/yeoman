@@ -104,10 +104,10 @@ class OpenAITTSProvider:
         model: str,
         voice: str,
         format: str,
-    ) -> bytes:
+    ) -> tuple[bytes | None, str | None]:
         if not self.api_key:
             logger.warning("OpenAI API key not configured for TTS")
-            return b""
+            return None, "openai_api_key_missing"
 
         models = [model]
         if "openrouter.ai" in self.api_url and "/" not in model:
@@ -142,7 +142,7 @@ class OpenAITTSProvider:
                         )
                     except Exception as e:
                         logger.error("OpenAI TTS request failed {}: {}", e.__class__.__name__, e)
-                        return b""
+                        return None, f"openai_request_failed:{e.__class__.__name__}"
                     if response.status_code < 400:
                         break
                 if response is not None and response.status_code < 400:
@@ -150,13 +150,14 @@ class OpenAITTSProvider:
 
         try:
             if response is None:
-                return b""
+                return None, "openai_no_response"
             response.raise_for_status()
         except Exception as e:
             logger.error("OpenAI TTS error {}: {}", e.__class__.__name__, getattr(response, "text", ""))
-            return b""
+            status = getattr(response, "status_code", "unknown")
+            return None, f"openai_http_{status}"
 
-        return bytes(response.content or b"")
+        return bytes(response.content or b""), None
 
 
 def _resolve_elevenlabs_output_format(fmt: str) -> str:
@@ -195,15 +196,15 @@ class ElevenLabsTTSProvider:
         model: str,
         voice: str,
         format: str,
-    ) -> bytes:
+    ) -> tuple[bytes | None, str | None]:
         if not self.api_key:
             logger.warning("ElevenLabs API key not configured for TTS")
-            return b""
+            return None, "elevenlabs_api_key_missing"
 
         voice_id = str(voice or "").strip()
         if not voice_id:
             logger.warning("ElevenLabs voice id is required for TTS")
-            return b""
+            return None, "elevenlabs_voice_id_missing"
 
         url = self.api_base.rstrip("/") + f"/text-to-speech/{quote(voice_id, safe='')}"
         headers = {
@@ -229,11 +230,11 @@ class ElevenLabsTTSProvider:
                 )
             except Exception as e:
                 logger.error("ElevenLabs TTS request failed {}: {}", e.__class__.__name__, e)
-                return b""
+                return None, f"elevenlabs_request_failed:{e.__class__.__name__}"
 
         try:
             if response is None:
-                return b""
+                return None, "elevenlabs_no_response"
             response.raise_for_status()
         except Exception as e:
             logger.error(
@@ -241,9 +242,13 @@ class ElevenLabsTTSProvider:
                 e.__class__.__name__,
                 getattr(response, "text", ""),
             )
-            return b""
+            status = getattr(response, "status_code", "unknown")
+            body = str(getattr(response, "text", "") or "").strip().lower()
+            if "quota_exceeded" in body:
+                return None, "elevenlabs_quota_exceeded"
+            return None, f"elevenlabs_http_{status}"
 
-        return bytes(response.content or b"")
+        return bytes(response.content or b""), None
 
 
 class TTSSynthesizer:
@@ -280,6 +285,22 @@ class TTSSynthesizer:
         voice: str,
         format: str,
     ) -> bytes | None:
+        audio, _ = await self.synthesize_with_status(
+            text,
+            profile=profile,
+            voice=voice,
+            format=format,
+        )
+        return audio
+
+    async def synthesize_with_status(
+        self,
+        text: str,
+        *,
+        profile: ResolvedProfile,
+        voice: str,
+        format: str,
+    ) -> tuple[bytes | None, str | None]:
         async with self._semaphore:
             return await self._synthesize_once(
                 text,
@@ -295,9 +316,9 @@ class TTSSynthesizer:
         profile: ResolvedProfile,
         voice: str,
         format: str,
-    ) -> bytes | None:
+    ) -> tuple[bytes | None, str | None]:
         if profile.kind != "tts":
-            return None
+            return None, "tts_profile_kind_mismatch"
 
         provider = (profile.provider or "openai_tts").strip().lower()
         timeout_s = max(1.0, (profile.timeout_ms or 30000) / 1000.0)
@@ -310,8 +331,8 @@ class TTSSynthesizer:
                 extra_headers=self._openai_extra_headers,
                 timeout_seconds=timeout_s,
             )
-            audio = await client.synthesize(text=text, model=model, voice=voice, format=format)
-            return audio or None
+            audio, error = await client.synthesize(text=text, model=model, voice=voice, format=format)
+            return (audio or None), error
         if provider in {"elevenlabs_tts", "elevenlabs"}:
             model_candidate = str(profile.model or "").strip()
             if not model_candidate or model_candidate.startswith("tts-"):
@@ -327,7 +348,12 @@ class TTSSynthesizer:
                 extra_headers=self._elevenlabs_extra_headers,
                 timeout_seconds=timeout_s,
             )
-            audio = await client.synthesize(text=text, model=model, voice=voice_candidate, format=format)
-            return audio or None
+            audio, error = await client.synthesize(
+                text=text,
+                model=model,
+                voice=voice_candidate,
+                format=format,
+            )
+            return (audio or None), error
 
-        return None
+        return None, f"tts_provider_unsupported:{provider}"

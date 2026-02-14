@@ -249,7 +249,8 @@ nanobot channels login
 {
   "channels": {
     "whatsapp": {
-      "enabled": true
+      "enabled": true,
+      "acceptFromMe": false
     }
   }
 }
@@ -328,6 +329,7 @@ Notes:
 - Voice replies are sent as **quoted voice notes** (no extra text), so groups can see what message the bot responded to.
 - For ElevenLabs, set `voice.output.voice` to a **voice ID** (from ElevenLabs voices API).
 - If TTS fails or the synthesized audio is too large for the bridge payload limit, the bot falls back to text.
+- Set `channels.whatsapp.acceptFromMe=true` only when you want Nanobot to process messages sent by the same WhatsApp account that runs the bridge.
 
 **3. Run** (two terminals)
 

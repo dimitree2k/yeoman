@@ -312,6 +312,7 @@ def build_gateway_runtime(
         model_router=model_router,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
+        owner_alert_resolver=policy_adapter.owner_recipients,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:

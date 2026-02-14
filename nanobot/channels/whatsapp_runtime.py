@@ -430,6 +430,7 @@ class WhatsAppRuntimeManager:
             env["BRIDGE_TOKEN"] = token
             env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
             env["WHATSAPP_READ_RECEIPTS"] = "1" if wa.read_receipts else "0"
+            env["WHATSAPP_ACCEPT_FROM_ME"] = "1" if wa.accept_from_me else "0"
             env["WHATSAPP_PERSIST_INBOUND_AUDIO"] = "1" if wa.media.persist_incoming_audio else "0"
             incoming_media = wa.media.incoming_path.expanduser().resolve()
             outgoing_media = wa.media.outgoing_path.expanduser().resolve()

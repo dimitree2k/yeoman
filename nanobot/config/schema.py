@@ -96,6 +96,7 @@ class WhatsAppConfig(BaseModel):
     auth_dir: str = "~/.nanobot/whatsapp-auth"
     debounce_ms: int = 0
     read_receipts: bool = True
+    accept_from_me: bool = False
     media_max_mb: int = 50
     max_dedupe_entries: int = 5000
     max_debounce_buckets: int = 2000
@@ -202,6 +203,8 @@ class ProviderConfig(BaseModel):
 
 class ElevenLabsProviderConfig(ProviderConfig):
     """ElevenLabs provider config with optional TTS defaults."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     voice_id: str | None = Field(default=None, alias="voiceId")
     model_id: str | None = Field(default=None, alias="modelId")
