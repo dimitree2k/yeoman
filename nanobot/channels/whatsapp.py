@@ -108,6 +108,7 @@ class InboundEvent:
     media_path: str | None
     media_bytes: int | None
     media_description: str | None
+    voice_transcript: str | None
 
 
 class WhatsAppChannel(BaseChannel):
@@ -124,6 +125,9 @@ class WhatsAppChannel(BaseChannel):
         media_storage: MediaStorage | None = None,
         provider_factory: "ProviderFactory | None" = None,
         groq_api_key: str | None = None,
+        openai_api_key: str | None = None,
+        openai_api_base: str | None = None,
+        openai_extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
@@ -136,7 +140,13 @@ class WhatsAppChannel(BaseChannel):
         self._vision_describer = (
             VisionDescriber(provider_factory) if provider_factory is not None else None
         )
-        self._asr_transcriber = ASRTranscriber(groq_api_key=groq_api_key)
+        self._asr_transcriber = ASRTranscriber(
+            groq_api_key=groq_api_key,
+            openai_api_key=openai_api_key,
+            openai_api_base=openai_api_base,
+            openai_extra_headers=openai_extra_headers,
+            max_concurrency=self.config.media.max_asr_concurrency,
+        )
         self._ws: Any | None = None
         self._connected = False
         self._reader_task: asyncio.Task[None] | None = None
@@ -307,12 +317,80 @@ class WhatsAppChannel(BaseChannel):
 
         await self._stop_typing(msg.chat_id)
 
+        reply_to = str(msg.reply_to or "").strip() or None
+        text = _markdown_to_whatsapp(msg.content)
+
+        if msg.media:
+            caption_used = False
+            sent_any_media = False
+            for media_path in msg.media:
+                validated = self._media_storage.validate_outgoing_path(media_path)
+                if validated is None or not validated.exists() or not validated.is_file():
+                    logger.warning("WhatsApp outbound media path rejected: {}", media_path)
+                    continue
+
+                mime = "application/octet-stream"
+                suffix = validated.suffix.lower()
+                if suffix in {".ogg", ".opus"}:
+                    mime = "audio/ogg"
+                elif suffix in {".jpg", ".jpeg"}:
+                    mime = "image/jpeg"
+                elif suffix == ".png":
+                    mime = "image/png"
+                elif suffix == ".webp":
+                    mime = "image/webp"
+                elif suffix == ".gif":
+                    mime = "image/gif"
+                elif suffix == ".mp4":
+                    mime = "video/mp4"
+
+                caption = None
+                if not caption_used and text and not mime.startswith("audio/"):
+                    caption = text
+                    caption_used = True
+
+                payload: dict[str, object] = {
+                    "to": msg.chat_id,
+                    "mediaPath": str(validated),
+                    "mimeType": mime,
+                    "fileName": validated.name,
+                    "caption": caption,
+                }
+                if reply_to:
+                    payload["replyToMessageId"] = reply_to
+
+                await self._send_command(
+                    "send_media",
+                    payload,
+                    timeout_seconds=30.0,
+                )
+                sent_any_media = True
+
+                # Best-effort cleanup for generated TTS voice notes.
+                if (
+                    validated.name.startswith("tts-")
+                    and validated.suffix.lower() in {".ogg", ".opus"}
+                    and validated.parent.name == "tts"
+                ):
+                    with contextlib.suppress(OSError):
+                        validated.unlink()
+
+            if sent_any_media:
+                return
+
+        if not text:
+            return
+
+        payload: dict[str, object] = {
+            "to": msg.chat_id,
+            "text": text,
+        }
+        if reply_to:
+            payload["replyToMessageId"] = reply_to
+
         await self._send_command(
             "send_text",
-            {
-                "to": msg.chat_id,
-                "text": _markdown_to_whatsapp(msg.content),
-            },
+            payload,
             timeout_seconds=20.0,
         )
 
@@ -484,6 +562,7 @@ class WhatsAppChannel(BaseChannel):
             media_path=media_path or None,
             media_bytes=media_bytes,
             media_description=None,
+            voice_transcript=None,
         )
 
     async def _ingest_inbound_event(self, event: InboundEvent) -> None:
@@ -581,6 +660,7 @@ class WhatsAppChannel(BaseChannel):
             media_path=last.media_path,
             media_bytes=last.media_bytes,
             media_description=last.media_description,
+            voice_transcript=last.voice_transcript,
         )
 
         await self._publish_event(merged)
@@ -614,62 +694,122 @@ class WhatsAppChannel(BaseChannel):
             logger.warning(f"Failed to archive inbound WhatsApp message {event.message_id}: {e}")
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
-        if (
-            not self.config.media.enabled
-            or not self.config.media.describe_images
-            or event.media_kind != "image"
-            or not event.media_path
-            or self._vision_describer is None
-            or self._model_router is None
-        ):
+        if not self.config.media.enabled:
             return event
 
-        validated_path = self._media_storage.validate_incoming_path(event.media_path)
-        if validated_path is None:
-            logger.warning(
-                "Skipping WhatsApp image description due to invalid media path: {}",
-                event.media_path,
+        if event.media_kind == "image":
+            if (
+                not self.config.media.describe_images
+                or not event.media_path
+                or self._vision_describer is None
+                or self._model_router is None
+            ):
+                return event
+
+            validated_path = self._media_storage.validate_incoming_path(event.media_path)
+            if validated_path is None:
+                logger.warning(
+                    "Skipping WhatsApp image description due to invalid media path: {}",
+                    event.media_path,
+                )
+                return event
+            try:
+                size_bytes = validated_path.stat().st_size
+            except OSError:
+                return event
+            max_bytes = max(1, int(self.config.media.max_image_bytes_mb)) * 1024 * 1024
+            if size_bytes > max_bytes:
+                logger.info(
+                    "Skipping WhatsApp image description due to size limit: path={} bytes={} limit={}",
+                    validated_path,
+                    size_bytes,
+                    max_bytes,
+                )
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                profile = self._model_router.resolve("vision.describe_image", channel=self.name)
+            except KeyError as e:
+                logger.warning(f"Skipping WhatsApp image description due to missing route: {e}")
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                description = await self._vision_describer.describe(validated_path, profile)
+            except Exception as e:
+                logger.warning("WhatsApp image description failed {}: {}", e.__class__.__name__, e)
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            if not description:
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            if "[image_description]" in event.text:
+                enriched_text = event.text
+            else:
+                enriched_text = f"{event.text}\n[image_description] {description}"
+            return replace(
+                event,
+                text=enriched_text,
+                media_path=str(validated_path),
+                media_bytes=size_bytes,
+                media_description=description,
             )
-            return event
-        try:
-            size_bytes = validated_path.stat().st_size
-        except OSError:
-            return event
-        max_bytes = max(1, int(self.config.media.max_image_bytes_mb)) * 1024 * 1024
-        if size_bytes > max_bytes:
-            logger.info(
-                "Skipping WhatsApp image description due to size limit: path={} bytes={} limit={}",
-                validated_path,
-                size_bytes,
-                max_bytes,
+
+        if event.media_kind == "audio":
+            if (
+                not self.config.media.transcribe_audio
+                or not event.media_path
+                or self._model_router is None
+            ):
+                return event
+
+            validated_path = self._media_storage.validate_incoming_path(event.media_path)
+            if validated_path is None:
+                logger.warning(
+                    "Skipping WhatsApp audio transcription due to invalid media path: {}",
+                    event.media_path,
+                )
+                return event
+            try:
+                size_bytes = validated_path.stat().st_size
+            except OSError:
+                return event
+            max_bytes = max(1, int(self.config.media.max_audio_bytes_mb)) * 1024 * 1024
+            if size_bytes > max_bytes:
+                logger.info(
+                    "Skipping WhatsApp audio transcription due to size limit: path={} bytes={} limit={}",
+                    validated_path,
+                    size_bytes,
+                    max_bytes,
+                )
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                profile = self._model_router.resolve("asr.transcribe_audio", channel=self.name)
+            except KeyError as e:
+                logger.warning(f"Skipping WhatsApp audio transcription due to missing route: {e}")
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            transcript = None
+            try:
+                transcript = await self._asr_transcriber.transcribe(validated_path, profile)
+            except Exception as e:
+                logger.warning("WhatsApp audio transcription failed {}: {}", e.__class__.__name__, e)
+
+            if not transcript:
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            if self.config.media.delete_audio_after_transcription:
+                with contextlib.suppress(OSError):
+                    validated_path.unlink()
+
+            return replace(
+                event,
+                text=transcript,
+                media_path=str(validated_path),
+                media_bytes=size_bytes,
+                voice_transcript=transcript,
             )
-            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
 
-        try:
-            profile = self._model_router.resolve("vision.describe_image", channel=self.name)
-        except KeyError as e:
-            logger.warning(f"Skipping WhatsApp image description due to missing route: {e}")
-            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
-
-        try:
-            description = await self._vision_describer.describe(validated_path, profile)
-        except Exception as e:
-            logger.warning("WhatsApp image description failed {}: {}", e.__class__.__name__, e)
-            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
-
-        if not description:
-            return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
-        if "[image_description]" in event.text:
-            enriched_text = event.text
-        else:
-            enriched_text = f"{event.text}\n[image_description] {description}"
-        return replace(
-            event,
-            text=enriched_text,
-            media_path=str(validated_path),
-            media_bytes=size_bytes,
-            media_description=description,
-        )
+        return event
 
     async def _run_media_cleanup_once(self) -> None:
         if not self.config.media.enabled:
@@ -698,9 +838,7 @@ class WhatsAppChannel(BaseChannel):
                 break
 
     async def _publish_event(self, event: InboundEvent) -> None:
-        text = event.text
-        if text == "[Voice Message]":
-            text = "[Voice Message: Transcription not available for WhatsApp yet]"
+        is_voice = event.media_kind == "audio"
         media_for_assistant: list[str] = []
         if (
             self.config.media.pass_image_to_assistant
@@ -712,7 +850,7 @@ class WhatsAppChannel(BaseChannel):
         await self._handle_message(
             sender_id=event.sender_id,
             chat_id=event.chat_jid,
-            content=text,
+            content=event.text,
             media=media_for_assistant,
             metadata={
                 "message_id": event.message_id,
@@ -733,6 +871,8 @@ class WhatsAppChannel(BaseChannel):
                 "media_type": event.media_type,
                 "media_kind": event.media_kind,
                 "media_description": event.media_description,
+                "is_voice": is_voice,
+                "voice_transcript": event.voice_transcript,
             },
         )
 
@@ -831,9 +971,6 @@ class WhatsAppChannel(BaseChannel):
             raise RuntimeError("Bridge websocket not connected")
 
         request_id = uuid.uuid4().hex
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
-
         envelope = {
             "version": PROTOCOL_VERSION,
             "type": command_type,
@@ -842,10 +979,20 @@ class WhatsAppChannel(BaseChannel):
             "accountId": "default",
             "payload": payload,
         }
+        encoded = json.dumps(envelope)
+        envelope_bytes = len(encoded.encode("utf-8"))
+        max_payload_bytes = max(1, int(self.config.max_payload_bytes))
+        if envelope_bytes > max_payload_bytes:
+            raise ValueError(
+                "Bridge command payload too large: "
+                f"{envelope_bytes} > {max_payload_bytes} bytes"
+            )
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
 
         try:
             async with self._send_lock:
-                await self._ws.send(json.dumps(envelope))
+                await self._ws.send(encoded)
             return await asyncio.wait_for(future, timeout=timeout_seconds)
         finally:
             self._pending.pop(request_id, None)

@@ -32,8 +32,10 @@ from nanobot.cron.types import CronJob
 from nanobot.heartbeat.service import HeartbeatService
 from nanobot.media.router import ModelRouter
 from nanobot.media.storage import MediaStorage
+from nanobot.media.tts import TTSSynthesizer
 from nanobot.memory import MemoryService
 from nanobot.providers.factory import ProviderFactory
+from nanobot.providers.openai_compatible import resolve_openai_compatible_credentials
 from nanobot.security import NoopSecurity, SecurityEngine
 from nanobot.session.manager import SessionManager
 from nanobot.storage.inbound_archive import InboundArchive
@@ -284,6 +286,19 @@ def build_gateway_runtime(
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
+    openai_compat = resolve_openai_compatible_credentials(config)
+    elevenlabs = config.providers.elevenlabs
+    tts = TTSSynthesizer(
+        openai_api_key=openai_compat.api_key if openai_compat else None,
+        openai_api_base=openai_compat.api_base if openai_compat else None,
+        openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
+        elevenlabs_api_key=elevenlabs.api_key or None,
+        elevenlabs_api_base=elevenlabs.api_base,
+        elevenlabs_extra_headers=elevenlabs.extra_headers,
+        elevenlabs_default_voice_id=elevenlabs.voice_id,
+        elevenlabs_default_model_id=elevenlabs.model_id,
+        max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
+    )
     orchestrator = Orchestrator(
         policy=policy_adapter,
         responder=responder,
@@ -294,6 +309,9 @@ def build_gateway_runtime(
         security=security,
         security_block_message=config.security.block_user_message,
         policy_admin_handler=admin_command_handler,
+        model_router=model_router,
+        tts=tts,
+        whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:

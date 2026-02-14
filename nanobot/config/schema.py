@@ -29,7 +29,7 @@ class ModelProfile(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    kind: Literal["chat", "vision", "asr", "ocr", "video", "embedding"]
+    kind: Literal["chat", "vision", "asr", "ocr", "video", "embedding", "tts"]
     model: str | None = None
     provider: str | None = None
     max_tokens: int | None = None
@@ -65,6 +65,12 @@ class WhatsAppMediaConfig(BaseModel):
     describe_images: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_images"])
     pass_image_to_assistant: bool = bool(DEFAULT_WHATSAPP_MEDIA["pass_image_to_assistant"])
     max_image_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_image_bytes_mb"])
+    persist_incoming_audio: bool = bool(DEFAULT_WHATSAPP_MEDIA["persist_incoming_audio"])
+    transcribe_audio: bool = bool(DEFAULT_WHATSAPP_MEDIA["transcribe_audio"])
+    max_audio_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_audio_bytes_mb"])
+    delete_audio_after_transcription: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_audio_after_transcription"])
+    max_asr_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_asr_concurrency"]), ge=1)
+    max_tts_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_tts_concurrency"]), ge=1)
 
     @property
     def incoming_path(self) -> Path:
@@ -187,11 +193,18 @@ class AgentsConfig(BaseModel):
 
 
 class ProviderConfig(BaseModel):
-    """LLM provider configuration."""
+    """Provider credential configuration."""
 
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+
+class ElevenLabsProviderConfig(ProviderConfig):
+    """ElevenLabs provider config with optional TTS defaults."""
+
+    voice_id: str | None = Field(default=None, alias="voiceId")
+    model_id: str | None = Field(default=None, alias="modelId")
 
 
 def _get_provider_names() -> list[str]:
@@ -202,9 +215,10 @@ def _get_provider_names() -> list[str]:
 
 
 class ProvidersConfig(BaseModel):
-    """Configuration for LLM providers."""
+    """Configuration for provider credentials."""
 
     model_config = ConfigDict(extra="allow")
+    elevenlabs: ElevenLabsProviderConfig = Field(default_factory=ElevenLabsProviderConfig)
 
     @model_validator(mode="after")
     def _inject_provider_defaults(self) -> "ProvidersConfig":

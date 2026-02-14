@@ -27,6 +27,45 @@ test('parseBridgeCommand accepts valid v2 command', () => {
   }
 });
 
+test('parseBridgeCommand accepts send_text with replyToMessageId', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_text',
+    token: 'secret',
+    requestId: 'req-2',
+    payload: {
+      to: '12345@s.whatsapp.net',
+      text: 'hello',
+      replyToMessageId: 'ABCDEF',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'send_text');
+  }
+});
+
+test('parseBridgeCommand accepts send_media with mediaPath', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_media',
+    token: 'secret',
+    requestId: 'req-3',
+    payload: {
+      to: '12345@s.whatsapp.net',
+      mediaPath: '/tmp/sample.ogg',
+      mimeType: 'audio/ogg',
+      replyToMessageId: 'ABCDEF',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'send_media');
+  }
+});
+
 test('parseBridgeCommand rejects legacy command shape', () => {
   const parsed = parseBridgeCommand({
     type: 'send',

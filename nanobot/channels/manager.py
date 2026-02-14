@@ -10,6 +10,7 @@ from loguru import logger
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
@@ -72,6 +73,7 @@ class ChannelManager:
         if self.config.channels.whatsapp.enabled:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
+                openai_compat = resolve_openai_compatible_credentials(self.config)
                 self.channels["whatsapp"] = WhatsAppChannel(
                     self.config.channels.whatsapp,
                     self.bus,
@@ -80,6 +82,9 @@ class ChannelManager:
                     media_storage=self.media_storage,
                     provider_factory=self.provider_factory,
                     groq_api_key=self.config.providers.groq.api_key or None,
+                    openai_api_key=openai_compat.api_key if openai_compat else None,
+                    openai_api_base=openai_compat.api_base if openai_compat else None,
+                    openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:

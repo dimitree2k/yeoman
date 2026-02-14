@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
-import { extname, join } from 'path';
+import { basename, extname, isAbsolute, join, relative, resolve } from 'path';
 
 import makeWASocket, {
   DisconnectReason,
@@ -18,6 +18,9 @@ const VERSION = '0.2.0';
 const INBOUND_DEDUPE_TTL_MS = 20 * 60_000;
 const INBOUND_DEDUPE_MAX = 5_000;
 const INBOUND_DEDUPE_CLEANUP_INTERVAL_MS = 30_000;
+const INBOUND_QUOTE_TTL_MS = 20 * 60_000;
+const INBOUND_QUOTE_MAX = 2_000;
+const INBOUND_QUOTE_CLEANUP_INTERVAL_MS = 30_000;
 const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 
@@ -61,9 +64,11 @@ export interface SendMediaInput {
   to: string;
   mediaUrl?: string;
   mediaBase64?: string;
+  mediaPath?: string;
   mimeType?: string;
   fileName?: string;
   caption?: string;
+  replyToMessageId?: string;
 }
 
 export interface SendPollInput {
@@ -92,6 +97,7 @@ export interface WhatsAppClientOptions {
   authDir: string;
   mediaIncomingDir?: string;
   mediaOutgoingDir?: string;
+  persistInboundAudio?: boolean;
   readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void;
@@ -213,7 +219,29 @@ function limitText(value: string, max = 10_000): string {
   return text.slice(0, max);
 }
 
-async function loadMediaSource(input: SendMediaInput): Promise<{
+function mediaMimeFromFileName(pathOrName: string): string | undefined {
+  const ext = extname(pathOrName).toLowerCase();
+  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.mp4') return 'video/mp4';
+  return undefined;
+}
+
+function isWithinRoot(pathToCheck: string, root: string): boolean {
+  const rel = relative(root, pathToCheck);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+async function loadMediaSource(
+  input: SendMediaInput,
+  options?: { allowedLocalMediaRoots?: string[] },
+): Promise<{
   buffer: Buffer;
   mimeType: string;
   fileName?: string;
@@ -228,6 +256,66 @@ async function loadMediaSource(input: SendMediaInput): Promise<{
       buffer,
       mimeType: input.mimeType || 'application/octet-stream',
       fileName: input.fileName,
+    };
+  }
+
+  if (input.mediaPath) {
+    const allowedRoots = (options?.allowedLocalMediaRoots || [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => value.length > 0)
+      .map((value) => resolve(value));
+    if (allowedRoots.length === 0) {
+      throw {
+        code: 'ERR_UNSUPPORTED',
+        message: 'mediaPath transport is disabled',
+        retryable: false,
+      };
+    }
+
+    const requestedPath = resolve(input.mediaPath);
+    let resolvedPath = requestedPath;
+    try {
+      resolvedPath = await fs.realpath(requestedPath);
+    } catch {
+      resolvedPath = requestedPath;
+    }
+    const allowed = allowedRoots.some((root) => isWithinRoot(resolvedPath, root));
+    if (!allowed) {
+      throw {
+        code: 'ERR_SCHEMA',
+        message: 'mediaPath must be under configured outgoing media directory',
+        retryable: false,
+      };
+    }
+
+    const st = await fs.stat(resolvedPath);
+    if (!st.isFile()) {
+      throw {
+        code: 'ERR_SCHEMA',
+        message: 'mediaPath must point to a file',
+        retryable: false,
+      };
+    }
+    if (st.size <= 0) {
+      throw {
+        code: 'ERR_SCHEMA',
+        message: 'mediaPath file is empty',
+        retryable: false,
+      };
+    }
+
+    const buffer = await fs.readFile(resolvedPath);
+    if (buffer.length === 0) {
+      throw {
+        code: 'ERR_SCHEMA',
+        message: 'mediaPath file is empty',
+        retryable: false,
+      };
+    }
+    return {
+      buffer,
+      mimeType: input.mimeType || mediaMimeFromFileName(resolvedPath) || 'application/octet-stream',
+      fileName: input.fileName || basename(resolvedPath),
     };
   }
 
@@ -272,6 +360,8 @@ export class WhatsAppClient {
 
   private readonly recentInbound = new Map<string, number>();
   private nextInboundCleanupAt = 0;
+  private readonly quoteCache = new Map<string, { msg: any; expiresAt: number }>();
+  private nextQuoteCleanupAt = 0;
   private latestQr: string | null = null;
   private latestQrAt = 0;
 
@@ -301,6 +391,52 @@ export class WhatsAppClient {
 
   private async persistInboundImage(msg: any, messageId: string, media: InboundMedia): Promise<InboundMedia> {
     if (!this.sock || media.kind !== 'image') return media;
+
+    const now = new Date();
+    const yyyy = String(now.getUTCFullYear());
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const dayDir = join(this.mediaIncomingDir, yyyy, mm, dd);
+    await ensureDirPrivate(dayDir);
+
+    const ext = mediaExtension(media.kind, media.mimeType, media.fileName);
+    const filePath = join(dayDir, `${messageId}${ext}`);
+
+    const downloaded = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: pino({ level: 'silent' }),
+        reuploadRequest: this.sock.updateMediaMessage,
+      },
+    );
+
+    const downloadedAny: unknown = downloaded;
+    let buffer: Buffer | null = null;
+    if (Buffer.isBuffer(downloadedAny)) {
+      buffer = downloadedAny;
+    } else if (downloadedAny && typeof downloadedAny === 'object' && ArrayBuffer.isView(downloadedAny)) {
+      buffer = Buffer.from(downloadedAny as Uint8Array);
+    }
+    if (!buffer || buffer.length === 0) return media;
+
+    await fs.writeFile(filePath, buffer);
+    try {
+      await fs.chmod(filePath, 0o600);
+    } catch {
+      // Ignore chmod failures on unsupported environments.
+    }
+    return {
+      ...media,
+      path: filePath,
+      bytes: buffer.length,
+    };
+  }
+
+  private async persistInboundAudio(msg: any, messageId: string, media: InboundMedia): Promise<InboundMedia> {
+    if (!this.sock || media.kind !== 'audio') return media;
+    if (!this.options.persistInboundAudio) return media;
 
     const now = new Date();
     const yyyy = String(now.getUTCFullYear());
@@ -423,6 +559,52 @@ export class WhatsAppClient {
     if (existing && existing > now) return true;
     this.recentInbound.set(key, now + INBOUND_DEDUPE_TTL_MS);
     return false;
+  }
+
+  private cleanupQuoteCache(): void {
+    const now = nowMs();
+    if (now < this.nextQuoteCleanupAt && this.quoteCache.size <= INBOUND_QUOTE_MAX) return;
+    this.nextQuoteCleanupAt = now + INBOUND_QUOTE_CLEANUP_INTERVAL_MS;
+    for (const [key, entry] of this.quoteCache.entries()) {
+      if (entry.expiresAt <= now) this.quoteCache.delete(key);
+    }
+    while (this.quoteCache.size > INBOUND_QUOTE_MAX) {
+      const oldest = this.quoteCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.quoteCache.delete(oldest);
+    }
+  }
+
+  private quoteKey(chatJid: string, messageId: string): string {
+    return `${chatJid}:${messageId}`;
+  }
+
+  private storeInboundForQuote(chatJid: string, messageId: string, msg: any): void {
+    if (!chatJid || !messageId || !msg) return;
+    this.cleanupQuoteCache();
+    const now = nowMs();
+    this.quoteCache.set(this.quoteKey(chatJid, messageId), { msg, expiresAt: now + INBOUND_QUOTE_TTL_MS });
+    while (this.quoteCache.size > INBOUND_QUOTE_MAX) {
+      const oldest = this.quoteCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.quoteCache.delete(oldest);
+    }
+  }
+
+  private resolveQuotedMessage(chatJidRaw: string, replyToMessageId: string | undefined): any | undefined {
+    const chatJid = normalizeJid(chatJidRaw);
+    const messageId = String(replyToMessageId || '').trim();
+    if (!chatJid || !messageId) return undefined;
+    this.cleanupQuoteCache();
+    const now = nowMs();
+    const key = this.quoteKey(chatJid, messageId);
+    const entry = this.quoteCache.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now) {
+      this.quoteCache.delete(key);
+      return undefined;
+    }
+    return entry.msg;
   }
 
   private extractContextInfo(msg: any): any {
@@ -730,6 +912,8 @@ export class WhatsAppClient {
         const messageId = String(msg?.key?.id || '').trim();
         if (!messageId) continue;
 
+        this.storeInboundForQuote(chatJid, messageId, msg);
+
         const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
         if (this.seenInbound(dedupeKey)) {
           this.droppedInboundDuplicates += 1;
@@ -746,6 +930,13 @@ export class WhatsAppClient {
         if (inboundMedia?.kind === 'image') {
           try {
             inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
+          } catch (err) {
+            this.lastError = safeErrorMessage(err);
+            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+          }
+        } else if (inboundMedia?.kind === 'audio') {
+          try {
+            inboundMedia = await this.persistInboundAudio(msg, messageId, inboundMedia);
           } catch (err) {
             this.lastError = safeErrorMessage(err);
             this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
@@ -788,11 +979,16 @@ export class WhatsAppClient {
     await closed;
   }
 
-  async sendText(to: string, text: string): Promise<{ to: string }> {
+  async sendText(to: string, text: string, replyToMessageId?: string): Promise<{ to: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
-    await this.sock.sendMessage(to, { text: limitText(text, 8_000) });
+    const quoted = this.resolveQuotedMessage(to, replyToMessageId);
+    if (quoted) {
+      await this.sock.sendMessage(to, { text: limitText(text, 8_000) }, { quoted });
+    } else {
+      await this.sock.sendMessage(to, { text: limitText(text, 8_000) });
+    }
     return { to };
   }
 
@@ -801,35 +997,46 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
-    const media = await loadMediaSource(input);
+    const quoted = this.resolveQuotedMessage(input.to, input.replyToMessageId);
+    const media = await loadMediaSource(input, {
+      allowedLocalMediaRoots: [this.mediaOutgoingDir],
+    });
     const kind = mediaKindFromMime(media.mimeType);
     const caption = input.caption ? limitText(input.caption, 2_000) : undefined;
 
     if (kind === 'image') {
-      await this.sock.sendMessage(input.to, {
-        image: media.buffer,
-        caption,
-        mimetype: media.mimeType,
-      });
+      const payload = { image: media.buffer, caption, mimetype: media.mimeType };
+      if (quoted) {
+        await this.sock.sendMessage(input.to, payload, { quoted });
+      } else {
+        await this.sock.sendMessage(input.to, payload);
+      }
     } else if (kind === 'video') {
-      await this.sock.sendMessage(input.to, {
-        video: media.buffer,
-        caption,
-        mimetype: media.mimeType,
-      });
+      const payload = { video: media.buffer, caption, mimetype: media.mimeType };
+      if (quoted) {
+        await this.sock.sendMessage(input.to, payload, { quoted });
+      } else {
+        await this.sock.sendMessage(input.to, payload);
+      }
     } else if (kind === 'audio') {
-      await this.sock.sendMessage(input.to, {
-        audio: media.buffer,
-        ptt: true,
-        mimetype: media.mimeType,
-      });
+      const payload = { audio: media.buffer, ptt: true, mimetype: media.mimeType };
+      if (quoted) {
+        await this.sock.sendMessage(input.to, payload, { quoted });
+      } else {
+        await this.sock.sendMessage(input.to, payload);
+      }
     } else {
-      await this.sock.sendMessage(input.to, {
+      const payload = {
         document: media.buffer,
         fileName: media.fileName || 'file',
         caption,
         mimetype: media.mimeType,
-      });
+      };
+      if (quoted) {
+        await this.sock.sendMessage(input.to, payload, { quoted });
+      } else {
+        await this.sock.sendMessage(input.to, payload);
+      }
     }
 
     return { to: input.to, mimeType: media.mimeType, bytes: media.buffer.length };

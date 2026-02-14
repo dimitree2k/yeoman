@@ -7,6 +7,7 @@ It answers, per chat:
 - **When to reply** (response gating)
 - **Which tools are allowed** (tool ACL)
 - **Which persona file** is used
+- **Voice behavior** (wake phrases + voice replies)
 
 Policy is **hot-reloaded** by default while the gateway is running.
 
@@ -51,7 +52,18 @@ For a given message, policy is resolved in this order:
       "tools": ["list_dir", "read_file", "web_search", "web_fetch"],
       "deny": []
     },
-    "personaFile": null
+    "personaFile": null,
+    "voice": {
+      "input": { "wakePhrases": [] },
+      "output": {
+        "mode": "text",
+        "ttsRoute": "tts.speak",
+        "voice": "alloy",
+        "format": "opus",
+        "maxSentences": 2,
+        "maxChars": 150
+      }
+    }
   },
   "channels": {
     "telegram": {
@@ -128,6 +140,32 @@ Tool safety notes:
 #### `personaFile`
 - `null`: no persona override.
 - String path: relative to your workspace (usually `~/.nanobot/workspace`), e.g. `memory/personas/poe-brash.md`.
+
+#### `voice`
+
+Voice settings are **per chat** and are evaluated alongside `whenToReply`.
+
+**`voice.input.wakePhrases`**
+- Used only for **WhatsApp groups** under `whenToReply.mode=mention_only`.
+- A group **voice note** can trigger a reply if its transcript contains any wake phrase.
+- Wake phrase matching is deterministic:
+  - lowercase
+  - non-alphanumeric → spaces
+  - collapse spaces
+  - match as whole-token substring (so `"nano"` does not match `"nanobot"` unless you list both)
+- Wake phrases do **not** make the bot respond to normal text messages in mention-only groups (only voice notes).
+
+**`voice.output.mode`**
+- `text`: always send text replies (default).
+- `in_kind`: if the inbound message is a voice note, reply with a voice note; otherwise reply with text.
+- `always`: always reply with a voice note.
+- `off`: disable voice output (text replies only).
+
+**`voice.output` other fields**
+- `ttsRoute`: model route for TTS (default `tts.speak`, supports `whatsapp.tts.speak` overrides).
+- `voice`: provider-specific voice selector (default `alloy` for OpenAI; use a **voice ID** for ElevenLabs, or set `providers.elevenlabs.voiceId` as default).
+- `format`: for WhatsApp voice notes, use `opus`.
+- `maxSentences` / `maxChars`: strict guardrails before TTS; if TTS fails or audio is too large, nanobot falls back to text.
 
 ### Sender Matching (identity normalization)
 

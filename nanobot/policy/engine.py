@@ -27,6 +27,37 @@ def _normalize_tool_names(values: list[str]) -> frozenset[str]:
     return frozenset(normalized)
 
 
+def _normalize_wake_text(value: str) -> str:
+    lowered = str(value or "").lower()
+    if not lowered:
+        return ""
+    normalized = "".join(ch if ch.isalnum() else " " for ch in lowered)
+    return " ".join(normalized.split())
+
+
+def _normalize_wake_phrases(values: list[str]) -> frozenset[str]:
+    normalized: set[str] = set()
+    for phrase in values:
+        norm = _normalize_wake_text(phrase)
+        if norm:
+            normalized.add(norm)
+    return frozenset(normalized)
+
+
+def _wake_phrase_match(content: str, wake_phrases: frozenset[str]) -> bool:
+    if not wake_phrases:
+        return False
+    normalized = _normalize_wake_text(content)
+    if not normalized:
+        return False
+    haystack = f" {normalized} "
+    for phrase in wake_phrases:
+        needle = f" {phrase} "
+        if needle in haystack:
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class ActorContext:
     """Normalized actor/channel context for policy decisions."""
@@ -38,6 +69,8 @@ class ActorContext:
     is_group: bool
     mentioned_bot: bool
     reply_to_bot: bool
+    content: str = ""
+    is_voice: bool = False
 
 
 @dataclass(slots=True)
@@ -54,6 +87,13 @@ class EffectivePolicy:
     allowed_tools_deny: list[str]
     tool_access: dict[str, dict[str, Any]]
     persona_file: str | None
+    voice_input_wake_phrases: list[str]
+    voice_output_mode: str
+    voice_output_tts_route: str
+    voice_output_voice: str
+    voice_output_format: str
+    voice_output_max_sentences: int
+    voice_output_max_chars: int
 
 
 @dataclass(slots=True)
@@ -97,6 +137,13 @@ class _CompiledPolicy:
     allowed_tools_deny: frozenset[str]
     tool_access_rules: dict[str, _CompiledToolAccessRule]
     persona_file: str | None
+    voice_input_wake_phrases: frozenset[str]
+    voice_output_mode: str
+    voice_output_tts_route: str
+    voice_output_voice: str
+    voice_output_format: str
+    voice_output_max_sentences: int
+    voice_output_max_chars: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +263,13 @@ class PolicyEngine:
                 if tool_name.strip()
             },
             persona_file=resolved.persona_file,
+            voice_input_wake_phrases=_normalize_wake_phrases(resolved.voice.input.wake_phrases),
+            voice_output_mode=str(resolved.voice.output.mode),
+            voice_output_tts_route=str(resolved.voice.output.tts_route),
+            voice_output_voice=str(resolved.voice.output.voice),
+            voice_output_format=str(resolved.voice.output.format),
+            voice_output_max_sentences=int(resolved.voice.output.max_sentences),
+            voice_output_max_chars=int(resolved.voice.output.max_chars),
         )
 
     def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
@@ -362,6 +416,13 @@ class PolicyEngine:
                 for tool_name, rule in sorted(resolved.tool_access_rules.items())
             },
             persona_file=resolved.persona_file,
+            voice_input_wake_phrases=sorted(resolved.voice_input_wake_phrases),
+            voice_output_mode=resolved.voice_output_mode,
+            voice_output_tts_route=resolved.voice_output_tts_route,
+            voice_output_voice=resolved.voice_output_voice,
+            voice_output_format=resolved.voice_output_format,
+            voice_output_max_sentences=resolved.voice_output_max_sentences,
+            voice_output_max_chars=resolved.voice_output_max_chars,
         )
 
     @staticmethod
@@ -403,8 +464,11 @@ class PolicyEngine:
         if mode == "mention_only":
             if not actor.is_group:
                 return True, "when_to_reply:mention_only_dm"
-            ok = actor.mentioned_bot or actor.reply_to_bot
-            return ok, "when_to_reply:mention_only_group"
+            if actor.mentioned_bot or actor.reply_to_bot:
+                return True, "when_to_reply:mention_only_group"
+            if actor.is_voice and _wake_phrase_match(actor.content, policy.voice_input_wake_phrases):
+                return True, "when_to_reply:mention_only_group_voice_wake_phrase"
+            return False, "when_to_reply:mention_only_group"
         if mode == "allowed_senders":
             ok = self._sender_match(actor.sender_primary, actor.sender_aliases, policy.when_to_reply_senders)
             return ok, "when_to_reply:allowed_senders"

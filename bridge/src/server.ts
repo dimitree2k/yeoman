@@ -73,6 +73,7 @@ export class BridgeServer {
     private readonly authDir: string,
     private readonly mediaIncomingDir: string,
     private readonly mediaOutgoingDir: string,
+    private readonly persistInboundAudio: boolean,
     private readonly token: string,
     private readonly bridgeVersion: string,
     private readonly buildId: string,
@@ -93,6 +94,7 @@ export class BridgeServer {
       authDir: this.authDir,
       mediaIncomingDir: this.mediaIncomingDir,
       mediaOutgoingDir: this.mediaOutgoingDir,
+      persistInboundAudio: this.persistInboundAudio,
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => this.broadcastMessage(msg),
@@ -266,7 +268,7 @@ export class BridgeServer {
 
     if (type === 'send_text') {
       const parsed = parseSendTextPayload(payload);
-      const sent = await this.wa.sendText(parsed.to, parsed.text);
+      const sent = await this.wa.sendText(parsed.to, parsed.text, parsed.replyToMessageId);
       return { sent };
     }
 

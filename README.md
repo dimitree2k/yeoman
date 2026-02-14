@@ -255,6 +255,80 @@ nanobot channels login
 }
 ```
 
+### WhatsApp Voice (STT + TTS)
+
+Voice support is opt-in. Enable inbound audio persistence (required for transcription):
+
+```json
+{
+  "channels": {
+    "whatsapp": {
+      "media": {
+        "persistIncomingAudio": true
+      }
+    }
+  },
+  "providers": {
+    "openrouter": { "apiKey": "sk-or-v1-..." }
+  }
+}
+```
+
+To use ElevenLabs for voice replies, set a TTS profile + route and add `providers.elevenlabs`:
+
+```json
+{
+  "models": {
+    "profiles": {
+      "tts_elevenlabs": {
+        "kind": "tts",
+        "provider": "elevenlabs_tts",
+        "model": "eleven_multilingual_v2",
+        "timeoutMs": 30000
+      }
+    },
+    "routes": {
+      "whatsapp.tts.speak": "tts_elevenlabs"
+    }
+  },
+  "providers": {
+    "elevenlabs": {
+      "apiKey": "YOUR_ELEVENLABS_KEY",
+      "apiBase": "https://api.elevenlabs.io/v1",
+      "voiceId": "ztZBipzb4WQJRDayep3G",
+      "modelId": "eleven_multilingual_v2"
+    }
+  }
+}
+```
+
+`providers.elevenlabs.apiBase` is optional (default is `https://api.elevenlabs.io/v1`, API v1).
+
+Then configure per-chat voice policy in `~/.nanobot/policy.json` (example for a group):
+
+```json
+{
+  "channels": {
+    "whatsapp": {
+      "chats": {
+        "1203634...@g.us": {
+          "whenToReply": { "mode": "mention_only", "senders": [] },
+          "voice": {
+            "input": { "wakePhrases": ["nanobot", "nano"] },
+            "output": { "mode": "in_kind", "voice": "JBFqnCBsd6RMkjVDRZzb", "format": "opus", "maxSentences": 2, "maxChars": 150 }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Notes:
+- Voice replies are sent as **quoted voice notes** (no extra text), so groups can see what message the bot responded to.
+- For ElevenLabs, set `voice.output.voice` to a **voice ID** (from ElevenLabs voices API).
+- If TTS fails or the synthesized audio is too large for the bridge payload limit, the bot falls back to text.
+
 **3. Run** (two terminals)
 
 ```bash

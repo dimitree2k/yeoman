@@ -85,6 +85,9 @@ def _to_actor(event: InboundEvent) -> ActorContext:
         is_group=event.is_group,
         mentioned_bot=event.mentioned_bot,
         reply_to_bot=event.reply_to_bot,
+        content=event.content,
+        is_voice=bool(event.raw_metadata.get("is_voice", False))
+        or str(event.raw_metadata.get("media_kind") or "").strip() == "audio",
     )
 
 
@@ -221,12 +224,36 @@ class EnginePolicyAdapter(PolicyPort):
                 notes_allow_blocked_senders=False,
                 notes_batch_interval_seconds=1800,
                 notes_batch_max_messages=100,
+                voice_output_mode="text",
+                voice_output_tts_route="tts.speak",
+                voice_output_voice="alloy",
+                voice_output_format="opus",
+                voice_output_max_sentences=2,
+                voice_output_max_chars=150,
                 source="disabled",
             )
 
         self._maybe_reload()
         actor = _to_actor(event)
         decision = self._engine.evaluate(actor, self._known_tools)
+        voice_output_mode = "text"
+        voice_output_tts_route = "tts.speak"
+        voice_output_voice = "alloy"
+        voice_output_format = "opus"
+        voice_output_max_sentences = 2
+        voice_output_max_chars = 150
+        if event.channel in self._engine.apply_channels:
+            try:
+                effective = self._engine.resolve_policy(event.channel, event.chat_id)
+                voice_output_mode = effective.voice_output_mode
+                voice_output_tts_route = effective.voice_output_tts_route
+                voice_output_voice = effective.voice_output_voice
+                voice_output_format = effective.voice_output_format
+                voice_output_max_sentences = effective.voice_output_max_sentences
+                voice_output_max_chars = effective.voice_output_max_chars
+            except Exception:
+                # Policy voice output settings are optional and should never break evaluation.
+                pass
         notes = self._engine.resolve_memory_notes(
             channel=event.channel,
             chat_id=event.chat_id,
@@ -244,6 +271,12 @@ class EnginePolicyAdapter(PolicyPort):
             notes_allow_blocked_senders=notes.allow_blocked_senders,
             notes_batch_interval_seconds=notes.batch_interval_seconds,
             notes_batch_max_messages=notes.batch_max_messages,
+            voice_output_mode=voice_output_mode,
+            voice_output_tts_route=voice_output_tts_route,
+            voice_output_voice=voice_output_voice,
+            voice_output_format=voice_output_format,
+            voice_output_max_sentences=voice_output_max_sentences,
+            voice_output_max_chars=voice_output_max_chars,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )
 
@@ -309,6 +342,19 @@ class EnginePolicyAdapter(PolicyPort):
                     },
                     "toolAccess": effective.tool_access,
                     "personaFile": effective.persona_file,
+                    "voice": {
+                        "input": {
+                            "wakePhrases": effective.voice_input_wake_phrases,
+                        },
+                        "output": {
+                            "mode": effective.voice_output_mode,
+                            "ttsRoute": effective.voice_output_tts_route,
+                            "voice": effective.voice_output_voice,
+                            "format": effective.voice_output_format,
+                            "maxSentences": effective.voice_output_max_sentences,
+                            "maxChars": effective.voice_output_max_chars,
+                        },
+                    },
                 }
                 if effective is not None
                 else None

@@ -8,6 +8,7 @@ from typing import Any
 DEFAULT_ASSISTANT_MODEL = "anthropic/claude-opus-4-5"
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_ASR_MODEL = "whisper-large-v3"
+DEFAULT_TTS_MODEL = "tts-1"
 
 DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
     "assistant_default": {
@@ -29,6 +30,12 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "model": DEFAULT_ASR_MODEL,
         "timeout_ms": 60000,
     },
+    "tts_default": {
+        "kind": "tts",
+        "provider": "openai_tts",
+        "model": DEFAULT_TTS_MODEL,
+        "timeout_ms": 30000,
+    },
     "memory_embed_fast": {
         "kind": "embedding",
         "model": "openai/text-embedding-3-small",
@@ -47,8 +54,10 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "assistant.reply": "assistant_default",
     "vision.describe_image": "vision_whatsapp_cheap",
     "asr.transcribe_audio": "asr_default",
+    "tts.speak": "tts_default",
     "whatsapp.vision.describe_image": "vision_whatsapp_cheap",
     "whatsapp.asr.transcribe_audio": "asr_default",
+    "whatsapp.tts.speak": "tts_default",
     "memory.embed": "memory_embed_fast",
     "memory.capture.extract": "memory_capture_fast",
 }
@@ -61,6 +70,12 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "describe_images": True,
     "pass_image_to_assistant": False,
     "max_image_bytes_mb": 8,
+    "persist_incoming_audio": False,
+    "transcribe_audio": True,
+    "max_audio_bytes_mb": 25,
+    "delete_audio_after_transcription": True,
+    "max_asr_concurrency": 2,
+    "max_tts_concurrency": 2,
 }
 
 DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {

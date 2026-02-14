@@ -33,15 +33,18 @@ export interface ProtocolError {
 export interface SendTextPayload {
   to: string;
   text: string;
+  replyToMessageId?: string;
 }
 
 export interface SendMediaPayload {
   to: string;
   mediaUrl?: string;
   mediaBase64?: string;
+  mediaPath?: string;
   mimeType?: string;
   fileName?: string;
   caption?: string;
+  replyToMessageId?: string;
 }
 
 export interface SendPollPayload {
@@ -148,8 +151,9 @@ function asOptionalStringArray(value: unknown): string[] | undefined {
 function parseSendText(payload: Record<string, unknown>): SendTextPayload | null {
   const to = asString(payload.to);
   const text = asString(payload.text);
+  const replyToMessageId = asOptionalString(payload.replyToMessageId);
   if (!to || !text) return null;
-  return { to, text };
+  return { to, text, replyToMessageId };
 }
 
 function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | null {
@@ -157,11 +161,13 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
   if (!to) return null;
   const mediaUrl = asOptionalString(payload.mediaUrl);
   const mediaBase64 = asOptionalString(payload.mediaBase64);
+  const mediaPath = asOptionalString(payload.mediaPath);
   const mimeType = asOptionalString(payload.mimeType);
   const fileName = asOptionalString(payload.fileName);
   const caption = asOptionalString(payload.caption);
-  if (!mediaUrl && !mediaBase64) return null;
-  return { to, mediaUrl, mediaBase64, mimeType, fileName, caption };
+  const replyToMessageId = asOptionalString(payload.replyToMessageId);
+  if (!mediaUrl && !mediaBase64 && !mediaPath) return null;
+  return { to, mediaUrl, mediaBase64, mediaPath, mimeType, fileName, caption, replyToMessageId };
 }
 
 function parseSendPoll(payload: Record<string, unknown>): SendPollPayload | null {

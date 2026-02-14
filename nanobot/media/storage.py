@@ -27,6 +27,18 @@ class MediaStorage:
         except (OSError, RuntimeError, ValueError):
             return None
 
+    def validate_outgoing_path(self, path: str | Path | None) -> Path | None:
+        """Return resolved path only when it is inside configured outgoing root."""
+        if not path:
+            return None
+        try:
+            resolved = Path(path).expanduser().resolve()
+            outgoing_root = self.outgoing_dir.expanduser().resolve()
+            resolved.relative_to(outgoing_root)
+            return resolved
+        except (OSError, RuntimeError, ValueError):
+            return None
+
     def cleanup_expired(self, channel: str, retention_days: int) -> int:
         """Delete incoming files older than retention window for one channel."""
         days = max(1, int(retention_days))

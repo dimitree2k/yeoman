@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Awaitable, Callable
 
 from nanobot.core.admin_commands import AdminCommandResult
@@ -15,8 +17,12 @@ from nanobot.core.intents import (
     SendOutboundIntent,
     SetTypingIntent,
 )
-from nanobot.core.models import ArchivedMessage, InboundEvent, OutboundEvent
+from nanobot.core.models import ArchivedMessage, InboundEvent, OutboundEvent, PolicyDecision
 from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
+from nanobot.media.tts import TTSSynthesizer, strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
+
+if TYPE_CHECKING:
+    from nanobot.media.router import ModelRouter
 
 
 class Orchestrator:
@@ -35,6 +41,10 @@ class Orchestrator:
         security: SecurityPort | None = None,
         security_block_message: str = "Request blocked for security reasons.",
         policy_admin_handler: Callable[[InboundEvent], AdminCommandResult | str | None] | None = None,
+        model_router: "ModelRouter | None" = None,
+        tts: TTSSynthesizer | None = None,
+        whatsapp_tts_outgoing_dir: Path | None = None,
+        whatsapp_tts_max_raw_bytes: int = 160 * 1024,
     ) -> None:
         self._policy = policy
         self._responder = responder
@@ -45,6 +55,10 @@ class Orchestrator:
         self._security = security
         self._security_block_message = security_block_message
         self._policy_admin_handler = policy_admin_handler
+        self._model_router = model_router
+        self._tts = tts
+        self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
+        self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -385,6 +399,15 @@ class Orchestrator:
                 chat_id=outbound_chat_id,
                 content=reply,
             )
+            voice_outbound = await self._maybe_voice_reply(
+                event=event,
+                reply=reply,
+                outbound_channel=outbound_channel,
+                outbound_chat_id=outbound_chat_id,
+                decision=decision,
+            )
+            if voice_outbound is not None:
+                outbound = voice_outbound
             intents.append(SendOutboundIntent(event=outbound))
             intents.append(
                 PersistSessionIntent(
@@ -412,6 +435,78 @@ class Orchestrator:
                     )
                 else:
                     await self._typing_notifier(event.channel, event.chat_id, False)
+
+    @staticmethod
+    def _is_inbound_voice(event: InboundEvent) -> bool:
+        raw = event.raw_metadata
+        if bool(raw.get("is_voice", False)):
+            return True
+        return str(raw.get("media_kind") or "").strip().lower() == "audio"
+
+    def _resolve_tts_profile(self, *, route: str, channel: str) -> object | None:
+        if self._model_router is None:
+            return None
+        task_key = str(route or "").strip() or "tts.speak"
+        if task_key.startswith(f"{channel}."):
+            return self._model_router.resolve(task_key)
+        return self._model_router.resolve(task_key, channel=channel)
+
+    async def _maybe_voice_reply(
+        self,
+        *,
+        event: InboundEvent,
+        reply: str,
+        outbound_channel: str,
+        outbound_chat_id: str,
+        decision: PolicyDecision,
+    ) -> OutboundEvent | None:
+        if self._tts is None or self._whatsapp_tts_outgoing_dir is None:
+            return None
+        if outbound_channel != "whatsapp":
+            return None
+
+        mode = str(getattr(decision, "voice_output_mode", "text") or "text").strip().lower()
+        if mode in {"", "off", "text"}:
+            return None
+        if mode == "in_kind" and not self._is_inbound_voice(event):
+            return None
+
+        fmt = str(getattr(decision, "voice_output_format", "opus") or "opus").strip().lower()
+        if fmt != "opus":
+            return None
+
+        route = str(getattr(decision, "voice_output_tts_route", "") or "").strip() or "tts.speak"
+        profile = self._resolve_tts_profile(route=route, channel=outbound_channel)
+        if profile is None:
+            return None
+
+        voice = str(getattr(decision, "voice_output_voice", "") or "").strip() or "alloy"
+        max_sentences = int(getattr(decision, "voice_output_max_sentences", 2) or 2)
+        max_chars = int(getattr(decision, "voice_output_max_chars", 150) or 150)
+
+        plain = strip_markdown_for_tts(reply)
+        limited = truncate_for_voice(plain, max_sentences=max_sentences, max_chars=max_chars)
+        if not limited:
+            return None
+
+        try:
+            audio = await self._tts.synthesize(limited, profile=profile, voice=voice, format=fmt)
+        except Exception:
+            return None
+        if not audio:
+            return None
+        if len(audio) > self._whatsapp_tts_max_raw_bytes:
+            return None
+
+        out_dir = self._whatsapp_tts_outgoing_dir / "tts"
+        path = write_tts_audio_file(out_dir, audio, ext=".ogg")
+        return OutboundEvent(
+            channel=outbound_channel,
+            chat_id=outbound_chat_id,
+            content="",
+            reply_to=event.message_id,
+            media=(str(path),),
+        )
 
     def _dedupe_key(self, event: InboundEvent) -> str | None:
         if not event.message_id:

@@ -53,6 +53,12 @@ class PolicyDecision:
     notes_allow_blocked_senders: bool = False
     notes_batch_interval_seconds: int = 1800
     notes_batch_max_messages: int = 100
+    voice_output_mode: Literal["text", "in_kind", "always", "off"] = "text"
+    voice_output_tts_route: str = "tts.speak"
+    voice_output_voice: str = "alloy"
+    voice_output_format: str = "opus"
+    voice_output_max_sentences: int = 2
+    voice_output_max_chars: int = 150
     source: str = "disabled"
 
 

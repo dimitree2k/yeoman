@@ -18,6 +18,7 @@ WhenToReplyMode = Literal["all", "mention_only", "allowed_senders", "owner_only"
 AllowedToolsMode = Literal["all", "allowlist"]
 ToolAccessMode = Literal["everyone", "allowlist", "owner_only"]
 MemoryNotesMode = Literal["adaptive", "heuristic", "hybrid"]
+VoiceOutputMode = Literal["text", "in_kind", "always", "off"]
 
 
 class WhoCanTalkPolicy(PolicyModel):
@@ -90,6 +91,54 @@ class ToolAccessRuleOverride(PolicyModel):
     senders: list[str] | None = None
 
 
+class VoiceInputPolicy(PolicyModel):
+    """Voice input settings for a chat."""
+
+    wake_phrases: list[str] = Field(default_factory=list, alias="wakePhrases")
+
+
+class VoiceInputPolicyOverride(PolicyModel):
+    """Partial override for voice input settings."""
+
+    wake_phrases: list[str] | None = Field(default=None, alias="wakePhrases")
+
+
+class VoiceOutputPolicy(PolicyModel):
+    """Voice output settings for a chat."""
+
+    mode: VoiceOutputMode = "text"
+    tts_route: str = Field(default="tts.speak", alias="ttsRoute")
+    voice: str = "alloy"
+    format: str = "opus"
+    max_sentences: int = Field(default=2, alias="maxSentences", ge=1)
+    max_chars: int = Field(default=150, alias="maxChars", ge=1)
+
+
+class VoiceOutputPolicyOverride(PolicyModel):
+    """Partial override for voice output settings."""
+
+    mode: VoiceOutputMode | None = None
+    tts_route: str | None = Field(default=None, alias="ttsRoute")
+    voice: str | None = None
+    format: str | None = None
+    max_sentences: int | None = Field(default=None, alias="maxSentences", ge=1)
+    max_chars: int | None = Field(default=None, alias="maxChars", ge=1)
+
+
+class VoicePolicy(PolicyModel):
+    """Voice policy settings for a chat (input + output)."""
+
+    input: VoiceInputPolicy = Field(default_factory=VoiceInputPolicy)
+    output: VoiceOutputPolicy = Field(default_factory=VoiceOutputPolicy)
+
+
+class VoicePolicyOverride(PolicyModel):
+    """Partial override for voice policy settings."""
+
+    input: VoiceInputPolicyOverride | None = None
+    output: VoiceOutputPolicyOverride | None = None
+
+
 class ChatPolicy(PolicyModel):
     """Resolved chat policy (no optional fields)."""
 
@@ -99,6 +148,7 @@ class ChatPolicy(PolicyModel):
     allowed_tools: AllowedToolsPolicy = Field(default_factory=AllowedToolsPolicy, alias="allowedTools")
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
+    voice: VoicePolicy = Field(default_factory=VoicePolicy)
 
 
 class ChatPolicyOverride(PolicyModel):
@@ -110,6 +160,7 @@ class ChatPolicyOverride(PolicyModel):
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
+    voice: VoicePolicyOverride | None = None
     comment: str | None = Field(default=None, alias="comment")
 
 
