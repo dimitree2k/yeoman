@@ -41,6 +41,8 @@ from nanobot.policy.schema import (
     BlockedSendersPolicyOverride,
     ChatPolicyOverride,
     PolicyConfig,
+    VoiceOutputPolicyOverride,
+    VoicePolicyOverride,
     WhenToReplyMode,
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
@@ -131,7 +133,10 @@ class EnginePolicyAdapter(PolicyPort):
         self._policy_admin_service: PolicyAdminService | None = None
         self._admin_router = AdminCommandRouter(
             [
+                CommandCatalogCommandHandler(self),
+                HelpAliasCommandHandler(self),
                 PolicyAdminCommandHandler(self),
+                VoiceMessagesCommandHandler(self),
                 ResetSessionCommandHandler(self),
             ]
         )
@@ -405,20 +410,16 @@ class EnginePolicyAdapter(PolicyPort):
         return self._admin_router.route(_to_admin_context(event))
 
     def policy_admin_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        if ctx.channel != "whatsapp" or ctx.is_group:
-            return False
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return False
-        return self._is_whatsapp_owner(ctx, policy)
+        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
 
     def session_reset_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        if ctx.channel != "whatsapp":
-            return False
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return False
-        return self._is_whatsapp_owner(ctx, policy)
+        return bool(self._owner_policy_for_context(ctx))
+
+    def command_catalog_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx))
+
+    def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx))
 
     def session_reset_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         if argv:
@@ -472,6 +473,180 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
+    def command_catalog_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        include_all = False
+        if argv:
+            normalized = argv[0].strip().lower()
+            if len(argv) == 1 and normalized in {"all", "full"}:
+                include_all = True
+            elif len(argv) == 1 and normalized in {"help", "-h", "--help"}:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /commands [all]",
+                    command_name="commands",
+                    outcome="applied",
+                    source="dm" if not ctx.is_group else "group",
+                )
+            else:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /commands [all]",
+                    command_name="commands",
+                    outcome="invalid",
+                    source="dm" if not ctx.is_group else "group",
+                )
+
+        lines = [
+            "Available slash commands for this chat:",
+            "- /commands [all] — list available commands",
+            "- /reset — clear conversation history for this chat",
+            "- /voicemessages <status|on|off|in_kind|always|text|inherit>",
+        ]
+        if self.policy_admin_is_applicable(ctx):
+            lines.append("- /policy help — policy admin commands")
+            if include_all and self._policy_admin_service is not None:
+                lines.append("")
+                lines.extend(self._policy_admin_service.registry.usage_lines())
+        else:
+            lines.append("In your DM with Nano: /policy help")
+        return AdminCommandResult(
+            status="handled",
+            response="\n".join(lines),
+            command_name="commands",
+            outcome="applied",
+            source="dm" if not ctx.is_group else "group",
+        )
+
+    @staticmethod
+    def _voice_mode_token(raw: str) -> str | None:
+        value = raw.strip().lower().replace("-", "_")
+        aliases = {
+            "on": "in_kind",
+            "off": "off",
+            "status": "status",
+            "inherit": "inherit",
+            "default": "inherit",
+            "inkind": "in_kind",
+        }
+        mode = aliases.get(value, value)
+        valid = {"status", "inherit", "text", "in_kind", "always", "off"}
+        if mode not in valid:
+            return None
+        return mode
+
+    @staticmethod
+    def _voice_output_override_is_empty(override: VoiceOutputPolicyOverride) -> bool:
+        return (
+            override.mode is None
+            and override.tts_route is None
+            and override.voice is None
+            and override.format is None
+            and override.max_sentences is None
+            and override.max_chars is None
+        )
+
+    @classmethod
+    def _cleanup_voice_override(cls, override: ChatPolicyOverride) -> None:
+        voice = override.voice
+        if voice is None:
+            return
+        if voice.input is not None and voice.input.wake_phrases is None:
+            voice.input = None
+        if voice.output is not None and cls._voice_output_override_is_empty(voice.output):
+            voice.output = None
+        if voice.input is None and voice.output is None:
+            override.voice = None
+
+    def voice_messages_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if len(argv) > 1:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /voicemessages <status|on|off|in_kind|always|text|inherit>",
+                command_name="voicemessages",
+                outcome="invalid",
+                source="dm" if not ctx.is_group else "group",
+            )
+
+        mode_token = "status"
+        if argv:
+            parsed = self._voice_mode_token(argv[0])
+            if parsed is None:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /voicemessages <status|on|off|in_kind|always|text|inherit>",
+                    command_name="voicemessages",
+                    outcome="invalid",
+                    source="dm" if not ctx.is_group else "group",
+                )
+            mode_token = parsed
+
+        if self._engine is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Voice settings unavailable: policy engine is not active.",
+                command_name="voicemessages",
+                outcome="error",
+                source="dm" if not ctx.is_group else "group",
+            )
+
+        if mode_token == "status":
+            effective = self._engine.resolve_policy("whatsapp", ctx.chat_id)
+            return AdminCommandResult(
+                status="handled",
+                response=f"Voice messages for this chat: {effective.voice_output_mode}.",
+                command_name="voicemessages",
+                outcome="applied",
+                source="dm" if not ctx.is_group else "group",
+            )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Voice settings unavailable: policy is not loaded.",
+                command_name="voicemessages",
+                outcome="error",
+                source="dm" if not ctx.is_group else "group",
+            )
+
+        override = self._whatsapp_chat_override(policy, ctx.chat_id)
+        if mode_token == "inherit":
+            if override.voice is not None and override.voice.output is not None:
+                override.voice.output.mode = None
+        else:
+            if override.voice is None:
+                override.voice = VoicePolicyOverride()
+            if override.voice.output is None:
+                override.voice.output = VoiceOutputPolicyOverride()
+            override.voice.output.mode = mode_token  # type: ignore[assignment]
+        self._cleanup_voice_override(override)
+
+        try:
+            self._save_policy_and_reload(policy)
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply voice setting: {e}",
+                command_name="voicemessages",
+                outcome="error",
+                source="dm" if not ctx.is_group else "group",
+            )
+
+        effective = self._engine.resolve_policy("whatsapp", ctx.chat_id)
+        return AdminCommandResult(
+            status="handled",
+            response=f"Voice messages updated for this chat: {effective.voice_output_mode}.",
+            command_name="voicemessages",
+            outcome="applied",
+            source="dm" if not ctx.is_group else "group",
+            metric_events=(
+                AdminMetricEvent(
+                    name="voice_messages_set_total",
+                    labels=(("channel", ctx.channel), ("mode", effective.voice_output_mode)),
+                ),
+            ),
+        )
+
     def policy_admin_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         policy = self._load_policy_for_admin()
         if policy is None:
@@ -509,6 +684,16 @@ class EnginePolicyAdapter(PolicyPort):
             return load_policy(self._policy_path)
         except Exception:
             return None
+
+    def _owner_policy_for_context(self, ctx: AdminCommandContext) -> PolicyConfig | None:
+        if ctx.channel != "whatsapp":
+            return None
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return None
+        if not self._is_whatsapp_owner(ctx, policy):
+            return None
+        return policy
 
     def _session_wal_path(self, session_key: str) -> Path:
         state_dir = Path(self._memory_state_dir).expanduser()
@@ -1042,3 +1227,60 @@ class ResetSessionCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/reset"
+
+
+class CommandCatalogCommandHandler(AdminCommandHandler):
+    """Deterministic `/commands` command for discoverability."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "commands"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.command_catalog_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.command_catalog_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/commands"
+
+
+class HelpAliasCommandHandler(AdminCommandHandler):
+    """Alias `/help` to `/commands` in WhatsApp owner contexts."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "help"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.command_catalog_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.command_catalog_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/help"
+
+
+class VoiceMessagesCommandHandler(AdminCommandHandler):
+    """Deterministic `/voicemessages` command for per-chat voice output mode."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "voicemessages"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.voice_messages_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.voice_messages_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/voicemessages"
