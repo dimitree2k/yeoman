@@ -62,6 +62,7 @@ def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolCo
         restrict_to_workspace = True
         exec_config.isolation.enabled = True
         exec_config.isolation.fail_closed = True
+        exec_config.allow_host_execution = False
     return restrict_to_workspace, exec_config
 
 

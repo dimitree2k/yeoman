@@ -27,6 +27,7 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        allow_host_execution: bool = False,
         isolation_config: "ExecIsolationConfig | None" = None,
     ):
 
@@ -45,6 +46,7 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.allow_host_execution = allow_host_execution
         self.isolation_config = isolation_config or ExecIsolationConfig()
 
         self._session_key = "cli:default"
@@ -86,8 +88,15 @@ class ExecTool(Tool):
         if self._sandbox_manager:
             return await self._execute_isolated(command=command, cwd=cwd)
 
-        if self.isolation_config.enabled and self.isolation_config.fail_closed and self._isolation_error:
-            return f"Error: Exec isolation unavailable: {self._isolation_error}"
+        if self.isolation_config.enabled:
+            reason = self._isolation_error or "sandbox manager unavailable"
+            return f"Error: Exec isolation unavailable: {reason}"
+
+        if not self.allow_host_execution:
+            return (
+                "Error: Host exec is disabled by configuration "
+                "(set tools.exec.allowHostExecution=true to enable unsafe host execution)"
+            )
 
         return await self._execute_local(command=command, cwd=cwd)
 
@@ -160,12 +169,13 @@ class ExecTool(Tool):
         except Exception as e:
             self._isolation_error = str(e)
             self._sandbox_manager = None
-            if self.isolation_config.fail_closed:
-                logger.error(f"Exec isolation unavailable (fail-closed): {self._isolation_error}")
-            else:
+            if self.allow_host_execution:
                 logger.warning(
-                    f"Exec isolation unavailable, falling back to host execution: {self._isolation_error}"
+                    "Exec isolation unavailable; host exec remains enabled via allow_host_execution=true: {}",
+                    self._isolation_error,
                 )
+            else:
+                logger.error("Exec isolation unavailable (host exec disabled): {}", self._isolation_error)
 
     async def _execute_local(self, command: str, cwd: str) -> str:
         try:
@@ -212,9 +222,7 @@ class ExecTool(Tool):
         )
 
         if not self._sandbox_manager:
-            if self.isolation_config.fail_closed:
-                return f"Error: Exec isolation unavailable: {self._isolation_error or 'unknown error'}"
-            return await self._execute_local(command=command, cwd=cwd)
+            return f"Error: Exec isolation unavailable: {self._isolation_error or 'unknown error'}"
 
         try:
             result = await self._sandbox_manager.execute(
@@ -228,9 +236,7 @@ class ExecTool(Tool):
         except SandboxPreemptedError as e:
             return f"Error: Command interrupted due to sandbox preemption ({e})"
         except (IsolationUnavailableError, SandboxExecutionError) as e:
-            if self.isolation_config.fail_closed:
-                return f"Error: Exec isolation unavailable: {str(e)}"
-            return await self._execute_local(command=command, cwd=cwd)
+            return f"Error: Exec isolation unavailable: {str(e)}"
         except Exception as e:
             return f"Error executing command: {str(e)}"
 

@@ -409,7 +409,7 @@ class PolicyAdminService:
     def _chat_alias(chat_id: str) -> str:
         import hashlib
 
-        digest = hashlib.sha1(chat_id.encode("utf-8")).hexdigest()[:6]
+        digest = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:10]
         return f"g-{digest}"
 
     def _discover_groups(self, policy: PolicyConfig) -> dict[str, dict[str, Any]]:

@@ -120,6 +120,7 @@ class SubagentManager:
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.effective_restrict_to_workspace,
+                allow_host_execution=self.exec_config.allow_host_execution,
                 isolation_config=self.exec_config.isolation,
             )
             exec_tool.set_session_context(f"subagent:{task_id}")

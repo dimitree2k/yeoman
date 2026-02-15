@@ -127,14 +127,14 @@ DEFAULT_MEMORY: dict[str, Any] = {
 
 DEFAULT_SECURITY: dict[str, Any] = {
     "enabled": True,
-    "fail_mode": "mixed",
+    "fail_mode": "closed",
     "stages": {
         "input": True,
         "tool": True,
-        "output": False,
+        "output": True,
     },
     "block_user_message": "Request blocked for security reasons.",
-    "strict_profile": False,
+    "strict_profile": True,
     "redact_placeholder": "[REDACTED]",
 }
 

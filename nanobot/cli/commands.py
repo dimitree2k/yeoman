@@ -647,6 +647,7 @@ def agent(
         restrict_to_workspace = True
         exec_config.isolation.enabled = True
         exec_config.isolation.fail_closed = True
+        exec_config.allow_host_execution = False
     responder = LLMResponder(
         bus=bus,
         provider=provider,

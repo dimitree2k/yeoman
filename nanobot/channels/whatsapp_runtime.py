@@ -256,7 +256,7 @@ class WhatsAppRuntimeManager:
         if not shutil.which("npm"):
             raise RuntimeError("npm is required on first bridge runtime install (dependencies only)")
         result = subprocess.run(
-            ["npm", "install", "--omit=dev", "--no-fund", "--no-audit"],
+            ["npm", "install", "--omit=dev", "--no-fund"],
             cwd=root,
             capture_output=True,
             text=True,

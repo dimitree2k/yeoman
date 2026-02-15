@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -205,19 +206,30 @@ def _atomic_write_config(path: Path, config: Config) -> None:
     """Atomically write config as camelCase JSON with secure permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
     data = convert_to_camel(config.model_dump())
-    tmp_name = f".{path.name}.tmp-{os.getpid()}"
-    tmp_path = path.with_name(tmp_name)
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
+    fd, tmp_raw = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=str(path.parent), text=True)
+    tmp_path = Path(tmp_raw)
     try:
-        tmp_path.chmod(0o600)
-    except OSError:
-        pass
-    os.replace(tmp_path, path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def convert_keys(data: Any) -> Any:

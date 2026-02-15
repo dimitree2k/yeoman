@@ -18,14 +18,15 @@ from nanobot.agent.tools.exec_isolation import (
     SandboxPreemptedError,
     SandboxTimeoutError,
 )
+from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import _validate_url
 from nanobot.app.bootstrap import _resolve_security_tool_settings
 from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import _migrate_config, convert_keys, convert_to_camel
-from nanobot.config.schema import Config, ExecToolConfig, SecurityConfig
+from nanobot.config.loader import _atomic_write_config, _migrate_config, convert_keys, convert_to_camel
+from nanobot.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
 from nanobot.core.intents import SendOutboundIntent
 from nanobot.core.models import InboundEvent, PolicyDecision
 from nanobot.core.orchestrator import Orchestrator
@@ -127,12 +128,28 @@ async def test_exec_tool_blocks_dangerous_command(tmp_path: Path) -> None:
 
 
 async def test_exec_tool_timeout_and_recovery(tmp_path: Path) -> None:
-    tool = ExecTool(timeout=1, working_dir=str(tmp_path))
+    tool = ExecTool(
+        timeout=1,
+        working_dir=str(tmp_path),
+        allow_host_execution=True,
+        isolation_config=ExecIsolationConfig(enabled=False),
+    )
     timed_out = await tool.execute("sleep 2")
     assert "timed out" in timed_out
 
     recovered = await tool.execute("echo ok")
     assert "ok" in recovered
+
+
+async def test_exec_tool_blocks_host_execution_when_disabled(tmp_path: Path) -> None:
+    tool = ExecTool(
+        timeout=1,
+        working_dir=str(tmp_path),
+        allow_host_execution=False,
+        isolation_config=ExecIsolationConfig(enabled=False),
+    )
+    result = await tool.execute("echo ok")
+    assert "Host exec is disabled by configuration" in result
 
 
 async def test_pi_stats_tool_json_format() -> None:
@@ -166,7 +183,8 @@ async def test_pi_stats_tool_top_n_limit() -> None:
 def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     cfg = Config()
     iso = cfg.tools.exec.isolation
-    assert iso.enabled is False
+    assert cfg.tools.exec.allow_host_execution is False
+    assert iso.enabled is True
     assert iso.backend == "bubblewrap"
     assert iso.batch_session_idle_seconds == 600
     assert iso.max_containers == 5
@@ -191,6 +209,7 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
         },
         "tools": {
             "exec": {
+                "allowHostExecution": True,
                 "isolation": {
                     "enabled": True,
                     "batchSessionIdleSeconds": 123,
@@ -206,6 +225,7 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
         },
     }
     loaded = Config.model_validate(convert_keys(data))
+    assert loaded.tools.exec.allow_host_execution is True
     assert loaded.tools.exec.isolation.enabled is True
     assert loaded.tools.exec.isolation.batch_session_idle_seconds == 123
     assert loaded.tools.exec.isolation.max_containers == 7
@@ -214,6 +234,7 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
     assert loaded.memory.capture.min_confidence == 0.9
 
     dumped = convert_to_camel(loaded.model_dump())
+    assert dumped["tools"]["exec"]["allowHostExecution"] is True
     assert dumped["tools"]["exec"]["isolation"]["batchSessionIdleSeconds"] == 123
     assert dumped["tools"]["exec"]["isolation"]["maxContainers"] == 7
     assert dumped["agents"]["defaults"]["timingLogsEnabled"] is True
@@ -281,11 +302,13 @@ def test_strict_profile_enables_workspace_and_exec_isolation() -> None:
     cfg = Config()
     cfg.security.strict_profile = True
     cfg.tools.restrict_to_workspace = False
+    cfg.tools.exec.allow_host_execution = True
     cfg.tools.exec.isolation.enabled = False
     cfg.tools.exec.isolation.fail_closed = False
 
     restrict, exec_cfg = _resolve_security_tool_settings(cfg)
     assert restrict is True
+    assert exec_cfg.allow_host_execution is False
     assert exec_cfg.isolation.enabled is True
     assert exec_cfg.isolation.fail_closed is True
 
@@ -306,6 +329,66 @@ def test_validate_url_blocks_private_dns_targets(monkeypatch: pytest.MonkeyPatch
     blocked, msg = _validate_url("http://evil.test/path")
     assert blocked is False
     assert "private-network" in msg
+
+
+async def test_read_file_tool_blocks_prefix_bypass(tmp_path: Path) -> None:
+    allowed = tmp_path / "workspace"
+    allowed.mkdir()
+    outside = tmp_path / "workspace_evil.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    tool = ReadFileTool(allowed_dir=allowed)
+    result = await tool.execute(str(outside))
+    assert "outside allowed directory" in result
+
+
+def test_security_engine_redacts_sensitive_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = SecurityEngine(SecurityConfig(fail_mode="open"))
+    captured: dict[str, Any] = {}
+
+    def fake_warning(*args: Any, **kwargs: Any) -> None:
+        del kwargs
+        captured["args"] = args
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("nanobot.security.engine.logger.warning", fake_warning)
+    monkeypatch.setattr("nanobot.security.engine.decide_input", boom)
+
+    engine.check_input(
+        "hello",
+        context={
+            "api_key": "sk-abc123abc123abc123abc123",
+            "nested": {"authorization": "Bearer abc.def.ghi"},
+            "note": "token sk-proj-abc123abc123abc123abc123 is here",
+        },
+    )
+
+    logged_context = captured["args"][-1]
+    assert logged_context["api_key"] == "[REDACTED]"
+    assert logged_context["nested"]["authorization"] == "[REDACTED]"
+    assert "[REDACTED]" in logged_context["note"]
+
+
+def test_atomic_write_config_cleans_temp_file_on_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    cfg = Config()
+
+    def boom_replace(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("nanobot.config.loader.os.replace", boom_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _atomic_write_config(config_path, cfg)
+
+    assert list(tmp_path.glob(".config.json.tmp-*")) == []
 
 
 class _AllowPolicy(PolicyPort):

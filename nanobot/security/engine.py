@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from loguru import logger
 
 from nanobot.config.schema import SecurityConfig
@@ -9,6 +11,31 @@ from nanobot.core.models import SecurityDecision, SecurityResult, SecurityStage
 from nanobot.core.ports import SecurityPort
 from nanobot.security.normalize import normalize_text
 from nanobot.security.rules import decide_input, decide_output, decide_tool
+
+_SENSITIVE_CONTEXT_KEYS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "auth",
+    "credential",
+    "private_key",
+    "cookie",
+)
+
+_SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"sk-[a-zA-Z0-9]{20,}"),
+    re.compile(r"sk-proj-[a-zA-Z0-9\-_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"ghp_[a-zA-Z0-9]{20,}"),
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+    re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    ),
+)
+
+_MAX_LOG_VALUE_CHARS = 512
 
 
 class SecurityEngine(SecurityPort):
@@ -65,12 +92,13 @@ class SecurityEngine(SecurityPort):
         error: Exception,
         context: dict[str, object] | None,
     ) -> SecurityResult:
+        safe_context = self._sanitize_context(context)
         logger.warning(
             "security_error stage={} fail_mode={} error={} context={}",
             stage,
             self._config.fail_mode,
             error,
-            context or {},
+            safe_context,
         )
 
         if self._config.fail_mode == "open":
@@ -132,6 +160,7 @@ class SecurityEngine(SecurityPort):
     def _log(result: SecurityResult, context: dict[str, object] | None) -> None:
         if result.decision.action == "allow":
             return
+        safe_context = SecurityEngine._sanitize_context(context)
         logger.info(
             "security_decision stage={} action={} severity={} reason={} tags={} context={}",
             result.stage,
@@ -139,5 +168,46 @@ class SecurityEngine(SecurityPort):
             result.decision.severity,
             result.decision.reason,
             list(result.decision.tags),
-            context or {},
+            safe_context,
         )
+
+    @staticmethod
+    def _sanitize_context(context: dict[str, object] | None) -> dict[str, object]:
+        if not context:
+            return {}
+        return {
+            str(key): SecurityEngine._sanitize_value(value, parent_key=str(key))
+            for key, value in context.items()
+        }
+
+    @staticmethod
+    def _sanitize_value(value: object, *, parent_key: str = "") -> object:
+        lowered_key = parent_key.lower()
+        if any(token in lowered_key for token in _SENSITIVE_CONTEXT_KEYS):
+            return "[REDACTED]"
+
+        if isinstance(value, dict):
+            return {
+                str(k): SecurityEngine._sanitize_value(v, parent_key=str(k))
+                for k, v in value.items()
+            }
+
+        if isinstance(value, list):
+            return [SecurityEngine._sanitize_value(item, parent_key=parent_key) for item in value]
+
+        if isinstance(value, tuple):
+            return tuple(SecurityEngine._sanitize_value(item, parent_key=parent_key) for item in value)
+
+        if isinstance(value, str):
+            return SecurityEngine._sanitize_string(value)
+
+        return value
+
+    @staticmethod
+    def _sanitize_string(text: str) -> str:
+        sanitized = text
+        for pattern in _SENSITIVE_VALUE_PATTERNS:
+            sanitized = pattern.sub("[REDACTED]", sanitized)
+        if len(sanitized) > _MAX_LOG_VALUE_CHARS:
+            return sanitized[:_MAX_LOG_VALUE_CHARS] + "...(truncated)"
+        return sanitized

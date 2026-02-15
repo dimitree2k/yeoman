@@ -365,7 +365,7 @@ class MemoryConfig(BaseModel):
 class ExecIsolationConfig(BaseModel):
     """Container isolation configuration for exec tool."""
 
-    enabled: bool = False
+    enabled: bool = True
     backend: Literal["bubblewrap"] = "bubblewrap"
     fail_closed: bool = True
     batch_session_idle_seconds: int = 600
@@ -379,6 +379,7 @@ class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
 
     timeout: int = 60
+    allow_host_execution: bool = False
     isolation: ExecIsolationConfig = Field(default_factory=ExecIsolationConfig)
 
 
