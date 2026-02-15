@@ -3,6 +3,7 @@
 from nanobot.core.intents import (
     PersistSessionIntent,
     QueueMemoryNotesCaptureIntent,
+    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -23,6 +24,7 @@ __all__ = [
     "PersistSessionIntent",
     "PolicyDecision",
     "QueueMemoryNotesCaptureIntent",
+    "RecordManualMemoryIntent",
     "RecordMetricIntent",
     "SendOutboundIntent",
     "SetTypingIntent",

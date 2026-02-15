@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import time
+import unicodedata
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -13,6 +15,7 @@ from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
     QueueMemoryNotesCaptureIntent,
+    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -23,6 +26,36 @@ from nanobot.media.tts import TTSSynthesizer, strip_markdown_for_tts, truncate_f
 
 if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
+
+_IDEA_MARKERS = ("[idea]", "#idea", "idea:", "inbox idea")
+_BACKLOG_MARKERS = ("[backlog]", "#backlog", "backlog:")
+_IDEA_PREFIX_WORDS = {
+    "idea",
+    "idee",
+    "ideia",
+    "идея",
+    "아이디어",
+    "アイデア",
+    "想法",
+}
+_IDEA_PREFIX_PHRASES = {
+    "new idea",
+    "inbox idea",
+}
+_BACKLOG_PREFIX_WORDS = {
+    "backlog",
+    "todo",
+    "aufgabe",
+    "aufgaben",
+    "tache",
+    "tarea",
+    "задача",
+    "任务",
+    "할일",
+}
+_BACKLOG_PREFIX_PHRASES = {
+    "to do",
+}
 
 
 class Orchestrator:
@@ -67,6 +100,75 @@ class Orchestrator:
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
+
+    @staticmethod
+    def _fold_accents(text: str) -> str:
+        return "".join(
+            ch
+            for ch in unicodedata.normalize("NFKD", text)
+            if not unicodedata.combining(ch)
+        )
+
+    @classmethod
+    def _capture_kind_and_body(cls, content: str) -> tuple[str, str] | None:
+        """Classify explicit idea/backlog capture intent and return normalized body."""
+        text = str(content or "").strip()
+        if not text:
+            return None
+
+        lowered = text.lower()
+        for marker in _BACKLOG_MARKERS:
+            if lowered.startswith(marker):
+                body = text[len(marker) :].lstrip(" \t:;.,-")
+                return "backlog", (body or text)
+        for marker in _IDEA_MARKERS:
+            if lowered.startswith(marker):
+                body = text[len(marker) :].lstrip(" \t:;.,-")
+                return "idea", (body or text)
+
+        tokens = list(re.finditer(r"[^\W_]+", text, flags=re.UNICODE))
+        if not tokens:
+            return None
+
+        first = cls._fold_accents(tokens[0].group(0)).lower()
+        first_two = first
+        first_three = first
+        if len(tokens) >= 2:
+            second = cls._fold_accents(tokens[1].group(0)).lower()
+            first_two = f"{first} {second}"
+            first_three = first_two
+        if len(tokens) >= 3:
+            third = cls._fold_accents(tokens[2].group(0)).lower()
+            first_three = f"{first_two} {third}"
+
+        cut_at = tokens[0].end()
+        kind: str | None = None
+        if (
+            first in _BACKLOG_PREFIX_WORDS
+            or first_two in _BACKLOG_PREFIX_PHRASES
+            or first_three in _BACKLOG_PREFIX_PHRASES
+        ):
+            kind = "backlog"
+            if first_three in _BACKLOG_PREFIX_PHRASES and len(tokens) >= 3:
+                cut_at = tokens[2].end()
+            elif first_two in _BACKLOG_PREFIX_PHRASES and len(tokens) >= 2:
+                cut_at = tokens[1].end()
+        elif (
+            first in _IDEA_PREFIX_WORDS
+            or first_two in _IDEA_PREFIX_PHRASES
+            or first_three in _IDEA_PREFIX_PHRASES
+        ):
+            kind = "idea"
+            if first_three in _IDEA_PREFIX_PHRASES and len(tokens) >= 3:
+                cut_at = tokens[2].end()
+            elif first_two in _IDEA_PREFIX_PHRASES and len(tokens) >= 2:
+                cut_at = tokens[1].end()
+
+        if kind is None:
+            return None
+
+        body = text[cut_at:].lstrip(" \t:;.,-")
+        return kind, (body or text)
 
     async def handle(self, event: InboundEvent) -> list[OrchestratorIntent]:
         """Process one inbound event and return executable intents."""
@@ -156,6 +258,89 @@ class Orchestrator:
         decision = self._policy.evaluate(event)
         notes_capture_allowed = bool(decision.notes_enabled)
         notes_mode = decision.notes_mode
+
+        capture_signal = None
+        if event.channel == "whatsapp":
+            capture_signal = self._capture_kind_and_body(event.content)
+        if decision.accept_message and capture_signal is not None:
+            capture_kind, capture_body = capture_signal
+            canonical = f"[{capture_kind.upper()}] {capture_body}".strip()
+
+            if self._security is not None:
+                security_input = self._security.check_input(
+                    canonical,
+                    context={
+                        "channel": event.channel,
+                        "chat_id": event.chat_id,
+                        "sender_id": event.sender_id,
+                        "message_id": event.message_id or "",
+                        "path": "idea_capture",
+                    },
+                )
+                if security_input.decision.action == "block":
+                    intents.append(
+                        RecordMetricIntent(
+                            name="security_input_blocked",
+                            labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                        )
+                    )
+                    intents.append(
+                        RecordMetricIntent(
+                            name="idea_capture_dropped_security",
+                            labels=(("channel", event.channel), ("kind", capture_kind)),
+                        )
+                    )
+                    return intents
+
+            intents.append(
+                RecordManualMemoryIntent(
+                    channel=event.channel,
+                    chat_id=event.chat_id,
+                    sender_id=event.sender_id,
+                    content=canonical,
+                    entry_kind="backlog" if capture_kind == "backlog" else "idea",
+                )
+            )
+            intents.append(
+                RecordMetricIntent(
+                    name="idea_capture_saved",
+                    labels=(("channel", event.channel), ("kind", capture_kind)),
+                )
+            )
+            if event.message_id:
+                emoji = "📌" if capture_kind == "backlog" else "💡"
+                intents.append(
+                    SendOutboundIntent(
+                        event=OutboundEvent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            content="",
+                            metadata={
+                                "reaction_only": True,
+                                "reaction": {
+                                    "message_id": event.message_id,
+                                    "emoji": emoji,
+                                    "participant_jid": event.participant,
+                                    "from_me": False,
+                                },
+                            },
+                        )
+                    )
+                )
+                intents.append(
+                    RecordMetricIntent(
+                        name="idea_capture_reacted",
+                        labels=(("channel", event.channel), ("kind", capture_kind)),
+                    )
+                )
+            else:
+                intents.append(
+                    RecordMetricIntent(
+                        name="idea_capture_no_message_id",
+                        labels=(("channel", event.channel), ("kind", capture_kind)),
+                    )
+                )
+            return intents
 
         if not decision.accept_message:
             if notes_capture_allowed and decision.notes_allow_blocked_senders:

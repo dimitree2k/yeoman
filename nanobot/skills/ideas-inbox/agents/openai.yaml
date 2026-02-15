@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ideas Inbox"
+  short_description: "Capture, review, and prioritize ideas from memory"
+  default_prompt: "Capture this as an idea, then prepare an evening review shortlist."

@@ -321,6 +321,30 @@ class WhatsAppChannel(BaseChannel):
 
         await self._stop_typing(msg.chat_id)
 
+        reaction = msg.metadata.get("reaction") if isinstance(msg.metadata, dict) else None
+        if isinstance(reaction, dict):
+            reaction_message_id = str(reaction.get("message_id") or "").strip()
+            reaction_emoji = str(reaction.get("emoji") or "").strip()
+            if reaction_message_id and reaction_emoji:
+                payload: dict[str, object] = {
+                    "chatJid": msg.chat_id,
+                    "messageId": reaction_message_id,
+                    "emoji": reaction_emoji,
+                }
+                participant = str(reaction.get("participant_jid") or "").strip()
+                if participant:
+                    payload["participantJid"] = participant
+                if "from_me" in reaction:
+                    payload["fromMe"] = bool(reaction.get("from_me"))
+                await self._send_command_with_retry(
+                    "react",
+                    payload,
+                    timeout_seconds=12.0,
+                    max_attempts=SEND_MAX_ATTEMPTS,
+                )
+                if bool(msg.metadata.get("reaction_only", False)):
+                    return
+
         reply_to = str(msg.reply_to or "").strip() or None
         text = _markdown_to_whatsapp(msg.content)
 
@@ -1042,6 +1066,11 @@ class WhatsAppChannel(BaseChannel):
         if command_type == "presence_update":
             summary["state"] = payload.get("state")
             summary["chat_jid"] = payload.get("chatJid")
+            return summary
+        if command_type == "react":
+            summary["chat_jid"] = payload.get("chatJid")
+            summary["message_id"] = payload.get("messageId")
+            summary["emoji"] = payload.get("emoji")
             return summary
         return summary
 

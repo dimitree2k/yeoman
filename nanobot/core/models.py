@@ -115,3 +115,4 @@ class OutboundEvent:
     content: str
     reply_to: str | None = None
     media: tuple[str, ...] = ()
+    metadata: dict[str, object] = field(default_factory=dict)

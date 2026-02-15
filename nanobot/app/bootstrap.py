@@ -21,6 +21,7 @@ from nanobot.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
     QueueMemoryNotesCaptureIntent,
+    RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
     SetTypingIntent,
@@ -144,6 +145,7 @@ class OrchestratorService:
                             content=intent.event.content,
                             reply_to=intent.event.reply_to,
                             media=list(intent.event.media),
+                            metadata=dict(intent.event.metadata or {}),
                         )
                     )
                 case PersistSessionIntent():
@@ -160,6 +162,19 @@ class OrchestratorService:
                         mode=intent.mode,
                         batch_interval_seconds=intent.batch_interval_seconds,
                         batch_max_messages=intent.batch_max_messages,
+                    )
+                case RecordManualMemoryIntent():
+                    mapped_kind = "decision" if intent.entry_kind == "backlog" else "episodic"
+                    salience = 0.9 if intent.entry_kind == "backlog" else 0.8
+                    self._memory.record_manual(
+                        channel=intent.channel,
+                        chat_id=intent.chat_id,
+                        sender_id=intent.sender_id,
+                        scope_type="chat",
+                        kind=mapped_kind,
+                        text=intent.content,
+                        importance=salience,
+                        confidence=1.0,
                     )
                 case RecordMetricIntent():
                     self._telemetry.incr(intent.name, intent.value, intent.labels)
