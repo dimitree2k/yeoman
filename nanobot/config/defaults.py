@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 DEFAULT_ASSISTANT_MODEL = "anthropic/claude-opus-4-5"
+DEFAULT_SUBAGENT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_ASR_MODEL = "whisper-large-v3"
 DEFAULT_TTS_MODEL = "tts-1"
@@ -16,6 +17,13 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "model": DEFAULT_ASSISTANT_MODEL,
         "max_tokens": 8192,
         "temperature": 0.7,
+    },
+    "subagent_default": {
+        "kind": "chat",
+        "model": DEFAULT_SUBAGENT_MODEL,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+        "timeout_ms": 60000,
     },
     "vision_whatsapp_cheap": {
         "kind": "vision",
@@ -133,7 +141,7 @@ DEFAULT_SECURITY: dict[str, Any] = {
         "tool": True,
         "output": True,
     },
-    "block_user_message": "Request blocked for security reasons.",
+    "block_user_message": "😂",
     "strict_profile": True,
     "redact_placeholder": "[REDACTED]",
 }
