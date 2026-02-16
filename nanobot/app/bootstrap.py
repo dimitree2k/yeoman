@@ -261,6 +261,16 @@ def build_gateway_runtime(
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    # Create policy adapter first so we can use it for owner_alert_resolver
+    policy_adapter = EnginePolicyAdapter(
+        engine=policy_engine,
+        known_tools=set(),  # Will be updated after responder is created
+        policy_path=policy_path,
+        session_manager=session_manager,
+        workspace=workspace,
+        memory_state_dir=memory_state_dir,
+    )
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -275,17 +285,13 @@ def build_gateway_runtime(
         telemetry=telemetry,
         security=security,
         cron_service=cron,
+        owner_alert_resolver=policy_adapter.owner_recipients,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
-    policy_adapter = EnginePolicyAdapter(
-        engine=policy_engine,
-        known_tools=set(responder.tool_names),
-        policy_path=policy_path,
-        session_manager=session_manager,
-        workspace=workspace,
-        memory_state_dir=memory_state_dir,
-    )
+
+    # Update policy adapter with actual tool names
+    policy_adapter._known_tools = set(responder.tool_names)
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
     if admin_command_handler is None:
         admin_command_handler = getattr(policy_adapter, "maybe_handle_admin_command", None)

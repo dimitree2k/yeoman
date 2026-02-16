@@ -50,6 +50,7 @@ class LLMResponder(ResponderPort):
         memory_service: "MemoryService | None" = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
+        owner_alert_resolver: "callable[[str], list[str]] | None" = None,
     ) -> None:
         from nanobot.config.schema import ExecToolConfig
 
@@ -64,6 +65,8 @@ class LLMResponder(ResponderPort):
         self.memory = memory_service
         self.telemetry = telemetry
         self.security = security
+        self.owner_alert_resolver = owner_alert_resolver
+        self._seen_chats: set[str] = set()
 
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
@@ -289,6 +292,34 @@ class LLMResponder(ResponderPort):
 
         return final_content or "I've completed processing but have no response to give."
 
+    async def _notify_new_chat(self, channel: str, chat_id: str) -> None:
+        """Notify owner when Nano sees a new chat for the first time."""
+        if self.owner_alert_resolver is None:
+            return
+
+        full_key = f"{channel}:{chat_id}"
+        if full_key in self._seen_chats:
+            return
+
+        self._seen_chats.add(full_key)
+        owners = self.owner_alert_resolver(channel)
+        if not owners:
+            return
+
+        is_group = chat_id.endswith("@g.us")
+        chat_type = "group" if is_group else "chat"
+        message = f"🔔 Nano was added to a new WhatsApp {chat_type}: `{chat_id}`"
+
+        for owner in owners:
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=owner,
+                    content=message,
+                )
+            )
+            logger.info("notified owner {} about new chat {}", owner, chat_id)
+
     async def _generate(
         self,
         *,
@@ -302,7 +333,20 @@ class LLMResponder(ResponderPort):
         allowed_tools: set[str],
         persona_text: str | None,
     ) -> str:
+        # Check for new chat and notify owner
+        await self._notify_new_chat(channel, chat_id)
+
         session = self.sessions.get_or_create(session_key)
+
+        # Save session immediately on first message (even if no response yet)
+        if not session.messages:
+            session.add_message("user", content)
+            self.sessions.save(session)
+            # Track that we've already added the user message to avoid duplication
+            _user_message_already_added = True
+        else:
+            _user_message_already_added = False
+
         self._set_tool_context(channel=channel, chat_id=chat_id, session_key=session_key)
 
         if self.memory is not None:
@@ -401,7 +445,9 @@ class LLMResponder(ResponderPort):
             except Exception as e:
                 logger.warning("memory wal post-write failed: {}", e)
 
-        session.add_message("user", content)
+        # Only add messages if they weren't already added (for new sessions)
+        if not _user_message_already_added:
+            session.add_message("user", content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         return final_content
