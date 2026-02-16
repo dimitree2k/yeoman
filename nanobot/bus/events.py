@@ -35,3 +35,11 @@ class OutboundMessage:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ReactionMessage:
+    """Reaction to add to a specific message."""
+
+    channel: str
+    chat_id: str
+    message_id: str
+    emoji: str

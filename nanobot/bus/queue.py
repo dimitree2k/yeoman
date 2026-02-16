@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 
 
 class MessageBus:
@@ -16,13 +16,26 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self, *, inbound_maxsize: int = 0, outbound_maxsize: int = 0):
+    def __init__(
+        self, *, inbound_maxsize: int = 0, outbound_maxsize: int = 0, reaction_maxsize: int = 0
+    ):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=max(0, inbound_maxsize))
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(maxsize=max(0, outbound_maxsize))
-        self._outbound_subscribers: dict[str, list[Callable[[OutboundMessage], Awaitable[None]]]] = {}
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(
+            maxsize=max(0, outbound_maxsize)
+        )
+        self.reaction: asyncio.Queue[ReactionMessage] = asyncio.Queue(
+            maxsize=max(0, reaction_maxsize)
+        )
+        self._outbound_subscribers: dict[
+            str, list[Callable[[OutboundMessage], Awaitable[None]]]
+        ] = {}
+        self._reaction_subscribers: dict[
+            str, list[Callable[[ReactionMessage], Awaitable[None]]]
+        ] = {}
         self._running = False
         self._inbound_dropped = 0
         self._outbound_dropped = 0
+        self._reaction_dropped = 0
 
     async def _put_bounded(self, queue: asyncio.Queue, msg: object, channel: str) -> None:
         if queue.maxsize > 0 and queue.full():
@@ -56,10 +69,24 @@ class MessageBus:
         """Consume the next outbound message (blocks until available)."""
         return await self.outbound.get()
 
+    async def publish_reaction(self, msg: ReactionMessage) -> None:
+        """Publish a reaction from the agent to channels."""
+        await self._put_bounded(self.reaction, msg, "reaction")
+
+    async def consume_reaction(self) -> ReactionMessage:
+        """Consume the next reaction message (blocks until available)."""
+        return await self.reaction.get()
+
+    def subscribe_reaction(
+        self, channel: str, callback: Callable[[ReactionMessage], Awaitable[None]]
+    ) -> None:
+        """Subscribe to reaction messages for a specific channel."""
+        if channel not in self._reaction_subscribers:
+            self._reaction_subscribers[channel] = []
+        self._reaction_subscribers[channel].append(callback)
+
     def subscribe_outbound(
-        self,
-        channel: str,
-        callback: Callable[[OutboundMessage], Awaitable[None]]
+        self, channel: str, callback: Callable[[OutboundMessage], Awaitable[None]]
     ) -> None:
         """Subscribe to outbound messages for a specific channel."""
         if channel not in self._outbound_subscribers:
@@ -84,6 +111,21 @@ class MessageBus:
             except asyncio.TimeoutError:
                 continue
 
+    async def dispatch_reactions(self) -> None:
+        """Dispatch reaction messages to subscribed channels."""
+        self._running = True
+        while self._running:
+            try:
+                msg = await asyncio.wait_for(self.reaction.get(), timeout=1.0)
+                subscribers = self._reaction_subscribers.get(msg.channel, [])
+                for callback in subscribers:
+                    try:
+                        await callback(msg)
+                    except Exception as e:
+                        logger.error(f"Error dispatching reaction to {msg.channel}: {e}")
+            except asyncio.TimeoutError:
+                continue
+
     def stop(self) -> None:
         """Stop the dispatcher loop."""
         self._running = False
@@ -99,6 +141,11 @@ class MessageBus:
         return self.outbound.qsize()
 
     @property
+    def reaction_size(self) -> int:
+        """Number of pending reaction messages."""
+        return self.reaction.qsize()
+
+    @property
     def inbound_dropped(self) -> int:
         """Number of dropped inbound messages due to queue overflow."""
         return self._inbound_dropped
@@ -107,3 +154,8 @@ class MessageBus:
     def outbound_dropped(self) -> int:
         """Number of dropped outbound messages due to queue overflow."""
         return self._outbound_dropped
+
+    @property
+    def reaction_dropped(self) -> int:
+        """Number of dropped reaction messages due to queue overflow."""
+        return self._reaction_dropped
