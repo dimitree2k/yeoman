@@ -41,6 +41,7 @@ class LLMResponder(ResponderPort):
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        subagent_model: str | None = None,
         max_iterations: int = 20,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
@@ -67,6 +68,8 @@ class LLMResponder(ResponderPort):
         self.security = security
         self.owner_alert_resolver = owner_alert_resolver
         self._seen_chats: set[str] = set()
+        self._seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
+        self._load_seen_chats()
 
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
@@ -79,16 +82,37 @@ class LLMResponder(ResponderPort):
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()  # type: ignore[no-untyped-call]  # boundary-any
+        subagent_model_to_use = subagent_model or self.model
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
             bus=bus,
-            model=self.model,
+            model=subagent_model_to_use,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
         )
         self._register_default_tools()
+
+    def _load_seen_chats(self) -> None:
+        """Load seen chats from persistent storage."""
+        try:
+            if self._seen_chats_path.exists():
+                data = json.loads(self._seen_chats_path.read_text())
+                self._seen_chats = set(data.get("chats", []))
+                logger.info("loaded {} seen chats from {}", len(self._seen_chats), self._seen_chats_path)
+        except Exception as e:
+            logger.warning("failed to load seen chats: {}", e)
+            self._seen_chats = set()
+
+    def _save_seen_chats(self) -> None:
+        """Save seen chats to persistent storage."""
+        try:
+            self._seen_chats_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {"chats": list(self._seen_chats)}
+            self._seen_chats_path.write_text(json.dumps(data))
+        except Exception as e:
+            logger.warning("failed to save seen chats: {}", e)
 
     @property
     def tool_names(self) -> frozenset[str]:
@@ -302,6 +326,7 @@ class LLMResponder(ResponderPort):
             return
 
         self._seen_chats.add(full_key)
+        self._save_seen_chats()
         owners = self.owner_alert_resolver(channel)
         if not owners:
             return

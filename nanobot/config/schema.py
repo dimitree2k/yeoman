@@ -179,12 +179,14 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
     timing_logs_enabled: bool = False
+    subagent_model: str | None = Field(default=None, alias="subagentModel")
 
 
 class AgentsConfig(BaseModel):
@@ -204,7 +206,7 @@ class ProviderConfig(BaseModel):
 class ElevenLabsProviderConfig(ProviderConfig):
     """ElevenLabs provider config with optional TTS defaults."""
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
 
     voice_id: str | None = Field(default=None, alias="voiceId")
     model_id: str | None = Field(default=None, alias="modelId")
@@ -419,6 +421,7 @@ class BusConfig(BaseModel):
 
 class Config(BaseSettings):
     """Root configuration for nanobot."""
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
 
     config_version: int = 2
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
@@ -482,6 +485,3 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
 
-    class Config:
-        env_prefix = "NANOBOT_"
-        env_nested_delimiter = "__"
