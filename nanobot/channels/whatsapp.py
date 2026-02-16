@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import OutboundMessage, ReactionMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
@@ -432,6 +432,30 @@ class WhatsAppChannel(BaseChannel):
         """Public typing API used by policy-aware orchestration."""
         await self._stop_typing(chat_id)
 
+    async def send_reaction(self, msg: ReactionMessage) -> None:
+        """Send a reaction emoji to a specific message via WhatsApp."""
+        if not self._connected:
+            connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
+            if not connected:
+                raise RuntimeError("WhatsApp bridge not connected")
+
+        if not msg.message_id:
+            logger.warning("Cannot send reaction: missing message_id")
+            return
+
+        payload: dict[str, object] = {
+            "chatJid": msg.chat_id,
+            "messageId": msg.message_id,
+            "emoji": msg.emoji,
+        }
+
+        await self._send_command_with_retry(
+            "react",
+            payload,
+            timeout_seconds=20.0,
+            max_attempts=SEND_MAX_ATTEMPTS,
+        )
+
     async def _verify_bridge_health(self, token: str, timeout_seconds: float) -> None:
         response = await self._send_command(
             "health",
@@ -822,7 +846,9 @@ class WhatsAppChannel(BaseChannel):
             try:
                 transcript = await self._asr_transcriber.transcribe(validated_path, profile)
             except Exception as e:
-                logger.warning("WhatsApp audio transcription failed {}: {}", e.__class__.__name__, e)
+                logger.warning(
+                    "WhatsApp audio transcription failed {}: {}", e.__class__.__name__, e
+                )
 
             if not transcript:
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
@@ -1014,8 +1040,7 @@ class WhatsAppChannel(BaseChannel):
         max_payload_bytes = max(1, int(self.config.max_payload_bytes))
         if envelope_bytes > max_payload_bytes:
             raise ValueError(
-                "Bridge command payload too large: "
-                f"{envelope_bytes} > {max_payload_bytes} bytes"
+                f"Bridge command payload too large: {envelope_bytes} > {max_payload_bytes} bytes"
             )
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future

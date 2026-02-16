@@ -49,6 +49,7 @@ class ChannelManager:
         self.provider_factory = provider_factory
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._reaction_dispatch_task: asyncio.Task | None = None
 
         self._init_channels()
 
@@ -59,6 +60,7 @@ class ChannelManager:
         if self.config.channels.telegram.enabled:
             try:
                 from nanobot.channels.telegram import TelegramChannel
+
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
                     self.bus,
@@ -73,6 +75,7 @@ class ChannelManager:
         if self.config.channels.whatsapp.enabled:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
+
                 openai_compat = resolve_openai_compatible_credentials(self.config)
                 self.channels["whatsapp"] = WhatsAppChannel(
                     self.config.channels.whatsapp,
@@ -94,9 +97,8 @@ class ChannelManager:
         if self.config.channels.discord.enabled:
             try:
                 from nanobot.channels.discord import DiscordChannel
-                self.channels["discord"] = DiscordChannel(
-                    self.config.channels.discord, self.bus
-                )
+
+                self.channels["discord"] = DiscordChannel(self.config.channels.discord, self.bus)
                 logger.info("Discord channel enabled")
             except ImportError as e:
                 logger.warning(f"Discord channel not available: {e}")
@@ -105,9 +107,8 @@ class ChannelManager:
         if self.config.channels.feishu.enabled:
             try:
                 from nanobot.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
-                )
+
+                self.channels["feishu"] = FeishuChannel(self.config.channels.feishu, self.bus)
                 logger.info("Feishu channel enabled")
             except ImportError as e:
                 logger.warning(f"Feishu channel not available: {e}")
@@ -125,8 +126,9 @@ class ChannelManager:
             logger.warning("No channels enabled")
             return
 
-        # Start outbound dispatcher
+        # Start outbound and reaction dispatchers
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
+        self._reaction_dispatch_task = asyncio.create_task(self._dispatch_reactions())
 
         # Start channels
         tasks = []
@@ -141,11 +143,17 @@ class ChannelManager:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
 
-        # Stop dispatcher
+        # Stop dispatchers
         if self._dispatch_task:
             self._dispatch_task.cancel()
             try:
                 await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+        if self._reaction_dispatch_task:
+            self._reaction_dispatch_task.cancel()
+            try:
+                await self._reaction_dispatch_task
             except asyncio.CancelledError:
                 pass
 
@@ -163,10 +171,7 @@ class ChannelManager:
 
         while True:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_outbound(),
-                    timeout=1.0
-                )
+                msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
 
                 channel = self.channels.get(msg.channel)
                 if channel:
@@ -189,6 +194,40 @@ class ChannelManager:
                         logger.error(f"Error sending to {msg.channel}: {e}")
                 else:
                     logger.warning(f"Unknown channel: {msg.channel}")
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    async def _dispatch_reactions(self) -> None:
+        """Dispatch reaction messages to the appropriate channel."""
+        logger.info("Reaction dispatcher started")
+
+        while True:
+            try:
+                msg = await asyncio.wait_for(self.bus.consume_reaction(), timeout=1.0)
+
+                channel = self.channels.get(msg.channel)
+                if channel:
+                    try:
+                        logger.debug(
+                            "Reaction dispatch channel={} chat={} message_id={} emoji={}",
+                            msg.channel,
+                            msg.chat_id,
+                            msg.message_id,
+                            msg.emoji,
+                        )
+                        await channel.send_reaction(msg)
+                        logger.debug(
+                            "Reaction dispatch success channel={} chat={}",
+                            msg.channel,
+                            msg.chat_id,
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending reaction to {msg.channel}: {e}")
+                else:
+                    logger.warning(f"Unknown channel for reaction: {msg.channel}")
 
             except asyncio.TimeoutError:
                 continue
@@ -224,10 +263,7 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {
-                "enabled": True,
-                "running": channel.is_running
-            }
+            name: {"enabled": True, "running": channel.is_running}
             for name, channel in self.channels.items()
         }
 

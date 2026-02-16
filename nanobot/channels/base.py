@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from nanobot.bus.queue import MessageBus
 
 
@@ -56,6 +56,20 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def send_reaction(self, msg: ReactionMessage) -> None:
+        """
+        Send a reaction emoji to a specific message.
+
+        Args:
+            msg: The reaction message containing emoji and target message info.
+
+        Default implementation does nothing. Channels that support reactions
+        (like WhatsApp) should override this method.
+        """
+        from loguru import logger
+
+        logger.warning(f"Channel {self.name} does not support reactions")
+
     def is_allowed(self, sender_id: str) -> bool:
         """
         Check if a sender is allowed to use this bot.
@@ -76,7 +90,7 @@ class BaseChannel(ABC):
         chat_id: str,
         content: str,
         media: list[str] | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -96,7 +110,7 @@ class BaseChannel(ABC):
             chat_id=str(chat_id),
             content=content,
             media=media or [],
-            metadata=metadata or {}
+            metadata=metadata or {},
         )
 
         await self.bus.publish_inbound(msg)
