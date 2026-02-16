@@ -14,7 +14,7 @@ from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from nanobot.adapters.responder_llm import LLMResponder
 from nanobot.adapters.telemetry import InMemoryTelemetry
 from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.manager import ChannelManager
 from nanobot.core.intents import (
@@ -24,6 +24,7 @@ from nanobot.core.intents import (
     RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
+    SendReactionIntent,
     SetTypingIntent,
 )
 from nanobot.core.models import InboundEvent
@@ -120,7 +121,12 @@ class OrchestratorService:
                 intents = await self._orchestrator.handle(event)
                 await self._dispatch_intents(intents)
             except Exception as e:
-                logger.error("vnext orchestrator failure channel={} chat={}: {}", event.channel, event.chat_id, e)
+                logger.error(
+                    "vnext orchestrator failure channel={} chat={}: {}",
+                    event.channel,
+                    event.chat_id,
+                    e,
+                )
                 await self._bus.publish_outbound(
                     OutboundMessage(
                         channel=event.channel,
@@ -146,6 +152,15 @@ class OrchestratorService:
                             reply_to=intent.event.reply_to,
                             media=list(intent.event.media),
                             metadata=dict(intent.event.metadata or {}),
+                        )
+                    )
+                case SendReactionIntent():
+                    await self._bus.publish_reaction(
+                        ReactionMessage(
+                            channel=intent.channel,
+                            chat_id=intent.chat_id,
+                            message_id=intent.message_id,
+                            emoji=intent.emoji,
                         )
                     )
                 case PersistSessionIntent():
@@ -276,6 +291,7 @@ def build_gateway_runtime(
         workspace=workspace,
         bus=bus,
         model=assistant_model,
+        subagent_model=config.agents.defaults.subagent_model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=exec_config,

@@ -18,11 +18,17 @@ from nanobot.core.intents import (
     RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
+    SendReactionIntent,
     SetTypingIntent,
 )
 from nanobot.core.models import ArchivedMessage, InboundEvent, OutboundEvent, PolicyDecision
 from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
-from nanobot.media.tts import TTSSynthesizer, strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
+from nanobot.media.tts import (
+    TTSSynthesizer,
+    strip_markdown_for_tts,
+    truncate_for_voice,
+    write_tts_audio_file,
+)
 
 if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
@@ -72,8 +78,9 @@ class Orchestrator:
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
         security: SecurityPort | None = None,
-        security_block_message: str = "Request blocked for security reasons.",
-        policy_admin_handler: Callable[[InboundEvent], AdminCommandResult | str | None] | None = None,
+        security_block_message: str = "😂",
+        policy_admin_handler: Callable[[InboundEvent], AdminCommandResult | str | None]
+        | None = None,
         model_router: "ModelRouter | None" = None,
         tts: TTSSynthesizer | None = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
@@ -227,7 +234,11 @@ class Orchestrator:
                         )
                     )
                 elif admin_result.intercepts_normal_flow:
-                    metric_name = "admin_command_handled" if admin_result.status == "handled" else "admin_command_unknown"
+                    metric_name = (
+                        "admin_command_handled"
+                        if admin_result.status == "handled"
+                        else "admin_command_unknown"
+                    )
                     intents.append(
                         RecordMetricIntent(
                             name=metric_name,
@@ -359,7 +370,10 @@ class Orchestrator:
                         intents.append(
                             RecordMetricIntent(
                                 name="security_input_blocked",
-                                labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                                labels=(
+                                    ("channel", event.channel),
+                                    ("reason", security_input.decision.reason),
+                                ),
                             )
                         )
                         intents.append(
@@ -439,7 +453,10 @@ class Orchestrator:
                         intents.append(
                             RecordMetricIntent(
                                 name="security_input_blocked",
-                                labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                                labels=(
+                                    ("channel", event.channel),
+                                    ("reason", security_input.decision.reason),
+                                ),
                             )
                         )
                         intents.append(
@@ -510,16 +527,18 @@ class Orchestrator:
                 intents.append(
                     RecordMetricIntent(
                         name="security_input_blocked",
-                        labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                        labels=(
+                            ("channel", event.channel),
+                            ("reason", security_input.decision.reason),
+                        ),
                     )
                 )
                 intents.append(
-                    SendOutboundIntent(
-                        event=OutboundEvent(
-                            channel=event.channel,
-                            chat_id=event.chat_id,
-                            content=security_input.sanitized_text or self._security_block_message,
-                        )
+                    SendReactionIntent(
+                        channel=event.channel,
+                        chat_id=event.chat_id,
+                        message_id=event.message_id or "",
+                        emoji=self._security_block_message,
                     )
                 )
                 return intents
@@ -572,7 +591,10 @@ class Orchestrator:
                     intents.append(
                         RecordMetricIntent(
                             name="security_output_blocked",
-                            labels=(("channel", event.channel), ("reason", output_result.decision.reason)),
+                            labels=(
+                                ("channel", event.channel),
+                                ("reason", output_result.decision.reason),
+                            ),
                         )
                     )
 
@@ -763,9 +785,7 @@ class Orchestrator:
         self._recent_owner_alert_keys[key] = now + float(self._owner_alert_cooldown_seconds)
 
         content = (
-            "⚠️ Nano diagnostic\n"
-            f"voice fallback in {channel}:{chat_id}\n"
-            f"reason={reason_compact}"
+            f"⚠️ Nano diagnostic\nvoice fallback in {channel}:{chat_id}\nreason={reason_compact}"
         )
         for target in sorted(set(normalized_targets)):
             intents.append(
@@ -803,7 +823,9 @@ class Orchestrator:
             return False
         now = time.monotonic()
         if now >= self._next_dedupe_cleanup_at:
-            expired = [k for k, expires_at in self._recent_message_keys.items() if expires_at <= now]
+            expired = [
+                k for k, expires_at in self._recent_message_keys.items() if expires_at <= now
+            ]
             for expired_key in expired:
                 self._recent_message_keys.pop(expired_key, None)
             self._next_dedupe_cleanup_at = now + 30.0
@@ -867,7 +889,9 @@ class Orchestrator:
         raw["reply_context_source"] = "archive"
         return replace(event, reply_to_text=text, raw_metadata=raw), True, True
 
-    def _build_reply_context_window(self, *, event: InboundEvent, anchor: ArchivedMessage) -> list[str]:
+    def _build_reply_context_window(
+        self, *, event: InboundEvent, anchor: ArchivedMessage
+    ) -> list[str]:
         if self._reply_archive is None:
             return []
         if not anchor.message_id:
