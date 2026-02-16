@@ -6,6 +6,7 @@ from nanobot.core.intents import (
     RecordManualMemoryIntent,
     RecordMetricIntent,
     SendOutboundIntent,
+    SendReactionIntent,
     SetTypingIntent,
 )
 from nanobot.core.models import (
@@ -27,5 +28,6 @@ __all__ = [
     "RecordManualMemoryIntent",
     "RecordMetricIntent",
     "SendOutboundIntent",
+    "SendReactionIntent",
     "SetTypingIntent",
 ]

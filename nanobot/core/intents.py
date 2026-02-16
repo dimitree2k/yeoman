@@ -68,9 +68,20 @@ class RecordMetricIntent:
     labels: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SendReactionIntent:
+    """Deliver one reaction emoji to a specific message."""
+
+    channel: str
+    chat_id: str
+    message_id: str
+    emoji: str
+
+
 type OrchestratorIntent = (
     SetTypingIntent
     | SendOutboundIntent
+    | SendReactionIntent
     | PersistSessionIntent
     | QueueMemoryNotesCaptureIntent
     | RecordManualMemoryIntent
@@ -79,6 +90,7 @@ type OrchestratorIntent = (
 type IntentKind = Literal[
     "typing",
     "send_outbound",
+    "send_reaction",
     "persist_session",
     "queue_memory_notes_capture",
     "record_manual_memory",

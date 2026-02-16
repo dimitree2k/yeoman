@@ -116,3 +116,4 @@ class OutboundEvent:
     reply_to: str | None = None
     media: tuple[str, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
+    reaction_emoji: str | None = None
