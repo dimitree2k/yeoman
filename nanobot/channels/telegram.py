@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from telegram import BotCommand, Update
 from telegram.constants import MessageEntityType
-from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from nanobot.bus.events import OutboundMessage
@@ -116,6 +116,7 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._bot_id: int | None = None
         self._bot_username: str = ""
+        self._stopping_due_to_conflict = False
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -443,6 +444,9 @@ class TelegramChannel(BaseChannel):
 
     def _on_polling_error(self, error: TelegramError) -> None:
         """Handle polling loop errors without noisy stack traces."""
+        if isinstance(error, Conflict):
+            self._schedule_conflict_shutdown(error)
+            return
         if isinstance(error, RetryAfter):
             logger.warning(f"Telegram rate limited; retrying after {error.retry_after}s")
             return
@@ -454,3 +458,25 @@ class TelegramChannel(BaseChannel):
             )
             return
         logger.error("Telegram polling error {}: {}", error.__class__.__name__, error)
+
+    def _schedule_conflict_shutdown(self, error: TelegramError) -> None:
+        """Stop polling once when Telegram reports a duplicate getUpdates consumer."""
+        if self._stopping_due_to_conflict:
+            return
+
+        self._stopping_due_to_conflict = True
+        self._running = False
+        logger.error(
+            "Telegram polling conflict detected (another bot instance is already running getUpdates): {}. "
+            "Stopping this Telegram channel instance.",
+            error,
+        )
+
+        # Trigger async shutdown from sync callback context.
+        try:
+            asyncio.create_task(self.stop())
+        except RuntimeError:
+            logger.error(
+                "Unable to schedule Telegram shutdown after conflict; no running event loop. "
+                "Stop the duplicate bot process and restart nanobot."
+            )

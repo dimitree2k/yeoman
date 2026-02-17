@@ -320,6 +320,8 @@ class LLMResponder(ResponderPort):
         """Notify owner when Nano sees a new chat for the first time."""
         if self.owner_alert_resolver is None:
             return
+        if channel != "whatsapp":
+            return
 
         full_key = f"{channel}:{chat_id}"
         if full_key in self._seen_chats:
