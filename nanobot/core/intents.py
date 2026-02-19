@@ -76,6 +76,7 @@ class SendReactionIntent:
     chat_id: str
     message_id: str
     emoji: str
+    participant_jid: str | None = None
 
 
 type OrchestratorIntent = (

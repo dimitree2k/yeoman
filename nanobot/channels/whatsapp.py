@@ -448,6 +448,8 @@ class WhatsAppChannel(BaseChannel):
             "messageId": msg.message_id,
             "emoji": msg.emoji,
         }
+        if msg.participant_jid:
+            payload["participantJid"] = msg.participant_jid
 
         await self._send_command_with_retry(
             "react",

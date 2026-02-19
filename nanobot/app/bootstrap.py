@@ -161,6 +161,7 @@ class OrchestratorService:
                             chat_id=intent.chat_id,
                             message_id=intent.message_id,
                             emoji=intent.emoji,
+                            participant_jid=intent.participant_jid,
                         )
                     )
                 case PersistSessionIntent():

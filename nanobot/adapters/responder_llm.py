@@ -313,8 +313,10 @@ class LLMResponder(ResponderPort):
 
             final_content = response.content
             break
+        else:
+            return "⚙️❓"  # max iterations reached without a text response
 
-        return final_content or "I've completed processing but have no response to give."
+        return final_content or "🤔❓"
 
     async def _notify_new_chat(self, channel: str, chat_id: str) -> None:
         """Notify owner when Nano sees a new chat for the first time."""

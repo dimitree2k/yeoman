@@ -33,6 +33,8 @@ from nanobot.media.tts import (
 if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
 
+_REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
+
 _IDEA_MARKERS = ("[idea]", "#idea", "idea:", "inbox idea")
 _BACKLOG_MARKERS = ("[backlog]", "#backlog", "backlog:")
 _IDEA_PREFIX_WORDS = {
@@ -539,6 +541,7 @@ class Orchestrator:
                         chat_id=event.chat_id,
                         message_id=event.message_id or "",
                         emoji=self._security_block_message,
+                        participant_jid=event.participant,
                     )
                 )
                 return intents
@@ -563,6 +566,34 @@ class Orchestrator:
                 intents.append(
                     RecordMetricIntent(
                         name="responder_empty",
+                        labels=(("channel", event.channel),),
+                    )
+                )
+                return intents
+
+            # ── Reaction marker: LLM returned ::reaction::<emoji> ──
+            reaction_match = _REACTION_RE.match(reply)
+            if reaction_match and event.message_id:
+                emoji = reaction_match.group(1).strip()
+                intents.append(
+                    SendReactionIntent(
+                        channel=event.channel,
+                        chat_id=event.chat_id,
+                        message_id=event.message_id,
+                        emoji=emoji,
+                        participant_jid=event.participant,
+                    )
+                )
+                intents.append(
+                    PersistSessionIntent(
+                        session_key=f"{event.channel}:{event.chat_id}",
+                        user_content=event.content,
+                        assistant_content=f"[reacted with {emoji}]",
+                    )
+                )
+                intents.append(
+                    RecordMetricIntent(
+                        name="reaction_sent",
                         labels=(("channel", event.channel),),
                     )
                 )
