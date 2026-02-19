@@ -59,6 +59,12 @@ class PolicyDecision:
     voice_output_format: str = "opus"
     voice_output_max_sentences: int = 2
     voice_output_max_chars: int = 150
+    talkative_cooldown_enabled: bool = False
+    talkative_cooldown_streak_threshold: int = 7
+    talkative_cooldown_topic_overlap_threshold: float = 0.34
+    talkative_cooldown_cooldown_seconds: int = 900
+    talkative_cooldown_delay_seconds: float = 2.5
+    talkative_cooldown_use_llm_message: bool = False
     is_owner: bool = False
     source: str = "disabled"
 

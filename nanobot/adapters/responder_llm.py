@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
 
@@ -31,6 +35,14 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
     from nanobot.memory.service import MemoryService
+
+
+@dataclass
+class _TalkativeCooldownState:
+    sender_id: str = ""
+    topic_tokens: set[str] = field(default_factory=set)
+    streak: int = 0
+    cooldown_until: float = 0.0
 
 
 class LLMResponder(ResponderPort):
@@ -74,6 +86,7 @@ class LLMResponder(ResponderPort):
         self._seen_chats: set[str] = set()
         self._seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
         self._load_seen_chats()
+        self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
             self.exec_config.isolation.enabled
@@ -412,6 +425,179 @@ class LLMResponder(ResponderPort):
             )
             logger.info("notified owner {} about new chat {}", owner, chat_id)
 
+    @staticmethod
+    def _topic_tokens(text: str) -> set[str]:
+        compact = re.sub(r"https?://\S+", " ", text.lower())
+        compact = re.sub(r"[^a-z0-9_\s]+", " ", compact)
+        tokens = {t for t in compact.split() if len(t) >= 4 and not t.isdigit()}
+        if tokens:
+            return set(list(tokens)[:40])
+        fallback = {t for t in compact.split() if len(t) >= 2 and not t.isdigit()}
+        return set(list(fallback)[:24])
+
+    @staticmethod
+    def _topic_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        union = left | right
+        if not union:
+            return 0.0
+        return len(left & right) / len(union)
+
+    @staticmethod
+    def _is_probably_german(text: str) -> bool:
+        lowered = f" {text.lower()} "
+        de_markers = (
+            " und ",
+            " der ",
+            " die ",
+            " das ",
+            " ist ",
+            " nicht ",
+            " was ",
+            " wie ",
+            " heute ",
+            " kann ",
+            " kannst ",
+            " bitte ",
+            " danke ",
+        )
+        en_markers = (
+            " the ",
+            " and ",
+            " is ",
+            " not ",
+            " what ",
+            " how ",
+            " today ",
+            " can ",
+            " please ",
+            " thanks ",
+        )
+        de_score = sum(1 for marker in de_markers if marker in lowered)
+        en_score = sum(1 for marker in en_markers if marker in lowered)
+        return de_score >= en_score
+
+    def _talkative_message_for(self, text: str) -> str:
+        if self._is_probably_german(text):
+            return (
+                "Bro, du bist heute extrem gespraechig zum selben Thema. "
+                "Nano braucht kurz Pause. "
+                "Wenn du 24/7 quatschen willst, goenn dir ein OpenAI/Kimi/Anthropic-Abo."
+            )
+        return (
+            "Bro, you are very talkative on the same topic today. "
+            "Nano needs a short break. "
+            "If you want 24/7 bot chat, get an OpenAI/Kimi/Anthropic subscription."
+        )
+
+    async def _generate_talkative_message_llm(self, text: str) -> str | None:
+        language_hint = "German" if self._is_probably_german(text) else "English"
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You write one short playful cooldown message for a busy group chat. "
+                    "No markdown. No threats. No slurs. No factual claims. "
+                    "Max 2 sentences and max 160 characters."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Write a cheeky message telling one very talkative person to take a short pause, "
+                    "and suggest buying an OpenAI/Kimi/Anthropic subscription for all-day bot chatting. "
+                    f"Output language: {language_hint}."
+                ),
+            },
+        ]
+        try:
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=prompt,
+                    tools=[],
+                    model=self.model,
+                    max_tokens=80,
+                    temperature=0.9,
+                ),
+                timeout=6.0,
+            )
+        except Exception as exc:
+            logger.debug("talkative llm message generation failed: {}", exc)
+            return None
+
+        if response.has_tool_calls:
+            return None
+        content = (response.content or "").strip()
+        if not content:
+            return None
+        if len(content) > 220:
+            content = content[:220].rstrip() + "..."
+        return content
+
+    async def _maybe_talkative_cooldown_reply(
+        self,
+        *,
+        session_key: str,
+        sender_id: str | None,
+        content: str,
+        metadata: dict[str, object],
+        enabled: bool,
+        streak_threshold: int,
+        topic_overlap_threshold: float,
+        cooldown_seconds: int,
+        delay_seconds: float,
+        use_llm_message: bool,
+    ) -> str | None:
+        if not enabled:
+            return None
+        if not bool(metadata.get("is_group", False)):
+            return None
+        actor = (sender_id or "").strip()
+        if not actor:
+            return None
+
+        tokens = self._topic_tokens(content)
+        if not tokens:
+            return None
+
+        state = self._talkative_state.get(session_key, _TalkativeCooldownState())
+        same_sender = actor == state.sender_id
+        same_topic = (
+            same_sender
+            and bool(state.topic_tokens)
+            and self._topic_overlap(tokens, state.topic_tokens) >= float(topic_overlap_threshold)
+        )
+
+        if same_sender and same_topic:
+            state.streak += 1
+            state.topic_tokens = set(list(state.topic_tokens | tokens)[:40])
+        else:
+            state.sender_id = actor
+            state.topic_tokens = tokens
+            state.streak = 1
+
+        now = time.monotonic()
+        if state.cooldown_until > now:
+            self._talkative_state[session_key] = state
+            return None
+
+        if state.streak < int(streak_threshold):
+            self._talkative_state[session_key] = state
+            return None
+
+        state.cooldown_until = now + float(cooldown_seconds)
+        state.streak = 0
+        self._talkative_state[session_key] = state
+
+        if delay_seconds > 0:
+            await asyncio.sleep(float(delay_seconds))
+        if use_llm_message:
+            llm_message = await self._generate_talkative_message_llm(content)
+            if llm_message:
+                return llm_message
+        return self._talkative_message_for(content)
+
     async def _generate(
         self,
         *,
@@ -424,6 +610,12 @@ class LLMResponder(ResponderPort):
         metadata: dict[str, object],
         allowed_tools: set[str],
         persona_text: str | None,
+        talkative_cooldown_enabled: bool = False,
+        talkative_cooldown_streak_threshold: int = 7,
+        talkative_cooldown_topic_overlap_threshold: float = 0.34,
+        talkative_cooldown_cooldown_seconds: int = 900,
+        talkative_cooldown_delay_seconds: float = 2.5,
+        talkative_cooldown_use_llm_message: bool = False,
         is_owner: bool = False,
     ) -> str:
         # Check for new chat and notify owner
@@ -476,28 +668,43 @@ class LLMResponder(ResponderPort):
             if retrieved_memory_text:
                 self._metric("memory_prompt_chars", len(retrieved_memory_text))
 
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=content,
-            current_metadata=metadata,
-            retrieved_memory_text=retrieved_memory_text,
-            persona_text=persona_text,
-            media=list(media),
-            channel=channel,
-            chat_id=chat_id,
+        talkative_reply = await self._maybe_talkative_cooldown_reply(
+            session_key=session_key,
+            sender_id=sender_id,
+            content=content,
+            metadata=metadata,
+            enabled=talkative_cooldown_enabled,
+            streak_threshold=talkative_cooldown_streak_threshold,
+            topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
+            cooldown_seconds=talkative_cooldown_cooldown_seconds,
+            delay_seconds=talkative_cooldown_delay_seconds,
+            use_llm_message=talkative_cooldown_use_llm_message,
         )
+        if talkative_reply is not None:
+            final_content = talkative_reply
+        else:
+            messages = self.context.build_messages(
+                history=session.get_history(),
+                current_message=content,
+                current_metadata=metadata,
+                retrieved_memory_text=retrieved_memory_text,
+                persona_text=persona_text,
+                media=list(media),
+                channel=channel,
+                chat_id=chat_id,
+            )
 
-        final_content = await self._chat_loop(
-            messages=messages,
-            allowed_tools=allowed_tools,
-            security_context={
-                "channel": channel,
-                "chat_id": chat_id,
-                "sender_id": sender_id or "",
-                "session_key": session_key,
-            },
-            is_owner=is_owner,
-        )
+            final_content = await self._chat_loop(
+                messages=messages,
+                allowed_tools=allowed_tools,
+                security_context={
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "sender_id": sender_id or "",
+                    "session_key": session_key,
+                },
+                is_owner=is_owner,
+            )
 
         if self.memory is not None:
             try:
@@ -573,6 +780,12 @@ class LLMResponder(ResponderPort):
             metadata=metadata,
             allowed_tools=set(decision.allowed_tools),
             persona_text=decision.persona_text,
+            talkative_cooldown_enabled=decision.talkative_cooldown_enabled,
+            talkative_cooldown_streak_threshold=decision.talkative_cooldown_streak_threshold,
+            talkative_cooldown_topic_overlap_threshold=decision.talkative_cooldown_topic_overlap_threshold,
+            talkative_cooldown_cooldown_seconds=decision.talkative_cooldown_cooldown_seconds,
+            talkative_cooldown_delay_seconds=decision.talkative_cooldown_delay_seconds,
+            talkative_cooldown_use_llm_message=decision.talkative_cooldown_use_llm_message,
             is_owner=decision.is_owner,
         )
 
@@ -597,6 +810,12 @@ class LLMResponder(ResponderPort):
             metadata={},
             allowed_tools=set(allowed_tools or self.tool_names),
             persona_text=persona_text,
+            talkative_cooldown_enabled=False,
+            talkative_cooldown_streak_threshold=7,
+            talkative_cooldown_topic_overlap_threshold=0.34,
+            talkative_cooldown_cooldown_seconds=900,
+            talkative_cooldown_delay_seconds=2.5,
+            talkative_cooldown_use_llm_message=False,
             is_owner=is_owner,
         )
 

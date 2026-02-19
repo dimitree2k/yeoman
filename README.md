@@ -486,6 +486,29 @@ Quick reference for modes:
 
 Tip: use `nanobot policy explain` to debug "why didn’t the bot reply?" for a specific chat/sender.
 
+Optional per-chat playful cooldown (for very long same-topic monologues in groups):
+
+```json
+{
+  "channels": {
+    "whatsapp": {
+      "chats": {
+        "491786127564-1611913127@g.us": {
+          "talkativeCooldown": {
+            "enabled": true,
+            "streakThreshold": 7,
+            "topicOverlapThreshold": 0.34,
+            "cooldownSeconds": 900,
+            "delaySeconds": 2.5,
+            "useLlmMessage": false
+          }
+        }
+      }
+    }
+  }
+}
+```
+
 #### WhatsApp Owner DM Policy Commands
 
 Deterministic policy commands in chat are **slash-only** and currently use the `/policy` namespace.

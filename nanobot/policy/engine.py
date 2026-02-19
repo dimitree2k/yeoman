@@ -94,6 +94,12 @@ class EffectivePolicy:
     voice_output_format: str
     voice_output_max_sentences: int
     voice_output_max_chars: int
+    talkative_cooldown_enabled: bool
+    talkative_cooldown_streak_threshold: int
+    talkative_cooldown_topic_overlap_threshold: float
+    talkative_cooldown_cooldown_seconds: int
+    talkative_cooldown_delay_seconds: float
+    talkative_cooldown_use_llm_message: bool
 
 
 @dataclass(slots=True)
@@ -144,6 +150,12 @@ class _CompiledPolicy:
     voice_output_format: str
     voice_output_max_sentences: int
     voice_output_max_chars: int
+    talkative_cooldown_enabled: bool
+    talkative_cooldown_streak_threshold: int
+    talkative_cooldown_topic_overlap_threshold: float
+    talkative_cooldown_cooldown_seconds: int
+    talkative_cooldown_delay_seconds: float
+    talkative_cooldown_use_llm_message: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +282,16 @@ class PolicyEngine:
             voice_output_format=str(resolved.voice.output.format),
             voice_output_max_sentences=int(resolved.voice.output.max_sentences),
             voice_output_max_chars=int(resolved.voice.output.max_chars),
+            talkative_cooldown_enabled=bool(resolved.talkative_cooldown.enabled),
+            talkative_cooldown_streak_threshold=int(
+                resolved.talkative_cooldown.streak_threshold
+            ),
+            talkative_cooldown_topic_overlap_threshold=float(
+                resolved.talkative_cooldown.topic_overlap_threshold
+            ),
+            talkative_cooldown_cooldown_seconds=int(resolved.talkative_cooldown.cooldown_seconds),
+            talkative_cooldown_delay_seconds=float(resolved.talkative_cooldown.delay_seconds),
+            talkative_cooldown_use_llm_message=bool(resolved.talkative_cooldown.use_llm_message),
         )
 
     def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
@@ -423,6 +445,12 @@ class PolicyEngine:
             voice_output_format=resolved.voice_output_format,
             voice_output_max_sentences=resolved.voice_output_max_sentences,
             voice_output_max_chars=resolved.voice_output_max_chars,
+            talkative_cooldown_enabled=resolved.talkative_cooldown_enabled,
+            talkative_cooldown_streak_threshold=resolved.talkative_cooldown_streak_threshold,
+            talkative_cooldown_topic_overlap_threshold=resolved.talkative_cooldown_topic_overlap_threshold,
+            talkative_cooldown_cooldown_seconds=resolved.talkative_cooldown_cooldown_seconds,
+            talkative_cooldown_delay_seconds=resolved.talkative_cooldown_delay_seconds,
+            talkative_cooldown_use_llm_message=resolved.talkative_cooldown_use_llm_message,
         )
 
     @staticmethod

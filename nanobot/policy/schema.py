@@ -140,6 +140,30 @@ class VoicePolicyOverride(PolicyModel):
     output: VoiceOutputPolicyOverride | None = None
 
 
+class TalkativeCooldownPolicy(PolicyModel):
+    """Playful cooldown behavior for very long same-topic back-and-forth in groups."""
+
+    enabled: bool = False
+    streak_threshold: int = Field(default=7, alias="streakThreshold", ge=3, le=30)
+    topic_overlap_threshold: float = Field(default=0.34, alias="topicOverlapThreshold", ge=0.0, le=1.0)
+    cooldown_seconds: int = Field(default=900, alias="cooldownSeconds", ge=10, le=86_400)
+    delay_seconds: float = Field(default=2.5, alias="delaySeconds", ge=0.0, le=30.0)
+    use_llm_message: bool = Field(default=False, alias="useLlmMessage")
+
+
+class TalkativeCooldownPolicyOverride(PolicyModel):
+    """Partial override for talkative-cooldown behavior."""
+
+    enabled: bool | None = None
+    streak_threshold: int | None = Field(default=None, alias="streakThreshold", ge=3, le=30)
+    topic_overlap_threshold: float | None = Field(
+        default=None, alias="topicOverlapThreshold", ge=0.0, le=1.0
+    )
+    cooldown_seconds: int | None = Field(default=None, alias="cooldownSeconds", ge=10, le=86_400)
+    delay_seconds: float | None = Field(default=None, alias="delaySeconds", ge=0.0, le=30.0)
+    use_llm_message: bool | None = Field(default=None, alias="useLlmMessage")
+
+
 class ChatPolicy(PolicyModel):
     """Resolved chat policy (no optional fields)."""
 
@@ -154,6 +178,9 @@ class ChatPolicy(PolicyModel):
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicy = Field(default_factory=VoicePolicy)
+    talkative_cooldown: TalkativeCooldownPolicy = Field(
+        default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
+    )
 
 
 class ChatPolicyOverride(PolicyModel):
@@ -168,6 +195,9 @@ class ChatPolicyOverride(PolicyModel):
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicyOverride | None = None
+    talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(
+        default=None, alias="talkativeCooldown"
+    )
     comment: str | None = Field(default=None, alias="comment")
 
 

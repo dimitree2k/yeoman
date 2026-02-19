@@ -243,6 +243,12 @@ class EnginePolicyAdapter(PolicyPort):
                 voice_output_format="opus",
                 voice_output_max_sentences=2,
                 voice_output_max_chars=150,
+                talkative_cooldown_enabled=False,
+                talkative_cooldown_streak_threshold=7,
+                talkative_cooldown_topic_overlap_threshold=0.34,
+                talkative_cooldown_cooldown_seconds=900,
+                talkative_cooldown_delay_seconds=2.5,
+                talkative_cooldown_use_llm_message=False,
                 source="disabled",
             )
 
@@ -256,6 +262,12 @@ class EnginePolicyAdapter(PolicyPort):
         voice_output_format = "opus"
         voice_output_max_sentences = 2
         voice_output_max_chars = 150
+        talkative_cooldown_enabled = False
+        talkative_cooldown_streak_threshold = 7
+        talkative_cooldown_topic_overlap_threshold = 0.34
+        talkative_cooldown_cooldown_seconds = 900
+        talkative_cooldown_delay_seconds = 2.5
+        talkative_cooldown_use_llm_message = False
         if event.channel in self._engine.apply_channels:
             try:
                 effective = self._engine.resolve_policy(event.channel, event.chat_id)
@@ -265,6 +277,20 @@ class EnginePolicyAdapter(PolicyPort):
                 voice_output_format = effective.voice_output_format
                 voice_output_max_sentences = effective.voice_output_max_sentences
                 voice_output_max_chars = effective.voice_output_max_chars
+                talkative_cooldown_enabled = effective.talkative_cooldown_enabled
+                talkative_cooldown_streak_threshold = (
+                    effective.talkative_cooldown_streak_threshold
+                )
+                talkative_cooldown_topic_overlap_threshold = (
+                    effective.talkative_cooldown_topic_overlap_threshold
+                )
+                talkative_cooldown_cooldown_seconds = (
+                    effective.talkative_cooldown_cooldown_seconds
+                )
+                talkative_cooldown_delay_seconds = effective.talkative_cooldown_delay_seconds
+                talkative_cooldown_use_llm_message = (
+                    effective.talkative_cooldown_use_llm_message
+                )
             except Exception:
                 # Policy voice output settings are optional and should never break evaluation.
                 pass
@@ -291,6 +317,12 @@ class EnginePolicyAdapter(PolicyPort):
             voice_output_format=voice_output_format,
             voice_output_max_sentences=voice_output_max_sentences,
             voice_output_max_chars=voice_output_max_chars,
+            talkative_cooldown_enabled=talkative_cooldown_enabled,
+            talkative_cooldown_streak_threshold=talkative_cooldown_streak_threshold,
+            talkative_cooldown_topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
+            talkative_cooldown_cooldown_seconds=talkative_cooldown_cooldown_seconds,
+            talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
+            talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
             is_owner=is_owner,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )
@@ -369,6 +401,14 @@ class EnginePolicyAdapter(PolicyPort):
                             "maxSentences": effective.voice_output_max_sentences,
                             "maxChars": effective.voice_output_max_chars,
                         },
+                    },
+                    "talkativeCooldown": {
+                        "enabled": effective.talkative_cooldown_enabled,
+                        "streakThreshold": effective.talkative_cooldown_streak_threshold,
+                        "topicOverlapThreshold": effective.talkative_cooldown_topic_overlap_threshold,
+                        "cooldownSeconds": effective.talkative_cooldown_cooldown_seconds,
+                        "delaySeconds": effective.talkative_cooldown_delay_seconds,
+                        "useLlmMessage": effective.talkative_cooldown_use_llm_message,
                     },
                 }
                 if effective is not None
