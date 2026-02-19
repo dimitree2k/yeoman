@@ -135,6 +135,7 @@ class EnginePolicyAdapter(PolicyPort):
             [
                 CommandCatalogCommandHandler(self),
                 HelpAliasCommandHandler(self),
+                PanicCommandHandler(self),
                 PolicyAdminCommandHandler(self),
                 VoiceMessagesCommandHandler(self),
                 ResetSessionCommandHandler(self),
@@ -463,6 +464,48 @@ class EnginePolicyAdapter(PolicyPort):
     def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
 
+    def panic_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
+
+    def panic_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        delay_s = 1.0
+        if argv:
+            if len(argv) == 1 and argv[0].strip().lower() in {"now", "--now"}:
+                delay_s = 0.0
+            else:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /panic [now]",
+                    command_name="panic",
+                    outcome="invalid",
+                    source="dm",
+                )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Panic unavailable: policy engine is not active.",
+                command_name="panic",
+                outcome="error",
+                source="dm",
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+
+        self._trigger_panic_shutdown(delay_s=delay_s)
+        suffix = "" if delay_s <= 0 else " (after ack)"
+        return AdminCommandResult(
+            status="handled",
+            response=f"Panic switch engaged. Stopping gateway and WhatsApp bridge{suffix}.",
+            command_name="panic",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(name="panic_switch_total", labels=(("channel", ctx.channel),)),
+            ),
+        )
+
     def session_reset_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         if argv:
             return AdminCommandResult(status="handled", response="Usage: /reset")
@@ -544,6 +587,8 @@ class EnginePolicyAdapter(PolicyPort):
             "- /reset — clear conversation history for this chat",
             "- /voicemessages <status|on|off|in_kind|always|text|inherit>",
         ]
+        if self.panic_is_applicable(ctx):
+            lines.append("- /panic [now] — emergency stop gateway + WhatsApp bridge")
         if self.policy_admin_is_applicable(ctx):
             lines.append("- /policy help — policy admin commands")
             if include_all and self._policy_admin_service is not None:
@@ -791,6 +836,36 @@ class EnginePolicyAdapter(PolicyPort):
             dry_run=execution.dry_run,
             metric_events=tuple(metrics),
         )
+
+    @staticmethod
+    def _panic_shutdown_worker(delay_s: float) -> None:
+        if delay_s > 0:
+            time.sleep(delay_s)
+
+        config = load_config()
+        try:
+            from nanobot.cli.commands import _stop_gateway_processes
+
+            _stop_gateway_processes(config.gateway.port)
+        except Exception:
+            pass
+
+        try:
+            from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+
+            runtime = WhatsAppRuntimeManager(config=config)
+            runtime.stop_bridge()
+        except Exception:
+            pass
+
+    def _trigger_panic_shutdown(self, *, delay_s: float) -> None:
+        worker = threading.Thread(
+            target=self._panic_shutdown_worker,
+            args=(max(0.0, float(delay_s)),),
+            daemon=True,
+            name="nanobot-panic-shutdown",
+        )
+        worker.start()
 
     def _is_whatsapp_owner(self, ctx: AdminCommandContext, policy: PolicyConfig) -> bool:
         identity = resolve_actor_identity(
@@ -1307,6 +1382,25 @@ class HelpAliasCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/help"
+
+
+class PanicCommandHandler(AdminCommandHandler):
+    """Deterministic `/panic` command for emergency process shutdown."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "panic"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.panic_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.panic_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/panic"
 
 
 class VoiceMessagesCommandHandler(AdminCommandHandler):
