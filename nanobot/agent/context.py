@@ -3,6 +3,7 @@
 import base64
 import mimetypes
 import platform
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ class ContextBuilder:
 
         # Core identity
         parts.append(self._get_identity())
+        parts.append(self._build_temporal_grounding())
+        parts.append(self._build_fact_verification_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
         parts.append(
@@ -95,6 +98,43 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
 
         return "\n\n---\n\n".join(parts)
+
+    @staticmethod
+    def _build_temporal_grounding() -> str:
+        """Build per-turn local clock context to ground relative date questions."""
+        now = datetime.now().astimezone()
+        tz_offset = now.strftime("%z")
+        tz_offset_fmt = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else tz_offset
+        tz_name = now.tzname() or "local"
+
+        return "\n".join(
+            [
+                "# Temporal Grounding",
+                f"Current local datetime: {now.isoformat(timespec='seconds')}",
+                f"Current local date: {now.strftime('%Y-%m-%d')}",
+                f"Current weekday: {now.strftime('%A')}",
+                f"Local timezone: {tz_name} (UTC{tz_offset_fmt})",
+                "When users ask about today/yesterday/tomorrow or current date/time, use this clock context.",
+                "Do not infer current date from chat history timestamps, memory notes, or message metadata.",
+                "When discussing events, prefer explicit absolute dates (YYYY-MM-DD) over relative wording.",
+                "Only say today/this week/last week after comparing the event date to Current local date.",
+                "If event timing is uncertain, say uncertainty explicitly instead of guessing relative dates.",
+            ]
+        )
+
+    @staticmethod
+    def _build_fact_verification_guardrails() -> str:
+        """Build guardrails for high-risk factual claims about real entities."""
+        return "\n".join(
+            [
+                "# Fact Verification",
+                "For questions about real people/companies/events, verify key claims with tools before asserting specifics when tools are available.",
+                "If multiple entities share the same name, ask which one the user means or provide clearly separated candidates.",
+                "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
+                "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
+                "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
+            ]
+        )
 
     def _resolve_active_skills(self, skill_names: list[str] | None) -> list[str]:
         """Resolve active skills with stable order and de-duplication."""
