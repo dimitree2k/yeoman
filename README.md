@@ -573,6 +573,46 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | `tools.exec.isolation.pressurePolicy` | `"preempt_oldest_active"` | Capacity policy when all sandboxes are busy. |
 | `~/.nanobot/policy.json` | auto-created | Per-channel and per-chat access, reply rules, tool ACL, and persona selection. |
 
+#### Scoped File Access Grants (Owner Sessions)
+
+Use `policy.json` `fileAccess` to permit explicit non-workspace paths while keeping workspace-first defaults.
+
+```json
+{
+  "fileAccess": {
+    "ownerOnly": true,
+    "audit": true,
+    "grants": [
+      {
+        "id": "docs-read",
+        "path": "/home/dm/Documents",
+        "recursive": true,
+        "mode": "read",
+        "description": "Read-only documents access"
+      },
+      {
+        "id": "nanobot-source",
+        "path": "/home/dm/Documents/nanobot",
+        "recursive": true,
+        "mode": "read-write",
+        "description": "Edit local source tree"
+      }
+    ],
+    "blockedPaths": [
+      "/home/dm/.ssh",
+      "/home/dm/.aws"
+    ],
+    "blockedPatterns": [".env", "id_rsa", "*.pem"]
+  }
+}
+```
+
+Rules:
+- Workspace remains always allowed.
+- `blockedPaths` and `blockedPatterns` always override grants.
+- Grants are only enabled for owner sessions when `ownerOnly=true`.
+- Exec isolation mounts grant paths under `/grants/<grant-id>` when enabled.
+
 #### Linux Exec Isolation (bubblewrap)
 
 - Scope: `exec` tool only (file tools remain host-side but are forced to workspace scope when isolation is enabled).

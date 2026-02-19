@@ -52,6 +52,15 @@ class CommandResult:
     exit_code: int
 
 
+@dataclass(frozen=True, slots=True)
+class SandboxMount:
+    """Extra bind-mount for a grant path inside the sandbox."""
+
+    host_path: Path
+    container_path: str  # e.g. "/grants/nanobot-source"
+    readonly: bool = True
+
+
 @dataclass(slots=True)
 class MountAllowlist:
     """Host-side allowlist rules for mount validation."""
@@ -121,9 +130,15 @@ class MountAllowlist:
 class BubblewrapSandboxSession:
     """Persistent bubblewrap shell process for one batch-session."""
 
-    def __init__(self, session_key: str, workspace: Path):
+    def __init__(
+        self,
+        session_key: str,
+        workspace: Path,
+        extra_mounts: list[SandboxMount] | None = None,
+    ):
         self.session_key = session_key
         self.workspace = workspace
+        self.extra_mounts: list[SandboxMount] = list(extra_mounts or [])
 
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -251,6 +266,12 @@ class BubblewrapSandboxSession:
                 args.extend(["--ro-bind", path, path])
 
         args.extend(["--bind", str(self.workspace), "/workspace"])
+
+        # Mount grant paths under /grants/<id>
+        for mount in self.extra_mounts:
+            flag = "--ro-bind" if mount.readonly else "--bind"
+            args.extend([flag, str(mount.host_path), mount.container_path])
+
         args.extend(["--chdir", "/workspace"])
         args.append("--clearenv")
 
@@ -316,12 +337,14 @@ class ExecSandboxManager:
         idle_seconds: int,
         pressure_policy: str,
         allowlist_path: Path,
+        extra_mounts: list[SandboxMount] | None = None,
     ):
         self.workspace = workspace.expanduser().resolve()
         self.max_containers = max(1, max_containers)
         self.idle_seconds = max(30, idle_seconds)
         self.pressure_policy = pressure_policy
         self.allowlist_path = allowlist_path
+        self._extra_mounts: list[SandboxMount] = list(extra_mounts or [])
 
         self._sessions: dict[str, BubblewrapSandboxSession] = {}
         self._lock = asyncio.Lock()
@@ -329,6 +352,10 @@ class ExecSandboxManager:
         self._check_runtime()
         self._allowlist = MountAllowlist.load(self.allowlist_path)
         self._allowlist.validate_workspace(self.workspace)
+
+        # Validate grant mount host paths against the allowlist
+        for mount in self._extra_mounts:
+            self._allowlist.validate_workspace(mount.host_path)
 
     async def execute(
         self,
@@ -376,7 +403,11 @@ class ExecSandboxManager:
 
             await self._ensure_capacity_locked()
 
-            session = BubblewrapSandboxSession(session_key=session_key, workspace=self.workspace)
+            session = BubblewrapSandboxSession(
+                session_key=session_key,
+                workspace=self.workspace,
+                extra_mounts=self._extra_mounts,
+            )
             await session.start()
             self._sessions[session_key] = session
             logger.debug(

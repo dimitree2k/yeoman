@@ -74,9 +74,7 @@ def onboard():
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
-    console.print(
-        "\n[dim]Want Telegram/WhatsApp? See project README > Chat Apps[/dim]"
-    )
+    console.print("\n[dim]Want Telegram/WhatsApp? See project README > Chat Apps[/dim]")
 
 
 def _create_workspace_templates(workspace: Path):
@@ -627,8 +625,10 @@ def agent(
     """Interact with the agent directly."""
     from nanobot.adapters.responder_llm import LLMResponder
     from nanobot.adapters.telemetry import InMemoryTelemetry
+    from nanobot.agent.tools.file_access import build_file_access_resolver
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
+    from nanobot.policy.loader import load_policy
     from nanobot.security import NoopSecurity, SecurityEngine
 
     config = load_config()
@@ -648,6 +648,13 @@ def agent(
         exec_config.isolation.enabled = True
         exec_config.isolation.fail_closed = True
         exec_config.allow_host_execution = False
+
+    policy = load_policy()
+    file_access_resolver = build_file_access_resolver(
+        workspace=config.workspace_path,
+        policy=policy,
+    )
+
     responder = LLMResponder(
         bus=bus,
         provider=provider,
@@ -660,6 +667,7 @@ def agent(
         memory_service=memory_service,
         telemetry=telemetry,
         security=security,
+        file_access_resolver=file_access_resolver,
     )
 
     if message:

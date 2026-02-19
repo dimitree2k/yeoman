@@ -249,6 +249,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._maybe_reload()
         actor = _to_actor(event)
         decision = self._engine.evaluate(actor, self._known_tools)
+        is_owner = self._engine.is_owner(actor)
         voice_output_mode = "text"
         voice_output_tts_route = "tts.speak"
         voice_output_voice = "alloy"
@@ -290,6 +291,7 @@ class EnginePolicyAdapter(PolicyPort):
             voice_output_format=voice_output_format,
             voice_output_max_sentences=voice_output_max_sentences,
             voice_output_max_chars=voice_output_max_chars,
+            is_owner=is_owner,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )
 

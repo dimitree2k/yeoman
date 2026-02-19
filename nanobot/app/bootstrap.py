@@ -14,6 +14,7 @@ from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from nanobot.adapters.responder_llm import LLMResponder
 from nanobot.adapters.telemetry import InMemoryTelemetry
 from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
+from nanobot.agent.tools.file_access import build_file_access_resolver
 from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.manager import ChannelManager
@@ -287,6 +288,11 @@ def build_gateway_runtime(
         memory_state_dir=memory_state_dir,
     )
 
+    file_access_resolver = build_file_access_resolver(
+        workspace=workspace,
+        policy=policy_engine.policy if policy_engine is not None else None,
+    )
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -303,6 +309,7 @@ def build_gateway_runtime(
         security=security,
         cron_service=cron,
         owner_alert_resolver=policy_adapter.owner_recipients,
+        file_access_resolver=file_access_resolver,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))

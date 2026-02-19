@@ -25,7 +25,12 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import _validate_url
 from nanobot.app.bootstrap import _resolve_security_tool_settings
 from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import _atomic_write_config, _migrate_config, convert_keys, convert_to_camel
+from nanobot.config.loader import (
+    _atomic_write_config,
+    _migrate_config,
+    convert_keys,
+    convert_to_camel,
+)
 from nanobot.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
 from nanobot.core.intents import SendOutboundIntent
 from nanobot.core.models import InboundEvent, PolicyDecision
@@ -214,7 +219,7 @@ def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
                     "enabled": True,
                     "batchSessionIdleSeconds": 123,
                     "maxContainers": 7,
-                }
+                },
             }
         },
         "memory": {
@@ -325,7 +330,9 @@ def test_validate_url_blocks_private_targets(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_validate_url_blocks_private_dns_targets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("nanobot.agent.tools.web._host_resolves_private", lambda host: host == "evil.test")
+    monkeypatch.setattr(
+        "nanobot.agent.tools.web._host_resolves_private", lambda host: host == "evil.test"
+    )
     blocked, msg = _validate_url("http://evil.test/path")
     assert blocked is False
     assert "private-network" in msg
@@ -566,7 +573,13 @@ class FakeSandboxSession:
     counter = 0
     by_key: dict[str, "FakeSandboxSession"] = {}
 
-    def __init__(self, session_key: str, workspace: Path):
+    def __init__(
+        self,
+        session_key: str,
+        workspace: Path,
+        extra_mounts: list[object] | None = None,
+    ):
+        del extra_mounts
         type(self).counter += 1
         self.instance_id = type(self).counter
         self.session_key = session_key
@@ -631,7 +644,9 @@ def _build_fake_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Exec
         "nanobot.agent.tools.exec_isolation.MountAllowlist.load",
         staticmethod(lambda _path: allowlist),
     )
-    monkeypatch.setattr("nanobot.agent.tools.exec_isolation.BubblewrapSandboxSession", FakeSandboxSession)
+    monkeypatch.setattr(
+        "nanobot.agent.tools.exec_isolation.BubblewrapSandboxSession", FakeSandboxSession
+    )
 
     return ExecSandboxManager(
         workspace=tmp_path / "workspace",

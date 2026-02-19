@@ -11,11 +11,14 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
+    from nanobot.agent.tools.file_access import FileAccessResolver
     from nanobot.config.schema import ExecToolConfig
 
+from nanobot.agent.tools.file_access import enable_grants
 from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
@@ -41,6 +44,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        file_access_resolver: "FileAccessResolver | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -50,6 +54,7 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.file_access_resolver = file_access_resolver
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
             or (
@@ -112,16 +117,36 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
-            tools.register(ReadFileTool(allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(allowed_dir=allowed_dir))
-            tools.register(ListDirTool(allowed_dir=allowed_dir))
+            if self.file_access_resolver is not None:
+                tools.register(ReadFileTool(resolver=self.file_access_resolver))
+                tools.register(WriteFileTool(resolver=self.file_access_resolver))
+                tools.register(ListDirTool(resolver=self.file_access_resolver))
+            else:
+                allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
+                tools.register(ReadFileTool(allowed_dir=allowed_dir))
+                tools.register(WriteFileTool(allowed_dir=allowed_dir))
+                tools.register(ListDirTool(allowed_dir=allowed_dir))
+            grant_mounts: list[SandboxMount] = []
+            grant_container_prefixes: list[str] = []
+            if self.file_access_resolver is not None and self.file_access_resolver.has_grants:
+                for host_path, container_path, readonly in self.file_access_resolver.iter_grant_mounts():
+                    grant_mounts.append(
+                        SandboxMount(
+                            host_path=host_path,
+                            container_path=container_path,
+                            readonly=readonly,
+                        )
+                    )
+                    grant_container_prefixes.append(container_path)
+
             exec_tool = ExecTool(
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.effective_restrict_to_workspace,
                 allow_host_execution=self.exec_config.allow_host_execution,
                 isolation_config=self.exec_config.isolation,
+                extra_mounts=grant_mounts,
+                grant_container_prefixes=grant_container_prefixes,
             )
             exec_tool.set_session_context(f"subagent:{task_id}")
             tools.register(exec_tool)

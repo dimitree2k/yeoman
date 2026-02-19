@@ -440,6 +440,10 @@ class PolicyEngine:
         owners = self._owner_index.get(actor.channel, frozenset())
         return self._sender_match(actor.sender_primary, actor.sender_aliases, owners)
 
+    def is_owner(self, actor: ActorContext) -> bool:
+        """Public check: is the actor a configured owner for their channel?"""
+        return self._owner_match(actor)
+
     def _evaluate_who_can_talk(self, actor: ActorContext, policy: _CompiledPolicy) -> tuple[bool, str]:
         mode = policy.who_can_talk_mode
         if mode == "everyone":

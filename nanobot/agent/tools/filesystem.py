@@ -1,13 +1,22 @@
 """File system tools: read, write, edit."""
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
 
+if TYPE_CHECKING:
+    from nanobot.agent.tools.file_access import FileAccessResolver
+
 
 def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
-    """Resolve path and optionally enforce directory restriction."""
+    """Resolve path and optionally enforce directory restriction.
+
+    Legacy helper kept for call-sites that have not migrated to
+    ``FileAccessResolver``.
+    """
     resolved = Path(path).expanduser().resolve()
     if allowed_dir:
         allowed = allowed_dir.expanduser().resolve()
@@ -21,8 +30,14 @@ def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
 class ReadFileTool(Tool):
     """Tool to read file contents."""
 
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        resolver: "FileAccessResolver | None" = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._resolver = resolver
 
     @property
     def name(self) -> str:
@@ -47,7 +62,10 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            if self._resolver is not None:
+                file_path = self._resolver.resolve(path, operation="read")
+            else:
+                file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
@@ -64,8 +82,14 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
 
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        resolver: "FileAccessResolver | None" = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._resolver = resolver
 
     @property
     def name(self) -> str:
@@ -94,7 +118,10 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            if self._resolver is not None:
+                file_path = self._resolver.resolve(path, operation="write")
+            else:
+                file_path = _resolve_path(path, self._allowed_dir)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
@@ -107,8 +134,14 @@ class WriteFileTool(Tool):
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
 
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        resolver: "FileAccessResolver | None" = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._resolver = resolver
 
     @property
     def name(self) -> str:
@@ -141,7 +174,10 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            if self._resolver is not None:
+                file_path = self._resolver.resolve(path, operation="write")
+            else:
+                file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
 
@@ -168,8 +204,14 @@ class EditFileTool(Tool):
 class ListDirTool(Tool):
     """Tool to list directory contents."""
 
-    def __init__(self, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        *,
+        resolver: "FileAccessResolver | None" = None,
+    ):
         self._allowed_dir = allowed_dir
+        self._resolver = resolver
 
     @property
     def name(self) -> str:
@@ -194,7 +236,10 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = _resolve_path(path, self._allowed_dir)
+            if self._resolver is not None:
+                dir_path = self._resolver.resolve(path, operation="list")
+            else:
+                dir_path = _resolve_path(path, self._allowed_dir)
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():

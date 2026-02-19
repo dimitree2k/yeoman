@@ -11,10 +11,12 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.file_access import FileAccessResolver, enable_grants
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -52,6 +54,7 @@ class LLMResponder(ResponderPort):
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
         owner_alert_resolver: "callable[[str], list[str]] | None" = None,
+        file_access_resolver: FileAccessResolver | None = None,
     ) -> None:
         from nanobot.config.schema import ExecToolConfig
 
@@ -67,16 +70,14 @@ class LLMResponder(ResponderPort):
         self.telemetry = telemetry
         self.security = security
         self.owner_alert_resolver = owner_alert_resolver
+        self.file_access_resolver = file_access_resolver
         self._seen_chats: set[str] = set()
         self._seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
         self._load_seen_chats()
 
-        self.effective_restrict_to_workspace = (
-            restrict_to_workspace
-            or (
-                self.exec_config.isolation.enabled
-                and self.exec_config.isolation.force_workspace_restriction
-            )
+        self.effective_restrict_to_workspace = restrict_to_workspace or (
+            self.exec_config.isolation.enabled
+            and self.exec_config.isolation.force_workspace_restriction
         )
 
         self.context = ContextBuilder(workspace)
@@ -91,6 +92,7 @@ class LLMResponder(ResponderPort):
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
+            file_access_resolver=file_access_resolver,
         )
         self._register_default_tools()
 
@@ -100,7 +102,9 @@ class LLMResponder(ResponderPort):
             if self._seen_chats_path.exists():
                 data = json.loads(self._seen_chats_path.read_text())
                 self._seen_chats = set(data.get("chats", []))
-                logger.info("loaded {} seen chats from {}", len(self._seen_chats), self._seen_chats_path)
+                logger.info(
+                    "loaded {} seen chats from {}", len(self._seen_chats), self._seen_chats_path
+                )
         except Exception as e:
             logger.warning("failed to load seen chats: {}", e)
             self._seen_chats = set()
@@ -119,11 +123,34 @@ class LLMResponder(ResponderPort):
         return frozenset(self.tools.tool_names)
 
     def _register_default_tools(self) -> None:
-        allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
-        self.tools.register(ReadFileTool(allowed_dir=allowed_dir))
-        self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
-        self.tools.register(EditFileTool(allowed_dir=allowed_dir))
-        self.tools.register(ListDirTool(allowed_dir=allowed_dir))
+        if self.file_access_resolver is not None:
+            self.tools.register(ReadFileTool(resolver=self.file_access_resolver))
+            self.tools.register(WriteFileTool(resolver=self.file_access_resolver))
+            self.tools.register(EditFileTool(resolver=self.file_access_resolver))
+            self.tools.register(ListDirTool(resolver=self.file_access_resolver))
+        else:
+            allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
+            self.tools.register(ReadFileTool(allowed_dir=allowed_dir))
+            self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
+            self.tools.register(EditFileTool(allowed_dir=allowed_dir))
+            self.tools.register(ListDirTool(allowed_dir=allowed_dir))
+
+        grant_mounts: list[SandboxMount] = []
+        grant_container_prefixes: list[str] = []
+        if self.file_access_resolver is not None and self.file_access_resolver.has_grants:
+            for (
+                host_path,
+                container_path,
+                readonly,
+            ) in self.file_access_resolver.iter_grant_mounts():
+                grant_mounts.append(
+                    SandboxMount(
+                        host_path=host_path,
+                        container_path=container_path,
+                        readonly=readonly,
+                    )
+                )
+                grant_container_prefixes.append(container_path)
 
         exec_tool = ExecTool(
             working_dir=str(self.workspace),
@@ -131,6 +158,8 @@ class LLMResponder(ResponderPort):
             restrict_to_workspace=self.effective_restrict_to_workspace,
             allow_host_execution=self.exec_config.allow_host_execution,
             isolation_config=self.exec_config.isolation,
+            extra_mounts=grant_mounts,
+            grant_container_prefixes=grant_container_prefixes,
         )
         self.tools.register(exec_tool)
         self.tools.register(PiStatsTool())
@@ -192,17 +221,19 @@ class LLMResponder(ResponderPort):
     @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
         metadata = dict(event.raw_metadata)
-        metadata.update({
-            "message_id": event.message_id,
-            "sender_id": event.sender_id,
-            "participant": event.participant,
-            "is_group": event.is_group,
-            "mentioned_bot": event.mentioned_bot,
-            "reply_to_bot": event.reply_to_bot,
-            "reply_to_message_id": event.reply_to_message_id,
-            "reply_to_participant": event.reply_to_participant,
-            "reply_to_text": event.reply_to_text,
-        })
+        metadata.update(
+            {
+                "message_id": event.message_id,
+                "sender_id": event.sender_id,
+                "participant": event.participant,
+                "is_group": event.is_group,
+                "mentioned_bot": event.mentioned_bot,
+                "reply_to_bot": event.reply_to_bot,
+                "reply_to_message_id": event.reply_to_message_id,
+                "reply_to_participant": event.reply_to_participant,
+                "reply_to_text": event.reply_to_text,
+            }
+        )
         return metadata
 
     @staticmethod
@@ -237,12 +268,34 @@ class LLMResponder(ResponderPort):
             if schema.get("function", {}).get("name") in allowed_tools
         ]
 
+    def _should_enable_grants(self, is_owner: bool) -> bool:
+        """Check whether grants should be activated for tool execution."""
+        if self.file_access_resolver is None or not self.file_access_resolver.has_grants:
+            return False
+        if self.file_access_resolver.owner_only:
+            return is_owner
+        return True
+
+    async def _execute_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        is_owner: bool,
+    ) -> str:
+        """Execute a tool call, activating grant context when appropriate."""
+        if self._should_enable_grants(is_owner):
+            with enable_grants():
+                return await self.tools.execute(name, arguments)
+        return await self.tools.execute(name, arguments)
+
     async def _chat_loop(
         self,
         *,
         messages: list[dict[str, Any]],
         allowed_tools: set[str],
         security_context: dict[str, object] | None = None,
+        is_owner: bool = False,
     ) -> str:
         iteration = 0
         final_content: str | None = None
@@ -277,7 +330,9 @@ class LLMResponder(ResponderPort):
                     args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
                     if tool_call.name not in allowed_tools:
-                        result = f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
+                        result = (
+                            f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
+                        )
                     else:
                         if self.security is not None:
                             tool_security = self.security.check_tool(
@@ -300,9 +355,17 @@ class LLMResponder(ResponderPort):
                                         "security_tool_warn",
                                         labels=(("tool", tool_call.name),),
                                     )
-                                result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                                result = await self._execute_tool(
+                                    tool_call.name,
+                                    tool_call.arguments,
+                                    is_owner=is_owner,
+                                )
                         else:
-                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                            result = await self._execute_tool(
+                                tool_call.name,
+                                tool_call.arguments,
+                                is_owner=is_owner,
+                            )
                     messages = self.context.add_tool_result(
                         messages,
                         tool_call.id,
@@ -361,6 +424,7 @@ class LLMResponder(ResponderPort):
         metadata: dict[str, object],
         allowed_tools: set[str],
         persona_text: str | None,
+        is_owner: bool = False,
     ) -> str:
         # Check for new chat and notify owner
         await self._notify_new_chat(channel, chat_id)
@@ -432,6 +496,7 @@ class LLMResponder(ResponderPort):
                 "sender_id": sender_id or "",
                 "session_key": session_key,
             },
+            is_owner=is_owner,
         )
 
         if self.memory is not None:
@@ -508,6 +573,7 @@ class LLMResponder(ResponderPort):
             metadata=metadata,
             allowed_tools=set(decision.allowed_tools),
             persona_text=decision.persona_text,
+            is_owner=decision.is_owner,
         )
 
     async def process_direct(
@@ -519,6 +585,7 @@ class LLMResponder(ResponderPort):
         chat_id: str = "direct",
         allowed_tools: set[str] | None = None,
         persona_text: str | None = None,
+        is_owner: bool = True,
     ) -> str:
         return await self._generate(
             session_key=session_key,
@@ -530,6 +597,7 @@ class LLMResponder(ResponderPort):
             metadata={},
             allowed_tools=set(allowed_tools or self.tool_names),
             persona_text=persona_text,
+            is_owner=is_owner,
         )
 
     async def aclose(self) -> None:

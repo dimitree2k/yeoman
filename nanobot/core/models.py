@@ -59,6 +59,7 @@ class PolicyDecision:
     voice_output_format: str = "opus"
     voice_output_max_sentences: int = 2
     voice_output_max_chars: int = 150
+    is_owner: bool = False
     source: str = "disabled"
 
 

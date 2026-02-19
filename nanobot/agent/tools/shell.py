@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.file_access import grants_are_active
 from nanobot.config.schema import ExecIsolationConfig
 
 if TYPE_CHECKING:
-    from nanobot.agent.tools.exec_isolation import ExecSandboxManager
+    from nanobot.agent.tools.exec_isolation import ExecSandboxManager, SandboxMount
 
 
 class ExecTool(Tool):
@@ -29,25 +30,30 @@ class ExecTool(Tool):
         restrict_to_workspace: bool = False,
         allow_host_execution: bool = False,
         isolation_config: "ExecIsolationConfig | None" = None,
+        *,
+        extra_mounts: list["SandboxMount"] | None = None,
+        grant_container_prefixes: list[str] | None = None,
     ):
-
-
         self.timeout = timeout
         self.working_dir = working_dir
         self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
+            r"\brm\s+-[rf]{1,2}\b",  # rm -r, rm -rf, rm -fr
+            r"\bdel\s+/[fq]\b",  # del /f, del /q
+            r"\brmdir\s+/s\b",  # rmdir /s
+            r"\b(format|mkfs|diskpart)\b",  # disk operations
+            r"\bdd\s+if=",  # dd
+            r">\s*/dev/sd",  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            r":\(\)\s*\{.*\};\s*:",  # fork bomb
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.allow_host_execution = allow_host_execution
         self.isolation_config = isolation_config or ExecIsolationConfig()
+        self._extra_mounts = list(extra_mounts or [])
+        self._grant_container_prefixes = [
+            p.rstrip("/") for p in (grant_container_prefixes or []) if p and p.startswith("/")
+        ]
 
         self._session_key = "cli:default"
         self._sandbox_manager: "ExecSandboxManager | None" = None
@@ -67,16 +73,13 @@ class ExecTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                },
+                "command": {"type": "string", "description": "The shell command to execute"},
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for the command"
-                }
+                    "description": "Optional working directory for the command",
+                },
             },
-            "required": ["command"]
+            "required": ["command"],
         }
 
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
@@ -114,6 +117,18 @@ class ExecTool(Tool):
         if self._sandbox_manager:
             await self._sandbox_manager.aclose()
 
+    def _is_allowed_grant_path(self, raw_path: str) -> bool:
+        if not raw_path.startswith("/"):
+            return False
+        if not self._grant_container_prefixes:
+            return False
+        if not grants_are_active():
+            return False
+        for prefix in self._grant_container_prefixes:
+            if raw_path == prefix or raw_path.startswith(prefix + "/"):
+                return True
+        return False
+
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
@@ -137,6 +152,8 @@ class ExecTool(Tool):
             posix_paths = re.findall(r"/[^\s\"']+", cmd)
 
             for raw in win_paths + posix_paths:
+                if self._is_allowed_grant_path(raw):
+                    continue
                 try:
                     p = Path(raw).resolve()
                 except Exception:
@@ -165,6 +182,7 @@ class ExecTool(Tool):
                 idle_seconds=self.isolation_config.batch_session_idle_seconds,
                 pressure_policy=self.isolation_config.pressure_policy,
                 allowlist_path=allowlist_path,
+                extra_mounts=self._extra_mounts,
             )
         except Exception as e:
             self._isolation_error = str(e)
@@ -175,7 +193,9 @@ class ExecTool(Tool):
                     self._isolation_error,
                 )
             else:
-                logger.error("Exec isolation unavailable (host exec disabled): {}", self._isolation_error)
+                logger.error(
+                    "Exec isolation unavailable (host exec disabled): {}", self._isolation_error
+                )
 
     async def _execute_local(self, command: str, cwd: str) -> str:
         try:
@@ -187,10 +207,7 @@ class ExecTool(Tool):
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 process.kill()
                 return f"Error: Command timed out after {self.timeout} seconds"

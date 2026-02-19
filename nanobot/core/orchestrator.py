@@ -113,9 +113,7 @@ class Orchestrator:
     @staticmethod
     def _fold_accents(text: str) -> str:
         return "".join(
-            ch
-            for ch in unicodedata.normalize("NFKD", text)
-            if not unicodedata.combining(ch)
+            ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
         )
 
     @classmethod
@@ -294,7 +292,10 @@ class Orchestrator:
                     intents.append(
                         RecordMetricIntent(
                             name="security_input_blocked",
-                            labels=(("channel", event.channel), ("reason", security_input.decision.reason)),
+                            labels=(
+                                ("channel", event.channel),
+                                ("reason", security_input.decision.reason),
+                            ),
                         )
                     )
                     intents.append(
@@ -535,15 +536,26 @@ class Orchestrator:
                         ),
                     )
                 )
-                intents.append(
-                    SendReactionIntent(
-                        channel=event.channel,
-                        chat_id=event.chat_id,
-                        message_id=event.message_id or "",
-                        emoji=self._security_block_message,
-                        participant_jid=event.participant,
+                if event.message_id:
+                    intents.append(
+                        SendReactionIntent(
+                            channel=event.channel,
+                            chat_id=event.chat_id,
+                            message_id=event.message_id,
+                            emoji=self._security_block_message,
+                            participant_jid=event.participant,
+                        )
                     )
-                )
+                else:
+                    intents.append(
+                        SendOutboundIntent(
+                            event=OutboundEvent(
+                                channel=event.channel,
+                                chat_id=event.chat_id,
+                                content=self._security_block_message,
+                            )
+                        )
+                    )
                 return intents
 
         typing_started = False

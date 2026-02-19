@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PolicyModel(BaseModel):
@@ -144,8 +145,12 @@ class ChatPolicy(PolicyModel):
 
     who_can_talk: WhoCanTalkPolicy = Field(default_factory=WhoCanTalkPolicy, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicy = Field(default_factory=WhenToReplyPolicy, alias="whenToReply")
-    blocked_senders: BlockedSendersPolicy = Field(default_factory=BlockedSendersPolicy, alias="blockedSenders")
-    allowed_tools: AllowedToolsPolicy = Field(default_factory=AllowedToolsPolicy, alias="allowedTools")
+    blocked_senders: BlockedSendersPolicy = Field(
+        default_factory=BlockedSendersPolicy, alias="blockedSenders"
+    )
+    allowed_tools: AllowedToolsPolicy = Field(
+        default_factory=AllowedToolsPolicy, alias="allowedTools"
+    )
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicy = Field(default_factory=VoicePolicy)
@@ -156,7 +161,9 @@ class ChatPolicyOverride(PolicyModel):
 
     who_can_talk: WhoCanTalkPolicyOverride | None = Field(default=None, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
-    blocked_senders: BlockedSendersPolicyOverride | None = Field(default=None, alias="blockedSenders")
+    blocked_senders: BlockedSendersPolicyOverride | None = Field(
+        default=None, alias="blockedSenders"
+    )
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     persona_file: str | None = Field(default=None, alias="personaFile")
@@ -175,10 +182,16 @@ class RuntimePolicy(PolicyModel):
     """Runtime behavior for policy handling."""
 
     reload_on_change: bool = Field(default=True, alias="reloadOnChange")
-    reload_check_interval_seconds: float = Field(default=1.0, alias="reloadCheckIntervalSeconds", ge=0.1)
+    reload_check_interval_seconds: float = Field(
+        default=1.0, alias="reloadCheckIntervalSeconds", ge=0.1
+    )
     feature_flags: dict[str, bool] = Field(default_factory=dict, alias="featureFlags")
-    admin_command_rate_limit_per_minute: int = Field(default=30, alias="adminCommandRateLimitPerMinute", ge=1)
-    admin_require_confirm_for_risky: bool = Field(default=False, alias="adminRequireConfirmForRisky")
+    admin_command_rate_limit_per_minute: int = Field(
+        default=30, alias="adminCommandRateLimitPerMinute", ge=1
+    )
+    admin_require_confirm_for_risky: bool = Field(
+        default=False, alias="adminRequireConfirmForRisky"
+    )
 
 
 class MemoryNotesBatchPolicy(PolicyModel):
@@ -229,7 +242,9 @@ class MemoryNotesPolicy(PolicyModel):
     )
     batch: MemoryNotesBatchPolicy = Field(default_factory=MemoryNotesBatchPolicy)
     defaults: MemoryNotesDefaultsPolicy = Field(default_factory=MemoryNotesDefaultsPolicy)
-    channels: dict[str, MemoryNotesChannelPolicy] = Field(default_factory=_default_memory_notes_channels)
+    channels: dict[str, MemoryNotesChannelPolicy] = Field(
+        default_factory=_default_memory_notes_channels
+    )
 
 
 def _default_owners() -> dict[str, list[str]]:
@@ -272,6 +287,65 @@ def _default_channels() -> dict[str, ChannelPolicy]:
     }
 
 
+FileAccessMode = Literal["read", "read-write"]
+
+
+class FileAccessGrantPolicy(PolicyModel):
+    """Single scoped file-access grant."""
+
+    id: str
+    path: str
+    recursive: bool = True
+    mode: FileAccessMode = "read"
+    description: str = ""
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("grant path must not be empty")
+        expanded = Path(raw).expanduser()
+        if not expanded.is_absolute():
+            raise ValueError(f"grant path must be absolute (got: {value})")
+        resolved = expanded.resolve()
+        return resolved.as_posix()
+
+
+class FileAccessPolicy(PolicyModel):
+    """Scoped file-access grants for owner sessions."""
+
+    grants: list[FileAccessGrantPolicy] = Field(default_factory=list)
+    blocked_paths: list[str] = Field(default_factory=list, alias="blockedPaths")
+    blocked_patterns: list[str] = Field(default_factory=list, alias="blockedPatterns")
+    owner_only: bool = Field(default=True, alias="ownerOnly")
+    audit: bool = True
+
+    @field_validator("blocked_paths")
+    @classmethod
+    def _validate_blocked_paths(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            raw = str(value or "").strip()
+            if not raw:
+                raise ValueError("blocked path must not be empty")
+            expanded = Path(raw).expanduser()
+            if not expanded.is_absolute():
+                raise ValueError(f"blocked path must be absolute (got: {value})")
+            resolved = expanded.resolve()
+            normalized.append(resolved.as_posix())
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_unique_grant_ids(self) -> "FileAccessPolicy":
+        seen: set[str] = set()
+        for grant in self.grants:
+            if grant.id in seen:
+                raise ValueError(f"duplicate fileAccess grant id: {grant.id}")
+            seen.add(grant.id)
+        return self
+
+
 class PolicyConfig(PolicyModel):
     """Root policy configuration."""
 
@@ -281,3 +355,4 @@ class PolicyConfig(PolicyModel):
     defaults: ChatPolicy = Field(default_factory=_default_policy_defaults)
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)
     memory_notes: MemoryNotesPolicy = Field(default_factory=MemoryNotesPolicy, alias="memoryNotes")
+    file_access: FileAccessPolicy | None = Field(default=None, alias="fileAccess")
