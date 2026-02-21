@@ -241,9 +241,11 @@ def build_gateway_runtime(
     """Compose full gateway runtime around vNext orchestrator."""
     from nanobot.config.loader import get_data_dir
 
+    from nanobot.utils.helpers import get_operational_data_path
+
     session_manager = SessionManager(workspace)
     inbound_archive = InboundArchive(
-        db_path=get_data_dir() / "inbound" / "reply_context.db",
+        db_path=get_operational_data_path() / "inbound" / "reply_context.db",
         retention_days=30,
     )
     inbound_archive.purge_older_than(days=30)
@@ -275,7 +277,7 @@ def build_gateway_runtime(
     except Exception as e:
         logger.warning("memory backfill failed: {}", e)
 
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     # Create policy adapter first so we can use it for owner_alert_resolver

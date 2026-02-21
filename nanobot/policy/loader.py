@@ -10,7 +10,8 @@ from nanobot.policy.schema import PolicyConfig
 
 def get_policy_path() -> Path:
     """Get the default policy file path."""
-    return Path.home() / ".nanobot" / "policy.json"
+    from nanobot.utils.helpers import get_data_path
+    return get_data_path() / "policy.json"
 
 
 def load_policy(path: Path | None = None) -> PolicyConfig:

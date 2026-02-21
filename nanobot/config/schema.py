@@ -93,7 +93,7 @@ class WhatsAppConfig(BaseModel):
     bridge_token: str = ""
     bridge_auto_repair: bool = True
     bridge_startup_timeout_ms: int = 15000
-    auth_dir: str = "~/.nanobot/whatsapp-auth"
+    auth_dir: str = "~/.nanobot/secrets/whatsapp-auth"
     debounce_ms: int = 0
     read_receipts: bool = True
     accept_from_me: bool = False
@@ -438,9 +438,9 @@ class Config(BaseSettings):
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        base = Path.home() / ".nanobot"
+        from nanobot.utils.helpers import get_data_path
         candidate = Path(self.agents.defaults.workspace).expanduser()
-        return candidate if candidate.is_absolute() else base / candidate
+        return candidate if candidate.is_absolute() else get_data_path() / candidate
 
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""

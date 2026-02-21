@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 import json
 import os
-import shutil
 import signal
+import shutil
 import subprocess
 import time
 import uuid
@@ -19,6 +19,14 @@ from urllib.parse import urlparse
 from loguru import logger
 
 from nanobot.config.loader import get_config_path, get_data_dir, load_config, save_config
+from nanobot.utils.process import (
+    is_bridge_dir,
+    is_bridge_process,
+    listener_pids_for_port,
+    pid_alive,
+    read_pid_file,
+    signal_process_group,
+)
 
 PROTOCOL_VERSION = 2
 MANIFEST_FILENAME = "bridge.manifest.json"
@@ -50,80 +58,6 @@ class BridgeReadyReport:
     health: dict[str, Any]
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _command_for_pid(pid: int) -> str:
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
-
-
-def _process_cwd(pid: int) -> Path | None:
-    proc_cwd = Path(f"/proc/{pid}/cwd")
-    try:
-        if proc_cwd.exists():
-            return proc_cwd.resolve()
-    except OSError:
-        return None
-    return None
-
-
-def _is_bridge_dir(path: Path) -> bool:
-    package_json = path / "package.json"
-    if not package_json.exists():
-        return False
-    try:
-        data = json.loads(package_json.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    return data.get("name") == "nanobot-whatsapp-bridge"
-
-
-def _is_bridge_process(pid: int) -> bool:
-    cmd = _command_for_pid(pid).lower()
-    if not cmd:
-        return False
-    cwd = _process_cwd(pid)
-    if cwd and _is_bridge_dir(cwd):
-        return True
-    return "nanobot-whatsapp-bridge" in cmd
-
-
-def _listener_pids_for_port(port: int) -> set[int]:
-    listener_pids: set[int] = set()
-    if not shutil.which("lsof"):
-        return listener_pids
-
-    result = subprocess.run(
-        ["lsof", "-nP", f"-tiTCP:{port}", "-sTCP:LISTEN"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return listener_pids
-
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            listener_pids.add(int(line))
-        except ValueError:
-            continue
-    return listener_pids
 
 
 class WhatsAppRuntimeManager:
@@ -138,7 +72,11 @@ class WhatsAppRuntimeManager:
     ):
         self.config = config or load_config()
         self._source_bridge_dir = source_bridge_dir
-        self._user_bridge_dir = user_bridge_dir or (get_data_dir() / "bridge")
+        if user_bridge_dir is not None:
+            self._user_bridge_dir = user_bridge_dir
+        else:
+            from nanobot.utils.helpers import get_cache_path
+            self._user_bridge_dir = get_cache_path() / "bridge"
         self._runtime_refreshed = False
 
     @property
@@ -147,15 +85,13 @@ class WhatsAppRuntimeManager:
 
     @property
     def bridge_log_path(self) -> Path:
-        logs_dir = get_data_dir() / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        return logs_dir / "whatsapp-bridge.log"
+        from nanobot.utils.helpers import get_logs_path
+        return get_logs_path() / "whatsapp-bridge.log"
 
     @property
     def bridge_pid_path(self) -> Path:
-        run_dir = get_data_dir() / "run"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir / "whatsapp-bridge.pid"
+        from nanobot.utils.helpers import get_run_path
+        return get_run_path() / "whatsapp-bridge.pid"
 
     def _resolve_bridge_port(self) -> int:
         wa = self.config.channels.whatsapp
@@ -346,17 +282,12 @@ class WhatsAppRuntimeManager:
         return old_token, new_token
 
     def _find_bridge_pids(self, port: int) -> list[int]:
-        pids: set[int] = set(_listener_pids_for_port(port))
+        pids: set[int] = set(listener_pids_for_port(port))
 
-        pid_file = self.bridge_pid_path
-        if pid_file.exists():
-            try:
-                pid = int(pid_file.read_text().strip())
-                if _pid_alive(pid) and (pid in pids or _is_bridge_process(pid)):
-                    pids.add(pid)
-            except ValueError:
-                pass
-        return sorted(pid for pid in pids if _pid_alive(pid))
+        stored = read_pid_file(self.bridge_pid_path)
+        if stored is not None and pid_alive(stored) and (stored in pids or is_bridge_process(stored)):
+            pids.add(stored)
+        return sorted(p for p in pids if pid_alive(p))
 
     def status_bridge(self, port: int | None = None) -> BridgeStatus:
         resolved_port = self._resolve_bridge_port() if port is None else port
@@ -369,21 +300,7 @@ class WhatsAppRuntimeManager:
         )
 
     def _signal_bridge_pid(self, pid: int, sig: int) -> None:
-        try:
-            pgid = os.getpgid(pid)
-        except OSError:
-            pgid = None
-        current_pgid = os.getpgrp()
-        if pgid is not None and pgid > 0 and pgid != current_pgid:
-            try:
-                os.killpg(pgid, sig)
-                return
-            except OSError:
-                pass
-        try:
-            os.kill(pid, sig)
-        except OSError:
-            pass
+        signal_process_group(pid, sig)
 
     def stop_bridge(self, port: int | None = None, timeout_s: float = 8.0) -> int:
         resolved_port = self._resolve_bridge_port() if port is None else port
@@ -392,22 +309,22 @@ class WhatsAppRuntimeManager:
             self.bridge_pid_path.unlink(missing_ok=True)
             return 0
 
-        for pid in pids:
-            self._signal_bridge_pid(pid, signal.SIGTERM)
+        for p in pids:
+            self._signal_bridge_pid(p, signal.SIGTERM)
 
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            remaining = [pid for pid in pids if _pid_alive(pid)]
+            remaining = [p for p in pids if pid_alive(p)]
             listeners = self._find_bridge_pids(resolved_port)
             if not remaining and not listeners:
                 self.bridge_pid_path.unlink(missing_ok=True)
                 return len(pids)
             time.sleep(0.2)
 
-        for pid in [pid for pid in pids if _pid_alive(pid)]:
-            self._signal_bridge_pid(pid, signal.SIGKILL)
-        for pid in self._find_bridge_pids(resolved_port):
-            self._signal_bridge_pid(pid, signal.SIGKILL)
+        for p in [p for p in pids if pid_alive(p)]:
+            self._signal_bridge_pid(p, signal.SIGKILL)
+        for p in self._find_bridge_pids(resolved_port):
+            self._signal_bridge_pid(p, signal.SIGKILL)
         self.bridge_pid_path.unlink(missing_ok=True)
         return len(pids)
 

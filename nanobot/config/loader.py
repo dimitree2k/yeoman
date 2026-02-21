@@ -17,7 +17,7 @@ CONFIG_VERSION = 2
 
 def get_config_path() -> Path:
     """Get the default configuration file path."""
-    return Path.home() / ".nanobot" / "config.json"
+    return get_data_dir() / "config.json"
 
 
 def get_data_dir() -> Path:
@@ -26,9 +26,84 @@ def get_data_dir() -> Path:
     return get_data_path()
 
 
-def load_config(config_path: Path | None = None) -> Config:
+def _load_dotenv() -> None:
+    """Load ~/.nanobot/.env (or $NANOBOT_HOME/.env) into os.environ.
+
+    Existing environment variables are never overwritten — real env vars
+    always take priority over the .env file.
     """
-    Load configuration from file or create default.
+    nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
+    base = Path(nanobot_home) if nanobot_home else Path.home() / ".nanobot"
+    env_file = base / ".env"
+    if not env_file.exists():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Strip surrounding quotes (single or double)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError:
+        pass
+
+
+def _apply_env_overrides(config: Config) -> Config:
+    """Patch api_keys and tokens from environment variables.
+
+    Environment variables (including those loaded from .env) take priority
+    over values already present in config.json. This means the .env file
+    is the canonical source for secrets; config.json can have empty keys.
+    """
+    from nanobot.providers.registry import PROVIDERS
+    from nanobot.config.schema import ProviderConfig
+
+    # Provider API keys — iterate registry so every provider is covered
+    for spec in PROVIDERS:
+        if not spec.env_key:
+            continue
+        provider = getattr(config.providers, spec.name, None)
+        if not isinstance(provider, ProviderConfig):
+            continue
+        env_val = os.environ.get(spec.env_key, "").strip()
+        if env_val:
+            provider.api_key = env_val
+
+    # ElevenLabs — not in PROVIDERS, handled separately
+    elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    if elevenlabs_key:
+        config.providers.elevenlabs.api_key = elevenlabs_key
+
+    # Channel tokens
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if tg_token:
+        config.channels.telegram.token = tg_token
+
+    wa_bridge_token = os.environ.get("WHATSAPP_BRIDGE_TOKEN", "").strip()
+    if wa_bridge_token:
+        config.channels.whatsapp.bridge_token = wa_bridge_token
+
+    # Tool API keys
+    search_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if search_key:
+        config.tools.web.search.api_key = search_key
+
+    return config
+
+
+def load_config(config_path: Path | None = None) -> Config:
+    """Load configuration from file or create default.
+
+    Loading order:
+      1. Parse ~/.nanobot/.env and inject into os.environ (if not already set).
+      2. Load config.json, applying schema migration.
+      3. Override empty api_key / token fields with env var values.
 
     Args:
         config_path: Optional path to config file. Uses default if not provided.
@@ -36,6 +111,8 @@ def load_config(config_path: Path | None = None) -> Config:
     Returns:
         Loaded configuration object.
     """
+    _load_dotenv()
+
     path = config_path or get_config_path()
 
     if path.exists():
@@ -48,17 +125,16 @@ def load_config(config_path: Path | None = None) -> Config:
             if changed:
                 _backup_config(path)
                 _atomic_write_config(path, validated)
-            return validated
+            return _apply_env_overrides(validated)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
 
-    return Config()
+    return _apply_env_overrides(Config())
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
-    """
-    Save configuration to file.
+    """Save configuration to file.
 
     Args:
         config: Configuration to save.

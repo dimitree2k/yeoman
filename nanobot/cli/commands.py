@@ -11,6 +11,16 @@ from rich.console import Console
 from rich.table import Table
 
 from nanobot import __logo__, __version__
+from nanobot.utils.process import (
+    command_for_pid,
+    is_bridge_dir,
+    is_bridge_process,
+    listener_pids_for_port,
+    pid_alive,
+    read_pid_file,
+    signal_pid,
+    signal_process_group,
+)
 
 app = typer.Typer(
     name="nanobot",
@@ -189,43 +199,13 @@ def _make_policy_engine(config):
 
 
 def _gateway_pid_path() -> Path:
-    from nanobot.config.loader import get_data_dir
-
-    run_dir = get_data_dir() / "run"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir / "gateway.pid"
+    from nanobot.utils.helpers import get_run_path
+    return get_run_path() / "gateway.pid"
 
 
 def _gateway_log_path() -> Path:
-    from nanobot.config.loader import get_data_dir
-
-    logs_dir = get_data_dir() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir / "gateway.log"
-
-
-def _pid_alive(pid: int) -> bool:
-    import os
-
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _command_for_pid(pid: int) -> str:
-    import subprocess
-
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    from nanobot.utils.helpers import get_logs_path
+    return get_logs_path() / "gateway.log"
 
 
 def _pid_has_env(pid: int, key: str, value: str | None = None) -> bool:
@@ -248,13 +228,13 @@ def _pid_has_env(pid: int, key: str, value: str | None = None) -> bool:
     return False
 
 
-def _gateway_cmd_port(command: str) -> int | None:
+def _gateway_cmd_port(cmd: str) -> int | None:
     import shlex
 
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(cmd)
     except ValueError:
-        tokens = command.split()
+        tokens = cmd.split()
 
     if "gateway" not in tokens:
         return None
@@ -275,13 +255,13 @@ def _gateway_cmd_port(command: str) -> int | None:
     return resolved
 
 
-def _is_nanobot_gateway_command(command: str) -> bool:
+def _is_nanobot_gateway_command(cmd: str) -> bool:
     import shlex
 
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(cmd)
     except ValueError:
-        tokens = command.split()
+        tokens = cmd.split()
 
     if "gateway" not in tokens:
         return False
@@ -310,19 +290,17 @@ def _is_gateway_process_on_port(pid: int, port: int) -> bool:
     if pid == os.getpid():
         return False
 
-    command = _command_for_pid(pid)
-    if not command:
+    cmd = command_for_pid(pid)
+    if not cmd:
         return False
 
     if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
-        cmd_port = _gateway_cmd_port(command)
-        return cmd_port == port
+        return _gateway_cmd_port(cmd) == port
 
-    if not _is_nanobot_gateway_command(command):
+    if not _is_nanobot_gateway_command(cmd):
         return False
 
-    cmd_port = _gateway_cmd_port(command)
-    return cmd_port == port
+    return _gateway_cmd_port(cmd) == port
 
 
 def _find_gateway_pids(port: int) -> list[int]:
@@ -330,14 +308,9 @@ def _find_gateway_pids(port: int) -> list[int]:
 
     pids: set[int] = set()
 
-    pid_file = _gateway_pid_path()
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _pid_alive(pid) and _is_gateway_process_on_port(pid, port):
-                pids.add(pid)
-        except ValueError:
-            pass
+    stored = read_pid_file(_gateway_pid_path())
+    if stored is not None and pid_alive(stored) and _is_gateway_process_on_port(stored, port):
+        pids.add(stored)
 
     result = subprocess.run(
         ["ps", "-eo", "pid=,command="],
@@ -356,22 +329,13 @@ def _find_gateway_pids(port: int) -> list[int]:
         if not parts:
             continue
         try:
-            pid = int(parts[0])
+            p = int(parts[0])
         except ValueError:
             continue
-        if _pid_alive(pid) and _is_gateway_process_on_port(pid, port):
-            pids.add(pid)
+        if pid_alive(p) and _is_gateway_process_on_port(p, port):
+            pids.add(p)
 
     return sorted(pids)
-
-
-def _signal_gateway_pid(pid: int, sig: int) -> None:
-    import os
-
-    try:
-        os.kill(pid, sig)
-    except OSError:
-        pass
 
 
 def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
@@ -383,21 +347,21 @@ def _stop_gateway_processes(port: int, timeout_s: float = 10.0) -> int:
         _gateway_pid_path().unlink(missing_ok=True)
         return 0
 
-    for pid in pids:
-        _signal_gateway_pid(pid, signal.SIGTERM)
+    for p in pids:
+        signal_pid(p, signal.SIGTERM)
 
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        remaining = [pid for pid in pids if _pid_alive(pid)]
+        remaining = [p for p in pids if pid_alive(p)]
         listeners = _find_gateway_pids(port)
         if not remaining and not listeners:
             break
         time.sleep(0.2)
     else:
-        for pid in [pid for pid in pids if _pid_alive(pid)]:
-            _signal_gateway_pid(pid, signal.SIGKILL)
-        for pid in _find_gateway_pids(port):
-            _signal_gateway_pid(pid, signal.SIGKILL)
+        for p in [p for p in pids if pid_alive(p)]:
+            signal_pid(p, signal.SIGKILL)
+        for p in _find_gateway_pids(port):
+            signal_pid(p, signal.SIGKILL)
 
     _gateway_pid_path().unlink(missing_ok=True)
     return len(pids)
@@ -411,6 +375,15 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
 
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from nanobot.config.loader import load_config
+    from nanobot.utils.helpers import migrate_runtime_layout
+
+    # Migrate old flat layout to new subdirectory layout before anything else
+    # creates new-layout directories (which would block the rename-based migration).
+    moved = migrate_runtime_layout()
+    if moved:
+        from loguru import logger
+        for old in moved:
+            logger.info("runtime layout migration: moved {}", old)
 
     config = load_config()
     if ensure_whatsapp and config.channels.whatsapp.enabled:
@@ -473,11 +446,19 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from nanobot.config.loader import load_config
+    from nanobot.utils.helpers import migrate_runtime_layout
 
     if verbose:
         import logging
 
         logging.basicConfig(level=logging.DEBUG)
+
+    # Migrate old flat layout to new subdirectory layout (one-shot, idempotent)
+    moved = migrate_runtime_layout()
+    if moved:
+        from loguru import logger
+        for old in moved:
+            logger.info("runtime layout migration: moved {}", old)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
@@ -610,6 +591,107 @@ def gateway(
         return
 
     _run_gateway_foreground(port, verbose, ensure_whatsapp=ensure_whatsapp)
+
+
+# ============================================================================
+# Config Commands
+# ============================================================================
+
+config_app = typer.Typer(help="Manage nanobot configuration")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("migrate-to-env")
+def config_migrate_to_env(
+    force: bool = typer.Option(False, "--force", help="Overwrite existing .env file"),
+):
+    """Migrate API keys and tokens from config.json to .env file.
+
+    Reads all secret values from config.json, writes them to ~/.nanobot/.env
+    (mode 0600), then zeros out those fields in config.json so the file
+    becomes safe to commit to version control.
+    """
+    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.providers.registry import PROVIDERS
+    from nanobot.utils.helpers import get_data_path
+
+    env_path = get_data_path() / ".env"
+    if env_path.exists() and not force:
+        console.print(f"[yellow].env already exists at {env_path}[/yellow]")
+        console.print("Use --force to overwrite it.")
+        raise typer.Exit(1)
+
+    # Load config without env override so we see what's currently in the JSON.
+    # We call load_config() which also loads .env, but provider keys already in
+    # config.json will be present; we collect everything that is non-empty.
+    config = load_config()
+
+    lines: list[str] = [
+        "# nanobot secrets — generated by: nanobot config migrate-to-env",
+        "# DO NOT COMMIT this file.",
+        "",
+        "# LLM Provider API Keys",
+    ]
+    migrated: list[str] = []
+
+    # Standard providers from registry
+    for spec in PROVIDERS:
+        provider = getattr(config.providers, spec.name, None)
+        if provider is None:
+            continue
+        key = (provider.api_key or "").strip()
+        if key:
+            lines.append(f"{spec.env_key}={key}")
+            migrated.append(spec.env_key)
+            provider.api_key = ""
+
+    # ElevenLabs (not in PROVIDERS)
+    el = config.providers.elevenlabs
+    el_key = (el.api_key or "").strip()
+    if el_key:
+        lines.append(f"ELEVENLABS_API_KEY={el_key}")
+        migrated.append("ELEVENLABS_API_KEY")
+        el.api_key = ""
+
+    lines += ["", "# Channel Tokens"]
+
+    tg_token = (config.channels.telegram.token or "").strip()
+    if tg_token:
+        lines.append(f"TELEGRAM_BOT_TOKEN={tg_token}")
+        migrated.append("TELEGRAM_BOT_TOKEN")
+        config.channels.telegram.token = ""
+
+    wa_token = (config.channels.whatsapp.bridge_token or "").strip()
+    if wa_token:
+        lines.append(f"WHATSAPP_BRIDGE_TOKEN={wa_token}")
+        migrated.append("WHATSAPP_BRIDGE_TOKEN")
+        config.channels.whatsapp.bridge_token = ""
+
+    lines += ["", "# Tool API Keys"]
+
+    search_key = (config.tools.web.search.api_key or "").strip()
+    if search_key:
+        lines.append(f"BRAVE_SEARCH_API_KEY={search_key}")
+        migrated.append("BRAVE_SEARCH_API_KEY")
+        config.tools.web.search.api_key = ""
+
+    if not migrated:
+        console.print("[yellow]No non-empty secrets found in config.json to migrate.[/yellow]")
+        return
+
+    env_content = "\n".join(lines) + "\n"
+    env_path.write_text(env_content, encoding="utf-8")
+    try:
+        env_path.chmod(0o600)
+    except OSError:
+        pass
+
+    save_config(config)
+
+    console.print(f"[green]✓[/green] Created {env_path}")
+    console.print(f"[green]✓[/green] Migrated {len(migrated)} secret(s): {', '.join(migrated)}")
+    console.print(f"[green]✓[/green] Zeroed out secrets in {get_config_path()}")
+    console.print("\n[dim]Add .env to your .gitignore. It is already excluded by the default .gitignore.[/dim]")
 
 
 # ============================================================================
@@ -987,19 +1069,13 @@ channels_app.add_typer(bridge_app, name="bridge")
 
 
 def _bridge_pid_path() -> Path:
-    from nanobot.config.loader import get_data_dir
-
-    run_dir = get_data_dir() / "run"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir / "whatsapp-bridge.pid"
+    from nanobot.utils.helpers import get_run_path
+    return get_run_path() / "whatsapp-bridge.pid"
 
 
 def _bridge_log_path() -> Path:
-    from nanobot.config.loader import get_data_dir
-
-    logs_dir = get_data_dir() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir / "whatsapp-bridge.log"
+    from nanobot.utils.helpers import get_logs_path
+    return get_logs_path() / "whatsapp-bridge.log"
 
 
 def _bridge_port_from_config() -> int:
@@ -1009,99 +1085,14 @@ def _bridge_port_from_config() -> int:
     return wa.resolved_bridge_port
 
 
-def _process_cwd(pid: int) -> Path | None:
-    proc_cwd = Path(f"/proc/{pid}/cwd")
-    try:
-        if proc_cwd.exists():
-            return proc_cwd.resolve()
-    except OSError:
-        return None
-    return None
-
-
-def _is_bridge_dir(path: Path) -> bool:
-    package_json = path / "package.json"
-    if not package_json.exists():
-        return False
-    try:
-        data = json.loads(package_json.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    return data.get("name") == "nanobot-whatsapp-bridge"
-
-
-def _is_bridge_process(pid: int) -> bool:
-    cmd = _command_for_pid(pid).lower()
-    if not cmd:
-        return False
-    cwd = _process_cwd(pid)
-    if cwd and _is_bridge_dir(cwd):
-        return True
-    return "nanobot-whatsapp-bridge" in cmd
-
-
-def _listener_pids_for_port(port: int) -> set[int]:
-    import shutil
-    import subprocess
-
-    listener_pids: set[int] = set()
-
-    if shutil.which("lsof"):
-        result = subprocess.run(
-            ["lsof", "-nP", "-tiTCP:{0}".format(port), "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pid = int(line)
-                    listener_pids.add(pid)
-                except ValueError:
-                    continue
-    return listener_pids
-
-
 def _find_bridge_pids(port: int) -> list[int]:
-    pids: set[int] = set(_listener_pids_for_port(port))
+    pids: set[int] = set(listener_pids_for_port(port))
 
-    pid_file = _bridge_pid_path()
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if _pid_alive(pid) and (pid in pids or _is_bridge_process(pid)):
-                pids.add(pid)
-        except ValueError:
-            pass
+    stored = read_pid_file(_bridge_pid_path())
+    if stored is not None and pid_alive(stored) and (stored in pids or is_bridge_process(stored)):
+        pids.add(stored)
 
-    return sorted(pid for pid in pids if _pid_alive(pid))
-
-
-def _signal_bridge_pid(pid: int, sig: int) -> None:
-    import os
-
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        pgid = None
-
-    # Prefer process-group signaling so npm wrappers + child node both stop.
-    current_pgid = os.getpgrp()
-    if pgid is not None and pgid > 0 and pgid != current_pgid:
-        try:
-            os.killpg(pgid, sig)
-            return
-        except OSError:
-            pass
-
-    try:
-        os.kill(pid, sig)
-    except OSError:
-        pass
+    return sorted(p for p in pids if pid_alive(p))
 
 
 def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
@@ -1113,25 +1104,24 @@ def _stop_bridge_processes(port: int, timeout_s: float = 8.0) -> int:
         _bridge_pid_path().unlink(missing_ok=True)
         return 0
 
-    stopped = 0
-    for pid in pids:
-        _signal_bridge_pid(pid, signal.SIGTERM)
+    # Prefer process-group signaling so npm wrappers + child node both stop.
+    for p in pids:
+        signal_process_group(p, signal.SIGTERM)
 
+    stopped = 0
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        remaining = [pid for pid in pids if _pid_alive(pid)]
+        remaining = [p for p in pids if pid_alive(p)]
         listeners = _find_bridge_pids(port)
         if not remaining and not listeners:
             stopped = len(pids)
             break
         time.sleep(0.2)
     else:
-        remaining = [pid for pid in pids if _pid_alive(pid)]
-        for pid in remaining:
-            _signal_bridge_pid(pid, signal.SIGKILL)
-        # Final sweep for any remaining listener process on the bridge port.
-        for pid in _find_bridge_pids(port):
-            _signal_bridge_pid(pid, signal.SIGKILL)
+        for p in [p for p in pids if pid_alive(p)]:
+            signal_process_group(p, signal.SIGKILL)
+        for p in _find_bridge_pids(port):
+            signal_process_group(p, signal.SIGKILL)
         stopped = len(pids)
 
     _bridge_pid_path().unlink(missing_ok=True)

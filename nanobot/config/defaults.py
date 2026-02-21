@@ -72,8 +72,8 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "enabled": True,
-    "incoming_dir": "~/.nanobot/media/incoming/whatsapp",
-    "outgoing_dir": "~/.nanobot/media/outgoing/whatsapp",
+    "incoming_dir": "~/.nanobot/var/media/incoming/whatsapp",
+    "outgoing_dir": "~/.nanobot/var/media/outgoing/whatsapp",
     "retention_days": 30,
     "describe_images": True,
     "pass_image_to_assistant": False,
@@ -94,7 +94,7 @@ DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
 DEFAULT_MEMORY: dict[str, Any] = {
     "enabled": True,
     "mode": "primary",
-    "db_path": "~/.nanobot/memory/memory.db",
+    "db_path": "~/.nanobot/data/memory/memory.db",
     "capture": {
         "enabled": True,
         "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],
