@@ -272,7 +272,7 @@ class RuntimeConfig(BaseModel):
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    tavily_api_key: str = ""  # Tavily API key (https://tavily.com)
     max_results: int = 5
 
 

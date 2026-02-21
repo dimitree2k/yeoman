@@ -302,7 +302,7 @@ def build_gateway_runtime(
         model=assistant_model,
         subagent_model=config.agents.defaults.subagent_model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        brave_api_key=config.tools.web.search.api_key or None,
+        tavily_api_key=config.tools.web.search.tavily_api_key or None,
         exec_config=exec_config,
         restrict_to_workspace=restrict_to_workspace,
         session_manager=session_manager,

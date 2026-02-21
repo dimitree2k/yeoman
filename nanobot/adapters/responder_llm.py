@@ -23,7 +23,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.core.models import InboundEvent, PolicyDecision
@@ -57,7 +57,7 @@ class LLMResponder(ResponderPort):
         model: str | None = None,
         subagent_model: str | None = None,
         max_iterations: int = 20,
-        brave_api_key: str | None = None,
+        tavily_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
@@ -75,7 +75,7 @@ class LLMResponder(ResponderPort):
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.max_iterations = max(1, int(max_iterations))
-        self.brave_api_key = brave_api_key
+        self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.memory = memory_service
@@ -102,7 +102,7 @@ class LLMResponder(ResponderPort):
             workspace=workspace,
             bus=bus,
             model=subagent_model_to_use,
-            brave_api_key=brave_api_key,
+            tavily_api_key=tavily_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
             file_access_resolver=file_access_resolver,
@@ -177,8 +177,9 @@ class LLMResponder(ResponderPort):
         self.tools.register(exec_tool)
         self.tools.register(PiStatsTool())
 
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
-        self.tools.register(WebFetchTool())
+        self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
+        self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
+        self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
 
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
         self.tools.register(message_tool)
