@@ -298,6 +298,7 @@ def build_gateway_runtime(
 
     openai_compat = resolve_openai_compatible_credentials(config)
     elevenlabs = config.providers.elevenlabs
+    openrouter = config.providers.openrouter
     tts = TTSSynthesizer(
         openai_api_key=openai_compat.api_key if openai_compat else None,
         openai_api_base=openai_compat.api_base if openai_compat else None,
@@ -307,6 +308,9 @@ def build_gateway_runtime(
         elevenlabs_extra_headers=elevenlabs.extra_headers,
         elevenlabs_default_voice_id=elevenlabs.voice_id,
         elevenlabs_default_model_id=elevenlabs.model_id,
+        openrouter_api_key=openrouter.api_key or None,
+        openrouter_api_base=openrouter.api_base,
+        openrouter_extra_headers=openrouter.extra_headers,
         max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
     )
 

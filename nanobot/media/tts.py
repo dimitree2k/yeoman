@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import re
 import uuid
@@ -251,6 +253,186 @@ class ElevenLabsTTSProvider:
         return bytes(response.content or b""), None
 
 
+_OPENROUTER_AUDIO_FORMATS = {"wav", "mp3", "flac", "opus", "pcm16"}
+
+# OpenAI only supports pcm16 when stream=true (all other formats require non-streaming,
+# but OpenRouter requires streaming for audio output).  We always request pcm16 and
+# convert to OGG/Opus ourselves so WhatsApp can play it as a voice note.
+_OPENROUTER_STREAM_FORMAT = "pcm16"
+_OPENROUTER_PCM_SAMPLE_RATE = 24_000  # OpenAI audio models output at 24 kHz
+
+
+def _pcm16_to_ogg_opus(pcm_data: bytes) -> bytes | None:
+    """Convert raw signed-16-bit LE mono PCM to OGG/Opus via ffmpeg subprocess.
+
+    Returns None if ffmpeg is not available or conversion fails.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as pcm_f:
+        pcm_f.write(pcm_data)
+        pcm_path = pcm_f.name
+    ogg_path = pcm_path + ".ogg"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "s16le",
+                "-ar", str(_OPENROUTER_PCM_SAMPLE_RATE),
+                "-ac", "1",
+                "-i", pcm_path,
+                "-c:a", "libopus",
+                "-b:a", "32k",
+                ogg_path,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error("ffmpeg PCM→OGG failed: {}", result.stderr.decode(errors="replace"))
+            return None
+        with open(ogg_path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.error("ffmpeg not found — cannot convert PCM16 to OGG/Opus")
+        return None
+    except Exception as e:
+        logger.error("ffmpeg PCM→OGG error {}: {}", e.__class__.__name__, e)
+        return None
+    finally:
+        for p in (pcm_path, ogg_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+class OpenRouterAudioTTSProvider:
+    """TTS via OpenRouter chat completions with audio output modality.
+
+    Uses the ``/chat/completions`` endpoint with ``modalities: ["audio"]``
+    and extracts base64-encoded audio from the response.  Compatible with
+    any OpenRouter model that supports audio output (e.g.
+    ``openai/gpt-4o-mini-audio-preview``, ``openai/gpt-audio``).
+    """
+
+    _SYSTEM_PROMPT = (
+        "You are a text-to-speech engine. "
+        "Speak the user's message exactly as provided, word for word, "
+        "with no additions, omissions, or commentary."
+    )
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        api_base: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        base = (api_base or "https://openrouter.ai/api/v1").rstrip("/")
+        self.api_url = base + "/chat/completions"
+        self.timeout_seconds = timeout_seconds
+        self.extra_headers = extra_headers
+
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        model: str,
+        voice: str,
+        format: str,
+    ) -> tuple[bytes | None, str | None]:
+        if not self.api_key:
+            logger.warning("OpenRouter API key not configured for audio TTS")
+            return None, "openrouter_audio_api_key_missing"
+
+        # OpenAI only allows pcm16 in streaming mode; we convert to OGG/Opus after.
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **(self.extra_headers or {}),
+        }
+        payload: dict[str, object] = {
+            "model": model,
+            "modalities": ["text", "audio"],
+            "audio": {"voice": voice, "format": _OPENROUTER_STREAM_FORMAT},
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": self._SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        }
+
+        audio_chunks: list[str] = []
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                ) as response:
+                    if response.status_code >= 400:
+                        raw = await response.aread()
+                        raw_text = raw.decode(errors="replace")
+                        # Unwrap nested provider error if present.
+                        detail = raw_text
+                        try:
+                            parsed = json.loads(raw_text)
+                            inner = parsed.get("error", {})
+                            metadata = inner.get("metadata", {})
+                            detail = (
+                                metadata.get("raw")
+                                or inner.get("message")
+                                or raw_text
+                            )
+                        except Exception:
+                            pass
+                        logger.error(
+                            "OpenRouter audio TTS HTTP {}: {}",
+                            response.status_code,
+                            detail,
+                        )
+                        return None, f"openrouter_audio_http_{response.status_code}"
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:]
+                        if data.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            delta = chunk["choices"][0]["delta"]
+                            audio = delta.get("audio")
+                            if audio and "data" in audio:
+                                audio_chunks.append(audio["data"])
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.error("OpenRouter audio TTS request failed {}: {}", e.__class__.__name__, e)
+            return None, f"openrouter_audio_request_failed:{e.__class__.__name__}"
+
+        if not audio_chunks:
+            logger.error("OpenRouter audio TTS: no audio data received in stream")
+            return None, "openrouter_audio_no_data"
+
+        try:
+            pcm_bytes = base64.b64decode("".join(audio_chunks))
+        except Exception as e:
+            logger.error("OpenRouter audio TTS failed to decode PCM16: {}", e)
+            return None, f"openrouter_audio_decode_failed:{e.__class__.__name__}"
+
+        ogg_bytes = _pcm16_to_ogg_opus(pcm_bytes)
+        if ogg_bytes is None:
+            return None, "openrouter_audio_pcm_convert_failed"
+        return ogg_bytes, None
+
+
 class TTSSynthesizer:
     """Synthesize speech using the route-selected TTS backend."""
 
@@ -265,6 +447,9 @@ class TTSSynthesizer:
         elevenlabs_extra_headers: dict[str, str] | None = None,
         elevenlabs_default_voice_id: str | None = None,
         elevenlabs_default_model_id: str | None = None,
+        openrouter_api_key: str | None = None,
+        openrouter_api_base: str | None = None,
+        openrouter_extra_headers: dict[str, str] | None = None,
         max_concurrency: int = 2,
     ) -> None:
         self._openai_api_key = openai_api_key
@@ -275,6 +460,9 @@ class TTSSynthesizer:
         self._elevenlabs_extra_headers = elevenlabs_extra_headers
         self._elevenlabs_default_voice_id = elevenlabs_default_voice_id
         self._elevenlabs_default_model_id = elevenlabs_default_model_id
+        self._openrouter_api_key = openrouter_api_key
+        self._openrouter_api_base = openrouter_api_base
+        self._openrouter_extra_headers = openrouter_extra_headers
         self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
 
     async def synthesize(
@@ -354,6 +542,17 @@ class TTSSynthesizer:
                 voice=voice_candidate,
                 format=format,
             )
+            return (audio or None), error
+
+        if provider in {"openrouter_audio"}:
+            model = profile.model or "openai/gpt-4o-mini-audio-preview"
+            client = OpenRouterAudioTTSProvider(
+                api_key=self._openrouter_api_key,
+                api_base=self._openrouter_api_base,
+                extra_headers=self._openrouter_extra_headers,
+                timeout_seconds=timeout_s,
+            )
+            audio, error = await client.synthesize(text=text, model=model, voice=voice, format=format)
             return (audio or None), error
 
         return None, f"tts_provider_unsupported:{provider}"
