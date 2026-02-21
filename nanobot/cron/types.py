@@ -21,12 +21,23 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn"] = "agent_turn"
+    kind: Literal["system_event", "agent_turn", "voice_broadcast"] = "agent_turn"
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    # Voice broadcast settings (kind=voice_broadcast)
+    voice_messages: list[str] = field(default_factory=list)
+    voice_random: bool = False
+    voice_group: str | None = None
+    voice_chat_id: str | None = None
+    voice_channel: str | None = None
+    voice_name: str | None = None
+    voice_tts_route: str | None = None
+    voice_verbatim: bool = True
+    voice_max_sentences: int | None = None
+    voice_max_chars: int | None = None
 
 
 @dataclass

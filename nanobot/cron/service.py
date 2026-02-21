@@ -80,6 +80,16 @@ class CronService:
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
                             to=j["payload"].get("to"),
+                            voice_messages=list(j["payload"].get("voiceMessages", []) or []),
+                            voice_random=bool(j["payload"].get("voiceRandom", False)),
+                            voice_group=j["payload"].get("voiceGroup"),
+                            voice_chat_id=j["payload"].get("voiceChatId"),
+                            voice_channel=j["payload"].get("voiceChannel"),
+                            voice_name=j["payload"].get("voiceName"),
+                            voice_tts_route=j["payload"].get("voiceTtsRoute"),
+                            voice_verbatim=bool(j["payload"].get("voiceVerbatim", True)),
+                            voice_max_sentences=j["payload"].get("voiceMaxSentences"),
+                            voice_max_chars=j["payload"].get("voiceMaxChars"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -127,6 +137,16 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
+                        "voiceMessages": list(j.payload.voice_messages),
+                        "voiceRandom": j.payload.voice_random,
+                        "voiceGroup": j.payload.voice_group,
+                        "voiceChatId": j.payload.voice_chat_id,
+                        "voiceChannel": j.payload.voice_channel,
+                        "voiceName": j.payload.voice_name,
+                        "voiceTtsRoute": j.payload.voice_tts_route,
+                        "voiceVerbatim": j.payload.voice_verbatim,
+                        "voiceMaxSentences": j.payload.voice_max_sentences,
+                        "voiceMaxChars": j.payload.voice_max_chars,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -290,6 +310,65 @@ class CronService:
         self._arm_timer()
 
         logger.info(f"Cron: added job '{name}' ({job.id})")
+        return job
+
+    def add_voice_job(
+        self,
+        *,
+        name: str,
+        schedule: CronSchedule,
+        messages: list[str],
+        randomize: bool = False,
+        group: str | None = None,
+        chat_id: str | None = None,
+        channel: str | None = "whatsapp",
+        voice: str | None = None,
+        tts_route: str | None = None,
+        verbatim: bool = True,
+        max_sentences: int | None = None,
+        max_chars: int | None = None,
+        delete_after_run: bool = False,
+    ) -> CronJob:
+        """Add a new voice broadcast cron job."""
+        cleaned_messages = [str(m).strip() for m in messages if str(m).strip()]
+        if not cleaned_messages:
+            raise ValueError("voice job requires at least one non-empty message")
+        if not str(group or "").strip() and not str(chat_id or "").strip():
+            raise ValueError("voice job requires either group or chat_id target")
+
+        store = self._load_store()
+        now = _now_ms()
+
+        job = CronJob(
+            id=str(uuid.uuid4())[:8],
+            name=name,
+            enabled=True,
+            schedule=schedule,
+            payload=CronPayload(
+                kind="voice_broadcast",
+                message=cleaned_messages[0],
+                voice_messages=cleaned_messages,
+                voice_random=bool(randomize),
+                voice_group=str(group or "").strip() or None,
+                voice_chat_id=str(chat_id or "").strip() or None,
+                voice_channel=str(channel or "").strip() or None,
+                voice_name=str(voice or "").strip() or None,
+                voice_tts_route=str(tts_route or "").strip() or None,
+                voice_verbatim=bool(verbatim),
+                voice_max_sentences=max_sentences,
+                voice_max_chars=max_chars,
+            ),
+            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
+            created_at_ms=now,
+            updated_at_ms=now,
+            delete_after_run=delete_after_run,
+        )
+
+        store.jobs.append(job)
+        self._save_store()
+        self._arm_timer()
+
+        logger.info(f"Cron: added voice job '{name}' ({job.id})")
         return job
 
     def remove_job(self, job_id: str) -> bool:

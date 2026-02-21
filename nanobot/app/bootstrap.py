@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, assert_never
@@ -369,6 +370,44 @@ def build_gateway_runtime(
     )
 
     async def on_cron_job(job: CronJob) -> str | None:
+        if job.payload.kind == "voice_broadcast":
+            phrases = [str(v).strip() for v in list(job.payload.voice_messages) if str(v).strip()]
+            if not phrases and str(job.payload.message or "").strip():
+                phrases = [str(job.payload.message).strip()]
+            if not phrases:
+                raise ValueError("voice_broadcast job has no message candidates")
+
+            content = random.choice(phrases) if job.payload.voice_random else phrases[0]
+            args: dict[str, object] = {"content": content}
+            if job.payload.voice_verbatim:
+                args["verbatim"] = True
+            if job.payload.voice_name:
+                args["voice"] = job.payload.voice_name
+            if job.payload.voice_tts_route:
+                args["tts_route"] = job.payload.voice_tts_route
+            if job.payload.voice_max_sentences is not None:
+                args["max_sentences"] = int(job.payload.voice_max_sentences)
+            if job.payload.voice_max_chars is not None:
+                args["max_chars"] = int(job.payload.voice_max_chars)
+
+            voice_channel = str(job.payload.voice_channel or "").strip() or "whatsapp"
+            args["channel"] = voice_channel
+            if str(job.payload.voice_group or "").strip():
+                args["group"] = str(job.payload.voice_group).strip()
+            else:
+                chat_target = (
+                    str(job.payload.voice_chat_id or "").strip()
+                    or str(job.payload.to or "").strip()
+                )
+                if not chat_target:
+                    raise ValueError("voice_broadcast job has no target chat")
+                args["chat_id"] = chat_target
+
+            result = await responder.tools.execute("send_voice", args)
+            if str(result).startswith("Error:"):
+                raise RuntimeError(str(result))
+            return str(result)
+
         response = await responder.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",

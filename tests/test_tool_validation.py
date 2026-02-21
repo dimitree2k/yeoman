@@ -39,6 +39,8 @@ from nanobot.core.intents import SendOutboundIntent
 from nanobot.core.models import InboundEvent, PolicyDecision
 from nanobot.core.orchestrator import Orchestrator
 from nanobot.core.ports import PolicyPort, ResponderPort
+from nanobot.cron.service import CronService
+from nanobot.cron.types import CronSchedule
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.security.engine import SecurityEngine
 from nanobot.security.normalize import normalize_text
@@ -203,6 +205,38 @@ async def test_send_voice_tool_rejects_non_whatsapp_group_target() -> None:
     tool = SendVoiceTool(send_callback=None)
     result = await tool.execute(content="Hi", channel="telegram", group="Finanzgruppe")
     assert result == "Error: `group` is supported only for WhatsApp"
+
+
+def test_cron_service_add_voice_job_persists_payload(tmp_path: Path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    created = service.add_voice_job(
+        name="Weekly Fun Voice",
+        schedule=CronSchedule(kind="cron", expr="0 12 * * 1"),
+        messages=["moin ihr rabauken", "was geht in der gruppe"],
+        randomize=True,
+        group="Finanzgruppe",
+        channel="whatsapp",
+        voice="alloy",
+        tts_route="whatsapp.tts.speak",
+        verbatim=True,
+    )
+
+    assert created.payload.kind == "voice_broadcast"
+    assert created.payload.voice_random is True
+    assert created.payload.voice_group == "Finanzgruppe"
+    assert created.payload.voice_messages == ["moin ihr rabauken", "was geht in der gruppe"]
+
+    reloaded = CronService(store_path).list_jobs(include_disabled=True)
+    assert len(reloaded) == 1
+    payload = reloaded[0].payload
+    assert payload.kind == "voice_broadcast"
+    assert payload.voice_group == "Finanzgruppe"
+    assert payload.voice_random is True
+    assert payload.voice_messages == ["moin ihr rabauken", "was geht in der gruppe"]
+    assert payload.voice_name == "alloy"
+    assert payload.voice_tts_route == "whatsapp.tts.speak"
 
 
 async def test_exec_tool_blocks_dangerous_command(tmp_path: Path) -> None:
