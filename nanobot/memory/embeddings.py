@@ -46,7 +46,7 @@ class MemoryEmbeddingService:
     def _create_provider(self, model: str) -> LiteLLMProvider:
         provider_cfg = self._config.get_provider(model)
         api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
-        api_base = self._config.get_api_base(model)
+        api_base = provider_cfg.api_base if provider_cfg else None
         extra_headers = provider_cfg.extra_headers if provider_cfg else None
         return LiteLLMProvider(
             api_key=api_key,

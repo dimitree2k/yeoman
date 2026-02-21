@@ -156,7 +156,7 @@ def _make_provider(config):
         raise typer.Exit(1)
     return LiteLLMProvider(
         api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
+        api_base=p.api_base if p else None,
         default_model=model,
         extra_headers=p.extra_headers if p else None,
     )

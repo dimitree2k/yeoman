@@ -22,7 +22,7 @@ class ProviderFactory:
         """Create a provider bound to the supplied model route."""
         provider_cfg = self.config.get_provider(model)
         api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
-        api_base = self.config.get_api_base(model)
+        api_base = provider_cfg.api_base if provider_cfg else None
         extra_headers = provider_cfg.extra_headers if provider_cfg else None
         return LiteLLMProvider(
             api_key=api_key,
