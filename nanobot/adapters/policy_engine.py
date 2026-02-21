@@ -179,6 +179,21 @@ class EnginePolicyAdapter(PolicyPort):
         values = self._engine.policy.owners.get(channel, [])
         return [str(v).strip() for v in values if str(v).strip()]
 
+    def resolve_whatsapp_group(self, reference: str) -> tuple[str | None, str | None]:
+        """Resolve one WhatsApp group reference (alias/name/chat id) to chat id."""
+        target = str(reference or "").strip()
+        if not target:
+            return None, "group reference cannot be empty"
+        if " " not in target and target.endswith("@g.us"):
+            return target, None
+        if self._policy_admin_service is None:
+            return None, "group resolver unavailable: policy admin service is not configured"
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return None, "group resolver unavailable: policy is not loaded"
+        return self._policy_admin_service.resolve_group_reference(target, policy=policy)
+
     def _stat_mtime_ns(self) -> int | None:
         if self._policy_path is None:
             return None
@@ -586,6 +601,7 @@ class EnginePolicyAdapter(PolicyPort):
             "- /commands [all] — list available commands",
             "- /reset — clear conversation history for this chat",
             "- /voicemessages <status|on|off|in_kind|always|text|inherit>",
+            "- !voice-send <here|chat_id|group_alias> <text> — owner raw voice send (no LLM paraphrase)",
         ]
         if self.panic_is_applicable(ctx):
             lines.append("- /panic [now] — emergency stop gateway + WhatsApp bridge")

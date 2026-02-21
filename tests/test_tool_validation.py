@@ -19,11 +19,14 @@ from nanobot.agent.tools.exec_isolation import (
     SandboxTimeoutError,
 )
 from nanobot.agent.tools.filesystem import ReadFileTool
+from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import _validate_url
 from nanobot.app.bootstrap import _resolve_security_tool_settings
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import (
     _atomic_write_config,
@@ -124,6 +127,82 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+@pytest.mark.asyncio
+async def test_message_tool_resolves_whatsapp_group_reference() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    def _resolve_group(reference: str) -> tuple[str | None, str | None]:
+        if reference == "Finanzgruppe":
+            return "491786127564-1611913127@g.us", None
+        return None, "unknown group reference"
+
+    tool = MessageTool(
+        send_callback=_send,
+        default_channel="whatsapp",
+        default_chat_id="34596062240904@lid",
+        group_resolver=_resolve_group,
+    )
+    result = await tool.execute(content="Ping", group="Finanzgruppe")
+
+    assert result == "Message sent to whatsapp:491786127564-1611913127@g.us"
+    assert len(sent) == 1
+    assert sent[0].channel == "whatsapp"
+    assert sent[0].chat_id == "491786127564-1611913127@g.us"
+    assert sent[0].content == "Ping"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_tool_resolves_group_and_forwards_request() -> None:
+    calls: list[VoiceSendRequest] = []
+
+    async def _send_voice(req: VoiceSendRequest) -> str:
+        calls.append(req)
+        return f"Voice message sent to {req.channel}:{req.chat_id}"
+
+    def _resolve_group(reference: str) -> tuple[str | None, str | None]:
+        if reference == "Finanzgruppe":
+            return "491786127564-1611913127@g.us", None
+        return None, "unknown group reference"
+
+    tool = SendVoiceTool(
+        send_callback=_send_voice,
+        default_channel="whatsapp",
+        default_chat_id="34596062240904@lid",
+        group_resolver=_resolve_group,
+    )
+    result = await tool.execute(
+        content="Kurzes Update",
+        group="Finanzgruppe",
+        voice="alloy",
+        tts_route="whatsapp.tts.speak",
+        max_sentences=2,
+        max_chars=120,
+    )
+
+    assert result == "Voice message sent to whatsapp:491786127564-1611913127@g.us"
+    assert len(calls) == 1
+    assert calls[0] == VoiceSendRequest(
+        channel="whatsapp",
+        chat_id="491786127564-1611913127@g.us",
+        content="Kurzes Update",
+        voice="alloy",
+        tts_route="whatsapp.tts.speak",
+        reply_to=None,
+        max_sentences=2,
+        max_chars=120,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_voice_tool_rejects_non_whatsapp_group_target() -> None:
+    tool = SendVoiceTool(send_callback=None)
+    result = await tool.execute(content="Hi", channel="telegram", group="Finanzgruppe")
+    assert result == "Error: `group` is supported only for WhatsApp"
 
 
 async def test_exec_tool_blocks_dangerous_command(tmp_path: Path) -> None:
@@ -454,6 +533,50 @@ class _ToolProvider(LLMProvider):
         return "dummy/model"
 
 
+class _CountingProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> LLMResponse:
+        del messages, tools, model, max_tokens, temperature
+        self.calls += 1
+        return LLMResponse(content="llm-called")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+class _FakeModelRouter:
+    def resolve(self, task_key: str, channel: str | None = None) -> object:
+        del task_key, channel
+        return object()
+
+
+class _FakeTTS:
+    def __init__(self) -> None:
+        self.last_text = ""
+
+    async def synthesize_with_status(
+        self,
+        text: str,
+        *,
+        profile: object,
+        voice: str,
+        format: str,
+    ) -> tuple[bytes | None, str | None]:
+        del profile, voice, format
+        self.last_text = text
+        return b"voice-bytes", None
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_blocks_input_before_responder() -> None:
     security = SecurityEngine(SecurityConfig())
@@ -482,7 +605,11 @@ async def test_orchestrator_blocks_input_before_responder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_responder_blocks_tool_call_via_security(tmp_path: Path) -> None:
+async def test_responder_blocks_tool_call_via_security(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
@@ -499,6 +626,84 @@ async def test_responder_blocks_tool_call_via_security(tmp_path: Path) -> None:
 
     assert out == "done"
     assert "blocked by security middleware" in provider.last_tool_result.lower()
+
+
+@pytest.mark.asyncio
+async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bus = MessageBus()
+    provider = _CountingProvider()
+    tts = _FakeTTS()
+
+    def _resolve_group(reference: str) -> tuple[str | None, str | None]:
+        if reference == "Finanzgruppe":
+            return "491786127564-1611913127@g.us", None
+        return None, "unknown group reference"
+
+    responder = LLMResponder(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        group_resolver=_resolve_group,
+        model_router=_FakeModelRouter(),  # type: ignore[arg-type]
+        tts=tts,  # type: ignore[arg-type]
+        whatsapp_tts_outgoing_dir=tmp_path,
+    )
+
+    out = await responder.process_direct(
+        '!voice-send Finanzgruppe "hey ihr penner! was geht?"',
+        session_key="whatsapp:34596062240904@lid",
+        channel="whatsapp",
+        chat_id="34596062240904@lid",
+        is_owner=True,
+    )
+    await responder.aclose()
+
+    assert out == "done"
+    assert provider.calls == 0
+    assert tts.last_text == "hey ihr penner! was geht?"
+    outbound = await bus.consume_outbound()
+    assert outbound.channel == "whatsapp"
+    assert outbound.chat_id == "491786127564-1611913127@g.us"
+    assert outbound.content == ""
+    assert len(outbound.media) == 1
+    assert Path(outbound.media[0]).exists()
+
+
+@pytest.mark.asyncio
+async def test_non_owner_raw_voice_send_does_not_bypass_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bus = MessageBus()
+    provider = _CountingProvider()
+
+    responder = LLMResponder(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+    )
+
+    out = await responder.process_direct(
+        "!voice-send here hi",
+        session_key="whatsapp:34596062240904@lid",
+        channel="whatsapp",
+        chat_id="34596062240904@lid",
+        is_owner=False,
+    )
+    await responder.aclose()
+
+    assert out == "llm-called"
+    assert provider.calls == 1
+    assert bus.outbound_size == 0
 
 
 def test_workspace_path_relative_is_scoped_under_nanobot_home(

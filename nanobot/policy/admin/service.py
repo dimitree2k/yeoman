@@ -423,6 +423,7 @@ class PolicyAdminService:
                     "alias": self._chat_alias(chat_id),
                     "in_policy": False,
                     "comment": "",
+                    "tags": [],
                     "seen_session": False,
                     "seen_log": False,
                     "seen_bridge": False,
@@ -441,6 +442,13 @@ class PolicyAdminService:
                 comment = (override.comment or "").strip()
                 if comment:
                     rec["comment"] = comment
+                tags: list[str] = []
+                for raw in list(override.group_tags or []):
+                    tag = str(raw or "").strip()
+                    if tag and tag not in tags:
+                        tags.append(tag)
+                if tags:
+                    rec["tags"] = tags
 
         base_dir = self._policy_path.parent
         sessions_dir = base_dir / "sessions"
@@ -498,6 +506,16 @@ class PolicyAdminService:
         if len(by_alias) > 1:
             return None, by_alias
 
+        by_tag = [
+            chat_id
+            for chat_id, rec in records.items()
+            if target in {str(tag).strip() for tag in list(rec.get("tags", []))}
+        ]
+        if len(by_tag) == 1:
+            return by_tag[0], []
+        if len(by_tag) > 1:
+            return None, by_tag
+
         exact_comment = [
             chat_id
             for chat_id, rec in records.items()
@@ -519,6 +537,16 @@ class PolicyAdminService:
         if len(ci_comment) > 1:
             return None, ci_comment
 
+        ci_tag = [
+            chat_id
+            for chat_id, rec in records.items()
+            if lowered in {str(tag).strip().lower() for tag in list(rec.get("tags", []))}
+        ]
+        if len(ci_tag) == 1:
+            return ci_tag[0], []
+        if len(ci_tag) > 1:
+            return None, ci_tag
+
         bridge_hits = [
             chat_id for chat_id, subject in self._bridge_subject_cache.items() if subject.strip().lower() == lowered
         ]
@@ -527,7 +555,71 @@ class PolicyAdminService:
         if len(bridge_hits) > 1:
             return None, bridge_hits
 
+        lowered_compact = re.sub(r"[\W_]+", "", lowered)
+        if len(lowered_compact) >= 4:
+            partial_hits: set[str] = set()
+
+            def _matches_value(value: str) -> bool:
+                raw = str(value or "").strip().lower()
+                if not raw:
+                    return False
+                if lowered in raw:
+                    return True
+                raw_compact = re.sub(r"[\W_]+", "", raw)
+                if not raw_compact:
+                    return False
+                return lowered_compact in raw_compact
+
+            for chat_id, rec in records.items():
+                alias = str(rec.get("alias") or "")
+                comment = str(rec.get("comment") or "")
+                subject = str(self._bridge_subject_cache.get(chat_id, "") or "")
+                tags = [str(tag or "") for tag in list(rec.get("tags", []))]
+                if (
+                    _matches_value(alias)
+                    or _matches_value(comment)
+                    or _matches_value(subject)
+                    or any(_matches_value(tag) for tag in tags)
+                ):
+                    partial_hits.add(chat_id)
+
+            if len(partial_hits) == 1:
+                return next(iter(partial_hits)), []
+            if len(partial_hits) > 1:
+                return None, sorted(partial_hits)
+
         return None, []
+
+    def resolve_group_reference(
+        self,
+        query: str,
+        *,
+        policy: PolicyConfig | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve one WhatsApp group reference used by non-admin surfaces."""
+        target = str(query or "").strip()
+        if not target:
+            return None, "group reference cannot be empty"
+        if " " not in target and target.endswith("@g.us"):
+            return target, None
+
+        try:
+            effective_policy = policy or load_policy(self._policy_path)
+        except Exception as e:
+            return None, f"failed to load policy: {e}"
+
+        records = self._discover_groups(effective_policy)
+        if not records:
+            return None, "no WhatsApp groups discovered yet"
+
+        resolved, ambiguous = self._match_group_query(target, records)
+        if resolved is not None:
+            return resolved, None
+        if ambiguous:
+            matches = ", ".join(ambiguous[:3])
+            suffix = " ..." if len(ambiguous) > 3 else ""
+            return None, f"group reference is ambiguous: {target} ({matches}{suffix})"
+        return None, f"unknown group reference: {target}"
 
     @staticmethod
     def _source_layer(policy: PolicyConfig, chat_id: str, field_name: str) -> str:
@@ -590,7 +682,14 @@ class PolicyAdminService:
         for rec in records.values():
             chat_id = str(rec["chat_id"])
             comment = str(rec["comment"] or "")
-            if query and query not in chat_id.lower() and query not in comment.lower() and query not in str(rec["alias"]):
+            tags_joined = " ".join(str(tag).lower() for tag in list(rec.get("tags", [])))
+            if (
+                query
+                and query not in chat_id.lower()
+                and query not in comment.lower()
+                and query not in str(rec["alias"]).lower()
+                and query not in tags_joined
+            ):
                 continue
             rows.append(rec)
 
@@ -627,10 +726,12 @@ class PolicyAdminService:
             chat_id = str(rec["chat_id"])
             alias = str(rec["alias"])
             comment = str(rec["comment"] or "")
+            tags = [str(tag).strip() for tag in list(rec.get("tags", [])) if str(tag).strip()]
+            tags_suffix = f" | tags: {', '.join(tags)}" if tags else ""
             if comment:
-                lines.append(f"- {alias} | {chat_id} | {source_text} | {comment}")
+                lines.append(f"- {alias} | {chat_id} | {source_text} | {comment}{tags_suffix}")
             else:
-                lines.append(f"- {alias} | {chat_id} | {source_text}")
+                lines.append(f"- {alias} | {chat_id} | {source_text}{tags_suffix}")
 
         if len(rows) > max_rows:
             lines.append(f"... and {len(rows) - max_rows} more")
@@ -675,12 +776,14 @@ class PolicyAdminService:
             rec = records.get(resolved, {})
             alias = str(rec.get("alias") or self._chat_alias(resolved))
             comment = str(rec.get("comment") or "").strip()
+            tags = [str(tag).strip() for tag in list(rec.get("tags", [])) if str(tag).strip()]
+            tags_suffix = f" | tags: {', '.join(tags)}" if tags else ""
             suffix = f" | {comment}" if comment else ""
             return self._result(
                 outcome="noop",
                 actor=actor,
                 command_name="resolve-group",
-                message=f"Resolved '{query}' -> {resolved} ({alias}){suffix}",
+                message=f"Resolved '{query}' -> {resolved} ({alias}){suffix}{tags_suffix}",
             )
 
         if ambiguous:

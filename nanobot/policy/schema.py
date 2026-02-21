@@ -176,6 +176,7 @@ class ChatPolicy(PolicyModel):
         default_factory=AllowedToolsPolicy, alias="allowedTools"
     )
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
+    group_tags: list[str] = Field(default_factory=list, alias="groupTags")
     persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicy = Field(default_factory=VoicePolicy)
     talkative_cooldown: TalkativeCooldownPolicy = Field(
@@ -193,6 +194,7 @@ class ChatPolicyOverride(PolicyModel):
     )
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
+    group_tags: list[str] | None = Field(default=None, alias="groupTags")
     persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicyOverride | None = None
     talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(

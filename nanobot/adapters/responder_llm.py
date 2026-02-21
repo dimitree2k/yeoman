@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -30,10 +32,13 @@ from nanobot.core.models import InboundEvent, PolicyDecision
 from nanobot.core.ports import ResponderPort, SecurityPort, TelemetryPort
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
+from nanobot.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
     from nanobot.cron.service import CronService
+    from nanobot.media.router import ModelRouter
+    from nanobot.media.tts import TTSSynthesizer
     from nanobot.memory.service import MemoryService
 
 
@@ -67,6 +72,11 @@ class LLMResponder(ResponderPort):
         security: SecurityPort | None = None,
         owner_alert_resolver: "callable[[str], list[str]] | None" = None,
         file_access_resolver: FileAccessResolver | None = None,
+        group_resolver: "callable[[str], tuple[str | None, str | None]] | None" = None,
+        model_router: "ModelRouter | None" = None,
+        tts: "TTSSynthesizer | None" = None,
+        whatsapp_tts_outgoing_dir: Path | None = None,
+        whatsapp_tts_max_raw_bytes: int = 160 * 1024,
     ) -> None:
         from nanobot.config.schema import ExecToolConfig
 
@@ -83,6 +93,11 @@ class LLMResponder(ResponderPort):
         self.security = security
         self.owner_alert_resolver = owner_alert_resolver
         self.file_access_resolver = file_access_resolver
+        self.group_resolver = group_resolver
+        self._model_router = model_router
+        self._tts = tts
+        self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
+        self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._seen_chats: set[str] = set()
         self._seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
         self._load_seen_chats()
@@ -181,8 +196,17 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
 
-        message_tool = MessageTool(send_callback=self.bus.publish_outbound)
+        message_tool = MessageTool(
+            send_callback=self.bus.publish_outbound,
+            group_resolver=self._resolve_group_reference,
+        )
         self.tools.register(message_tool)
+        self.tools.register(
+            SendVoiceTool(
+                send_callback=self._send_voice_message,
+                group_resolver=self._resolve_group_reference,
+            )
+        )
 
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
@@ -209,6 +233,10 @@ class LLMResponder(ResponderPort):
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(channel, chat_id)
 
+        send_voice_tool = self.tools.get("send_voice")
+        if isinstance(send_voice_tool, SendVoiceTool):
+            send_voice_tool.set_context(channel, chat_id)
+
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(channel, chat_id)
@@ -222,6 +250,62 @@ class LLMResponder(ResponderPort):
             cron_tool.set_context(channel, chat_id)
 
     @staticmethod
+    def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:
+        compact = str(content or "").strip()
+        if not compact:
+            return None
+        lowered = compact.lower()
+        if not (lowered.startswith("!voice-send") or lowered.startswith("!voice_send")):
+            return None
+        try:
+            tokens = shlex.split(compact)
+        except ValueError:
+            return "", ""
+        if len(tokens) < 3:
+            return "", ""
+        target = str(tokens[1] or "").strip()
+        text = " ".join(tokens[2:]).strip()
+        if not target or not text:
+            return "", ""
+        return target, text
+
+    async def _maybe_handle_owner_raw_voice_command(
+        self,
+        *,
+        channel: str,
+        content: str,
+        is_owner: bool,
+    ) -> str | None:
+        if not is_owner:
+            return None
+        parsed = self._parse_owner_raw_voice_command(content)
+        if parsed is None:
+            return None
+        target, text = parsed
+        if not target or not text:
+            return "Usage: !voice-send <here|chat_id|group_alias> <text>"
+        if channel != "whatsapp":
+            return "Error: !voice-send currently supports only WhatsApp sessions"
+
+        args: dict[str, Any] = {"content": text}
+        args["verbatim"] = True
+        target_lower = target.lower()
+        if target_lower not in {"here", "this", "current"}:
+            if "@" in target:
+                args["chat_id"] = target
+            else:
+                args["group"] = target
+
+        result = await self._execute_tool(
+            "send_voice",
+            args,
+            is_owner=True,
+        )
+        if str(result).startswith("Error:"):
+            return result
+        return "done"
+
+    @staticmethod
     def _route_for_event(event: InboundEvent) -> tuple[str, str]:
         if event.channel != "system":
             return event.channel, event.chat_id
@@ -231,6 +315,82 @@ class LLMResponder(ResponderPort):
         if not channel or not chat_id:
             return "cli", event.chat_id
         return channel, chat_id
+
+    def _resolve_group_reference(self, reference: str) -> tuple[str | None, str | None]:
+        resolver = self.group_resolver
+        if resolver is None:
+            return None, "WhatsApp group resolver is not configured"
+        try:
+            return resolver(reference)
+        except Exception as e:
+            return None, f"group resolver failed: {e}"
+
+    def _resolve_tts_profile(self, *, route: str, channel: str) -> object | None:
+        if self._model_router is None:
+            return None
+        task_key = str(route or "").strip() or "tts.speak"
+        if task_key.startswith(f"{channel}."):
+            return self._model_router.resolve(task_key)
+        return self._model_router.resolve(task_key, channel=channel)
+
+    async def _send_voice_message(self, request: VoiceSendRequest) -> str:
+        channel = str(request.channel or "").strip()
+        chat_id = str(request.chat_id or "").strip()
+        content = str(request.content or "").strip()
+        if not channel or not chat_id:
+            return "Error: Missing target channel/chat for voice sending"
+        if channel != "whatsapp":
+            return "Error: send_voice currently supports only WhatsApp"
+        if not content:
+            return "Error: Voice content is empty"
+        if self._tts is None or self._whatsapp_tts_outgoing_dir is None:
+            return "Error: Voice sending runtime is not configured"
+
+        route = str(request.tts_route or "").strip() or "tts.speak"
+        profile = self._resolve_tts_profile(route=route, channel=channel)
+        if profile is None:
+            return f"Error: TTS route is unresolved: {route}"
+
+        voice = str(request.voice or "").strip() or "alloy"
+        if request.verbatim:
+            limited = content
+        else:
+            max_sentences = max(1, int(request.max_sentences or 3))
+            max_chars = max(1, int(request.max_chars or 260))
+            plain = strip_markdown_for_tts(content)
+            limited = truncate_for_voice(plain, max_sentences=max_sentences, max_chars=max_chars)
+        if not limited:
+            return "Error: Nothing to synthesize after normalization"
+
+        try:
+            audio, tts_error = await self._tts.synthesize_with_status(
+                limited,
+                profile=profile,  # type: ignore[arg-type]
+                voice=voice,
+                format="opus",
+            )
+        except Exception as e:
+            return f"Error: TTS synthesis failed ({e.__class__.__name__})"
+        if not audio:
+            return f"Error: TTS synthesis failed ({tts_error or 'empty audio'})"
+        if len(audio) > self._whatsapp_tts_max_raw_bytes:
+            return (
+                "Error: Synthesized audio too large "
+                f"({len(audio)} bytes > {self._whatsapp_tts_max_raw_bytes})"
+            )
+
+        out_dir = self._whatsapp_tts_outgoing_dir / "tts"
+        path = write_tts_audio_file(out_dir, audio, ext=".ogg")
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                reply_to=str(request.reply_to or "").strip() or None,
+                media=[str(path)],
+            )
+        )
+        return f"Voice message sent to {channel}:{chat_id}"
 
     @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
@@ -647,65 +807,73 @@ class LLMResponder(ResponderPort):
             except Exception as e:
                 logger.warning("memory wal pre-write failed: {}", e)
 
-        retrieved_memory_text = ""
-        retrieved_hits_count = 0
-        if self.memory is not None:
-            try:
-                retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
+        owner_raw_voice_reply = await self._maybe_handle_owner_raw_voice_command(
+            channel=channel,
+            content=content,
+            is_owner=is_owner,
+        )
+        if owner_raw_voice_reply is not None:
+            final_content = owner_raw_voice_reply
+        else:
+            retrieved_memory_text = ""
+            retrieved_hits_count = 0
+            if self.memory is not None:
+                try:
+                    retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
+                        channel=channel,
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        query=content,
+                        reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
+                    )
+                    retrieved_hits_count = len(retrieved_hits)
+                except Exception as e:
+                    logger.warning("memory recall failed: {}", e)
+
+                if retrieved_hits_count > 0:
+                    self._metric("memory_recall_hit")
+                else:
+                    self._metric("memory_recall_miss")
+                if retrieved_memory_text:
+                    self._metric("memory_prompt_chars", len(retrieved_memory_text))
+
+            talkative_reply = await self._maybe_talkative_cooldown_reply(
+                session_key=session_key,
+                sender_id=sender_id,
+                content=content,
+                metadata=metadata,
+                enabled=talkative_cooldown_enabled,
+                streak_threshold=talkative_cooldown_streak_threshold,
+                topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
+                cooldown_seconds=talkative_cooldown_cooldown_seconds,
+                delay_seconds=talkative_cooldown_delay_seconds,
+                use_llm_message=talkative_cooldown_use_llm_message,
+            )
+            if talkative_reply is not None:
+                final_content = talkative_reply
+            else:
+                messages = self.context.build_messages(
+                    history=session.get_history(),
+                    current_message=content,
+                    current_metadata=metadata,
+                    retrieved_memory_text=retrieved_memory_text,
+                    persona_text=persona_text,
+                    media=list(media),
                     channel=channel,
                     chat_id=chat_id,
-                    sender_id=sender_id,
-                    query=content,
-                    reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
                 )
-                retrieved_hits_count = len(retrieved_hits)
-            except Exception as e:
-                logger.warning("memory recall failed: {}", e)
 
-            if retrieved_hits_count > 0:
-                self._metric("memory_recall_hit")
-            else:
-                self._metric("memory_recall_miss")
-            if retrieved_memory_text:
-                self._metric("memory_prompt_chars", len(retrieved_memory_text))
-
-        talkative_reply = await self._maybe_talkative_cooldown_reply(
-            session_key=session_key,
-            sender_id=sender_id,
-            content=content,
-            metadata=metadata,
-            enabled=talkative_cooldown_enabled,
-            streak_threshold=talkative_cooldown_streak_threshold,
-            topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
-            cooldown_seconds=talkative_cooldown_cooldown_seconds,
-            delay_seconds=talkative_cooldown_delay_seconds,
-            use_llm_message=talkative_cooldown_use_llm_message,
-        )
-        if talkative_reply is not None:
-            final_content = talkative_reply
-        else:
-            messages = self.context.build_messages(
-                history=session.get_history(),
-                current_message=content,
-                current_metadata=metadata,
-                retrieved_memory_text=retrieved_memory_text,
-                persona_text=persona_text,
-                media=list(media),
-                channel=channel,
-                chat_id=chat_id,
-            )
-
-            final_content = await self._chat_loop(
-                messages=messages,
-                allowed_tools=allowed_tools,
-                security_context={
-                    "channel": channel,
-                    "chat_id": chat_id,
-                    "sender_id": sender_id or "",
-                    "session_key": session_key,
-                },
-                is_owner=is_owner,
-            )
+                final_content = await self._chat_loop(
+                    messages=messages,
+                    allowed_tools=allowed_tools,
+                    security_context={
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "sender_id": sender_id or "",
+                        "session_key": session_key,
+                    },
+                    is_owner=is_owner,
+                )
 
         if self.memory is not None:
             try:

@@ -295,6 +295,20 @@ def build_gateway_runtime(
         policy=policy_engine.policy if policy_engine is not None else None,
     )
 
+    openai_compat = resolve_openai_compatible_credentials(config)
+    elevenlabs = config.providers.elevenlabs
+    tts = TTSSynthesizer(
+        openai_api_key=openai_compat.api_key if openai_compat else None,
+        openai_api_base=openai_compat.api_base if openai_compat else None,
+        openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
+        elevenlabs_api_key=elevenlabs.api_key or None,
+        elevenlabs_api_base=elevenlabs.api_base,
+        elevenlabs_extra_headers=elevenlabs.extra_headers,
+        elevenlabs_default_voice_id=elevenlabs.voice_id,
+        elevenlabs_default_model_id=elevenlabs.model_id,
+        max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
+    )
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -312,6 +326,10 @@ def build_gateway_runtime(
         cron_service=cron,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
+        group_resolver=policy_adapter.resolve_whatsapp_group,
+        model_router=model_router,
+        tts=tts,
+        whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
@@ -334,19 +352,6 @@ def build_gateway_runtime(
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
-    openai_compat = resolve_openai_compatible_credentials(config)
-    elevenlabs = config.providers.elevenlabs
-    tts = TTSSynthesizer(
-        openai_api_key=openai_compat.api_key if openai_compat else None,
-        openai_api_base=openai_compat.api_base if openai_compat else None,
-        openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
-        elevenlabs_api_key=elevenlabs.api_key or None,
-        elevenlabs_api_base=elevenlabs.api_base,
-        elevenlabs_extra_headers=elevenlabs.extra_headers,
-        elevenlabs_default_voice_id=elevenlabs.voice_id,
-        elevenlabs_default_model_id=elevenlabs.model_id,
-        max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
-    )
     orchestrator = Orchestrator(
         policy=policy_adapter,
         responder=responder,

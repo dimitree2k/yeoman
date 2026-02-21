@@ -195,7 +195,7 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
-Only use the 'message' tool for explicit out-of-band delivery to a specific channel/chat.
+Use 'message' for out-of-band text delivery and 'send_voice' for out-of-band WhatsApp voice notes.
 For Raspberry Pi/system metrics (temperature, RAM, disk, uptime), prefer the 'pi_stats' tool when available.
 For WhatsApp voice-note requests: do not claim voice sending is unavailable by default.
 If asked to reply in voice and policy allows voice output for that chat, provide the answer content directly and keep it concise for TTS.

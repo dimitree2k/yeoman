@@ -200,8 +200,11 @@ class PolicyEngine:
         }
 
         def dump_override(override: ChatPolicyOverride) -> dict[str, Any]:
-            # Human-only fields (like comment) must not affect evaluation.
-            return override.model_dump(exclude_none=True, exclude={"comment"})
+            # Human-only fields must not affect evaluation.
+            return override.model_dump(
+                exclude_none=True,
+                exclude={"comment", "group_tags"},
+            )
 
         channels_to_compile = set(self.apply_channels) | set(self.policy.channels.keys())
         for channel in channels_to_compile:
