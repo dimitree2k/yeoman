@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
 
 from nanobot.agent.tools.file_access import enable_grants
+from nanobot.agent.tools.deep_research import DeepResearchTool
 from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -153,6 +154,7 @@ class SubagentManager:
             tools.register(PiStatsTool())
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
+            tools.register(DeepResearchTool())
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)

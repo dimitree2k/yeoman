@@ -1313,6 +1313,7 @@ def _policy_known_tools() -> set[str]:
         "pi_stats",
         "web_search",
         "web_fetch",
+        "deep_research",
         "message",
         "spawn",
         "cron",
