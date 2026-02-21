@@ -23,3 +23,4 @@ tests/
 node_modules/
 
 /workspace/
+.docs/
