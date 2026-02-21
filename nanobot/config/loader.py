@@ -90,9 +90,12 @@ def _apply_env_overrides(config: Config) -> Config:
         config.channels.whatsapp.bridge_token = wa_bridge_token
 
     # Tool API keys
-    search_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    # Prefer Tavily key; keep BRAVE_SEARCH_API_KEY as backward-compatible fallback.
+    search_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not search_key:
+        search_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
     if search_key:
-        config.tools.web.search.api_key = search_key
+        config.tools.web.search.tavily_api_key = search_key
 
     return config
 

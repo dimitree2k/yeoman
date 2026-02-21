@@ -669,11 +669,11 @@ def config_migrate_to_env(
 
     lines += ["", "# Tool API Keys"]
 
-    search_key = (config.tools.web.search.api_key or "").strip()
+    search_key = (config.tools.web.search.tavily_api_key or "").strip()
     if search_key:
-        lines.append(f"BRAVE_SEARCH_API_KEY={search_key}")
-        migrated.append("BRAVE_SEARCH_API_KEY")
-        config.tools.web.search.api_key = ""
+        lines.append(f"TAVILY_API_KEY={search_key}")
+        migrated.append("TAVILY_API_KEY")
+        config.tools.web.search.tavily_api_key = ""
 
     if not migrated:
         console.print("[yellow]No non-empty secrets found in config.json to migrate.[/yellow]")
