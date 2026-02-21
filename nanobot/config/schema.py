@@ -443,39 +443,61 @@ class Config(BaseSettings):
         return candidate if candidate.is_absolute() else get_data_path() / candidate
 
     def get_provider(self, model: str | None = None) -> ProviderConfig | None:
-        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        from nanobot.providers.registry import PROVIDERS
+        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
+        Env vars from ProviderSpec.env_key are used as fallback when config.api_key is empty."""
+        import os
+        from nanobot.providers.registry import PROVIDERS, ProviderSpec
+
+        def _has_api_key(provider_config: ProviderConfig, spec: ProviderSpec) -> bool:
+            """Check if provider has api_key in config or env."""
+            if provider_config.api_key:
+                return True
+            # Fallback to env var
+            return bool(os.environ.get(spec.env_key))
 
         model_lower = (model or self.agents.defaults.model).lower()
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
-            if p and any(kw in model_lower for kw in spec.keywords) and p.api_key:
+            if p and any(kw in model_lower for kw in spec.keywords) and _has_api_key(p, spec):
                 return p
 
         # Fallback: gateways first, then others (follows registry order)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
+            if p and _has_api_key(p, spec):
                 return p
         return None
 
     def get_api_key(self, model: str | None = None) -> str | None:
-        """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
-        return p.api_key if p else None
-
-    def get_api_base(self, model: str | None = None) -> str | None:
-        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        """Get API key for the given model. Falls back to first available key.
+        Checks config first, then env vars from ProviderSpec.env_key."""
+        import os
         from nanobot.providers.registry import PROVIDERS
 
+        # Check if provider in config has a key
         p = self.get_provider(model)
-        if p and p.api_base:
-            return p.api_base
-        # Only gateways get a default URL here. Standard providers (like Moonshot)
-        # handle their base URL via env vars in _setup_env, NOT via api_base —
-        # otherwise find_gateway() would misdetect them as local/vLLM.
+        if p and p.api_key:
+            return p.api_key
+
+        # Fallback to env vars (check in registry order)
+        model_lower = (model or self.agents.defaults.model).lower()
+
+        for spec in PROVIDERS:
+            if any(kw in model_lower for kw in spec.keywords):
+                env_key = os.environ.get(spec.env_key)
+                if env_key:
+                    return env_key
+
+        # Fallback: any available key from env (gateways first)
+        for spec in PROVIDERS:
+            env_key = os.environ.get(spec.env_key)
+            if env_key:
+                return env_key
+
+        return None
+
         for spec in PROVIDERS:
             if (
                 spec.is_gateway
