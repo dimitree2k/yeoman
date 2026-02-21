@@ -15,13 +15,12 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
 
 from nanobot.agent.tools.file_access import enable_grants
-from nanobot.agent.tools.deep_research import DeepResearchTool
 from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -42,7 +41,7 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
-        brave_api_key: str | None = None,
+        tavily_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         file_access_resolver: "FileAccessResolver | None" = None,
@@ -52,7 +51,7 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
-        self.brave_api_key = brave_api_key
+        self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.file_access_resolver = file_access_resolver
@@ -152,9 +151,9 @@ class SubagentManager:
             exec_tool.set_session_context(f"subagent:{task_id}")
             tools.register(exec_tool)
             tools.register(PiStatsTool())
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
-            tools.register(WebFetchTool())
-            tools.register(DeepResearchTool())
+            tools.register(WebSearchTool(api_key=self.tavily_api_key))
+            tools.register(WebFetchTool(api_key=self.tavily_api_key))
+            tools.register(DeepResearchTool(api_key=self.tavily_api_key))
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
