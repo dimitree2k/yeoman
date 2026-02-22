@@ -451,7 +451,7 @@ class PolicyAdminService:
                     rec["tags"] = tags
 
         base_dir = self._policy_path.parent
-        sessions_dir = base_dir / "sessions"
+        sessions_dir = base_dir / "data" / "inbound"
         if sessions_dir.exists():
             for path in sessions_dir.glob("whatsapp_*@g.us.jsonl"):
                 chat_id = path.name[len("whatsapp_") : -len(".jsonl")]
@@ -464,7 +464,7 @@ class PolicyAdminService:
                 except OSError:
                     pass
 
-        log_path = base_dir / "logs" / "gateway.log"
+        log_path = base_dir / "var" / "logs" / "gateway.log"
         if log_path.exists():
             try:
                 with open(log_path, encoding="utf-8", errors="ignore") as f:

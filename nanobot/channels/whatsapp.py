@@ -25,6 +25,7 @@ from nanobot.media.vision import VisionDescriber
 if TYPE_CHECKING:
     from nanobot.media.router import ModelRouter
     from nanobot.providers.factory import ProviderFactory
+    from nanobot.storage.chat_registry import ChatRegistry
     from nanobot.storage.inbound_archive import InboundArchive
 
 
@@ -171,6 +172,13 @@ class WhatsAppChannel(BaseChannel):
         self._presence_supported = True
         self._presence_unsupported_logged = False
         self._runtime = WhatsAppRuntimeManager()
+        self._chat_registry: ChatRegistry | None = None
+        try:
+            from nanobot.storage.chat_registry import ChatRegistry
+
+            self._chat_registry = ChatRegistry()
+        except Exception as e:
+            logger.warning(f"Failed to initialize chat registry: {e}")
 
     def _require_token(self) -> str:
         token = (self.config.bridge_token or "").strip()
@@ -311,6 +319,10 @@ class WhatsAppChannel(BaseChannel):
             self._media_cleanup_task = None
 
         self._fail_pending("Channel stopped")
+        if self._chat_registry is not None:
+            with contextlib.suppress(Exception):
+                self._chat_registry.close()
+            self._chat_registry = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WhatsApp."""
@@ -627,6 +639,7 @@ class WhatsAppChannel(BaseChannel):
 
         event = await self._enrich_media_event(event)
         self._archive_inbound_event(event)
+        self._sync_chat_registry(event)
 
         if self.config.debounce_ms <= 0 or event.media_kind is not None:
             await self._publish_event(event)
@@ -748,6 +761,18 @@ class WhatsAppChannel(BaseChannel):
                 )
         except Exception as e:
             logger.warning(f"Failed to archive inbound WhatsApp message {event.message_id}: {e}")
+
+    def _sync_chat_registry(self, event: InboundEvent) -> None:
+        if self._chat_registry is None:
+            return
+        try:
+            self._chat_registry.register_chat(
+                channel=self.name,
+                chat_id=event.chat_jid,
+                chat_type="group" if event.is_group else "dm",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update chat registry for {event.chat_jid}: {e}")
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
         if not self.config.media.enabled:

@@ -13,7 +13,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, get_data_path
+from nanobot.utils.helpers import ensure_dir, get_data_path, get_operational_data_path
 
 PURGE_INTERVAL_SECONDS = 3600
 
@@ -35,7 +35,11 @@ class ChatRegistry:
         self,
         db_path: Path | None = None,
     ) -> None:
-        self.db_path = db_path or (get_data_path() / "inbound" / "chat_registry.db")
+        if db_path is not None:
+            self.db_path = db_path
+        else:
+            self.db_path = get_operational_data_path() / "inbound" / "chat_registry.db"
+            self._migrate_legacy_default_path()
         ensure_dir(self.db_path.parent)
 
         self._lock = threading.RLock()
@@ -45,6 +49,23 @@ class ChatRegistry:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_schema()
         self._last_purge_at = 0.0
+
+    def _migrate_legacy_default_path(self) -> None:
+        """Move legacy ~/.nanobot/inbound/chat_registry.db into ~/.nanobot/data/inbound/."""
+        legacy = get_data_path() / "inbound" / "chat_registry.db"
+        if legacy == self.db_path:
+            return
+        if not legacy.exists() or self.db_path.exists():
+            return
+        ensure_dir(self.db_path.parent)
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                src = Path(f"{legacy}{suffix}")
+                dst = Path(f"{self.db_path}{suffix}")
+                if src.exists() and not dst.exists():
+                    src.replace(dst)
+        except OSError as e:
+            logger.warning(f"Failed to migrate legacy chat registry DB from {legacy}: {e}")
 
     def _create_schema(self) -> None:
         with self._lock:
@@ -117,6 +138,9 @@ class ChatRegistry:
 
         now_iso = datetime.now(UTC).isoformat()
         chat_type_safe = chat_type or ChatType.UNKNOWN.value
+        community_flag = (
+            1 if is_community is True else 0 if is_community is False else None
+        )
 
         with self._lock:
             # Check if already exists
@@ -155,7 +179,7 @@ class ChatRegistry:
                         description,
                         owner_id,
                         participant_count,
-                        1 if is_community else None,
+                        community_flag,
                         invite_code,
                         json.dumps(metadata) if metadata else None,
                         now_iso,
@@ -174,7 +198,7 @@ class ChatRegistry:
                         first_seen_at, last_seen_at, created_at,
                         description, owner_id, participant_count,
                         is_community, invite_code, metadata_json, last_sync_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(channel),
@@ -187,7 +211,7 @@ class ChatRegistry:
                         description,
                         owner_id,
                         participant_count,
-                        1 if is_community else None,
+                        community_flag,
                         invite_code,
                         json.dumps(metadata) if metadata else None,
                         now_iso,

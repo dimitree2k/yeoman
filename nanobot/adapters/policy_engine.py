@@ -1164,7 +1164,7 @@ class EnginePolicyAdapter(PolicyPort):
         base_dir = self._policy_path.parent if self._policy_path is not None else Path.home() / ".nanobot"
 
         # Session files show groups observed by runtime.
-        sessions_dir = base_dir / "sessions"
+        sessions_dir = base_dir / "data" / "inbound"
         if sessions_dir.exists():
             for path in sessions_dir.glob("whatsapp_*@g.us.jsonl"):
                 chat_id = path.name[len("whatsapp_") : -len(".jsonl")]
@@ -1178,7 +1178,7 @@ class EnginePolicyAdapter(PolicyPort):
                     pass
 
         # Gateway log is a fallback source for recently observed group IDs.
-        log_path = base_dir / "logs" / "gateway.log"
+        log_path = base_dir / "var" / "logs" / "gateway.log"
         if log_path.exists():
             try:
                 with open(log_path, encoding="utf-8", errors="ignore") as f:

@@ -76,8 +76,8 @@ def get_workspace_path(workspace: str | None = None) -> Path:
 
 
 def get_sessions_path() -> Path:
-    """Get the sessions storage directory (~/.nanobot/data/sessions)."""
-    return ensure_dir(get_operational_data_path() / "sessions")
+    """Get the session history directory (~/.nanobot/data/inbound)."""
+    return ensure_dir(get_operational_data_path() / "inbound")
 
 
 def get_memory_path(workspace: Path | None = None) -> Path:
@@ -106,10 +106,27 @@ def migrate_runtime_layout() -> list[str]:
     data = get_data_path()
     moved: list[str] = []
 
+    # Legacy session JSONL files lived in ~/.nanobot/sessions.
+    # Move those files into ~/.nanobot/data/inbound, even if the destination
+    # directory already exists (e.g. because reply_context.db is already there).
+    legacy_sessions_dir = data / "sessions"
+    inbound_dir = get_operational_data_path() / "inbound"
+    if legacy_sessions_dir.exists() and legacy_sessions_dir.is_dir():
+        inbound_dir.mkdir(parents=True, exist_ok=True)
+        for old in legacy_sessions_dir.glob("*.jsonl"):
+            new = inbound_dir / old.name
+            if new.exists():
+                continue
+            old.rename(new)
+            moved.append(str(old))
+        try:
+            legacy_sessions_dir.rmdir()
+        except OSError:
+            pass
+
     migrations: list[tuple[Path, Path]] = [
         # Long-lived operational data → data/
         (data / "memory", get_operational_data_path() / "memory"),
-        (data / "sessions", get_operational_data_path() / "sessions"),
         (data / "inbound", get_operational_data_path() / "inbound"),
         (data / "cron", get_operational_data_path() / "cron"),
         (data / "policy", get_operational_data_path() / "policy"),
