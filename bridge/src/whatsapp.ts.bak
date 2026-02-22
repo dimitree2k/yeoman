@@ -361,48 +361,6 @@ async function loadMediaSource(
   }
 }
 
-
-export interface GroupMetadata {
-  id: string;
-  subject: string;
-  subjectOwner?: string;
-  subjectTime?: number;
-  desc?: string;
-  descOwner?: string;
-  descTime?: number;
-  descId?: string;
-  creation?: number;
-  owner?: string;
-  size?: number;
-  participants?: any[];
-  isCommunity?: boolean;
-  isParentGroup?: boolean;
-  isAnnounceGrpRestrict?: boolean;
-  isMemberGroup?: boolean;
-  restrict?: boolean;
-  announce?: boolean;
-  ephemeralDuration?: number;
-  ephemeralSettingTimestamp?: number;
-  inviteCode?: string;
-  defaultInviteExpiration?: number;
-  inviteLinkPreventJoin?: boolean;
-  participantAdInfo?: any;
-  groupSet?: {
-    addMode?: string;
-    editAdmins?: boolean;
-    sendMessages?: boolean;
-  };
-  groupTypes?: any;
-  linkedParent?: string;
-  groupMetadata?: {
-    viewOnce?: boolean;
-  };
-}
-
-export interface GroupMetadataResult extends GroupMetadata {
-  normalizedId: string;
-}
-
 export class WhatsAppClient {
   private readonly options: WhatsAppClientOptions;
   private sock: any = null;
@@ -1332,60 +1290,26 @@ export class WhatsAppClient {
     return { state: input.state, chatJid: input.chatJid };
   }
 
-  async listGroups(ids?: string[]): Promise<GroupMetadataResult[]> {
+  async listGroups(ids?: string[]): Promise<Array<{ id: string; subject: string }>> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
 
     const all = await this.sock.groupFetchAllParticipating();
-    const results: GroupMetadataResult[] = [];
-
+    const byId = new Map<string, string>();
     for (const [jid, meta] of Object.entries(all || {})) {
       const normalized = normalizeJid(String(jid));
-      if (!normalized) continue;
-
-      const data = meta as any;
-      const result: GroupMetadataResult = {
-        normalizedId: normalized,
-        id: String(data.id || normalized),
-        subject: String(data.subject || '').trim(),
-        subjectOwner: data.subjectOwner ? String(data.subjectOwner) : undefined,
-        subjectTime: typeof data.subjectTime === 'number' ? data.subjectTime : undefined,
-        desc: data.desc ? String(data.desc).trim() : undefined,
-        descOwner: data.descOwner ? String(data.descOwner) : undefined,
-        descTime: typeof data.descTime === 'number' ? data.descTime : undefined,
-        descId: data.descId ? String(data.descId) : undefined,
-        creation: typeof data.creation === 'number' ? data.creation : undefined,
-        owner: data.owner ? String(data.owner) : undefined,
-        size: typeof data.size === 'number' ? data.size : undefined,
-        participants: Array.isArray(data.participants) ? data.participants : undefined,
-        isCommunity: typeof data.isCommunity === 'boolean' ? data.isCommunity : undefined,
-        isParentGroup: typeof data.isParentGroup === 'boolean' ? data.isParentGroup : undefined,
-        isAnnounceGrpRestrict: typeof data.isAnnounceGrpRestrict === 'boolean' ? data.isAnnounceGrpRestrict : undefined,
-        isMemberGroup: typeof data.isMemberGroup === 'boolean' ? data.isMemberGroup : undefined,
-        restrict: typeof data.restrict === 'boolean' ? data.restrict : undefined,
-        announce: typeof data.announce === 'boolean' ? data.announce : undefined,
-        ephemeralDuration: typeof data.ephemeralDuration === 'number' ? data.ephemeralDuration : undefined,
-        ephemeralSettingTimestamp: typeof data.ephemeralSettingTimestamp === 'number' ? data.ephemeralSettingTimestamp : undefined,
-        inviteCode: data.inviteCode ? String(data.inviteCode) : undefined,
-        defaultInviteExpiration: typeof data.defaultInviteExpiration === 'number' ? data.defaultInviteExpiration : undefined,
-        inviteLinkPreventJoin: typeof data.inviteLinkPreventJoin === 'boolean' ? data.inviteLinkPreventJoin : undefined,
-        participantAdInfo: data.participantAdInfo,
-        groupSet: data.groupSet,
-        groupTypes: data.groupTypes,
-        linkedParent: data.linkedParent ? String(data.linkedParent) : undefined,
-        groupMetadata: data.groupMetadata,
-      };
-
-      results.push(result);
+      const subject = String((meta as any)?.subject || '').trim();
+      if (normalized && subject) {
+        byId.set(normalized, subject);
+      }
     }
 
     const wanted = (ids || []).map((x) => normalizeJid(String(x))).filter((x) => x.length > 0);
-    const selected = wanted.length > 0
-      ? results.filter((r) => wanted.includes(r.normalizedId))
-      : results;
-
-    return selected.filter((x) => x.subject.length > 0);
+    const selected = wanted.length > 0 ? wanted : Array.from(byId.keys());
+    return selected
+      .map((id) => ({ id, subject: byId.get(id) || '' }))
+      .filter((x) => x.subject.length > 0);
   }
 
   async loginStart(opts: { force?: boolean; timeoutMs?: number } = {}): Promise<{

@@ -46,6 +46,7 @@ class PolicyDecision:
     should_respond: bool
     allowed_tools: frozenset[str]
     reason: str
+    when_to_reply_mode: Literal["all", "mention_only", "allowed_senders", "owner_only", "off"] = "all"
     persona_text: str | None = None
     persona_file: str | None = None
     notes_enabled: bool = False

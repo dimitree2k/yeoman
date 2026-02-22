@@ -302,37 +302,7 @@ export class BridgeServer {
       const parsed = parseListGroupsPayload(payload);
       const groups = await this.wa.listGroups(parsed.ids);
       return {
-        groups: groups.map((g) => ({
-          chatJid: g.normalizedId || g.id,
-          id: g.id,
-          subject: g.subject,
-          subjectOwner: g.subjectOwner,
-          subjectTime: g.subjectTime,
-          desc: g.desc,
-          descOwner: g.descOwner,
-          descTime: g.descTime,
-          descId: g.descId,
-          creation: g.creation,
-          owner: g.owner,
-          size: g.size,
-          participants: g.participants,
-          isCommunity: g.isCommunity,
-          isParentGroup: g.isParentGroup,
-          isAnnounceGrpRestrict: g.isAnnounceGrpRestrict,
-          isMemberGroup: g.isMemberGroup,
-          restrict: g.restrict,
-          announce: g.announce,
-          ephemeralDuration: g.ephemeralDuration,
-          ephemeralSettingTimestamp: g.ephemeralSettingTimestamp,
-          inviteCode: g.inviteCode,
-          defaultInviteExpiration: g.defaultInviteExpiration,
-          inviteLinkPreventJoin: g.inviteLinkPreventJoin,
-          participantAdInfo: g.participantAdInfo,
-          groupSet: g.groupSet,
-          groupTypes: g.groupTypes,
-          linkedParent: g.linkedParent,
-          groupMetadata: g.groupMetadata,
-        })),
+        groups: groups.map((g) => ({ chatJid: g.id, subject: g.subject })),
       };
     }
 

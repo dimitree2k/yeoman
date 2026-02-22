@@ -651,10 +651,18 @@ class Orchestrator:
                     outbound_channel = route_channel
                     outbound_chat_id = route_chat_id
 
+            should_thread = (
+                outbound_channel == "whatsapp"
+                and event.is_group
+                and bool(event.message_id)
+                and decision.when_to_reply_mode == "mention_only"
+                and (event.mentioned_bot or event.reply_to_bot)
+            )
             outbound = OutboundEvent(
                 channel=outbound_channel,
                 chat_id=outbound_chat_id,
                 content=reply,
+                reply_to=event.message_id if should_thread else None,
             )
             voice_outbound = await self._maybe_voice_reply(
                 event=event,

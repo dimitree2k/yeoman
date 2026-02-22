@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
 
@@ -248,6 +248,7 @@ class EnginePolicyAdapter(PolicyPort):
                 should_respond=True,
                 allowed_tools=frozenset(self._known_tools),
                 reason="policy_disabled",
+                when_to_reply_mode="all",
                 notes_enabled=False,
                 notes_mode="adaptive",
                 notes_allow_blocked_senders=False,
@@ -284,9 +285,11 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_cooldown_seconds = 900
         talkative_cooldown_delay_seconds = 2.5
         talkative_cooldown_use_llm_message = False
+        when_to_reply_mode: Literal["all", "mention_only", "allowed_senders", "owner_only", "off"] = "all"
         if event.channel in self._engine.apply_channels:
             try:
                 effective = self._engine.resolve_policy(event.channel, event.chat_id)
+                when_to_reply_mode = effective.when_to_reply_mode
                 voice_output_mode = effective.voice_output_mode
                 voice_output_tts_route = effective.voice_output_tts_route
                 voice_output_voice = effective.voice_output_voice
@@ -320,6 +323,7 @@ class EnginePolicyAdapter(PolicyPort):
             should_respond=decision.should_respond,
             allowed_tools=frozenset(decision.allowed_tools),
             reason=decision.reason,
+            when_to_reply_mode=when_to_reply_mode,
             persona_file=decision.persona_file,
             persona_text=self._engine.persona_text(decision.persona_file),
             notes_enabled=notes.enabled,

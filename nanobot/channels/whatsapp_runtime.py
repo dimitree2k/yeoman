@@ -31,6 +31,8 @@ from nanobot.utils.process import (
 PROTOCOL_VERSION = 2
 MANIFEST_FILENAME = "bridge.manifest.json"
 DEFAULT_BUILD_ID = "dev"
+STARTUP_HEALTH_RETRIES = 2
+STARTUP_HEALTH_RETRY_BASE_DELAY_S = 1.0
 
 
 @dataclass(slots=True)
@@ -471,15 +473,37 @@ class WhatsAppRuntimeManager:
             status = self.repair_once(status.port)
             started = True
 
+        def health_check_with_retries() -> dict[str, Any]:
+            attempts = 1 + STARTUP_HEALTH_RETRIES
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    return self.health_check(timeout)
+                except Exception as e:
+                    last_error = e
+                    if attempt >= attempts:
+                        break
+                    delay_s = STARTUP_HEALTH_RETRY_BASE_DELAY_S * attempt
+                    logger.warning(
+                        "Bridge health check failed (attempt {}/{}): {}. Retrying in {:.1f}s.",
+                        attempt,
+                        attempts,
+                        e,
+                        delay_s,
+                    )
+                    time.sleep(delay_s)
+            assert last_error is not None
+            raise last_error
+
         repaired = False
         try:
-            health = self.health_check(timeout)
+            health = health_check_with_retries()
         except Exception as e:
             if not repair_enabled:
                 raise RuntimeError(f"Bridge health check failed: {e}") from e
             repaired = True
             status = self.repair_once(status.port)
-            health = self.health_check(timeout)
+            health = health_check_with_retries()
 
         return BridgeReadyReport(
             ready=True,

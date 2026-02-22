@@ -867,6 +867,125 @@ class WhatsAppChannel(BaseChannel):
                 voice_transcript=transcript,
             )
 
+        if event.media_kind == "video":
+            if (
+                not self.config.media.describe_videos
+                or not event.media_path
+                or self._vision_describer is None
+                or self._model_router is None
+            ):
+                return event
+
+            validated_path = self._media_storage.validate_incoming_path(event.media_path)
+            if validated_path is None:
+                logger.warning(
+                    "Skipping WhatsApp video description due to invalid media path: {}",
+                    event.media_path,
+                )
+                return event
+            try:
+                size_bytes = validated_path.stat().st_size
+            except OSError:
+                return event
+            max_bytes = max(1, int(self.config.media.max_video_bytes_mb)) * 1024 * 1024
+            if size_bytes > max_bytes:
+                logger.info(
+                    "Skipping WhatsApp video description due to size limit: path={} bytes={} limit={}",
+                    validated_path,
+                    size_bytes,
+                    max_bytes,
+                )
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                profile = self._model_router.resolve("vision.describe_video", channel=self.name)
+            except KeyError as e:
+                logger.warning(f"Skipping WhatsApp video description due to missing route: {e}")
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                description = await self._vision_describer.describe_video(
+                    validated_path,
+                    profile,
+                    frame_count=self.config.media.video_frame_count,
+                )
+            except Exception as e:
+                logger.warning("WhatsApp video description failed {}: {}", e.__class__.__name__, e)
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            if self.config.media.delete_video_after_description:
+                with contextlib.suppress(OSError):
+                    validated_path.unlink()
+
+            if not description:
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            if "[video_description]" in event.text:
+                enriched_text = event.text
+            else:
+                enriched_text = f"{event.text}\n[video_description] {description}"
+            return replace(
+                event,
+                text=enriched_text,
+                media_path=str(validated_path),
+                media_bytes=size_bytes,
+                media_description=description,
+            )
+
+        if event.media_kind == "sticker":
+            if (
+                not self.config.media.describe_stickers
+                or not event.media_path
+                or self._vision_describer is None
+                or self._model_router is None
+            ):
+                return event
+
+            validated_path = self._media_storage.validate_incoming_path(event.media_path)
+            if validated_path is None:
+                logger.warning(
+                    "Skipping WhatsApp sticker description due to invalid media path: {}",
+                    event.media_path,
+                )
+                return event
+            try:
+                size_bytes = validated_path.stat().st_size
+            except OSError:
+                return event
+
+            try:
+                profile = self._model_router.resolve(
+                    "vision.describe_image", channel=self.name
+                )
+            except KeyError as e:
+                logger.warning(f"Skipping WhatsApp sticker description due to missing route: {e}")
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            try:
+                description = await self._vision_describer.describe(validated_path, profile)
+            except Exception as e:
+                logger.warning(
+                    "WhatsApp sticker description failed {}: {}", e.__class__.__name__, e
+                )
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            if self.config.media.delete_sticker_after_description:
+                with contextlib.suppress(OSError):
+                    validated_path.unlink()
+
+            if not description:
+                return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            if "[sticker_description]" in event.text:
+                enriched_text = event.text
+            else:
+                enriched_text = f"{event.text}\n[sticker_description] {description}"
+            return replace(
+                event,
+                text=enriched_text,
+                media_path=str(validated_path),
+                media_bytes=size_bytes,
+                media_description=description,
+            )
+
         return event
 
     async def _run_media_cleanup_once(self) -> None:

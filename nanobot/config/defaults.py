@@ -66,6 +66,8 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "whatsapp.vision.describe_image": "vision_whatsapp_cheap",
     "whatsapp.asr.transcribe_audio": "asr_default",
     "whatsapp.tts.speak": "tts_default",
+    "vision.describe_video": "vision_whatsapp_cheap",
+    "whatsapp.vision.describe_video": "vision_whatsapp_cheap",
     "memory.embed": "memory_embed_fast",
     "memory.capture.extract": "memory_capture_fast",
 }
@@ -84,6 +86,12 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "delete_audio_after_transcription": True,
     "max_asr_concurrency": 2,
     "max_tts_concurrency": 2,
+    "describe_videos": True,
+    "max_video_bytes_mb": 20,
+    "video_frame_count": 4,
+    "delete_video_after_description": True,
+    "describe_stickers": True,
+    "delete_sticker_after_description": True,
 }
 
 DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {

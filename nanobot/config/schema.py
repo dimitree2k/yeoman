@@ -71,6 +71,12 @@ class WhatsAppMediaConfig(BaseModel):
     delete_audio_after_transcription: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_audio_after_transcription"])
     max_asr_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_asr_concurrency"]), ge=1)
     max_tts_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_tts_concurrency"]), ge=1)
+    describe_videos: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_videos"])
+    max_video_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_video_bytes_mb"])
+    video_frame_count: int = int(DEFAULT_WHATSAPP_MEDIA["video_frame_count"])
+    delete_video_after_description: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_video_after_description"])
+    describe_stickers: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_stickers"])
+    delete_sticker_after_description: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_sticker_after_description"])
 
     @property
     def incoming_path(self) -> Path:
