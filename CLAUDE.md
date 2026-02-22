@@ -107,3 +107,26 @@ Auth state persisted in `~/.nanobot/whatsapp-auth/`.
 - Policy engine is deterministic — no ad-hoc ACLs in code
 - All access control in `~/.nanobot/policy.json`
 - Input/output validation in `security/engine.py`
+
+## Conversation Context (WhatsApp)
+
+Two parallel context sources are injected into every prompt for WhatsApp messages:
+
+| Source | Trigger | Limit (config key) |
+|--------|---------|-------------------|
+| **Thread window** | explicit `reply_to_message_id` only | `reply_context_window_limit` (default 6) |
+| **Ambient window** | every message, always | `ambient_window_limit` (default 8) |
+
+**Ambient window** = last N messages before the current one, fetched from the inbound archive
+(`SqliteReplyArchiveAdapter` → `lookup_messages_before(current_message_id)`).
+Injected into `event.raw_metadata["ambient_context_window"]` by
+`orchestrator._build_ambient_window()` → `_resolve_reply_context()`.
+
+Rendered in `context._with_reply_context()`:
+- With reply → `[Reply Context]` block gains a `recent_messages:` sub-section
+- No reply, but ambient present → `[Recent Messages]` block (ambient only)
+
+Also fed into `memory.build_retrieved_context(query=…)` in `responder_llm.py` to enrich
+the semantic/FTS recall signal for vague one-liner messages.
+
+See `docs/ambient-context-window.md` for the full design (local only, gitignored).

@@ -363,6 +363,7 @@ def build_gateway_runtime(
         reply_archive=archive_adapter,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
+        ambient_window_limit=config.channels.whatsapp.ambient_window_limit,
         typing_notifier=typing_adapter,
         security=security,
         security_block_message=config.security.block_user_message,

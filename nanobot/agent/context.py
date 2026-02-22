@@ -342,8 +342,6 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         ).strip()
         reply_to_participant = str(metadata.get("reply_to_participant") or "").strip()
         reply_to_text = str(metadata.get("reply_to_text") or "").strip()
-        if not reply_to_text:
-            return text
 
         reply_context_source = str(metadata.get("reply_context_source") or "").strip()
         raw_window = metadata.get("reply_context_window")
@@ -358,11 +356,34 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
                 if len(compact) > 220:
                     compact = compact[:220] + "..."
                 window_lines.append(compact)
-        lines = [
-            "[Reply Context]",
-            "usage: Treat quoted_message as the content of the replied-to message.",
-            "usage: Do not claim you cannot see the replied message when quoted_message is present.",
-        ]
+
+        raw_ambient = metadata.get("ambient_context_window")
+        ambient_lines: list[str] = []
+        if isinstance(raw_ambient, list):
+            for item in raw_ambient[:10]:
+                if not isinstance(item, str):
+                    continue
+                compact = " ".join(item.split())
+                if not compact:
+                    continue
+                if len(compact) > 220:
+                    compact = compact[:220] + "..."
+                ambient_lines.append(compact)
+
+        if not reply_to_text and not ambient_lines:
+            return text
+
+        if reply_to_text:
+            lines = [
+                "[Reply Context]",
+                "usage: Treat quoted_message as the content of the replied-to message.",
+                "usage: Do not claim you cannot see the replied message when quoted_message is present.",
+            ]
+        else:
+            lines = [
+                "[Recent Messages]",
+                "usage: Ambient window of recent chat messages for conversational context.",
+            ]
         if reply_context_source:
             lines.append(f"source: {reply_context_source}")
         if reply_to_message_id:
@@ -377,6 +398,10 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         if window_lines:
             lines.append("topic_window_before_reply:")
             for index, line in enumerate(window_lines, 1):
+                lines.append(f"{index}. {line}")
+        if ambient_lines:
+            lines.append("recent_messages:")
+            for index, line in enumerate(ambient_lines, 1):
                 lines.append(f"{index}. {line}")
 
         return f"{text}\n\n" + "\n".join(lines)

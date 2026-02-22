@@ -89,6 +89,7 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
 DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
     "window_limit": 6,
     "line_max_chars": 256,
+    "ambient_window_limit": 8,
 }
 
 DEFAULT_MEMORY: dict[str, Any] = {

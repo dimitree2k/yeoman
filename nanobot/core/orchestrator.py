@@ -77,6 +77,7 @@ class Orchestrator:
         reply_archive: ReplyArchivePort | None = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
+        ambient_window_limit: int = 8,
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
         security: SecurityPort | None = None,
@@ -95,6 +96,7 @@ class Orchestrator:
         self._reply_archive = reply_archive
         self._reply_context_window_limit = max(1, int(reply_context_window_limit))
         self._reply_context_line_max_chars = max(32, int(reply_context_line_max_chars))
+        self._ambient_window_limit = max(0, int(ambient_window_limit))
         self._typing_notifier = typing_notifier
         self._security = security
         self._security_block_message = security_block_message
@@ -896,10 +898,17 @@ class Orchestrator:
             return event, False, False
         reply_to_message_id = (event.reply_to_message_id or "").strip()
         has_payload_reply_text = bool((event.reply_to_text or "").strip())
+
+        # Ambient window: last N messages before this one (always, regardless of reply)
+        ambient_lines = self._build_ambient_window(event=event)
+
         if not reply_to_message_id:
-            if has_payload_reply_text:
+            if has_payload_reply_text or ambient_lines:
                 raw = dict(event.raw_metadata)
-                raw.setdefault("reply_context_source", "payload")
+                if has_payload_reply_text:
+                    raw.setdefault("reply_context_source", "payload")
+                if ambient_lines:
+                    raw["ambient_context_window"] = ambient_lines
                 return replace(event, raw_metadata=raw), False, False
             return event, False, False
 
@@ -911,9 +920,12 @@ class Orchestrator:
                 preferred_chat_id=event.chat_id,
             )
         if row is None:
-            if has_payload_reply_text:
+            if has_payload_reply_text or ambient_lines:
                 raw = dict(event.raw_metadata)
-                raw.setdefault("reply_context_source", "payload")
+                if has_payload_reply_text:
+                    raw.setdefault("reply_context_source", "payload")
+                if ambient_lines:
+                    raw["ambient_context_window"] = ambient_lines
                 return replace(event, raw_metadata=raw), True, False
             return event, True, False
 
@@ -922,13 +934,15 @@ class Orchestrator:
         window_lines = self._build_reply_context_window(event=event, anchor=row)
         if window_lines:
             raw["reply_context_window"] = window_lines
+        if ambient_lines:
+            raw["ambient_context_window"] = ambient_lines
 
         if has_payload_reply_text:
             return replace(event, raw_metadata=raw), True, True
 
         text = row.text.strip()
         if not text:
-            return event, True, False
+            return replace(event, raw_metadata=raw), True, False
         raw["reply_context_source"] = "archive"
         return replace(event, reply_to_text=text, raw_metadata=raw), True, True
 
@@ -966,3 +980,31 @@ class Orchestrator:
             speaker = (row.sender_id or row.participant or "unknown").strip() or "unknown"
             lines.append(f"[{speaker}] {compact}")
         return lines[: self._reply_context_window_limit]
+
+    def _build_ambient_window(self, *, event: InboundEvent) -> list[str]:
+        """Fetch last N messages before the current event — ambient group state."""
+        if self._reply_archive is None or self._ambient_window_limit <= 0:
+            return []
+        if not event.message_id:
+            return []
+        try:
+            before = self._reply_archive.lookup_messages_before(
+                event.channel,
+                event.chat_id,
+                event.message_id,
+                limit=self._ambient_window_limit,
+            )
+        except Exception:
+            return []
+        if not before:
+            return []
+        lines: list[str] = []
+        for row in reversed(before):
+            compact = " ".join(row.text.split())
+            if not compact:
+                continue
+            if len(compact) > self._reply_context_line_max_chars:
+                compact = compact[: self._reply_context_line_max_chars] + "..."
+            speaker = (row.sender_id or row.participant or "unknown").strip() or "unknown"
+            lines.append(f"[{speaker}] {compact}")
+        return lines[: self._ambient_window_limit]

@@ -108,6 +108,7 @@ class WhatsAppConfig(BaseModel):
     max_payload_bytes: int = 262144
     reply_context_window_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["window_limit"])
     reply_context_line_max_chars: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["line_max_chars"])
+    ambient_window_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["ambient_window_limit"])
     media: WhatsAppMediaConfig = Field(default_factory=WhatsAppMediaConfig)
 
     @property

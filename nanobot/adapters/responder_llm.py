@@ -819,11 +819,23 @@ class LLMResponder(ResponderPort):
             retrieved_hits_count = 0
             if self.memory is not None:
                 try:
+                    # Augment the memory query with recent ambient messages so that vague
+                    # inputs like "what do you think?" can surface relevant memories.
+                    memory_query = content
+                    ambient_raw = metadata.get("ambient_context_window") if metadata else None
+                    if isinstance(ambient_raw, list) and ambient_raw:
+                        ambient_snippet = " ".join(
+                            (line.split("] ", 1)[-1] if "] " in line else line)
+                            for line in ambient_raw[:5]
+                            if isinstance(line, str)
+                        ).strip()
+                        if ambient_snippet:
+                            memory_query = f"{ambient_snippet} {content}".strip()
                     retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
                         channel=channel,
                         chat_id=chat_id,
                         sender_id=sender_id,
-                        query=content,
+                        query=memory_query,
                         reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
                     )
                     retrieved_hits_count = len(retrieved_hits)
