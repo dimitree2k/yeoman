@@ -133,7 +133,10 @@ class EnginePolicyAdapter(PolicyPort):
         self._policy_admin_service: PolicyAdminService | None = None
         self._admin_router = AdminCommandRouter(
             [
+                ApproveCommandHandler(self),
+                ApproveMentionCommandHandler(self),
                 CommandCatalogCommandHandler(self),
+                DenyCommandHandler(self),
                 HelpAliasCommandHandler(self),
                 PanicCommandHandler(self),
                 PolicyAdminCommandHandler(self),
@@ -483,6 +486,241 @@ class EnginePolicyAdapter(PolicyPort):
     def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
 
+    def approve_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        """Check if approve/deny commands are applicable (owner in DM)."""
+        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
+
+    def _get_group_name(self, chat_id: str) -> str | None:
+        """Get group name from chat_registry or bridge."""
+        # Try chat_registry first
+        try:
+            from nanobot.storage.chat_registry import ChatRegistry
+            registry = ChatRegistry()
+            try:
+                chat_info = registry.get_chat("whatsapp", chat_id)
+                if chat_info:
+                    name = chat_info.get("readable_name")
+                    if name:
+                        return name
+            finally:
+                registry.close()
+        except Exception:
+            pass
+
+        # Try bridge lookup
+        try:
+            names = self._list_group_subjects_from_bridge([chat_id])
+            if names.get(chat_id):
+                return names[chat_id]
+        except Exception:
+            pass
+
+        return None
+
+    def approve_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        """Handle /approve <chat_id> - allow group + set reply mode to 'all'."""
+        if len(argv) != 1:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /approve <chat_id@g.us>",
+                command_name="approve",
+                outcome="invalid",
+                source="dm",
+            )
+
+        try:
+            chat_id = self._parse_group_chat_id(argv[0])
+        except ValueError as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Invalid approve arguments: {e}",
+                command_name="approve",
+                outcome="invalid",
+                source="dm",
+            )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Approve unavailable: policy engine is not active.",
+                command_name="approve",
+                outcome="error",
+                source="dm",
+            )
+
+        # Get group name for comment
+        group_name = self._get_group_name(chat_id)
+
+        # Set whoCanTalk=everyone and whenToReply=all
+        override = self._whatsapp_chat_override(policy, chat_id)
+        override.who_can_talk = WhoCanTalkPolicyOverride(mode="everyone", senders=[])
+        override.when_to_reply = WhenToReplyPolicyOverride(mode="all", senders=[])
+        if group_name and not override.comment:
+            override.comment = group_name
+
+        try:
+            self._save_policy_and_reload(policy)
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply policy change: {e}",
+                command_name="approve",
+                outcome="error",
+                source="dm",
+            )
+
+        name_suffix = f" ({group_name})" if group_name else ""
+        return AdminCommandResult(
+            status="handled",
+            response=f"✅ Approved {chat_id}{name_suffix}: whoCanTalk=everyone, whenToReply=all.",
+            command_name="approve",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(name="approve_command_total", labels=(("channel", ctx.channel),)),
+            ),
+        )
+
+    def approve_mention_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        """Handle /approve-mention <chat_id> - allow group + set reply mode to 'mention_only'."""
+        if len(argv) != 1:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /approve-mention <chat_id@g.us>",
+                command_name="approve-mention",
+                outcome="invalid",
+                source="dm",
+            )
+
+        try:
+            chat_id = self._parse_group_chat_id(argv[0])
+        except ValueError as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Invalid approve-mention arguments: {e}",
+                command_name="approve-mention",
+                outcome="invalid",
+                source="dm",
+            )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Approve unavailable: policy engine is not active.",
+                command_name="approve-mention",
+                outcome="error",
+                source="dm",
+            )
+
+        # Get group name for comment
+        group_name = self._get_group_name(chat_id)
+
+        # Set whoCanTalk=everyone and whenToReply=mention_only
+        override = self._whatsapp_chat_override(policy, chat_id)
+        override.who_can_talk = WhoCanTalkPolicyOverride(mode="everyone", senders=[])
+        override.when_to_reply = WhenToReplyPolicyOverride(mode="mention_only", senders=[])
+        if group_name and not override.comment:
+            override.comment = group_name
+
+        try:
+            self._save_policy_and_reload(policy)
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply policy change: {e}",
+                command_name="approve-mention",
+                outcome="error",
+                source="dm",
+            )
+
+        name_suffix = f" ({group_name})" if group_name else ""
+        return AdminCommandResult(
+            status="handled",
+            response=f"✅ Approved {chat_id}{name_suffix}: whoCanTalk=everyone, whenToReply=mention_only.",
+            command_name="approve-mention",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(name="approve_mention_command_total", labels=(("channel", ctx.channel),)),
+            ),
+        )
+
+    def deny_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        """Handle /deny <chat_id> - block group (owners only)."""
+        if len(argv) != 1:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /deny <chat_id@g.us>",
+                command_name="deny",
+                outcome="invalid",
+                source="dm",
+            )
+
+        try:
+            chat_id = self._parse_group_chat_id(argv[0])
+        except ValueError as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Invalid deny arguments: {e}",
+                command_name="deny",
+                outcome="invalid",
+                source="dm",
+            )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Deny unavailable: policy engine is not active.",
+                command_name="deny",
+                outcome="error",
+                source="dm",
+            )
+
+        owner_senders = list(policy.owners.get("whatsapp", []))
+        if not owner_senders:
+            return AdminCommandResult(
+                status="handled",
+                response="Cannot deny group: owners.whatsapp is empty in policy.",
+                command_name="deny",
+                outcome="error",
+                source="dm",
+            )
+
+        # Get group name for comment
+        group_name = self._get_group_name(chat_id)
+
+        # Set whoCanTalk=allowlist (owners only)
+        override = self._whatsapp_chat_override(policy, chat_id)
+        override.who_can_talk = WhoCanTalkPolicyOverride(mode="allowlist", senders=owner_senders)
+        if group_name and not override.comment:
+            override.comment = group_name
+
+        try:
+            self._save_policy_and_reload(policy)
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply policy change: {e}",
+                command_name="deny",
+                outcome="error",
+                source="dm",
+            )
+
+        name_suffix = f" ({group_name})" if group_name else ""
+        return AdminCommandResult(
+            status="handled",
+            response=f"🚫 Denied {chat_id}{name_suffix}: whoCanTalk=allowlist (owners only).",
+            command_name="deny",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(name="deny_command_total", labels=(("channel", ctx.channel),)),
+            ),
+        )
+
     def panic_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
 
@@ -609,6 +847,10 @@ class EnginePolicyAdapter(PolicyPort):
         ]
         if self.panic_is_applicable(ctx):
             lines.append("- /panic [now] — emergency stop gateway + WhatsApp bridge")
+        if self.approve_is_applicable(ctx):
+            lines.append("- /approve <chat_id@g.us> — approve new chat (allow + reply all)")
+            lines.append("- /approve-mention <chat_id@g.us> — approve new chat (allow + mention only)")
+            lines.append("- /deny <chat_id@g.us> — block chat (owners only)")
         if self.policy_admin_is_applicable(ctx):
             lines.append("- /policy help — policy admin commands")
             if include_all and self._policy_admin_service is not None:
@@ -1440,3 +1682,60 @@ class VoiceMessagesCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/voicemessages"
+
+
+class ApproveCommandHandler(AdminCommandHandler):
+    """Quick `/approve` command for new chat approval (allow + reply all)."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "approve"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.approve_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.approve_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/approve <chat_id@g.us>"
+
+
+class ApproveMentionCommandHandler(AdminCommandHandler):
+    """Quick `/approve-mention` command for new chat approval (allow + mention only)."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "approve-mention"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.approve_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.approve_mention_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/approve-mention <chat_id@g.us>"
+
+
+class DenyCommandHandler(AdminCommandHandler):
+    """Quick `/deny` command for blocking a chat (owners only)."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "deny"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.approve_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.deny_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/deny <chat_id@g.us>"

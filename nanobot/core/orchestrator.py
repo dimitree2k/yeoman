@@ -108,6 +108,7 @@ class Orchestrator:
         self._owner_alert_resolver = owner_alert_resolver
         self._owner_alert_cooldown_seconds = max(30, int(owner_alert_cooldown_seconds))
         self._recent_owner_alert_keys: dict[str, float] = {}
+        self._notified_new_chats: set[str] = set()  # In-memory tracking to prevent duplicate notifications
         self._dedupe_ttl_seconds = max(1, int(dedupe_ttl_seconds))
         self._recent_message_keys: dict[str, float] = {}
         self._next_dedupe_cleanup_at = 0.0
@@ -441,6 +442,11 @@ class Orchestrator:
                 )
             )
             return intents
+
+        # Notify owner about new chats BEFORE checking should_respond
+        # This ensures notifications are sent even for passive group joins
+        self._maybe_notify_new_chat(intents, event)
+
         if not decision.should_respond:
             if notes_capture_allowed:
                 if self._security is not None:
@@ -864,6 +870,121 @@ class Orchestrator:
         if not digits:
             return None
         return f"{digits}@s.whatsapp.net"
+
+    def _maybe_notify_new_chat(
+        self,
+        intents: list[OrchestratorIntent],
+        event: InboundEvent,
+    ) -> None:
+        """Notify owner when Nano sees a new WhatsApp chat for the first time."""
+        if event.channel != "whatsapp":
+            return
+        if self._owner_alert_resolver is None:
+            return
+
+        owners = self._owner_alert_resolver(event.channel)
+        if not owners:
+            return
+
+        full_key = f"{event.channel}:{event.chat_id}"
+        
+        # Check in-memory cache first (prevents duplicates within session)
+        # This check happens BEFORE any I/O to prevent race conditions
+        if full_key in self._notified_new_chats:
+            return
+
+        # Check persistent storage
+        from pathlib import Path
+        import json
+        seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
+        seen_chats: set[str] = set()
+        try:
+            if seen_chats_path.exists():
+                data = json.loads(seen_chats_path.read_text())
+                seen_chats = set(data.get("chats", []))
+        except Exception:
+            seen_chats = set()
+
+        if full_key in seen_chats:
+            # Also add to in-memory cache for faster lookup next time
+            self._notified_new_chats.add(full_key)
+            return
+
+        # Mark as seen in memory IMMEDIATELY to prevent race conditions
+        # This ensures that if another message from the same chat arrives
+        # concurrently, it will be deduplicated
+        self._notified_new_chats.add(full_key)
+        
+        # Persist to disk
+        seen_chats.add(full_key)
+        try:
+            seen_chats_path.parent.mkdir(parents=True, exist_ok=True)
+            seen_chats_path.write_text(json.dumps({"chats": list(seen_chats)}))
+        except Exception:
+            pass
+
+        # Get group info from chat_registry (if available)
+        group_name = None
+        group_desc = None
+        try:
+            from nanobot.storage.chat_registry import ChatRegistry
+            registry = ChatRegistry()
+            try:
+                chat_info = registry.get_chat(event.channel, event.chat_id)
+                if chat_info:
+                    group_name = chat_info.get("readable_name")
+                    group_desc = chat_info.get("description")
+            finally:
+                registry.close()
+        except Exception:
+            pass
+
+        # Also try to get name from event metadata (bridge may send it)
+        if not group_name:
+            group_name = event.raw_metadata.get("group_name") or event.raw_metadata.get("subject")
+        if not group_desc:
+            group_desc = event.raw_metadata.get("group_desc") or event.raw_metadata.get("description")
+
+        is_group = event.chat_id.endswith("@g.us")
+        chat_type = "group" if is_group else "chat"
+
+        # Build the notification message
+        lines = []
+        lines.append(f"🔔 Nano was added to a new WhatsApp {chat_type}")
+        if group_name:
+            lines.append(f"📛 Name: {group_name}")
+        if group_desc:
+            lines.append(f"📝 Description: {group_desc}")
+        lines.append(f"🆔 ID: `{event.chat_id}`")
+        lines.append("")
+        lines.append("⚡ Quick commands:")
+        lines.append(f"  /approve {event.chat_id}  → allow + reply all")
+        lines.append(f"  /approve-mention {event.chat_id}  → allow + mention only")
+        lines.append(f"  /deny {event.chat_id}  → block")
+        lines.append("")
+        lines.append("Or use full commands:")
+        lines.append(f"  /policy allow-group {event.chat_id}")
+        lines.append(f"  /policy set-when {event.chat_id} all|mention_only")
+        lines.append(f"  /policy block-group {event.chat_id}")
+
+        message = "\n".join(lines)
+
+        normalized_targets: list[str] = []
+        for raw in owners:
+            target = self._normalize_owner_target(event.channel, raw)
+            if target:
+                normalized_targets.append(target)
+
+        for target in sorted(set(normalized_targets)):
+            intents.append(
+                SendOutboundIntent(
+                    event=OutboundEvent(
+                        channel=event.channel,
+                        chat_id=target,
+                        content=message,
+                    )
+                )
+            )
 
     def _dedupe_key(self, event: InboundEvent) -> str | None:
         if not event.message_id:

@@ -98,9 +98,6 @@ class LLMResponder(ResponderPort):
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
-        self._seen_chats: set[str] = set()
-        self._seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
-        self._load_seen_chats()
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -123,28 +120,6 @@ class LLMResponder(ResponderPort):
             file_access_resolver=file_access_resolver,
         )
         self._register_default_tools()
-
-    def _load_seen_chats(self) -> None:
-        """Load seen chats from persistent storage."""
-        try:
-            if self._seen_chats_path.exists():
-                data = json.loads(self._seen_chats_path.read_text())
-                self._seen_chats = set(data.get("chats", []))
-                logger.info(
-                    "loaded {} seen chats from {}", len(self._seen_chats), self._seen_chats_path
-                )
-        except Exception as e:
-            logger.warning("failed to load seen chats: {}", e)
-            self._seen_chats = set()
-
-    def _save_seen_chats(self) -> None:
-        """Save seen chats to persistent storage."""
-        try:
-            self._seen_chats_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {"chats": list(self._seen_chats)}
-            self._seen_chats_path.write_text(json.dumps(data))
-        except Exception as e:
-            logger.warning("failed to save seen chats: {}", e)
 
     @property
     def tool_names(self) -> frozenset[str]:
@@ -555,36 +530,73 @@ class LLMResponder(ResponderPort):
 
         return final_content or "🤔❓"
 
-    async def _notify_new_chat(self, channel: str, chat_id: str) -> None:
-        """Notify owner when Nano sees a new chat for the first time."""
+    async def _handle_approve_command(self, channel: str, sender_id: str, content: str) -> str | None:
+        """Handle owner approve/deny commands for new groups.
+        
+        Commands:
+        - /approve <chat_id> - Allow group + reply to all
+        - /deny <chat_id> - Block group
+        - yes <chat_id> - Shortcut for approve
+        - approve <chat_id> - Shortcut for approve
+        """
+        # Check if sender is owner
         if self.owner_alert_resolver is None:
-            return
-        if channel != "whatsapp":
-            return
-
-        full_key = f"{channel}:{chat_id}"
-        if full_key in self._seen_chats:
-            return
-
-        self._seen_chats.add(full_key)
-        self._save_seen_chats()
+            return None
         owners = self.owner_alert_resolver(channel)
-        if not owners:
-            return
+        if sender_id not in owners:
+            return None
 
-        is_group = chat_id.endswith("@g.us")
-        chat_type = "group" if is_group else "chat"
-        message = f"🔔 Nano was added to a new WhatsApp {chat_type}: `{chat_id}`"
+        content_lower = content.lower().strip()
+        
+        # Parse command
+        chat_id = None
+        command_type = None
+        
+        # /approve <chat_id>
+        if content_lower.startswith("/approve "):
+            chat_id = content[8:].strip()
+            command_type = "approve"
+        # /deny <chat_id>
+        elif content_lower.startswith("/deny "):
+            chat_id = content[5:].strip()
+            command_type = "deny"
+        # just "yes" or "approve" - need to find pending group from context
+        elif content_lower in ("yes", "approve", "approved"):
+            # Could track pending approvals, for now just return help
+            return "Please specify the group ID: /approve <chat_id@g.us>"
+        # "yes <chat_id>" or "approve <chat_id>"
+        elif content_lower.startswith("yes ") or content_lower.startswith("approve "):
+            parts = content.split(None, 1)
+            if len(parts) == 2:
+                chat_id = parts[1].strip()
+                command_type = "approve"
+        elif content_lower.startswith("deny "):
+            parts = content.split(None, 1)
+            if len(parts) == 2:
+                chat_id = parts[1].strip()
+                command_type = "deny"
+        
+        if not chat_id or not command_type:
+            return None
 
-        for owner in owners:
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=channel,
-                    chat_id=owner,
-                    content=message,
-                )
+        # Validate chat_id format
+        if not chat_id.endswith("@g.us") and not chat_id.endswith("@s.whatsapp.net"):
+            return f"Invalid chat ID format. Use: /approve <chat_id@g.us>"
+
+        # Execute the command via policy admin (if available) or return instructions
+        if command_type == "approve":
+            return (
+                f"✅ Approving group {chat_id}\n"
+                f"Run these commands:\n"
+                f"  /policy allow-group {chat_id}\n"
+                f"  /policy set-when {chat_id} all"
             )
-            logger.info("notified owner {} about new chat {}", owner, chat_id)
+        else:  # deny
+            return (
+                f"🚫 Blocking group {chat_id}\n"
+                f"Run:\n"
+                f"  /policy block-group {chat_id}"
+            )
 
     @staticmethod
     def _topic_tokens(text: str) -> set[str]:
@@ -779,8 +791,11 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_use_llm_message: bool = False,
         is_owner: bool = False,
     ) -> str:
-        # Check for new chat and notify owner
-        await self._notify_new_chat(channel, chat_id)
+        # Handle owner approve/deny commands
+        if is_owner and channel == "whatsapp":
+            approval_response = await self._handle_approve_command(channel, sender_id or "", content)
+            if approval_response:
+                return approval_response
 
         session = self.sessions.get_or_create(session_key)
 
