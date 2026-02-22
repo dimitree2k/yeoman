@@ -187,6 +187,8 @@ class ChatPolicy(PolicyModel):
 class ChatPolicyOverride(PolicyModel):
     """Partial override at channel-default or specific-chat level."""
 
+    comment: str | None = Field(default=None, alias="comment")
+    persona_file: str | None = Field(default=None, alias="personaFile")
     who_can_talk: WhoCanTalkPolicyOverride | None = Field(default=None, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
     blocked_senders: BlockedSendersPolicyOverride | None = Field(
@@ -195,12 +197,10 @@ class ChatPolicyOverride(PolicyModel):
     allowed_tools: AllowedToolsPolicyOverride | None = Field(default=None, alias="allowedTools")
     tool_access: dict[str, ToolAccessRuleOverride] | None = Field(default=None, alias="toolAccess")
     group_tags: list[str] | None = Field(default=None, alias="groupTags")
-    persona_file: str | None = Field(default=None, alias="personaFile")
     voice: VoicePolicyOverride | None = None
     talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(
         default=None, alias="talkativeCooldown"
     )
-    comment: str | None = Field(default=None, alias="comment")
 
 
 class ChannelPolicy(PolicyModel):
