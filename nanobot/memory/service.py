@@ -812,6 +812,35 @@ class MemoryService:
         saved, inserted = self.store.upsert_node(entry)
         return saved, inserted
 
+    @staticmethod
+    def _strip_manual_capture_marker(text: str) -> str:
+        compact = " ".join(str(text or "").split()).strip()
+        if not compact:
+            return ""
+        marker_match = re.match(r"^\[(idea|backlog)\]\s*(.*)$", compact, flags=re.IGNORECASE)
+        if marker_match:
+            body = marker_match.group(2).strip()
+            return body or compact
+        return compact
+
+    def record_idea_backlog_capture(
+        self,
+        *,
+        entry_kind: Literal["idea", "backlog"],
+        content: str,
+        source: str = "manual_capture",
+    ) -> int | None:
+        """Mirror explicit idea/backlog captures into structured queue table."""
+        title = self._strip_manual_capture_marker(content)
+        if not title:
+            return None
+        stage = "backlog" if entry_kind == "backlog" else "inbox"
+        try:
+            return self.store.append_idea_backlog_item(stage=stage, title=title, source=source)
+        except Exception as exc:
+            logger.warning("idea backlog mirror write failed: {}", exc)
+            return None
+
     def prune(
         self,
         *,

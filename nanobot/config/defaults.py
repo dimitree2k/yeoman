@@ -112,8 +112,8 @@ DEFAULT_MEMORY: dict[str, Any] = {
         "mode": "hybrid",
         "extract_route": "memory.capture.extract",
         "max_candidates_per_message": 4,
-        "min_confidence": 0.6,
-        "min_salience": 0.45,
+        "min_confidence": 0.4,
+        "min_salience": 0.4,
     },
     "recall": {
         "max_results": 8,

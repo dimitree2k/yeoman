@@ -99,6 +99,35 @@ class MemoryStore:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS idea_backlog_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stage TEXT NOT NULL CHECK(stage IN ('inbox', 'backlog')),
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'done', 'archived')),
+                    title TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    priority INTEGER CHECK(priority BETWEEN 1 AND 5 OR priority IS NULL),
+                    tags TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    promoted_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_idea_backlog_stage_status
+                ON idea_backlog_items (stage, status, created_at DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_idea_backlog_priority
+                ON idea_backlog_items (stage, priority DESC, created_at DESC)
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory2_nodes_fts
                 USING fts5(entry_id UNINDEXED, content)
                 """
@@ -457,6 +486,27 @@ class MemoryStore:
                 """
             )
             self._conn.commit()
+
+    def append_idea_backlog_item(
+        self,
+        *,
+        stage: str,
+        title: str,
+        source: str,
+    ) -> int:
+        now_iso = datetime.now(UTC).isoformat()
+        promoted_at = now_iso if stage == "backlog" else None
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO idea_backlog_items (
+                    stage, status, title, details, priority, tags, source, created_at, updated_at, promoted_at
+                ) VALUES (?, 'open', ?, '', NULL, '', ?, ?, ?, ?)
+                """,
+                (stage, title, source, now_iso, now_iso, promoted_at),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:

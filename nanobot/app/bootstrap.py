@@ -194,6 +194,11 @@ class OrchestratorService:
                         importance=salience,
                         confidence=1.0,
                     )
+                    self._memory.record_idea_backlog_capture(
+                        entry_kind=intent.entry_kind,
+                        content=intent.content,
+                        source="orchestrator_manual_capture",
+                    )
                 case RecordMetricIntent():
                     self._telemetry.incr(intent.name, intent.value, intent.labels)
                 case _:
