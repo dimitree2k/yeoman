@@ -40,7 +40,7 @@ Channel → Manager → Bus/Queue → Orchestrator
 Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`, `ResponderPort`, `ReplyArchivePort`, `SecurityPort`, `TelemetryPort`); adapters implement them. Orchestrator emits typed `OrchestratorIntent` objects; channels react asynchronously.
 
 <p align="center">
-  <img src="nanobot_arch.png" alt="architecture" width="700">
+  <img src="nanobot_arch.svg" alt="architecture" width="900">
 </p>
 
 ## Install
