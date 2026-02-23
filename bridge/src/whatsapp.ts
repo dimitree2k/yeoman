@@ -24,6 +24,7 @@ const INBOUND_QUOTE_CLEANUP_INTERVAL_MS = 30_000;
 const OUTBOUND_SELF_FILTER_TTL_MS = 10 * 60_000;
 const OUTBOUND_SELF_FILTER_MAX = 5_000;
 const OUTBOUND_SELF_FILTER_CLEANUP_INTERVAL_MS = 30_000;
+const INBOUND_IMAGE_RETRY_DELAYS_MS = [250, 500, 1000];
 const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 
@@ -165,6 +166,14 @@ function safeErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return String(err);
+}
+
+function decodeDownloadedMedia(downloaded: unknown): Buffer | null {
+  if (Buffer.isBuffer(downloaded)) return downloaded;
+  if (downloaded && typeof downloaded === 'object' && ArrayBuffer.isView(downloaded)) {
+    return Buffer.from(downloaded as Uint8Array);
+  }
+  return null;
 }
 
 async function ensureAuthSecurity(authDir: string): Promise<void> {
@@ -462,22 +471,29 @@ export class WhatsAppClient {
     const ext = mediaExtension(media.kind, media.mimeType, media.fileName);
     const filePath = join(dayDir, `${messageId}${ext}`);
 
-    const downloaded = await downloadMediaMessage(
-      msg,
-      'buffer',
-      {},
-      {
-        logger: pino({ level: 'silent' }),
-        reuploadRequest: this.sock.updateMediaMessage,
-      },
-    );
-
-    const downloadedAny: unknown = downloaded;
     let buffer: Buffer | null = null;
-    if (Buffer.isBuffer(downloadedAny)) {
-      buffer = downloadedAny;
-    } else if (downloadedAny && typeof downloadedAny === 'object' && ArrayBuffer.isView(downloadedAny)) {
-      buffer = Buffer.from(downloadedAny as Uint8Array);
+    for (let attempt = 0; attempt <= INBOUND_IMAGE_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const downloaded = await downloadMediaMessage(
+          msg,
+          'buffer',
+          {},
+          {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: this.sock.updateMediaMessage,
+          },
+        );
+        buffer = decodeDownloadedMedia(downloaded);
+      } catch {
+        if (attempt >= INBOUND_IMAGE_RETRY_DELAYS_MS.length) {
+          throw new Error('inbound image download failed after retries');
+        }
+      }
+      if (buffer && buffer.length > 0) break;
+      const backoffMs = INBOUND_IMAGE_RETRY_DELAYS_MS[attempt];
+      if (backoffMs && backoffMs > 0) {
+        await sleep(backoffMs);
+      }
     }
     if (!buffer || buffer.length === 0) return media;
 
