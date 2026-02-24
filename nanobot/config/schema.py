@@ -25,7 +25,12 @@ def _default_model_profiles() -> dict[str, "ModelProfile"]:
 
 
 class ModelProfile(BaseModel):
-    """One model profile used for a specific capability route."""
+    """One model profile used for a specific capability route.
+
+    Supports fallback chains: when the primary model fails (429/5xx),
+    the router tries each fallback in order. Cooldown tracking prevents
+    repeated failures from overwhelming degraded providers.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -35,6 +40,10 @@ class ModelProfile(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     timeout_ms: int | None = None
+    # Fallback chain: list of profile names to try if this profile fails
+    fallback: list[str] = Field(default_factory=list)
+    # Cooldown seconds after a 429/5xx error before retrying this profile
+    cooldown_seconds: int = 60
 
 
 class ModelRoutingConfig(BaseModel):
@@ -453,6 +462,7 @@ class Config(BaseSettings):
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
         Env vars from ProviderSpec.env_key are used as fallback when config.api_key is empty."""
         import os
+
         from nanobot.providers.registry import PROVIDERS, ProviderSpec
 
         def _has_api_key(provider_config: ProviderConfig, spec: ProviderSpec) -> bool:
@@ -481,6 +491,7 @@ class Config(BaseSettings):
         """Get API key for the given model. Falls back to first available key.
         Checks config first, then env vars from ProviderSpec.env_key."""
         import os
+
         from nanobot.providers.registry import PROVIDERS
 
         # Check if provider in config has a key
@@ -513,4 +524,3 @@ class Config(BaseSettings):
             ):
                 return spec.default_api_base
         return None
-

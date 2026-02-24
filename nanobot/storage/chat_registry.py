@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, get_data_path, get_operational_data_path
+from nanobot.utils.helpers import ensure_dir, get_operational_data_path
 
 PURGE_INTERVAL_SECONDS = 3600
 
@@ -39,7 +38,6 @@ class ChatRegistry:
             self.db_path = db_path
         else:
             self.db_path = get_operational_data_path() / "inbound" / "chat_registry.db"
-            self._migrate_legacy_default_path()
         ensure_dir(self.db_path.parent)
 
         self._lock = threading.RLock()
@@ -49,23 +47,6 @@ class ChatRegistry:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_schema()
         self._last_purge_at = 0.0
-
-    def _migrate_legacy_default_path(self) -> None:
-        """Move legacy ~/.nanobot/inbound/chat_registry.db into ~/.nanobot/data/inbound/."""
-        legacy = get_data_path() / "inbound" / "chat_registry.db"
-        if legacy == self.db_path:
-            return
-        if not legacy.exists() or self.db_path.exists():
-            return
-        ensure_dir(self.db_path.parent)
-        try:
-            for suffix in ("", "-wal", "-shm"):
-                src = Path(f"{legacy}{suffix}")
-                dst = Path(f"{self.db_path}{suffix}")
-                if src.exists() and not dst.exists():
-                    src.replace(dst)
-        except OSError as e:
-            logger.warning(f"Failed to migrate legacy chat registry DB from {legacy}: {e}")
 
     def _create_schema(self) -> None:
         with self._lock:
@@ -386,67 +367,6 @@ class ChatRegistry:
         ).fetchall()
         result["by_type"] = {r["chat_type"]: r["count"] for r in by_type}
         return result
-
-    def migrate_from_seen_chats(self, seen_chats_path: Path) -> int:
-        """Migrate legacy seen_chats.json format to registry."""
-        if not seen_chats_path.exists():
-            return 0
-
-        try:
-            data = json.loads(seen_chats_path.read_text())
-            chats_list = data.get("chats", [])
-            if not isinstance(chats_list, list):
-                return 0
-
-            migrated = 0
-            for full_key in chats_list:
-                if not isinstance(full_key, str):
-                    continue
-
-                # Parse "channel:chat_id" format
-                if ":" not in full_key:
-                    continue
-
-                parts = full_key.split(":", 1)
-                if len(parts) != 2:
-                    continue
-
-                channel, chat_id = parts
-                if not channel or not chat_id:
-                    continue
-
-                # Infer chat type
-                inferred_type = ChatType.UNKNOWN.value
-                if chat_id.endswith("@g.us"):
-                    inferred_type = ChatType.GROUP.value
-                elif channel == "telegram":
-                    if chat_id.startswith("-100"):
-                        inferred_type = ChatType.GROUP.value
-                    else:
-                        inferred_type = ChatType.DM.value
-                elif channel == "whatsapp":
-                    if chat_id.endswith("@lid"):
-                        inferred_type = ChatType.DM.value
-                    elif chat_id.endswith("@s.whatsapp.net"):
-                        inferred_type = ChatType.DM.value
-                    else:
-                        inferred_type = ChatType.GROUP.value
-
-                # Try to infer chat name from policy or other sources
-                # For now, just register with available info
-                if self.register_chat(
-                    channel=channel,
-                    chat_id=chat_id,
-                    chat_type=inferred_type,
-                ):
-                    migrated += 1
-
-            logger.info(f"Migrated {migrated} chats from seen_chats.json")
-            return migrated
-
-        except Exception as e:
-            logger.warning(f"Failed to migrate seen_chats.json: {e}")
-            return 0
 
     def sync_from_bridge_metadata(
         self,

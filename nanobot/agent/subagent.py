@@ -14,11 +14,10 @@ if TYPE_CHECKING:
     from nanobot.agent.tools.file_access import FileAccessResolver
     from nanobot.config.schema import ExecToolConfig
 
-from nanobot.agent.tools.file_access import enable_grants
+from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage

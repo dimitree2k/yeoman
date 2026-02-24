@@ -13,8 +13,8 @@ from loguru import logger
 from nanobot.adapters.policy_engine import EnginePolicyAdapter
 from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from nanobot.adapters.responder_llm import LLMResponder
-from nanobot.adapters.telemetry import InMemoryTelemetry
 from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
+from nanobot.telemetry import InMemoryTelemetry
 from nanobot.agent.tools.file_access import build_file_access_resolver
 from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from nanobot.bus.queue import MessageBus
@@ -245,7 +245,6 @@ def build_gateway_runtime(
     bus: MessageBus,
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
-    from nanobot.config.loader import get_data_dir
 
     from nanobot.utils.helpers import get_operational_data_path
 

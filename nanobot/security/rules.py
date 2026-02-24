@@ -171,14 +171,14 @@ def decide_tool(tool_name: str, args: dict[str, Any]) -> SecurityDecision:
 def decide_output(text: str, redact_placeholder: str = "[REDACTED]") -> tuple[SecurityDecision, str | None]:
     sanitized = text
     hit_count = 0
-    
+
     # Check for sensitive token patterns (API keys, etc.)
     for pattern in _OUTPUT_SECRET_PATTERNS:
         sanitized_next, replacements = pattern.subn(redact_placeholder, sanitized)
         if replacements:
             hit_count += replacements
             sanitized = sanitized_next
-    
+
     # Check for config file references - block them completely
     for pattern in _CONFIG_FILE_PATTERNS:
         if pattern.search(sanitized):

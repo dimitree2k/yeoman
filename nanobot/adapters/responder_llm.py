@@ -9,20 +9,20 @@ import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, Callable, override
 
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.file_access import FileAccessResolver, enable_grants
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.pi_stats import PiStatsTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
-from nanobot.agent.tools.exec_isolation import SandboxMount
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
@@ -30,9 +30,9 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.core.models import InboundEvent, PolicyDecision
 from nanobot.core.ports import ResponderPort, SecurityPort, TelemetryPort
+from nanobot.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
-from nanobot.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
@@ -70,9 +70,9 @@ class LLMResponder(ResponderPort):
         memory_service: "MemoryService | None" = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
-        owner_alert_resolver: "callable[[str], list[str]] | None" = None,
+        owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
         file_access_resolver: FileAccessResolver | None = None,
-        group_resolver: "callable[[str], tuple[str | None, str | None]] | None" = None,
+        group_resolver: "Callable[[str], tuple[str | None, str | None]] | None" = None,
         model_router: "ModelRouter | None" = None,
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
@@ -532,7 +532,7 @@ class LLMResponder(ResponderPort):
 
     async def _handle_approve_command(self, channel: str, sender_id: str, content: str) -> str | None:
         """Handle owner approve/deny commands for new groups.
-        
+
         Commands:
         - /approve <chat_id> - Allow group + reply to all
         - /deny <chat_id> - Block group
@@ -547,11 +547,11 @@ class LLMResponder(ResponderPort):
             return None
 
         content_lower = content.lower().strip()
-        
+
         # Parse command
         chat_id = None
         command_type = None
-        
+
         # /approve <chat_id>
         if content_lower.startswith("/approve "):
             chat_id = content[8:].strip()
@@ -575,13 +575,13 @@ class LLMResponder(ResponderPort):
             if len(parts) == 2:
                 chat_id = parts[1].strip()
                 command_type = "deny"
-        
+
         if not chat_id or not command_type:
             return None
 
         # Validate chat_id format
         if not chat_id.endswith("@g.us") and not chat_id.endswith("@s.whatsapp.net"):
-            return f"Invalid chat ID format. Use: /approve <chat_id@g.us>"
+            return "Invalid chat ID format. Use: /approve <chat_id@g.us>"
 
         # Execute the command via policy admin (if available) or return instructions
         if command_type == "approve":

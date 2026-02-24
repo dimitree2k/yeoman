@@ -292,7 +292,7 @@ class EnginePolicyAdapter(PolicyPort):
         if event.channel in self._engine.apply_channels:
             try:
                 effective = self._engine.resolve_policy(event.channel, event.chat_id)
-                when_to_reply_mode = effective.when_to_reply_mode
+                when_to_reply_mode = effective.when_to_reply_mode  # type: ignore[assignment]
                 voice_output_mode = effective.voice_output_mode
                 voice_output_tts_route = effective.voice_output_tts_route
                 voice_output_voice = effective.voice_output_voice
@@ -1433,11 +1433,12 @@ class EnginePolicyAdapter(PolicyPort):
 
         # Bridge lookup can resolve human-readable group subjects even if policy has no comment.
         bridge_names = self._list_group_subjects_from_bridge(list(records.keys()))
-        for chat_id, subject in bridge_names.items():
-            rec = records.get(chat_id)
-            if rec is None:
-                rec = ensure(chat_id)
-            rec["seen_bridge"] = True
+        for bridge_chat_id, subject in bridge_names.items():
+            rec2: dict[str, Any] | None = records.get(bridge_chat_id)
+            if rec2 is None:
+                rec2 = ensure(bridge_chat_id)
+                records[bridge_chat_id] = rec2
+            rec2["seen_bridge"] = True
             if not str(rec.get("comment") or "").strip():
                 rec["comment"] = subject
 
