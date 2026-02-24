@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -18,9 +18,8 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
-from nanobot.config.loader import get_config_path, get_data_dir, load_config, save_config
+from nanobot.config.loader import get_config_path, load_config, save_config
 from nanobot.utils.process import (
-    is_bridge_dir,
     is_bridge_process,
     listener_pids_for_port,
     pid_alive,

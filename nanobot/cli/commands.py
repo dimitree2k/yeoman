@@ -13,7 +13,6 @@ from rich.table import Table
 from nanobot import __logo__, __version__
 from nanobot.utils.process import (
     command_for_pid,
-    is_bridge_dir,
     is_bridge_process,
     listener_pids_for_port,
     pid_alive,
@@ -2385,6 +2384,7 @@ def chats_sync(
     import uuid
 
     import websockets
+
     from nanobot.config.loader import load_config
     from nanobot.storage.chat_registry import ChatRegistry
 

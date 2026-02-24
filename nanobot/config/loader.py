@@ -61,8 +61,8 @@ def _apply_env_overrides(config: Config) -> Config:
     over values already present in config.json. This means the .env file
     is the canonical source for secrets; config.json can have empty keys.
     """
-    from nanobot.providers.registry import PROVIDERS
     from nanobot.config.schema import ProviderConfig
+    from nanobot.providers.registry import PROVIDERS
 
     # Provider API keys — iterate registry so every provider is covered
     for spec in PROVIDERS:

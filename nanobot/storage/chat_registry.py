@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path

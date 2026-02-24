@@ -245,7 +245,6 @@ def build_gateway_runtime(
     bus: MessageBus,
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
-    from nanobot.config.loader import get_data_dir
 
     from nanobot.utils.helpers import get_operational_data_path
 
