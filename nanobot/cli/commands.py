@@ -374,15 +374,6 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
 
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from nanobot.config.loader import load_config
-    from nanobot.utils.helpers import migrate_runtime_layout
-
-    # Migrate old flat layout to new subdirectory layout before anything else
-    # creates new-layout directories (which would block the rename-based migration).
-    moved = migrate_runtime_layout()
-    if moved:
-        from loguru import logger
-        for old in moved:
-            logger.info("runtime layout migration: moved {}", old)
 
     config = load_config()
     if ensure_whatsapp and config.channels.whatsapp.enabled:
@@ -445,19 +436,11 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from nanobot.config.loader import load_config
-    from nanobot.utils.helpers import migrate_runtime_layout
 
     if verbose:
         import logging
 
         logging.basicConfig(level=logging.DEBUG)
-
-    # Migrate old flat layout to new subdirectory layout (one-shot, idempotent)
-    moved = migrate_runtime_layout()
-    if moved:
-        from loguru import logger
-        for old in moved:
-            logger.info("runtime layout migration: moved {}", old)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
@@ -705,12 +688,12 @@ def agent(
 ):
     """Interact with the agent directly."""
     from nanobot.adapters.responder_llm import LLMResponder
-    from nanobot.adapters.telemetry import InMemoryTelemetry
     from nanobot.agent.tools.file_access import build_file_access_resolver
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
     from nanobot.policy.loader import load_policy
     from nanobot.security import NoopSecurity, SecurityEngine
+    from nanobot.telemetry import InMemoryTelemetry
 
     config = load_config()
     memory_service = _make_memory_service(config)
@@ -2463,5 +2446,3 @@ def chats_sync(
         console.print(f"[green]✓[/green] Synced {len(results)} chats from {channel} bridge")
         console.print(f"  [green]{new_count}[/green] new chats registered")
         console.print(f"  [cyan]{updated_count}[/cyan] existing chats updated")
-
-

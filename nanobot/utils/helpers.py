@@ -97,62 +97,6 @@ def get_skills_path(workspace: Path | None = None) -> Path:
     return ensure_dir(ws / "skills")
 
 
-def migrate_runtime_layout() -> list[str]:
-    """One-shot migration from the old flat ~/.nanobot layout to the new subdirectory layout.
-
-    Moves files/directories only when the old path exists and the new path does not.
-    Returns a list of old paths that were moved (for logging).
-    """
-    data = get_data_path()
-    moved: list[str] = []
-
-    # Legacy session JSONL files lived in ~/.nanobot/sessions.
-    # Move those files into ~/.nanobot/data/inbound, even if the destination
-    # directory already exists (e.g. because reply_context.db is already there).
-    legacy_sessions_dir = data / "sessions"
-    inbound_dir = get_operational_data_path() / "inbound"
-    if legacy_sessions_dir.exists() and legacy_sessions_dir.is_dir():
-        inbound_dir.mkdir(parents=True, exist_ok=True)
-        for old in legacy_sessions_dir.glob("*.jsonl"):
-            new = inbound_dir / old.name
-            if new.exists():
-                continue
-            old.rename(new)
-            moved.append(str(old))
-        try:
-            legacy_sessions_dir.rmdir()
-        except OSError:
-            pass
-
-    migrations: list[tuple[Path, Path]] = [
-        # Long-lived operational data → data/
-        (data / "memory", get_operational_data_path() / "memory"),
-        (data / "inbound", get_operational_data_path() / "inbound"),
-        (data / "cron", get_operational_data_path() / "cron"),
-        (data / "policy", get_operational_data_path() / "policy"),
-        (data / "seen_chats.json", get_operational_data_path() / "seen_chats.json"),
-        # Ephemeral state → var/
-        (data / "logs", get_logs_path()),
-        (data / "run", get_run_path()),
-        (data / "media", get_var_path() / "media"),
-        # Derived/cache artifacts → var/cache/
-        (data / "bridge", get_cache_path() / "bridge"),
-        # Secrets → secrets/
-        (data / "whatsapp-auth", get_secrets_path() / "whatsapp-auth"),
-    ]
-
-    for old_path, new_path in migrations:
-        if not old_path.exists():
-            continue
-        if new_path.exists():
-            continue
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        old_path.rename(new_path)
-        moved.append(str(old_path))
-
-    return moved
-
-
 def today_date() -> str:
     """Get today's date in YYYY-MM-DD format."""
     return datetime.now().strftime("%Y-%m-%d")
