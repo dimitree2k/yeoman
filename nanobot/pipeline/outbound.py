@@ -74,7 +74,11 @@ class OutboundMiddleware:
         # ── Reaction marker ──────────────────────────────────────────
         reaction_match = _REACTION_RE.match(reply)
         if reaction_match and event.message_id:
-            emoji = reaction_match.group(1).strip()
+            full_content = reaction_match.group(1).strip()
+            # Split emoji from optional text body (separated by newline)
+            parts = full_content.split("\n", 1)
+            emoji = parts[0].strip()
+            text_body = parts[1].strip() if len(parts) > 1 else ""
             ctx.intents.append(
                 SendReactionIntent(
                     channel=event.channel,
@@ -84,15 +88,18 @@ class OutboundMiddleware:
                     participant_jid=event.participant,
                 )
             )
-            ctx.intents.append(
-                PersistSessionIntent(
-                    session_key=f"{event.channel}:{event.chat_id}",
-                    user_content=event.content,
-                    assistant_content=f"[reacted with {emoji}]",
-                )
-            )
             ctx.metric("reaction_sent", labels=(("channel", event.channel),))
-            return
+            if not text_body:
+                ctx.intents.append(
+                    PersistSessionIntent(
+                        session_key=f"{event.channel}:{event.chat_id}",
+                        user_content=event.content,
+                        assistant_content=f"[reacted with {emoji}]",
+                    )
+                )
+                return
+            # Fall through with text_body as the reply to send
+            reply = text_body
 
         # ── Output security ──────────────────────────────────────────
         if self._security is not None:
