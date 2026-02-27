@@ -16,6 +16,7 @@ Security:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -63,7 +64,7 @@ def _check_auth(auth_header: str | None, expected_token: str) -> bool:
     if not auth_header.startswith("Bearer "):
         return False
     token = auth_header[7:]  # Remove "Bearer " prefix
-    return token == expected_token
+    return hmac.compare_digest(token, expected_token)
 
 
 def _rate_limit_key(request: Any) -> str:
