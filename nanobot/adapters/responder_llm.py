@@ -171,6 +171,10 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
 
+        from nanobot.agent.tools.browse import BrowseTool
+
+        self.tools.register(BrowseTool())
+
         message_tool = MessageTool(
             send_callback=self.bus.publish_outbound,
             group_resolver=self._resolve_group_reference,
