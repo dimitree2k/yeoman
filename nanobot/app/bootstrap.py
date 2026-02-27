@@ -273,6 +273,16 @@ def build_gateway_runtime(
     restrict_to_workspace, exec_config = _resolve_security_tool_settings(config)
     security = SecurityEngine(config.security) if config.security.enabled else NoopSecurity()
 
+    # Optional LLM-based input classifier (second defence layer).
+    security_classifier = None
+    if config.security.enabled and config.security.stages.input:
+        try:
+            from nanobot.security.classifier import InputClassifier
+
+            security_classifier = InputClassifier(config=config)
+        except Exception as exc:
+            logger.warning("security classifier disabled: {}", exc)
+
     memory_service = MemoryService(workspace=workspace, config=config.memory, root_config=config)
     memory_state_dir = config.memory.wal.state_dir
     try:
@@ -370,6 +380,7 @@ def build_gateway_runtime(
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,
         typing_notifier=typing_adapter,
         security=security,
+        security_classifier=security_classifier,
         security_block_message=config.security.block_user_message,
         policy_admin_handler=admin_command_handler,
         model_router=model_router,

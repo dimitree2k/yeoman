@@ -56,6 +56,13 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,
         "timeout_ms": 15000,
     },
+    "security_classifier": {
+        "kind": "chat",
+        "model": "openai/gpt-4o-mini",
+        "max_tokens": 300,
+        "temperature": 0.0,
+        "timeout_ms": 10000,
+    },
 }
 
 DEFAULT_MODEL_ROUTES: dict[str, str] = {
@@ -70,6 +77,7 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "whatsapp.vision.describe_video": "vision_whatsapp_cheap",
     "memory.embed": "memory_embed_fast",
     "memory.capture.extract": "memory_capture_fast",
+    "security.classify": "security_classifier",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from nanobot.media.router import ModelRouter
     from nanobot.media.tts import TTSSynthesizer
+    from nanobot.security.classifier import InputClassifier
 
 
 class Orchestrator:
@@ -56,6 +57,7 @@ class Orchestrator:
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: "Callable[[str, str, bool], Awaitable[None]] | None" = None,
         security: SecurityPort | None = None,
+        security_classifier: "InputClassifier | None" = None,
         security_block_message: str = "😂",
         policy_admin_handler: "Callable[[InboundEvent], AdminCommandResult | str | None] | None" = None,
         model_router: "ModelRouter | None" = None,
@@ -81,7 +83,7 @@ class Orchestrator:
             AccessControlMiddleware(security=security),
             NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver),
             NoReplyFilterMiddleware(security=security),
-            InputSecurityMiddleware(security=security, block_message=security_block_message),
+            InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(responder=responder, typing_notifier=typing_notifier),
             OutboundMiddleware(
                 security=security,
