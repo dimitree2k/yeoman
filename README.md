@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="nanobot_logo.png" alt="nanobot-stack" width="400">
+  <img src="yeoman_logo.png" alt="yeoman" width="400">
 
   <h3>Policy-first personal AI assistant runtime</h3>
 
@@ -13,9 +13,9 @@
 
 ---
 
-**nanobot-stack** is a lightweight, multi-channel AI assistant runtime with deterministic policy control, long-term memory, voice I/O, and tool sandboxing — ~18k lines of Python.
+**yeoman** is a lightweight, multi-channel AI assistant runtime with deterministic policy control, long-term memory, voice I/O, and tool sandboxing — ~18k lines of Python.
 
-> Originally forked from [HKUDS/nanobot](https://github.com/HKUDS/nanobot). This project has since diverged significantly with a rewritten policy engine, hexagonal architecture, multi-channel support, memory system, security hardening, and more. MIT license preserved. See [UPSTREAM.md](UPSTREAM.md) for details.
+> Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
 
 ## Highlights
 
@@ -40,22 +40,22 @@ Channel → Manager → Bus/Queue → Orchestrator
 Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`, `ResponderPort`, `ReplyArchivePort`, `SecurityPort`, `TelemetryPort`); adapters implement them. Orchestrator emits typed `OrchestratorIntent` objects; channels react asynchronously.
 
 <p align="center">
-  <img src="nanobot_arch.svg" alt="architecture" width="900">
+  <img src="yeoman_arch.svg" alt="architecture" width="900">
 </p>
 
 ## Install
 
 ```bash
 # From source (recommended for development)
-git clone https://github.com/dimitree2k/nanobot-stack.git
-cd nanobot-stack
+git clone https://github.com/dimitree2k/yeoman.git
+cd yeoman
 pip install -e .
 
 # With uv
-uv tool install nanobot-stack
+uv tool install yeoman
 
 # From PyPI (once published)
-pip install nanobot-stack
+pip install yeoman
 ```
 
 ## Quick Start
@@ -63,20 +63,20 @@ pip install nanobot-stack
 **1. Initialize**
 
 ```bash
-nanobot onboard
+yeoman onboard
 ```
 
 **2. Add API keys** — pick any method:
 
 | Method | Location | Notes |
 |--------|----------|-------|
-| `.env` file | `~/.nanobot/.env` | Recommended. `nanobot config migrate-to-env` can generate it |
+| `.env` file | `~/.yeoman/.env` | Recommended. `yeoman config migrate-to-env` can generate it |
 | Environment variables | Shell / systemd | `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, etc. |
-| Config file | `~/.nanobot/config.json` | Works but `.env` is preferred for secrets |
+| Config file | `~/.yeoman/config.json` | Works but `.env` is preferred for secrets |
 
 ```bash
 # Example: set model in config, key in .env
-echo 'OPENROUTER_API_KEY=sk-or-v1-xxx' >> ~/.nanobot/.env
+echo 'OPENROUTER_API_KEY=sk-or-v1-xxx' >> ~/.yeoman/.env
 ```
 
 ```json
@@ -90,7 +90,7 @@ echo 'OPENROUTER_API_KEY=sk-or-v1-xxx' >> ~/.nanobot/.env
 **3. Chat**
 
 ```bash
-nanobot agent -m "Hello!"
+yeoman agent -m "Hello!"
 ```
 
 > [!TIP]
@@ -99,19 +99,19 @@ nanobot agent -m "Hello!"
 <a id="channels"></a>
 ## Channels
 
-All channels are configured in `~/.nanobot/config.json` and access-controlled via `~/.nanobot/policy.json`.
+All channels are configured in `~/.yeoman/config.json` and access-controlled via `~/.yeoman/policy.json`.
 
 | Channel | Complexity | Notes |
 |---------|-----------|-------|
 | **Telegram** | Easy | Bot token from @BotFather |
 | **Discord** | Easy | Bot token + MESSAGE CONTENT intent |
-| **WhatsApp** | Medium | QR link via `nanobot channels login` (Node.js ≥18) |
+| **WhatsApp** | Medium | QR link via `yeoman channels login` (Node.js ≥18) |
 | **Feishu** | Medium | WebSocket — no public IP needed |
 
 Start all enabled channels:
 
 ```bash
-nanobot gateway
+yeoman gateway
 ```
 
 <details>
@@ -134,20 +134,20 @@ Invite with scopes: `bot` · Permissions: `Send Messages`, `Read Message History
 ### WhatsApp
 
 ```bash
-nanobot channels login   # scan QR
-nanobot gateway           # start
+yeoman channels login   # scan QR
+yeoman gateway           # start
 ```
 
 ```json
 { "channels": { "whatsapp": { "enabled": true } } }
 ```
 
-Supports voice (STT + TTS), bridge lifecycle management (`nanobot channels bridge start|stop|restart|status`), and media persistence.
+Supports voice (STT + TTS), bridge lifecycle management (`yeoman channels bridge start|stop|restart|status`), and media persistence.
 
 ### Feishu
 
 ```bash
-pip install nanobot-stack[feishu]
+pip install yeoman[feishu]
 ```
 
 ```json
@@ -162,7 +162,7 @@ pip install nanobot-stack[feishu]
 
 ## Policy Engine
 
-`~/.nanobot/policy.json` controls four dimensions per channel and chat:
+`~/.yeoman/policy.json` controls four dimensions per channel and chat:
 
 | Dimension | Modes |
 |-----------|-------|
@@ -176,7 +176,7 @@ Merge precedence: `defaults` → `channels.<ch>.default` → `channels.<ch>.chat
 Policy is hot-reloaded — no restart needed. Debug with:
 
 ```bash
-nanobot policy explain --channel telegram --chat -1001234567890 --sender "12345|User"
+yeoman policy explain --channel telegram --chat -1001234567890 --sender "12345|User"
 ```
 
 ## Providers
@@ -211,45 +211,45 @@ Adding a new provider requires only 2 changes: a `ProviderSpec` in `providers/re
 
 | Command | Description |
 |---------|-------------|
-| `nanobot onboard` | Initialize config & workspace |
-| `nanobot agent -m "..."` | Single-shot chat |
-| `nanobot agent` | Interactive chat |
-| `nanobot gateway` | Start all enabled channels |
-| `nanobot status` | Runtime status |
-| `nanobot logs` | View gateway/bridge logs |
+| `yeoman onboard` | Initialize config & workspace |
+| `yeoman agent -m "..."` | Single-shot chat |
+| `yeoman agent` | Interactive chat |
+| `yeoman gateway` | Start all enabled channels |
+| `yeoman status` | Runtime status |
+| `yeoman logs` | View gateway/bridge logs |
 | **Channels** | |
-| `nanobot channels login` | Link WhatsApp (scan QR) |
-| `nanobot channels status` | Show channel status |
-| `nanobot channels bridge start\|stop\|restart\|status` | Manage WhatsApp bridge |
+| `yeoman channels login` | Link WhatsApp (scan QR) |
+| `yeoman channels status` | Show channel status |
+| `yeoman channels bridge start\|stop\|restart\|status` | Manage WhatsApp bridge |
 | **Policy** | |
-| `nanobot policy path` | Show policy file location |
-| `nanobot policy explain` | Debug policy decisions for a chat/sender |
-| `nanobot policy cmd "/policy ..."` | Run policy commands from CLI |
-| `nanobot policy annotate-whatsapp-comments` | Auto-fill WhatsApp group names in policy |
+| `yeoman policy path` | Show policy file location |
+| `yeoman policy explain` | Debug policy decisions for a chat/sender |
+| `yeoman policy cmd "/policy ..."` | Run policy commands from CLI |
+| `yeoman policy annotate-whatsapp-comments` | Auto-fill WhatsApp group names in policy |
 | **Memory** | |
-| `nanobot memory status` | Memory backend info and counters |
-| `nanobot memory search --query "..."` | Search long-term memory |
-| `nanobot memory add --text "..."` | Insert manual memory entry |
-| `nanobot memory prune` | Retention cleanup |
-| `nanobot memory reindex` | Rebuild FTS index |
-| `nanobot memory notes status\|set` | Per-chat background notes config |
+| `yeoman memory status` | Memory backend info and counters |
+| `yeoman memory search --query "..."` | Search long-term memory |
+| `yeoman memory add --text "..."` | Insert manual memory entry |
+| `yeoman memory prune` | Retention cleanup |
+| `yeoman memory reindex` | Rebuild FTS index |
+| `yeoman memory notes status\|set` | Per-chat background notes config |
 | **Config** | |
-| `nanobot config migrate-to-env` | Move secrets from config.json to .env |
+| `yeoman config migrate-to-env` | Move secrets from config.json to .env |
 | **Cron** | |
-| `nanobot cron list\|add\|remove\|enable\|run` | Manage scheduled tasks |
-| `nanobot cron add-voice` | Schedule voice broadcast jobs |
+| `yeoman cron list\|add\|remove\|enable\|run` | Manage scheduled tasks |
+| `yeoman cron add-voice` | Schedule voice broadcast jobs |
 
 ## Docker
 
 ```bash
-docker build -t nanobot .
-docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
+docker build -t yeoman .
+docker run -v ~/.yeoman:/root/.yeoman -p 18790:18790 yeoman gateway
 ```
 
 ## Project Structure
 
 ```
-nanobot/
+yeoman/
 ├── agent/        Core agent loop, prompt builder, skills, tools
 ├── core/         Orchestrator pipeline, ports, intents, models
 ├── adapters/     Port implementations (policy, LLM, archive, telemetry)
@@ -274,22 +274,17 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ## Changelog
 
-### Unreleased
+### v0.2.0 — Feb 2026
 
-**Ambient context & voice expansion**
-- Ambient context window for group conversations
-- OpenRouter audio TTS provider
-- Voice broadcast scheduling via cron
-- `.env` file support for provider API keys (`nanobot config migrate-to-env`)
-- Tavily deep research tool (replacing Brave Search)
-- Data layout restructuring and process utilities extraction
+- Renamed project from nanobot-stack to yeoman
+- Runtime directory migrated from `~/.nanobot` to `~/.yeoman` (auto-migrated on first run)
 
 ### v0.1.3 — Feb 2026
 
 #### Policy Engine
 - Deterministic per-channel, per-chat access control with hot-reload
 - Admin commands via `/policy` namespace (WhatsApp owner DM)
-- `nanobot policy explain` for debugging reply decisions
+- `yeoman policy explain` for debugging reply decisions
 - Blocked senders, talkative cooldown for groups
 - Emergency `/panic` shutdown command
 - Scoped file access grants with blocked paths/patterns override
@@ -340,12 +335,12 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 - `edit_file` tool and sub-agent improvements
 
 #### CLI & Ops
-- `nanobot gateway` with daemon control (start/stop/restart)
-- `nanobot logs` — unified log viewer
-- `nanobot config migrate-to-env` — move secrets to `.env`
-- `nanobot policy annotate-whatsapp-comments` — auto-fill group names
+- `yeoman gateway` with daemon control (start/stop/restart)
+- `yeoman logs` — unified log viewer
+- `yeoman config migrate-to-env` — move secrets to `.env`
+- `yeoman policy annotate-whatsapp-comments` — auto-fill group names
 - Docker support with volume-mounted config
 
 ---
 
-<sub>MIT License · Originally forked from [HKUDS/nanobot](https://github.com/HKUDS/nanobot) · See [UPSTREAM.md](UPSTREAM.md)</sub>
+<sub>MIT License · Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot)</sub>
