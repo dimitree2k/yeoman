@@ -170,7 +170,7 @@ class SkillsLoader:
         """Parse yeoman metadata JSON from frontmatter."""
         try:
             data = json.loads(raw)
-            return data.get("nanobot", {}) if isinstance(data, dict) else {}
+            return data.get("yeoman", {}) if isinstance(data, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
 

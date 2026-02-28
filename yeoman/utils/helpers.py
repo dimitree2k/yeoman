@@ -14,27 +14,12 @@ def ensure_dir(path: Path) -> Path:
 def get_data_path() -> Path:
     """Get the yeoman data directory.
 
-    Respects YEOMAN_HOME (or legacy NANOBOT_HOME) environment variable;
-    falls back to ~/.yeoman. Migrates ~/.nanobot → ~/.yeoman on first run.
+    Respects YEOMAN_HOME environment variable; falls back to ~/.yeoman.
     """
     yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
     if yeoman_home:
         return ensure_dir(Path(yeoman_home))
-
-    # Legacy fallback
-    nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
-    if nanobot_home:
-        return ensure_dir(Path(nanobot_home))
-
-    new_dir = Path.home() / ".yeoman"
-    old_dir = Path.home() / ".nanobot"
-
-    if not new_dir.exists() and old_dir.exists():
-        import shutil
-        print(f"Migrating runtime directory: {old_dir} → {new_dir}")
-        shutil.move(str(old_dir), str(new_dir))
-
-    return ensure_dir(new_dir)
+    return ensure_dir(Path.home() / ".yeoman")
 
 
 def get_var_path() -> Path:

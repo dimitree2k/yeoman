@@ -88,12 +88,12 @@ def _is_yeoman_gateway_command(cmd: str) -> bool:
             return True
 
     exe = tokens[0] if tokens else ""
-    if exe == "nanobot" or exe.endswith("/nanobot"):
+    if exe == "yeoman" or exe.endswith("/yeoman"):
         return True
 
     if "python" in exe and len(tokens) > 1:
         script = tokens[1]
-        if script == "nanobot" or script.endswith("/nanobot"):
+        if script == "yeoman" or script.endswith("/yeoman"):
             return True
 
     return False
