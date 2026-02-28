@@ -1,25 +1,25 @@
-# nanobot-stack — Source Code
+# yeoman — Source Code
 
-Lightweight, policy-first personal AI assistant runtime (~13k core lines).
-Independent fork of HKUDS/nanobot. MIT license.
+Lightweight, policy-first personal AI assistant runtime (~18k core lines).
+
 
 ## Quick Reference
 
 | What | Where |
 |------|-------|
-| Entry point / CLI | `nanobot/cli/commands.py` (typer) |
-| Orchestrator pipeline | `nanobot/core/orchestrator.py` |
-| Policy engine | `nanobot/policy/engine.py` |
-| Memory service | `nanobot/memory/service.py` |
-| Channel adapters | `nanobot/channels/{telegram,discord,whatsapp,feishu}.py` |
-| Tool registry | `nanobot/agent/tools/registry.py` |
-| Provider registry | `nanobot/providers/registry.py` (single source of truth) |
-| Config schema (Pydantic) | `nanobot/config/schema.py` |
-| Port interfaces (DI) | `nanobot/core/ports.py` |
+| Entry point / CLI | `yeoman/cli/commands.py` (typer) |
+| Orchestrator pipeline | `yeoman/core/orchestrator.py` |
+| Policy engine | `yeoman/policy/engine.py` |
+| Memory service | `yeoman/memory/service.py` |
+| Channel adapters | `yeoman/channels/{telegram,discord,whatsapp,feishu}.py` |
+| Tool registry | `yeoman/agent/tools/registry.py` |
+| Provider registry | `yeoman/providers/registry.py` (single source of truth) |
+| Config schema (Pydantic) | `yeoman/config/schema.py` |
+| Port interfaces (DI) | `yeoman/core/ports.py` |
 | WhatsApp bridge (TS) | `bridge/src/` |
 | Tests | `tests/test_*.py` |
 | Architecture docs | `docs/` |
-| Runtime data dir | `~/.nanobot/` (config, policy, memory, logs — see `~/.nanobot/CLAUDE.md`) |
+| Runtime data dir | `~/.yeoman/` (config, policy, memory, logs — see `~/.yeoman/CLAUDE.md`) |
 
 ## Two Repositories
 
@@ -27,15 +27,15 @@ This project spans two directories that must be kept in sync:
 
 | Location | Purpose | Git repo |
 |----------|---------|---------|
-| `~/Documents/nanobot/` | Source code (this repo) | public/private source repo |
-| `~/.nanobot/` | Runtime state: config, policy, memory, logs, workspace | separate private runtime repo |
+| `~/Documents/yeoman/` | Source code (this repo) | public/private source repo |
+| `~/.yeoman/` | Runtime state: config, policy, memory, logs, workspace | separate private runtime repo |
 
 **When working on a task**, consider which directory is relevant:
-- Code changes → `~/Documents/nanobot/`, then reinstall (`pip install -e .`)
-- Config/policy/persona/skill changes → `~/.nanobot/`
-- Debugging a live issue → check `~/.nanobot/var/logs/` and `~/.nanobot/data/`
+- Code changes → `~/Documents/yeoman/`, then reinstall (`pip install -e .`)
+- Config/policy/persona/skill changes → `~/.yeoman/`
+- Debugging a live issue → check `~/.yeoman/var/logs/` and `~/.yeoman/data/`
 
-The runtime CLAUDE.md (`~/.nanobot/CLAUDE.md`) documents the full layout, git tracking rules, secrets management, and config file schemas for the runtime directory.
+The runtime CLAUDE.md (`~/.yeoman/CLAUDE.md`) documents the full layout, git tracking rules, secrets management, and config file schemas for the runtime directory.
 
 ## Architecture
 
@@ -84,8 +84,8 @@ Orchestrator emits `OrchestratorIntent` objects; channels react asynchronously.
 ## Config Hierarchy (runtime)
 
 1. Hard-coded defaults in source
-2. `~/.nanobot/config.json` — providers, models, channels
-3. `~/.nanobot/policy.json` — per-channel/per-chat overrides (hot-reloaded)
+2. `~/.yeoman/config.json` — providers, models, channels
+3. `~/.yeoman/policy.json` — per-channel/per-chat overrides (hot-reloaded)
 4. Environment variables (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
 
 ## Adding a New LLM Provider
@@ -99,9 +99,9 @@ Only 2 changes needed:
 ```bash
 pytest tests/                        # Run all tests
 pytest -xvs tests/test_policy_engine.py  # Single test, verbose
-ruff check nanobot/                  # Lint
-ruff format nanobot/                 # Format
-mypy nanobot/core nanobot/adapters   # Type check strict modules
+ruff check yeoman/                  # Lint
+ruff format yeoman/                 # Format
+mypy yeoman/core yeoman/adapters   # Type check strict modules
 bash core_agent_lines.sh             # Count core lines
 ```
 
@@ -109,19 +109,19 @@ bash core_agent_lines.sh             # Count core lines
 
 Skills are directories containing `SKILL.md` (YAML front-matter + markdown body).
 Loaded dynamically by `agent/skills.py`. Compatible with OpenClaw format.
-Bundled skills in `nanobot/skills/`; user skills in `~/.nanobot/workspace/skills/`.
+Bundled skills in `yeoman/skills/`; user skills in `~/.yeoman/workspace/skills/`.
 
 ## WhatsApp Bridge
 
 TypeScript (Baileys 7.0.0-rc.9) in `bridge/src/`. Compiled to `bridge/dist/`.
 Communicates with Python gateway via WebSocket (`ws://localhost:3001`).
-Auth state persisted in `~/.nanobot/whatsapp-auth/`.
+Auth state persisted in `~/.yeoman/whatsapp-auth/`.
 
 ## Security Notes
 
 - Tool isolation via Linux bubblewrap sandbox (`agent/tools/exec_isolation.py`)
 - Policy engine is deterministic — no ad-hoc ACLs in code
-- All access control in `~/.nanobot/policy.json`
+- All access control in `~/.yeoman/policy.json`
 - Input/output validation in `security/engine.py`
 
 ## Conversation Context (WhatsApp)
