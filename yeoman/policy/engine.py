@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from nanobot.policy.identity import normalize_identity_token, normalize_sender_list
-from nanobot.policy.persona import load_persona_text, resolve_persona_path
-from nanobot.policy.schema import ChatPolicy, ChatPolicyOverride, MemoryNotesMode, PolicyConfig
+from yeoman.policy.identity import normalize_identity_token, normalize_sender_list
+from yeoman.policy.persona import load_persona_text, resolve_persona_path
+from yeoman.policy.schema import ChatPolicy, ChatPolicyOverride, MemoryNotesMode, PolicyConfig
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

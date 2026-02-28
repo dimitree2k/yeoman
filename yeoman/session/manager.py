@@ -8,7 +8,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.helpers import get_sessions_path, safe_filename
+from yeoman.utils.helpers import get_sessions_path, safe_filename
 
 
 @dataclass

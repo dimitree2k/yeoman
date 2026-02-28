@@ -7,9 +7,9 @@ background notes capture for memory.
 
 from __future__ import annotations
 
-from nanobot.core.intents import QueueMemoryNotesCaptureIntent
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import SecurityPort
+from yeoman.core.intents import QueueMemoryNotesCaptureIntent
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import SecurityPort
 
 
 class AccessControlMiddleware:

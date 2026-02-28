@@ -167,7 +167,7 @@ class SkillsLoader:
         return content
 
     def _parse_nanobot_metadata(self, raw: str) -> dict:
-        """Parse nanobot metadata JSON from frontmatter."""
+        """Parse yeoman metadata JSON from frontmatter."""
         try:
             data = json.loads(raw)
             return data.get("nanobot", {}) if isinstance(data, dict) else {}
@@ -186,7 +186,7 @@ class SkillsLoader:
         return True
 
     def _get_skill_meta(self, name: str) -> dict:
-        """Get nanobot metadata for a skill (cached in frontmatter)."""
+        """Get yeoman metadata for a skill (cached in frontmatter)."""
         meta = self.get_skill_metadata(name) or {}
         return self._parse_nanobot_metadata(meta.get("metadata", ""))
 

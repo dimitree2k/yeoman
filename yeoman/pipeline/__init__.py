@@ -4,18 +4,18 @@ Each module contains one middleware class extracted from the monolithic
 ``Orchestrator.handle()`` method.  See ``core/pipeline.py`` for the runner.
 """
 
-from nanobot.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
-from nanobot.pipeline.admin import AdminCommandMiddleware
-from nanobot.pipeline.archive import ArchiveMiddleware
-from nanobot.pipeline.dedup import DeduplicationMiddleware
-from nanobot.pipeline.idea_capture import IdeaCaptureMiddleware
-from nanobot.pipeline.new_chat import NewChatNotifyMiddleware
-from nanobot.pipeline.normalize import NormalizationMiddleware
-from nanobot.pipeline.outbound import OutboundMiddleware
-from nanobot.pipeline.policy import PolicyMiddleware
-from nanobot.pipeline.reply_context import ReplyContextMiddleware
-from nanobot.pipeline.responder import ResponderMiddleware
-from nanobot.pipeline.security_input import InputSecurityMiddleware
+from yeoman.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
+from yeoman.pipeline.admin import AdminCommandMiddleware
+from yeoman.pipeline.archive import ArchiveMiddleware
+from yeoman.pipeline.dedup import DeduplicationMiddleware
+from yeoman.pipeline.idea_capture import IdeaCaptureMiddleware
+from yeoman.pipeline.new_chat import NewChatNotifyMiddleware
+from yeoman.pipeline.normalize import NormalizationMiddleware
+from yeoman.pipeline.outbound import OutboundMiddleware
+from yeoman.pipeline.policy import PolicyMiddleware
+from yeoman.pipeline.reply_context import ReplyContextMiddleware
+from yeoman.pipeline.responder import ResponderMiddleware
+from yeoman.pipeline.security_input import InputSecurityMiddleware
 
 __all__ = [
     "AccessControlMiddleware",

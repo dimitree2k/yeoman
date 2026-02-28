@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nanobot.policy.loader import load_policy
-from nanobot.policy.schema import PolicyConfig
+from yeoman.policy.loader import load_policy
+from yeoman.policy.schema import PolicyConfig
 
 
 @dataclass(frozen=True, slots=True)

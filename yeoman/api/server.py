@@ -1,4 +1,4 @@
-"""FastAPI-based Control Plane API for nanobot.
+"""FastAPI-based Control Plane API for yeoman.
 
 Minimal endpoints for operational visibility and control:
 - GET /health - Health check (no auth required)
@@ -26,9 +26,9 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from nanobot.channels.manager import ChannelManager
-    from nanobot.config.loader import Config
-    from nanobot.telemetry.base import TelemetryPort
+    from yeoman.channels.manager import ChannelManager
+    from yeoman.config.loader import Config
+    from yeoman.telemetry.base import TelemetryPort
 
 
 @dataclass
@@ -139,7 +139,7 @@ def create_app(
 
     app = FastAPI(
         title="Nanobot Control Plane",
-        description="Minimal control plane API for nanobot operations",
+        description="Minimal control plane API for yeoman operations",
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -250,7 +250,7 @@ def create_app(
 
         try:
             # Reload config from disk
-            from nanobot.config.loader import load_config
+            from yeoman.config.loader import load_config
 
             new_config = load_config()
             _state.config = new_config
@@ -272,7 +272,7 @@ def create_app(
         # If we have a PrometheusTelemetry backend, use it
         if _state.telemetry:
             try:
-                from nanobot.telemetry.prometheus import PrometheusTelemetry
+                from yeoman.telemetry.prometheus import PrometheusTelemetry
 
                 if isinstance(_state.telemetry, PrometheusTelemetry):
                     from prometheus_client import generate_latest

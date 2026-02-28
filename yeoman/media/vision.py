@@ -11,8 +11,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from nanobot.media.router import ResolvedProfile
-from nanobot.providers.factory import ProviderFactory
+from yeoman.media.router import ResolvedProfile
+from yeoman.providers.factory import ProviderFactory
 
 PROMPT = (
     "Describe this image in 1-2 concise sentences. "
@@ -130,7 +130,7 @@ class VisionDescriber:
             logger.warning("ffmpeg not found — cannot extract video frames")
             return []
 
-        tmpdir = Path(tempfile.mkdtemp(prefix="nanobot_vframes_"))
+        tmpdir = Path(tempfile.mkdtemp(prefix="yeoman_vframes_"))
         # Use ffmpeg thumbnail filter to pick representative frames, falling back to
         # uniform time-based selection via fps filter with total frame count limit.
         # The select filter picks every Nth frame; we probe duration first.

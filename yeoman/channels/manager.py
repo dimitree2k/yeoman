@@ -7,17 +7,17 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Config
-from nanobot.providers.openai_compatible import resolve_openai_compatible_credentials
+from yeoman.bus.queue import MessageBus
+from yeoman.channels.base import BaseChannel
+from yeoman.config.schema import Config
+from yeoman.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:
-    from nanobot.media.router import ModelRouter
-    from nanobot.media.storage import MediaStorage
-    from nanobot.providers.factory import ProviderFactory
-    from nanobot.session.manager import SessionManager
-    from nanobot.storage.inbound_archive import InboundArchive
+    from yeoman.media.router import ModelRouter
+    from yeoman.media.storage import MediaStorage
+    from yeoman.providers.factory import ProviderFactory
+    from yeoman.session.manager import SessionManager
+    from yeoman.storage.inbound_archive import InboundArchive
 
 
 class ChannelManager:
@@ -59,7 +59,7 @@ class ChannelManager:
         # Telegram channel
         if self.config.channels.telegram.enabled:
             try:
-                from nanobot.channels.telegram import TelegramChannel
+                from yeoman.channels.telegram import TelegramChannel
 
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
@@ -74,7 +74,7 @@ class ChannelManager:
         # WhatsApp channel
         if self.config.channels.whatsapp.enabled:
             try:
-                from nanobot.channels.whatsapp import WhatsAppChannel
+                from yeoman.channels.whatsapp import WhatsAppChannel
 
                 openai_compat = resolve_openai_compatible_credentials(self.config)
                 self.channels["whatsapp"] = WhatsAppChannel(
@@ -96,7 +96,7 @@ class ChannelManager:
         # Discord channel
         if self.config.channels.discord.enabled:
             try:
-                from nanobot.channels.discord import DiscordChannel
+                from yeoman.channels.discord import DiscordChannel
 
                 self.channels["discord"] = DiscordChannel(self.config.channels.discord, self.bus)
                 logger.info("Discord channel enabled")
@@ -106,7 +106,7 @@ class ChannelManager:
         # Feishu channel
         if self.config.channels.feishu.enabled:
             try:
-                from nanobot.channels.feishu import FeishuChannel
+                from yeoman.channels.feishu import FeishuChannel
 
                 self.channels["feishu"] = FeishuChannel(self.config.channels.feishu, self.bus)
                 logger.info("Feishu channel enabled")

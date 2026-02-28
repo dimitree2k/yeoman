@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from nanobot.core.models import ArchivedMessage, InboundEvent
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import ReplyArchivePort
+from yeoman.core.models import ArchivedMessage, InboundEvent
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import ReplyArchivePort
 
 
 class ReplyContextMiddleware:

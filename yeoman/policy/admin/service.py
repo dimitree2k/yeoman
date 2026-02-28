@@ -15,19 +15,19 @@ from typing import Any, Callable
 
 import websockets
 
-from nanobot.config.loader import load_config
-from nanobot.policy.admin.audit import PolicyAuditEntry, PolicyAuditStore
-from nanobot.policy.admin.contracts import (
+from yeoman.config.loader import load_config
+from yeoman.policy.admin.audit import PolicyAuditEntry, PolicyAuditStore
+from yeoman.policy.admin.contracts import (
     PolicyActorContext,
     PolicyCommand,
     PolicyExecutionOptions,
     PolicyExecutionResult,
 )
-from nanobot.policy.admin.registry import PolicyCommandRegistry
-from nanobot.policy.engine import PolicyEngine
-from nanobot.policy.identity import normalize_identity_token
-from nanobot.policy.loader import load_policy, save_policy
-from nanobot.policy.schema import (
+from yeoman.policy.admin.registry import PolicyCommandRegistry
+from yeoman.policy.engine import PolicyEngine
+from yeoman.policy.identity import normalize_identity_token
+from yeoman.policy.loader import load_policy, save_policy
+from yeoman.policy.schema import (
     BlockedSendersPolicyOverride,
     ChatPolicyOverride,
     PolicyConfig,

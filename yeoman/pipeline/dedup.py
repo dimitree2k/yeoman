@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from nanobot.core.pipeline import NextFn, PipelineContext
+from yeoman.core.pipeline import NextFn, PipelineContext
 
 
 class DeduplicationMiddleware:

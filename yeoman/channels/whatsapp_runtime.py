@@ -18,8 +18,8 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
-from nanobot.config.loader import get_config_path, load_config, save_config
-from nanobot.utils.process import (
+from yeoman.config.loader import get_config_path, load_config, save_config
+from yeoman.utils.process import (
     is_bridge_process,
     listener_pids_for_port,
     pid_alive,
@@ -76,7 +76,7 @@ class WhatsAppRuntimeManager:
         if user_bridge_dir is not None:
             self._user_bridge_dir = user_bridge_dir
         else:
-            from nanobot.utils.helpers import get_cache_path
+            from yeoman.utils.helpers import get_cache_path
             self._user_bridge_dir = get_cache_path() / "bridge"
         self._runtime_refreshed = False
 
@@ -86,12 +86,12 @@ class WhatsAppRuntimeManager:
 
     @property
     def bridge_log_path(self) -> Path:
-        from nanobot.utils.helpers import get_logs_path
+        from yeoman.utils.helpers import get_logs_path
         return get_logs_path() / "whatsapp-bridge.log"
 
     @property
     def bridge_pid_path(self) -> Path:
-        from nanobot.utils.helpers import get_run_path
+        from yeoman.utils.helpers import get_run_path
         return get_run_path() / "whatsapp-bridge.pid"
 
     def _resolve_bridge_port(self) -> int:
@@ -122,7 +122,7 @@ class WhatsAppRuntimeManager:
         for candidate in (package_bridge, repo_bridge):
             if (candidate / "package.json").exists() and (candidate / MANIFEST_FILENAME).exists():
                 return candidate
-        raise RuntimeError("Bridge source not found. Install nanobot with packaged bridge artifacts.")
+        raise RuntimeError("Bridge source not found. Install yeoman with packaged bridge artifacts.")
 
     def _read_manifest(self, path: Path) -> BridgeManifest:
         try:

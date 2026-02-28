@@ -8,7 +8,7 @@ from pathlib import Path
 import typer
 from rich.table import Table
 
-from nanobot import __logo__
+from yeoman import __logo__
 
 from .core import app, console
 from .gateway_commands import _find_gateway_pids, _start_gateway_daemon, _stop_gateway_processes
@@ -20,7 +20,7 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status() -> None:
     """Show channel status."""
-    from nanobot.config.loader import load_config
+    from yeoman.config.loader import load_config
 
     config = load_config()
 
@@ -59,8 +59,8 @@ def whatsapp_ensure(
     ),
 ) -> None:
     """Ensure WhatsApp runtime, bridge process and protocol health are ready."""
-    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import load_config
+    from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from yeoman.config.loader import load_config
 
     config = load_config()
     runtime = WhatsAppRuntimeManager(config=config)
@@ -114,8 +114,8 @@ def whatsapp_repair_sender(
     """Repair WhatsApp decrypt issues for one sender by resetting sender/session auth artifacts."""
     import shutil
 
-    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import load_config
+    from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from yeoman.config.loader import load_config
 
     raw_sender = (sender_id or "").strip()
     sender_token = raw_sender.split("@", 1)[0].split(":", 1)[0].strip()
@@ -210,7 +210,7 @@ def whatsapp_repair_sender(
 def _get_bridge_dir() -> Path:
     """Get the prepared user bridge runtime directory."""
     try:
-        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+        from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
         runtime = WhatsAppRuntimeManager()
         return runtime.ensure_runtime()
@@ -222,7 +222,7 @@ def _get_bridge_dir() -> Path:
 def _ensure_whatsapp_bridge_token(config=None, *, quiet: bool = False) -> str:
     """Ensure channels.whatsapp.bridgeToken exists, generating and saving if missing."""
     try:
-        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+        from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
         runtime = WhatsAppRuntimeManager(config=config)
         return runtime.ensure_bridge_token(quiet=quiet)
@@ -234,7 +234,7 @@ def _ensure_whatsapp_bridge_token(config=None, *, quiet: bool = False) -> str:
 def _rotate_whatsapp_bridge_token(config=None) -> tuple[str, str]:
     """Rotate channels.whatsapp.bridgeToken and persist it."""
     try:
-        from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+        from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
         runtime = WhatsAppRuntimeManager(config=config)
         old_token, new_token = runtime.rotate_bridge_token()
@@ -242,7 +242,7 @@ def _rotate_whatsapp_bridge_token(config=None) -> tuple[str, str]:
         console.print(f"[red]Failed to save rotated bridge token:[/red] {e}")
         raise typer.Exit(1)
 
-    from nanobot.config.loader import get_config_path
+    from yeoman.config.loader import get_config_path
 
     console.print(
         f"[green]✓[/green] Rotated channels.whatsapp.bridgeToken and saved to {get_config_path()}"
@@ -256,7 +256,7 @@ def channels_login() -> None:
     import os
     import subprocess
 
-    from nanobot.config.loader import load_config
+    from yeoman.config.loader import load_config
 
     config = load_config()
     wa = config.channels.whatsapp
@@ -285,8 +285,8 @@ channels_app.add_typer(bridge_app, name="bridge")
 
 
 def _bridge_runtime(port: int | None):
-    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import load_config
+    from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from yeoman.config.loader import load_config
 
     config = load_config()
     runtime = WhatsAppRuntimeManager(config=config)
@@ -300,7 +300,7 @@ def _print_bridge_started(status, *, action: str) -> None:
 
 
 def _bridge_log_path() -> Path:
-    from nanobot.utils.helpers import get_logs_path
+    from yeoman.utils.helpers import get_logs_path
 
     return get_logs_path() / "whatsapp-bridge.log"
 

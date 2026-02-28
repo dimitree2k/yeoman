@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.core.intents import SendOutboundIntent, SendReactionIntent
-from nanobot.core.models import OutboundEvent, SecurityDecision
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import SecurityPort
+from yeoman.core.intents import SendOutboundIntent, SendReactionIntent
+from yeoman.core.models import OutboundEvent, SecurityDecision
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import SecurityPort
 
 if TYPE_CHECKING:
-    from nanobot.security.classifier import InputClassifier
+    from yeoman.security.classifier import InputClassifier
 
 
 class InputSecurityMiddleware:

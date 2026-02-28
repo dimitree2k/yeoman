@@ -7,10 +7,10 @@ from typing import Any
 
 import httpx
 
-from nanobot.agent.tools.base import Tool
+from yeoman.agent.tools.base import Tool
 
 _DEFAULT_URL = "http://localhost:9867"
-_TOKEN_FILE = Path.home() / ".nanobot" / "workspace" / "skills" / "browser" / "state" / "bridge_token.txt"
+_TOKEN_FILE = Path.home() / ".yeoman" / "workspace" / "skills" / "browser" / "state" / "bridge_token.txt"
 _TIMEOUT = 30.0
 
 
@@ -204,7 +204,7 @@ class BrowseTool(Tool):
         except httpx.ConnectError:
             return (
                 "Error: Cannot connect to pinchtab. "
-                "Start it with: bash ~/.nanobot/workspace/skills/browser/scripts/start.sh &"
+                "Start it with: bash ~/.yeoman/workspace/skills/browser/scripts/start.sh &"
             )
         except httpx.TimeoutException:
             return "Error: Request to pinchtab timed out."

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nanobot.config.schema import Config
+from yeoman.config.schema import Config
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.file_access import grants_are_active
-from nanobot.config.schema import ExecIsolationConfig
+from yeoman.agent.tools.base import Tool
+from yeoman.agent.tools.file_access import grants_are_active
+from yeoman.config.schema import ExecIsolationConfig
 
 if TYPE_CHECKING:
-    from nanobot.agent.tools.exec_isolation import ExecSandboxManager, SandboxMount
+    from yeoman.agent.tools.exec_isolation import ExecSandboxManager, SandboxMount
 
 
 class ExecTool(Tool):
@@ -172,7 +172,7 @@ class ExecTool(Tool):
             self._isolation_error = "working_dir is required when exec isolation is enabled"
             return
 
-        from nanobot.agent.tools.exec_isolation import ExecSandboxManager
+        from yeoman.agent.tools.exec_isolation import ExecSandboxManager
 
         allowlist_path = Path(self.isolation_config.allowlist_path).expanduser()
         try:
@@ -231,7 +231,7 @@ class ExecTool(Tool):
             return f"Error executing command: {str(e)}"
 
     async def _execute_isolated(self, command: str, cwd: str) -> str:
-        from nanobot.agent.tools.exec_isolation import (
+        from yeoman.agent.tools.exec_isolation import (
             IsolationUnavailableError,
             SandboxExecutionError,
             SandboxPreemptedError,

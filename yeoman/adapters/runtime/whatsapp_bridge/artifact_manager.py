@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
 
 class BridgeArtifactManager:

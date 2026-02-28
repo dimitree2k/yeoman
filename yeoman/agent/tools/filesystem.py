@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nanobot.agent.tools.base import Tool
+from yeoman.agent.tools.base import Tool
 
 if TYPE_CHECKING:
-    from nanobot.agent.tools.file_access import FileAccessResolver
+    from yeoman.agent.tools.file_access import FileAccessResolver
 
 
 def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:

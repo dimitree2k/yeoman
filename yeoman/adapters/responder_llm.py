@@ -13,33 +13,33 @@ from typing import TYPE_CHECKING, Any, Callable, override
 
 from loguru import logger
 
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.exec_isolation import SandboxMount
-from nanobot.agent.tools.file_access import FileAccessResolver, enable_grants
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.pi_stats import PiStatsTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
-from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.core.models import InboundEvent, PolicyDecision
-from nanobot.core.ports import ResponderPort, SecurityPort, TelemetryPort
-from nanobot.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
-from nanobot.providers.base import LLMProvider
-from nanobot.session.manager import SessionManager
+from yeoman.agent.context import ContextBuilder
+from yeoman.agent.subagent import SubagentManager
+from yeoman.agent.tools.cron import CronTool
+from yeoman.agent.tools.exec_isolation import SandboxMount
+from yeoman.agent.tools.file_access import FileAccessResolver, enable_grants
+from yeoman.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from yeoman.agent.tools.message import MessageTool
+from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.registry import ToolRegistry
+from yeoman.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
+from yeoman.agent.tools.shell import ExecTool
+from yeoman.agent.tools.spawn import SpawnTool
+from yeoman.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
+from yeoman.bus.events import OutboundMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.core.models import InboundEvent, PolicyDecision
+from yeoman.core.ports import ResponderPort, SecurityPort, TelemetryPort
+from yeoman.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
+from yeoman.providers.base import LLMProvider
+from yeoman.session.manager import SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ExecToolConfig
-    from nanobot.cron.service import CronService
-    from nanobot.media.router import ModelRouter
-    from nanobot.media.tts import TTSSynthesizer
-    from nanobot.memory.service import MemoryService
+    from yeoman.config.schema import ExecToolConfig
+    from yeoman.cron.service import CronService
+    from yeoman.media.router import ModelRouter
+    from yeoman.media.tts import TTSSynthesizer
+    from yeoman.memory.service import MemoryService
 
 
 @dataclass
@@ -78,7 +78,7 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
     ) -> None:
-        from nanobot.config.schema import ExecToolConfig
+        from yeoman.config.schema import ExecToolConfig
 
         self.provider = provider
         self.workspace = workspace
@@ -171,7 +171,7 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
 
-        from nanobot.agent.tools.browse import BrowseTool
+        from yeoman.agent.tools.browse import BrowseTool
 
         self.tools.register(BrowseTool())
 
@@ -429,7 +429,7 @@ class LLMResponder(ResponderPort):
         """
         if not profile_name or self._model_router is None:
             return None
-        from nanobot.config.loader import camel_to_snake
+        from yeoman.config.loader import camel_to_snake
         snake_name = camel_to_snake(profile_name)
         try:
             return self._model_router.resolve_by_profile(snake_name).model

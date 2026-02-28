@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Iterator, Literal
 from loguru import logger
 
 if TYPE_CHECKING:
-    from nanobot.policy.schema import PolicyConfig
+    from yeoman.policy.schema import PolicyConfig
 
 _grants_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "file_access_grants_active",

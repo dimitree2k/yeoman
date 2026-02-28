@@ -7,8 +7,8 @@ from typing import Any
 import litellm
 from litellm import acompletion
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.providers.registry import find_by_model, find_gateway
+from yeoman.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from yeoman.providers.registry import find_by_model, find_gateway
 
 
 class LiteLLMProvider(LLMProvider):

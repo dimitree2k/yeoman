@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from nanobot.utils.helpers import ensure_dir
+from yeoman.utils.helpers import ensure_dir
 
 
 class MediaStorage:

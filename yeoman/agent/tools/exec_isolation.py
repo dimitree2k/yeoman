@@ -57,7 +57,7 @@ class SandboxMount:
     """Extra bind-mount for a grant path inside the sandbox."""
 
     host_path: Path
-    container_path: str  # e.g. "/grants/nanobot-source"
+    container_path: str  # e.g. "/grants/yeoman-source"
     readonly: bool = True
 
 

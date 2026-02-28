@@ -21,7 +21,7 @@ def chats_list(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
     """List chats from the registry."""
-    from nanobot.storage.chat_registry import ChatRegistry, ChatType
+    from yeoman.storage.chat_registry import ChatRegistry, ChatType
 
     registry = ChatRegistry()
 
@@ -69,7 +69,7 @@ def chats_show(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
     """Show detailed information about a chat."""
-    from nanobot.storage.chat_registry import ChatRegistry
+    from yeoman.storage.chat_registry import ChatRegistry
 
     registry = ChatRegistry()
     chat = registry.get_chat(channel.lower(), chat_id)
@@ -115,8 +115,8 @@ def chats_sync(
 
     import websockets
 
-    from nanobot.config.loader import load_config
-    from nanobot.storage.chat_registry import ChatRegistry
+    from yeoman.config.loader import load_config
+    from yeoman.storage.chat_registry import ChatRegistry
 
     console.print(f"[cyan]Syncing metadata from {channel} bridge...[/cyan]")
 

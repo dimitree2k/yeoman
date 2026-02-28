@@ -17,11 +17,11 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.core.models import SecurityDecision
-from nanobot.providers.litellm_provider import LiteLLMProvider
+from yeoman.core.models import SecurityDecision
+from yeoman.providers.litellm_provider import LiteLLMProvider
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import Config, ModelProfile
+    from yeoman.config.schema import Config, ModelProfile
 
 _ROUTE_KEY = "security.classify"
 

@@ -12,13 +12,13 @@ from telegram.constants import MessageEntityType
 from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import TelegramConfig
+from yeoman.bus.events import OutboundMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.channels.base import BaseChannel
+from yeoman.config.schema import TelegramConfig
 
 if TYPE_CHECKING:
-    from nanobot.session.manager import SessionManager
+    from yeoman.session.manager import SessionManager
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -230,7 +230,7 @@ class TelegramChannel(BaseChannel):
 
         user = update.effective_user
         await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
+            f"👋 Hi {user.first_name}! I'm yeoman.\n\n"
             "Send me a message and I'll respond!\n"
             "Type /help to see available commands."
         )
@@ -262,7 +262,7 @@ class TelegramChannel(BaseChannel):
             return
 
         help_text = (
-            "🐈 <b>nanobot commands</b>\n\n"
+            "🐈 <b>yeoman commands</b>\n\n"
             "/start — Start the bot\n"
             "/reset — Reset conversation history\n"
             "/help — Show this help message\n\n"
@@ -322,7 +322,7 @@ class TelegramChannel(BaseChannel):
 
                 # Save to workspace/media/
                 from pathlib import Path
-                media_dir = Path.home() / ".nanobot" / "media"
+                media_dir = Path.home() / ".yeoman" / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
 
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
@@ -332,7 +332,7 @@ class TelegramChannel(BaseChannel):
 
                 # Handle voice transcription
                 if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
+                    from yeoman.providers.transcription import GroqTranscriptionProvider
                     transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
@@ -478,5 +478,5 @@ class TelegramChannel(BaseChannel):
         except RuntimeError:
             logger.error(
                 "Unable to schedule Telegram shutdown after conflict; no running event loop. "
-                "Stop the duplicate bot process and restart nanobot."
+                "Stop the duplicate bot process and restart yeoman."
             )

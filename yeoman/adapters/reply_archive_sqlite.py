@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import override
 
-from nanobot.core.models import ArchivedMessage, InboundEvent
-from nanobot.core.ports import ReplyArchivePort
-from nanobot.storage.inbound_archive import InboundArchive
+from yeoman.core.models import ArchivedMessage, InboundEvent
+from yeoman.core.ports import ReplyArchivePort
+from yeoman.storage.inbound_archive import InboundArchive
 
 
 class SqliteReplyArchiveAdapter(ReplyArchivePort):

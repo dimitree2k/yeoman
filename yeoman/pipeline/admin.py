@@ -9,13 +9,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from nanobot.core.intents import RecordMetricIntent, SendOutboundIntent
-from nanobot.core.models import OutboundEvent
-from nanobot.core.pipeline import NextFn, PipelineContext
+from yeoman.core.intents import RecordMetricIntent, SendOutboundIntent
+from yeoman.core.models import OutboundEvent
+from yeoman.core.pipeline import NextFn, PipelineContext
 
 if TYPE_CHECKING:
-    from nanobot.core.admin_commands import AdminCommandResult
-    from nanobot.core.models import InboundEvent
+    from yeoman.core.admin_commands import AdminCommandResult
+    from yeoman.core.models import InboundEvent
 
 
 class AdminCommandMiddleware:
@@ -33,7 +33,7 @@ class AdminCommandMiddleware:
             await next(ctx)
             return
 
-        from nanobot.core.admin_commands import AdminCommandResult
+        from yeoman.core.admin_commands import AdminCommandResult
 
         admin_result = self._handler(ctx.event)
         if isinstance(admin_result, str):

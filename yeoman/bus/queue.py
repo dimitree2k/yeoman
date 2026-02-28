@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
-from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
+from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 
 
 class MessageBus:

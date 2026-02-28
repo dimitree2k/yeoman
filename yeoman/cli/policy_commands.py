@@ -35,7 +35,7 @@ def _policy_known_tools() -> set[str]:
 @policy_app.command("path")
 def policy_path_cmd() -> None:
     """Show policy file location."""
-    from nanobot.policy.loader import get_policy_path
+    from yeoman.policy.loader import get_policy_path
 
     console.print(get_policy_path())
 
@@ -50,8 +50,8 @@ def policy_explain(
     reply_to_bot: bool = typer.Option(False, "--reply-to-bot", help="Message is a reply to bot"),
 ) -> None:
     """Explain merged policy + decision for one actor/chat."""
-    from nanobot.adapters.policy_engine import EnginePolicyAdapter
-    from nanobot.config.loader import load_config
+    from yeoman.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman.config.loader import load_config
 
     config = load_config()
     policy_engine, policy_path = make_policy_engine(config)
@@ -81,9 +81,9 @@ def policy_cmd(
     """Execute one shared policy admin command via CLI."""
     import getpass
 
-    from nanobot.config.loader import load_config
-    from nanobot.policy.admin.contracts import PolicyActorContext, PolicyExecutionOptions
-    from nanobot.policy.admin.service import PolicyAdminService
+    from yeoman.config.loader import load_config
+    from yeoman.policy.admin.contracts import PolicyActorContext, PolicyExecutionOptions
+    from yeoman.policy.admin.service import PolicyAdminService
 
     config = load_config()
     policy_engine, policy_path = make_policy_engine(config)
@@ -137,8 +137,8 @@ def policy_annotate_whatsapp_comments(
 
     import websockets
 
-    from nanobot.config.loader import load_config
-    from nanobot.policy.loader import get_policy_path, load_policy, save_policy
+    from yeoman.config.loader import load_config
+    from yeoman.policy.loader import get_policy_path, load_policy, save_policy
 
     async def _list_groups(url: str, ids: list[str], token: str) -> dict[str, str]:
         request_id = uuid.uuid4().hex
@@ -219,7 +219,7 @@ def policy_annotate_whatsapp_comments(
     except Exception as e:
         console.print(f"[red]Failed to fetch group names from bridge:[/red] {e}")
         console.print(
-            "[dim]Tip: ensure the WhatsApp bridge is running and connected (nanobot channels bridge status).[/dim]"
+            "[dim]Tip: ensure the WhatsApp bridge is running and connected (yeoman channels bridge status).[/dim]"
         )
         raise typer.Exit(1)
 

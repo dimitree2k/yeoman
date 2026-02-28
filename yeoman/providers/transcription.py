@@ -224,7 +224,7 @@ class OpenAITranscriptionProvider:
         if not ffmpeg_bin:
             return None
 
-        fd, tmp_name = tempfile.mkstemp(prefix="nanobot-asr-", suffix=".wav")
+        fd, tmp_name = tempfile.mkstemp(prefix="yeoman-asr-", suffix=".wav")
         os.close(fd)
         tmp_path = Path(tmp_name)
         try:

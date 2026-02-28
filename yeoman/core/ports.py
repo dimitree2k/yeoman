@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from nanobot.core.models import ArchivedMessage, InboundEvent, PolicyDecision, SecurityResult
+from yeoman.core.models import ArchivedMessage, InboundEvent, PolicyDecision, SecurityResult
 
 
 class ReplyArchivePort(Protocol):

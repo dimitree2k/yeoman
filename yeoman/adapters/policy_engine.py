@@ -13,31 +13,31 @@ from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
 
-from nanobot.config.loader import load_config
-from nanobot.core.admin_commands import (
+from yeoman.config.loader import load_config
+from yeoman.core.admin_commands import (
     AdminCommandContext,
     AdminCommandHandler,
     AdminCommandResult,
     AdminCommandRouter,
     AdminMetricEvent,
 )
-from nanobot.core.models import InboundEvent, PolicyDecision
-from nanobot.core.ports import PolicyPort
-from nanobot.policy.admin.contracts import (
+from yeoman.core.models import InboundEvent, PolicyDecision
+from yeoman.core.ports import PolicyPort
+from yeoman.policy.admin.contracts import (
     PolicyActorContext,
     PolicyCommand,
     PolicyExecutionOptions,
     PolicyExecutionResult,
 )
-from nanobot.policy.admin.service import PolicyAdminService
-from nanobot.policy.engine import ActorContext, PolicyEngine
-from nanobot.policy.identity import (
+from yeoman.policy.admin.service import PolicyAdminService
+from yeoman.policy.engine import ActorContext, PolicyEngine
+from yeoman.policy.identity import (
     normalize_identity_token,
     normalize_sender_list,
     resolve_actor_identity,
 )
-from nanobot.policy.loader import load_policy, save_policy
-from nanobot.policy.schema import (
+from yeoman.policy.loader import load_policy, save_policy
+from yeoman.policy.schema import (
     BlockedSendersPolicyOverride,
     ChatPolicyOverride,
     PolicyConfig,
@@ -47,10 +47,10 @@ from nanobot.policy.schema import (
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
 )
-from nanobot.utils.helpers import safe_filename
+from yeoman.utils.helpers import safe_filename
 
 if TYPE_CHECKING:
-    from nanobot.session.manager import SessionManager
+    from yeoman.session.manager import SessionManager
 
 _POLICY_ADMIN_USAGE = (
     "Policy commands (owner DM only):\n"
@@ -128,7 +128,7 @@ class EnginePolicyAdapter(PolicyPort):
         elif self._engine is not None:
             self._workspace = self._engine.workspace
         else:
-            self._workspace = (Path.home() / ".nanobot" / "workspace").resolve()
+            self._workspace = (Path.home() / ".yeoman" / "workspace").resolve()
         self._memory_state_dir = str(memory_state_dir or "memory/session-state")
         self._policy_admin_service: PolicyAdminService | None = None
         self._admin_router = AdminCommandRouter(
@@ -159,7 +159,7 @@ class EnginePolicyAdapter(PolicyPort):
                 else reload_check_interval_seconds
             )
         if self._policy_path is not None:
-            workspace = self._engine.workspace if self._engine is not None else Path.home() / ".nanobot" / "workspace"
+            workspace = self._engine.workspace if self._engine is not None else Path.home() / ".yeoman" / "workspace"
             apply_channels = self._engine.apply_channels if self._engine is not None else {"telegram", "whatsapp"}
             self._policy_admin_service = PolicyAdminService(
                 policy_path=self._policy_path,
@@ -497,7 +497,7 @@ class EnginePolicyAdapter(PolicyPort):
         """Get group name from chat_registry or bridge."""
         # Try chat_registry first
         try:
-            from nanobot.storage.chat_registry import ChatRegistry
+            from yeoman.storage.chat_registry import ChatRegistry
             registry = ChatRegistry()
             try:
                 chat_info = registry.get_chat("whatsapp", chat_id)
@@ -1109,14 +1109,14 @@ class EnginePolicyAdapter(PolicyPort):
 
         config = load_config()
         try:
-            from nanobot.cli.commands import _stop_gateway_processes
+            from yeoman.cli.commands import _stop_gateway_processes
 
             _stop_gateway_processes(config.gateway.port)
         except Exception:
             pass
 
         try:
-            from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
+            from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
             runtime = WhatsAppRuntimeManager(config=config)
             runtime.stop_bridge()
@@ -1128,7 +1128,7 @@ class EnginePolicyAdapter(PolicyPort):
             target=self._panic_shutdown_worker,
             args=(max(0.0, float(delay_s)),),
             daemon=True,
-            name="nanobot-panic-shutdown",
+            name="yeoman-panic-shutdown",
         )
         worker.start()
 
@@ -1406,7 +1406,7 @@ class EnginePolicyAdapter(PolicyPort):
                 if comment:
                     rec["comment"] = comment
 
-        base_dir = self._policy_path.parent if self._policy_path is not None else Path.home() / ".nanobot"
+        base_dir = self._policy_path.parent if self._policy_path is not None else Path.home() / ".yeoman"
 
         # Session files show groups observed by runtime.
         sessions_dir = base_dir / "data" / "inbound"

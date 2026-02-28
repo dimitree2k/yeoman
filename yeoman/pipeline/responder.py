@@ -9,8 +9,8 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import ResponderPort
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import ResponderPort
 
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
 
@@ -39,7 +39,7 @@ class ResponderMiddleware:
                 if self._typing_notifier is not None:
                     await self._typing_notifier(ctx.event.channel, ctx.event.chat_id, True)
                 else:
-                    from nanobot.core.intents import SetTypingIntent
+                    from yeoman.core.intents import SetTypingIntent
 
                     ctx.intents.append(
                         SetTypingIntent(
@@ -65,7 +65,7 @@ class ResponderMiddleware:
                 if self._typing_notifier is not None:
                     await self._typing_notifier(ctx.event.channel, ctx.event.chat_id, False)
                 else:
-                    from nanobot.core.intents import SetTypingIntent
+                    from yeoman.core.intents import SetTypingIntent
 
                     ctx.intents.append(
                         SetTypingIntent(

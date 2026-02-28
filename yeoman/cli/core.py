@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from nanobot import __logo__, __version__
+from yeoman import __logo__, __version__
 
 app = typer.Typer(
     name="nanobot",
@@ -83,10 +83,10 @@ Information about the user goes here.
 @app.command()
 def onboard() -> None:
     """Initialize nanobot-stack configuration and workspace."""
-    from nanobot.config.loader import get_config_path, save_config
-    from nanobot.config.schema import Config
-    from nanobot.policy.loader import ensure_policy_file
-    from nanobot.utils.helpers import get_workspace_path
+    from yeoman.config.loader import get_config_path, save_config
+    from yeoman.config.schema import Config
+    from yeoman.policy.loader import ensure_policy_file
+    from yeoman.utils.helpers import get_workspace_path
 
     config_path = get_config_path()
 
@@ -107,16 +107,16 @@ def onboard() -> None:
 
     console.print(f"\n{__logo__} nanobot-stack is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print("  1. Add your API key to [cyan]~/.yeoman/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
-    console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
+    console.print('  2. Chat: [cyan]yeoman agent -m "Hello!"[/cyan]')
     console.print("\n[dim]Want Telegram/WhatsApp? See project README > Chat Apps[/dim]")
 
 
 def make_provider(config):
     """Create LiteLLMProvider from config. Exits if no API key found."""
-    from nanobot.media.router import ModelRouter
-    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from yeoman.media.router import ModelRouter
+    from yeoman.providers.litellm_provider import LiteLLMProvider
 
     model = config.agents.defaults.model
     try:
@@ -129,7 +129,7 @@ def make_provider(config):
     provider_cfg = config.get_provider(model)
     if not (provider_cfg and provider_cfg.api_key) and not model.startswith("bedrock/"):
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
+        console.print("Set one in ~/.yeoman/config.json under providers section")
         raise typer.Exit(1)
     return LiteLLMProvider(
         api_key=provider_cfg.api_key if provider_cfg else None,
@@ -141,15 +141,15 @@ def make_provider(config):
 
 def make_memory_service(config):
     """Create memory service from config/workspace."""
-    from nanobot.memory import MemoryService
+    from yeoman.memory import MemoryService
 
     return MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
 
 
 def make_policy_engine(config):
-    """Create policy engine + path from ~/.nanobot/policy.json."""
-    from nanobot.policy.engine import PolicyEngine
-    from nanobot.policy.loader import get_policy_path, load_policy
+    """Create policy engine + path from ~/.yeoman/policy.json."""
+    from yeoman.policy.engine import PolicyEngine
+    from yeoman.policy.loader import get_policy_path, load_policy
 
     try:
         policy_path = get_policy_path()

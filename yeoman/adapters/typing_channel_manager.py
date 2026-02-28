@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nanobot.channels.manager import ChannelManager
+from yeoman.channels.manager import ChannelManager
 
 
 class ChannelManagerTypingAdapter:

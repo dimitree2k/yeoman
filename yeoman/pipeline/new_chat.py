@@ -10,13 +10,13 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from nanobot.core.intents import SendOutboundIntent
-from nanobot.core.models import OutboundEvent
-from nanobot.core.pipeline import NextFn, PipelineContext
+from yeoman.core.intents import SendOutboundIntent
+from yeoman.core.models import OutboundEvent
+from yeoman.core.pipeline import NextFn, PipelineContext
 
 
 class NewChatNotifyMiddleware:
-    """Send owner notification when nanobot joins a new WhatsApp chat."""
+    """Send owner notification when yeoman joins a new WhatsApp chat."""
 
     def __init__(
         self,
@@ -42,7 +42,7 @@ class NewChatNotifyMiddleware:
             return
 
         # Check persistent storage.
-        seen_chats_path = Path.home() / ".nanobot" / "seen_chats.json"
+        seen_chats_path = Path.home() / ".yeoman" / "seen_chats.json"
         seen_chats: set[str] = set()
         try:
             if seen_chats_path.exists():
@@ -68,7 +68,7 @@ class NewChatNotifyMiddleware:
         group_name = None
         group_desc = None
         try:
-            from nanobot.storage.chat_registry import ChatRegistry
+            from yeoman.storage.chat_registry import ChatRegistry
 
             registry = ChatRegistry()
             try:

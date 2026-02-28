@@ -22,8 +22,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from nanobot.core.intents import OrchestratorIntent, RecordMetricIntent
-from nanobot.core.models import InboundEvent, PolicyDecision
+from yeoman.core.intents import OrchestratorIntent, RecordMetricIntent
+from yeoman.core.models import InboundEvent, PolicyDecision
 
 # Forward-compatible: will switch to Message once channels migrate.
 type PipelineEvent = InboundEvent

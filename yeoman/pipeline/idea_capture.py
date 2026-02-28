@@ -10,13 +10,13 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from nanobot.core.intents import (
+from yeoman.core.intents import (
     RecordManualMemoryIntent,
     SendOutboundIntent,
 )
-from nanobot.core.models import OutboundEvent
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import SecurityPort
+from yeoman.core.models import OutboundEvent
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import SecurityPort
 
 _IDEA_MARKERS = ("[idea]", "#idea", "idea:", "inbox idea")
 _BACKLOG_MARKERS = ("[backlog]", "#backlog", "backlog:")

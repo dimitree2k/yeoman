@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
 
-from nanobot.config.defaults import (
+from yeoman.config.defaults import (
     DEFAULT_MEMORY,
     DEFAULT_SECURITY,
     DEFAULT_WHATSAPP_MEDIA,
@@ -108,7 +108,7 @@ class WhatsAppConfig(BaseModel):
     bridge_token: str = ""
     bridge_auto_repair: bool = True
     bridge_startup_timeout_ms: int = 15000
-    auth_dir: str = "~/.nanobot/secrets/whatsapp-auth"
+    auth_dir: str = "~/.yeoman/secrets/whatsapp-auth"
     debounce_ms: int = 0
     read_receipts: bool = True
     accept_from_me: bool = False
@@ -196,7 +196,7 @@ class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = "~/.yeoman/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
@@ -230,7 +230,7 @@ class ElevenLabsProviderConfig(ProviderConfig):
 
 def _get_provider_names() -> list[str]:
     """Get provider names from registry."""
-    from nanobot.providers.registry import PROVIDERS
+    from yeoman.providers.registry import PROVIDERS
 
     return [spec.name for spec in PROVIDERS]
 
@@ -244,7 +244,7 @@ class ProvidersConfig(BaseModel):
     @model_validator(mode="after")
     def _inject_provider_defaults(self) -> "ProvidersConfig":
         """Auto-generate provider fields from registry."""
-        from nanobot.providers.registry import PROVIDERS
+        from yeoman.providers.registry import PROVIDERS
 
         for spec in PROVIDERS:
             value = getattr(self, spec.name, None)
@@ -390,7 +390,7 @@ class ExecIsolationConfig(BaseModel):
     max_containers: int = 5
     pressure_policy: Literal["preempt_oldest_active"] = "preempt_oldest_active"
     force_workspace_restriction: bool = True
-    allowlist_path: str = "~/.config/nanobot/mount-allowlist.json"
+    allowlist_path: str = "~/.config/yeoman/mount-allowlist.json"
 
 
 class ExecToolConfig(BaseModel):
@@ -436,7 +436,7 @@ class BusConfig(BaseModel):
 
 
 class Config(BaseSettings):
-    """Root configuration for nanobot."""
+    """Root configuration for yeoman."""
     model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
 
     config_version: int = 2
@@ -454,7 +454,7 @@ class Config(BaseSettings):
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
-        from nanobot.utils.helpers import get_data_path
+        from yeoman.utils.helpers import get_data_path
         candidate = Path(self.agents.defaults.workspace).expanduser()
         return candidate if candidate.is_absolute() else get_data_path() / candidate
 
@@ -463,7 +463,7 @@ class Config(BaseSettings):
         Env vars from ProviderSpec.env_key are used as fallback when config.api_key is empty."""
         import os
 
-        from nanobot.providers.registry import PROVIDERS, ProviderSpec
+        from yeoman.providers.registry import PROVIDERS, ProviderSpec
 
         def _has_api_key(provider_config: ProviderConfig, spec: ProviderSpec) -> bool:
             """Check if provider has api_key in config or env."""
@@ -492,7 +492,7 @@ class Config(BaseSettings):
         Checks config first, then env vars from ProviderSpec.env_key."""
         import os
 
-        from nanobot.providers.registry import PROVIDERS
+        from yeoman.providers.registry import PROVIDERS
 
         # Check if provider in config has a key
         p = self.get_provider(model)

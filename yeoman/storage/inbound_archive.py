@@ -11,7 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, get_data_path
+from yeoman.utils.helpers import ensure_dir, get_data_path
 
 DEFAULT_RETENTION_DAYS = 30
 PURGE_INTERVAL_SECONDS = 3600

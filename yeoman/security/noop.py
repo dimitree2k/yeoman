@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from nanobot.core.models import SecurityDecision, SecurityResult
-from nanobot.core.ports import SecurityPort
+from yeoman.core.models import SecurityDecision, SecurityResult
+from yeoman.core.ports import SecurityPort
 
 
 class NoopSecurity(SecurityPort):

@@ -14,7 +14,7 @@ from urllib.parse import quote
 import httpx
 from loguru import logger
 
-from nanobot.media.router import ResolvedProfile
+from yeoman.media.router import ResolvedProfile
 
 
 def strip_markdown_for_tts(text: str) -> str:

@@ -1,4 +1,4 @@
-"""Shared process management utilities for nanobot daemon processes."""
+"""Shared process management utilities for yeoman daemon processes."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def read_pid_file(path: Path) -> int | None:
 
 
 def is_bridge_dir(path: Path) -> bool:
-    """Return True if path is a nanobot WhatsApp bridge runtime directory."""
+    """Return True if path is a yeoman WhatsApp bridge runtime directory."""
     package_json = path / "package.json"
     if not package_json.exists():
         return False

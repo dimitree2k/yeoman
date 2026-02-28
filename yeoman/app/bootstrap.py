@@ -10,16 +10,16 @@ from typing import TYPE_CHECKING, assert_never
 
 from loguru import logger
 
-from nanobot.adapters.policy_engine import EnginePolicyAdapter
-from nanobot.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
-from nanobot.adapters.responder_llm import LLMResponder
-from nanobot.adapters.typing_channel_manager import ChannelManagerTypingAdapter
-from nanobot.telemetry import InMemoryTelemetry
-from nanobot.agent.tools.file_access import build_file_access_resolver
-from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.manager import ChannelManager
-from nanobot.core.intents import (
+from yeoman.adapters.policy_engine import EnginePolicyAdapter
+from yeoman.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
+from yeoman.adapters.responder_llm import LLMResponder
+from yeoman.adapters.typing_channel_manager import ChannelManagerTypingAdapter
+from yeoman.telemetry import InMemoryTelemetry
+from yeoman.agent.tools.file_access import build_file_access_resolver
+from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.channels.manager import ChannelManager
+from yeoman.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
     QueueMemoryNotesCaptureIntent,
@@ -29,27 +29,27 @@ from nanobot.core.intents import (
     SendReactionIntent,
     SetTypingIntent,
 )
-from nanobot.core.models import InboundEvent
-from nanobot.core.orchestrator import Orchestrator
-from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob
-from nanobot.heartbeat.service import HeartbeatService
-from nanobot.media.router import ModelRouter
-from nanobot.media.storage import MediaStorage
-from nanobot.media.tts import TTSSynthesizer
-from nanobot.memory import MemoryService
-from nanobot.providers.factory import ProviderFactory
-from nanobot.providers.openai_compatible import resolve_openai_compatible_credentials
-from nanobot.security import NoopSecurity, SecurityEngine
-from nanobot.session.manager import SessionManager
-from nanobot.storage.inbound_archive import InboundArchive
+from yeoman.core.models import InboundEvent
+from yeoman.core.orchestrator import Orchestrator
+from yeoman.cron.service import CronService
+from yeoman.cron.types import CronJob
+from yeoman.heartbeat.service import HeartbeatService
+from yeoman.media.router import ModelRouter
+from yeoman.media.storage import MediaStorage
+from yeoman.media.tts import TTSSynthesizer
+from yeoman.memory import MemoryService
+from yeoman.providers.factory import ProviderFactory
+from yeoman.providers.openai_compatible import resolve_openai_compatible_credentials
+from yeoman.security import NoopSecurity, SecurityEngine
+from yeoman.session.manager import SessionManager
+from yeoman.storage.inbound_archive import InboundArchive
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from nanobot.config.schema import Config, ExecToolConfig
-    from nanobot.policy.engine import PolicyEngine
-    from nanobot.providers.base import LLMProvider
+    from yeoman.config.schema import Config, ExecToolConfig
+    from yeoman.policy.engine import PolicyEngine
+    from yeoman.providers.base import LLMProvider
 
 
 def _normalize_timestamp(ts: datetime) -> datetime:
@@ -246,7 +246,7 @@ def build_gateway_runtime(
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
 
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.utils.helpers import get_operational_data_path
 
     session_manager = SessionManager(workspace)
     inbound_archive = InboundArchive(
@@ -277,7 +277,7 @@ def build_gateway_runtime(
     security_classifier = None
     if config.security.enabled and config.security.stages.input:
         try:
-            from nanobot.security.classifier import InputClassifier
+            from yeoman.security.classifier import InputClassifier
 
             security_classifier = InputClassifier(config=config)
         except Exception as exc:

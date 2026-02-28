@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from nanobot.core.pipeline import NextFn, PipelineContext
+from yeoman.core.pipeline import NextFn, PipelineContext
 
 
 class NormalizationMiddleware:

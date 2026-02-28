@@ -6,7 +6,7 @@ from pathlib import Path
 
 import typer
 
-from nanobot import __logo__
+from yeoman import __logo__
 
 from .channel_commands import _bridge_log_path
 from .core import app, console
@@ -21,7 +21,7 @@ def logs(
     bridge: bool = typer.Option(True, "--bridge/--no-bridge", help="Include WhatsApp bridge log"),
     raw: bool = typer.Option(False, "--raw", help="Use tail instead of lnav"),
 ) -> None:
-    """View nanobot logs (uses lnav when available)."""
+    """View yeoman logs (uses lnav when available)."""
     import shutil
     import subprocess
 
@@ -59,16 +59,16 @@ def logs(
 
 @app.command()
 def status() -> None:
-    """Show nanobot status."""
-    from nanobot.config.loader import get_config_path, load_config
-    from nanobot.policy.loader import get_policy_path
+    """Show yeoman status."""
+    from yeoman.config.loader import get_config_path, load_config
+    from yeoman.policy.loader import get_policy_path
 
     config_path = get_config_path()
     policy_path = get_policy_path()
     config = load_config()
     workspace = config.workspace_path
 
-    console.print(f"{__logo__} nanobot Status\n")
+    console.print(f"{__logo__} yeoman Status\n")
 
     console.print(
         f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
@@ -81,7 +81,7 @@ def status() -> None:
     )
 
     if config_path.exists():
-        from nanobot.providers.registry import PROVIDERS
+        from yeoman.providers.registry import PROVIDERS
 
         console.print(f"Model: {config.agents.defaults.model}")
 

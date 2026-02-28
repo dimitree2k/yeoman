@@ -13,20 +13,20 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage, ReactionMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
-from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-from nanobot.config.schema import WhatsAppConfig
-from nanobot.media.asr import ASRTranscriber
-from nanobot.media.storage import MediaStorage
-from nanobot.media.vision import VisionDescriber
+from yeoman.bus.events import OutboundMessage, ReactionMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.channels.base import BaseChannel
+from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+from yeoman.config.schema import WhatsAppConfig
+from yeoman.media.asr import ASRTranscriber
+from yeoman.media.storage import MediaStorage
+from yeoman.media.vision import VisionDescriber
 
 if TYPE_CHECKING:
-    from nanobot.media.router import ModelRouter
-    from nanobot.providers.factory import ProviderFactory
-    from nanobot.storage.chat_registry import ChatRegistry
-    from nanobot.storage.inbound_archive import InboundArchive
+    from yeoman.media.router import ModelRouter
+    from yeoman.providers.factory import ProviderFactory
+    from yeoman.storage.chat_registry import ChatRegistry
+    from yeoman.storage.inbound_archive import InboundArchive
 
 
 def _markdown_to_whatsapp(text: str) -> str:
@@ -174,7 +174,7 @@ class WhatsAppChannel(BaseChannel):
         self._runtime = WhatsAppRuntimeManager()
         self._chat_registry: ChatRegistry | None = None
         try:
-            from nanobot.storage.chat_registry import ChatRegistry
+            from yeoman.storage.chat_registry import ChatRegistry
 
             self._chat_registry = ChatRegistry()
         except Exception as e:
@@ -515,7 +515,7 @@ class WhatsAppChannel(BaseChannel):
             if version is None:
                 logger.warning(
                     "Bridge frame missing protocol version. "
-                    "Likely outdated bridge build; run `nanobot channels bridge restart` to refresh."
+                    "Likely outdated bridge build; run `yeoman channels bridge restart` to refresh."
                 )
             else:
                 logger.warning(f"Unexpected bridge protocol version: {version!r}")

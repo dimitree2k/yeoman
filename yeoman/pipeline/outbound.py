@@ -13,18 +13,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from nanobot.core.intents import (
+from yeoman.core.intents import (
     PersistSessionIntent,
     SendOutboundIntent,
     SendReactionIntent,
 )
-from nanobot.core.models import OutboundEvent
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import SecurityPort
+from yeoman.core.models import OutboundEvent
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import SecurityPort
 
 if TYPE_CHECKING:
-    from nanobot.media.router import ModelRouter
-    from nanobot.media.tts import TTSSynthesizer
+    from yeoman.media.router import ModelRouter
+    from yeoman.media.tts import TTSSynthesizer
 
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
 # Matches text followed by a reaction suffix: "some text\n\n::reaction::emoji"
@@ -219,7 +219,7 @@ class OutboundMiddleware:
         max_sentences = int(getattr(decision, "voice_output_max_sentences", 2) or 2)
         max_chars = int(getattr(decision, "voice_output_max_chars", 150) or 150)
 
-        from nanobot.media.tts import (
+        from yeoman.media.tts import (
             strip_markdown_for_tts,
             truncate_for_voice,
             write_tts_audio_file,
@@ -304,7 +304,7 @@ class OutboundMiddleware:
             return
         self._recent_alert_keys[key] = now + float(self._owner_alert_cooldown_seconds)
 
-        from nanobot.pipeline.new_chat import _normalize_owner_target
+        from yeoman.pipeline.new_chat import _normalize_owner_target
 
         content = (
             f"⚠️ Nano diagnostic\nvoice fallback in {channel}:{chat_id}\nreason={reason_compact}"

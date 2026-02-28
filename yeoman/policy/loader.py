@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from nanobot.policy.schema import PolicyConfig
+from yeoman.policy.schema import PolicyConfig
 
 
 def get_policy_path() -> Path:
     """Get the default policy file path."""
-    from nanobot.utils.helpers import get_data_path
+    from yeoman.utils.helpers import get_data_path
     return get_data_path() / "policy.json"
 
 

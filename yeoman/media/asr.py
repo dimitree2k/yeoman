@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from nanobot.media.router import ResolvedProfile
-from nanobot.providers.transcription import GroqTranscriptionProvider, OpenAITranscriptionProvider
+from yeoman.media.router import ResolvedProfile
+from yeoman.providers.transcription import GroqTranscriptionProvider, OpenAITranscriptionProvider
 
 
 class ASRTranscriber:

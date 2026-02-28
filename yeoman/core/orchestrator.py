@@ -11,30 +11,30 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from nanobot.core.admin_commands import AdminCommandResult
-from nanobot.core.intents import OrchestratorIntent
-from nanobot.core.models import InboundEvent
-from nanobot.core.pipeline import Pipeline
-from nanobot.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
-from nanobot.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
-from nanobot.pipeline.admin import AdminCommandMiddleware
-from nanobot.pipeline.archive import ArchiveMiddleware
-from nanobot.pipeline.dedup import DeduplicationMiddleware
-from nanobot.pipeline.idea_capture import IdeaCaptureMiddleware
-from nanobot.pipeline.new_chat import NewChatNotifyMiddleware
-from nanobot.pipeline.normalize import NormalizationMiddleware
-from nanobot.pipeline.outbound import OutboundMiddleware
-from nanobot.pipeline.policy import PolicyMiddleware
-from nanobot.pipeline.reply_context import ReplyContextMiddleware
-from nanobot.pipeline.responder import ResponderMiddleware
-from nanobot.pipeline.security_input import InputSecurityMiddleware
+from yeoman.core.admin_commands import AdminCommandResult
+from yeoman.core.intents import OrchestratorIntent
+from yeoman.core.models import InboundEvent
+from yeoman.core.pipeline import Pipeline
+from yeoman.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
+from yeoman.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
+from yeoman.pipeline.admin import AdminCommandMiddleware
+from yeoman.pipeline.archive import ArchiveMiddleware
+from yeoman.pipeline.dedup import DeduplicationMiddleware
+from yeoman.pipeline.idea_capture import IdeaCaptureMiddleware
+from yeoman.pipeline.new_chat import NewChatNotifyMiddleware
+from yeoman.pipeline.normalize import NormalizationMiddleware
+from yeoman.pipeline.outbound import OutboundMiddleware
+from yeoman.pipeline.policy import PolicyMiddleware
+from yeoman.pipeline.reply_context import ReplyContextMiddleware
+from yeoman.pipeline.responder import ResponderMiddleware
+from yeoman.pipeline.security_input import InputSecurityMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from nanobot.media.router import ModelRouter
-    from nanobot.media.tts import TTSSynthesizer
-    from nanobot.security.classifier import InputClassifier
+    from yeoman.media.router import ModelRouter
+    from yeoman.media.tts import TTSSynthesizer
+    from yeoman.security.classifier import InputClassifier
 
 
 class Orchestrator:

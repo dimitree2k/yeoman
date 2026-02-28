@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from nanobot.config.defaults import apply_missing_defaults
-from nanobot.config.schema import Config
+from yeoman.config.defaults import apply_missing_defaults
+from yeoman.config.schema import Config
 
 CONFIG_VERSION = 2
 
@@ -21,19 +21,19 @@ def get_config_path() -> Path:
 
 
 def get_data_dir() -> Path:
-    """Get the nanobot data directory."""
-    from nanobot.utils.helpers import get_data_path
+    """Get the yeoman data directory."""
+    from yeoman.utils.helpers import get_data_path
     return get_data_path()
 
 
 def _load_dotenv() -> None:
-    """Load ~/.nanobot/.env (or $NANOBOT_HOME/.env) into os.environ.
+    """Load ~/.yeoman/.env (or $NANOBOT_HOME/.env) into os.environ.
 
     Existing environment variables are never overwritten — real env vars
     always take priority over the .env file.
     """
     nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
-    base = Path(nanobot_home) if nanobot_home else Path.home() / ".nanobot"
+    base = Path(nanobot_home) if nanobot_home else Path.home() / ".yeoman"
     env_file = base / ".env"
     if not env_file.exists():
         return
@@ -61,8 +61,8 @@ def _apply_env_overrides(config: Config) -> Config:
     over values already present in config.json. This means the .env file
     is the canonical source for secrets; config.json can have empty keys.
     """
-    from nanobot.config.schema import ProviderConfig
-    from nanobot.providers.registry import PROVIDERS
+    from yeoman.config.schema import ProviderConfig
+    from yeoman.providers.registry import PROVIDERS
 
     # Provider API keys — iterate registry so every provider is covered
     for spec in PROVIDERS:
@@ -104,7 +104,7 @@ def load_config(config_path: Path | None = None) -> Config:
     """Load configuration from file or create default.
 
     Loading order:
-      1. Parse ~/.nanobot/.env and inject into os.environ (if not already set).
+      1. Parse ~/.yeoman/.env and inject into os.environ (if not already set).
       2. Load config.json, applying schema migration.
       3. Override empty api_key / token fields with env var values.
 

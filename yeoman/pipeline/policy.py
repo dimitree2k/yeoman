@@ -6,8 +6,8 @@ engine and store the decision in ``ctx.decision`` for downstream middleware.
 
 from __future__ import annotations
 
-from nanobot.core.pipeline import NextFn, PipelineContext
-from nanobot.core.ports import PolicyPort
+from yeoman.core.pipeline import NextFn, PipelineContext
+from yeoman.core.ports import PolicyPort
 
 
 class PolicyMiddleware:

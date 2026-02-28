@@ -1,8 +1,8 @@
 """Active semantic memory package."""
 
-from nanobot.memory.embeddings import MemoryEmbeddingService
-from nanobot.memory.extractor import ExtractedCandidate, MemoryExtractorService
-from nanobot.memory.models import (
+from yeoman.memory.embeddings import MemoryEmbeddingService
+from yeoman.memory.extractor import ExtractedCandidate, MemoryExtractorService
+from yeoman.memory.models import (
     MemoryCaptureCandidate,
     MemoryCaptureResult,
     MemoryEntry,
@@ -10,8 +10,8 @@ from nanobot.memory.models import (
     MemoryScopeType,
     MemorySector,
 )
-from nanobot.memory.service import MemoryService
-from nanobot.memory.store import MemoryStore
+from yeoman.memory.service import MemoryService
+from yeoman.memory.store import MemoryStore
 
 __all__ = [
     "ExtractedCandidate",

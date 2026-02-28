@@ -16,21 +16,21 @@ from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
-from nanobot.memory.embeddings import MemoryEmbeddingService
-from nanobot.memory.extractor import ExtractedCandidate, MemoryExtractorService
-from nanobot.memory.models import (
+from yeoman.memory.embeddings import MemoryEmbeddingService
+from yeoman.memory.extractor import ExtractedCandidate, MemoryExtractorService
+from yeoman.memory.models import (
     MemoryCaptureCandidate,
     MemoryCaptureResult,
     MemoryEntry,
     MemoryHit,
     MemorySector,
 )
-from nanobot.memory.session_state import SessionStateStore
-from nanobot.memory.store import MemoryStore
-from nanobot.policy.loader import load_policy
+from yeoman.memory.session_state import SessionStateStore
+from yeoman.memory.store import MemoryStore
+from yeoman.policy.loader import load_policy
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import Config, MemoryConfig
+    from yeoman.config.schema import Config, MemoryConfig
 
 
 @dataclass(slots=True)
@@ -71,7 +71,7 @@ class MemoryService:
 
         db_path = Path(self.config.db_path).expanduser()
         if not db_path.is_absolute():
-            db_path = (Path.home() / ".nanobot" / db_path).resolve()
+            db_path = (Path.home() / ".yeoman" / db_path).resolve()
         self.db_path = db_path
         self.store = MemoryStore(db_path)
         self.state_store = SessionStateStore(workspace, state_dir=self.config.wal.state_dir)

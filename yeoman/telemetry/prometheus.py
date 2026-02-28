@@ -1,4 +1,4 @@
-"""Prometheus metrics backend for nanobot observability.
+"""Prometheus metrics backend for yeoman observability.
 
 Provides a Prometheus-compatible metrics endpoint for production monitoring.
 Metrics are exposed at /metrics for scraping by Prometheus server.
@@ -37,7 +37,7 @@ class PrometheusTelemetry:
     """Prometheus-backed telemetry with /metrics endpoint.
 
     This adapter:
-    - Registers standard nanobot metrics
+    - Registers standard yeoman metrics
     - Exposes /metrics endpoint on localhost:8080 by default
     - Thread-safe metrics collection
     - Supports counters, gauges, histograms, and timings
@@ -75,29 +75,29 @@ class PrometheusTelemetry:
         self._Histogram = Histogram
         self._start_http_server = start_http_server
 
-        # Register standard nanobot metrics
+        # Register standard yeoman metrics
         self._register_standard_metrics()
 
     def _register_standard_metrics(self) -> None:
-        """Register standard nanobot metrics."""
+        """Register standard yeoman metrics."""
         # LLM metrics
         self._metrics["llm_requests_total"] = self._Counter(
-            "nanobot_llm_requests_total",
+            "yeoman_llm_requests_total",
             "Total LLM requests",
             labelnames=["model", "provider", "channel"],
         )
         self._metrics["llm_tokens_total"] = self._Counter(
-            "nanobot_llm_tokens_total",
+            "yeoman_llm_tokens_total",
             "Total LLM tokens generated",
             labelnames=["model", "provider", "channel", "kind"],  # kind=prompt/completion
         )
         self._metrics["llm_cost_dollars"] = self._Counter(
-            "nanobot_llm_cost_dollars",
+            "yeoman_llm_cost_dollars",
             "Estimated LLM cost in dollars",
             labelnames=["model", "provider", "channel"],
         )
         self._metrics["llm_request_duration_seconds"] = self._Histogram(
-            "nanobot_llm_request_duration_seconds",
+            "yeoman_llm_request_duration_seconds",
             "LLM request duration in seconds",
             labelnames=["model", "provider", "channel"],
             buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0],
@@ -105,45 +105,45 @@ class PrometheusTelemetry:
 
         # Tool metrics
         self._metrics["tool_calls_total"] = self._Counter(
-            "nanobot_tool_calls_total",
+            "yeoman_tool_calls_total",
             "Total tool calls executed",
             labelnames=["tool", "channel", "status"],  # status=success/error
         )
 
         # Event metrics
         self._metrics["events_total"] = self._Counter(
-            "nanobot_events_total",
+            "yeoman_events_total",
             "Total events processed",
             labelnames=["type", "channel"],
         )
         self._metrics["events_dropped_total"] = self._Counter(
-            "nanobot_events_dropped_total",
+            "yeoman_events_dropped_total",
             "Total events dropped",
             labelnames=["reason", "channel"],
         )
 
         # Memory metrics
         self._metrics["memory_notes_total"] = self._Counter(
-            "nanobot_memory_notes_total",
+            "yeoman_memory_notes_total",
             "Total memory notes captured",
             labelnames=["mode", "channel"],
         )
         self._metrics["memory_recall_total"] = self._Counter(
-            "nanobot_memory_recall_total",
+            "yeoman_memory_recall_total",
             "Total memory recall operations",
             labelnames=["channel", "status"],  # status=hit/miss
         )
 
         # Queue metrics
         self._metrics["queue_size"] = self._Gauge(
-            "nanobot_queue_size",
+            "yeoman_queue_size",
             "Queue size",
             labelnames=["queue", "channel"],  # queue=inbound/outbound
         )
 
         # Response metrics
         self._metrics["response_size_bytes"] = self._Histogram(
-            "nanobot_response_size_bytes",
+            "yeoman_response_size_bytes",
             "Response size in bytes",
             labelnames=["channel"],
             buckets=[100, 500, 1000, 5000, 10000, 50000, 100000],
@@ -178,7 +178,7 @@ class PrometheusTelemetry:
             # Create ad-hoc counter
             labelnames = [k for k, _ in labels] if labels else []
             metric = self._Counter(
-                f"nanobot_{name}",
+                f"yeoman_{name}",
                 f"Counter: {name}",
                 labelnames=labelnames,
             )
@@ -200,7 +200,7 @@ class PrometheusTelemetry:
             # Create ad-hoc gauge
             labelnames = [k for k, _ in labels] if labels else []
             metric = self._Gauge(
-                f"nanobot_{name}",
+                f"yeoman_{name}",
                 f"Gauge: {name}",
                 labelnames=labelnames,
             )
@@ -224,7 +224,7 @@ class PrometheusTelemetry:
             # Create ad-hoc histogram
             labelnames = [k for k, _ in labels] if labels else []
             metric = self._Histogram(
-                f"nanobot_{name}",
+                f"yeoman_{name}",
                 f"Histogram: {name}",
                 labelnames=labelnames,
             )

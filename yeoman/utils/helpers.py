@@ -1,4 +1,4 @@
-"""Utility functions for nanobot."""
+"""Utility functions for yeoman."""
 
 import os
 from datetime import datetime
@@ -12,23 +12,23 @@ def ensure_dir(path: Path) -> Path:
 
 
 def get_data_path() -> Path:
-    """Get the nanobot data directory.
+    """Get the yeoman data directory.
 
     Respects NANOBOT_HOME environment variable; falls back to ~/.nanobot.
     """
     nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
     if nanobot_home:
         return ensure_dir(Path(nanobot_home))
-    return ensure_dir(Path.home() / ".nanobot")
+    return ensure_dir(Path.home() / ".yeoman")
 
 
 def get_var_path() -> Path:
-    """Get the ephemeral state directory (~/.nanobot/var)."""
+    """Get the ephemeral state directory (~/.yeoman/var)."""
     return ensure_dir(get_data_path() / "var")
 
 
 def get_secrets_path() -> Path:
-    """Get the secrets directory (~/.nanobot/secrets), chmod 0700."""
+    """Get the secrets directory (~/.yeoman/secrets), chmod 0700."""
     path = ensure_dir(get_data_path() / "secrets")
     try:
         path.chmod(0o700)
@@ -38,22 +38,22 @@ def get_secrets_path() -> Path:
 
 
 def get_operational_data_path() -> Path:
-    """Get the long-lived operational data directory (~/.nanobot/data)."""
+    """Get the long-lived operational data directory (~/.yeoman/data)."""
     return ensure_dir(get_data_path() / "data")
 
 
 def get_logs_path() -> Path:
-    """Get the logs directory (~/.nanobot/var/logs)."""
+    """Get the logs directory (~/.yeoman/var/logs)."""
     return ensure_dir(get_var_path() / "logs")
 
 
 def get_run_path() -> Path:
-    """Get the PID/socket run directory (~/.nanobot/var/run)."""
+    """Get the PID/socket run directory (~/.yeoman/var/run)."""
     return ensure_dir(get_var_path() / "run")
 
 
 def get_cache_path() -> Path:
-    """Get the cache directory (~/.nanobot/var/cache)."""
+    """Get the cache directory (~/.yeoman/var/cache)."""
     return ensure_dir(get_var_path() / "cache")
 
 
@@ -61,7 +61,7 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     """Get the workspace path.
 
     Args:
-        workspace: Optional workspace path. Defaults to ~/.nanobot/workspace.
+        workspace: Optional workspace path. Defaults to ~/.yeoman/workspace.
 
     Returns:
         Expanded and ensured workspace path.
@@ -76,7 +76,7 @@ def get_workspace_path(workspace: str | None = None) -> Path:
 
 
 def get_sessions_path() -> Path:
-    """Get the session history directory (~/.nanobot/data/inbound)."""
+    """Get the session history directory (~/.yeoman/data/inbound)."""
     return ensure_dir(get_operational_data_path() / "inbound")
 
 

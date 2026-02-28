@@ -6,7 +6,7 @@ import asyncio
 
 import typer
 
-from nanobot import __logo__
+from yeoman import __logo__
 
 from .core import app, console, make_memory_service, make_provider
 
@@ -17,13 +17,13 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ) -> None:
     """Interact with the agent directly."""
-    from nanobot.adapters.responder_llm import LLMResponder
-    from nanobot.agent.tools.file_access import build_file_access_resolver
-    from nanobot.bus.queue import MessageBus
-    from nanobot.config.loader import load_config
-    from nanobot.policy.loader import load_policy
-    from nanobot.security import NoopSecurity, SecurityEngine
-    from nanobot.telemetry import InMemoryTelemetry
+    from yeoman.adapters.responder_llm import LLMResponder
+    from yeoman.agent.tools.file_access import build_file_access_resolver
+    from yeoman.bus.queue import MessageBus
+    from yeoman.config.loader import load_config
+    from yeoman.policy.loader import load_policy
+    from yeoman.security import NoopSecurity, SecurityEngine
+    from yeoman.telemetry import InMemoryTelemetry
 
     config = load_config()
     memory_service = make_memory_service(config)

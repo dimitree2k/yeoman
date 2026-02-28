@@ -1,4 +1,4 @@
-"""Curated rule sets for nanobot security middleware."""
+"""Curated rule sets for yeoman security middleware."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import json
 import re
 from typing import Any
 
-from nanobot.core.models import SecurityDecision, SecuritySeverity
-from nanobot.security.models import RuleHit
-from nanobot.security.normalize import NormalizedText
+from yeoman.core.models import SecurityDecision, SecuritySeverity
+from yeoman.security.models import RuleHit
+from yeoman.security.normalize import NormalizedText
 
 _INPUT_OVERRIDE = [
     re.compile(r"\b(ignore|forget|disregard)\b.{0,30}\b(instruction|system|rule)s?\b", re.IGNORECASE),
@@ -49,7 +49,7 @@ _CONFIG_FILE_PATTERNS = [
     re.compile(r"IDENTITY\.md", re.IGNORECASE),
     re.compile(r"TOOLS\.md", re.IGNORECASE),
     re.compile(r"SKILL\.md", re.IGNORECASE),
-    re.compile(r"\.nanobot/"),
+    re.compile(r"\.yeoman/"),
     re.compile(r"workspace/memory"),
     re.compile(r"workspace/SOUL", re.IGNORECASE),
 ]

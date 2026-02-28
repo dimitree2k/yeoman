@@ -6,11 +6,11 @@ import re
 
 from loguru import logger
 
-from nanobot.config.schema import SecurityConfig
-from nanobot.core.models import SecurityDecision, SecurityResult, SecurityStage
-from nanobot.core.ports import SecurityPort
-from nanobot.security.normalize import normalize_text
-from nanobot.security.rules import decide_input, decide_output, decide_tool
+from yeoman.config.schema import SecurityConfig
+from yeoman.core.models import SecurityDecision, SecurityResult, SecurityStage
+from yeoman.core.ports import SecurityPort
+from yeoman.security.normalize import normalize_text
+from yeoman.security.rules import decide_input, decide_output, decide_tool
 
 _SENSITIVE_CONTEXT_KEYS = (
     "password",

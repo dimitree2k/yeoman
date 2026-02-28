@@ -30,7 +30,7 @@ def _normalize_choice(raw: str, *, choices: set[str], option: str) -> str:
 
 @contextmanager
 def _memory_service_context():
-    from nanobot.config.loader import load_config
+    from yeoman.config.loader import load_config
 
     service = make_memory_service(load_config())
     try:
@@ -83,9 +83,9 @@ def memory_notes_status(
     is_group: bool = typer.Option(True, "--is-group/--is-dm", help="Resolve as group or DM"),
 ) -> None:
     """Show effective background memory-notes settings for one chat."""
-    from nanobot.config.loader import load_config
-    from nanobot.policy.engine import PolicyEngine
-    from nanobot.policy.loader import load_policy
+    from yeoman.config.loader import load_config
+    from yeoman.policy.engine import PolicyEngine
+    from yeoman.policy.loader import load_policy
 
     resolved_channel = _notes_channel_guard(channel)
     config = load_config()
@@ -130,8 +130,8 @@ def memory_notes_set(
     ),
 ) -> None:
     """Set per-chat memory-notes override in policy.json."""
-    from nanobot.policy.loader import load_policy, save_policy
-    from nanobot.policy.schema import MemoryNotesChannelPolicy, MemoryNotesOverride
+    from yeoman.policy.loader import load_policy, save_policy
+    from yeoman.policy.schema import MemoryNotesChannelPolicy, MemoryNotesOverride
 
     resolved_channel = _notes_channel_guard(channel)
     enabled_value = _notes_parse_optional_bool(enabled)

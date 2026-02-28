@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from nanobot.providers.litellm_provider import LiteLLMProvider
+from yeoman.providers.litellm_provider import LiteLLMProvider
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import Config
-    from nanobot.providers.base import LLMProvider
+    from yeoman.config.schema import Config
+    from yeoman.providers.base import LLMProvider
 
 
 @dataclass(slots=True)

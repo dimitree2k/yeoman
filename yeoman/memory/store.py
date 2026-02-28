@@ -10,8 +10,8 @@ from array import array
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nanobot.memory.models import MemoryEntry, MemoryHit, MemorySector
-from nanobot.utils.helpers import ensure_dir
+from yeoman.memory.models import MemoryEntry, MemoryHit, MemorySector
+from yeoman.utils.helpers import ensure_dir
 
 
 class MemoryStore:

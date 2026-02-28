@@ -11,18 +11,18 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from nanobot.agent.tools.file_access import FileAccessResolver
-    from nanobot.config.schema import ExecToolConfig
+    from yeoman.agent.tools.file_access import FileAccessResolver
+    from yeoman.config.schema import ExecToolConfig
 
-from nanobot.agent.tools.exec_isolation import SandboxMount
-from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.pi_stats import PiStatsTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from yeoman.agent.tools.exec_isolation import SandboxMount
+from yeoman.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
+from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.registry import ToolRegistry
+from yeoman.agent.tools.shell import ExecTool
+from yeoman.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
+from yeoman.bus.events import InboundMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.providers.base import LLMProvider
 
 
 class SubagentManager:
@@ -45,7 +45,7 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         file_access_resolver: "FileAccessResolver | None" = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from yeoman.config.schema import ExecToolConfig
         self.provider = provider
         self.workspace = workspace
         self.bus = bus

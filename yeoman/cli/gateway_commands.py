@@ -7,20 +7,20 @@ from pathlib import Path
 
 import typer
 
-from nanobot import __logo__
-from nanobot.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
+from yeoman import __logo__
+from yeoman.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
 
 from .core import app, console, make_policy_engine, make_provider
 
 
 def _gateway_pid_path() -> Path:
-    from nanobot.utils.helpers import get_run_path
+    from yeoman.utils.helpers import get_run_path
 
     return get_run_path() / "gateway.pid"
 
 
 def _gateway_log_path() -> Path:
-    from nanobot.utils.helpers import get_logs_path
+    from yeoman.utils.helpers import get_logs_path
 
     return get_logs_path() / "gateway.log"
 
@@ -84,7 +84,7 @@ def _is_nanobot_gateway_command(cmd: str) -> bool:
 
     if "-m" in tokens:
         i = tokens.index("-m")
-        if i + 1 < len(tokens) and tokens[i + 1] == "nanobot.cli.commands":
+        if i + 1 < len(tokens) and tokens[i + 1] == "yeoman.cli.commands":
             return True
 
     exe = tokens[0] if tokens else ""
@@ -188,8 +188,8 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
     import sys
     import time
 
-    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import load_config
+    from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from yeoman.config.loader import load_config
 
     config = load_config()
     if ensure_whatsapp and config.channels.whatsapp.enabled:
@@ -210,7 +210,7 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
         return
 
     log_path = _gateway_log_path()
-    cmd = [sys.executable, "-m", "nanobot.cli.commands", "gateway", "--port", str(port)]
+    cmd = [sys.executable, "-m", "yeoman.cli.commands", "gateway", "--port", str(port)]
     if verbose:
         cmd.append("--verbose")
 
@@ -246,18 +246,18 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
 
 
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
-    """Start the nanobot gateway in foreground."""
-    from nanobot.app.bootstrap import build_gateway_runtime
-    from nanobot.bus.queue import MessageBus
-    from nanobot.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from nanobot.config.loader import load_config
+    """Start the yeoman gateway in foreground."""
+    from yeoman.app.bootstrap import build_gateway_runtime
+    from yeoman.bus.queue import MessageBus
+    from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+    from yeoman.config.loader import load_config
 
     if verbose:
         import logging
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    console.print(f"{__logo__} Starting yeoman gateway on port {port}...")
 
     config = load_config()
     if ensure_whatsapp and config.channels.whatsapp.enabled:
@@ -325,7 +325,7 @@ def gateway(
         help="Ensure WhatsApp runtime/health before starting gateway",
     ),
 ) -> None:
-    """Start or control the nanobot gateway."""
+    """Start or control the yeoman gateway."""
     action_mode: str | None = None
     if action:
         normalized = action.strip().lower()

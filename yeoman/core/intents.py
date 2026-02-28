@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from nanobot.core.models import OutboundEvent
+from yeoman.core.models import OutboundEvent
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

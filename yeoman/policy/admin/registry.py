@@ -5,7 +5,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass
 
-from nanobot.policy.admin.contracts import PolicyCommand, PolicyExecutionOptions
+from yeoman.policy.admin.contracts import PolicyCommand, PolicyExecutionOptions
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nanobot.core.models import SecurityDecision, SecurityResult, SecuritySeverity, SecurityStage
+from yeoman.core.models import SecurityDecision, SecurityResult, SecuritySeverity, SecurityStage
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

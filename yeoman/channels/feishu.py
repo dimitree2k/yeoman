@@ -9,10 +9,10 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import FeishuConfig
+from yeoman.bus.events import OutboundMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.channels.base import BaseChannel
+from yeoman.config.schema import FeishuConfig
 
 try:
     import lark_oapi as lark

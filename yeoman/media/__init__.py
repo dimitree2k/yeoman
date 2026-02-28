@@ -1,9 +1,9 @@
 """Media intelligence routing, storage, and capability executors."""
 
-from nanobot.media.asr import ASRTranscriber
-from nanobot.media.router import ModelRouter, ResolvedProfile
-from nanobot.media.storage import MediaStorage
-from nanobot.media.vision import VisionDescriber
+from yeoman.media.asr import ASRTranscriber
+from yeoman.media.router import ModelRouter, ResolvedProfile
+from yeoman.media.storage import MediaStorage
+from yeoman.media.vision import VisionDescriber
 
 __all__ = [
     "ASRTranscriber",

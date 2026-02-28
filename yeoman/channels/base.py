@@ -3,8 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from nanobot.bus.events import InboundMessage, OutboundMessage, ReactionMessage
-from nanobot.bus.queue import MessageBus
+from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
+from yeoman.bus.queue import MessageBus
 
 
 class BaseChannel(ABC):
@@ -12,7 +12,7 @@ class BaseChannel(ABC):
     Abstract base class for chat channel implementations.
 
     Each channel (Telegram, Discord, etc.) should implement this interface
-    to integrate with the nanobot message bus.
+    to integrate with the yeoman message bus.
     """
 
     name: str = "base"

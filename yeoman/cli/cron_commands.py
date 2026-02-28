@@ -20,8 +20,8 @@ def cron_list(
     """List scheduled jobs."""
     import time
 
-    from nanobot.cron.service import CronService
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.utils.helpers import get_operational_data_path
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -75,9 +75,9 @@ def cron_add(
     ),
 ) -> None:
     """Add a scheduled job."""
-    from nanobot.cron.service import CronService
-    from nanobot.cron.types import CronSchedule
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.cron.types import CronSchedule
+    from yeoman.utils.helpers import get_operational_data_path
 
     if every:
         schedule = CronSchedule(kind="every", every_ms=every * 1000)
@@ -146,9 +146,9 @@ def cron_add_voice(
     import datetime
     from pathlib import Path
 
-    from nanobot.cron.service import CronService
-    from nanobot.cron.types import CronSchedule
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.cron.types import CronSchedule
+    from yeoman.utils.helpers import get_operational_data_path
 
     chosen = [every is not None, bool(cron_expr), bool(at)]
     if sum(chosen) != 1:
@@ -211,8 +211,8 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ) -> None:
     """Remove a scheduled job."""
-    from nanobot.cron.service import CronService
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.utils.helpers import get_operational_data_path
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -229,8 +229,8 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ) -> None:
     """Enable or disable a job."""
-    from nanobot.cron.service import CronService
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.utils.helpers import get_operational_data_path
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -249,8 +249,8 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ) -> None:
     """Manually run a job."""
-    from nanobot.cron.service import CronService
-    from nanobot.utils.helpers import get_operational_data_path
+    from yeoman.cron.service import CronService
+    from yeoman.utils.helpers import get_operational_data_path
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)

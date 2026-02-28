@@ -1,4 +1,4 @@
-"""Control Plane API for nanobot.
+"""Control Plane API for yeoman.
 
 Provides a minimal FastAPI-based control plane with:
 - /health - Health check endpoint

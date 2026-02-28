@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from nanobot.agent.tools.base import Tool
+from yeoman.agent.tools.base import Tool
 
 
 @dataclass(frozen=True, slots=True)

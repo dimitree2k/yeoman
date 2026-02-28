@@ -1,6 +1,6 @@
 """Typed core domain and orchestration primitives."""
 
-from nanobot.core.intents import (
+from yeoman.core.intents import (
     PersistSessionIntent,
     QueueMemoryNotesCaptureIntent,
     RecordManualMemoryIntent,
@@ -9,13 +9,13 @@ from nanobot.core.intents import (
     SendReactionIntent,
     SetTypingIntent,
 )
-from nanobot.core.models import (
+from yeoman.core.models import (
     ArchivedMessage,
     InboundEvent,
     OutboundEvent,
     PolicyDecision,
 )
-from nanobot.core.orchestrator import Orchestrator
+from yeoman.core.orchestrator import Orchestrator
 
 __all__ = [
     "ArchivedMessage",

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ModelProfile, ModelRoutingConfig
+    from yeoman.config.schema import ModelProfile, ModelRoutingConfig
 
 
 @dataclass(frozen=True, slots=True)

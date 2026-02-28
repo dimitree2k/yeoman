@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nanobot.channels.whatsapp_runtime import (
+from yeoman.channels.whatsapp_runtime import (
     BridgeReadyReport,
     BridgeStatus,
     WhatsAppRuntimeManager,
