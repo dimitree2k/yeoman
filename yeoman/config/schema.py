@@ -195,7 +195,7 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
     workspace: str = "~/.yeoman/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
@@ -222,7 +222,7 @@ class ProviderConfig(BaseModel):
 class ElevenLabsProviderConfig(ProviderConfig):
     """ElevenLabs provider config with optional TTS defaults."""
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
 
     voice_id: str | None = Field(default=None, alias="voiceId")
     model_id: str | None = Field(default=None, alias="modelId")
@@ -437,7 +437,7 @@ class BusConfig(BaseModel):
 
 class Config(BaseSettings):
     """Root configuration for yeoman."""
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="NANOBOT_", env_nested_delimiter="__")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
 
     config_version: int = 2
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)

@@ -27,13 +27,15 @@ def get_data_dir() -> Path:
 
 
 def _load_dotenv() -> None:
-    """Load ~/.yeoman/.env (or $NANOBOT_HOME/.env) into os.environ.
+    """Load ~/.yeoman/.env (or $YEOMAN_HOME/.env or legacy $NANOBOT_HOME/.env) into os.environ.
 
     Existing environment variables are never overwritten — real env vars
     always take priority over the .env file.
     """
-    nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
-    base = Path(nanobot_home) if nanobot_home else Path.home() / ".yeoman"
+    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+    if not yeoman_home:
+        yeoman_home = os.environ.get("NANOBOT_HOME", "").strip()
+    base = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
     env_file = base / ".env"
     if not env_file.exists():
         return
