@@ -19,7 +19,23 @@ Independent fork of HKUDS/nanobot. MIT license.
 | WhatsApp bridge (TS) | `bridge/src/` |
 | Tests | `tests/test_*.py` |
 | Architecture docs | `docs/` |
-| Runtime data dir | `~/.nanobot/` (separate — see its own CLAUDE.md) |
+| Runtime data dir | `~/.nanobot/` (config, policy, memory, logs — see `~/.nanobot/CLAUDE.md`) |
+
+## Two Repositories
+
+This project spans two directories that must be kept in sync:
+
+| Location | Purpose | Git repo |
+|----------|---------|---------|
+| `~/Documents/nanobot/` | Source code (this repo) | public/private source repo |
+| `~/.nanobot/` | Runtime state: config, policy, memory, logs, workspace | separate private runtime repo |
+
+**When working on a task**, consider which directory is relevant:
+- Code changes → `~/Documents/nanobot/`, then reinstall (`pip install -e .`)
+- Config/policy/persona/skill changes → `~/.nanobot/`
+- Debugging a live issue → check `~/.nanobot/var/logs/` and `~/.nanobot/data/`
+
+The runtime CLAUDE.md (`~/.nanobot/CLAUDE.md`) documents the full layout, git tracking rules, secrets management, and config file schemas for the runtime directory.
 
 ## Architecture
 

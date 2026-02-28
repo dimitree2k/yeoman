@@ -421,6 +421,21 @@ class LLMResponder(ResponderPort):
             if schema.get("function", {}).get("name") in allowed_tools
         ]
 
+    def _model_for_profile(self, profile_name: str | None) -> str | None:
+        """Return the model string for a named profile, or None if unresolvable.
+
+        Profile names in policy.json are camelCase (e.g. "grokFast") but config
+        loader converts dict keys to snake_case (e.g. "grok_fast"), so we normalize.
+        """
+        if not profile_name or self._model_router is None:
+            return None
+        from nanobot.config.loader import camel_to_snake
+        snake_name = camel_to_snake(profile_name)
+        try:
+            return self._model_router.resolve_by_profile(snake_name).model
+        except KeyError:
+            return None
+
     def _should_enable_grants(self, is_owner: bool) -> bool:
         """Check whether grants should be activated for tool execution."""
         if self.file_access_resolver is None or not self.file_access_resolver.has_grants:
@@ -449,6 +464,7 @@ class LLMResponder(ResponderPort):
         allowed_tools: set[str],
         security_context: dict[str, object] | None = None,
         is_owner: bool = False,
+        model: str | None = None,
     ) -> str:
         iteration = 0
         final_content: str | None = None
@@ -458,7 +474,7 @@ class LLMResponder(ResponderPort):
             response = await self.provider.chat(
                 messages=messages,
                 tools=self._tool_definitions(allowed_tools),
-                model=self.model,
+                model=model or self.model,
             )
 
             if response.has_tool_calls:
@@ -794,6 +810,7 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_delay_seconds: float = 2.5,
         talkative_cooldown_use_llm_message: bool = False,
         is_owner: bool = False,
+        model_profile: str | None = None,
     ) -> str:
         # Handle owner approve/deny commands
         if is_owner and channel == "whatsapp":
@@ -904,6 +921,7 @@ class LLMResponder(ResponderPort):
                         "session_key": session_key,
                     },
                     is_owner=is_owner,
+                    model=self._model_for_profile(model_profile),
                 )
 
         if self.memory is not None:
@@ -987,6 +1005,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_delay_seconds=decision.talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=decision.talkative_cooldown_use_llm_message,
             is_owner=decision.is_owner,
+            model_profile=decision.model_profile,
         )
 
     async def process_direct(

@@ -130,6 +130,16 @@ class ModelRouter:
             )
         return self._to_resolved(chosen_key, profile_name, profile)
 
+    def resolve_by_profile(self, profile_name: str) -> ResolvedProfile:
+        """Resolve directly by profile name, bypassing route lookup.
+
+        Raises KeyError if the profile does not exist.
+        """
+        profile = self._routing.profiles.get(profile_name)
+        if profile is None:
+            raise KeyError(f"No model profile named '{profile_name}'")
+        return self._to_resolved(profile_name, profile_name, profile)
+
     def is_in_cooldown(self, profile_name: str) -> bool:
         """Check if a profile is currently in cooldown."""
         entry = self._state.cooldowns.get(profile_name)

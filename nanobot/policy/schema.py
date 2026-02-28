@@ -178,6 +178,7 @@ class ChatPolicy(PolicyModel):
     tool_access: dict[str, ToolAccessRule] = Field(default_factory=dict, alias="toolAccess")
     group_tags: list[str] = Field(default_factory=list, alias="groupTags")
     persona_file: str | None = Field(default=None, alias="personaFile")
+    model_profile: str | None = Field(default=None, alias="modelProfile")
     voice: VoicePolicy = Field(default_factory=VoicePolicy)
     talkative_cooldown: TalkativeCooldownPolicy = Field(
         default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
@@ -189,6 +190,7 @@ class ChatPolicyOverride(PolicyModel):
 
     comment: str | None = Field(default=None, alias="comment")
     persona_file: str | None = Field(default=None, alias="personaFile")
+    model_profile: str | None = Field(default=None, alias="modelProfile")
     who_can_talk: WhoCanTalkPolicyOverride | None = Field(default=None, alias="whoCanTalk")
     when_to_reply: WhenToReplyPolicyOverride | None = Field(default=None, alias="whenToReply")
     blocked_senders: BlockedSendersPolicyOverride | None = Field(

@@ -87,6 +87,7 @@ class EffectivePolicy:
     allowed_tools_deny: list[str]
     tool_access: dict[str, dict[str, Any]]
     persona_file: str | None
+    model_profile: str | None
     voice_input_wake_phrases: list[str]
     voice_output_mode: str
     voice_output_tts_route: str
@@ -143,6 +144,7 @@ class _CompiledPolicy:
     allowed_tools_deny: frozenset[str]
     tool_access_rules: dict[str, _CompiledToolAccessRule]
     persona_file: str | None
+    model_profile: str | None
     voice_input_wake_phrases: frozenset[str]
     voice_output_mode: str
     voice_output_tts_route: str
@@ -278,6 +280,7 @@ class PolicyEngine:
                 if tool_name.strip()
             },
             persona_file=resolved.persona_file,
+            model_profile=resolved.model_profile,
             voice_input_wake_phrases=_normalize_wake_phrases(resolved.voice.input.wake_phrases),
             voice_output_mode=str(resolved.voice.output.mode),
             voice_output_tts_route=str(resolved.voice.output.tts_route),
@@ -441,6 +444,7 @@ class PolicyEngine:
                 for tool_name, rule in sorted(resolved.tool_access_rules.items())
             },
             persona_file=resolved.persona_file,
+            model_profile=resolved.model_profile,
             voice_input_wake_phrases=sorted(resolved.voice_input_wake_phrases),
             voice_output_mode=resolved.voice_output_mode,
             voice_output_tts_route=resolved.voice_output_tts_route,
