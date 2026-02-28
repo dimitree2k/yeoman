@@ -306,7 +306,7 @@ git add -A && git commit -m "refactor: rename image assets to yeoman"
 - Replace `~/.yeoman` → `~/.yeoman`
 - Replace the fork notice (line 18) with:
   ```
-  > Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman). MIT license preserved.
+  > Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
   ```
 - Remove references to `UPSTREAM.md` (it will be trimmed)
 - Remove the footer fork attribution (line ~351)
@@ -336,21 +336,21 @@ Bulk replace:
 - `~/.yeoman` → `~/.yeoman`
 - `yeoman` → `yeoman`
 - Update the header line to: `Lightweight, policy-first personal AI assistant runtime (~18k core lines).`
-- Remove: `Independent fork of HKUDS/yeoman. MIT license.`
+- Remove: `Independent fork of HKUDS/nanobot. MIT license.`
 
 **Step 2: Update SECURITY.md**
 
 Bulk replace:
 - `yeoman` → `yeoman` throughout
 - `~/.yeoman` → `~/.yeoman`
-- Remove the upstream link line (`- Upstream project: https://github.com/HKUDS/yeoman`)
+- Remove the upstream link line (`- Upstream project: https://github.com/HKUDS/nanobot`)
 
 **Step 3: Rewrite UPSTREAM.md to minimal acknowledgment**
 
 ```markdown
 # Project Origin
 
-This project was originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman).
+This project was originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot).
 The codebase has since been substantially rewritten. MIT license preserved.
 ```
 

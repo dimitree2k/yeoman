@@ -40,15 +40,17 @@ The runtime CLAUDE.md (`~/.yeoman/CLAUDE.md`) documents the full layout, git tra
 ## Architecture
 
 ```
-Channel → Manager → Bus/Queue → Orchestrator
-  → Policy Engine (decision) → Security Engine (validation)
-  → LLM Responder (LiteLLM) → Tool Execution → Memory Capture
-  → Channel → User
+Channel → Bus (inbound) → 13-stage Middleware Pipeline → OrchestratorIntent[]
+  01 Normalize → 02 Dedup → 03 Archive → 04 Context → 05 Admin
+  → 06 Policy → 07 Idea Capture → 08 Access Control → 09 New Chat
+  → 10 No-Reply → 11 Security → 12 LLM Response → 13 Outbound
+Intent dispatch → Bus (outbound/reaction) → Channel → User
 ```
 
 **Hexagonal / Ports & Adapters**: `core/ports.py` defines `PolicyPort`, `ResponderPort`,
 `ReplyArchivePort`, `SecurityPort`. Adapters in `adapters/` implement them.
-Orchestrator emits `OrchestratorIntent` objects; channels react asynchronously.
+The pipeline emits `OrchestratorIntent` objects; channels react asynchronously.
+Media (ASR/TTS/vision) is cross-cutting: channels enrich inbound, responder synthesizes outbound.
 
 ## Module Map
 

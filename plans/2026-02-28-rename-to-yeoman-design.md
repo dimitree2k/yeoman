@@ -5,7 +5,7 @@
 
 ## Context
 
-This project was forked from HKUDS/yeoman. Since then, 85% of the codebase has been
+This project was forked from HKUDS/nanobot. Since then, 85% of the codebase has been
 rewritten or added new. Only ~15% of the current 27k lines trace back to the original.
 The project has its own identity and architecture. Time to rename.
 
@@ -22,7 +22,7 @@ The project has its own identity and architecture. Time to rename.
 | GitHub repo | `dimitree2k/yeoman` | `dimitree2k/yeoman` |
 
 Fork acknowledgment kept as a single line in README:
-> Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman). MIT license preserved.
+> Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
 
 ## Scope
 

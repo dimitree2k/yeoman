@@ -13,9 +13,9 @@
 
 ---
 
-**yeoman** is a lightweight, multi-channel AI assistant runtime with deterministic policy control, long-term memory, voice I/O, and tool sandboxing — ~18k lines of Python.
+**yeoman** is a lightweight, multi-channel AI assistant runtime with deterministic policy control, long-term memory, voice I/O, and tool sandboxing.
 
-> Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman). MIT license preserved.
+> Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
 
 ## Highlights
 
@@ -31,13 +31,14 @@
 ## Architecture
 
 ```
-Channel → Manager → Bus/Queue → Orchestrator
-  → Policy (decision) → Security (validation)
-  → LLM Responder → Tool Execution → Memory Capture
-  → Channel → User
+Channel → Bus (inbound) → 13-stage Middleware Pipeline → OrchestratorIntent[]
+  01 Normalize → 02 Dedup → 03 Archive → 04 Context → 05 Admin
+  → 06 Policy → 07 Idea Capture → 08 Access Control → 09 New Chat
+  → 10 No-Reply → 11 Security → 12 LLM Response → 13 Outbound
+Intent dispatch → Bus (outbound/reaction) → Channel → User
 ```
 
-Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`, `ResponderPort`, `ReplyArchivePort`, `SecurityPort`, `TelemetryPort`); adapters implement them. Orchestrator emits typed `OrchestratorIntent` objects; channels react asynchronously.
+Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`, `ResponderPort`, `ReplyArchivePort`, `SecurityPort`, `TelemetryPort`); adapters implement them. The pipeline emits typed `OrchestratorIntent` objects; channels react asynchronously. Media (ASR/TTS/vision) is cross-cutting — channels enrich inbound, the responder synthesizes outbound.
 
 <p align="center">
   <img src="yeoman_arch.svg" alt="architecture" width="900">
@@ -276,15 +277,15 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ### v0.2.0 — Feb 2026
 
-- Renamed project from yeoman-stack to yeoman
-- Runtime directory migrated from `~/.yeoman` to `~/.yeoman` (auto-migrated on first run)
+- Renamed project from nanobotstack to yeoman
+- Runtime directory migrated from `~/.nanobot` to `~/.yeoman` (auto-migrated on first run)
 
 ### v0.1.3 — Feb 2026
 
 #### Policy Engine
 - Deterministic per-channel, per-chat access control with hot-reload
 - Admin commands via `/policy` namespace (WhatsApp owner DM)
-- `yeoman policy explain` for debugging reply decisions
+- `nanobot policy explain` for debugging reply decisions
 - Blocked senders, talkative cooldown for groups
 - Emergency `/panic` shutdown command
 - Scoped file access grants with blocked paths/patterns override
@@ -343,4 +344,4 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ---
 
-<sub>MIT License · Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman)</sub>
+<sub>MIT License · Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot)</sub>
