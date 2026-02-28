@@ -1,17 +1,17 @@
 # WhatsApp Message Lifecycle and Memory (Current Runtime)
 
-This document describes what happens, step by step, for WhatsApp group and DM messages in the current nanobot runtime.
+This document describes what happens, step by step, for WhatsApp group and DM messages in the current yeoman runtime.
 
 ## 1. Runtime Components Involved
 
 - Bridge (Node.js): `bridge/src/server.ts`, `bridge/src/whatsapp.ts`
-- Python WhatsApp channel: `nanobot/channels/whatsapp.py`
-- Message bus: `nanobot/bus/queue.py`
-- Orchestrator/policy/security: `nanobot/core/orchestrator.py`, `nanobot/adapters/policy_engine.py`, `nanobot/policy/engine.py`, `nanobot/security/engine.py`
-- Responder + prompt assembly: `nanobot/adapters/responder_llm.py`, `nanobot/agent/context.py`
-- Session history: `nanobot/session/manager.py`
-- Long-term memory: `nanobot/memory/service.py`, `nanobot/memory/store.py`, `nanobot/memory/extractor.py`
-- Reply-context archive: `nanobot/storage/inbound_archive.py`
+- Python WhatsApp channel: `yeoman/channels/whatsapp.py`
+- Message bus: `yeoman/bus/queue.py`
+- Orchestrator/policy/security: `yeoman/core/orchestrator.py`, `yeoman/adapters/policy_engine.py`, `yeoman/policy/engine.py`, `yeoman/security/engine.py`
+- Responder + prompt assembly: `yeoman/adapters/responder_llm.py`, `yeoman/agent/context.py`
+- Session history: `yeoman/session/manager.py`
+- Long-term memory: `yeoman/memory/service.py`, `yeoman/memory/store.py`, `yeoman/memory/extractor.py`
+- Reply-context archive: `yeoman/storage/inbound_archive.py`
 
 ## 2. Inbound Flow (Message You Send in WhatsApp)
 
@@ -31,7 +31,7 @@ This document describes what happens, step by step, for WhatsApp group and DM me
 8. Optional media enrichment runs:
    - image description can be added to text
    - voice is currently converted to a placeholder text for assistant input
-9. Message is archived to reply-context DB (`~/.nanobot/inbound/reply_context.db`).
+9. Message is archived to reply-context DB (`~/.yeoman/inbound/reply_context.db`).
 10. Debounce logic may merge rapid messages from same sender/chat into one event.
 11. Final event is published to message bus as `InboundMessage`.
 
@@ -39,7 +39,7 @@ This document describes what happens, step by step, for WhatsApp group and DM me
 
 `is_group` is inferred from JID suffix (`@g.us`).
 
-Policy defaults for WhatsApp (`nanobot/policy/schema.py`):
+Policy defaults for WhatsApp (`yeoman/policy/schema.py`):
 - `whenToReply=mention_only`
 
 Effective behavior:
@@ -79,7 +79,7 @@ For each turn, responder builds prompt with:
    - style persistence guardrail (prevents persistent user-injected catchphrases)
    - channel persona override text (if policy provides `personaFile`)
    - bootstrap files from workspace (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md`)
-2. Last session history messages (up to 50 messages) from `~/.nanobot/sessions/*.jsonl`.
+2. Last session history messages (up to 50 messages) from `~/.yeoman/sessions/*.jsonl`.
 3. Retrieved long-term memory block (if hits found).
 4. Current user message + reply context block.
 
@@ -99,21 +99,21 @@ Important: personas are not “remembered” by chat history. They are reloaded 
 
 ### 7.1 Short-Term Conversation Memory (Session History)
 
-- Location: `~/.nanobot/sessions/<channel>_<chat>.jsonl`
+- Location: `~/.yeoman/sessions/<channel>_<chat>.jsonl`
 - Written every successful turn (user + assistant)
 - Used directly as recent chat history in prompt
 - This is the biggest source of short-term style drift/catchphrase persistence
 
 ### 7.2 Reply Context Archive
 
-- Location: `~/.nanobot/inbound/reply_context.db`
+- Location: `~/.yeoman/inbound/reply_context.db`
 - Stores inbound message text keyed by `(channel, chat_id, message_id)`
 - Used to resolve quoted/reply context
 - Retention purge default: 30 days
 
 ### 7.3 Long-Term Semantic Memory (Active `memory`)
 
-- Location default: `~/.nanobot/memory/memory.db`
+- Location default: `~/.yeoman/memory/memory.db`
 - Backend tables are named `memory2_*` for schema continuity, but this is the active memory system
 - Capture is asynchronous via queue/thread
 - Capture sources:
@@ -154,7 +154,7 @@ Retrieval:
 ## 8. Why a Bad Greeting Can Keep Reappearing
 
 Usually one (or more) of these:
-1. It is still in recent session history (`~/.nanobot/sessions/...jsonl`).
+1. It is still in recent session history (`~/.yeoman/sessions/...jsonl`).
 2. It was captured as long-term memory and recalled.
 3. Persona text or policy still enforces/encourages it.
 4. Group conversation keeps re-seeding it in fresh turns.
@@ -163,21 +163,21 @@ Usually one (or more) of these:
 
 - Clear one chat short-term history: owner command `/reset` (also clears session WAL file for that session).
 - Inspect/search long-term memory:
-  - `nanobot memory status`
-  - `nanobot memory search --query "..." --scope all`
+  - `yeoman memory status`
+  - `yeoman memory search --query "..." --scope all`
 - Add corrective long-term fact manually:
-  - `nanobot memory add --kind preference --scope chat --channel whatsapp --chat-id <chat> --text "Do not use phrase X"`
+  - `yeoman memory add --kind preference --scope chat --channel whatsapp --chat-id <chat> --text "Do not use phrase X"`
 - Policy/persona-level control:
   - set/clear persona per group via `/policy ...` owner commands
-  - edit policy defaults in `~/.nanobot/policy.json`
+  - edit policy defaults in `~/.yeoman/policy.json`
 
-## 10. Files Under `~/.nanobot` Most Relevant to WhatsApp Message Handling
+## 10. Files Under `~/.yeoman` Most Relevant to WhatsApp Message Handling
 
-- `~/.nanobot/config.json` - runtime + model + memory config
-- `~/.nanobot/policy.json` - access/reply/tool/persona policy
-- `~/.nanobot/sessions/*.jsonl` - short-term chat history
-- `~/.nanobot/inbound/reply_context.db` - quoted-message lookup archive
-- `~/.nanobot/memory/memory.db` - long-term semantic memory DB
-- `~/.nanobot/whatsapp-auth/` - WhatsApp bridge auth/session credentials
-- `~/.nanobot/logs/whatsapp-bridge.log` - bridge log
-- `~/.nanobot/run/whatsapp-bridge.pid` - bridge PID
+- `~/.yeoman/config.json` - runtime + model + memory config
+- `~/.yeoman/policy.json` - access/reply/tool/persona policy
+- `~/.yeoman/sessions/*.jsonl` - short-term chat history
+- `~/.yeoman/inbound/reply_context.db` - quoted-message lookup archive
+- `~/.yeoman/memory/memory.db` - long-term semantic memory DB
+- `~/.yeoman/whatsapp-auth/` - WhatsApp bridge auth/session credentials
+- `~/.yeoman/logs/whatsapp-bridge.log` - bridge log
+- `~/.yeoman/run/whatsapp-bridge.pid` - bridge PID

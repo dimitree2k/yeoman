@@ -1,0 +1,152 @@
+"""Utility functions for yeoman."""
+
+import os
+from datetime import datetime
+from pathlib import Path
+
+
+def ensure_dir(path: Path) -> Path:
+    """Ensure a directory exists, creating it if necessary."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_data_path() -> Path:
+    """Get the yeoman data directory.
+
+    Respects YEOMAN_HOME (or legacy NANOBOT_HOME) environment variable;
+    falls back to ~/.yeoman. Migrates ~/.nanobot → ~/.yeoman on first run.
+    """
+    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+    if yeoman_home:
+        return ensure_dir(Path(yeoman_home))
+
+    # Legacy fallback
+    nanobot_home = os.environ.get("NANOBOT_HOME", "").strip()
+    if nanobot_home:
+        return ensure_dir(Path(nanobot_home))
+
+    new_dir = Path.home() / ".yeoman"
+    old_dir = Path.home() / ".nanobot"
+
+    if not new_dir.exists() and old_dir.exists():
+        import shutil
+        print(f"Migrating runtime directory: {old_dir} → {new_dir}")
+        shutil.move(str(old_dir), str(new_dir))
+
+    return ensure_dir(new_dir)
+
+
+def get_var_path() -> Path:
+    """Get the ephemeral state directory (~/.yeoman/var)."""
+    return ensure_dir(get_data_path() / "var")
+
+
+def get_secrets_path() -> Path:
+    """Get the secrets directory (~/.yeoman/secrets), chmod 0700."""
+    path = ensure_dir(get_data_path() / "secrets")
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def get_operational_data_path() -> Path:
+    """Get the long-lived operational data directory (~/.yeoman/data)."""
+    return ensure_dir(get_data_path() / "data")
+
+
+def get_logs_path() -> Path:
+    """Get the logs directory (~/.yeoman/var/logs)."""
+    return ensure_dir(get_var_path() / "logs")
+
+
+def get_run_path() -> Path:
+    """Get the PID/socket run directory (~/.yeoman/var/run)."""
+    return ensure_dir(get_var_path() / "run")
+
+
+def get_cache_path() -> Path:
+    """Get the cache directory (~/.yeoman/var/cache)."""
+    return ensure_dir(get_var_path() / "cache")
+
+
+def get_workspace_path(workspace: str | None = None) -> Path:
+    """Get the workspace path.
+
+    Args:
+        workspace: Optional workspace path. Defaults to ~/.yeoman/workspace.
+
+    Returns:
+        Expanded and ensured workspace path.
+    """
+    base = get_data_path()
+    if workspace:
+        candidate = Path(workspace).expanduser()
+        path = candidate if candidate.is_absolute() else base / candidate
+    else:
+        path = base / "workspace"
+    return ensure_dir(path)
+
+
+def get_sessions_path() -> Path:
+    """Get the session history directory (~/.yeoman/data/inbound)."""
+    return ensure_dir(get_operational_data_path() / "inbound")
+
+
+def get_memory_path(workspace: Path | None = None) -> Path:
+    """Get the memory directory.
+
+    When a workspace is provided, the memory sub-directory lives inside it
+    (for WAL session state). Otherwise returns the operational data memory dir.
+    """
+    if workspace is not None:
+        return ensure_dir(workspace / "memory")
+    return ensure_dir(get_operational_data_path() / "memory")
+
+
+def get_skills_path(workspace: Path | None = None) -> Path:
+    """Get the skills directory within the workspace."""
+    ws = workspace or get_workspace_path()
+    return ensure_dir(ws / "skills")
+
+
+def today_date() -> str:
+    """Get today's date in YYYY-MM-DD format."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def timestamp() -> str:
+    """Get current timestamp in ISO format."""
+    return datetime.now().isoformat()
+
+
+def truncate_string(s: str, max_len: int = 100, suffix: str = "...") -> str:
+    """Truncate a string to max length, adding suffix if truncated."""
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - len(suffix)] + suffix
+
+
+def safe_filename(name: str) -> str:
+    """Convert a string to a safe filename."""
+    unsafe = '<>:"/\\|?*'
+    for char in unsafe:
+        name = name.replace(char, "_")
+    return name.strip()
+
+
+def parse_session_key(key: str) -> tuple[str, str]:
+    """Parse a session key into channel and chat_id.
+
+    Args:
+        key: Session key in format "channel:chat_id"
+
+    Returns:
+        Tuple of (channel, chat_id)
+    """
+    parts = key.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid session key: {key}")
+    return parts[0], parts[1]

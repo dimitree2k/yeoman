@@ -18,15 +18,15 @@ Two `InMemoryTelemetry` classes exist:
 
 | Location | Lines | Features |
 |----------|-------|----------|
-| `nanobot/adapters/telemetry.py` | 23 | Simple counter-only, debug logging |
-| `nanobot/telemetry/inmemory.py` | 65 | Full implementation (counters, gauges, histograms, timings) |
+| `yeoman/adapters/telemetry.py` | 23 | Simple counter-only, debug logging |
+| `yeoman/telemetry/inmemory.py` | 65 | Full implementation (counters, gauges, histograms, timings) |
 
 ### Usage
 
 ```bash
 # Current imports
-nanobot/app/bootstrap.py:from nanobot.adapters.telemetry import InMemoryTelemetry
-nanobot/cli/commands.py:from nanobot.adapters.telemetry import InMemoryTelemetry
+yeoman/app/bootstrap.py:from yeoman.adapters.telemetry import InMemoryTelemetry
+yeoman/cli/commands.py:from yeoman.adapters.telemetry import InMemoryTelemetry
 ```
 
 ### Migration Plan
@@ -34,26 +34,26 @@ nanobot/cli/commands.py:from nanobot.adapters.telemetry import InMemoryTelemetry
 1. **Update imports** in `bootstrap.py` and `commands.py`:
    ```python
    # Change from:
-   from nanobot.adapters.telemetry import InMemoryTelemetry
+   from yeoman.adapters.telemetry import InMemoryTelemetry
    
    # Change to:
-   from nanobot.telemetry import InMemoryTelemetry
+   from yeoman.telemetry import InMemoryTelemetry
    ```
 
-2. **Deprecate** `nanobot/adapters/telemetry.py`:
+2. **Deprecate** `yeoman/adapters/telemetry.py`:
    - Add deprecation warning
    - Keep for backward compatibility for 1-2 releases
    - Re-export from new location
 
-3. **Remove** `nanobot/adapters/telemetry.py` after deprecation period
+3. **Remove** `yeoman/adapters/telemetry.py` after deprecation period
 
 ### Migration Code
 
 ```python
-# nanobot/adapters/telemetry.py (updated)
+# yeoman/adapters/telemetry.py (updated)
 """Simple structured telemetry sink for vNext intents.
 
-DEPRECATED: Use nanobot.telemetry.InMemoryTelemetry instead.
+DEPRECATED: Use yeoman.telemetry.InMemoryTelemetry instead.
 This module will be removed in a future release.
 """
 
@@ -61,11 +61,11 @@ from __future__ import annotations
 
 import warnings
 
-from nanobot.telemetry.inmemory import InMemoryTelemetry
+from yeoman.telemetry.inmemory import InMemoryTelemetry
 
 warnings.warn(
-    "nanobot.adapters.telemetry.InMemoryTelemetry is deprecated. "
-    "Use nanobot.telemetry.InMemoryTelemetry instead.",
+    "yeoman.adapters.telemetry.InMemoryTelemetry is deprecated. "
+    "Use yeoman.telemetry.InMemoryTelemetry instead.",
     DeprecationWarning,
     stacklevel=2,
 )
@@ -80,29 +80,29 @@ __all__ = ["InMemoryTelemetry"]
 The codebase already has robust data migrations:
 
 ### Chat Registry Migration
-**File**: `nanobot/storage/chat_registry.py`
+**File**: `yeoman/storage/chat_registry.py`
 
 | Migration | Description | Status |
 |-----------|-------------|--------|
-| `_migrate_legacy_default_path()` | Moves `~/.nanobot/inbound/chat_registry.db` to `~/.nanobot/data/inbound/` | ✅ Active |
+| `_migrate_legacy_default_path()` | Moves `~/.yeoman/inbound/chat_registry.db` to `~/.yeoman/data/inbound/` | ✅ Active |
 | `migrate_from_seen_chats()` | Converts legacy `seen_chats.json` to registry DB | ✅ Active |
 
 ### Session Migration
-**File**: `nanobot/utils/helpers.py`
+**File**: `yeoman/utils/helpers.py`
 
 | Migration | Description | Status |
 |-----------|-------------|--------|
-| Session directory migration | Moves `~/.nanobot/sessions/*.jsonl` to `~/.nanobot/data/sessions/` | ✅ Active |
+| Session directory migration | Moves `~/.yeoman/sessions/*.jsonl` to `~/.yeoman/data/sessions/` | ✅ Active |
 
 ### Persona Path Migration
-**File**: `nanobot/policy/persona.py`
+**File**: `yeoman/policy/persona.py`
 
 | Migration | Description | Status |
 |-----------|-------------|--------|
 | `_legacy_persona_relative()` | Maps old `memory/personas/*` paths to `personas/*` | ✅ Active |
 
 ### Config Migration
-**File**: `nanobot/config/loader.py`
+**File**: `yeoman/config/loader.py`
 
 | Migration | Description | Status |
 |-----------|-------------|--------|
@@ -120,8 +120,8 @@ Three message types exist:
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `InboundEvent` | `nanobot/core/models.py` | Orchestrator input (15 fields) |
-| `InboundMessage` | `nanobot/bus/events.py` | Bus transport |
+| `InboundEvent` | `yeoman/core/models.py` | Orchestrator input (15 fields) |
+| `InboundMessage` | `yeoman/bus/events.py` | Bus transport |
 | `InboundEvent` (bridge) | `bridge/src/protocol.ts` | WhatsApp bridge protocol (19 fields) |
 
 ### Migration Plan (From Original Plan)
@@ -180,9 +180,9 @@ The plan mentioned removing these files, but they **no longer exist**:
 ## 6. Implementation Checklist
 
 ```markdown
-[ ] Update imports in nanobot/app/bootstrap.py
-[ ] Update imports in nanobot/cli/commands.py
-[ ] Add deprecation warning to nanobot/adapters/telemetry.py
+[ ] Update imports in yeoman/app/bootstrap.py
+[ ] Update imports in yeoman/cli/commands.py
+[ ] Add deprecation warning to yeoman/adapters/telemetry.py
 [ ] Run tests to verify no breakage
 [ ] Document change in CHANGELOG
 ```

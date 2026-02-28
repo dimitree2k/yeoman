@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security issue in nanobot:
+If you discover a security issue in yeoman:
 
 1. Do not open a public issue.
 2. Open a private GitHub security advisory or contact maintainers directly.
@@ -15,12 +15,12 @@ Target initial response time: within 48 hours.
 
 ## Security Model (Current)
 
-nanobot uses a layered security model:
+yeoman uses a layered security model:
 
-1. Policy layer (`~/.nanobot/policy.json`)
+1. Policy layer (`~/.yeoman/policy.json`)
    - Controls who can talk, when the bot replies, and which tools can run.
    - Supports per-channel and per-chat overrides.
-2. Runtime security middleware (`security.*` in `~/.nanobot/config.json`)
+2. Runtime security middleware (`security.*` in `~/.yeoman/config.json`)
    - Staged checks for input, tool calls, and optional output sanitization.
 3. Tool guardrails
    - `exec` has deny-pattern filters, timeout, output truncation, and optional sandbox isolation.
@@ -32,14 +32,14 @@ nanobot uses a layered security model:
 Critical rules:
 
 - Never commit API keys or bridge tokens.
-- Assume `~/.nanobot/config.json` contains sensitive material.
+- Assume `~/.yeoman/config.json` contains sensitive material.
 
 Recommended permissions:
 
 ```bash
-chmod 700 ~/.nanobot
-chmod 600 ~/.nanobot/config.json
-chmod 700 ~/.nanobot/whatsapp-auth
+chmod 700 ~/.yeoman
+chmod 600 ~/.yeoman/config.json
+chmod 700 ~/.yeoman/whatsapp-auth
 ```
 
 Notes:
@@ -51,7 +51,7 @@ Notes:
 ## Access Control (Policy, Not `allowFrom`)
 
 `channels.*.allowFrom` has been removed from `config.json`.
-Access control now lives in `~/.nanobot/policy.json`.
+Access control now lives in `~/.yeoman/policy.json`.
 
 Key controls:
 
@@ -88,8 +88,8 @@ Example:
 Legacy migration:
 
 ```bash
-nanobot policy migrate-allowfrom --dry-run
-nanobot policy migrate-allowfrom
+yeoman policy migrate-allowfrom --dry-run
+yeoman policy migrate-allowfrom
 ```
 
 ## Admin Command Security
@@ -105,8 +105,8 @@ Built-in protections:
 - Admin command rate limiting (`runtime.adminCommandRateLimitPerMinute`, default `30`/minute)
 - Optional confirm gate for risky commands (`runtime.adminRequireConfirmForRisky`)
 - Policy mutation backups + append-only audit log under:
-  - `~/.nanobot/policy/audit/policy_changes.jsonl`
-  - `~/.nanobot/policy/audit/backups/`
+  - `~/.yeoman/policy/audit/policy_changes.jsonl`
+  - `~/.yeoman/policy/audit/backups/`
 
 ## Tool and Execution Security
 
@@ -123,7 +123,7 @@ Recommended for production:
 
 - Enable `tools.exec.isolation.enabled=true`
 - Keep `tools.exec.isolation.failClosed=true`
-- Keep mount allowlist outside repo (default `~/.config/nanobot/mount-allowlist.json`)
+- Keep mount allowlist outside repo (default `~/.config/yeoman/mount-allowlist.json`)
 
 ### File tools
 
@@ -135,7 +135,7 @@ Recommended for production:
 
 - External provider calls use HTTPS endpoints.
 - WhatsApp bridge defaults to local binding (`127.0.0.1:3001`) with token authentication.
-- Keep bridge auth state protected in `~/.nanobot/whatsapp-auth` (mode `0700`).
+- Keep bridge auth state protected in `~/.yeoman/whatsapp-auth` (mode `0700`).
 
 If you expose bridge or gateway outside localhost:
 
@@ -147,16 +147,16 @@ If you expose bridge or gateway outside localhost:
 
 Sensitive local data may exist in:
 
-- `~/.nanobot/config.json` (API keys/tokens)
-- `~/.nanobot/policy.json` (owner IDs, ACLs)
-- `~/.nanobot/sessions/*.jsonl` (conversation history)
-- `~/.nanobot/memory/memory.db` (long-term memory)
-- `~/.nanobot/inbound/reply_context.db` (message archive)
-- `~/.nanobot/logs/*` (runtime logs)
+- `~/.yeoman/config.json` (API keys/tokens)
+- `~/.yeoman/policy.json` (owner IDs, ACLs)
+- `~/.yeoman/sessions/*.jsonl` (conversation history)
+- `~/.yeoman/memory/memory.db` (long-term memory)
+- `~/.yeoman/inbound/reply_context.db` (message archive)
+- `~/.yeoman/logs/*` (runtime logs)
 
 Operational guidance:
 
-- Limit host access to the nanobot user.
+- Limit host access to the yeoman user.
 - Define retention/rotation policy for logs and memory databases.
 - Treat prompts and chat history as sensitive data.
 
@@ -195,8 +195,8 @@ Current limitations to account for:
 Before production deployment:
 
 - [ ] Run as non-root dedicated user
-- [ ] `~/.nanobot` permissions hardened (`700`)
-- [ ] `~/.nanobot/config.json` permissions hardened (`600`)
+- [ ] `~/.yeoman` permissions hardened (`700`)
+- [ ] `~/.yeoman/config.json` permissions hardened (`600`)
 - [ ] Owners and per-chat ACLs configured in `policy.json`
 - [ ] High-risk tools (`exec`, `spawn`) denied or tightly scoped
 - [ ] Exec isolation enabled and fail-closed
@@ -210,8 +210,8 @@ If compromise is suspected:
 
 1. Revoke and rotate API keys and bridge tokens immediately.
 2. Review runtime logs and policy audit history.
-3. Inspect `~/.nanobot/policy.json` for unauthorized ACL/persona/tool changes.
-4. Review `~/.nanobot/sessions/` and memory DB for prompt-injection persistence.
+3. Inspect `~/.yeoman/policy.json` for unauthorized ACL/persona/tool changes.
+4. Review `~/.yeoman/sessions/` and memory DB for prompt-injection persistence.
 5. Update dependencies and redeploy from a trusted baseline.
 6. Report confirmed vulnerabilities to maintainers.
 
@@ -223,7 +223,7 @@ Project references:
 
 - This repository advisories: `/security/advisories`
 - This repository releases: `/releases`
-- Upstream project: https://github.com/HKUDS/nanobot
+
 
 ## License
 

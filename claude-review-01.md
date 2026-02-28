@@ -2,7 +2,7 @@
 
 ## Context
 
-Evolve nanobot into a more secure, flexible, observable platform without losing current strengths (deterministic policy, security staging, bubblewrap sandbox, WhatsApp depth, media pipeline, memory system).
+Evolve yeoman into a more secure, flexible, observable platform without losing current strengths (deterministic policy, security staging, bubblewrap sandbox, WhatsApp depth, media pipeline, memory system).
 
 This revision incorporates source-level analysis of **both** codebases plus the Kilo Code critical review and your own inputs about hidden features, existing memory, and code quality priorities.
 
@@ -35,7 +35,7 @@ Verified by reading actual source at `~/Projects/spacebot`:
 | Feature | Spacebot Code Status | Nanobot Gap? |
 |---------|---------------------|--------------|
 | Channel/Branch/Worker process model | **Solid** (`src/agent/{channel,branch,worker}.rs`) | Gap, but current arch works |
-| Compactor (3-tier: 80/85/95%) | **Solid** (`src/agent/compactor.rs`, 350 LOC) | **Gap** — but nanobot uses short sessions + memory recall, so less urgent than assumed |
+| Compactor (3-tier: 80/85/95%) | **Solid** (`src/agent/compactor.rs`, 350 LOC) | **Gap** — but yeoman uses short sessions + memory recall, so less urgent than assumed |
 | Prometheus metrics (feature-gated) | **Solid** (`METRICS.md`, hooks) | **Gap** — InMemoryTelemetry only |
 | Control plane API (Axum, SSE) | **Solid** (`src/api/server.rs`, comprehensive) | **Gap** — CLI only |
 | MCP integration (rmcp crate) | **Solid** (`src/mcp.rs`, 638 LOC) | **Gap** — no MCP at all |
@@ -44,7 +44,7 @@ Verified by reading actual source at `~/Projects/spacebot`:
 | Memory bulletin (cortex phase 1) | **Partial** — bulletin loop works, rest is stubs | Gap — but low priority |
 | File ingestion pipeline | **Solid** (`src/agent/ingestion.rs`, 350 LOC) | Gap |
 | Message coalescing | **Solid** (channel-level debounce) | Partial — WA only |
-| User-scoped memory | **Design doc only**, zero code | **Already implemented in nanobot** |
+| User-scoped memory | **Design doc only**, zero code | **Already implemented in yeoman** |
 | Multi-agent graph | **Design doc only**, zero code | N/A — skip |
 | Prompt-level routing | **Design doc only** | N/A — skip |
 
@@ -83,23 +83,23 @@ Verified by reading actual source at `~/Projects/spacebot`:
 
 4. **Add docstrings** to undocumented public APIs — especially the media pipeline, which is sophisticated but hidden
 
-5. **Run full lint/type pass**: `ruff check nanobot/ && mypy nanobot/core nanobot/adapters` — fix all warnings
+5. **Run full lint/type pass**: `ruff check yeoman/ && mypy yeoman/core yeoman/adapters` — fix all warnings
 
 ### Phase 1: Proven Value — Observability + Reliability
 
-**1. Model Routing + Fallback Chains** (extends `nanobot/media/router.py`)
+**1. Model Routing + Fallback Chains** (extends `yeoman/media/router.py`)
 - **Why first**: Prevents manual recovery on provider outages. Enables cheaper models for background tasks. Infrastructure that later features depend on (compactor can use cheap models, MCP tools can use task-specific models).
 - **Steal from Spacebot**: `src/llm/routing.rs` — resolution hierarchy (task → process → fallback), rate limit cooldown with configurable seconds, per-task model override.
 - **Scope**: Extend `ModelRouter` (currently 64 LOC) with fallback list per profile and 429/5xx cooldown tracking.
-- **Files**: Update `nanobot/media/router.py`, `nanobot/config/schema.py`, `nanobot/providers/factory.py`
+- **Files**: Update `yeoman/media/router.py`, `yeoman/config/schema.py`, `yeoman/providers/factory.py`
 - **Success metric**: Zero failed requests during single-provider outage (measurable in logs today).
 
-**2. Prometheus Metrics** (replaces `nanobot/adapters/telemetry.py`)
+**2. Prometheus Metrics** (replaces `yeoman/adapters/telemetry.py`)
 - **Why**: Makes everything measurable. Current InMemoryTelemetry (24 LOC) is a noop sink.
 - **Steal from Spacebot**: `METRICS.md` (metric naming convention), `src/llm/pricing.rs` (cost estimation), feature-gate pattern.
 - **Scope**: Pluggable metrics backend behind TelemetryPort. Prometheus exporter + `/metrics` endpoint. Keep in-memory for tests/dev.
-- **Key metrics**: `nanobot_llm_requests_total`, `nanobot_llm_tokens_total`, `nanobot_llm_cost_dollars`, `nanobot_tool_calls_total`, `nanobot_llm_request_duration_seconds`
-- **Files**: New `nanobot/telemetry/prometheus.py`, update `nanobot/core/ports.py`, update `nanobot/adapters/telemetry.py`
+- **Key metrics**: `yeoman_llm_requests_total`, `yeoman_llm_tokens_total`, `yeoman_llm_cost_dollars`, `yeoman_tool_calls_total`, `yeoman_llm_request_duration_seconds`
+- **Files**: New `yeoman/telemetry/prometheus.py`, update `yeoman/core/ports.py`, update `yeoman/adapters/telemetry.py`
 - **Security**: `/metrics` endpoint bind to localhost only by default.
 - **Success metric**: Grafana dashboard showing P95 response time + cost per model.
 
@@ -107,16 +107,16 @@ Verified by reading actual source at `~/Projects/spacebot`:
 - **Why**: CLI-only limits operational agility. Start small.
 - **Scope**: FastAPI server, minimal endpoints: `/health`, `/status`, `/channels`, `/config/reload`, `/metrics` (Prometheus). SSE event stream deferred.
 - **Steal from Spacebot**: `src/api/server.rs` endpoint surface design, state sharing pattern.
-- **Files**: New `nanobot/api/server.py`, new `nanobot/api/routes/`, update `nanobot/app/bootstrap.py`
+- **Files**: New `yeoman/api/server.py`, new `yeoman/api/routes/`, update `yeoman/app/bootstrap.py`
 - **Security**: Token auth required from day one. Rate limiting on all endpoints. Audit logging for admin operations.
 - **Success metric**: `curl localhost:8080/health` returns 200.
 
 ### Phase 2: Ecosystem
 
-**4. Skill Installer** (extends `nanobot/agent/skills.py`)
+**4. Skill Installer** (extends `yeoman/agent/skills.py`)
 - **Why**: Current skill loading is local-only. GitHub install enables sharing.
 - **Steal from Spacebot**: `src/skills.rs` install workflow.
-- **Scope**: New `nanobot/skills/installer.py`, CLI subcommands `skill install/list/remove`.
+- **Scope**: New `yeoman/skills/installer.py`, CLI subcommands `skill install/list/remove`.
 - **Security**: Path traversal validation on archives. Content sandboxing.
 
 ### Phase 3: Intelligence (If Needed)
@@ -181,7 +181,7 @@ Verified by reading actual source at `~/Projects/spacebot`:
 | Model fallback | Zero failed requests during single-provider outage |
 | Prometheus metrics | Grafana dashboard shows P95 latency + cost/model |
 | Control plane API | `curl localhost:8080/health` returns 200 |
-| Code cleanup | `ruff check nanobot/` + `mypy nanobot/core nanobot/adapters` = 0 errors |
+| Code cleanup | `ruff check yeoman/` + `mypy yeoman/core yeoman/adapters` = 0 errors |
 | File decomposition | No file over 800 LOC in core modules |
 | Documentation | All public APIs have docstrings |
 
@@ -192,5 +192,5 @@ Verified by reading actual source at `~/Projects/spacebot`:
 For each implemented feature:
 - Unit tests matching current coverage patterns (`tests/test_*.py`)
 - Integration test with at least one real channel
-- No regression in `pytest tests/` + `ruff check nanobot/` + `mypy nanobot/core nanobot/adapters`
+- No regression in `pytest tests/` + `ruff check yeoman/` + `mypy yeoman/core yeoman/adapters`
 - Measured success metric achieved before marking complete

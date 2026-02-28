@@ -1051,7 +1051,7 @@ export class WhatsAppClient {
       version,
       logger,
       printQRInTerminal: false,
-      browser: ['nanobot', 'bridge', VERSION],
+      browser: ['yeoman', 'bridge', VERSION],
       syncFullHistory: false,
       markOnlineOnConnect: true,
     });

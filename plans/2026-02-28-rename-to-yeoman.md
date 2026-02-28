@@ -1,10 +1,10 @@
-# Rename nanobot to yeoman — Implementation Plan
+# Rename yeoman to yeoman — Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Rename the project from nanobot/nanobot-stack to yeoman across all source, config, docs, and assets.
+**Goal:** Rename the project from yeoman/yeoman to yeoman across all source, config, docs, and assets.
 
-**Architecture:** Mechanical bulk rename of the Python package directory and all imports, followed by targeted updates to path resolvers, config defaults, build metadata, bridge code, docs, and assets. A runtime migration helper auto-moves ~/.nanobot to ~/.yeoman on first run.
+**Architecture:** Mechanical bulk rename of the Python package directory and all imports, followed by targeted updates to path resolvers, config defaults, build metadata, bridge code, docs, and assets. A runtime migration helper auto-moves ~/.yeoman to ~/.yeoman on first run.
 
 **Tech Stack:** Python, TypeScript (bridge), shell scripts, pyproject.toml (hatch build system)
 
@@ -13,12 +13,12 @@
 ### Task 1: Rename the Python package directory
 
 **Files:**
-- Rename: `nanobot/` → `yeoman/`
+- Rename: `yeoman/` → `yeoman/`
 
 **Step 1: Rename the directory**
 
 ```bash
-git mv nanobot yeoman
+git mv yeoman yeoman
 ```
 
 **Step 2: Verify the directory was renamed**
@@ -29,7 +29,7 @@ Expected: file exists
 **Step 3: Commit**
 
 ```bash
-git add -A && git commit -m "refactor: rename nanobot/ package directory to yeoman/"
+git add -A && git commit -m "refactor: rename yeoman/ package directory to yeoman/"
 ```
 
 ---
@@ -40,26 +40,26 @@ git add -A && git commit -m "refactor: rename nanobot/ package directory to yeom
 - Modify: all 136 `.py` files under `yeoman/`
 - Modify: all 23 test files under `tests/`
 
-**Step 1: Replace all `nanobot.` imports in source and tests**
+**Step 1: Replace all `yeoman.` imports in source and tests**
 
 ```bash
-find yeoman tests -name "*.py" -exec sed -i 's/\bfrom nanobot\b/from yeoman/g; s/\bimport nanobot\b/import yeoman/g; s/"nanobot\./"yeoman./g; s/'\''nanobot\./'\''yeoman./g' {} +
+find yeoman tests -name "*.py" -exec sed -i 's/\bfrom yeoman\b/from yeoman/g; s/\bimport yeoman\b/import yeoman/g; s/"yeoman\./"yeoman./g; s/'\''yeoman\./'\''yeoman./g' {} +
 ```
 
-**Step 2: Verify no `nanobot` imports remain**
+**Step 2: Verify no `yeoman` imports remain**
 
-Run: `grep -r "from nanobot\.\|import nanobot\." yeoman/ tests/`
+Run: `grep -r "from yeoman\.\|import yeoman\." yeoman/ tests/`
 Expected: no output
 
-**Step 3: Check for string references to `nanobot.` module paths (e.g. in mypy overrides, logging)**
+**Step 3: Check for string references to `yeoman.` module paths (e.g. in mypy overrides, logging)**
 
-Run: `grep -rn "nanobot\." yeoman/ tests/ --include="*.py" | grep -v __pycache__`
+Run: `grep -rn "yeoman\." yeoman/ tests/ --include="*.py" | grep -v __pycache__`
 Fix any remaining references manually.
 
 **Step 4: Commit**
 
 ```bash
-git add -A && git commit -m "refactor: update all Python imports from nanobot to yeoman"
+git add -A && git commit -m "refactor: update all Python imports from yeoman to yeoman"
 ```
 
 ---
@@ -74,19 +74,19 @@ git add -A && git commit -m "refactor: update all Python imports from nanobot to
 Apply these changes to `pyproject.toml`:
 
 ```
-Line 2:  name = "nanobot-stack"          → name = "yeoman"
+Line 2:  name = "yeoman"          → name = "yeoman"
 Line 4:  description = "...(fork of...)" → description = "Policy-first personal AI assistant runtime"
-Line 8:  {name = "nanobot contributors"} → {name = "yeoman contributors"}
-Line 44: nanobot = "nanobot.cli..."       → yeoman = "yeoman.cli.commands:app"
-Line 45: nanobot-stack = "nanobot.cli..." → DELETE this line
-Line 52: packages = ["nanobot"]           → packages = ["yeoman"]
-Line 55: "nanobot" = "nanobot"            → "yeoman" = "yeoman"
-Line 60: "nanobot/**/*.py"               → "yeoman/**/*.py"
-Line 61: "nanobot/skills/**/*.md"        → "yeoman/skills/**/*.md"
-Line 62: "nanobot/skills/**/*.sh"        → "yeoman/skills/**/*.sh"
-Line 67: "nanobot/"                      → "yeoman/"
-Line 74: "nanobot/bridge"               → "yeoman/bridge"
-Line 91: ["nanobot.core.*", ...]         → ["yeoman.core.*", "yeoman.adapters.*", "yeoman.app.*"]
+Line 8:  {name = "yeoman contributors"} → {name = "yeoman contributors"}
+Line 44: yeoman = "yeoman.cli..."       → yeoman = "yeoman.cli.commands:app"
+Line 45: yeoman = "yeoman.cli..." → DELETE this line
+Line 52: packages = ["yeoman"]           → packages = ["yeoman"]
+Line 55: "yeoman" = "yeoman"            → "yeoman" = "yeoman"
+Line 60: "yeoman/**/*.py"               → "yeoman/**/*.py"
+Line 61: "yeoman/skills/**/*.md"        → "yeoman/skills/**/*.md"
+Line 62: "yeoman/skills/**/*.sh"        → "yeoman/skills/**/*.sh"
+Line 67: "yeoman/"                      → "yeoman/"
+Line 74: "yeoman/bridge"               → "yeoman/bridge"
+Line 91: ["yeoman.core.*", ...]         → ["yeoman.core.*", "yeoman.adapters.*", "yeoman.app.*"]
 ```
 
 **Step 2: Verify toml is valid**
@@ -125,7 +125,7 @@ Note: bump version to 0.2.0 to mark the rename.
 Change line 9:
 ```python
 # Old:
-load_dotenv(os.path.expanduser("~/.nanobot/.env"), override=False)
+load_dotenv(os.path.expanduser("~/.yeoman/.env"), override=False)
 # New:
 load_dotenv(os.path.expanduser("~/.yeoman/.env"), override=False)
 ```
@@ -152,7 +152,7 @@ def get_data_path() -> Path:
     """Get the yeoman data directory.
 
     Respects YEOMAN_HOME (or legacy NANOBOT_HOME) environment variable;
-    falls back to ~/.yeoman. Migrates ~/.nanobot → ~/.yeoman on first run.
+    falls back to ~/.yeoman. Migrates ~/.yeoman → ~/.yeoman on first run.
     """
     yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
     if yeoman_home:
@@ -164,7 +164,7 @@ def get_data_path() -> Path:
         return ensure_dir(Path(nanobot_home))
 
     new_dir = Path.home() / ".yeoman"
-    old_dir = Path.home() / ".nanobot"
+    old_dir = Path.home() / ".yeoman"
 
     if not new_dir.exists() and old_dir.exists():
         import shutil
@@ -176,14 +176,14 @@ def get_data_path() -> Path:
 
 **Step 2: Update all docstrings in the same file**
 
-Replace `~/.nanobot` with `~/.yeoman` and `NANOBOT_HOME` with `YEOMAN_HOME` in all
+Replace `~/.yeoman` with `~/.yeoman` and `NANOBOT_HOME` with `YEOMAN_HOME` in all
 docstrings for `get_var_path`, `get_logs_path`, `get_run_path`, `get_cache_path`,
 `get_operational_data_path`, `get_secrets_path`.
 
 **Step 3: Commit**
 
 ```bash
-git add yeoman/utils/helpers.py && git commit -m "feat: update path resolver for yeoman with nanobot migration fallback"
+git add yeoman/utils/helpers.py && git commit -m "feat: update path resolver for yeoman with yeoman migration fallback"
 ```
 
 ---
@@ -196,8 +196,8 @@ git add yeoman/utils/helpers.py && git commit -m "feat: update path resolver for
 
 **Step 1: Update `loader.py`**
 
-- Line 24 docstring: `nanobot` → `yeoman`
-- Line 30 docstring: `~/.nanobot/.env` → `~/.yeoman/.env`, `$NANOBOT_HOME` → `$YEOMAN_HOME`
+- Line 24 docstring: `yeoman` → `yeoman`
+- Line 30 docstring: `~/.yeoman/.env` → `~/.yeoman/.env`, `$NANOBOT_HOME` → `$YEOMAN_HOME`
 - Lines 35-36: Update env var and path:
   ```python
   yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
@@ -205,14 +205,14 @@ git add yeoman/utils/helpers.py && git commit -m "feat: update path resolver for
       yeoman_home = os.environ.get("NANOBOT_HOME", "").strip()
   base = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
   ```
-- Line 107 docstring: `~/.nanobot/.env` → `~/.yeoman/.env`
+- Line 107 docstring: `~/.yeoman/.env` → `~/.yeoman/.env`
 
 **Step 2: Update `schema.py` defaults**
 
 - Line 111: `auth_dir: str = "~/.yeoman/secrets/whatsapp-auth"`
 - Line 199: `workspace: str = "~/.yeoman/workspace"`
 - Line 393: `allowlist_path: str = "~/.config/yeoman/mount-allowlist.json"`
-- Line 439 docstring: `nanobot` → `yeoman`
+- Line 439 docstring: `yeoman` → `yeoman`
 
 **Step 3: Commit**
 
@@ -242,7 +242,7 @@ console.log('yeoman WhatsApp Bridge');
 **Step 2: Commit**
 
 ```bash
-git add bridge/src/index.ts && git commit -m "refactor: update bridge paths from .nanobot to .yeoman"
+git add bridge/src/index.ts && git commit -m "refactor: update bridge paths from .yeoman to .yeoman"
 ```
 
 ---
@@ -252,15 +252,15 @@ git add bridge/src/index.ts && git commit -m "refactor: update bridge paths from
 **Files:**
 - Modify: `core_agent_lines.sh`
 
-**Step 1: Replace all `nanobot` references with `yeoman`**
+**Step 1: Replace all `yeoman` references with `yeoman`**
 
 ```bash
-sed -i 's/nanobot/yeoman/g' core_agent_lines.sh
+sed -i 's/yeoman/yeoman/g' core_agent_lines.sh
 ```
 
 **Step 2: Verify**
 
-Run: `grep nanobot core_agent_lines.sh`
+Run: `grep yeoman core_agent_lines.sh`
 Expected: no output
 
 **Step 3: Commit**
@@ -297,16 +297,16 @@ git add -A && git commit -m "refactor: rename image assets to yeoman"
 **Files:**
 - Modify: `README.md` (~54 occurrences)
 
-**Step 1: Bulk replace `nanobot` references**
+**Step 1: Bulk replace `yeoman` references**
 
-- Replace `nanobot-stack` → `yeoman` (project name)
+- Replace `yeoman` → `yeoman` (project name)
 - Replace `nanobot_logo.png` → `yeoman_logo.png`
 - Replace `nanobot_arch.svg` → `yeoman_arch.svg`
-- Replace `nanobot` CLI command references → `yeoman`
-- Replace `~/.nanobot` → `~/.yeoman`
+- Replace `yeoman` CLI command references → `yeoman`
+- Replace `~/.yeoman` → `~/.yeoman`
 - Replace the fork notice (line 18) with:
   ```
-  > Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
+  > Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman). MIT license preserved.
   ```
 - Remove references to `UPSTREAM.md` (it will be trimmed)
 - Remove the footer fork attribution (line ~351)
@@ -332,25 +332,25 @@ git add README.md && git commit -m "docs: update README for yeoman rename"
 **Step 1: Update CLAUDE.md**
 
 Bulk replace:
-- `nanobot` → `yeoman` in module paths, commands, directory references
-- `~/.nanobot` → `~/.yeoman`
-- `nanobot-stack` → `yeoman`
+- `yeoman` → `yeoman` in module paths, commands, directory references
+- `~/.yeoman` → `~/.yeoman`
+- `yeoman` → `yeoman`
 - Update the header line to: `Lightweight, policy-first personal AI assistant runtime (~18k core lines).`
-- Remove: `Independent fork of HKUDS/nanobot. MIT license.`
+- Remove: `Independent fork of HKUDS/yeoman. MIT license.`
 
 **Step 2: Update SECURITY.md**
 
 Bulk replace:
-- `nanobot` → `yeoman` throughout
-- `~/.nanobot` → `~/.yeoman`
-- Remove the upstream link line (`- Upstream project: https://github.com/HKUDS/nanobot`)
+- `yeoman` → `yeoman` throughout
+- `~/.yeoman` → `~/.yeoman`
+- Remove the upstream link line (`- Upstream project: https://github.com/HKUDS/yeoman`)
 
 **Step 3: Rewrite UPSTREAM.md to minimal acknowledgment**
 
 ```markdown
 # Project Origin
 
-This project was originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot).
+This project was originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman).
 The codebase has since been substantially rewritten. MIT license preserved.
 ```
 
@@ -374,13 +374,13 @@ git commit -m "docs: update CLAUDE.md, SECURITY.md, UPSTREAM.md for yeoman renam
 **Step 1: Bulk replace in planning docs**
 
 ```bash
-find plans/ -name "*.md" -exec sed -i 's/nanobot-stack/yeoman/g; s/~\/.nanobot/~\/.yeoman/g; s/nanobot/yeoman/g' {} +
+find plans/ -name "*.md" -exec sed -i 's/yeoman/yeoman/g; s/~\/.yeoman/~\/.yeoman/g; s/yeoman/yeoman/g' {} +
 ```
 
 **Step 2: Update skill docs**
 
 ```bash
-find yeoman/skills/ -name "*.md" -exec sed -i 's/nanobot/yeoman/g' {} +
+find yeoman/skills/ -name "*.md" -exec sed -i 's/yeoman/yeoman/g' {} +
 ```
 
 **Step 3: Commit**
@@ -401,7 +401,7 @@ git commit -m "docs: update planning and skill docs for yeoman rename"
 
 ```
 # Old:
-Copyright (c) 2025 nanobot contributors
+Copyright (c) 2025 yeoman contributors
 # New:
 Copyright (c) 2025 yeoman contributors
 ```
@@ -416,10 +416,10 @@ git add LICENSE && git commit -m "docs: update LICENSE copyright to yeoman contr
 
 ### Task 14: Catch any remaining references
 
-**Step 1: Search for any remaining `nanobot` references**
+**Step 1: Search for any remaining `yeoman` references**
 
 ```bash
-grep -rn "nanobot" --include="*.py" --include="*.toml" --include="*.md" --include="*.ts" --include="*.sh" --include="*.json" . | grep -v __pycache__ | grep -v .git/ | grep -v uv.lock | grep -v node_modules
+grep -rn "yeoman" --include="*.py" --include="*.toml" --include="*.md" --include="*.ts" --include="*.sh" --include="*.json" . | grep -v __pycache__ | grep -v .git/ | grep -v uv.lock | grep -v node_modules
 ```
 
 **Step 2: Fix any remaining references found**
@@ -429,7 +429,7 @@ Each should be evaluated — some may be legitimate (e.g. the fork acknowledgmen
 **Step 3: Commit if changes were made**
 
 ```bash
-git add -A && git commit -m "refactor: fix remaining nanobot references"
+git add -A && git commit -m "refactor: fix remaining yeoman references"
 ```
 
 ---
@@ -464,9 +464,9 @@ Expected: clean or only pre-existing issues
 ### Task 16: Update Claude memory files
 
 **Files:**
-- Modify: `/home/dm/.claude/projects/-home-dm-Documents-nanobot/memory/MEMORY.md`
+- Modify: `/home/dm/.claude/projects/-home-dm-Documents-yeoman/memory/MEMORY.md`
 
-**Step 1: Update all `nanobot` references to `yeoman`**
+**Step 1: Update all `yeoman` references to `yeoman`**
 
 Update the memory file to reflect the new project name, paths, and commands.
 

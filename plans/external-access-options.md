@@ -1,8 +1,8 @@
-# External Access Options for nanobot-stack
+# External Access Options for yeoman
 
 ## Overview
 
-Your nanobot-stack project consists of:
+Your yeoman project consists of:
 - **Gateway Service**: Listens on port `18790` (configurable via `config.json`)
 - **WhatsApp Bridge**: Listens on port `3001` (default, only accepts loopback connections)
 - **Chat Channels**: Telegram, Discord, WhatsApp, Feishu
@@ -14,7 +14,7 @@ flowchart TB
     subgraph Home_Network
         GW[Gateway Service<br/>Port: 18790]
         WB[WhatsApp Bridge<br/>Port: 3001<br/>Loopback Only]
-        NB[nanobot-stack Core]
+        NB[yeoman Core]
         
         GW --> NB
         WB --> GW
@@ -113,7 +113,7 @@ Use Cloudflare Tunnel to create a secure, outbound-only connection to Cloudflare
 
 3. Create tunnel:
    ```bash
-   cloudflared tunnel create nanobot-tunnel
+   cloudflared tunnel create yeoman-tunnel
    ```
 
 4. Configure tunnel (`~/.cloudflared/config.yml`):
@@ -122,7 +122,7 @@ Use Cloudflare Tunnel to create a secure, outbound-only connection to Cloudflare
    credentials-file: /home/user/.cloudflared/<tunnel-id>.json
 
    ingress:
-     - hostname: nanobot.yourdomain.com
+     - hostname: yeoman.yourdomain.com
        service: http://localhost:18790
      - service: http_status:404
    ```
@@ -134,7 +134,7 @@ Use Cloudflare Tunnel to create a secure, outbound-only connection to Cloudflare
    sudo systemctl enable cloudflared
    ```
 
-6. Access via: `https://nanobot.yourdomain.com`
+6. Access via: `https://yeoman.yourdomain.com`
 
 ---
 
@@ -366,7 +366,7 @@ Set up a reverse proxy with SSL termination in front of your gateway.
 
 2. Configure Caddy (`/etc/caddy/Caddyfile`):
    ```
-   nanobot.yourdomain.com {
+   yeoman.yourdomain.com {
        reverse_proxy localhost:18790
    }
    ```
@@ -376,7 +376,7 @@ Set up a reverse proxy with SSL termination in front of your gateway.
    sudo systemctl restart caddy
    ```
 
-4. Access via: `https://nanobot.yourdomain.com`
+4. Access via: `https://yeoman.yourdomain.com`
 
 ### Implementation with Nginx (More Control)
 
@@ -385,11 +385,11 @@ Set up a reverse proxy with SSL termination in front of your gateway.
    sudo apt install nginx certbot python3-certbot-nginx
    ```
 
-2. Configure Nginx (`/etc/nginx/sites-available/nanobot`):
+2. Configure Nginx (`/etc/nginx/sites-available/yeoman`):
    ```nginx
    server {
        listen 80;
-       server_name nanobot.yourdomain.com;
+       server_name yeoman.yourdomain.com;
        
        location / {
            proxy_pass http://localhost:18790;
@@ -406,10 +406,10 @@ Set up a reverse proxy with SSL termination in front of your gateway.
 
 3. Enable and get SSL:
    ```bash
-   sudo ln -s /etc/nginx/sites-available/nanobot /etc/nginx/sites-enabled/
+   sudo ln -s /etc/nginx/sites-available/yeoman /etc/nginx/sites-enabled/
    sudo nginx -t
    sudo systemctl reload nginx
-   sudo certbot --nginx -d nanobot.yourdomain.com
+   sudo certbot --nginx -d yeoman.yourdomain.com
    ```
 
 ---
@@ -424,7 +424,7 @@ flowchart TB
     
     subgraph Cloud
         VPS[VPS/Cloud Server]
-        Docker[Docker Container<br/>nanobot-stack]
+        Docker[Docker Container<br/>yeoman]
     end
     
     Client[Internet Client] --> VPS
@@ -433,7 +433,7 @@ flowchart TB
 ```
 
 ### Description
-Deploy nanobot-stack to a VPS or cloud service with a public IP.
+Deploy yeoman to a VPS or cloud service with a public IP.
 
 ### Pros
 - Always available
@@ -455,19 +455,19 @@ Deploy nanobot-stack to a VPS or cloud service with a public IP.
    - Hetzner (~€4/month)
    - AWS Lightsail ($5/month)
 
-2. Deploy nanobot-stack:
+2. Deploy yeoman:
    ```bash
    # SSH into VPS
    ssh user@your-vps-ip
    
    # Clone and install
-   git clone https://github.com/dimitree2k/nanobot-stack.git
-   cd nanobot-stack
+   git clone https://github.com/dimitree2k/yeoman.git
+   cd yeoman
    pip install -e .
    
    # Or use Docker
-   docker build -t nanobot .
-   docker run -d -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
+   docker build -t yeoman .
+   docker run -d -v ~/.yeoman:/root/.yeoman -p 18790:18790 yeoman gateway
    ```
 
 3. Configure firewall:
@@ -484,7 +484,7 @@ Deploy nanobot-stack to a VPS or cloud service with a public IP.
 ## Option 5: Use Existing Chat Platforms (No Network Changes Required!)
 
 ### Description
-Leverage nanobot-stack's built-in chat platform integrations which don't require exposing ports.
+Leverage yeoman's built-in chat platform integrations which don't require exposing ports.
 
 ### Platform Options
 
@@ -511,7 +511,7 @@ Leverage nanobot-stack's built-in chat platform integrations which don't require
 
 #### Telegram (Recommended - Easiest)
 ```json
-// ~/.nanobot/config.json
+// ~/.yeoman/config.json
 {
   "channels": {
     "telegram": {
@@ -522,13 +522,13 @@ Leverage nanobot-stack's built-in chat platform integrations which don't require
 }
 ```
 
-Run: `nanobot gateway`
+Run: `yeoman gateway`
 
 Access: Open Telegram, find your bot, and chat!
 
 #### Discord
 ```json
-// ~/.nanobot/config.json
+// ~/.yeoman/config.json
 {
   "channels": {
     "discord": {
@@ -539,13 +539,13 @@ Access: Open Telegram, find your bot, and chat!
 }
 ```
 
-Run: `nanobot gateway`
+Run: `yeoman gateway`
 
 Access: Invite bot to your server and chat!
 
 #### Feishu (No Public IP Required!)
 ```json
-// ~/.nanobot/config.json
+// ~/.yeoman/config.json
 {
   "channels": {
     "feishu": {
@@ -557,17 +557,17 @@ Access: Invite bot to your server and chat!
 }
 ```
 
-Run: `nanobot gateway`
+Run: `yeoman gateway`
 
 Access: Chat with your Feishu bot!
 
 #### WhatsApp
 ```bash
 # Terminal 1: Link device
-nanobot channels login
+yeoman channels login
 
 # Terminal 2: Start gateway
-nanobot gateway
+yeoman gateway
 ```
 
 Access: Chat with your linked WhatsApp number!
@@ -582,19 +582,19 @@ Access: Chat with your linked WhatsApp number!
 2. **Rate Limiting**: Prevent brute force attacks
 3. **HTTPS/TLS**: Always use encrypted connections
 4. **Firewall**: Only expose necessary ports
-5. **Updates**: Keep nanobot-stack and dependencies updated
+5. **Updates**: Keep yeoman and dependencies updated
 6. **Monitoring**: Monitor access logs for suspicious activity
-7. **Backup**: Regular backups of `~/.nanobot` directory
+7. **Backup**: Regular backups of `~/.yeoman` directory
 
-### Specific to nanobot-stack
+### Specific to yeoman
 
 1. **WhatsApp Bridge Security**: The bridge (port 3001) is **hardcoded to accept loopback only** - do NOT expose this port externally
-2. **Policy Configuration**: Use `~/.nanobot/policy.json` to control access per chat
+2. **Policy Configuration**: Use `~/.yeoman/policy.json` to control access per chat
 3. **Workspace Restriction**: Enable `tools.restrictToWorkspace` in production
 4. **Exec Isolation**: Consider enabling `tools.exec.isolation.enabled` for Linux
 
 ```json
-// ~/.nanobot/config.json - Production settings
+// ~/.yeoman/config.json - Production settings
 {
   "tools": {
     "restrictToWorkspace": true,
@@ -640,7 +640,7 @@ Access: Chat with your linked WhatsApp number!
 
 ### Gateway Port Configuration
 
-Edit `~/.nanobot/config.json`:
+Edit `~/.yeoman/config.json`:
 ```json
 {
   "gateway": {
@@ -652,7 +652,7 @@ Edit `~/.nanobot/config.json`:
 
 ### WhatsApp Bridge Configuration
 
-Edit `~/.nanobot/config.json`:
+Edit `~/.yeoman/config.json`:
 ```json
 {
   "channels": {
@@ -674,7 +674,7 @@ Edit `~/.nanobot/config.json`:
 ## Troubleshooting
 
 ### Connection Refused
-- Check if gateway is running: `nanobot status`
+- Check if gateway is running: `yeoman status`
 - Verify firewall settings: `sudo ufw status`
 - Check port is listening: `sudo netstat -tlnp | grep 18790`
 
@@ -697,7 +697,7 @@ Edit `~/.nanobot/config.json`:
 
 ## Additional Resources
 
-- [nanobot-stack README](../README.md)
+- [yeoman README](../README.md)
 - [Cloudflare Tunnel Docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/)
 - [Tailscale Docs](https://tailscale.com/kb/)
 - [Caddy Server](https://caddyserver.com/docs/)

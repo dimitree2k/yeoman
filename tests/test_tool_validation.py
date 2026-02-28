@@ -9,42 +9,42 @@ from typing import Any
 
 import pytest
 
-from nanobot.adapters.responder_llm import LLMResponder
-from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.exec_isolation import (
+from yeoman.adapters.responder_llm import LLMResponder
+from yeoman.agent.tools.base import Tool
+from yeoman.agent.tools.exec_isolation import (
     CommandResult,
     ExecSandboxManager,
     MountAllowlist,
     SandboxPreemptedError,
     SandboxTimeoutError,
 )
-from nanobot.agent.tools.filesystem import ReadFileTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.pi_stats import PiStatsTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import _validate_url
-from nanobot.app.bootstrap import _resolve_security_tool_settings
-from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import (
+from yeoman.agent.tools.filesystem import ReadFileTool
+from yeoman.agent.tools.message import MessageTool
+from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.registry import ToolRegistry
+from yeoman.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
+from yeoman.agent.tools.shell import ExecTool
+from yeoman.agent.tools.web import _validate_url
+from yeoman.app.bootstrap import _resolve_security_tool_settings
+from yeoman.bus.events import OutboundMessage
+from yeoman.bus.queue import MessageBus
+from yeoman.config.loader import (
     _atomic_write_config,
     _migrate_config,
     convert_keys,
     convert_to_camel,
 )
-from nanobot.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
-from nanobot.core.intents import SendOutboundIntent
-from nanobot.core.models import InboundEvent, PolicyDecision
-from nanobot.core.orchestrator import Orchestrator
-from nanobot.core.ports import PolicyPort, ResponderPort
-from nanobot.cron.service import CronService
-from nanobot.cron.types import CronSchedule
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.security.engine import SecurityEngine
-from nanobot.security.normalize import normalize_text
-from nanobot.utils.helpers import get_workspace_path
+from yeoman.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
+from yeoman.core.intents import SendOutboundIntent
+from yeoman.core.models import InboundEvent, PolicyDecision
+from yeoman.core.orchestrator import Orchestrator
+from yeoman.core.ports import PolicyPort, ResponderPort
+from yeoman.cron.service import CronService
+from yeoman.cron.types import CronSchedule
+from yeoman.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from yeoman.security.engine import SecurityEngine
+from yeoman.security.normalize import normalize_text
+from yeoman.utils.helpers import get_workspace_path
 
 
 class SampleTool(Tool):
@@ -407,8 +407,8 @@ def test_mixed_fail_mode_input_open_tool_closed(monkeypatch: pytest.MonkeyPatch)
         del args, kwargs
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("nanobot.security.engine.decide_input", boom)
-    monkeypatch.setattr("nanobot.security.engine.decide_tool", boom)
+    monkeypatch.setattr("yeoman.security.engine.decide_input", boom)
+    monkeypatch.setattr("yeoman.security.engine.decide_tool", boom)
 
     input_result = engine.check_input("hello")
     tool_result = engine.check_tool("exec", {"command": "echo hi"})
@@ -432,7 +432,7 @@ def test_strict_profile_enables_workspace_and_exec_isolation() -> None:
 
 
 def test_validate_url_blocks_private_targets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("nanobot.agent.tools.web._host_resolves_private", lambda host: False)
+    monkeypatch.setattr("yeoman.agent.tools.web._host_resolves_private", lambda host: False)
 
     ok, _ = _validate_url("https://example.com")
     blocked_ip, _ = _validate_url("http://127.0.0.1")
@@ -444,7 +444,7 @@ def test_validate_url_blocks_private_targets(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_validate_url_blocks_private_dns_targets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "nanobot.agent.tools.web._host_resolves_private", lambda host: host == "evil.test"
+        "yeoman.agent.tools.web._host_resolves_private", lambda host: host == "evil.test"
     )
     blocked, msg = _validate_url("http://evil.test/path")
     assert blocked is False
@@ -474,8 +474,8 @@ def test_security_engine_redacts_sensitive_context(monkeypatch: pytest.MonkeyPat
         del args, kwargs
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("nanobot.security.engine.logger.warning", fake_warning)
-    monkeypatch.setattr("nanobot.security.engine.decide_input", boom)
+    monkeypatch.setattr("yeoman.security.engine.logger.warning", fake_warning)
+    monkeypatch.setattr("yeoman.security.engine.decide_input", boom)
 
     engine.check_input(
         "hello",
@@ -503,7 +503,7 @@ def test_atomic_write_config_cleans_temp_file_on_replace_error(
         del args, kwargs
         raise OSError("replace failed")
 
-    monkeypatch.setattr("nanobot.config.loader.os.replace", boom_replace)
+    monkeypatch.setattr("yeoman.config.loader.os.replace", boom_replace)
 
     with pytest.raises(OSError, match="replace failed"):
         _atomic_write_config(config_path, cfg)
@@ -740,15 +740,15 @@ async def test_non_owner_raw_voice_send_does_not_bypass_llm(
     assert bus.outbound_size == 0
 
 
-def test_workspace_path_relative_is_scoped_under_nanobot_home(
+def test_workspace_path_relative_is_scoped_under_yeoman_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     cfg = Config.model_validate(convert_keys({"agents": {"defaults": {"workspace": "workspace"}}}))
-    assert cfg.workspace_path == tmp_path / ".nanobot" / "workspace"
+    assert cfg.workspace_path == tmp_path / ".yeoman" / "workspace"
 
 
-def test_get_workspace_path_relative_is_scoped_under_nanobot_home(
+def test_get_workspace_path_relative_is_scoped_under_yeoman_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -757,7 +757,7 @@ def test_get_workspace_path_relative_is_scoped_under_nanobot_home(
     absolute_target = tmp_path / "custom-workspace"
     absolute = get_workspace_path(str(absolute_target))
 
-    assert relative == tmp_path / ".nanobot" / "workspace"
+    assert relative == tmp_path / ".yeoman" / "workspace"
     assert relative.exists()
     assert absolute == absolute_target
     assert absolute.exists()
@@ -876,15 +876,15 @@ def _build_fake_manager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Exec
 
     allowlist = MountAllowlist(allowed_roots=[tmp_path.resolve()], blocked_patterns=[])
     monkeypatch.setattr(
-        "nanobot.agent.tools.exec_isolation.ExecSandboxManager._check_runtime",
+        "yeoman.agent.tools.exec_isolation.ExecSandboxManager._check_runtime",
         staticmethod(lambda: None),
     )
     monkeypatch.setattr(
-        "nanobot.agent.tools.exec_isolation.MountAllowlist.load",
+        "yeoman.agent.tools.exec_isolation.MountAllowlist.load",
         staticmethod(lambda _path: allowlist),
     )
     monkeypatch.setattr(
-        "nanobot.agent.tools.exec_isolation.BubblewrapSandboxSession", FakeSandboxSession
+        "yeoman.agent.tools.exec_isolation.BubblewrapSandboxSession", FakeSandboxSession
     )
 
     return ExecSandboxManager(

@@ -36,8 +36,8 @@ try {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
-const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
-const MEDIA_DIR = process.env.MEDIA_DIR || join(homedir(), '.nanobot', 'media');
+const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.yeoman', 'whatsapp-auth');
+const MEDIA_DIR = process.env.MEDIA_DIR || join(homedir(), '.yeoman', 'media');
 const MEDIA_INCOMING_DIR = process.env.MEDIA_INCOMING_DIR || join(MEDIA_DIR, 'incoming', 'whatsapp');
 const MEDIA_OUTGOING_DIR = process.env.MEDIA_OUTGOING_DIR || join(MEDIA_DIR, 'outgoing', 'whatsapp');
 const PERSIST_INBOUND_AUDIO = parseBoolEnv(process.env.WHATSAPP_PERSIST_INBOUND_AUDIO, false);
@@ -63,7 +63,7 @@ if (!BRIDGE_TOKEN) {
   process.exit(1);
 }
 
-console.log('nanobot WhatsApp Bridge');
+console.log('yeoman WhatsApp Bridge');
 console.log('=======================');
 console.log(`host=${HOST} port=${PORT} authDir=${AUTH_DIR}`);
 console.log(`mediaIncomingDir=${MEDIA_INCOMING_DIR} mediaOutgoingDir=${MEDIA_OUTGOING_DIR}`);

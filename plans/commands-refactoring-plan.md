@@ -1,6 +1,6 @@
 # Commands.py Refactoring Plan
 
-**File**: `nanobot/cli/commands.py` (1458 lines)  
+**File**: `yeoman/cli/commands.py` (1458 lines)  
 **Goal**: Reduce size, eliminate duplication, improve maintainability
 
 ---
@@ -17,12 +17,12 @@
 
 ## Option A: Extract Process Management Only
 
-### Create `nanobot/cli/process.py`
+### Create `yeoman/cli/process.py`
 
 Extract common process management utilities used by both gateway and bridge:
 
 ```python
-# nanobot/cli/process.py
+# yeoman/cli/process.py
 """Process management utilities for CLI commands."""
 
 import os
@@ -104,11 +104,11 @@ class ProcessManager:
 
 | Function | Lines | Destination |
 |----------|-------|-------------|
-| [`_pid_alive()`](nanobot/cli/commands.py:219) | 219-226 | `pid_alive()` |
-| [`_command_for_pid()`](nanobot/cli/commands.py:229) | 229-240 | `command_for_pid()` |
-| [`_pid_has_env()`](nanobot/cli/commands.py:243) | 243-260 | `pid_has_env()` |
-| [`_process_cwd()`](nanobot/cli/commands.py:881) | 881-888 | `process_cwd()` |
-| [`_listener_pids_for_port()`](nanobot/cli/commands.py:912) | 912-935 | `listener_pids_for_port()` |
+| [`_pid_alive()`](yeoman/cli/commands.py:219) | 219-226 | `pid_alive()` |
+| [`_command_for_pid()`](yeoman/cli/commands.py:229) | 229-240 | `command_for_pid()` |
+| [`_pid_has_env()`](yeoman/cli/commands.py:243) | 243-260 | `pid_has_env()` |
+| [`_process_cwd()`](yeoman/cli/commands.py:881) | 881-888 | `process_cwd()` |
+| [`_listener_pids_for_port()`](yeoman/cli/commands.py:912) | 912-935 | `listener_pids_for_port()` |
 | New helper | - | `tokenize_command()` |
 
 ### ProcessManager Class Replaces
@@ -124,7 +124,7 @@ class ProcessManager:
 ### Usage in Refactored commands.py
 
 ```python
-from nanobot.cli.process import ProcessManager, pid_alive, command_for_pid
+from yeoman.cli.process import ProcessManager, pid_alive, command_for_pid
 
 # Gateway process manager
 gateway_manager = ProcessManager(
@@ -162,11 +162,11 @@ pids = bridge_manager.find_pids()
 
 In addition to Option A, extract workspace templates.
 
-### Create `nanobot/cli/templates.py`
+### Create `yeoman/cli/templates.py`
 
 ```python
-# nanobot/cli/templates.py
-"""Workspace template files for nanobot initialization."""
+# yeoman/cli/templates.py
+"""Workspace template files for yeoman initialization."""
 
 WORKSPACE_TEMPLATES = {
     "AGENTS.md": """# Agent Instructions
@@ -182,7 +182,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 """,
     "SOUL.md": """# Soul
 
-I am nanobot, a lightweight AI assistant.
+I am yeoman, a lightweight AI assistant.
 
 ## Personality
 
@@ -249,7 +249,7 @@ def create_workspace_files(workspace: Path) -> None:
 ```python
 def _create_workspace_templates(workspace: Path):
     """Create default workspace template files."""
-    from nanobot.cli.templates import create_workspace_files
+    from yeoman.cli.templates import create_workspace_files
     create_workspace_files(workspace)
 ```
 
@@ -263,10 +263,10 @@ def _create_workspace_templates(workspace: Path):
 
 ## Option C: Full Modular Split
 
-Reorganize into a `nanobot/cli/commands/` subdirectory:
+Reorganize into a `yeoman/cli/commands/` subdirectory:
 
 ```
-nanobot/cli/
+yeoman/cli/
 ├── __init__.py          # Re-exports app
 ├── process.py           # Process management utilities
 ├── templates.py         # Workspace templates
@@ -297,20 +297,20 @@ nanobot/cli/
 ### commands/__init__.py Structure
 
 ```python
-# nanobot/cli/commands/__init__.py
-"""CLI commands for nanobot."""
+# yeoman/cli/commands/__init__.py
+"""CLI commands for yeoman."""
 
 import typer
-from nanobot import __logo__
+from yeoman import __logo__
 
 app = typer.Typer(
-    name="nanobot",
-    help=f"{__logo__} nanobot - Personal AI Assistant",
+    name="yeoman",
+    help=f"{__logo__} yeoman - Personal AI Assistant",
     no_args_is_help=True,
 )
 
 # Import and register command groups
-from nanobot.cli.commands import onboard, gateway, agent, channels, policy, cron, status
+from yeoman.cli.commands import onboard, gateway, agent, channels, policy, cron, status
 
 app.command()(onboard.onboard)
 app.command()(gateway.gateway)
@@ -348,7 +348,7 @@ Option C is a larger undertaking that could be done incrementally after A and B 
 
 ## Implementation Order for Option A
 
-1. Create `nanobot/cli/process.py` with:
+1. Create `yeoman/cli/process.py` with:
    - `pid_alive()`
    - `command_for_pid()`
    - `process_cwd()`
@@ -357,8 +357,8 @@ Option C is a larger undertaking that could be done incrementally after A and B 
    - `listener_pids_for_port()`
    - `ProcessManager` class
 
-2. Update `nanobot/cli/commands.py`:
-   - Add `from nanobot.cli.process import ...`
+2. Update `yeoman/cli/commands.py`:
+   - Add `from yeoman.cli.process import ...`
    - Replace `_gateway_*` and `_bridge_*` functions with `ProcessManager` instances
    - Remove duplicated helper functions
 
