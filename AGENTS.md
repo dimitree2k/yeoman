@@ -48,11 +48,11 @@ Append `!` after the type/scope and add `BREAKING CHANGE:` in the footer:
 ```
 feat(config)!: rename reply_context_window to reply_context_window_limit
 
-BREAKING CHANGE: config key renamed; update ~/.nanobot/config.json manually.
+BREAKING CHANGE: config key renamed; update ~/.yeoman/config.json manually.
 ```
 
 ## General Rules
 
-- Never commit secrets, API keys, or personal data (`~/.nanobot/` runtime data is gitignored).
+- Never commit secrets, API keys, or personal data (`~/.yeoman/` runtime data is gitignored).
 - Keep PRs focused — one logical change per commit where practical.
-- Run `pytest tests/` and `ruff check nanobot/` before pushing.
+- Run `pytest tests/` and `ruff check yeoman/` before pushing.

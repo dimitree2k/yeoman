@@ -112,7 +112,7 @@ def is_bridge_dir(path: Path) -> bool:
         data = json.loads(package_json.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    return data.get("name") == "nanobot-whatsapp-bridge"
+    return data.get("name") == "yeoman-whatsapp-bridge"
 
 
 def is_bridge_process(pid: int) -> bool:
@@ -123,4 +123,4 @@ def is_bridge_process(pid: int) -> bool:
     cwd = process_cwd(pid)
     if cwd and is_bridge_dir(cwd):
         return True
-    return "nanobot-whatsapp-bridge" in cmd
+    return "yeoman-whatsapp-bridge" in cmd

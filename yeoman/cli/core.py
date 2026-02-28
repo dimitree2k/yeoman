@@ -10,8 +10,8 @@ from rich.console import Console
 from yeoman import __logo__, __version__
 
 app = typer.Typer(
-    name="nanobot",
-    help=f"{__logo__} nanobot-stack (compat: nanobot) - Personal AI Assistant",
+    name="yeoman",
+    help=f"{__logo__} yeoman - Personal AI Assistant",
     no_args_is_help=True,
 )
 
@@ -20,7 +20,7 @@ console = Console()
 
 def version_callback(value: bool) -> None:
     if value:
-        console.print(f"{__logo__} nanobot-stack v{__version__} (compat command: nanobot)")
+        console.print(f"{__logo__} yeoman v{__version__}")
         raise typer.Exit()
 
 
@@ -28,7 +28,7 @@ def version_callback(value: bool) -> None:
 def main(
     version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ) -> None:
-    """nanobot-stack (compat: nanobot) - Personal AI Assistant."""
+    """yeoman - Personal AI Assistant."""
 
 
 def _create_workspace_templates(workspace: Path) -> None:
@@ -47,7 +47,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 """,
         "SOUL.md": """# Soul
 
-I am nanobot-stack, a lightweight AI assistant.
+I am yeoman, a lightweight AI assistant.
 
 ## Personality
 
@@ -82,7 +82,7 @@ Information about the user goes here.
 
 @app.command()
 def onboard() -> None:
-    """Initialize nanobot-stack configuration and workspace."""
+    """Initialize yeoman configuration and workspace."""
     from yeoman.config.loader import get_config_path, save_config
     from yeoman.config.schema import Config
     from yeoman.policy.loader import ensure_policy_file
@@ -105,7 +105,7 @@ def onboard() -> None:
     console.print(f"[green]✓[/green] Created workspace at {workspace}")
     _create_workspace_templates(workspace)
 
-    console.print(f"\n{__logo__} nanobot-stack is ready!")
+    console.print(f"\n{__logo__} yeoman is ready!")
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.yeoman/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")

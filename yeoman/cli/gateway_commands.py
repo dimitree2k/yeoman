@@ -71,7 +71,7 @@ def _gateway_cmd_port(cmd: str) -> int | None:
     return resolved
 
 
-def _is_nanobot_gateway_command(cmd: str) -> bool:
+def _is_yeoman_gateway_command(cmd: str) -> bool:
     import shlex
 
     try:
@@ -112,7 +112,7 @@ def _is_gateway_process_on_port(pid: int, port: int) -> bool:
     if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
         return _gateway_cmd_port(cmd) == port
 
-    if not _is_nanobot_gateway_command(cmd):
+    if not _is_yeoman_gateway_command(cmd):
         return False
 
     return _gateway_cmd_port(cmd) == port
