@@ -15,7 +15,7 @@
 
 **yeoman** is a lightweight, multi-channel AI assistant runtime with deterministic policy control, long-term memory, voice I/O, and tool sandboxing — ~18k lines of Python.
 
-> Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot). MIT license preserved.
+> Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman). MIT license preserved.
 
 ## Highlights
 
@@ -276,8 +276,8 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ### v0.2.0 — Feb 2026
 
-- Renamed project from nanobot-stack to yeoman
-- Runtime directory migrated from `~/.nanobot` to `~/.yeoman` (auto-migrated on first run)
+- Renamed project from yeoman-stack to yeoman
+- Runtime directory migrated from `~/.yeoman` to `~/.yeoman` (auto-migrated on first run)
 
 ### v0.1.3 — Feb 2026
 
@@ -343,4 +343,4 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ---
 
-<sub>MIT License · Originally inspired by [HKUDS/nanobot](https://github.com/HKUDS/nanobot)</sub>
+<sub>MIT License · Originally inspired by [HKUDS/yeoman](https://github.com/HKUDS/yeoman)</sub>

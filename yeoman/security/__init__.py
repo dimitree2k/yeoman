@@ -1,4 +1,4 @@
-"""Nanobot-native security middleware."""
+"""Yeoman-native security middleware."""
 
 from yeoman.security.engine import SecurityEngine
 from yeoman.security.noop import NoopSecurity

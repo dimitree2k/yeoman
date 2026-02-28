@@ -1,4 +1,4 @@
-"""Nanobot-native security middleware engine."""
+"""Yeoman-native security middleware engine."""
 
 from __future__ import annotations
 

@@ -22,7 +22,7 @@
 
   <!-- Title bar -->
   <rect x="0" y="0" width="1380" height="48" fill="#0f172a"/>
-  <text x="690" y="30" text-anchor="middle" font-size="15" font-weight="700" fill="#f8fafc" letter-spacing="1.2">NANOBOT ARCHITECTURE</text>
+  <text x="690" y="30" text-anchor="middle" font-size="15" font-weight="700" fill="#f8fafc" letter-spacing="1.2">Yeoman ARCHITECTURE</text>
   <text x="1356" y="30" text-anchor="end" font-size="9" fill="#64748b">v2 · Feb 2026</text>
 
   <!-- ═══════════════════ CHANNELS ═══════════════════ -->
@@ -319,15 +319,15 @@
     <text x="150" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">CONFIGURATION</text>
 
     <rect x="10" y="32" width="88" height="36" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
-    <text x="54" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.nanobot/</text>
+    <text x="54" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.yeoman/</text>
     <text x="54" y="59" text-anchor="middle" font-size="7.5" fill="#334155" font-weight="600">config.json</text>
 
     <rect x="105" y="32" width="88" height="36" rx="6" fill="#faf5ff" stroke="#c4b5fd" stroke-width="0.5"/>
-    <text x="149" y="48" text-anchor="middle" font-size="7" fill="#5b21b6">~/.nanobot/</text>
+    <text x="149" y="48" text-anchor="middle" font-size="7" fill="#5b21b6">~/.yeoman/</text>
     <text x="149" y="59" text-anchor="middle" font-size="7.5" fill="#5b21b6" font-weight="600">policy.json</text>
 
     <rect x="200" y="32" width="88" height="36" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
-    <text x="244" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.nanobot/</text>
+    <text x="244" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.yeoman/</text>
     <text x="244" y="59" text-anchor="middle" font-size="7.5" fill="#334155" font-weight="600">.env</text>
   </g>
 
@@ -335,9 +335,9 @@
   <g transform="translate(345, 578)">
     <rect width="310" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
     <text x="155" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">CLI  <tspan font-weight="400" fill="#64748b" font-size="8">(typer)</tspan></text>
-    <text x="155" y="38" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot gateway · agent · status · chat</text>
-    <text x="155" y="51" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot policy · memory · cron · channels</text>
-    <text x="155" y="64" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot config migrate-to-env</text>
+    <text x="155" y="38" text-anchor="middle" font-size="7.5" fill="#64748b">yeoman gateway · agent · status · chat</text>
+    <text x="155" y="51" text-anchor="middle" font-size="7.5" fill="#64748b">yeoman policy · memory · cron · channels</text>
+    <text x="155" y="64" text-anchor="middle" font-size="7.5" fill="#64748b">yeoman config migrate-to-env</text>
   </g>
 
   <!-- Ports Legend -->

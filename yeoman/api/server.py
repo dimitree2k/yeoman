@@ -110,7 +110,7 @@ def create_app(
     """Create the FastAPI application.
 
     Args:
-        config: Nanobot configuration
+        config: Yeoman configuration
         channel_manager: Optional channel manager for status
         telemetry: Optional telemetry backend for metrics
         api_config: API-specific configuration
@@ -138,7 +138,7 @@ def create_app(
         _state = None
 
     app = FastAPI(
-        title="Nanobot Control Plane",
+        title="Yeoman Control Plane",
         description="Minimal control plane API for yeoman operations",
         version="0.1.0",
         lifespan=lifespan,
@@ -304,7 +304,7 @@ def run_server(
     This is a blocking call that runs the server until interrupted.
 
     Args:
-        config: Nanobot configuration
+        config: Yeoman configuration
         channel_manager: Optional channel manager
         telemetry: Optional telemetry backend
         api_config: API-specific configuration

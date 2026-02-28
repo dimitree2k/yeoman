@@ -11,7 +11,7 @@ Use tmux only when you need an interactive TTY. Prefer exec background mode for 
 ## Quickstart (isolated socket, exec tool)
 
 ```bash
-SOCKET_DIR="${NANOBOT_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/yeoman-tmux-sockets}"
+SOCKET_DIR="${Yeoman_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/yeoman-tmux-sockets}"
 mkdir -p "$SOCKET_DIR"
 SOCKET="$SOCKET_DIR/yeoman.sock"
 SESSION=yeoman-python
@@ -31,8 +31,8 @@ To monitor:
 
 ## Socket convention
 
-- Use `NANOBOT_TMUX_SOCKET_DIR` environment variable.
-- Default socket path: `"$NANOBOT_TMUX_SOCKET_DIR/yeoman.sock"`.
+- Use `Yeoman_TMUX_SOCKET_DIR` environment variable.
+- Default socket path: `"$Yeoman_TMUX_SOCKET_DIR/yeoman.sock"`.
 
 ## Targeting panes and naming
 
@@ -43,7 +43,7 @@ To monitor:
 ## Finding sessions
 
 - List sessions on your socket: `{baseDir}/scripts/find-sessions.sh -S "$SOCKET"`.
-- Scan all sockets: `{baseDir}/scripts/find-sessions.sh --all` (uses `NANOBOT_TMUX_SOCKET_DIR`).
+- Scan all sockets: `{baseDir}/scripts/find-sessions.sh --all` (uses `Yeoman_TMUX_SOCKET_DIR`).
 
 ## Sending input safely
 

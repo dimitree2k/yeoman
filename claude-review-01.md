@@ -1,4 +1,4 @@
-# Spacebot Ideas: Revised Applicability Assessment for Nanobot
+# Spacebot Ideas: Revised Applicability Assessment for Yeoman
 
 ## Context
 
@@ -8,7 +8,7 @@ This revision incorporates source-level analysis of **both** codebases plus the 
 
 ---
 
-## What Nanobot Already Has (Often Missed)
+## What Yeoman Already Has (Often Missed)
 
 Before adding anything, acknowledge what's strong and shouldn't be reinvented:
 
@@ -32,7 +32,7 @@ Before adding anything, acknowledge what's strong and shouldn't be reinvented:
 
 Verified by reading actual source at `~/Projects/spacebot`:
 
-| Feature | Spacebot Code Status | Nanobot Gap? |
+| Feature | Spacebot Code Status | Yeoman Gap? |
 |---------|---------------------|--------------|
 | Channel/Branch/Worker process model | **Solid** (`src/agent/{channel,branch,worker}.rs`) | Gap, but current arch works |
 | Compactor (3-tier: 80/85/95%) | **Solid** (`src/agent/compactor.rs`, 350 LOC) | **Gap** — but yeoman uses short sessions + memory recall, so less urgent than assumed |
@@ -56,7 +56,7 @@ Verified by reading actual source at `~/Projects/spacebot`:
 |------|----------|
 | **P0-1 Runtime Split** | Current orchestrator works (1139 LOC, battle-tested). No production incident driving this. Do only if metrics prove it's needed. Kilo Code review: "If the answer is architectural purity, that's not P0." |
 | **P0-2 Branch-First Dispatch** | Not implemented in Spacebot either. Vapor. Cannot steal what doesn't exist. |
-| **P0-3 Compactor (as P0)** | **Demoted to P2.** Nanobot's context is already short (50-message cap) + memory-augmented recall. Context overflow is NOT the pain point both docs assumed. If long sessions become a problem, add it then. |
+| **P0-3 Compactor (as P0)** | **Demoted to P2.** Yeoman's context is already short (50-message cap) + memory-augmented recall. Context overflow is NOT the pain point both docs assumed. If long sessions become a problem, add it then. |
 | **P2-11 User-Scoped Memory** | Already implemented — `user`/`chat`/`global` scope model with sector-to-scope mapping. At most a minor retrieval enhancement. |
 | **P2-12 Multi-Agent Graph** | Design doc only in Spacebot, 491 LOC of docs, zero code. Unproven. |
 | **P2-14 Process Timeline** | Depends on runtime split which is deferred. |

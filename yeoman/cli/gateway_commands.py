@@ -109,7 +109,7 @@ def _is_gateway_process_on_port(pid: int, port: int) -> bool:
     if not cmd:
         return False
 
-    if _pid_has_env(pid, "NANOBOT_GATEWAY_DAEMON", "1"):
+    if _pid_has_env(pid, "Yeoman_GATEWAY_DAEMON", "1"):
         return _gateway_cmd_port(cmd) == port
 
     if not _is_yeoman_gateway_command(cmd):
@@ -216,7 +216,7 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
 
     with open(log_path, "a") as log_file:
         env = dict(os.environ)
-        env["NANOBOT_GATEWAY_DAEMON"] = "1"
+        env["Yeoman_GATEWAY_DAEMON"] = "1"
         proc = subprocess.Popen(
             cmd,
             env=env,
