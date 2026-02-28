@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from nanobot.media.tts import TTSSynthesizer
 
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
+# Matches text followed by a reaction suffix: "some text\n\n::reaction::emoji"
+_REACTION_SUFFIX_RE = re.compile(r"^([\s\S]+?)\n+::reaction::([^\n]+?)\s*$")
 
 
 class OutboundMiddleware:
@@ -100,6 +102,12 @@ class OutboundMiddleware:
                 return
             # Fall through with text_body as the reply to send
             reply = text_body
+        else:
+            # Model appended ::reaction:: after text instead of using it standalone.
+            # Strip the marker and send only the clean text body.
+            suffix_match = _REACTION_SUFFIX_RE.match(reply)
+            if suffix_match:
+                reply = suffix_match.group(1).strip()
 
         # ── Output security ──────────────────────────────────────────
         if self._security is not None:

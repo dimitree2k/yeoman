@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 620" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1380 780" font-family="'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
       <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#94a3b8"/>
@@ -7,347 +7,421 @@
       <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#3b82f6"/>
     </marker>
     <marker id="ag" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
-      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#22c55e"/>
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#10b981"/>
     </marker>
     <marker id="ao" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-auto">
-      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#f97316"/>
+      <path d="M 0 0 L 10 3.5 L 0 7 z" fill="#f59e0b"/>
     </marker>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="108%">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.06"/>
+    </filter>
   </defs>
 
-  <!-- Background -->
-  <rect width="1100" height="620" rx="8" fill="#f8fafc"/>
+  <!-- Canvas background -->
+  <rect width="1380" height="780" fill="#f8fafc"/>
 
-  <!-- ======================== CHANNELS ======================== -->
-  <g transform="translate(30, 30)">
-    <rect width="130" height="300" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="65" y="22" text-anchor="middle" font-size="9" font-weight="600" fill="#334155" letter-spacing="0.5">CHANNELS</text>
+  <!-- Title bar -->
+  <rect x="0" y="0" width="1380" height="48" fill="#0f172a"/>
+  <text x="690" y="30" text-anchor="middle" font-size="15" font-weight="700" fill="#f8fafc" letter-spacing="1.2">NANOBOT ARCHITECTURE</text>
+  <text x="1356" y="30" text-anchor="end" font-size="9" fill="#64748b">v2 · Feb 2026</text>
 
-    <rect x="15" y="38" width="100" height="48" rx="8" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="0.5"/>
-    <text x="65" y="58" text-anchor="middle" font-size="11" font-weight="600" fill="#1e293b">Telegram</text>
-    <text x="65" y="70" text-anchor="middle" font-size="7" fill="#94a3b8">Bot API polling</text>
+  <!-- ═══════════════════ CHANNELS ═══════════════════ -->
+  <g transform="translate(24, 64)">
+    <rect width="155" height="335" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="78" y="24" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a" letter-spacing="0.8">CHANNELS</text>
+    <text x="78" y="36" text-anchor="middle" font-size="7" fill="#94a3b8">BaseChannel interface</text>
 
-    <rect x="15" y="94" width="100" height="48" rx="8" fill="#dcfce7" stroke="#86efac" stroke-width="0.5"/>
-    <text x="65" y="114" text-anchor="middle" font-size="11" font-weight="600" fill="#1e293b">WhatsApp</text>
-    <text x="65" y="126" text-anchor="middle" font-size="7" fill="#94a3b8">Baileys bridge (WS)</text>
+    <rect x="12" y="50" width="131" height="48" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="0.7"/>
+    <text x="78" y="70" text-anchor="middle" font-size="11" font-weight="600" fill="#1e40af">Telegram</text>
+    <text x="78" y="82" text-anchor="middle" font-size="7" fill="#64748b">python-telegram-bot · polling</text>
 
-    <rect x="15" y="150" width="100" height="48" rx="8" fill="#ede9fe" stroke="#c4b5fd" stroke-width="0.5"/>
-    <text x="65" y="170" text-anchor="middle" font-size="11" font-weight="600" fill="#1e293b">Discord</text>
-    <text x="65" y="182" text-anchor="middle" font-size="7" fill="#94a3b8">discord.py</text>
+    <rect x="12" y="106" width="131" height="48" rx="8" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="0.7"/>
+    <text x="78" y="126" text-anchor="middle" font-size="11" font-weight="600" fill="#065f46">WhatsApp</text>
+    <text x="78" y="138" text-anchor="middle" font-size="7" fill="#64748b">Baileys bridge · WS protocol v2</text>
 
-    <rect x="15" y="206" width="100" height="48" rx="8" fill="#fef3c7" stroke="#fcd34d" stroke-width="0.5"/>
-    <text x="65" y="226" text-anchor="middle" font-size="11" font-weight="600" fill="#1e293b">Feishu</text>
-    <text x="65" y="238" text-anchor="middle" font-size="7" fill="#94a3b8">WebSocket long-conn</text>
+    <rect x="12" y="162" width="131" height="48" rx="8" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="0.7"/>
+    <text x="78" y="182" text-anchor="middle" font-size="11" font-weight="600" fill="#5b21b6">Discord</text>
+    <text x="78" y="194" text-anchor="middle" font-size="7" fill="#64748b">discord.py · gateway intents</text>
 
-    <text x="65" y="275" text-anchor="middle" font-size="7" fill="#94a3b8">BaseChannel interface</text>
-    <text x="65" y="286" text-anchor="middle" font-size="7" fill="#94a3b8">start() · send() · send_reaction()</text>
+    <rect x="12" y="218" width="131" height="48" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="0.7"/>
+    <text x="78" y="238" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">Feishu</text>
+    <text x="78" y="250" text-anchor="middle" font-size="7" fill="#64748b">WebSocket long-conn</text>
+
+    <line x1="12" y1="280" x2="143" y2="280" stroke="#e2e8f0" stroke-width="0.5"/>
+    <text x="78" y="296" text-anchor="middle" font-size="7" fill="#64748b">start() · stop() · send()</text>
+    <text x="78" y="308" text-anchor="middle" font-size="7" fill="#64748b">send_reaction() · typing</text>
+    <text x="78" y="322" text-anchor="middle" font-size="7" fill="#94a3b8">ChannelManager routes outbound</text>
   </g>
 
-  <!-- ======================== MESSAGE BUS ======================== -->
-  <g transform="translate(195, 60)">
-    <rect width="100" height="240" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="50" y="22" text-anchor="middle" font-size="9" font-weight="600" fill="#334155" letter-spacing="0.5">BUS</text>
+  <!-- ═══════════════════ MESSAGE BUS ═══════════════════ -->
+  <g transform="translate(206, 80)">
+    <rect width="112" height="288" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="56" y="22" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a" letter-spacing="0.8">BUS</text>
 
-    <rect x="12" y="38" width="76" height="50" rx="6" fill="#dbeafe" stroke="#93c5fd" stroke-width="0.5"/>
-    <text x="50" y="56" text-anchor="middle" font-size="11" font-weight="600" fill="#1e40af">inbound</text>
-    <text x="50" y="68" text-anchor="middle" font-size="7" fill="#94a3b8">asyncio.Queue</text>
-    <text x="50" y="78" text-anchor="middle" font-size="7" fill="#94a3b8">dedup + backpressure</text>
+    <rect x="12" y="40" width="88" height="58" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="0.7"/>
+    <text x="56" y="58" text-anchor="middle" font-size="11" font-weight="600" fill="#1e40af">inbound</text>
+    <text x="56" y="72" text-anchor="middle" font-size="7" fill="#64748b">asyncio.Queue</text>
+    <text x="56" y="84" text-anchor="middle" font-size="7" fill="#94a3b8">dedup · backpressure</text>
 
-    <rect x="12" y="98" width="76" height="50" rx="6" fill="#d1fae5" stroke="#6ee7b7" stroke-width="0.5"/>
-    <text x="50" y="116" text-anchor="middle" font-size="11" font-weight="600" fill="#065f46">outbound</text>
-    <text x="50" y="128" text-anchor="middle" font-size="7" fill="#94a3b8">asyncio.Queue</text>
-    <text x="50" y="138" text-anchor="middle" font-size="7" fill="#94a3b8">text + media</text>
+    <rect x="12" y="106" width="88" height="58" rx="8" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="0.7"/>
+    <text x="56" y="124" text-anchor="middle" font-size="11" font-weight="600" fill="#065f46">outbound</text>
+    <text x="56" y="138" text-anchor="middle" font-size="7" fill="#64748b">asyncio.Queue</text>
+    <text x="56" y="150" text-anchor="middle" font-size="7" fill="#94a3b8">text · media · voice</text>
 
-    <rect x="12" y="158" width="76" height="50" rx="6" fill="#fef9c3" stroke="#fde047" stroke-width="0.5"/>
-    <text x="50" y="176" text-anchor="middle" font-size="11" font-weight="600" fill="#854d0e">reaction</text>
-    <text x="50" y="188" text-anchor="middle" font-size="7" fill="#94a3b8">asyncio.Queue</text>
-    <text x="50" y="198" text-anchor="middle" font-size="7" fill="#94a3b8">emoji reactions</text>
+    <rect x="12" y="172" width="88" height="58" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="0.7"/>
+    <text x="56" y="190" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">reaction</text>
+    <text x="56" y="204" text-anchor="middle" font-size="7" fill="#64748b">asyncio.Queue</text>
+    <text x="56" y="216" text-anchor="middle" font-size="7" fill="#94a3b8">emoji reactions</text>
 
-    <text x="50" y="228" text-anchor="middle" font-size="7" fill="#94a3b8">bounded · async</text>
+    <text x="56" y="252" text-anchor="middle" font-size="7" fill="#94a3b8">bounded queues</text>
+    <text x="56" y="264" text-anchor="middle" font-size="7" fill="#94a3b8">subscriber routing</text>
+    <text x="56" y="276" text-anchor="middle" font-size="7" fill="#94a3b8">fully async</text>
   </g>
 
-  <!-- ======================== ORCHESTRATOR ======================== -->
-  <g transform="translate(330, 30)">
-    <rect width="280" height="375" rx="10" fill="#ffffff" stroke="#6366f1" stroke-width="1.5"/>
-    <rect width="280" height="28" rx="10" fill="#6366f1"/>
-    <rect x="0" y="14" width="280" height="14" fill="#6366f1"/>
-    <text x="140" y="19" text-anchor="middle" font-size="10" font-weight="600" fill="#ffffff">ORCHESTRATOR PIPELINE</text>
+  <!-- ═══════════════════ ORCHESTRATOR PIPELINE ═══════════════════ -->
+  <g transform="translate(345, 64)">
+    <rect width="310" height="490" rx="12" fill="#ffffff" stroke="#6366f1" stroke-width="1.5" filter="url(#shadow)"/>
 
-    <!-- Steps -->
-    <g transform="translate(16, 38)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">1. Deduplication</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#94a3b8">TTL window</text>
+    <!-- Header -->
+    <rect width="310" height="30" rx="12" fill="#4f46e5"/>
+    <rect x="0" y="15" width="310" height="15" fill="#4f46e5"/>
+    <text x="155" y="21" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff" letter-spacing="0.6">ORCHESTRATOR PIPELINE</text>
+
+    <!-- 13 Middleware stages -->
+    <g transform="translate(14, 40)">
+      <!-- 1 -->
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">1</tspan>  Normalization</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">content cleanup</text>
     </g>
-    <g transform="translate(16, 64)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">2. Archive inbound</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">ReplyArchivePort</text>
+    <g transform="translate(14, 65)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">2</tspan>  Deduplication</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">TTL window (20 min)</text>
     </g>
-    <g transform="translate(16, 90)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">3. Resolve reply + ambient context</text>
+    <g transform="translate(14, 90)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">3</tspan>  Archive inbound</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">ReplyArchivePort</text>
     </g>
-    <g transform="translate(16, 116)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">4. Admin command routing</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#94a3b8">/policy namespace</text>
+    <g transform="translate(14, 115)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">4</tspan>  Reply context + ambient window</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">thread + topic</text>
     </g>
-    <g transform="translate(16, 142)">
-      <rect width="248" height="22" rx="4" fill="#eef2ff" stroke="#a5b4fc" stroke-width="0.5"/>
-      <text x="8" y="15" font-size="8" fill="#3730a3" font-weight="600">5. Policy evaluation</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">PolicyPort</text>
+    <g transform="translate(14, 140)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">5</tspan>  Admin command routing</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">/policy namespace</text>
     </g>
-    <g transform="translate(16, 168)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">6. Idea / backlog capture</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#94a3b8">→ reaction</text>
+    <g transform="translate(14, 165)">
+      <rect width="282" height="22" rx="4" fill="#eef2ff" stroke="#a5b4fc" stroke-width="0.5"/>
+      <text x="8" y="15" font-size="8" fill="#3730a3" font-weight="600"><tspan fill="#4f46e5">6</tspan>  Policy evaluation</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">PolicyPort</text>
     </g>
-    <g transform="translate(16, 194)">
-      <rect width="248" height="22" rx="4" fill="#fef2f2" stroke="#fca5a5" stroke-width="0.5"/>
-      <text x="8" y="15" font-size="8" fill="#991b1b" font-weight="600">7. Security input check</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">SecurityPort</text>
+    <g transform="translate(14, 190)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">7</tspan>  Idea capture</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">→ reaction · security</text>
     </g>
-    <g transform="translate(16, 220)">
-      <rect width="248" height="28" rx="4" fill="#eff6ff" stroke="#60a5fa" stroke-width="0.5"/>
-      <text x="8" y="13" font-size="8" fill="#1e40af" font-weight="600">8. LLM response generation</text>
-      <text x="240" y="13" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">ResponderPort</text>
-      <text x="8" y="23" font-size="7" fill="#94a3b8">agent loop · tools · context · memory retrieval</text>
+    <g transform="translate(14, 215)">
+      <rect width="282" height="22" rx="4" fill="#fef2f2" stroke="#fecaca" stroke-width="0.5"/>
+      <text x="8" y="15" font-size="8" fill="#991b1b"><tspan font-weight="600" fill="#dc2626">8</tspan>  Access control</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">block rejected</text>
     </g>
-    <g transform="translate(16, 252)">
-      <rect width="248" height="22" rx="4" fill="#fef2f2" stroke="#fca5a5" stroke-width="0.5"/>
-      <text x="8" y="15" font-size="8" fill="#991b1b">9. Security output check</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#94a3b8">sanitize / block</text>
+    <g transform="translate(14, 240)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">9</tspan>  New chat notification</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">owner alert</text>
     </g>
-    <g transform="translate(16, 278)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">10. Voice synthesis (optional)</text>
-      <text x="240" y="15" text-anchor="end" font-size="7" fill="#94a3b8">TTS</text>
+    <g transform="translate(14, 265)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">10</tspan>  No-reply filter</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">should_respond check</text>
     </g>
-    <g transform="translate(16, 304)">
-      <rect width="248" height="22" rx="4" fill="#f1f5f9"/>
-      <text x="8" y="15" font-size="8" fill="#475569">11. Session persist + memory capture</text>
+    <g transform="translate(14, 290)">
+      <rect width="282" height="22" rx="4" fill="#fef2f2" stroke="#fecaca" stroke-width="0.5"/>
+      <text x="8" y="15" font-size="8" fill="#991b1b" font-weight="600"><tspan fill="#dc2626">11</tspan>  Input security check</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">SecurityPort</text>
     </g>
+    <g transform="translate(14, 315)">
+      <rect width="282" height="30" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="0.7"/>
+      <text x="8" y="14" font-size="8" fill="#1e40af" font-weight="600"><tspan fill="#2563eb">12</tspan>  LLM response generation</text>
+      <text x="274" y="14" text-anchor="end" font-size="7" fill="#7c3aed" font-style="italic">ResponderPort</text>
+      <text x="8" y="25" font-size="7" fill="#64748b">agent loop · tools · context · memory recall</text>
+    </g>
+    <g transform="translate(14, 348)">
+      <rect width="282" height="22" rx="4" fill="#f1f5f9"/>
+      <text x="8" y="15" font-size="8" fill="#475569"><tspan font-weight="600" fill="#64748b">13</tspan>  Outbound assembly</text>
+      <text x="274" y="15" text-anchor="end" font-size="7" fill="#94a3b8">TTS · output security · emit</text>
+    </g>
+
+    <!-- Divider -->
+    <line x1="14" y1="380" x2="296" y2="380" stroke="#e2e8f0" stroke-width="0.5"/>
 
     <!-- Intent output -->
-    <rect x="16" y="334" width="248" height="28" rx="6" fill="#eef2ff" stroke="#6366f1" stroke-width="0.5"/>
-    <text x="140" y="352" text-anchor="middle" font-size="8" fill="#4338ca" font-weight="600">→ emit OrchestratorIntent[]</text>
+    <rect x="14" y="388" width="282" height="42" rx="6" fill="#eef2ff" stroke="#6366f1" stroke-width="0.5"/>
+    <text x="155" y="404" text-anchor="middle" font-size="8" fill="#4338ca" font-weight="600">OrchestratorIntent[]</text>
+    <text x="155" y="418" text-anchor="middle" font-size="6.5" fill="#64748b">SendOutbound · SendReaction · PersistSession</text>
+    <text x="155" y="428" text-anchor="middle" font-size="6.5" fill="#64748b">SetTyping · QueueMemory · RecordMetric</text>
+
+    <!-- Pipeline label -->
+    <text x="155" y="465" text-anchor="middle" font-size="7" fill="#94a3b8">Pipeline middleware chain · next() continuation</text>
+    <text x="155" y="478" text-anchor="middle" font-size="7" fill="#94a3b8">13 stages · typed intents · async throughout</text>
   </g>
 
-  <!-- ======================== POLICY ENGINE ======================== -->
-  <g transform="translate(648, 30)">
-    <rect width="195" height="95" rx="10" fill="#ffffff" stroke="#a78bfa" stroke-width="1"/>
-    <rect width="195" height="24" rx="10" fill="#8b5cf6"/>
-    <rect x="0" y="12" width="195" height="12" fill="#8b5cf6"/>
-    <text x="97" y="17" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">POLICY ENGINE</text>
-    <text x="12" y="42" font-size="8" fill="#475569">evaluate(event) → PolicyDecision</text>
-    <text x="12" y="54" font-size="7" fill="#94a3b8">who can talk · when to reply</text>
-    <text x="12" y="64" font-size="7" fill="#94a3b8">allowed tools · persona selection</text>
-    <text x="12" y="78" font-size="7" fill="#7c3aed">Hot-reload from ~/.nanobot/policy.json</text>
-    <text x="12" y="88" font-size="7" fill="#7c3aed">Deterministic — no ad-hoc ACLs</text>
+  <!-- ═══════════════════ POLICY ENGINE ═══════════════════ -->
+  <g transform="translate(682, 64)">
+    <rect width="225" height="108" rx="12" fill="#ffffff" stroke="#a78bfa" stroke-width="1" filter="url(#shadow)"/>
+    <rect width="225" height="26" rx="12" fill="#7c3aed"/>
+    <rect x="0" y="13" width="225" height="13" fill="#7c3aed"/>
+    <text x="112" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff">POLICY ENGINE</text>
+
+    <text x="14" y="44" font-size="8" fill="#334155">evaluate(actor) → PolicyDecision</text>
+    <text x="14" y="58" font-size="7" fill="#64748b">who_can_talk · when_to_reply</text>
+    <text x="14" y="70" font-size="7" fill="#64748b">allowed_tools · persona · voice mode</text>
+    <text x="14" y="82" font-size="7" fill="#64748b">talkative_cooldown · blocked_senders</text>
+    <text x="14" y="96" font-size="7" fill="#7c3aed">Hot-reload policy.json · per-chat overrides</text>
   </g>
 
-  <!-- ======================== SECURITY ENGINE ======================== -->
-  <g transform="translate(648, 140)">
-    <rect width="195" height="80" rx="10" fill="#ffffff" stroke="#f87171" stroke-width="1"/>
-    <rect width="195" height="24" rx="10" fill="#ef4444"/>
-    <rect x="0" y="12" width="195" height="12" fill="#ef4444"/>
-    <text x="97" y="17" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">SECURITY ENGINE</text>
-    <text x="12" y="42" font-size="8" fill="#475569">3-stage: input → tool → output</text>
-    <text x="12" y="54" font-size="7" fill="#94a3b8">injection detection · secret scanning</text>
-    <text x="12" y="64" font-size="7" fill="#94a3b8">sensitive data redaction · fail-closed</text>
+  <!-- ═══════════════════ SECURITY ENGINE ═══════════════════ -->
+  <g transform="translate(682, 186)">
+    <rect width="225" height="96" rx="12" fill="#ffffff" stroke="#f87171" stroke-width="1" filter="url(#shadow)"/>
+    <rect width="225" height="26" rx="12" fill="#ef4444"/>
+    <rect x="0" y="13" width="225" height="13" fill="#ef4444"/>
+    <text x="112" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff">SECURITY ENGINE</text>
+
+    <text x="14" y="44" font-size="8" fill="#334155">3-stage: input → tool → output</text>
+    <text x="14" y="58" font-size="7" fill="#64748b">injection detection · exfil blocking</text>
+    <text x="14" y="70" font-size="7" fill="#64748b">secret scanning · sensitive data redaction</text>
+    <text x="14" y="84" font-size="7" fill="#64748b">fail mode: open / closed / mixed</text>
   </g>
 
-  <!-- ======================== LLM RESPONDER ======================== -->
-  <g transform="translate(648, 235)">
-    <rect width="195" height="118" rx="10" fill="#ffffff" stroke="#3b82f6" stroke-width="1"/>
-    <rect width="195" height="24" rx="10" fill="#3b82f6"/>
-    <rect x="0" y="12" width="195" height="12" fill="#3b82f6"/>
-    <text x="97" y="17" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">LLM RESPONDER</text>
+  <!-- ═══════════════════ LLM RESPONDER ═══════════════════ -->
+  <g transform="translate(682, 296)">
+    <rect width="225" height="145" rx="12" fill="#ffffff" stroke="#3b82f6" stroke-width="1" filter="url(#shadow)"/>
+    <rect width="225" height="26" rx="12" fill="#2563eb"/>
+    <rect x="0" y="13" width="225" height="13" fill="#2563eb"/>
+    <text x="112" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff">LLM RESPONDER</text>
 
-    <text x="12" y="40" font-size="8" fill="#475569" font-weight="600">Agent Loop</text>
-    <text x="12" y="52" font-size="7" fill="#94a3b8">prompt → LLM → tool call → loop</text>
+    <text x="14" y="42" font-size="8" fill="#334155" font-weight="600">Agent Loop</text>
+    <text x="14" y="54" font-size="7" fill="#64748b">prompt → LLM → tool call → loop (max 20)</text>
 
-    <text x="12" y="68" font-size="8" fill="#475569" font-weight="600">Context Builder</text>
-    <text x="12" y="80" font-size="7" fill="#94a3b8">persona · reply context · ambient</text>
-    <text x="12" y="90" font-size="7" fill="#94a3b8">memory retrieval · skills · system</text>
+    <text x="14" y="70" font-size="8" fill="#334155" font-weight="600">Context Builder</text>
+    <text x="14" y="82" font-size="7" fill="#64748b">persona · ambient · reply context · skills</text>
+    <text x="14" y="93" font-size="7" fill="#64748b">memory retrieval · session history (50 msgs)</text>
 
-    <text x="12" y="106" font-size="8" fill="#475569" font-weight="600">Tool Registry</text>
-    <text x="12" y="116" font-size="7" fill="#94a3b8">exec(bwrap) · fs · web · cron · voice</text>
+    <text x="14" y="109" font-size="8" fill="#334155" font-weight="600">Tool Registry</text>
+    <text x="14" y="121" font-size="7" fill="#64748b">exec(bwrap) · file · web · browse · message</text>
+    <text x="14" y="132" font-size="7" fill="#64748b">voice · spawn · cron · pi-stats · research</text>
   </g>
 
-  <!-- ======================== MEMORY SERVICE ======================== -->
-  <g transform="translate(648, 368)">
-    <rect width="195" height="80" rx="10" fill="#ffffff" stroke="#22c55e" stroke-width="1"/>
-    <rect width="195" height="24" rx="10" fill="#22c55e"/>
-    <rect x="0" y="12" width="195" height="12" fill="#22c55e"/>
-    <text x="97" y="17" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">MEMORY SERVICE</text>
-    <text x="12" y="42" font-size="8" fill="#475569">SQLite (FTS + embeddings)</text>
-    <text x="12" y="54" font-size="7" fill="#94a3b8">semantic recall · background notes</text>
-    <text x="12" y="64" font-size="7" fill="#94a3b8">session state · scope filters</text>
+  <!-- ═══════════════════ MEMORY SERVICE ═══════════════════ -->
+  <g transform="translate(682, 455)">
+    <rect width="225" height="100" rx="12" fill="#ffffff" stroke="#10b981" stroke-width="1" filter="url(#shadow)"/>
+    <rect width="225" height="26" rx="12" fill="#10b981"/>
+    <rect x="0" y="13" width="225" height="13" fill="#10b981"/>
+    <text x="112" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff">MEMORY SERVICE</text>
+
+    <text x="14" y="42" font-size="8" fill="#334155">SQLite v2 (FTS5 + vector embeddings)</text>
+    <text x="14" y="56" font-size="7" fill="#64748b">semantic · procedural · episodic · emotional</text>
+    <text x="14" y="68" font-size="7" fill="#64748b">hybrid capture · scope filters · ACL</text>
+    <text x="14" y="80" font-size="7" fill="#64748b">lexical + vector recall · salience scoring</text>
+    <text x="14" y="92" font-size="7" fill="#64748b">session WAL snapshots · background notes</text>
   </g>
 
-  <!-- ======================== PROVIDERS ======================== -->
-  <g transform="translate(870, 30)">
-    <rect width="200" height="210" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="100" y="20" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">PROVIDER REGISTRY</text>
-    <text x="100" y="33" text-anchor="middle" font-size="7" fill="#94a3b8">LiteLLM · auto-prefix · env fallback</text>
+  <!-- ═══════════════════ PROVIDER REGISTRY ═══════════════════ -->
+  <g transform="translate(934, 64)">
+    <rect width="222" height="220" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="111" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">PROVIDER REGISTRY</text>
+    <text x="111" y="33" text-anchor="middle" font-size="7" fill="#94a3b8">LiteLLM · auto-prefix · env fallback</text>
 
-    <rect x="10" y="42" width="84" height="18" rx="4" fill="#fef3c7"/>
-    <text x="52" y="55" text-anchor="middle" font-size="7" fill="#92400e">OpenRouter</text>
-    <rect x="100" y="42" width="84" height="18" rx="4" fill="#fef3c7"/>
-    <text x="142" y="55" text-anchor="middle" font-size="7" fill="#92400e">AiHubMix</text>
+    <rect x="10" y="44" width="96" height="18" rx="4" fill="#fef3c7"/>
+    <text x="58" y="57" text-anchor="middle" font-size="7.5" fill="#92400e" font-weight="500">OpenRouter</text>
+    <rect x="112" y="44" width="96" height="18" rx="4" fill="#fef3c7"/>
+    <text x="160" y="57" text-anchor="middle" font-size="7.5" fill="#92400e" font-weight="500">AiHubMix</text>
 
-    <rect x="10" y="64" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="52" y="77" text-anchor="middle" font-size="7" fill="#9a3412">Anthropic</text>
-    <rect x="100" y="64" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="142" y="77" text-anchor="middle" font-size="7" fill="#9a3412">OpenAI</text>
+    <rect x="10" y="66" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="58" y="79" text-anchor="middle" font-size="7.5" fill="#9a3412">Anthropic</text>
+    <rect x="112" y="66" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="160" y="79" text-anchor="middle" font-size="7.5" fill="#9a3412">OpenAI</text>
 
-    <rect x="10" y="86" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="52" y="99" text-anchor="middle" font-size="7" fill="#9a3412">DeepSeek</text>
-    <rect x="100" y="86" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="142" y="99" text-anchor="middle" font-size="7" fill="#9a3412">Gemini</text>
+    <rect x="10" y="88" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="58" y="101" text-anchor="middle" font-size="7.5" fill="#9a3412">DeepSeek</text>
+    <rect x="112" y="88" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="160" y="101" text-anchor="middle" font-size="7.5" fill="#9a3412">Gemini</text>
 
-    <rect x="10" y="108" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="52" y="121" text-anchor="middle" font-size="7" fill="#9a3412">Groq</text>
-    <rect x="100" y="108" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="142" y="121" text-anchor="middle" font-size="7" fill="#9a3412">DashScope</text>
+    <rect x="10" y="110" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="58" y="123" text-anchor="middle" font-size="7.5" fill="#9a3412">Groq</text>
+    <rect x="112" y="110" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="160" y="123" text-anchor="middle" font-size="7.5" fill="#9a3412">DashScope</text>
 
-    <rect x="10" y="130" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="52" y="143" text-anchor="middle" font-size="7" fill="#9a3412">Moonshot</text>
-    <rect x="100" y="130" width="84" height="18" rx="4" fill="#fff7ed"/>
-    <text x="142" y="143" text-anchor="middle" font-size="7" fill="#9a3412">Zhipu AI</text>
+    <rect x="10" y="132" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="58" y="145" text-anchor="middle" font-size="7.5" fill="#9a3412">Moonshot</text>
+    <rect x="112" y="132" width="96" height="18" rx="4" fill="#fff7ed"/>
+    <text x="160" y="145" text-anchor="middle" font-size="7.5" fill="#9a3412">Zhipu AI</text>
 
-    <rect x="10" y="152" width="84" height="18" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="0.5"/>
-    <text x="52" y="165" text-anchor="middle" font-size="7" fill="#166534">vLLM (local)</text>
-    <rect x="100" y="152" width="84" height="18" rx="4" fill="#faf5ff" stroke="#d8b4fe" stroke-width="0.5"/>
-    <text x="142" y="165" text-anchor="middle" font-size="7" fill="#7e22ce">ElevenLabs</text>
+    <rect x="10" y="154" width="96" height="18" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="0.5"/>
+    <text x="58" y="167" text-anchor="middle" font-size="7.5" fill="#166534">vLLM (local)</text>
+    <rect x="112" y="154" width="96" height="18" rx="4" fill="#faf5ff" stroke="#d8b4fe" stroke-width="0.5"/>
+    <text x="160" y="167" text-anchor="middle" font-size="7.5" fill="#7e22ce">ElevenLabs</text>
 
-    <text x="100" y="190" text-anchor="middle" font-size="7" fill="#94a3b8">config.json · .env · env vars</text>
-    <text x="100" y="201" text-anchor="middle" font-size="7" fill="#94a3b8">2 files to add a new provider</text>
+    <line x1="10" y1="182" x2="208" y2="182" stroke="#e2e8f0" stroke-width="0.5"/>
+    <text x="111" y="197" text-anchor="middle" font-size="7" fill="#94a3b8">config.json · .env · model profiles</text>
+    <text x="111" y="210" text-anchor="middle" font-size="7" fill="#94a3b8">route-based dispatch · cooldown · fallbacks</text>
   </g>
 
-  <!-- ======================== MEDIA ======================== -->
-  <g transform="translate(870, 260)">
-    <rect width="200" height="80" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="100" y="20" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">MEDIA</text>
-    <rect x="10" y="30" width="56" height="18" rx="4" fill="#faf5ff"/>
-    <text x="38" y="43" text-anchor="middle" font-size="7" fill="#7e22ce">ASR</text>
-    <rect x="72" y="30" width="56" height="18" rx="4" fill="#faf5ff"/>
-    <text x="100" y="43" text-anchor="middle" font-size="7" fill="#7e22ce">TTS</text>
-    <rect x="134" y="30" width="56" height="18" rx="4" fill="#faf5ff"/>
-    <text x="162" y="43" text-anchor="middle" font-size="7" fill="#7e22ce">Vision</text>
-    <text x="100" y="68" text-anchor="middle" font-size="7" fill="#94a3b8">ModelRouter · Storage</text>
+  <!-- ═══════════════════ MEDIA ═══════════════════ -->
+  <g transform="translate(934, 300)">
+    <rect width="222" height="92" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="111" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">MEDIA PIPELINE</text>
+
+    <rect x="10" y="32" width="46" height="20" rx="4" fill="#faf5ff" stroke="#e9d5ff" stroke-width="0.5"/>
+    <text x="33" y="46" text-anchor="middle" font-size="7.5" fill="#7e22ce">ASR</text>
+    <rect x="62" y="32" width="46" height="20" rx="4" fill="#faf5ff" stroke="#e9d5ff" stroke-width="0.5"/>
+    <text x="85" y="46" text-anchor="middle" font-size="7.5" fill="#7e22ce">TTS</text>
+    <rect x="114" y="32" width="46" height="20" rx="4" fill="#faf5ff" stroke="#e9d5ff" stroke-width="0.5"/>
+    <text x="137" y="46" text-anchor="middle" font-size="7.5" fill="#7e22ce">Vision</text>
+    <rect x="166" y="32" width="46" height="20" rx="4" fill="#faf5ff" stroke="#e9d5ff" stroke-width="0.5"/>
+    <text x="189" y="46" text-anchor="middle" font-size="7.5" fill="#7e22ce">Video</text>
+
+    <text x="111" y="72" text-anchor="middle" font-size="7" fill="#64748b">ModelRouter · MediaStorage</text>
+    <text x="111" y="84" text-anchor="middle" font-size="7" fill="#94a3b8">Whisper · ElevenLabs · Gemini Flash</text>
   </g>
 
-  <!-- ======================== SERVICES ======================== -->
-  <g transform="translate(870, 360)">
-    <rect width="200" height="88" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="100" y="20" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">SERVICES</text>
-    <rect x="10" y="30" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="38" y="43" text-anchor="middle" font-size="7" fill="#0369a1">Cron</text>
-    <rect x="72" y="30" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="100" y="43" text-anchor="middle" font-size="7" fill="#0369a1">Heartbeat</text>
-    <rect x="134" y="30" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="162" y="43" text-anchor="middle" font-size="7" fill="#0369a1">Sessions</text>
-    <rect x="10" y="54" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="38" y="67" text-anchor="middle" font-size="7" fill="#0369a1">Archive</text>
-    <rect x="72" y="54" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="100" y="67" text-anchor="middle" font-size="7" fill="#0369a1">Skills</text>
-    <rect x="134" y="54" width="56" height="18" rx="4" fill="#f0f9ff"/>
-    <text x="162" y="67" text-anchor="middle" font-size="7" fill="#0369a1">Telemetry</text>
+  <!-- ═══════════════════ SERVICES ═══════════════════ -->
+  <g transform="translate(934, 408)">
+    <rect width="222" height="104" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="111" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">SERVICES</text>
+
+    <rect x="10" y="32" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="41" y="46" text-anchor="middle" font-size="7.5" fill="#0369a1">Cron</text>
+    <rect x="78" y="32" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="109" y="46" text-anchor="middle" font-size="7.5" fill="#0369a1">Heartbeat</text>
+    <rect x="146" y="32" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="177" y="46" text-anchor="middle" font-size="7.5" fill="#0369a1">Sessions</text>
+
+    <rect x="10" y="58" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="41" y="72" text-anchor="middle" font-size="7.5" fill="#0369a1">Archive</text>
+    <rect x="78" y="58" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="109" y="72" text-anchor="middle" font-size="7.5" fill="#0369a1">Skills</text>
+    <rect x="146" y="58" width="62" height="20" rx="4" fill="#f0f9ff" stroke="#bae6fd" stroke-width="0.5"/>
+    <text x="177" y="72" text-anchor="middle" font-size="7.5" fill="#0369a1">Telemetry</text>
+
+    <text x="111" y="95" text-anchor="middle" font-size="7" fill="#94a3b8">ChatRegistry · InboundArchive · Skills loader</text>
   </g>
 
-  <!-- ======================== CONFIG ======================== -->
-  <g transform="translate(30, 470)">
-    <rect width="285" height="75" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="142" y="20" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">CONFIGURATION</text>
-    <rect x="10" y="30" width="82" height="34" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
-    <text x="51" y="46" text-anchor="middle" font-size="7" fill="#475569">~/.nanobot/</text>
-    <text x="51" y="56" text-anchor="middle" font-size="7" fill="#475569">config.json</text>
-    <rect x="100" y="30" width="82" height="34" rx="6" fill="#f8fafc" stroke="#a78bfa" stroke-width="0.5"/>
-    <text x="141" y="46" text-anchor="middle" font-size="7" fill="#6d28d9">~/.nanobot/</text>
-    <text x="141" y="56" text-anchor="middle" font-size="7" fill="#6d28d9">policy.json</text>
-    <rect x="190" y="30" width="82" height="34" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
-    <text x="231" y="46" text-anchor="middle" font-size="7" fill="#475569">~/.nanobot/</text>
-    <text x="231" y="56" text-anchor="middle" font-size="7" fill="#475569">.env</text>
+  <!-- ═══════════════════ BOTTOM ROW ═══════════════════ -->
+
+  <!-- Configuration -->
+  <g transform="translate(24, 578)">
+    <rect width="300" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="150" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">CONFIGURATION</text>
+
+    <rect x="10" y="32" width="88" height="36" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
+    <text x="54" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.nanobot/</text>
+    <text x="54" y="59" text-anchor="middle" font-size="7.5" fill="#334155" font-weight="600">config.json</text>
+
+    <rect x="105" y="32" width="88" height="36" rx="6" fill="#faf5ff" stroke="#c4b5fd" stroke-width="0.5"/>
+    <text x="149" y="48" text-anchor="middle" font-size="7" fill="#5b21b6">~/.nanobot/</text>
+    <text x="149" y="59" text-anchor="middle" font-size="7.5" fill="#5b21b6" font-weight="600">policy.json</text>
+
+    <rect x="200" y="32" width="88" height="36" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="0.5"/>
+    <text x="244" y="48" text-anchor="middle" font-size="7" fill="#334155">~/.nanobot/</text>
+    <text x="244" y="59" text-anchor="middle" font-size="7.5" fill="#334155" font-weight="600">.env</text>
   </g>
 
   <!-- CLI -->
-  <g transform="translate(340, 470)">
-    <rect width="270" height="75" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="135" y="20" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">CLI (typer)</text>
-    <text x="135" y="38" text-anchor="middle" font-size="7" fill="#94a3b8">nanobot gateway · agent · status · logs</text>
-    <text x="135" y="50" text-anchor="middle" font-size="7" fill="#94a3b8">nanobot policy explain · cmd · annotate</text>
-    <text x="135" y="62" text-anchor="middle" font-size="7" fill="#94a3b8">nanobot memory · cron · channels · config</text>
+  <g transform="translate(345, 578)">
+    <rect width="310" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="155" y="20" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">CLI  <tspan font-weight="400" fill="#64748b" font-size="8">(typer)</tspan></text>
+    <text x="155" y="38" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot gateway · agent · status · chat</text>
+    <text x="155" y="51" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot policy · memory · cron · channels</text>
+    <text x="155" y="64" text-anchor="middle" font-size="7.5" fill="#64748b">nanobot config migrate-to-env</text>
   </g>
 
-  <!-- ======================== PORT LEGEND ======================== -->
-  <g transform="translate(648, 470)">
-    <rect width="420" height="75" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
-    <text x="210" y="18" text-anchor="middle" font-size="9" font-weight="600" fill="#334155">PORT INTERFACES (core/ports.py)</text>
-    <text x="12" y="36" font-size="7" fill="#8b5cf6">■</text>
-    <text x="22" y="36" font-size="8" fill="#475569">PolicyPort → EnginePolicyAdapter</text>
-    <text x="210" y="36" font-size="7" fill="#ef4444">■</text>
-    <text x="220" y="36" font-size="8" fill="#475569">SecurityPort → SecurityEngine</text>
-    <text x="12" y="50" font-size="7" fill="#3b82f6">■</text>
-    <text x="22" y="50" font-size="8" fill="#475569">ResponderPort → LLMResponder</text>
-    <text x="210" y="50" font-size="7" fill="#22c55e">■</text>
-    <text x="220" y="50" font-size="8" fill="#475569">ReplyArchivePort → SqliteArchiveAdapter</text>
-    <text x="12" y="64" font-size="7" fill="#64748b">■</text>
-    <text x="22" y="64" font-size="8" fill="#475569">TelemetryPort → InMemoryTelemetry</text>
-    <text x="210" y="64" font-size="7" fill="#94a3b8">- - -</text>
-    <text x="232" y="64" font-size="8" fill="#94a3b8">dashed lines = port calls</text>
+  <!-- Ports Legend -->
+  <g transform="translate(682, 578)">
+    <rect width="474" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
+    <text x="237" y="18" text-anchor="middle" font-size="10" font-weight="700" fill="#0f172a">PORT INTERFACES  <tspan font-weight="400" fill="#64748b" font-size="8">core/ports.py</tspan></text>
+
+    <text x="14" y="36" font-size="7" fill="#7c3aed">&#9632;</text>
+    <text x="26" y="36" font-size="7.5" fill="#334155">PolicyPort → EnginePolicyAdapter</text>
+    <text x="240" y="36" font-size="7" fill="#ef4444">&#9632;</text>
+    <text x="252" y="36" font-size="7.5" fill="#334155">SecurityPort → SecurityEngine</text>
+
+    <text x="14" y="50" font-size="7" fill="#2563eb">&#9632;</text>
+    <text x="26" y="50" font-size="7.5" fill="#334155">ResponderPort → LLMResponder</text>
+    <text x="240" y="50" font-size="7" fill="#10b981">&#9632;</text>
+    <text x="252" y="50" font-size="7.5" fill="#334155">ReplyArchivePort → SqliteArchiveAdapter</text>
+
+    <text x="14" y="64" font-size="7" fill="#64748b">&#9632;</text>
+    <text x="26" y="64" font-size="7.5" fill="#334155">TelemetryPort → InMemoryTelemetry</text>
+    <text x="240" y="64" font-size="7" fill="#0ea5e9">&#9632;</text>
+    <text x="252" y="64" font-size="7.5" fill="#334155">RuntimeSupervisorPort → BridgeManager</text>
   </g>
 
-  <!-- ======================== FLOW LEGEND ======================== -->
-  <g transform="translate(30, 560)">
-    <rect width="1038" height="40" rx="8" fill="#f1f5f9" stroke="#e2e8f0" stroke-width="0.5"/>
-    <line x1="20" y1="20" x2="50" y2="20" stroke="#3b82f6" stroke-width="2"/>
-    <text x="56" y="24" font-size="7" fill="#94a3b8">Inbound (message in)</text>
-    <line x1="170" y1="20" x2="200" y2="20" stroke="#22c55e" stroke-width="2"/>
-    <text x="206" y="24" font-size="7" fill="#94a3b8">Outbound (reply out)</text>
-    <line x1="320" y1="20" x2="350" y2="20" stroke="#f97316" stroke-width="2"/>
-    <text x="356" y="24" font-size="7" fill="#94a3b8">Reaction (emoji)</text>
-    <line x1="450" y1="20" x2="480" y2="20" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4,2"/>
-    <text x="486" y="24" font-size="7" fill="#94a3b8">Port interface call</text>
-    <text x="640" y="24" font-size="7" fill="#475569">Hexagonal architecture · Typed intents · Async throughout · ~18k LOC</text>
+  <!-- ═══════════════════ FLOW LEGEND ═══════════════════ -->
+  <g transform="translate(24, 676)">
+    <rect width="1132" height="36" rx="8" fill="#0f172a" opacity="0.04"/>
+
+    <line x1="18" y1="18" x2="48" y2="18" stroke="#3b82f6" stroke-width="2"/>
+    <text x="55" y="22" font-size="7.5" fill="#475569">Inbound</text>
+
+    <line x1="120" y1="18" x2="150" y2="18" stroke="#10b981" stroke-width="2"/>
+    <text x="157" y="22" font-size="7.5" fill="#475569">Outbound</text>
+
+    <line x1="228" y1="18" x2="258" y2="18" stroke="#f59e0b" stroke-width="2"/>
+    <text x="265" y="22" font-size="7.5" fill="#475569">Reaction</text>
+
+    <line x1="330" y1="18" x2="360" y2="18" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4,2"/>
+    <text x="367" y="22" font-size="7.5" fill="#475569">Port call</text>
+
+    <text x="500" y="22" font-size="7.5" fill="#0f172a" font-weight="600">Hexagonal architecture</text>
+    <text x="630" y="22" font-size="7.5" fill="#64748b">· 13-stage pipeline · typed intents · async throughout · Python + TS bridge</text>
   </g>
 
-  <!-- ======================== ARROWS ======================== -->
+  <!-- ═══════════════════ ARROWS ═══════════════════ -->
 
   <!-- Channels → Bus (inbound) -->
-  <line x1="160" y1="105" x2="193" y2="105" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#ab)"/>
-  <text x="177" y="99" text-anchor="middle" font-size="7" fill="#3b82f6">in</text>
+  <line x1="179" y1="178" x2="204" y2="140" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#ab)"/>
+  <text x="186" y="152" font-size="7" fill="#3b82f6" font-weight="500">in</text>
 
   <!-- Bus → Channels (outbound) -->
-  <line x1="195" y1="168" x2="162" y2="168" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ag)"/>
-  <text x="178" y="162" text-anchor="middle" font-size="7" fill="#22c55e">out</text>
+  <line x1="206" y1="208" x2="181" y2="230" stroke="#10b981" stroke-width="1.5" marker-end="url(#ag)"/>
+  <text x="188" y="215" font-size="7" fill="#10b981" font-weight="500">out</text>
 
   <!-- Bus → Channels (reaction) -->
-  <line x1="195" y1="230" x2="162" y2="230" stroke="#f97316" stroke-width="1.5" marker-end="url(#ao)"/>
-  <text x="178" y="224" text-anchor="middle" font-size="7" fill="#f97316">rxn</text>
+  <line x1="206" y1="270" x2="181" y2="300" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#ao)"/>
+  <text x="188" y="282" font-size="7" fill="#f59e0b" font-weight="500">rxn</text>
 
   <!-- Bus → Orchestrator (inbound) -->
-  <line x1="295" y1="105" x2="328" y2="105" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#ab)"/>
+  <line x1="318" y1="140" x2="343" y2="140" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#ab)"/>
 
   <!-- Orchestrator → Bus (outbound intents) -->
-  <path d="M 330 380 L 310 380 L 310 168 L 297 168" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#ag)"/>
-  <text x="318" y="276" text-anchor="middle" font-size="7" fill="#22c55e" transform="rotate(-90, 318, 276)">intents</text>
+  <path d="M 345 500 L 325 500 L 325 208 L 320 208" stroke="#10b981" stroke-width="1.5" fill="none" marker-end="url(#ag)"/>
+  <text x="337" y="360" text-anchor="middle" font-size="7" fill="#10b981" transform="rotate(-90, 337, 360)">intents</text>
 
   <!-- Orchestrator → Bus (reaction intents) -->
-  <path d="M 330 395 L 300 395 L 300 230 L 297 230" stroke="#f97316" stroke-width="1.5" fill="none" marker-end="url(#ao)"/>
+  <path d="M 345 515 L 315 515 L 315 270 L 320 270" stroke="#f59e0b" stroke-width="1.5" fill="none" marker-end="url(#ao)"/>
 
-  <!-- Orchestrator → Policy -->
-  <line x1="610" y1="78" x2="646" y2="78" stroke="#8b5cf6" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
-  <!-- Orchestrator → Security -->
-  <line x1="610" y1="180" x2="646" y2="180" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
-  <!-- Orchestrator → Responder -->
-  <line x1="610" y1="290" x2="646" y2="290" stroke="#3b82f6" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+  <!-- Orchestrator → Policy (port call) -->
+  <line x1="655" y1="118" x2="680" y2="118" stroke="#7c3aed" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+
+  <!-- Orchestrator → Security (port call) -->
+  <line x1="655" y1="234" x2="680" y2="234" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+
+  <!-- Orchestrator → Responder (port call) -->
+  <line x1="655" y1="368" x2="680" y2="368" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+
   <!-- Orchestrator → Memory -->
-  <line x1="610" y1="370" x2="646" y2="408" stroke="#22c55e" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+  <line x1="655" y1="450" x2="680" y2="505" stroke="#10b981" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
 
   <!-- Responder → Providers -->
-  <line x1="843" y1="290" x2="868" y2="150" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
+  <line x1="907" y1="352" x2="932" y2="200" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
   <!-- Responder → Media -->
-  <line x1="843" y1="310" x2="868" y2="300" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
+  <line x1="907" y1="375" x2="932" y2="350" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
+  <!-- Memory → Providers (embed route) -->
+  <line x1="907" y1="490" x2="1045" y2="490" stroke="#94a3b8" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <line x1="1045" y1="490" x2="1045" y2="286" stroke="#94a3b8" stroke-width="0.8" stroke-dasharray="3,2" marker-end="url(#arrow)"/>
 </svg>
