@@ -1,6 +1,6 @@
-# nanobot Skills
+# yeoman Skills
 
-This directory contains built-in skills that extend nanobot's capabilities.
+This directory contains built-in skills that extend yeoman's capabilities.
 
 ## Skill Format
 

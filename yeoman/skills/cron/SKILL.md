@@ -26,7 +26,7 @@ cron(action="add", message="Earnings in 1h: AAPL", at="2026-02-16T13:30:00+01:00
 
 Dynamic task (agent executes each time):
 ```
-cron(action="add", message="Check HKUDS/nanobot GitHub stars and report", every_seconds=600)
+cron(action="add", message="Check HKUDS/yeoman GitHub stars and report", every_seconds=600)
 ```
 
 List/remove:

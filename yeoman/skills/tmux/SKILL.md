@@ -1,7 +1,7 @@
 ---
 name: tmux
 description: Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output.
-metadata: {"nanobot":{"emoji":"🧵","os":["darwin","linux"],"requires":{"bins":["tmux"]}}}
+metadata: {"yeoman":{"emoji":"🧵","os":["darwin","linux"],"requires":{"bins":["tmux"]}}}
 ---
 
 # tmux Skill
@@ -11,10 +11,10 @@ Use tmux only when you need an interactive TTY. Prefer exec background mode for 
 ## Quickstart (isolated socket, exec tool)
 
 ```bash
-SOCKET_DIR="${NANOBOT_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/nanobot-tmux-sockets}"
+SOCKET_DIR="${NANOBOT_TMUX_SOCKET_DIR:-${TMPDIR:-/tmp}/yeoman-tmux-sockets}"
 mkdir -p "$SOCKET_DIR"
-SOCKET="$SOCKET_DIR/nanobot.sock"
-SESSION=nanobot-python
+SOCKET="$SOCKET_DIR/yeoman.sock"
+SESSION=yeoman-python
 
 tmux -S "$SOCKET" new -d -s "$SESSION" -n shell
 tmux -S "$SOCKET" send-keys -t "$SESSION":0.0 -- 'PYTHON_BASIC_REPL=1 python3 -q' Enter
@@ -32,7 +32,7 @@ To monitor:
 ## Socket convention
 
 - Use `NANOBOT_TMUX_SOCKET_DIR` environment variable.
-- Default socket path: `"$NANOBOT_TMUX_SOCKET_DIR/nanobot.sock"`.
+- Default socket path: `"$NANOBOT_TMUX_SOCKET_DIR/yeoman.sock"`.
 
 ## Targeting panes and naming
 
