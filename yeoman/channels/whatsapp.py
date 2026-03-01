@@ -159,6 +159,7 @@ class WhatsAppChannel(BaseChannel):
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
         self._debounce_buffers: dict[str, list[InboundEvent]] = {}
+        self._debounce_delays: dict[str, float] = {}
         self._debounce_tasks: dict[str, asyncio.Task[None]] = {}
         self._inbound_tasks: set[asyncio.Task[None]] = set()
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
@@ -641,7 +642,12 @@ class WhatsAppChannel(BaseChannel):
         self._archive_inbound_event(event)
         self._sync_chat_registry(event)
 
-        if self.config.debounce_ms <= 0 or event.media_kind is not None:
+        effective_debounce = (
+            self.config.debounce_media_ms
+            if event.media_kind is not None
+            else self.config.debounce_ms
+        )
+        if effective_debounce <= 0:
             await self._publish_event(event)
             return
 
@@ -660,12 +666,18 @@ class WhatsAppChannel(BaseChannel):
             return
         bucket = self._debounce_buffers.setdefault(key, [])
         bucket.append(event)
+        self._debounce_delays[key] = min(
+            self._debounce_delays.get(key, effective_debounce),
+            effective_debounce,
+        )
 
         existing_task = self._debounce_tasks.get(key)
         if existing_task:
             existing_task.cancel()
 
-        self._debounce_tasks[key] = asyncio.create_task(self._flush_debounce_bucket(key))
+        self._debounce_tasks[key] = asyncio.create_task(
+            self._flush_debounce_bucket(key, self._debounce_delays[key])
+        )
 
     def _on_inbound_task_done(self, task: asyncio.Task[None]) -> None:
         self._inbound_tasks.discard(task)
@@ -675,14 +687,15 @@ class WhatsAppChannel(BaseChannel):
         if exc is not None:
             logger.error(f"WhatsApp inbound task failed: {exc}")
 
-    async def _flush_debounce_bucket(self, key: str) -> None:
+    async def _flush_debounce_bucket(self, key: str, delay_ms: float) -> None:
         try:
-            await asyncio.sleep(self.config.debounce_ms / 1000.0)
+            await asyncio.sleep(delay_ms / 1000.0)
         except asyncio.CancelledError:
             return
 
         events = self._debounce_buffers.pop(key, [])
         self._debounce_tasks.pop(key, None)
+        self._debounce_delays.pop(key, None)
         if not events:
             return
 
@@ -692,6 +705,7 @@ class WhatsAppChannel(BaseChannel):
 
         combined_text = "\n".join(event.text for event in events if event.text).strip()
         last = events[-1]
+        media_source = next((e for e in events if e.media_kind is not None), last)
         mentioned_jids = sorted({jid for event in events for jid in event.mentioned_jids})
         reply_to_message_id = next(
             (event.reply_to_message_id for event in reversed(events) if event.reply_to_message_id),
@@ -724,12 +738,12 @@ class WhatsAppChannel(BaseChannel):
             reply_to_message_id=reply_to_message_id,
             reply_to_participant=reply_to_participant,
             reply_to_text=reply_to_text,
-            media_kind=last.media_kind,
-            media_type=last.media_type,
-            media_path=last.media_path,
-            media_bytes=last.media_bytes,
-            media_description=last.media_description,
-            voice_transcript=last.voice_transcript,
+            media_kind=media_source.media_kind,
+            media_type=media_source.media_type,
+            media_path=media_source.media_path,
+            media_bytes=media_source.media_bytes,
+            media_description=media_source.media_description,
+            voice_transcript=media_source.voice_transcript,
         )
 
         await self._publish_event(merged)

@@ -110,6 +110,7 @@ class WhatsAppConfig(BaseModel):
     bridge_startup_timeout_ms: int = 15000
     auth_dir: str = "~/.yeoman/secrets/whatsapp-auth"
     debounce_ms: int = 0
+    debounce_media_ms: int = 500
     read_receipts: bool = True
     accept_from_me: bool = False
     media_max_mb: int = 50

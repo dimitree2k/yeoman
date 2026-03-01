@@ -45,7 +45,6 @@ class ContextBuilder:
         # Core identity
         parts.append(self._get_identity())
         parts.append(self._build_temporal_grounding())
-        parts.append(self._build_fact_verification_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
         parts.append(
@@ -122,20 +121,6 @@ Skills with available="false" need dependencies installed first - you can try in
             ]
         )
 
-    @staticmethod
-    def _build_fact_verification_guardrails() -> str:
-        """Build guardrails for high-risk factual claims about real entities."""
-        return "\n".join(
-            [
-                "# Fact Verification",
-                "For questions about real people/companies/events, verify key claims with tools before asserting specifics when tools are available.",
-                "If multiple entities share the same name, ask which one the user means or provide clearly separated candidates.",
-                "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
-                "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
-                "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
-            ]
-        )
-
     def _resolve_active_skills(self, skill_names: list[str] | None) -> list[str]:
         """Resolve active skills with stable order and de-duplication."""
         existing = {item["name"] for item in self.skills.list_skills(filter_unavailable=False)}
@@ -177,9 +162,10 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
-        return f"""# yeoman 🐈
+        return f"""# Assistant Identity
 
-You are yeoman, a helpful AI assistant. You have access to tools that allow you to:
+You are an AI assistant. Your name and persona are defined in SOUL.md below — follow that as the authoritative source.
+You have access to tools that allow you to:
 - Read, write, and edit files
 - Execute shell commands
 - Search the web and fetch web pages
@@ -202,9 +188,7 @@ If asked to reply in voice and policy allows voice output for that chat, provide
 If required context is missing (for example, user asks to answer "the last voice message" from another chat you cannot read in this turn), ask only for the missing content or exact target chat.
 Treat WhatsApp voice output as a runtime/channel capability, not as a limitation of the `message` tool schema.
 Never say "I can only send text" or "voice is not in my toolset" for WhatsApp voice-note requests.
-For cross-chat voice requests, state only the real blocker (missing source message content or missing target chat identity), then continue with the best actionable next step.
-
-Always be helpful, accurate, and concise. When using tools, explain what you're doing."""
+For cross-chat voice requests, state only the real blocker (missing source message content or missing target chat identity), then continue with the best actionable next step."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
