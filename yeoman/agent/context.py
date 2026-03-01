@@ -45,6 +45,7 @@ class ContextBuilder:
         # Core identity
         parts.append(self._get_identity())
         parts.append(self._build_temporal_grounding())
+        parts.append(self._build_fact_verification_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
         parts.append(
@@ -118,6 +119,20 @@ Skills with available="false" need dependencies installed first - you can try in
                 "When discussing events, prefer explicit absolute dates (YYYY-MM-DD) over relative wording.",
                 "Only say today/this week/last week after comparing the event date to Current local date.",
                 "If event timing is uncertain, say uncertainty explicitly instead of guessing relative dates.",
+            ]
+        )
+
+    @staticmethod
+    def _build_fact_verification_guardrails() -> str:
+        """Build guardrails for high-risk factual claims about real entities."""
+        return "\n".join(
+            [
+                "# Fact Verification",
+                "For questions about real people/companies/events, verify key claims with tools before asserting specifics when tools are available.",
+                "If multiple entities share the same name, ask which one the user means or provide clearly separated candidates.",
+                "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
+                "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
+                "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
             ]
         )
 
