@@ -9,13 +9,25 @@ metadata: {"yeoman":{"emoji":"🧾","requires":{"bins":["summarize"]},"install":
 
 Fast CLI to summarize URLs, local files, and YouTube links.
 
-## When to use (trigger phrases)
+## When to use
 
-Use this skill immediately when the user asks any of:
-- “use summarize.sh”
+Use this skill immediately when any of the following apply:
+
+**Explicit requests:**
+- “summarize this URL/article/video”
+- “transcribe this YouTube/video”
 - “what’s this link/video about?”
-- “summarize this URL/article”
-- “transcribe this YouTube/video” (best-effort transcript extraction; no `yt-dlp` needed)
+- “use summarize.sh”
+
+**YouTube or video URL present in the message** (even without an explicit request):
+- Message contains a `youtube.com` or `youtu.be` URL
+- “watch this”, “check this out”, “have you seen this”
+- “what does [person] say in this video?”
+- “is this worth watching?”
+- Any question where a video or article URL appears in the message
+
+**Never respond with “I can’t access YouTube” or “I can’t watch videos.”**
+Use `summarize --youtube auto` instead.
 
 ## Quick start
 
