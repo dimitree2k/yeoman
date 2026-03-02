@@ -20,6 +20,7 @@ Use this skill immediately when any of the following apply:
 - “use summarize.sh”
 
 **YouTube or video URL present in the message** (even without an explicit request):
+- A bare YouTube or video URL is pasted with no other text
 - Message contains a `youtube.com` or `youtu.be` URL
 - “watch this”, “check this out”, “have you seen this”
 - “what does [person] say in this video?”
