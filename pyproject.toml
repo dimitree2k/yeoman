@@ -31,6 +31,8 @@ dependencies = [
     "lark-oapi>=1.5.3",
     "socksio>=1.0.0",
     "youtube-transcript-api>=1.0.0",
+    "caldav>=1.4",
+    "icalendar>=6.1",
 ]
 
 [project.optional-dependencies]
