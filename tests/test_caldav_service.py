@@ -1,7 +1,6 @@
 """Tests for CalDAV service parsing and calendar listing."""
 
 from datetime import datetime, timezone
-from unittest.mock import PropertyMock
 
 import icalendar
 
