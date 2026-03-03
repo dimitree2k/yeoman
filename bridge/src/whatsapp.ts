@@ -73,6 +73,7 @@ export interface SendMediaInput {
   fileName?: string;
   caption?: string;
   replyToMessageId?: string;
+  mentions?: string[];
 }
 
 export interface SendPollInput {
@@ -138,6 +139,19 @@ function normalizeJid(jidRaw: string): string {
 function jidUserToken(jidRaw: string): string {
   const normalized = normalizeJid(jidRaw);
   return normalized.split('@', 1)[0] || '';
+}
+
+function normalizeMentions(values: string[] | undefined): string[] | undefined {
+  if (!Array.isArray(values) || values.length === 0) return undefined;
+  const seen = new Set<string>();
+  const mentions: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeJid(String(value || ''));
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    mentions.push(normalized);
+  }
+  return mentions.length > 0 ? mentions : undefined;
 }
 
 export function resolveParticipantJid(msg: any, remoteJidRaw: string, isGroup: boolean): string {
@@ -1206,16 +1220,28 @@ export class WhatsAppClient {
     await closed;
   }
 
-  async sendText(to: string, text: string, replyToMessageId?: string): Promise<{ to: string }> {
+  async sendText(
+    to: string,
+    text: string,
+    replyToMessageId?: string,
+    mentions?: string[],
+  ): Promise<{ to: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
     const quoted = this.resolveQuotedMessage(to, replyToMessageId);
+    const message: { text: string; mentions?: string[] } = {
+      text: limitText(text, 8_000),
+    };
+    const normalizedMentions = normalizeMentions(mentions);
+    if (normalizedMentions?.length) {
+      message.mentions = normalizedMentions;
+    }
     let sent: any;
     if (quoted) {
-      sent = await this.sock.sendMessage(to, { text: limitText(text, 8_000) }, { quoted });
+      sent = await this.sock.sendMessage(to, message, { quoted });
     } else {
-      sent = await this.sock.sendMessage(to, { text: limitText(text, 8_000) });
+      sent = await this.sock.sendMessage(to, message);
     }
     this.rememberOutboundSelfMessage(to, sent);
     return { to };
@@ -1232,9 +1258,10 @@ export class WhatsAppClient {
     });
     const kind = mediaKindFromMime(media.mimeType);
     const caption = input.caption ? limitText(input.caption, 2_000) : undefined;
+    const mentions = caption ? normalizeMentions(input.mentions) : undefined;
 
     if (kind === 'image') {
-      const payload = { image: media.buffer, caption, mimetype: media.mimeType };
+      const payload = { image: media.buffer, caption, mimetype: media.mimeType, mentions };
       let sent: any;
       if (quoted) {
         sent = await this.sock.sendMessage(input.to, payload, { quoted });
@@ -1243,7 +1270,7 @@ export class WhatsAppClient {
       }
       this.rememberOutboundSelfMessage(input.to, sent);
     } else if (kind === 'video') {
-      const payload = { video: media.buffer, caption, mimetype: media.mimeType };
+      const payload = { video: media.buffer, caption, mimetype: media.mimeType, mentions };
       let sent: any;
       if (quoted) {
         sent = await this.sock.sendMessage(input.to, payload, { quoted });
@@ -1266,6 +1293,7 @@ export class WhatsAppClient {
         fileName: media.fileName || 'file',
         caption,
         mimetype: media.mimeType,
+        mentions,
       };
       let sent: any;
       if (quoted) {

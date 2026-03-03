@@ -184,6 +184,13 @@ class WebFetchTool(Tool):
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})
 
+        # YouTube pages don't yield transcripts via web_fetch — redirect to the dedicated tool
+        if "youtube.com" in url or "youtu.be" in url:
+            return json.dumps({
+                "error": "YouTube URLs cannot be fetched this way — web_fetch only gets page HTML, not video transcripts.",
+                "action": f"Use the youtube_transcript tool instead: youtube_transcript(url=\"{url}\")"
+            })
+
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key:
             try:
@@ -458,3 +465,79 @@ class DeepResearchTool(Tool):
             lines.append("")
 
         return "\n".join(lines)
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    """Extract the YouTube video ID from various URL formats."""
+    import re
+    patterns = [
+        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        r"youtube\.com/watch\?.*v=([A-Za-z0-9_-]{11})",
+        r"youtube\.com/shorts/([A-Za-z0-9_-]{11})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{11})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+class YoutubeTranscriptTool(Tool):
+    """Fetch the transcript/captions of a YouTube video."""
+
+    name = "youtube_transcript"
+    description = (
+        "Fetch the spoken transcript (captions) of a YouTube video. "
+        "Use this whenever a YouTube URL is shared and you need to understand or summarize the video content. "
+        "Returns the full transcript text. Prefers the user's language, falls back to English, then auto-generated."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Full YouTube URL (youtu.be or youtube.com)"},
+            "language": {
+                "type": "string",
+                "description": "Preferred transcript language code, e.g. 'en', 'de' (default: 'en')",
+            },
+        },
+        "required": ["url"],
+    }
+
+    async def execute(self, url: str, language: str = "en", **kwargs: Any) -> str:
+        video_id = _extract_youtube_id(url)
+        if not video_id:
+            return json.dumps({"error": f"Could not parse YouTube video ID from URL: {url}"})
+
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+        except ImportError:
+            return json.dumps({"error": "youtube-transcript-api is not installed. Run: uv pip install youtube-transcript-api"})
+
+        api = YouTubeTranscriptApi()
+        # Try preferred language first, then English, then any available
+        for langs in ([language], ["en"], None):
+            try:
+                if langs is None:
+                    transcript = api.fetch(video_id)
+                else:
+                    transcript = api.fetch(video_id, languages=langs)
+                break
+            except Exception:
+                continue
+        else:
+            return json.dumps({"error": f"No transcript available for video {video_id}. The video may have no captions.", "video_id": video_id})
+
+        snippets = transcript.snippets
+        text = " ".join(s.text for s in snippets).strip()
+        # Trim to ~12k chars to avoid token overload
+        if len(text) > 12000:
+            text = text[:12000] + "\n\n[transcript truncated]"
+
+        return json.dumps({
+            "video_id": video_id,
+            "url": url,
+            "language": getattr(transcript, "language_code", language),
+            "transcript": text,
+            "snippet_count": len(snippets),
+        })

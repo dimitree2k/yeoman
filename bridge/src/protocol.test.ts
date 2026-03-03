@@ -46,6 +46,25 @@ test('parseBridgeCommand accepts send_text with replyToMessageId', () => {
   }
 });
 
+test('parseBridgeCommand accepts send_text with mentions', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_text',
+    token: 'secret',
+    requestId: 'req-mentions',
+    payload: {
+      to: '12345@g.us',
+      text: '@12345 hello',
+      mentions: ['12345@lid'],
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'send_text');
+  }
+});
+
 test('parseBridgeCommand accepts send_media with mediaPath', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,
@@ -63,6 +82,25 @@ test('parseBridgeCommand accepts send_media with mediaPath', () => {
   assert.equal(parsed.ok, true);
   if (parsed.ok) {
     assert.equal(parsed.command.type, 'send_media');
+  }
+});
+
+test('parseBridgeCommand rejects send_text with malformed mentions', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_text',
+    token: 'secret',
+    requestId: 'req-bad-mentions',
+    payload: {
+      to: '12345@g.us',
+      text: '@12345 hello',
+      mentions: '12345@lid',
+    },
+  });
+
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.error.code, 'ERR_SCHEMA');
   }
 });
 

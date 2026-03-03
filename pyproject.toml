@@ -30,6 +30,7 @@ dependencies = [
     "python-telegram-bot[socks]>=22.6",
     "lark-oapi>=1.5.3",
     "socksio>=1.0.0",
+    "youtube-transcript-api>=1.0.0",
 ]
 
 [project.optional-dependencies]

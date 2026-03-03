@@ -25,7 +25,7 @@ from yeoman.agent.tools.registry import ToolRegistry
 from yeoman.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from yeoman.agent.tools.shell import ExecTool
 from yeoman.agent.tools.spawn import SpawnTool
-from yeoman.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
+from yeoman.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool, YoutubeTranscriptTool
 from yeoman.bus.events import OutboundMessage
 from yeoman.bus.queue import MessageBus
 from yeoman.core.models import InboundEvent, PolicyDecision
@@ -170,6 +170,7 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
+        self.tools.register(YoutubeTranscriptTool())
 
         from yeoman.agent.tools.browse import BrowseTool
 

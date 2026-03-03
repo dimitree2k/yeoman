@@ -69,6 +69,28 @@ def _markdown_to_whatsapp(text: str) -> str:
     return text.strip()
 
 
+_WHATSAPP_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+(?:@[^\s@]+)?)")
+
+
+def _normalize_whatsapp_jid(value: str) -> str:
+    """Normalize WhatsApp JIDs into a stable wire format."""
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    left, sep, right = token.partition("@")
+    left = left.split(":", 1)[0].strip()
+    right = right.strip()
+    if not left:
+        return ""
+    return f"{left}@{right}" if sep and right else left
+
+
+def _whatsapp_jid_user_token(value: str) -> str:
+    """Extract the user token portion from a WhatsApp JID."""
+    normalized = _normalize_whatsapp_jid(value)
+    return normalized.split("@", 1)[0] if normalized else ""
+
+
 PROTOCOL_VERSION = 2
 DEDUPE_TTL_SECONDS = 20 * 60
 DEDUPE_CLEANUP_INTERVAL_SECONDS = 30
@@ -360,6 +382,8 @@ class WhatsAppChannel(BaseChannel):
 
         reply_to = str(msg.reply_to or "").strip() or None
         text = _markdown_to_whatsapp(msg.content)
+        mentions = self._resolve_outbound_mentions(text, msg.metadata)
+        allow_mentions = bool(mentions) and msg.chat_id.endswith("@g.us")
 
         if msg.media:
             caption_used = False
@@ -399,6 +423,8 @@ class WhatsAppChannel(BaseChannel):
                 }
                 if reply_to:
                     payload["replyToMessageId"] = reply_to
+                if allow_mentions and caption:
+                    payload["mentions"] = list(mentions)
 
                 await self._send_command_with_retry(
                     "send_media",
@@ -429,6 +455,8 @@ class WhatsAppChannel(BaseChannel):
         }
         if reply_to:
             payload["replyToMessageId"] = reply_to
+        if allow_mentions:
+            payload["mentions"] = list(mentions)
 
         await self._send_command_with_retry(
             "send_text",
@@ -1240,6 +1268,7 @@ class WhatsAppChannel(BaseChannel):
         if command_type == "send_text":
             summary["text_len"] = len(str(payload.get("text") or ""))
             summary["reply_to"] = bool(payload.get("replyToMessageId"))
+            summary["mentions"] = len(payload.get("mentions") or [])
             return summary
         if command_type == "send_media":
             summary["has_media_path"] = bool(payload.get("mediaPath"))
@@ -1247,6 +1276,7 @@ class WhatsAppChannel(BaseChannel):
             summary["file_name"] = payload.get("fileName")
             summary["caption_len"] = len(str(payload.get("caption") or ""))
             summary["reply_to"] = bool(payload.get("replyToMessageId"))
+            summary["mentions"] = len(payload.get("mentions") or [])
             return summary
         if command_type == "presence_update":
             summary["state"] = payload.get("state")
@@ -1258,6 +1288,67 @@ class WhatsAppChannel(BaseChannel):
             summary["emoji"] = payload.get("emoji")
             return summary
         return summary
+
+    @staticmethod
+    def _string_list(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    def _resolve_outbound_mentions(
+        self, text: str, metadata: dict[str, object] | None
+    ) -> list[str]:
+        if not text or not isinstance(metadata, dict):
+            return []
+
+        explicit_mentions: list[str] = []
+        explicit_seen: set[str] = set()
+        for raw in self._string_list(metadata.get("mentions")):
+            normalized = _normalize_whatsapp_jid(raw)
+            if not normalized or normalized in explicit_seen:
+                continue
+            explicit_seen.add(normalized)
+            explicit_mentions.append(normalized)
+        if explicit_mentions:
+            return explicit_mentions
+
+        candidates_by_full: dict[str, str] = {}
+        candidates_by_token: dict[str, str] = {}
+        for raw in self._string_list(metadata.get("mention_candidates")):
+            normalized = _normalize_whatsapp_jid(raw)
+            if not normalized:
+                continue
+            candidates_by_full.setdefault(normalized.lower(), normalized)
+            token = _whatsapp_jid_user_token(normalized)
+            if not token:
+                continue
+            lowered = token.lower()
+            candidates_by_token.setdefault(lowered, normalized)
+            if token.startswith("+"):
+                candidates_by_token.setdefault(token[1:].lower(), normalized)
+            elif token.isdigit():
+                candidates_by_token.setdefault(f"+{token}".lower(), normalized)
+
+        if not candidates_by_full and not candidates_by_token:
+            return []
+
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for match in _WHATSAPP_MENTION_RE.finditer(text):
+            raw_token = str(match.group(1) or "").strip()
+            if not raw_token:
+                continue
+            candidate: str | None = None
+            if "@" in raw_token:
+                candidate = candidates_by_full.get(_normalize_whatsapp_jid(raw_token).lower())
+            else:
+                candidate = candidates_by_token.get(raw_token.lower())
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            resolved.append(candidate)
+
+        return resolved
 
     async def _wait_connected_for_send(self, timeout_seconds: float) -> bool:
         if self._connected and self._ws is not None:

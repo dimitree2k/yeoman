@@ -31,6 +31,41 @@ _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
 _REACTION_SUFFIX_RE = re.compile(r"^([\s\S]+?)\n+::reaction::([^\n]+?)\s*$")
 
 
+def _normalize_whatsapp_jid(value: str) -> str:
+    """Normalize a WhatsApp JID into a stable comparison form."""
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    left, sep, right = token.partition("@")
+    left = left.split(":", 1)[0].strip()
+    right = right.strip()
+    if not left:
+        return ""
+    return f"{left}@{right}" if sep and right else left
+
+
+def _collect_whatsapp_mention_candidates(event: "InboundEvent") -> list[str]:
+    """Collect likely WhatsApp mention targets from the triggering event."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    raw_values: list[object] = [event.participant, event.reply_to_participant]
+    raw_mentions = event.raw_metadata.get("mentioned_jids")
+    if isinstance(raw_mentions, list):
+        raw_values.extend(raw_mentions)
+
+    for raw in raw_values:
+        if not isinstance(raw, str):
+            continue
+        normalized = _normalize_whatsapp_jid(raw)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    return candidates
+
+
 class OutboundMiddleware:
     """Assemble final outbound intent from the reply in ``ctx.reply``.
 
@@ -149,11 +184,18 @@ class OutboundMiddleware:
             and (event.mentioned_bot or event.reply_to_bot)
         )
 
+        outbound_metadata: dict[str, object] = {}
+        if outbound_channel == "whatsapp":
+            mention_candidates = _collect_whatsapp_mention_candidates(event)
+            if mention_candidates:
+                outbound_metadata["mention_candidates"] = mention_candidates
+
         outbound = OutboundEvent(
             channel=outbound_channel,
             chat_id=outbound_chat_id,
             content=reply,
             reply_to=event.message_id if should_thread else None,
+            metadata=outbound_metadata,
         )
 
         # ── Voice reply ──────────────────────────────────────────────
