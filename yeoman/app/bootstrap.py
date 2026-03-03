@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -328,6 +329,15 @@ def build_gateway_runtime(
         max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
     )
 
+    # CalDAV service — enabled when iCloud credentials are in env
+    _caldav_service = None
+    _caldav_user = os.environ.get("ICLOUD_CALDAV_USERNAME")
+    _caldav_pass = os.environ.get("ICLOUD_CALDAV_APP_PASSWORD")
+    if _caldav_user and _caldav_pass:
+        from yeoman.caldav.service import CalDAVService
+        _caldav_service = CalDAVService(_caldav_user, _caldav_pass)
+        logger.info("CalDAV service enabled for {}", _caldav_user)
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -343,6 +353,7 @@ def build_gateway_runtime(
         telemetry=telemetry,
         security=security,
         cron_service=cron,
+        caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
         group_resolver=policy_adapter.resolve_whatsapp_group,

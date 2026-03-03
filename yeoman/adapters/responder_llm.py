@@ -35,6 +35,7 @@ from yeoman.providers.base import LLMProvider
 from yeoman.session.manager import SessionManager
 
 if TYPE_CHECKING:
+    from yeoman.caldav.service import CalDAVService
     from yeoman.config.schema import ExecToolConfig
     from yeoman.cron.service import CronService
     from yeoman.media.router import ModelRouter
@@ -65,6 +66,7 @@ class LLMResponder(ResponderPort):
         tavily_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
+        caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         memory_service: "MemoryService | None" = None,
@@ -88,6 +90,7 @@ class LLMResponder(ResponderPort):
         self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self.caldav_service = caldav_service
         self.memory = memory_service
         self.telemetry = telemetry
         self.security = security
@@ -194,6 +197,11 @@ class LLMResponder(ResponderPort):
         if self.cron_service is not None:
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
+
+        # Calendar — only if CalDAV credentials are configured
+        if self.caldav_service is not None:
+            from yeoman.agent.tools.calendar import CalendarTool
+            self.tools.register(CalendarTool(self.caldav_service))
 
     def _metric(
         self,
