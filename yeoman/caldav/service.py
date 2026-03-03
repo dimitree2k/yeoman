@@ -4,6 +4,7 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 
 import caldav
+import caldav.lib.error
 import icalendar
 from loguru import logger
 
@@ -225,10 +226,17 @@ class CalDAVService:
         def _create() -> EventInfo:
             cal = self._get_calendar(calendar)
 
+            if all_day:
+                dtstart = start.date() if isinstance(start, datetime) else start
+                dtend = end.date() if isinstance(end, datetime) else end
+            else:
+                dtstart = start
+                dtend = end
+
             kwargs: dict = {
                 "summary": summary,
-                "dtstart": start,
-                "dtend": end,
+                "dtstart": dtstart,
+                "dtend": dtend,
             }
             if location:
                 kwargs["location"] = location
@@ -296,23 +304,10 @@ class CalDAVService:
         """
         def _update() -> EventInfo:
             cal = self._get_calendar(calendar)
-            # Find the event by UID
-            events = cal.search(event=True)
-            target = None
-            for ev in events:
-                try:
-                    ical = ev.icalendar_instance
-                    for component in ical.walk():
-                        if component.name == "VEVENT" and str(component.get("UID", "")) == event_id:
-                            target = ev
-                            break
-                    if target:
-                        break
-                except Exception:
-                    continue
-
-            if target is None:
-                raise ValueError(f"Event with UID '{event_id}' not found in calendar '{calendar}'")
+            try:
+                target = cal.event_by_uid(event_id)
+            except caldav.lib.error.NotFoundError:
+                raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
 
             # Map field names to iCal property names
             field_map = {
@@ -361,17 +356,11 @@ class CalDAVService:
         """
         def _delete() -> None:
             cal = self._get_calendar(calendar)
-            events = cal.search(event=True)
-            for ev in events:
-                try:
-                    ical = ev.icalendar_instance
-                    for component in ical.walk():
-                        if component.name == "VEVENT" and str(component.get("UID", "")) == event_id:
-                            ev.delete()
-                            return
-                except Exception:
-                    continue
-            raise ValueError(f"Event with UID '{event_id}' not found in calendar '{calendar}'")
+            try:
+                event = cal.event_by_uid(event_id)
+            except caldav.lib.error.NotFoundError:
+                raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
+            event.delete()
 
         await asyncio.to_thread(_delete)
 

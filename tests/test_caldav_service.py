@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 import icalendar
+import pytest
 
 from yeoman.caldav.service import CalDAVService
 from yeoman.caldav.types import CalendarInfo
@@ -17,6 +18,16 @@ DTEND:20260315T110000Z
 SUMMARY:Dentist Appointment
 LOCATION:Dr. Smith, 123 Main St
 DESCRIPTION:Annual checkup
+END:VEVENT
+END:VCALENDAR"""
+
+SAMPLE_ALL_DAY_ICAL = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:test-uid-allday
+DTSTART;VALUE=DATE:20260315
+DTEND;VALUE=DATE:20260316
+SUMMARY:Company Holiday
 END:VEVENT
 END:VCALENDAR"""
 
@@ -139,3 +150,36 @@ async def test_list_calendars() -> None:
     assert calendars[0].calendar_id == "https://caldav.icloud.com/personal/"
     assert calendars[1].name == "Work"
     assert calendars[1].calendar_id == "https://caldav.icloud.com/work/"
+
+
+def test_parse_event_all_day() -> None:
+    """Parse an all-day VEVENT, verify all_day=True and date boundaries."""
+    component = _get_vevent(SAMPLE_ALL_DAY_ICAL)
+    event = CalDAVService._parse_event(component, calendar_name="Work")
+
+    assert event.uid == "test-uid-allday"
+    assert event.summary == "Company Holiday"
+    assert event.all_day is True
+    assert event.start == datetime(2026, 3, 15, 0, 0, 0, tzinfo=timezone.utc)
+    assert event.end == datetime(2026, 3, 16, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_get_calendar_not_found() -> None:
+    """_get_calendar raises ValueError listing available calendars when name not found."""
+    fake_calendars = [
+        FakeCalendar("Family", "https://caldav.icloud.com/family/"),
+        FakeCalendar("Work", "https://caldav.icloud.com/work/"),
+    ]
+    fake_principal = FakePrincipal(fake_calendars)
+    fake_client = FakeDAVClient(fake_principal)
+
+    service = CalDAVService(username="test", app_password="test")
+    service._client = fake_client  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="not found") as exc_info:
+        service._get_calendar("Nonexistent")
+
+    # Verify available calendars are listed in the error message
+    msg = str(exc_info.value)
+    assert "Family" in msg
+    assert "Work" in msg
