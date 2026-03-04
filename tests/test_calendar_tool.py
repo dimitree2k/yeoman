@@ -115,3 +115,43 @@ async def test_missing_required_summary(tool: CalendarTool):
     result = await tool.execute(action="create_event", calendar="Family", start="2026-03-20T12:00:00Z")
     assert "error" in result.lower()
     assert "summary" in result.lower()
+
+
+async def test_search_events(tool: CalendarTool, mock_service):
+    mock_service.search_events.return_value = [
+        EventInfo(
+            uid="found-1",
+            summary="Hotel Booking Frankfurt",
+            start=datetime(2026, 3, 25, 14, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 3, 27, 11, 0, tzinfo=timezone.utc),
+            calendar_name="Family",
+        ),
+    ]
+    result = await tool.execute(action="search_events", query="Frankfurt")
+    assert "Frankfurt" in result
+    assert "found-1" in result
+    mock_service.search_events.assert_awaited_once()
+
+
+async def test_update_event(tool: CalendarTool, mock_service):
+    mock_service.update_event.return_value = EventInfo(
+        uid="uid-1",
+        summary="Dentist (rescheduled)",
+        start=datetime(2026, 3, 16, 14, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 3, 16, 15, 0, tzinfo=timezone.utc),
+        calendar_name="Family",
+    )
+    result = await tool.execute(
+        action="update_event",
+        calendar="Family",
+        event_id="uid-1",
+        summary="Dentist (rescheduled)",
+    )
+    assert "Dentist (rescheduled)" in result
+    mock_service.update_event.assert_awaited_once()
+
+
+async def test_search_events_missing_query(tool: CalendarTool):
+    result = await tool.execute(action="search_events")
+    assert "error" in result.lower()
+    assert "query" in result.lower()
