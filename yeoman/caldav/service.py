@@ -35,6 +35,23 @@ class CalDAVService:
             )
         return self._client
 
+    def _reconnect(self) -> caldav.DAVClient:
+        """Force a new connection (e.g. after session expiry)."""
+        self._client = None
+        return self._connect()
+
+    def _with_retry(self, fn):
+        """Run fn(), retrying once with a fresh connection on auth/connection errors."""
+        try:
+            return fn()
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if any(k in err_str for k in ("401", "403", "unauthorized", "connection", "timeout")):
+                logger.warning("CalDAV connection error, reconnecting: {}", exc)
+                self._reconnect()
+                return fn()
+            raise
+
     def _get_calendar(self, name: str) -> caldav.Calendar:
         """Find a calendar by display name.
 
@@ -157,29 +174,31 @@ class CalDAVService:
 
     async def list_calendars(self) -> list[CalendarInfo]:
         """List all calendars accessible by the user."""
-        def _list() -> list[CalendarInfo]:
-            client = self._connect()
-            principal = client.principal()
-            calendars = principal.calendars()
-            result: list[CalendarInfo] = []
-            for cal in calendars:
-                cal_id = str(cal.url) if cal.url else ""
-                color: str | None = None
-                try:
-                    color_prop = cal.get_property(caldav.elements.ical.CalendarColor())
-                    if color_prop:
-                        color = str(color_prop)
-                except Exception:
-                    pass
-                result.append(CalendarInfo(
-                    name=cal.name or "",
-                    calendar_id=cal_id,
-                    color=color,
-                    description=None,
-                ))
-            return result
+        def _sync() -> list[CalendarInfo]:
+            def _do():
+                client = self._connect()
+                principal = client.principal()
+                calendars = principal.calendars()
+                result: list[CalendarInfo] = []
+                for cal in calendars:
+                    cal_id = str(cal.url) if cal.url else ""
+                    color: str | None = None
+                    try:
+                        color_prop = cal.get_property(caldav.elements.ical.CalendarColor())
+                        if color_prop:
+                            color = str(color_prop)
+                    except Exception:
+                        pass
+                    result.append(CalendarInfo(
+                        name=cal.name or "",
+                        calendar_id=cal_id,
+                        color=color,
+                        description=None,
+                    ))
+                return result
+            return self._with_retry(_do)
 
-        return await asyncio.to_thread(_list)
+        return await asyncio.to_thread(_sync)
 
     async def list_events(
         self,
@@ -188,27 +207,29 @@ class CalDAVService:
         end: datetime,
     ) -> list[EventInfo]:
         """List events in a calendar within a date range."""
-        def _list() -> list[EventInfo]:
-            cal = self._get_calendar(calendar)
-            events = cal.search(
-                start=start,
-                end=end,
-                event=True,
-                expand=True,
-            )
-            result: list[EventInfo] = []
-            for event in events:
-                try:
-                    ical = event.icalendar_instance
-                    for component in ical.walk():
-                        if component.name == "VEVENT":
-                            result.append(self._parse_event(component, calendar_name=calendar))
-                except Exception as e:
-                    logger.warning(f"Failed to parse event: {e}")
-            result.sort(key=lambda e: e.start)
-            return result
+        def _sync() -> list[EventInfo]:
+            def _do():
+                cal = self._get_calendar(calendar)
+                events = cal.search(
+                    start=start,
+                    end=end,
+                    event=True,
+                    expand=True,
+                )
+                result: list[EventInfo] = []
+                for event in events:
+                    try:
+                        ical = event.icalendar_instance
+                        for component in ical.walk():
+                            if component.name == "VEVENT":
+                                result.append(self._parse_event(component, calendar_name=calendar))
+                    except Exception as e:
+                        logger.warning(f"Failed to parse event: {e}")
+                result.sort(key=lambda e: e.start)
+                return result
+            return self._with_retry(_do)
 
-        return await asyncio.to_thread(_list)
+        return await asyncio.to_thread(_sync)
 
     async def create_event(
         self,
@@ -223,69 +244,71 @@ class CalDAVService:
         reminders: list[Reminder] | None = None,
     ) -> EventInfo:
         """Create a new event in a calendar."""
-        def _create() -> EventInfo:
-            cal = self._get_calendar(calendar)
+        def _sync() -> EventInfo:
+            def _do():
+                cal = self._get_calendar(calendar)
 
-            if all_day:
-                dtstart = start.date() if isinstance(start, datetime) else start
-                dtend = end.date() if isinstance(end, datetime) else end
-            else:
-                dtstart = start
-                dtend = end
+                if all_day:
+                    dtstart = start.date() if isinstance(start, datetime) else start
+                    dtend = end.date() if isinstance(end, datetime) else end
+                else:
+                    dtstart = start
+                    dtend = end
 
-            kwargs: dict = {
-                "summary": summary,
-                "dtstart": dtstart,
-                "dtend": dtend,
-            }
-            if location:
-                kwargs["location"] = location
-            if description:
-                kwargs["description"] = description
+                kwargs: dict = {
+                    "summary": summary,
+                    "dtstart": dtstart,
+                    "dtend": dtend,
+                }
+                if location:
+                    kwargs["location"] = location
+                if description:
+                    kwargs["description"] = description
 
-            # Handle recurrence rule
-            if recurrence:
-                rrule_dict: dict = {"FREQ": recurrence.freq}
-                if recurrence.interval != 1:
-                    rrule_dict["INTERVAL"] = recurrence.interval
-                if recurrence.until:
-                    rrule_dict["UNTIL"] = recurrence.until
-                if recurrence.count:
-                    rrule_dict["COUNT"] = recurrence.count
-                if recurrence.by_day:
-                    rrule_dict["BYDAY"] = recurrence.by_day
-                kwargs["rrule"] = rrule_dict
+                # Handle recurrence rule
+                if recurrence:
+                    rrule_dict: dict = {"FREQ": recurrence.freq}
+                    if recurrence.interval != 1:
+                        rrule_dict["INTERVAL"] = recurrence.interval
+                    if recurrence.until:
+                        rrule_dict["UNTIL"] = recurrence.until
+                    if recurrence.count:
+                        rrule_dict["COUNT"] = recurrence.count
+                    if recurrence.by_day:
+                        rrule_dict["BYDAY"] = recurrence.by_day
+                    kwargs["rrule"] = rrule_dict
 
-            # Handle reminders — first one via alarm_trigger/alarm_action kwargs
-            if reminders and len(reminders) > 0:
-                kwargs["alarm_trigger"] = timedelta(minutes=-reminders[0].minutes_before)
-                kwargs["alarm_action"] = "DISPLAY"
+                # Handle reminders — first one via alarm_trigger/alarm_action kwargs
+                if reminders and len(reminders) > 0:
+                    kwargs["alarm_trigger"] = timedelta(minutes=-reminders[0].minutes_before)
+                    kwargs["alarm_action"] = "DISPLAY"
 
-            event = cal.add_event(**kwargs)
+                event = cal.add_event(**kwargs)
 
-            # Handle additional reminders (beyond the first) by editing the ical
-            if reminders and len(reminders) > 1:
-                with event.edit_icalendar_instance() as ical_obj:
-                    for component in ical_obj.walk():
-                        if component.name == "VEVENT":
-                            for reminder in reminders[1:]:
-                                alarm = icalendar.Alarm()
-                                alarm.add("ACTION", "DISPLAY")
-                                alarm.add("TRIGGER", timedelta(minutes=-reminder.minutes_before))
-                                alarm.add("DESCRIPTION", "Reminder")
-                                component.add_component(alarm)
-                            break
-                event.save()
+                # Handle additional reminders (beyond the first) by editing the ical
+                if reminders and len(reminders) > 1:
+                    with event.edit_icalendar_instance() as ical_obj:
+                        for component in ical_obj.walk():
+                            if component.name == "VEVENT":
+                                for reminder in reminders[1:]:
+                                    alarm = icalendar.Alarm()
+                                    alarm.add("ACTION", "DISPLAY")
+                                    alarm.add("TRIGGER", timedelta(minutes=-reminder.minutes_before))
+                                    alarm.add("DESCRIPTION", "Reminder")
+                                    component.add_component(alarm)
+                                break
+                    event.save()
 
-            # Parse back the created event
-            ical = event.icalendar_instance
-            for component in ical.walk():
-                if component.name == "VEVENT":
-                    return self._parse_event(component, calendar_name=calendar)
+                # Parse back the created event
+                ical = event.icalendar_instance
+                for component in ical.walk():
+                    if component.name == "VEVENT":
+                        return self._parse_event(component, calendar_name=calendar)
 
-            raise RuntimeError("Created event but failed to parse it back")
+                raise RuntimeError("Created event but failed to parse it back")
+            return self._with_retry(_do)
 
-        return await asyncio.to_thread(_create)
+        return await asyncio.to_thread(_sync)
 
     async def update_event(
         self,
@@ -302,44 +325,46 @@ class CalDAVService:
             apply_to: For recurring events: "this", "all", or "future".
             **changes: Fields to update (summary, start, end, location, description, etc.).
         """
-        def _update() -> EventInfo:
-            cal = self._get_calendar(calendar)
-            try:
-                target = cal.event_by_uid(event_id)
-            except caldav.lib.error.NotFoundError:
-                raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
+        def _sync() -> EventInfo:
+            def _do():
+                cal = self._get_calendar(calendar)
+                try:
+                    target = cal.event_by_uid(event_id)
+                except caldav.lib.error.NotFoundError:
+                    raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
 
-            # Map field names to iCal property names
-            field_map = {
-                "summary": "SUMMARY",
-                "start": "DTSTART",
-                "end": "DTEND",
-                "location": "LOCATION",
-                "description": "DESCRIPTION",
-            }
+                # Map field names to iCal property names
+                field_map = {
+                    "summary": "SUMMARY",
+                    "start": "DTSTART",
+                    "end": "DTEND",
+                    "location": "LOCATION",
+                    "description": "DESCRIPTION",
+                }
 
-            with target.edit_icalendar_instance() as ical_obj:
-                for component in ical_obj.walk():
+                with target.edit_icalendar_instance() as ical_obj:
+                    for component in ical_obj.walk():
+                        if component.name == "VEVENT":
+                            for field_name, value in changes.items():
+                                ical_prop = field_map.get(field_name)
+                                if ical_prop and value is not None:
+                                    # Remove existing then add new
+                                    component.pop(ical_prop, None)
+                                    component.add(ical_prop, value)
+                            break
+
+                target.save()
+
+                # Parse back the updated event
+                ical = target.icalendar_instance
+                for component in ical.walk():
                     if component.name == "VEVENT":
-                        for field_name, value in changes.items():
-                            ical_prop = field_map.get(field_name)
-                            if ical_prop and value is not None:
-                                # Remove existing then add new
-                                component.pop(ical_prop, None)
-                                component.add(ical_prop, value)
-                        break
+                        return self._parse_event(component, calendar_name=calendar)
 
-            target.save()
+                raise RuntimeError("Updated event but failed to parse it back")
+            return self._with_retry(_do)
 
-            # Parse back the updated event
-            ical = target.icalendar_instance
-            for component in ical.walk():
-                if component.name == "VEVENT":
-                    return self._parse_event(component, calendar_name=calendar)
-
-            raise RuntimeError("Updated event but failed to parse it back")
-
-        return await asyncio.to_thread(_update)
+        return await asyncio.to_thread(_sync)
 
     async def delete_event(
         self,
@@ -354,15 +379,17 @@ class CalDAVService:
             event_id: The UID of the event to delete.
             apply_to: For recurring events: "this", "all", or "future".
         """
-        def _delete() -> None:
-            cal = self._get_calendar(calendar)
-            try:
-                event = cal.event_by_uid(event_id)
-            except caldav.lib.error.NotFoundError:
-                raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
-            event.delete()
+        def _sync() -> None:
+            def _do():
+                cal = self._get_calendar(calendar)
+                try:
+                    event = cal.event_by_uid(event_id)
+                except caldav.lib.error.NotFoundError:
+                    raise ValueError(f"Event '{event_id}' not found in calendar '{calendar}'")
+                event.delete()
+            return self._with_retry(_do)
 
-        await asyncio.to_thread(_delete)
+        await asyncio.to_thread(_sync)
 
     async def search_events(
         self,
@@ -382,50 +409,52 @@ class CalDAVService:
             start: Start of date range (default: 30 days ago).
             end: End of date range (default: 365 days from now).
         """
-        def _search() -> list[EventInfo]:
-            now = datetime.now(tz=timezone.utc)
-            search_start = start or (now - timedelta(days=30))
-            search_end = end or (now + timedelta(days=365))
-            query_lower = query.lower()
+        def _sync() -> list[EventInfo]:
+            def _do():
+                now = datetime.now(tz=timezone.utc)
+                search_start = start or (now - timedelta(days=30))
+                search_end = end or (now + timedelta(days=365))
+                query_lower = query.lower()
 
-            if calendar:
-                calendars = [self._get_calendar(calendar)]
-            else:
-                client = self._connect()
-                principal = client.principal()
-                calendars = principal.calendars()
+                if calendar:
+                    calendars = [self._get_calendar(calendar)]
+                else:
+                    client = self._connect()
+                    principal = client.principal()
+                    calendars = principal.calendars()
 
-            result: list[EventInfo] = []
-            for cal in calendars:
-                cal_name = cal.name or ""
-                try:
-                    events = cal.search(
-                        start=search_start,
-                        end=search_end,
-                        event=True,
-                        expand=True,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to search calendar '{cal_name}': {e}")
-                    continue
-
-                for event in events:
+                result: list[EventInfo] = []
+                for cal in calendars:
+                    cal_name = cal.name or ""
                     try:
-                        ical = event.icalendar_instance
-                        for component in ical.walk():
-                            if component.name == "VEVENT":
-                                summary = str(component.get("SUMMARY", "")).lower()
-                                desc = str(component.get("DESCRIPTION", "")).lower()
-                                loc = str(component.get("LOCATION", "")).lower()
-
-                                if query_lower in summary or query_lower in desc or query_lower in loc:
-                                    result.append(
-                                        self._parse_event(component, calendar_name=cal_name)
-                                    )
+                        events = cal.search(
+                            start=search_start,
+                            end=search_end,
+                            event=True,
+                            expand=True,
+                        )
                     except Exception as e:
-                        logger.warning(f"Failed to parse event during search: {e}")
+                        logger.warning(f"Failed to search calendar '{cal_name}': {e}")
+                        continue
 
-            result.sort(key=lambda e: e.start)
-            return result
+                    for event in events:
+                        try:
+                            ical = event.icalendar_instance
+                            for component in ical.walk():
+                                if component.name == "VEVENT":
+                                    summary = str(component.get("SUMMARY", "")).lower()
+                                    desc = str(component.get("DESCRIPTION", "")).lower()
+                                    loc = str(component.get("LOCATION", "")).lower()
 
-        return await asyncio.to_thread(_search)
+                                    if query_lower in summary or query_lower in desc or query_lower in loc:
+                                        result.append(
+                                            self._parse_event(component, calendar_name=cal_name)
+                                        )
+                        except Exception as e:
+                            logger.warning(f"Failed to parse event during search: {e}")
+
+                result.sort(key=lambda e: e.start)
+                return result
+            return self._with_retry(_do)
+
+        return await asyncio.to_thread(_sync)
