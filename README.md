@@ -275,6 +275,35 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 
 ## Changelog
 
+### v0.3.0 — Mar 2026
+
+#### Calendar
+- Full CalDAV integration: create, read, update, delete events via natural language
+- `CalendarTool` registered in gateway with session reconnection on expiry
+- Supports all-day events, UID-based lookup, and multi-calendar accounts
+
+#### WhatsApp
+- Mention support for `send_text` and `send_media`
+- Separate debounce timing for media messages (reduces duplicate processing)
+
+#### Agent & Skills
+- **Sync subagent**: synchronous subagent execution for tool-within-tool patterns
+- **Fact check tool**: producer-reviewer pattern via sync subagent for verifiable claims
+- Fact verification guardrails in system prompt to reduce hallucination
+- YouTube / summarize skill: improved trigger detection for bare URLs and varied phrases
+- Style Persistence: anti-repetition and brief-acknowledgment rules in context builder
+
+#### Security
+- Reduced false positives in prompt injection classifier
+- Reduced false positives in persona manipulation classifier
+
+#### Session & Memory
+- Tool call traces persisted to session JSONL for auditability
+- `get_history()` defensively skips legacy/malformed rows missing `content` key (crash fix)
+
+#### Ops
+- Temperature reduced 0.8 → 0.6 for `assistantDefault`, `moneyboy`, `grokFast` profiles
+
 ### v0.2.0 — Feb 2026
 
 - Renamed project from nanobotstack to yeoman
