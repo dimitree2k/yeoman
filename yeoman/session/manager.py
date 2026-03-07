@@ -65,12 +65,28 @@ class Session:
         Returns:
             List of messages in LLM format (tool traces excluded).
         """
-        # Filter out tool traces for LLM context
-        chat_messages = [m for m in self.messages if m["role"] != "tool_trace"]
-        recent = chat_messages[-max_messages:] if len(chat_messages) > max_messages else chat_messages
+        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
 
-        # Convert to LLM format (just role and content)
-        return [{"role": m["role"], "content": m["content"]} for m in recent]
+        # Convert to LLM format (just role and content), skipping internal or malformed rows.
+        history: list[dict[str, Any]] = []
+        allowed_roles = {"system", "user", "assistant"}
+        for message in recent:
+            role = str(message.get("role") or "").strip()
+            if role == "tool_trace" or role not in allowed_roles:
+                continue
+
+            if "content" not in message:
+                # Backward compatibility for legacy rows that were not user/assistant text.
+                continue
+
+            content = message.get("content")
+            if content is None:
+                content = ""
+            if not isinstance(content, (str, list, dict)):
+                content = str(content)
+
+            history.append({"role": role, "content": content})
+        return history
 
     def get_full_history(self) -> list[dict[str, Any]]:
         """Return all messages including tool traces."""

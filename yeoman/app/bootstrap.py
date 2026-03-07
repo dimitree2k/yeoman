@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, assert_never
@@ -124,11 +125,14 @@ class OrchestratorService:
                 intents = await self._orchestrator.handle(event)
                 await self._dispatch_intents(intents)
             except Exception as e:
-                logger.opt(exception=True).error(
-                    "vnext orchestrator failure channel={} chat={}: {}",
+                tb = traceback.format_exc()
+                logger.error(
+                    "vnext orchestrator failure channel={} chat={}: {} (type={})\n{}",
                     event.channel,
                     event.chat_id,
                     e,
+                    type(e).__name__,
+                    tb,
                 )
                 await self._bus.publish_outbound(
                     OutboundMessage(
