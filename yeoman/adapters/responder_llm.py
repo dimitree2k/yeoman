@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from yeoman.cron.service import CronService
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
+    from yeoman.memory.core_blocks import CoreMemoryBlockStore
     from yeoman.memory.service import MemoryService
 
 
@@ -79,6 +80,7 @@ class LLMResponder(ResponderPort):
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        core_block_store: "CoreMemoryBlockStore | None" = None,
     ) -> None:
         from yeoman.config.schema import ExecToolConfig
 
@@ -101,6 +103,8 @@ class LLMResponder(ResponderPort):
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
+        self.core_block_store = core_block_store
+        self._core_memory_tools: list = []
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -193,6 +197,9 @@ class LLMResponder(ResponderPort):
 
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+
+        from yeoman.agent.tools.fact_check import FactCheckTool
+        self.tools.register(FactCheckTool(manager=self.subagents))
 
         if self.cron_service is not None:
             cron_tool = CronTool(self.cron_service)
