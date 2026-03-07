@@ -102,6 +102,96 @@ class SubagentManager:
         logger.info(f"Spawned subagent [{task_id}]: {display_label}")
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
+    async def spawn_sync(
+        self,
+        task: str,
+        label: str | None = None,
+        timeout_seconds: float = 120.0,
+    ) -> str:
+        """
+        Run a subagent synchronously — block until it returns a result.
+
+        Unlike spawn(), this does NOT announce results to a channel.
+        The caller gets the result string directly.
+        """
+        display_label = label or task[:30] + ("..." if len(task) > 30 else "")
+        task_id = str(uuid.uuid4())[:8]
+        logger.info(f"Sync subagent [{task_id}]: {display_label}")
+
+        try:
+            result = await asyncio.wait_for(
+                self._run_subagent_sync(task_id, task),
+                timeout=timeout_seconds,
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Sync subagent [{task_id}] timed out after {timeout_seconds}s")
+            return f"Subagent timed out after {timeout_seconds}s."
+
+    async def _run_subagent_sync(self, task_id: str, task: str) -> str:
+        """Execute subagent and return the result string (no channel announce)."""
+        exec_tool: ExecTool | None = None
+        try:
+            tools = ToolRegistry()
+            if self.file_access_resolver is not None:
+                tools.register(ReadFileTool(resolver=self.file_access_resolver))
+                tools.register(ListDirTool(resolver=self.file_access_resolver))
+            else:
+                allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
+                tools.register(ReadFileTool(allowed_dir=allowed_dir))
+                tools.register(ListDirTool(allowed_dir=allowed_dir))
+
+            tools.register(WebSearchTool(api_key=self.tavily_api_key))
+            tools.register(WebFetchTool(api_key=self.tavily_api_key))
+
+            system_prompt = self._build_subagent_prompt(task)
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task},
+            ]
+
+            max_iterations = 15
+            iteration = 0
+            final_result: str | None = None
+
+            while iteration < max_iterations:
+                iteration += 1
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=tools.get_definitions(),
+                    model=self.model,
+                )
+                if response.has_tool_calls:
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content or "",
+                        "tool_calls": tool_call_dicts,
+                    })
+                    for tool_call in response.tool_calls:
+                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        })
+                else:
+                    final_result = response.content
+                    break
+
+            return final_result or "Subagent completed with no response."
+        finally:
+            if exec_tool:
+                await exec_tool.aclose()
+
     async def _run_subagent(
         self,
         task_id: str,
