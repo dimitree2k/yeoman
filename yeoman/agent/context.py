@@ -229,6 +229,7 @@ For cross-chat voice requests, state only the real blocker (missing source messa
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        core_blocks: list | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -251,6 +252,19 @@ For cross-chat voice requests, state only the real blocker (missing source messa
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})
+
+        # Core memory blocks (editable via core_memory_* tools)
+        if core_blocks:
+            block_text = "\n\n".join(
+                f"### {b.label}\n{b.value or '(empty)'}" for b in core_blocks
+            )
+            core_memory_section = (
+                "# Core Memory (editable via core_memory_* tools)\n"
+                "These are your persistent notes for this conversation. "
+                "Update them with core_memory_replace and core_memory_append.\n\n"
+                + block_text
+            )
+            messages.append({"role": "system", "content": core_memory_section})
 
         # History
         messages.extend(history)

@@ -248,6 +248,11 @@ def build_gateway_runtime(
     """Compose full gateway runtime around vNext orchestrator."""
 
     from yeoman.utils.helpers import get_operational_data_path
+    from yeoman.memory.core_blocks import CoreMemoryBlockStore
+
+    core_block_store = CoreMemoryBlockStore(
+        get_operational_data_path() / "memory" / "core_blocks.json"
+    )
 
     session_manager = SessionManager(workspace)
     inbound_archive = InboundArchive(
@@ -360,6 +365,7 @@ def build_gateway_runtime(
         model_router=model_router,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
+        core_block_store=core_block_store,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
