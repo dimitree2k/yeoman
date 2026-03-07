@@ -107,6 +107,7 @@ class SubagentManager:
         task: str,
         label: str | None = None,
         timeout_seconds: float = 120.0,
+        memory_context: str | None = None,
     ) -> str:
         """
         Run a subagent synchronously — block until it returns a result.
@@ -120,7 +121,7 @@ class SubagentManager:
 
         try:
             result = await asyncio.wait_for(
-                self._run_subagent_sync(task_id, task),
+                self._run_subagent_sync(task_id, task, memory_context=memory_context),
                 timeout=timeout_seconds,
             )
             return result
@@ -128,7 +129,7 @@ class SubagentManager:
             logger.warning(f"Sync subagent [{task_id}] timed out after {timeout_seconds}s")
             return f"Subagent timed out after {timeout_seconds}s."
 
-    async def _run_subagent_sync(self, task_id: str, task: str) -> str:
+    async def _run_subagent_sync(self, task_id: str, task: str, memory_context: str | None = None) -> str:
         """Execute subagent and return the result string (no channel announce)."""
         exec_tool: ExecTool | None = None
         try:
@@ -145,6 +146,8 @@ class SubagentManager:
             tools.register(WebFetchTool(api_key=self.tavily_api_key))
 
             system_prompt = self._build_subagent_prompt(task)
+            if memory_context:
+                system_prompt += f"\n\n# Recalled Context\n{memory_context}"
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
