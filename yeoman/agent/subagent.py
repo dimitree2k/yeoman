@@ -131,69 +131,64 @@ class SubagentManager:
 
     async def _run_subagent_sync(self, task_id: str, task: str, memory_context: str | None = None) -> str:
         """Execute subagent and return the result string (no channel announce)."""
-        exec_tool: ExecTool | None = None
-        try:
-            tools = ToolRegistry()
-            if self.file_access_resolver is not None:
-                tools.register(ReadFileTool(resolver=self.file_access_resolver))
-                tools.register(ListDirTool(resolver=self.file_access_resolver))
-            else:
-                allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
-                tools.register(ReadFileTool(allowed_dir=allowed_dir))
-                tools.register(ListDirTool(allowed_dir=allowed_dir))
+        tools = ToolRegistry()
+        if self.file_access_resolver is not None:
+            tools.register(ReadFileTool(resolver=self.file_access_resolver))
+            tools.register(ListDirTool(resolver=self.file_access_resolver))
+        else:
+            allowed_dir = self.workspace if self.effective_restrict_to_workspace else None
+            tools.register(ReadFileTool(allowed_dir=allowed_dir))
+            tools.register(ListDirTool(allowed_dir=allowed_dir))
 
-            tools.register(WebSearchTool(api_key=self.tavily_api_key))
-            tools.register(WebFetchTool(api_key=self.tavily_api_key))
+        tools.register(WebSearchTool(api_key=self.tavily_api_key))
+        tools.register(WebFetchTool(api_key=self.tavily_api_key))
 
-            system_prompt = self._build_subagent_prompt(task)
-            if memory_context:
-                system_prompt += f"\n\n# Recalled Context\n{memory_context}"
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
+        system_prompt = self._build_subagent_prompt(task)
+        if memory_context:
+            system_prompt += f"\n\n# Recalled Context\n{memory_context}"
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
 
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
+        max_iterations = 15
+        iteration = 0
+        final_result: str | None = None
 
-            while iteration < max_iterations:
-                iteration += 1
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                )
-                if response.has_tool_calls:
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                        }
-                        for tc in response.tool_calls
-                    ]
+        while iteration < max_iterations:
+            iteration += 1
+            response = await self.provider.chat(
+                messages=messages,
+                tools=tools.get_definitions(),
+                model=self.model,
+            )
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages.append({
+                    "role": "assistant",
+                    "content": response.content or "",
+                    "tool_calls": tool_call_dicts,
+                })
+                for tool_call in response.tool_calls:
+                    result = await tools.execute(tool_call.name, tool_call.arguments)
                     messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "content": result,
                     })
-                    for tool_call in response.tool_calls:
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
+            else:
+                final_result = response.content
+                break
 
-            return final_result or "Subagent completed with no response."
-        finally:
-            if exec_tool:
-                await exec_tool.aclose()
+        return final_result or "Subagent completed with no response."
 
     async def _run_subagent(
         self,

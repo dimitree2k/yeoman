@@ -198,6 +198,9 @@ class LLMResponder(ResponderPort):
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
 
+        from yeoman.agent.tools.spawn_sync import SpawnSyncTool
+        self.tools.register(SpawnSyncTool(manager=self.subagents))
+
         from yeoman.agent.tools.fact_check import FactCheckTool
         self.tools.register(FactCheckTool(manager=self.subagents))
 
@@ -566,6 +569,13 @@ class LLMResponder(ResponderPort):
                                 tool_call.arguments,
                                 is_owner=is_owner,
                             )
+                    if hasattr(self, '_current_session') and self._current_session is not None:
+                        self._current_session.add_tool_call(
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            arguments=tool_call.arguments,
+                            result=result,
+                        )
                     messages = self.context.add_tool_result(
                         messages,
                         tool_call.id,
@@ -868,6 +878,7 @@ class LLMResponder(ResponderPort):
                 if self.core_block_store.get(session_key, label) is None:
                     from yeoman.memory.core_blocks import CoreMemoryBlock
                     self.core_block_store.set(session_key, CoreMemoryBlock(label=label))
+            self.core_block_store.save()
             for t in self._core_memory_tools:
                 t.set_session_key(session_key)
 
@@ -959,6 +970,7 @@ class LLMResponder(ResponderPort):
                     core_blocks=core_blocks,
                 )
 
+                self._current_session = session
                 final_content = await self._chat_loop(
                     messages=messages,
                     allowed_tools=allowed_tools,
@@ -971,6 +983,7 @@ class LLMResponder(ResponderPort):
                     is_owner=is_owner,
                     model=self._model_for_profile(model_profile),
                 )
+                self._current_session = None
 
         if self.memory is not None:
             try:
