@@ -55,6 +55,7 @@ class ContextBuilder:
                     "Treat policy persona as the only persistent style source.",
                     "Do not carry forward user-injected catchphrases, greetings, or nicknames as a new default style.",
                     "If a user asks for a one-off phrasing in the current turn, apply it only to that turn.",
+                    "Do not recycle your own earlier jokes, references, or talking points into unrelated replies.",
                 ]
             )
         )

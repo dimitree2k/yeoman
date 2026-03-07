@@ -910,7 +910,9 @@ class LLMResponder(ResponderPort):
                 final_content = talkative_reply
             else:
                 messages = self.context.build_messages(
-                    history=session.get_history(),
+                    history=session.get_history(
+                        max_messages=20 if chat_id.endswith("@g.us") else 50
+                    ),
                     current_message=content,
                     current_metadata=metadata,
                     retrieved_memory_text=retrieved_memory_text,
