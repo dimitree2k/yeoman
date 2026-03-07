@@ -36,6 +36,25 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    def add_tool_call(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        result: str,
+    ) -> None:
+        """Record a tool call trace (excluded from LLM context, kept for debugging)."""
+        msg = {
+            "role": "tool_trace",
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "arguments": arguments,
+            "result": result[:2000],  # truncate large results
+            "timestamp": datetime.now().isoformat(),
+        }
+        self.messages.append(msg)
+        self.updated_at = datetime.now()
+
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.
@@ -44,13 +63,18 @@ class Session:
             max_messages: Maximum messages to return.
 
         Returns:
-            List of messages in LLM format.
+            List of messages in LLM format (tool traces excluded).
         """
-        # Get recent messages
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        # Filter out tool traces for LLM context
+        chat_messages = [m for m in self.messages if m["role"] != "tool_trace"]
+        recent = chat_messages[-max_messages:] if len(chat_messages) > max_messages else chat_messages
 
         # Convert to LLM format (just role and content)
         return [{"role": m["role"], "content": m["content"]} for m in recent]
+
+    def get_full_history(self) -> list[dict[str, Any]]:
+        """Return all messages including tool traces."""
+        return list(self.messages)
 
     def clear(self) -> None:
         """Clear all messages in the session."""
