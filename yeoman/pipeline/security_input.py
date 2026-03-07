@@ -75,6 +75,18 @@ class InputSecurityMiddleware:
         await next(ctx)
 
     def _block(self, ctx: PipelineContext, decision: SecurityDecision) -> None:
+        logger.info(
+            "security_decision stage=input action=block severity={} reason={} tags={} context={}",
+            decision.severity,
+            decision.reason,
+            list(decision.tags),
+            {
+                "channel": ctx.event.channel,
+                "chat_id": ctx.event.chat_id,
+                "sender_id": ctx.event.sender_id,
+                "message_id": ctx.event.message_id or "",
+            },
+        )
         ctx.metric(
             "security_input_blocked",
             labels=(
