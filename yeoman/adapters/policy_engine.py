@@ -47,7 +47,7 @@ from yeoman.policy.schema import (
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
 )
-from yeoman.utils.helpers import safe_filename
+from yeoman.utils.helpers import get_operational_data_path, safe_filename
 
 if TYPE_CHECKING:
     from yeoman.session.manager import SessionManager
@@ -66,6 +66,30 @@ _POLICY_ADMIN_USAGE = (
     "/policy list-blocked <chat_id@g.us>\n"
     "/policy status-group <chat_id@g.us>"
 )
+
+_PAUSE_STATE_VERSION = 1
+_PAUSE_INDEFINITE = -1
+_PAUSE_DURATION_UNITS = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+}
+_PAUSE_DURATION_PATTERN = re.compile(r"^(?P<value>\d+)(?P<unit>[a-zA-Z]*)$")
 
 
 def _to_actor(event: InboundEvent) -> ActorContext:
@@ -138,12 +162,19 @@ class EnginePolicyAdapter(PolicyPort):
                 CommandCatalogCommandHandler(self),
                 DenyCommandHandler(self),
                 HelpAliasCommandHandler(self),
+                PauseCommandHandler(self),
                 PanicCommandHandler(self),
                 PolicyAdminCommandHandler(self),
+                StartCommandHandler(self),
+                StopCommandHandler(self),
                 VoiceMessagesCommandHandler(self),
                 ResetSessionCommandHandler(self),
             ]
         )
+        self._pause_state_path = self._resolve_pause_state_path()
+        self._global_pause_until_ms = 0
+        self._chat_pause_until_ms: dict[str, int] = {}
+        self._load_pause_state()
         self._last_reload_check = 0.0
         self._last_mtime_ns = self._stat_mtime_ns()
 
@@ -204,6 +235,178 @@ class EnginePolicyAdapter(PolicyPort):
             return self._policy_path.stat().st_mtime_ns
         except FileNotFoundError:
             return None
+
+    def _resolve_pause_state_path(self) -> Path:
+        if self._policy_path is not None:
+            base_dir = self._policy_path.parent
+            return base_dir / "data" / "policy" / "response_pauses.json"
+        return get_operational_data_path() / "policy" / "response_pauses.json"
+
+    @staticmethod
+    def _normalize_pause_until(value: object) -> int:
+        try:
+            parsed = int(str(value))
+        except (TypeError, ValueError):
+            return 0
+        if parsed == _PAUSE_INDEFINITE:
+            return _PAUSE_INDEFINITE
+        if parsed <= 0:
+            return 0
+        return parsed
+
+    def _load_pause_state(self) -> None:
+        path = self._pause_state_path
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+
+        global_until = data.get("global_until_ms")
+        if global_until is not None:
+            self._global_pause_until_ms = self._normalize_pause_until(global_until)
+
+        chat_payload = data.get("chat_until_ms")
+        if isinstance(chat_payload, dict):
+            parsed: dict[str, int] = {}
+            for raw_key, raw_until in chat_payload.items():
+                key = str(raw_key).strip()
+                if not key:
+                    continue
+                until = self._normalize_pause_until(raw_until)
+                if until == 0:
+                    continue
+                parsed[key] = until
+            self._chat_pause_until_ms = parsed
+
+    def _save_pause_state(self) -> None:
+        payload = {
+            "version": _PAUSE_STATE_VERSION,
+            "global_until_ms": int(self._global_pause_until_ms),
+            "chat_until_ms": {k: int(v) for k, v in sorted(self._chat_pause_until_ms.items())},
+        }
+        self._pause_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._pause_state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _pause_key(channel: str, chat_id: str) -> str:
+        return f"{channel}:{chat_id}"
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    @staticmethod
+    def _is_pause_until_active(until_ms: int, now_ms: int) -> bool:
+        return until_ms == _PAUSE_INDEFINITE or until_ms > now_ms
+
+    def _is_global_pause_active(self, *, now_ms: int | None = None) -> bool:
+        now = self._now_ms() if now_ms is None else now_ms
+        return self._is_pause_until_active(self._global_pause_until_ms, now)
+
+    def _prune_expired_pauses(self, *, persist: bool = True, now_ms: int | None = None) -> bool:
+        now = self._now_ms() if now_ms is None else now_ms
+        changed = False
+
+        if self._global_pause_until_ms > 0 and self._global_pause_until_ms <= now:
+            self._global_pause_until_ms = 0
+            changed = True
+
+        expired = [
+            key
+            for key, until in self._chat_pause_until_ms.items()
+            if until > 0 and until <= now
+        ]
+        if expired:
+            changed = True
+            for key in expired:
+                self._chat_pause_until_ms.pop(key, None)
+
+        if changed and persist:
+            self._save_pause_state()
+        return changed
+
+    def _pause_reason_for_chat(self, channel: str, chat_id: str) -> str | None:
+        now = self._now_ms()
+        changed = self._prune_expired_pauses(persist=False, now_ms=now)
+        if changed:
+            try:
+                self._save_pause_state()
+            except Exception:
+                pass
+        if self._is_pause_until_active(self._global_pause_until_ms, now):
+            return "paused_global"
+        pause_until = self._chat_pause_until_ms.get(self._pause_key(channel, chat_id), 0)
+        if self._is_pause_until_active(pause_until, now):
+            return "paused_chat"
+        return None
+
+    @staticmethod
+    def _format_duration_seconds(seconds: int) -> str:
+        if seconds % 86_400 == 0:
+            days = seconds // 86_400
+            return f"{days}d"
+        if seconds % 3_600 == 0:
+            hours = seconds // 3_600
+            return f"{hours}h"
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            return f"{minutes}m"
+        return f"{seconds}s"
+
+    @classmethod
+    def _parse_pause_duration_ms(cls, raw: str) -> int:
+        token = "".join(part.strip() for part in raw.split()).lower()
+        if not token:
+            raise ValueError("duration is required (example: 30min, 1h)")
+        match = _PAUSE_DURATION_PATTERN.match(token)
+        if match is None:
+            raise ValueError("invalid duration format (example: 30min, 1h)")
+        value = int(match.group("value"))
+        unit = match.group("unit") or "m"
+        multiplier = _PAUSE_DURATION_UNITS.get(unit)
+        if multiplier is None:
+            raise ValueError("unsupported duration unit (use s, min, h, or d)")
+        total_seconds = value * multiplier
+        if total_seconds < 1:
+            raise ValueError("duration must be at least 1 second")
+        if total_seconds > 30 * 86_400:
+            raise ValueError("duration must be 30 days or less")
+        return total_seconds * 1000
+
+    def _set_chat_pause(self, *, channel: str, chat_id: str, until_ms: int) -> None:
+        normalized = self._normalize_pause_until(until_ms)
+        if normalized == 0:
+            self._chat_pause_until_ms.pop(self._pause_key(channel, chat_id), None)
+        else:
+            self._chat_pause_until_ms[self._pause_key(channel, chat_id)] = normalized
+        self._save_pause_state()
+
+    def _clear_chat_pause(self, *, channel: str, chat_id: str) -> bool:
+        removed = self._chat_pause_until_ms.pop(self._pause_key(channel, chat_id), None)
+        if removed is None:
+            return False
+        self._save_pause_state()
+        return True
+
+    def _set_global_pause(self, until_ms: int) -> None:
+        self._global_pause_until_ms = self._normalize_pause_until(until_ms)
+        self._save_pause_state()
+
+    def _clear_all_pauses(self) -> bool:
+        changed = self._global_pause_until_ms != 0 or bool(self._chat_pause_until_ms)
+        if not changed:
+            return False
+        self._global_pause_until_ms = 0
+        self._chat_pause_until_ms.clear()
+        self._save_pause_state()
+        return True
 
     def _maybe_reload(self) -> None:
         if self._engine is None:
@@ -323,11 +526,17 @@ class EnginePolicyAdapter(PolicyPort):
             chat_id=event.chat_id,
             is_group=event.is_group,
         )
+        pause_reason = self._pause_reason_for_chat(event.channel, event.chat_id)
+        should_respond = decision.should_respond
+        reason = decision.reason
+        if pause_reason is not None and decision.accept_message:
+            should_respond = False
+            reason = pause_reason
         return PolicyDecision(
             accept_message=decision.accept_message,
-            should_respond=decision.should_respond,
+            should_respond=should_respond,
             allowed_tools=frozenset(decision.allowed_tools),
-            reason=decision.reason,
+            reason=reason,
             when_to_reply_mode=when_to_reply_mode,
             persona_file=decision.persona_file,
             persona_text=self._engine.persona_text(decision.persona_file),
@@ -487,6 +696,9 @@ class EnginePolicyAdapter(PolicyPort):
         return bool(self._owner_policy_for_context(ctx))
 
     def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx))
+
+    def response_control_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
 
     def approve_is_applicable(self, ctx: AdminCommandContext) -> bool:
@@ -766,6 +978,225 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
+    def stop_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        source = "dm" if not ctx.is_group else "group"
+        scope = "chat"
+        if argv:
+            if len(argv) == 1 and argv[0].strip().lower() == "all":
+                scope = "all"
+            else:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /stop or /stop all",
+                    command_name="stop",
+                    outcome="invalid",
+                    source=source,
+                )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Stop unavailable: policy engine is not active.",
+                command_name="stop",
+                outcome="error",
+                source=source,
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+
+        self._prune_expired_pauses()
+        try:
+            if scope == "all":
+                self._set_global_pause(_PAUSE_INDEFINITE)
+                response = "⏸️ Responses paused for all chats until /start all."
+            else:
+                self._set_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id, until_ms=_PAUSE_INDEFINITE)
+                if self._is_global_pause_active():
+                    response = (
+                        "⏸️ Responses paused for this chat. "
+                        "Global pause is active too; use /start all to resume everywhere."
+                    )
+                else:
+                    response = "⏸️ Responses paused for this chat until /start."
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply stop command: {e}",
+                command_name="stop",
+                outcome="error",
+                source=source,
+            )
+
+        return AdminCommandResult(
+            status="handled",
+            response=response,
+            command_name="stop",
+            outcome="applied",
+            source=source,
+            metric_events=(
+                AdminMetricEvent(
+                    name="response_pause_set_total",
+                    labels=(("channel", ctx.channel), ("scope", scope), ("mode", "indefinite")),
+                ),
+            ),
+        )
+
+    def pause_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        source = "dm" if not ctx.is_group else "group"
+        if not argv:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /pause <duration> or /pause all <duration>",
+                command_name="pause",
+                outcome="invalid",
+                source=source,
+            )
+
+        scope = "chat"
+        duration_parts = argv
+        if argv[0].strip().lower() == "all":
+            scope = "all"
+            duration_parts = argv[1:]
+            if not duration_parts:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /pause <duration> or /pause all <duration>",
+                    command_name="pause",
+                    outcome="invalid",
+                    source=source,
+                )
+
+        duration_expr = "".join(part.strip() for part in duration_parts)
+        try:
+            duration_ms = self._parse_pause_duration_ms(duration_expr)
+        except ValueError as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Invalid pause duration: {e}",
+                command_name="pause",
+                outcome="invalid",
+                source=source,
+            )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Pause unavailable: policy engine is not active.",
+                command_name="pause",
+                outcome="error",
+                source=source,
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+
+        self._prune_expired_pauses()
+        until_ms = self._now_ms() + duration_ms
+        duration_text = self._format_duration_seconds(duration_ms // 1000)
+        try:
+            if scope == "all":
+                self._set_global_pause(until_ms)
+                response = f"⏸️ Responses paused for all chats for {duration_text}. Use /start all to resume sooner."
+            else:
+                self._set_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id, until_ms=until_ms)
+                if self._is_global_pause_active():
+                    response = (
+                        f"⏸️ Responses paused for this chat for {duration_text}. "
+                        "Global pause is active too; use /start all to resume everywhere."
+                    )
+                else:
+                    response = f"⏸️ Responses paused for this chat for {duration_text}. Use /start to resume sooner."
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply pause command: {e}",
+                command_name="pause",
+                outcome="error",
+                source=source,
+            )
+
+        return AdminCommandResult(
+            status="handled",
+            response=response,
+            command_name="pause",
+            outcome="applied",
+            source=source,
+            metric_events=(
+                AdminMetricEvent(
+                    name="response_pause_set_total",
+                    labels=(("channel", ctx.channel), ("scope", scope), ("mode", "timed")),
+                ),
+            ),
+        )
+
+    def start_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        source = "dm" if not ctx.is_group else "group"
+        scope = "chat"
+        if argv:
+            if len(argv) == 1 and argv[0].strip().lower() == "all":
+                scope = "all"
+            else:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Usage: /start or /start all",
+                    command_name="start",
+                    outcome="invalid",
+                    source=source,
+                )
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Start unavailable: policy engine is not active.",
+                command_name="start",
+                outcome="error",
+                source=source,
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+
+        self._prune_expired_pauses()
+        try:
+            if scope == "all":
+                changed = self._clear_all_pauses()
+                response = "✅ Responses resumed for all chats." if changed else "Responses are already active everywhere."
+            else:
+                cleared = self._clear_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id)
+                if self._is_global_pause_active():
+                    if cleared:
+                        response = (
+                            "Cleared chat-specific pause for this chat. "
+                            "Global pause is still active; use /start all to resume everywhere."
+                        )
+                    else:
+                        response = "Global pause is still active; use /start all to resume everywhere."
+                else:
+                    response = "✅ Responses resumed for this chat." if cleared else "Responses are already active for this chat."
+        except Exception as e:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Failed to apply start command: {e}",
+                command_name="start",
+                outcome="error",
+                source=source,
+            )
+
+        return AdminCommandResult(
+            status="handled",
+            response=response,
+            command_name="start",
+            outcome="applied",
+            source=source,
+            metric_events=(
+                AdminMetricEvent(
+                    name="response_pause_cleared_total",
+                    labels=(("channel", ctx.channel), ("scope", scope)),
+                ),
+            ),
+        )
+
     def session_reset_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         if argv:
             return AdminCommandResult(status="handled", response="Usage: /reset")
@@ -845,6 +1276,9 @@ class EnginePolicyAdapter(PolicyPort):
             "Available slash commands for this chat:",
             "- /commands [all] — list available commands",
             "- /reset — clear conversation history for this chat",
+            "- /stop [all] — pause replies for this chat or all chats",
+            "- /pause <duration> or /pause all <duration> — timed pause (e.g. 30min, 1h)",
+            "- /start [all] — resume this chat or all chats",
             "- /voicemessages <status|on|off|in_kind|always|text|inherit>",
             "- !voice-send <here|chat_id|group_alias> <text> — owner raw voice send (no LLM paraphrase)",
         ]
@@ -1648,6 +2082,63 @@ class HelpAliasCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/help"
+
+
+class StopCommandHandler(AdminCommandHandler):
+    """Deterministic `/stop` command for silencing chat replies."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "stop"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.response_control_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.stop_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/stop [all]"
+
+
+class PauseCommandHandler(AdminCommandHandler):
+    """Deterministic `/pause` command for timed silencing."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "pause"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.response_control_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.pause_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/pause <duration>"
+
+
+class StartCommandHandler(AdminCommandHandler):
+    """Deterministic `/start` command for resuming silenced replies."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "start"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.response_control_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.start_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/start [all]"
 
 
 class PanicCommandHandler(AdminCommandHandler):

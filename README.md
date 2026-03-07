@@ -180,6 +180,19 @@ Policy is hot-reloaded — no restart needed. Debug with:
 yeoman policy explain --channel telegram --chat -1001234567890 --sender "12345|User"
 ```
 
+Owner response controls (WhatsApp owner only):
+
+```text
+/stop              # pause current chat until /start
+/stop all          # pause every chat until /start all
+/start             # resume current chat
+/start all         # resume all chats
+/pause 30min       # pause current chat for a duration
+/pause all 1h      # pause all chats for a duration
+```
+
+Supported pause units: `s`, `min`, `h`, `d` (for example `45s`, `15min`, `2h`, `1d`).
+
 ## Providers
 
 | Provider | Type | |
