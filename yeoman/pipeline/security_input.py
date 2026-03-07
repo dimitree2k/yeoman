@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 class InputSecurityMiddleware:
     """Check inbound text against security rules; halt if blocked."""
 
+    _BLOCK_EMOJI = "🚫"
+
     def __init__(
         self,
         *,
@@ -87,7 +89,7 @@ class InputSecurityMiddleware:
                     channel=ctx.event.channel,
                     chat_id=ctx.event.chat_id,
                     message_id=ctx.event.message_id,
-                    emoji=self._block_message,
+                    emoji=self._BLOCK_EMOJI,
                     participant_jid=ctx.event.participant,
                 )
             )

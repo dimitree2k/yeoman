@@ -44,7 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-yeoman = "yeoman.cli.commands:app"
+yeoman = "yeoman.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

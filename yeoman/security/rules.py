@@ -29,15 +29,13 @@ _INPUT_WARN = [
     re.compile(r"\b(bypass|override)\b.{0,20}\b(safety|security|guardrail)s?\b", re.IGNORECASE),
 ]
 
-# Persona manipulation detection - blocks attempts to change Nano's persona/address
+# Persona manipulation detection - blocks explicit commands to override configured persona/address.
+# Focus: unambiguous directives to change the bot's behavior, not specific honorific words.
 _PERSONA_MANIPULATION = [
-    re.compile(r"\b(anrede|addressierung|titel|nickname|称呼)\b", re.IGNORECASE),
-    re.compile(r"(nenn|sag|addressier|call me|称呼).{0,20}(mich|me|dir)\b", re.IGNORECASE),
-    re.compile(r"bitte.{0,30}(änder|change|änderung|addressier)\b", re.IGNORECASE),
-    re.compile(r"(Daddy|Sturmbann|Oberst|Herr|Führer|chef|boss)\b", re.IGNORECASE),
-    re.compile(r"ich bin.{0,20}(dein|deine).{0,20}(owner|herr|chef)\b", re.IGNORECASE),
     re.compile(r"\bnenn mich\b", re.IGNORECASE),
     re.compile(r"\bsag zu mir\b", re.IGNORECASE),
+    re.compile(r"\b(nenn|addressier).{0,20}mich\b", re.IGNORECASE),
+    re.compile(r"ich bin.{0,20}(dein|deine).{0,20}owner\b", re.IGNORECASE),
     re.compile(r"wie sollst du.{0,20}(mich|mir|dich){0,20}(nennen|addressieren|anreden)\b", re.IGNORECASE),
 ]
 
