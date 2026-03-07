@@ -41,6 +41,7 @@ export interface InboundMessageV2 {
   chatJid: string;
   participantJid: string;
   senderId: string;
+  senderPhoneJid?: string;
   isGroup: boolean;
   text: string;
   timestamp: number;
@@ -451,6 +452,9 @@ export class WhatsAppClient {
   private selfJids = new Set<string>();
   private selfTokens = new Set<string>();
 
+  /** Maps LID user tokens to phone-number JIDs (e.g. "169303366209721" → "491757070305@s.whatsapp.net"). */
+  private readonly lidToPhone = new Map<string, string>();
+
   private qrWaiters = new Set<(value: string) => void>();
   private connectWaiters = new Set<(value: boolean) => void>();
   private baileysVersionCache: [number, number, number] | null = null;
@@ -702,6 +706,83 @@ export class WhatsAppClient {
       const backoff = Math.min(maxDelayMs, initialDelayMs * 2 ** Math.max(0, this.reconnectAttempts - 1));
       const delayMs = randomJitter(backoff, 0.25);
       await sleep(delayMs);
+    }
+  }
+
+  /**
+   * Translate an array of mention JIDs, replacing LID JIDs with phone JIDs
+   * where a mapping is known. Returns translated JIDs and a token replacement
+   * map (LID token → phone token) for rewriting mention text.
+   */
+  private translateMentions(mentions: string[] | undefined): {
+    jids: string[] | undefined;
+    textReplacements: Map<string, string>;
+  } {
+    const textReplacements = new Map<string, string>();
+    if (!mentions || mentions.length === 0) return { jids: mentions, textReplacements };
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (const jid of mentions) {
+      const phone = this.resolvePhoneJid(jid);
+      const resolved = phone || jid;
+      if (phone) {
+        const lidToken = jidUserToken(jid);
+        const phoneToken = jidUserToken(phone);
+        if (lidToken && phoneToken) {
+          textReplacements.set(lidToken, phoneToken);
+        }
+      }
+      if (!seen.has(resolved)) {
+        seen.add(resolved);
+        result.push(resolved);
+      }
+    }
+    return { jids: result.length > 0 ? result : undefined, textReplacements };
+  }
+
+  /**
+   * Resolve a JID through the LID→phone cache.
+   * Returns the phone JID if the input is a LID, otherwise returns undefined.
+   */
+  resolvePhoneJid(jid: string): string | undefined {
+    const normalized = normalizeJid(jid);
+    if (!normalized) return undefined;
+    // Already a phone JID — no translation needed.
+    if (normalized.endsWith('@s.whatsapp.net')) return undefined;
+    const token = jidUserToken(normalized);
+    if (!token) return undefined;
+    return this.lidToPhone.get(token);
+  }
+
+  /**
+   * Populate the LID→phone cache from group metadata participants.
+   * Each participant may carry both `id` (phone JID) and `lid` (LID JID).
+   */
+  private async refreshLidCache(): Promise<void> {
+    if (!this.sock || !this.connected) return;
+    try {
+      const all = await this.sock.groupFetchAllParticipating();
+      let added = 0;
+      let sampleLogged = false;
+      for (const meta of Object.values(all || {})) {
+        const participants = (meta as any)?.participants;
+        if (!Array.isArray(participants)) continue;
+        for (const p of participants) {
+          // Baileys 7.x: participant.id is the LID, participant.phoneNumber is the phone JID.
+          const phoneRaw = typeof p?.phoneNumber === 'string' ? p.phoneNumber : '';
+          const lidRaw = typeof p?.id === 'string' ? p.id : '';
+          const phoneJid = normalizeJid(phoneRaw);
+          const lidToken = jidUserToken(lidRaw);
+          if (phoneJid && phoneJid.endsWith('@s.whatsapp.net') && lidToken) {
+            if (!this.lidToPhone.has(lidToken)) added++;
+            this.lidToPhone.set(lidToken, phoneJid);
+          }
+        }
+      }
+      this.options.onStatus('lid_cache_refreshed', { size: this.lidToPhone.size, added });
+    } catch (err) {
+      this.lastError = safeErrorMessage(err);
+      this.options.onError(`lid_cache_refresh_failed: ${this.lastError}`);
     }
   }
 
@@ -1106,6 +1187,8 @@ export class WhatsAppClient {
         });
         this.options.onStatus('connected');
         this.resolveConnected(true);
+        // Build LID→phone cache from group metadata (non-blocking).
+        void this.refreshLidCache();
       }
 
       if (connection === 'close') {
@@ -1203,6 +1286,7 @@ export class WhatsAppClient {
           chatJid,
           participantJid,
           senderId,
+          senderPhoneJid: this.resolvePhoneJid(participantJid) || undefined,
           isGroup,
           text: limitText(extracted.text, 8_000),
           timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
@@ -1230,12 +1314,14 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
     const quoted = this.resolveQuotedMessage(to, replyToMessageId);
-    const message: { text: string; mentions?: string[] } = {
-      text: limitText(text, 8_000),
-    };
-    const normalizedMentions = normalizeMentions(mentions);
-    if (normalizedMentions?.length) {
-      message.mentions = normalizedMentions;
+    const { jids: translatedMentions, textReplacements } = this.translateMentions(normalizeMentions(mentions));
+    let finalText = limitText(text, 8_000);
+    for (const [lidToken, phoneToken] of textReplacements) {
+      finalText = finalText.replaceAll(`@${lidToken}`, `@${phoneToken}`);
+    }
+    const message: { text: string; mentions?: string[] } = { text: finalText };
+    if (translatedMentions?.length) {
+      message.mentions = translatedMentions;
     }
     let sent: any;
     if (quoted) {
@@ -1257,8 +1343,14 @@ export class WhatsAppClient {
       allowedLocalMediaRoots: [this.mediaOutgoingDir],
     });
     const kind = mediaKindFromMime(media.mimeType);
-    const caption = input.caption ? limitText(input.caption, 2_000) : undefined;
-    const mentions = caption ? normalizeMentions(input.mentions) : undefined;
+    let caption = input.caption ? limitText(input.caption, 2_000) : undefined;
+    const translated = caption ? this.translateMentions(normalizeMentions(input.mentions)) : undefined;
+    const mentions = translated?.jids;
+    if (caption && translated?.textReplacements.size) {
+      for (const [lidToken, phoneToken] of translated.textReplacements) {
+        caption = caption.replaceAll(`@${lidToken}`, `@${phoneToken}`);
+      }
+    }
 
     if (kind === 'image') {
       const payload = { image: media.buffer, caption, mimetype: media.mimeType, mentions };

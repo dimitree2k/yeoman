@@ -50,6 +50,10 @@ def _collect_whatsapp_mention_candidates(event: "InboundEvent") -> list[str]:
     seen: set[str] = set()
 
     raw_values: list[object] = [event.participant, event.reply_to_participant]
+    # Include the original LID JID so mentions using LID tokens also resolve.
+    participant_lid = event.raw_metadata.get("participant_lid")
+    if isinstance(participant_lid, str) and participant_lid:
+        raw_values.append(participant_lid)
     raw_mentions = event.raw_metadata.get("mentioned_jids")
     if isinstance(raw_mentions, list):
         raw_values.extend(raw_mentions)

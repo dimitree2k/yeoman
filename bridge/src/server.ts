@@ -392,6 +392,7 @@ export class BridgeServer {
           chatJid: msg.chatJid,
           participantJid: msg.participantJid,
           senderId: msg.senderId,
+          senderPhoneJid: msg.senderPhoneJid,
           isGroup: msg.isGroup,
           text: msg.text,
           timestamp: msg.timestamp,

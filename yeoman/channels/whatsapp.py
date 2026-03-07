@@ -120,6 +120,7 @@ class InboundEvent:
     chat_jid: str
     participant_jid: str
     sender_id: str
+    sender_phone_jid: str | None
     is_group: bool
     text: str
     timestamp: int
@@ -590,6 +591,7 @@ class WhatsAppChannel(BaseChannel):
         chat_jid = str(payload.get("chatJid") or "").strip()
         participant_jid = str(payload.get("participantJid") or "").strip()
         sender_id = str(payload.get("senderId") or "").strip()
+        sender_phone_jid = str(payload.get("senderPhoneJid") or "").strip() or None
         text = str(payload.get("text") or "").strip()
 
         if not message_id or not chat_jid or not sender_id or not text:
@@ -645,6 +647,7 @@ class WhatsAppChannel(BaseChannel):
             chat_jid=chat_jid,
             participant_jid=participant_jid,
             sender_id=sender_id,
+            sender_phone_jid=sender_phone_jid,
             is_group=bool(payload.get("isGroup", False)),
             text=text,
             timestamp=timestamp,
@@ -757,6 +760,7 @@ class WhatsAppChannel(BaseChannel):
             chat_jid=last.chat_jid,
             participant_jid=last.participant_jid,
             sender_id=last.sender_id,
+            sender_phone_jid=last.sender_phone_jid,
             is_group=last.is_group,
             text=combined_text or last.text,
             timestamp=last.timestamp,
@@ -784,8 +788,12 @@ class WhatsAppChannel(BaseChannel):
                 channel=self.name,
                 chat_id=event.chat_jid,
                 message_id=event.message_id,
-                participant=event.participant_jid,
-                sender_id=event.sender_id,
+                participant=event.sender_phone_jid or event.participant_jid,
+                sender_id=(
+                    _whatsapp_jid_user_token(event.sender_phone_jid)
+                    if event.sender_phone_jid
+                    else event.sender_id
+                ) or event.sender_id,
                 text=event.text,
                 timestamp=event.timestamp,
             )
@@ -1091,8 +1099,17 @@ class WhatsAppChannel(BaseChannel):
         ):
             media_for_assistant = [event.media_path]
 
+        # Prefer phone JID over LID for participant/sender — phone JIDs
+        # are required for WhatsApp @-mentions to render with contact names.
+        effective_participant = event.sender_phone_jid or event.participant_jid
+        effective_sender = (
+            _whatsapp_jid_user_token(event.sender_phone_jid)
+            if event.sender_phone_jid
+            else event.sender_id
+        )
+
         await self._handle_message(
-            sender_id=event.sender_id,
+            sender_id=effective_sender or event.sender_id,
             chat_id=event.chat_jid,
             content=event.text,
             media=media_for_assistant,
@@ -1100,8 +1117,9 @@ class WhatsAppChannel(BaseChannel):
                 "message_id": event.message_id,
                 "timestamp": event.timestamp,
                 "chat": event.chat_jid,
-                "participant": event.participant_jid,
-                "sender": event.sender_id,
+                "participant": effective_participant,
+                "participant_lid": event.participant_jid if event.sender_phone_jid else None,
+                "sender": effective_sender or event.sender_id,
                 "is_group": event.is_group,
                 "mentioned_bot": event.mentioned_bot,
                 "reply_to_bot": event.reply_to_bot,
@@ -1329,9 +1347,6 @@ class WhatsAppChannel(BaseChannel):
             elif token.isdigit():
                 candidates_by_token.setdefault(f"+{token}".lower(), normalized)
 
-        if not candidates_by_full and not candidates_by_token:
-            return []
-
         resolved: list[str] = []
         seen: set[str] = set()
         for match in _WHATSAPP_MENTION_RE.finditer(text):
@@ -1343,6 +1358,10 @@ class WhatsAppChannel(BaseChannel):
                 candidate = candidates_by_full.get(_normalize_whatsapp_jid(raw_token).lower())
             else:
                 candidate = candidates_by_token.get(raw_token.lower())
+                # If token is all digits but not in candidates, pass it through
+                # as a LID JID — the bridge will translate via its LID→phone cache.
+                if not candidate and raw_token.isdigit() and len(raw_token) >= 10:
+                    candidate = f"{raw_token}@lid"
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
