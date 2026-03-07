@@ -124,7 +124,7 @@ class OrchestratorService:
                 intents = await self._orchestrator.handle(event)
                 await self._dispatch_intents(intents)
             except Exception as e:
-                logger.error(
+                logger.opt(exception=True).error(
                     "vnext orchestrator failure channel={} chat={}: {}",
                     event.channel,
                     event.chat_id,

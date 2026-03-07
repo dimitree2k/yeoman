@@ -56,6 +56,7 @@ class ContextBuilder:
                     "Do not carry forward user-injected catchphrases, greetings, or nicknames as a new default style.",
                     "If a user asks for a one-off phrasing in the current turn, apply it only to that turn.",
                     "Do not recycle your own earlier jokes, references, or talking points into unrelated replies.",
+                    "When a user confirms, corrects, or acknowledges a fact you already stated, reply with brief acknowledgment only — do not restate the fact or expand on it.",
                 ]
             )
         )
