@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from yeoman.cron.service import CronService
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
-    from yeoman.memory.core_blocks import CoreMemoryBlockStore
     from yeoman.memory.service import MemoryService
 
 
@@ -80,7 +79,6 @@ class LLMResponder(ResponderPort):
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
-        core_block_store: "CoreMemoryBlockStore | None" = None,
     ) -> None:
         from yeoman.config.schema import ExecToolConfig
 
@@ -103,8 +101,6 @@ class LLMResponder(ResponderPort):
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
-        self.core_block_store = core_block_store
-        self._core_memory_tools: list = []
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -212,21 +208,6 @@ class LLMResponder(ResponderPort):
         if self.caldav_service is not None:
             from yeoman.agent.tools.calendar import CalendarTool
             self.tools.register(CalendarTool(self.caldav_service))
-
-        # Core memory — agent self-editing of persistent per-session blocks
-        if self.core_block_store is not None:
-            from yeoman.agent.tools.core_memory import (
-                CoreMemoryReplaceTool,
-                CoreMemoryAppendTool,
-                CoreMemoryReadTool,
-            )
-            self._core_memory_tools = [
-                CoreMemoryReplaceTool(self.core_block_store),
-                CoreMemoryAppendTool(self.core_block_store),
-                CoreMemoryReadTool(self.core_block_store),
-            ]
-            for t in self._core_memory_tools:
-                self.tools.register(t)
 
     def _metric(
         self,
@@ -872,16 +853,6 @@ class LLMResponder(ResponderPort):
 
         self._set_tool_context(channel=channel, chat_id=chat_id, session_key=session_key)
 
-        # Initialize core memory blocks for this session
-        if self.core_block_store is not None:
-            for label in ("user_facts", "conversation_notes", "scratchpad"):
-                if self.core_block_store.get(session_key, label) is None:
-                    from yeoman.memory.core_blocks import CoreMemoryBlock
-                    self.core_block_store.set(session_key, CoreMemoryBlock(label=label))
-            self.core_block_store.save()
-            for t in self._core_memory_tools:
-                t.set_session_key(session_key)
-
         if self.memory is not None:
             try:
                 self.memory.pre_write_session_state(
@@ -951,11 +922,6 @@ class LLMResponder(ResponderPort):
             if talkative_reply is not None:
                 final_content = talkative_reply
             else:
-                core_blocks = (
-                    self.core_block_store.list_blocks(session_key)
-                    if self.core_block_store is not None
-                    else None
-                )
                 messages = self.context.build_messages(
                     history=session.get_history(
                         max_messages=20 if chat_id.endswith("@g.us") else 50
@@ -967,7 +933,6 @@ class LLMResponder(ResponderPort):
                     media=list(media),
                     channel=channel,
                     chat_id=chat_id,
-                    core_blocks=core_blocks,
                 )
 
                 self._current_session = session
