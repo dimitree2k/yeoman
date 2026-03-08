@@ -31,9 +31,18 @@ This project spans two directories that must be kept in sync:
 | `~/.yeoman/` | Runtime state: config, policy, memory, logs, workspace | separate private runtime repo |
 
 **When working on a task**, consider which directory is relevant:
-- Code changes → `~/Documents/yeoman/`, then reinstall (`pip install -e .`)
+- Code changes → `~/Documents/yeoman/`, then restart the gateway
 - Config/policy/persona/skill changes → `~/.yeoman/`
 - Debugging a live issue → check `~/.yeoman/var/logs/` and `~/.yeoman/data/`
+
+The active CLI/runtime is the repo venv at `~/Documents/yeoman/.venv/bin/yeoman`.
+Do not rely on the `uv` tool install as a separate runtime copy.
+
+Only run dependency sync when `pyproject.toml` or `uv.lock` changes:
+```bash
+cd ~/Documents/yeoman
+uv sync
+```
 
 The runtime CLAUDE.md (`~/.yeoman/CLAUDE.md`) documents the full layout, git tracking rules, secrets management, and config file schemas for the runtime directory.
 
