@@ -21,5 +21,6 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `weather` | Get weather info using wttr.in and Open-Meteo |
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `tmux` | Remote-control tmux sessions |
+| `browser` | Control a local real browser via pinchtab |
 | `agent-doctor` | Diagnose runtime, memory, gateway, cron, config, and security issues |
 | `skill-creator` | Create new skills |

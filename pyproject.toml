@@ -61,6 +61,7 @@ packages = ["yeoman"]
 include = [
     "yeoman/**/*.py",
     "yeoman/skills/**/*.md",
+    "yeoman/skills/**/*.py",
     "yeoman/skills/**/*.sh",
 ]
 
