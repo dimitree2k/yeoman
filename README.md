@@ -221,6 +221,39 @@ Adding a new provider requires only 2 changes: a `ProviderSpec` in `providers/re
 | **Scoped file grants** | Explicit path grants with blocked paths/patterns override |
 | **I/O validation** | Three-stage security middleware: input → tool → output checks with sensitive data redaction |
 
+## Health Check
+
+If yeoman includes the bundled `agent-doctor` skill, you can run a local health check for memory,
+cron, config, workspace files, gateway/bridge, security posture, and system prerequisites.
+
+Ask the agent:
+
+```text
+diagnose yeoman
+run a health check
+check what is broken
+```
+
+Or run it directly:
+
+```bash
+yeoman doctor
+```
+
+Use it:
+
+- right after onboarding
+- after editing `config.json`, `.env`, or `policy.json`
+- after runtime/dependency upgrades
+- when memory, gateway, WhatsApp, or cron behavior seems off
+
+Exit codes:
+
+- `0` no problems found
+- `1` warnings or critical issues found
+
+The doctor does not auto-fix anything; it reports findings and proposed fixes first.
+
 ## CLI Reference
 
 | Command | Description |
@@ -230,6 +263,7 @@ Adding a new provider requires only 2 changes: a `ProviderSpec` in `providers/re
 | `yeoman agent` | Interactive chat |
 | `yeoman gateway` | Start all enabled channels |
 | `yeoman status` | Runtime status |
+| `yeoman doctor` | Run health checks and report issues |
 | `yeoman logs` | View gateway/bridge logs |
 | **Channels** | |
 | `yeoman channels login` | Link WhatsApp (scan QR) |
@@ -287,6 +321,15 @@ bridge/           WhatsApp bridge (TypeScript / Baileys)
 ```
 
 ## Changelog
+
+### v0.4.0 — Mar 2026
+
+#### Diagnostics
+- Added bundled `agent-doctor` skill and `yeoman doctor` command
+- Added user-facing health-check documentation and issue-ID based fix guidance
+
+#### Release Hygiene
+- Aligned package metadata and runtime version string to `0.4.0`
 
 ### v0.3.0 — Mar 2026
 
