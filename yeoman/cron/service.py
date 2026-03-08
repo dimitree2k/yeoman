@@ -45,10 +45,12 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
+        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        sessions_dir: Path | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
+        self.sessions_dir = sessions_dir
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -164,10 +166,53 @@ class CronService:
 
         self.store_path.write_text(json.dumps(data, indent=2))
 
+    def _delete_session_file(self, job_id: str) -> None:
+        """Delete the session JSONL file for a cron job."""
+        if not self.sessions_dir:
+            return
+        session_file = self.sessions_dir / f"cron_{job_id}.jsonl"
+        try:
+            if session_file.exists():
+                session_file.unlink()
+                logger.info(f"Cron: deleted session file for job {job_id}")
+        except Exception as e:
+            logger.warning(f"Cron: failed to delete session file for job {job_id}: {e}")
+
+    def _purge_stale_jobs(self) -> None:
+        """Remove one-shot jobs that have already run or are long-overdue zombies."""
+        if not self._store:
+            return
+        now = _now_ms()
+        grace_ms = 7 * 24 * 3600 * 1000  # 7 days
+        to_purge = [
+            job.id for job in self._store.jobs
+            if job.schedule.kind == "at" and (
+                # Ran and was disabled (the normal post-run state)
+                (not job.enabled and job.state.last_run_at_ms)
+                # Enabled but scheduled time is >7 days in the past and never ran (zombie)
+                or (job.enabled and job.schedule.at_ms and
+                    job.schedule.at_ms < now - grace_ms and not job.state.last_run_at_ms)
+            )
+        ]
+        if to_purge:
+            self._store.jobs = [j for j in self._store.jobs if j.id not in to_purge]
+            for job_id in to_purge:
+                self._delete_session_file(job_id)
+            logger.info(f"Cron: purged {len(to_purge)} stale one-shot job(s): {to_purge}")
+
+        # Delete session files for jobs no longer in the store (manually deleted jobs)
+        if self.sessions_dir and self.sessions_dir.exists():
+            known_ids = {job.id for job in self._store.jobs}
+            for f in self.sessions_dir.glob("cron_*.jsonl"):
+                job_id = f.stem[len("cron_"):]
+                if job_id not in known_ids:
+                    self._delete_session_file(job_id)
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
         self._load_store()
+        self._purge_stale_jobs()
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
@@ -258,6 +303,7 @@ class CronService:
         if job.schedule.kind == "at":
             if job.delete_after_run:
                 self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+                self._delete_session_file(job.id)
             else:
                 job.enabled = False
                 job.state.next_run_at_ms = None
@@ -379,6 +425,7 @@ class CronService:
         removed = len(store.jobs) < before
 
         if removed:
+            self._delete_session_file(job_id)
             self._save_store()
             self._arm_timer()
             logger.info(f"Cron: removed job {job_id}")

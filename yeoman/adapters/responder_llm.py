@@ -109,7 +109,7 @@ class LLMResponder(ResponderPort):
         )
 
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(workspace, sessions_dir=workspace / "sessions")
         self.tools = ToolRegistry()  # type: ignore[no-untyped-call]  # boundary-any
         subagent_model_to_use = subagent_model or self.model
         self.subagents = SubagentManager(
