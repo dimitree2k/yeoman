@@ -47,16 +47,33 @@ Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`
 ## Install
 
 ```bash
-# From source (recommended for development)
+# Developer mode: source checkout + pinned repo venv
 git clone https://github.com/dimitree2k/yeoman.git
 cd yeoman
-pip install -e .
+uv sync
+./bin/yeoman --version
 
-# With uv
+# User mode: installed CLI outside a source checkout
 uv tool install yeoman
+yeoman --version
 
-# From PyPI (once published)
+# Or:
 pip install yeoman
+yeoman --version
+```
+
+Rule of thumb:
+
+- If you are inside the yeoman git checkout, use `./bin/yeoman`
+- If you installed yeoman as a tool or package, use `yeoman`
+- Avoid `python3 -m yeoman.cli.commands` unless `yeoman env` shows that `python3` is the same interpreter backing the active launcher
+
+Check the active runtime any time:
+
+```bash
+yeoman env
+# or, in the repo checkout:
+./bin/yeoman env
 ```
 
 ## Quick Start
@@ -66,6 +83,8 @@ pip install yeoman
 ```bash
 yeoman onboard
 ```
+
+If you are working from the source checkout, run the same commands with `./bin/yeoman` instead.
 
 **2. Add API keys** — pick any method:
 
@@ -240,6 +259,12 @@ Or run it directly:
 yeoman doctor
 ```
 
+If runtime behavior seems inconsistent, inspect the active launcher and Python first:
+
+```bash
+yeoman env
+```
+
 Use it:
 
 - right after onboarding
@@ -263,6 +288,7 @@ The doctor does not auto-fix anything; it reports findings and proposed fixes fi
 | `yeoman agent` | Interactive chat |
 | `yeoman gateway` | Start all enabled channels |
 | `yeoman status` | Runtime status |
+| `yeoman env` | Show active launcher and Python environment |
 | `yeoman doctor` | Run health checks and report issues |
 | `yeoman logs` | View gateway/bridge logs |
 | **Channels** | |

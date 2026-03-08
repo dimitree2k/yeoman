@@ -7,7 +7,7 @@ Lightweight, policy-first personal AI assistant runtime (~18k core lines).
 
 | What | Where |
 |------|-------|
-| Entry point / CLI | `yeoman/cli/commands.py` (typer) |
+| Entry point / CLI | `bin/yeoman` (repo wrapper) and `yeoman/cli/commands.py` (typer) |
 | Orchestrator pipeline | `yeoman/core/orchestrator.py` |
 | Policy engine | `yeoman/policy/engine.py` |
 | Memory service | `yeoman/memory/service.py` |
@@ -35,8 +35,14 @@ This project spans two directories that must be kept in sync:
 - Config/policy/persona/skill changes → `~/.yeoman/`
 - Debugging a live issue → check `~/.yeoman/var/logs/` and `~/.yeoman/data/`
 
-The active CLI/runtime is the repo venv at `~/Documents/yeoman/.venv/bin/yeoman`.
-Do not rely on the `uv` tool install as a separate runtime copy.
+The active development CLI/runtime is the repo wrapper at `~/Documents/yeoman/bin/yeoman`.
+That wrapper pins `~/Documents/yeoman/.venv/bin/python3`.
+Do not rely on `uv tool install yeoman` as a second development runtime copy.
+
+For any ambiguity, run:
+```bash
+./bin/yeoman env
+```
 
 Only run dependency sync when `pyproject.toml` or `uv.lock` changes:
 ```bash
@@ -83,7 +89,7 @@ Media (ASR/TTS/vision) is cross-cutting: channels enrich inbound, responder synt
 
 ## Conventions
 
-- **Package manager**: `uv` (preferred), `pip`, or `poetry`
+- **Package manager**: `uv sync` for development in this repo; installed users may use `uv tool install` or `pip install`
 - **Linter/Formatter**: Ruff (line-length 100, Python 3.14 target)
 - **Type checker**: MyPy strict on `core/`, `adapters/`
 - **Logging**: Loguru (structured, thread-safe)
