@@ -255,6 +255,7 @@ values = {
     "bridge_port": str(pick(whatsapp, "bridgePort", "bridge_port", default=3001) or 3001),
     "gateway_host": str(pick(gateway, "host", default="0.0.0.0") or "0.0.0.0"),
     "gateway_port": str(pick(gateway, "port", default=18790) or 18790),
+    "caldav_enabled": str(bool(env_or_file("ICLOUD_CALDAV_USERNAME") and env_or_file("ICLOUD_CALDAV_APP_PASSWORD"))).lower(),
     "exec_isolation_enabled": str(bool(pick(tools_exec_isolation, "enabled", default=True))).lower(),
     "restrict_to_workspace": str(bool(pick(tools, "restrictToWorkspace", "restrict_to_workspace", default=False))).lower(),
     "security_strict_profile": str(bool(pick(security, "strictProfile", "strict_profile", default=True))).lower(),
@@ -359,6 +360,44 @@ import sys
 current = tuple(int(part) for part in sys.argv[1].split("."))
 minimum = tuple(int(part) for part in sys.argv[2].split("."))
 print("true" if current >= minimum else "false")
+PY
+}
+
+detect_yeoman_python() {
+    local yeoman_path
+    local shebang
+    local candidate
+
+    yeoman_path="$(command -v "$YEOMAN_BIN" 2>/dev/null || true)"
+    if [ -z "$yeoman_path" ] || [ ! -f "$yeoman_path" ]; then
+        return 1
+    fi
+
+    IFS= read -r shebang < "$yeoman_path" || true
+    case "$shebang" in
+        '#!'*python*)
+            candidate="${shebang#\#!}"
+            candidate="${candidate%% *}"
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+python_missing_modules() {
+    local python_bin="$1"
+    shift
+
+    "$python_bin" - <<'PY' "$@"
+import importlib.util
+import sys
+
+missing = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is None]
+print(",".join(missing))
 PY
 }
 
@@ -807,6 +846,36 @@ else
     add_issue "system" "CRITICAL" "SYS-001" "python3 is not available" \
         "python3 is missing from PATH." \
         "Install Python 3.14+."
+fi
+
+if [ "${resolved_config_loaded:-false}" = "true" ] && [ "${caldav_enabled:-false}" = "true" ]; then
+    yeoman_python=""
+    if yeoman_python="$(detect_yeoman_python 2>/dev/null)"; then
+        yeoman_caldav_missing="$(python_missing_modules "$yeoman_python" caldav icalendar 2>/dev/null || true)"
+        if [ -z "$yeoman_caldav_missing" ]; then
+            line_ok "CalDAV dependencies are available in the yeoman runtime ($yeoman_python)"
+        else
+            add_issue "system" "CRITICAL" "SYS-005" "CalDAV dependencies are missing in the yeoman runtime" \
+                "CalDAV credentials are configured, but $yeoman_python cannot import: $yeoman_caldav_missing" \
+                "Install the missing packages into the interpreter used by 'yeoman', then restart the gateway."
+        fi
+
+        host_python="$(command -v python3 2>/dev/null || true)"
+        if [ -n "$host_python" ] && [ "$host_python" != "$yeoman_python" ]; then
+            host_caldav_missing="$(python_missing_modules "$host_python" caldav icalendar 2>/dev/null || true)"
+            if [ -n "$host_caldav_missing" ]; then
+                add_issue "system" "WARNING" "SYS-006" "host python3 lacks CalDAV dependencies used by source CLI commands" \
+                    "python3 ($host_python) cannot import: $host_caldav_missing; yeoman uses $yeoman_python" \
+                    "Use 'yeoman ...' or the yeoman venv interpreter, or install the missing packages into python3 before running 'python3 -m yeoman.cli.commands ...'."
+            else
+                line_ok "host python3 can also import CalDAV dependencies"
+            fi
+        fi
+    else
+        line_skip "CalDAV interpreter check skipped because the yeoman launcher interpreter could not be resolved"
+    fi
+else
+    line_skip "CalDAV dependency check skipped because CalDAV credentials are not configured"
 fi
 
 if [ "${resolved_config_loaded:-false}" = "true" ] && [ "${whatsapp_enabled:-false}" = "true" ]; then

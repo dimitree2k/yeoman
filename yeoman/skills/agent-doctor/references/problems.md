@@ -213,3 +213,15 @@ Severity: WARNING
 Problem: `sqlite3` is missing while memory is enabled.
 Likely cause: SQLite CLI not installed.
 Fix: install `sqlite3` so low-level DB checks and manual maintenance are available.
+
+### SYS-005
+Severity: CRITICAL
+Problem: CalDAV credentials are configured but the `yeoman` runtime cannot import `caldav` and/or `icalendar`.
+Likely cause: CalDAV packages were installed into a different Python environment than the one backing the `yeoman` launcher.
+Fix: install the missing packages into the interpreter reported by `yeoman doctor`, then restart the gateway.
+
+### SYS-006
+Severity: WARNING
+Problem: host `python3` lacks CalDAV dependencies while `yeoman` uses a different interpreter.
+Likely cause: direct source CLI commands are being run with the system interpreter instead of the yeoman virtualenv.
+Fix: prefer `yeoman ...` or the yeoman venv Python for source commands, or install the missing packages into host `python3` if that path is intentional.
