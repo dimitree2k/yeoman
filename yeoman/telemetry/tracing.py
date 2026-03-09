@@ -151,6 +151,8 @@ async def _flush() -> None:
             errors = body.get("errors", [])
             if errors:
                 logger.warning("Langfuse ingestion partial errors: {}", errors)
+            else:
+                logger.debug("langfuse flush ok: {} events sent", len(events))
     except Exception:
         logger.opt(exception=True).warning("Langfuse flush failed")
 
