@@ -70,6 +70,7 @@ def _markdown_to_whatsapp(text: str) -> str:
 
 
 _WHATSAPP_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+(?:@[^\s@]+)?)")
+_WHATSAPP_MENTION_TOKEN_TRAILING = ".,;:!?)]}>\"'”’"
 
 
 def _normalize_whatsapp_jid(value: str) -> str:
@@ -1351,6 +1352,7 @@ class WhatsAppChannel(BaseChannel):
         seen: set[str] = set()
         for match in _WHATSAPP_MENTION_RE.finditer(text):
             raw_token = str(match.group(1) or "").strip()
+            raw_token = raw_token.rstrip(_WHATSAPP_MENTION_TOKEN_TRAILING)
             if not raw_token:
                 continue
             candidate: str | None = None
