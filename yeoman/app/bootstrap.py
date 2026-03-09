@@ -45,6 +45,7 @@ from yeoman.security import NoopSecurity, SecurityEngine
 from yeoman.session.manager import SessionManager
 from yeoman.storage.inbound_archive import InboundArchive
 from yeoman.telemetry import InMemoryTelemetry
+from yeoman.telemetry import tracing
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -223,6 +224,7 @@ class GatewayRuntime:
     memory: MemoryService
 
     async def run(self) -> None:
+        tracing.init()
         try:
             await self.cron.start()
             await self.heartbeat.start()
@@ -238,6 +240,7 @@ class GatewayRuntime:
             await self.responder.aclose()
             self.inbound_archive.close()
             self.memory.close()
+            await tracing.shutdown()
 
 
 def build_gateway_runtime(

@@ -497,113 +497,113 @@ class LLMResponder(ResponderPort):
                 trace=trace,
                 name=f"iteration-{iteration}",
             ) if trace is not None else None
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self._tool_definitions(allowed_tools),
-                model=model or self.model,
-            )
-            lf.log_generation(
-                parent=iter_span or trace,
-                name="llm",
-                model=model or self.model,
-                input={"message_count": len(messages), "has_tools": bool(self._tool_definitions(allowed_tools))},
-                output=response.content,
-                usage={
-                    "input": response.usage.get("prompt_tokens", 0),
-                    "output": response.usage.get("completion_tokens", 0),
-                    "total": response.usage.get("total_tokens", 0),
-                },
-            )
-
-            if response.has_tool_calls:
-                tool_call_dicts: list[dict[str, Any]] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments),
-                        },
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages,
-                    response.content,
-                    tool_call_dicts,
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self._tool_definitions(allowed_tools),
+                    model=model or self.model,
+                )
+                lf.log_generation(
+                    parent=iter_span or trace,
+                    name="llm",
+                    model=model or self.model,
+                    input={"message_count": len(messages), "has_tools": bool(self._tool_definitions(allowed_tools))},
+                    output=response.content,
+                    usage={
+                        "input": response.usage.get("prompt_tokens", 0),
+                        "output": response.usage.get("completion_tokens", 0),
+                        "total": response.usage.get("total_tokens", 0),
+                    },
                 )
 
-                for tool_call in response.tool_calls:
-                    args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
-                    tool_span = lf.start_span(
-                        trace=trace,
-                        name=f"tool/{tool_call.name}",
-                        metadata={"arguments": args_preview[:500]},
-                        parent_span_id=iter_span.span_id if iter_span else None,
-                    ) if trace is not None else None
-                    if tool_call.name not in allowed_tools:
-                        result = (
-                            f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
-                        )
-                        lf.end_span(tool_span, output=result)
-                    else:
-                        if self.security is not None:
-                            tool_security = self.security.check_tool(
-                                tool_call.name,
-                                tool_call.arguments,
-                                context=security_context,
+                if response.has_tool_calls:
+                    tool_call_dicts: list[dict[str, Any]] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages = self.context.add_assistant_message(
+                        messages,
+                        response.content,
+                        tool_call_dicts,
+                    )
+
+                    for tool_call in response.tool_calls:
+                        args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
+                        tool_span = lf.start_span(
+                            trace=trace,
+                            name=f"tool/{tool_call.name}",
+                            metadata={"arguments": args_preview[:500]},
+                            parent_span_id=iter_span.span_id if iter_span else None,
+                        ) if trace is not None else None
+                        if tool_call.name not in allowed_tools:
+                            result = (
+                                f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                             )
-                            if tool_security.decision.action == "block":
-                                self._metric(
-                                    "security_tool_blocked",
-                                    labels=(("tool", tool_call.name),),
+                            lf.end_span(tool_span, output=result)
+                        else:
+                            if self.security is not None:
+                                tool_security = self.security.check_tool(
+                                    tool_call.name,
+                                    tool_call.arguments,
+                                    context=security_context,
                                 )
-                                result = (
-                                    "Error: Tool call blocked by security middleware "
-                                    f"({tool_security.decision.reason})."
-                                )
-                                lf.end_span(tool_span, output=result)
-                            else:
-                                if tool_security.decision.action == "warn":
+                                if tool_security.decision.action == "block":
                                     self._metric(
-                                        "security_tool_warn",
+                                        "security_tool_blocked",
                                         labels=(("tool", tool_call.name),),
                                     )
+                                    result = (
+                                        "Error: Tool call blocked by security middleware "
+                                        f"({tool_security.decision.reason})."
+                                    )
+                                    lf.end_span(tool_span, output=result)
+                                else:
+                                    if tool_security.decision.action == "warn":
+                                        self._metric(
+                                            "security_tool_warn",
+                                            labels=(("tool", tool_call.name),),
+                                        )
+                                    result = await self._execute_tool(
+                                        tool_call.name,
+                                        tool_call.arguments,
+                                        is_owner=is_owner,
+                                    )
+                                    lf.end_span(tool_span, output=result[:500] if result else "")
+                            else:
                                 result = await self._execute_tool(
                                     tool_call.name,
                                     tool_call.arguments,
                                     is_owner=is_owner,
                                 )
                                 lf.end_span(tool_span, output=result[:500] if result else "")
-                        else:
-                            result = await self._execute_tool(
-                                tool_call.name,
-                                tool_call.arguments,
-                                is_owner=is_owner,
+                        if hasattr(self, '_current_session') and self._current_session is not None:
+                            self._current_session.add_tool_call(
+                                tool_name=tool_call.name,
+                                tool_call_id=tool_call.id,
+                                arguments=tool_call.arguments,
+                                result=result,
                             )
-                            lf.end_span(tool_span, output=result[:500] if result else "")
-                    if hasattr(self, '_current_session') and self._current_session is not None:
-                        self._current_session.add_tool_call(
-                            tool_name=tool_call.name,
-                            tool_call_id=tool_call.id,
-                            arguments=tool_call.arguments,
-                            result=result,
+                        messages = self.context.add_tool_result(
+                            messages,
+                            tool_call.id,
+                            tool_call.name,
+                            result,
                         )
-                    messages = self.context.add_tool_result(
-                        messages,
-                        tool_call.id,
-                        tool_call.name,
-                        result,
-                    )
-                lf.end_span(iter_span)
-                continue
+                    continue
 
-            final_content = response.content
-            lf.end_span(iter_span)
-            break
+                final_content = response.content
+                break
+            finally:
+                lf.end_span(iter_span)
         else:
-            lf.end_span(iter_span)
             return "⚙️❓"  # max iterations reached without a text response
 
         return final_content or "🤔❓"
