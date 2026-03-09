@@ -38,6 +38,7 @@ from yeoman.core.ports import ResponderPort, SecurityPort, TelemetryPort
 from yeoman.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
 from yeoman.providers.base import LLMProvider
 from yeoman.session.manager import SessionManager
+from yeoman.telemetry import tracing as lf
 
 if TYPE_CHECKING:
     from yeoman.caldav.service import CalDAVService
@@ -485,16 +486,33 @@ class LLMResponder(ResponderPort):
         security_context: dict[str, object] | None = None,
         is_owner: bool = False,
         model: str | None = None,
+        trace: Any = None,
     ) -> str:
         iteration = 0
         final_content: str | None = None
 
         while iteration < self.max_iterations:
             iteration += 1
+            iter_span = lf.start_span(
+                trace=trace,
+                name=f"iteration-{iteration}",
+            ) if trace is not None else None
             response = await self.provider.chat(
                 messages=messages,
                 tools=self._tool_definitions(allowed_tools),
                 model=model or self.model,
+            )
+            lf.log_generation(
+                parent=iter_span or trace,
+                name="llm",
+                model=model or self.model,
+                input={"message_count": len(messages), "has_tools": bool(self._tool_definitions(allowed_tools))},
+                output=response.content,
+                usage={
+                    "input": response.usage.get("prompt_tokens", 0),
+                    "output": response.usage.get("completion_tokens", 0),
+                    "total": response.usage.get("total_tokens", 0),
+                },
             )
 
             if response.has_tool_calls:
@@ -518,10 +536,17 @@ class LLMResponder(ResponderPort):
                 for tool_call in response.tool_calls:
                     args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
+                    tool_span = lf.start_span(
+                        trace=trace,
+                        name=f"tool/{tool_call.name}",
+                        metadata={"arguments": args_preview[:500]},
+                        parent_span_id=iter_span.span_id if iter_span else None,
+                    ) if trace is not None else None
                     if tool_call.name not in allowed_tools:
                         result = (
                             f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                         )
+                        lf.end_span(tool_span, output=result)
                     else:
                         if self.security is not None:
                             tool_security = self.security.check_tool(
@@ -538,6 +563,7 @@ class LLMResponder(ResponderPort):
                                     "Error: Tool call blocked by security middleware "
                                     f"({tool_security.decision.reason})."
                                 )
+                                lf.end_span(tool_span, output=result)
                             else:
                                 if tool_security.decision.action == "warn":
                                     self._metric(
@@ -549,12 +575,14 @@ class LLMResponder(ResponderPort):
                                     tool_call.arguments,
                                     is_owner=is_owner,
                                 )
+                                lf.end_span(tool_span, output=result[:500] if result else "")
                         else:
                             result = await self._execute_tool(
                                 tool_call.name,
                                 tool_call.arguments,
                                 is_owner=is_owner,
                             )
+                            lf.end_span(tool_span, output=result[:500] if result else "")
                     if hasattr(self, '_current_session') and self._current_session is not None:
                         self._current_session.add_tool_call(
                             tool_name=tool_call.name,
@@ -568,11 +596,14 @@ class LLMResponder(ResponderPort):
                         tool_call.name,
                         result,
                     )
+                lf.end_span(iter_span)
                 continue
 
             final_content = response.content
+            lf.end_span(iter_span)
             break
         else:
+            lf.end_span(iter_span)
             return "⚙️❓"  # max iterations reached without a text response
 
         return final_content or "🤔❓"
@@ -845,6 +876,19 @@ class LLMResponder(ResponderPort):
             if approval_response:
                 return approval_response
 
+        trace = lf.start_trace(
+            name="generate",
+            metadata={
+                "channel": channel,
+                "chat_id": chat_id,
+                "session_key": session_key,
+                "model": self._model_for_profile(model_profile) or self.model,
+            },
+            tags=[channel],
+            session_id=session_key,
+        )
+        self._current_trace = trace
+
         session = self.sessions.get_or_create(session_key)
 
         # Save session immediately on first message (even if no response yet)
@@ -952,6 +996,7 @@ class LLMResponder(ResponderPort):
                     },
                     is_owner=is_owner,
                     model=self._model_for_profile(model_profile),
+                    trace=trace,
                 )
                 self._current_session = None
 
@@ -1000,6 +1045,7 @@ class LLMResponder(ResponderPort):
             session.add_message("user", content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+        self._current_trace = None
         return final_content
 
     @override
