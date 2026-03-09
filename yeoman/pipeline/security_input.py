@@ -75,11 +75,13 @@ class InputSecurityMiddleware:
         await next(ctx)
 
     def _block(self, ctx: PipelineContext, decision: SecurityDecision) -> None:
+        severity = str(getattr(decision, "severity", "safe"))
+        tags = tuple(getattr(decision, "tags", ()) or ())
         logger.info(
             "security_decision stage=input action=block severity={} reason={} tags={} context={}",
-            decision.severity,
+            severity,
             decision.reason,
-            list(decision.tags),
+            list(tags),
             {
                 "channel": ctx.event.channel,
                 "chat_id": ctx.event.chat_id,

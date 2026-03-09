@@ -16,7 +16,6 @@ from yeoman.adapters.policy_engine import EnginePolicyAdapter
 from yeoman.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman.adapters.responder_llm import LLMResponder
 from yeoman.adapters.typing_channel_manager import ChannelManagerTypingAdapter
-from yeoman.telemetry import InMemoryTelemetry
 from yeoman.agent.tools.file_access import build_file_access_resolver
 from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from yeoman.bus.queue import MessageBus
@@ -45,6 +44,7 @@ from yeoman.providers.openai_compatible import resolve_openai_compatible_credent
 from yeoman.security import NoopSecurity, SecurityEngine
 from yeoman.session.manager import SessionManager
 from yeoman.storage.inbound_archive import InboundArchive
+from yeoman.telemetry import InMemoryTelemetry
 
 if TYPE_CHECKING:
     from pathlib import Path

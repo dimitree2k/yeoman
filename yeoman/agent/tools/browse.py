@@ -1,6 +1,5 @@
 """Browse tool: real browser control via pinchtab HTTP API."""
 
-import json
 import os
 from pathlib import Path
 from typing import Any

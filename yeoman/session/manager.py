@@ -108,6 +108,7 @@ class SessionManager:
     def __init__(self, workspace: Path, sessions_dir: Path | None = None):
         self.workspace = workspace
         self.sessions_dir = sessions_dir if sessions_dir is not None else get_sessions_path()
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, Session] = {}
 
     def _get_session_path(self, key: str) -> Path:
@@ -176,6 +177,7 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, "w") as f:
             # Write metadata first

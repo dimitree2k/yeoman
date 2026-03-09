@@ -23,6 +23,7 @@ from yeoman.core.pipeline import NextFn, PipelineContext
 from yeoman.core.ports import SecurityPort
 
 if TYPE_CHECKING:
+    from yeoman.core.models import InboundEvent
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
 

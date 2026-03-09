@@ -15,17 +15,18 @@ Security:
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 if TYPE_CHECKING:
+    from fastapi import FastAPI
+
     from yeoman.channels.manager import ChannelManager
     from yeoman.config.loader import Config
     from yeoman.telemetry.base import TelemetryPort
@@ -119,7 +120,7 @@ def create_app(
         FastAPI application instance
     """
     from fastapi import FastAPI, HTTPException, Request, Response
-    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+    from fastapi.security import HTTPAuthorizationCredentials
 
     api_config = api_config or APIConfig()
 
@@ -143,8 +144,6 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
-
-    security = HTTPBearer(auto_error=False)
 
     def verify_auth(request: Request, credentials: HTTPAuthorizationCredentials | None = None) -> None:
         """Verify authentication for protected endpoints."""
