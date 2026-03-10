@@ -18,6 +18,7 @@ from yeoman.adapters.responder_llm import LLMResponder
 from yeoman.adapters.typing_channel_manager import ChannelManagerTypingAdapter
 from yeoman.agent.tools.file_access import build_file_access_resolver
 from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
+from yeoman.contacts.service import ContactsService
 from yeoman.bus.queue import MessageBus
 from yeoman.channels.manager import ChannelManager
 from yeoman.core.intents import (
@@ -222,6 +223,7 @@ class GatewayRuntime:
     inbound_archive: InboundArchive
     responder: LLMResponder
     memory: MemoryService
+    contacts: ContactsService
 
     async def run(self) -> None:
         tracing.init()
@@ -239,6 +241,7 @@ class GatewayRuntime:
             await self.channels.stop_all()
             await self.responder.aclose()
             self.inbound_archive.close()
+            self.contacts.close()
             self.memory.close()
             await tracing.shutdown()
 
@@ -299,6 +302,13 @@ def build_gateway_runtime(
             logger.info("memory backfill imported {} entries", imported)
     except Exception as e:
         logger.warning("memory backfill failed: {}", e)
+
+    contacts_service = ContactsService(
+        db_path=get_operational_data_path() / "contacts" / "contacts.db",
+    )
+    contacts_service.mark_owner_from_policy(
+        policy_engine.policy.owners if policy_engine else {},
+    )
 
     cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
@@ -393,6 +403,7 @@ def build_gateway_runtime(
         policy=policy_adapter,
         responder=responder,
         reply_archive=archive_adapter,
+        contacts=contacts_service,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,
@@ -495,4 +506,5 @@ def build_gateway_runtime(
         inbound_archive=inbound_archive,
         responder=responder,
         memory=memory_service,
+        contacts=contacts_service,
     )

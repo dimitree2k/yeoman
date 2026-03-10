@@ -19,6 +19,7 @@ from yeoman.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, Secur
 from yeoman.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
 from yeoman.pipeline.admin import AdminCommandMiddleware
 from yeoman.pipeline.archive import ArchiveMiddleware
+from yeoman.pipeline.contacts import ContactsMiddleware
 from yeoman.pipeline.dedup import DeduplicationMiddleware
 from yeoman.pipeline.idea_capture import IdeaCaptureMiddleware
 from yeoman.pipeline.new_chat import NewChatNotifyMiddleware
@@ -32,6 +33,7 @@ from yeoman.pipeline.security_input import InputSecurityMiddleware
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from yeoman.contacts.service import ContactsService
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
     from yeoman.security.classifier import InputClassifier
@@ -51,6 +53,7 @@ class Orchestrator:
         policy: PolicyPort,
         responder: ResponderPort,
         reply_archive: ReplyArchivePort | None = None,
+        contacts: "ContactsService | None" = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 8,
@@ -67,10 +70,14 @@ class Orchestrator:
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
         owner_alert_cooldown_seconds: int = 300,
     ) -> None:
-        self._pipeline = Pipeline([
+        layers: list = [
             NormalizationMiddleware(),
             DeduplicationMiddleware(ttl_seconds=dedupe_ttl_seconds),
             ArchiveMiddleware(archive=reply_archive),
+        ]
+        if contacts is not None:
+            layers.append(ContactsMiddleware(contacts=contacts))
+        layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,
                 reply_context_window_limit=reply_context_window_limit,
@@ -96,6 +103,7 @@ class Orchestrator:
                 owner_alert_cooldown_seconds=owner_alert_cooldown_seconds,
             ),
         ])
+        self._pipeline = Pipeline(layers)
 
     async def handle(self, event: InboundEvent) -> list[OrchestratorIntent]:
         """Process one inbound event and return executable intents."""
