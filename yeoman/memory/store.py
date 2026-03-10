@@ -132,6 +132,11 @@ class MemoryStore:
                 USING fts5(entry_id UNINDEXED, content)
                 """
             )
+            # Migration: add contact_id column if missing
+            try:
+                self._conn.execute("SELECT contact_id FROM memory2_nodes LIMIT 0")
+            except sqlite3.OperationalError:
+                self._conn.execute("ALTER TABLE memory2_nodes ADD COLUMN contact_id TEXT")
             self._conn.commit()
 
     @staticmethod
@@ -486,6 +491,17 @@ class MemoryStore:
                 """
             )
             self._conn.commit()
+
+    def link_nodes_to_contact(self, sender_id: str, contact_id: str) -> int:
+        """Link existing memory nodes to a contact by sender_id."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE memory2_nodes SET contact_id = ?"
+                " WHERE sender_id = ? AND (contact_id IS NULL OR contact_id = '')",
+                (contact_id, sender_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     def append_idea_backlog_item(
         self,

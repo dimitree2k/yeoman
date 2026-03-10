@@ -97,6 +97,8 @@ class MemoryService:
                 except Exception as exc:
                     logger.warning("memory extractor disabled due to route error: {}", exc)
 
+        self._contacts = None
+
         self._capture_queue: queue.Queue[dict[str, object]] = queue.Queue(
             maxsize=max(32, int(self.config.capture.queue_maxsize))
         )
@@ -121,6 +123,10 @@ class MemoryService:
         self._background_notes_mode_hybrid_total = 0
         self._background_notes_mode_heuristic_total = 0
         self._background_notes_saved_total = 0
+
+    def set_contacts(self, contacts: object) -> None:
+        """Late-binding setter for ContactsService (avoids circular bootstrap)."""
+        self._contacts = contacts
 
     @staticmethod
     def chat_scope_key(channel: str, chat_id: str) -> str:
