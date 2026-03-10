@@ -983,6 +983,14 @@ class LLMResponder(ResponderPort):
             if talkative_reply is not None:
                 final_content = talkative_reply
             else:
+                # Append contacts roster if present
+                roster_text = metadata.pop("_contacts_roster_text", None)
+                if roster_text:
+                    if retrieved_memory_text:
+                        retrieved_memory_text = f"{retrieved_memory_text}\n\n{roster_text}"
+                    else:
+                        retrieved_memory_text = str(roster_text)
+
                 messages = self.context.build_messages(
                     history=session.get_history(
                         max_messages=20 if chat_id.endswith("@g.us") else 50
@@ -1077,6 +1085,24 @@ class LLMResponder(ResponderPort):
             metadata["voice_reply_max_chars"] = int(
                 getattr(decision, "voice_output_max_chars", 150) or 150
             )
+        # Inject contacts roster for group chats with disclosure enabled
+        if (
+            decision.contacts_disclosure
+            and event.is_group
+            and self.contacts is not None
+        ):
+            mentioned_jids = event.raw_metadata.get("mentioned_jids", [])
+            jids: list[str] = []
+            if isinstance(mentioned_jids, list):
+                jids.extend(str(j) for j in mentioned_jids if isinstance(j, str))
+            for jid in self.contacts.known_jids:
+                if jid not in jids:
+                    jids.append(jid)
+            roster_text = self.contacts.format_roster_text(
+                channel=route_channel, participant_jids=jids,
+            )
+            if roster_text:
+                metadata["_contacts_roster_text"] = roster_text
         return await self._generate(
             session_key=session_key,
             channel=route_channel,

@@ -128,6 +128,15 @@ class MemoryService:
         """Late-binding setter for ContactsService (avoids circular bootstrap)."""
         self._contacts = contacts
 
+    def _resolve_contact_id(self, sender_id: str | None) -> str | None:
+        """Look up contact_id for a sender_id via the contacts cache."""
+        if not sender_id or self._contacts is None:
+            return None
+        jids = getattr(self._contacts, "known_jids", None)
+        if jids and isinstance(jids, dict):
+            return jids.get(sender_id)
+        return None
+
     @staticmethod
     def chat_scope_key(channel: str, chat_id: str) -> str:
         return f"channel:{channel}:chat:{chat_id}"
@@ -724,7 +733,12 @@ class MemoryService:
         if self.embedding is not None:
             embedding_model = self.embedding.model
             embedding = self.embedding.embed(compact)
-        self.store.upsert_node(entry, embedding_model=embedding_model, embedding=embedding)
+        self.store.upsert_node(
+            entry,
+            embedding_model=embedding_model,
+            embedding=embedding,
+            contact_id=self._resolve_contact_id(sender_id),
+        )
         return True
 
     def _heuristic_candidate(self, text: str) -> ExtractedCandidate:
@@ -815,7 +829,9 @@ class MemoryService:
             updated_at=now_iso,
             valid_from=now_iso,
         )
-        saved, inserted = self.store.upsert_node(entry)
+        saved, inserted = self.store.upsert_node(
+            entry, contact_id=self._resolve_contact_id(sender_id),
+        )
         return saved, inserted
 
     @staticmethod

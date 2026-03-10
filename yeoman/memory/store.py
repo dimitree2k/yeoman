@@ -200,6 +200,7 @@ class MemoryStore:
         *,
         embedding_model: str | None = None,
         embedding: list[float] | None = None,
+        contact_id: str | None = None,
     ) -> tuple[MemoryEntry, bool]:
         """Insert or merge one entry. Returns (entry, inserted_new)."""
         now_iso = datetime.now(UTC).isoformat()
@@ -256,12 +257,12 @@ class MemoryStore:
                 """
                 INSERT INTO memory2_nodes (
                     id, workspace_id, scope_type, scope_key,
-                    channel, chat_id, sender_id,
+                    channel, chat_id, sender_id, contact_id,
                     sector, kind, content, content_norm, content_hash,
                     salience, confidence,
                     source, source_message_id, source_role, language, meta_json,
                     created_at, updated_at, last_accessed_at, valid_from, valid_to, is_deleted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry_id,
@@ -271,6 +272,7 @@ class MemoryStore:
                     entry.channel,
                     entry.chat_id,
                     entry.sender_id,
+                    contact_id,
                     entry.sector,
                     entry.kind,
                     entry.content,
