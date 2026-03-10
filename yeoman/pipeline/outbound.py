@@ -23,6 +23,7 @@ from yeoman.core.pipeline import NextFn, PipelineContext
 from yeoman.core.ports import SecurityPort
 
 if TYPE_CHECKING:
+    from yeoman.contacts.service import ContactsService
     from yeoman.core.models import InboundEvent
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
@@ -86,6 +87,7 @@ class OutboundMiddleware:
     def __init__(
         self,
         *,
+        contacts: "ContactsService | None" = None,
         security: SecurityPort | None = None,
         security_block_message: str = "😂",
         tts: "TTSSynthesizer | None" = None,
@@ -95,6 +97,7 @@ class OutboundMiddleware:
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
         owner_alert_cooldown_seconds: int = 300,
     ) -> None:
+        self._contacts = contacts
         self._security = security
         self._security_block_message = security_block_message
         self._tts = tts
@@ -192,6 +195,18 @@ class OutboundMiddleware:
         outbound_metadata: dict[str, object] = {}
         if outbound_channel == "whatsapp":
             mention_candidates = _collect_whatsapp_mention_candidates(event)
+            # Resolve @Name mentions via contacts DB
+            if self._contacts is not None and ctx.reply:
+                seen = set(mention_candidates)
+                for match in re.finditer(r"(?<!\w)@(\w+)", ctx.reply):
+                    name = match.group(1)
+                    jid = self._contacts.resolve_name_to_jid(
+                        name, channel="whatsapp",
+                        group_participants=list(seen),
+                    )
+                    if jid and jid not in seen:
+                        mention_candidates.append(jid)
+                        seen.add(jid)
             if mention_candidates:
                 outbound_metadata["mention_candidates"] = mention_candidates
 

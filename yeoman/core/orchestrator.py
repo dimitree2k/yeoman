@@ -94,6 +94,7 @@ class Orchestrator:
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
             ResponderMiddleware(responder=responder, typing_notifier=typing_notifier),
             OutboundMiddleware(
+                contacts=contacts,
                 security=security,
                 security_block_message=security_block_message,
                 tts=tts,
