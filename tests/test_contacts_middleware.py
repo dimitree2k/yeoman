@@ -5,9 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from yeoman.contacts.service import ContactsService
-from yeoman.core.models import InboundEvent
+from yeoman.core.models import ArchivedMessage, InboundEvent
 from yeoman.core.pipeline import PipelineContext
 from yeoman.pipeline.contacts import ContactsMiddleware
+from yeoman.pipeline.reply_context import ReplyContextMiddleware
 
 
 def _make_event(**overrides: object) -> InboundEvent:
@@ -82,3 +83,45 @@ class TestContactsMiddleware:
             contacts.known_jids["140960843485342@lid"]
         )
         assert idents[0].kind == "lid"
+
+
+class _FakeArchive:
+    def __init__(self, messages: list[ArchivedMessage] | None = None) -> None:
+        self._messages = messages or []
+
+    def record_inbound(self, event: InboundEvent) -> None: pass
+    def lookup_message(self, channel, chat_id, message_id): return None
+    def lookup_message_any_chat(self, channel, message_id, preferred_chat_id=None): return None
+    def lookup_messages_before(self, channel, chat_id, anchor_id, limit=8):
+        return self._messages
+
+
+class TestSpeakerLabelResolution:
+    @pytest.mark.asyncio
+    async def test_ambient_window_uses_contact_display_name(
+        self, contacts: ContactsService,
+    ) -> None:
+        cid = contacts.ensure_contact(
+            channel="whatsapp", identifier="jid1@s.whatsapp.net",
+            kind="phone_jid", push_name="Pikachu123",
+        )
+        contacts.update_display_name(cid, "Alex")
+
+        archived = ArchivedMessage(
+            channel="whatsapp", chat_id="test-chat@g.us",
+            message_id="old-msg-001", text="hey there",
+            sender_id="jid1@s.whatsapp.net",
+            participant=None, timestamp=None,
+            created_at="2026-03-10T12:00:00Z",
+        )
+        archive = _FakeArchive(messages=[archived])
+        mw = ReplyContextMiddleware(archive=archive, contacts=contacts)
+        event = _make_event(message_id="msg-002")
+        ctx = PipelineContext(event=event)
+
+        async def next_fn(c: PipelineContext) -> None: pass
+        await mw(ctx, next_fn)
+
+        ambient = ctx.event.raw_metadata.get("ambient_context_window", [])
+        assert len(ambient) == 1
+        assert ambient[0].startswith("[Alex]")  # display_name, not pushName

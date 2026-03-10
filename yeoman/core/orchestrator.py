@@ -80,6 +80,7 @@ class Orchestrator:
         layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,
+                contacts=contacts,
                 reply_context_window_limit=reply_context_window_limit,
                 reply_context_line_max_chars=reply_context_line_max_chars,
                 ambient_window_limit=ambient_window_limit,
