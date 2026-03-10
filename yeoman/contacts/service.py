@@ -178,6 +178,52 @@ class ContactsService:
                     self.store.set_owner(contact.id, is_owner=True)
                     logger.info("marked {} as owner ({})", contact.display_name, jid)
 
+    # ── roster for disclosure ────────────────────────────────────────
+
+    def build_roster(
+        self,
+        *,
+        channel: str,
+        participant_jids: list[str],
+    ) -> list[dict[str, object]]:
+        """Build roster entries for known, non-owner participants."""
+        roster: list[dict[str, object]] = []
+        for jid in participant_jids:
+            contact_id = self.known_jids.get(jid)
+            if not contact_id:
+                continue
+            contact = self.store.get_contact(contact_id)
+            if contact is None or contact.is_owner:
+                continue
+            facts: list[str] = []
+            for f in self.store.get_fields(contact_id):
+                label = f" ({f.label})" if f.label else ""
+                if f.kind == "note":
+                    facts.append(f.value)
+                else:
+                    facts.append(f"{f.kind}{label}: {f.value}")
+            roster.append({"name": contact.display_name, "facts": facts})
+        return roster
+
+    def format_roster_text(
+        self,
+        *,
+        channel: str,
+        participant_jids: list[str],
+    ) -> str:
+        """Format roster as text block for LLM context injection."""
+        roster = self.build_roster(channel=channel, participant_jids=participant_jids)
+        if not roster:
+            return ""
+        lines = ["[Group Members]"]
+        for entry in roster:
+            facts_str = ", ".join(str(f) for f in entry["facts"]) if entry["facts"] else ""
+            if facts_str:
+                lines.append(f"- {entry['name']}: {facts_str}")
+            else:
+                lines.append(f"- {entry['name']}")
+        return "\n".join(lines)
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:

@@ -309,6 +309,7 @@ def build_gateway_runtime(
     contacts_service.mark_owner_from_policy(
         policy_engine.policy.owners if policy_engine else {},
     )
+    memory_service.set_contacts(contacts_service)
 
     cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
