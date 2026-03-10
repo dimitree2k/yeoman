@@ -15,6 +15,7 @@ from loguru import logger
 
 from yeoman.agent.context import ContextBuilder
 from yeoman.agent.subagent import SubagentManager
+from yeoman.agent.tools.contacts import ContactsTool
 from yeoman.agent.tools.cron import CronTool
 from yeoman.agent.tools.exec_isolation import SandboxMount
 from yeoman.agent.tools.file_access import FileAccessResolver, enable_grants
@@ -43,6 +44,7 @@ from yeoman.telemetry import tracing as lf
 if TYPE_CHECKING:
     from yeoman.caldav.service import CalDAVService
     from yeoman.config.schema import ExecToolConfig
+    from yeoman.contacts.service import ContactsService
     from yeoman.cron.service import CronService
     from yeoman.media.router import ModelRouter
     from yeoman.media.tts import TTSSynthesizer
@@ -72,6 +74,7 @@ class LLMResponder(ResponderPort):
         tavily_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
+        contacts_service: "ContactsService | None" = None,
         caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -96,6 +99,7 @@ class LLMResponder(ResponderPort):
         self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self.contacts_service = contacts_service
         self.caldav_service = caldav_service
         self.memory = memory_service
         self.telemetry = telemetry
@@ -210,6 +214,10 @@ class LLMResponder(ResponderPort):
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
 
+        if self.contacts_service is not None:
+            contacts_tool = ContactsTool(self.contacts_service)
+            self.tools.register(contacts_tool)
+
         # Calendar — only if CalDAV credentials are configured
         if self.caldav_service is not None:
             from yeoman.agent.tools.calendar import CalendarTool
@@ -248,6 +256,10 @@ class LLMResponder(ResponderPort):
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(channel, chat_id)
+
+        contacts_tool = self.tools.get("contacts")
+        if isinstance(contacts_tool, ContactsTool):
+            contacts_tool.set_context(channel, chat_id)
 
     @staticmethod
     def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:

@@ -370,6 +370,7 @@ def build_gateway_runtime(
         telemetry=telemetry,
         security=security,
         cron_service=cron,
+        contacts_service=contacts_service,
         caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
