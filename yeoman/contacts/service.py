@@ -224,6 +224,16 @@ class ContactsService:
                 lines.append(f"- {entry['name']}")
         return "\n".join(lines)
 
+    # ── memory backfill ────────────────────────────────────────────────────
+
+    def backfill_memory(self, memory_store: object) -> int:
+        """One-time backfill: link existing memory nodes to contacts by sender_id."""
+        linked = 0
+        for identifier, contact_id in self.known_jids.items():
+            count = memory_store.link_nodes_to_contact(identifier, contact_id)  # type: ignore[attr-defined]
+            linked += count
+        return linked
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
