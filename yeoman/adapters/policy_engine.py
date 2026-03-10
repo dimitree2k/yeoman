@@ -491,6 +491,7 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_cooldown_seconds = 900
         talkative_cooldown_delay_seconds = 2.5
         talkative_cooldown_use_llm_message = False
+        contacts_disclosure = False
         model_profile: str | None = None
         when_to_reply_mode: Literal["all", "mention_only", "allowed_senders", "owner_only", "off"] = "all"
         if event.channel in self._engine.apply_channels:
@@ -517,6 +518,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_use_llm_message = (
                     effective.talkative_cooldown_use_llm_message
                 )
+                contacts_disclosure = effective.contacts_disclosure
                 model_profile = effective.model_profile
             except Exception:
                 # Policy voice output settings are optional and should never break evaluation.
@@ -558,6 +560,7 @@ class EnginePolicyAdapter(PolicyPort):
             talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
             model_profile=model_profile,
+            contacts_disclosure=contacts_disclosure,
             is_owner=is_owner,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )

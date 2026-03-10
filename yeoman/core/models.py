@@ -67,6 +67,7 @@ class PolicyDecision:
     talkative_cooldown_delay_seconds: float = 2.5
     talkative_cooldown_use_llm_message: bool = False
     model_profile: str | None = None
+    contacts_disclosure: bool = False
     is_owner: bool = False
     source: str = "disabled"
 

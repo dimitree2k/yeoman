@@ -183,6 +183,7 @@ class ChatPolicy(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicy = Field(
         default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
     )
+    contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
 
 
 class ChatPolicyOverride(PolicyModel):
@@ -203,6 +204,7 @@ class ChatPolicyOverride(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(
         default=None, alias="talkativeCooldown"
     )
+    contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
 
 
 class ChannelPolicy(PolicyModel):
