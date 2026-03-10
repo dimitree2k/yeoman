@@ -63,6 +63,14 @@ class TestContactsService:
     def test_get_display_name_unknown(self, service: ContactsService) -> None:
         assert service.get_display_name("nonexistent") is None
 
+    def test_update_display_name_invalidates_cache(self, service: ContactsService) -> None:
+        cid = service.ensure_contact(
+            channel="whatsapp", identifier="jid1", kind="phone_jid", push_name="Alex",
+        )
+        assert service.get_display_name(cid) == "Alex"
+        service.update_display_name(cid, "Alexander")
+        assert service.get_display_name(cid) == "Alexander"
+
     def test_resolve_name_to_jid(self, service: ContactsService) -> None:
         service.ensure_contact(
             channel="whatsapp", identifier="jid1@s.whatsapp.net",

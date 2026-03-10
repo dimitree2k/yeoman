@@ -90,6 +90,11 @@ class ContactsService:
 
     # ── display name ──────────────────────────────────────────────────────
 
+    def update_display_name(self, contact_id: str, display_name: str) -> None:
+        """Update display name in the store and invalidate the cache entry."""
+        self.store.update_display_name(contact_id, display_name)
+        self._display_names.pop(contact_id, None)
+
     def get_display_name(self, contact_id: str) -> str | None:
         """Return the display name for a contact, using cache when possible."""
         if contact_id in self._display_names:
