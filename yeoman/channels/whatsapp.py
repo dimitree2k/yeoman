@@ -71,6 +71,7 @@ def _markdown_to_whatsapp(text: str) -> str:
 
 _WHATSAPP_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+(?:@[^\s@]+)?)")
 _WHATSAPP_MENTION_TOKEN_TRAILING = ".,;:!?)]}>\"'”’"
+_PHONE_MENTION_RE = re.compile(r"(?<!\w)\+(\d{10,15})(?!\d)")
 
 
 def _normalize_whatsapp_jid(value: str) -> str:
@@ -137,6 +138,7 @@ class InboundEvent:
     media_bytes: int | None
     media_description: str | None
     voice_transcript: str | None
+    sender_name: str | None = None
 
 
 class WhatsAppChannel(BaseChannel):
@@ -384,6 +386,8 @@ class WhatsAppChannel(BaseChannel):
 
         reply_to = str(msg.reply_to or "").strip() or None
         text = _markdown_to_whatsapp(msg.content)
+        # Rewrite +phone to @phone so the mention resolver picks them up.
+        text = _PHONE_MENTION_RE.sub(r"@\1", text)
         mentions = self._resolve_outbound_mentions(text, msg.metadata)
         allow_mentions = bool(mentions) and msg.chat_id.endswith("@g.us")
 
@@ -593,6 +597,7 @@ class WhatsAppChannel(BaseChannel):
         participant_jid = str(payload.get("participantJid") or "").strip()
         sender_id = str(payload.get("senderId") or "").strip()
         sender_phone_jid = str(payload.get("senderPhoneJid") or "").strip() or None
+        sender_name = str(payload.get("senderName") or "").strip() or None
         text = str(payload.get("text") or "").strip()
 
         if not message_id or not chat_jid or not sender_id or not text:
@@ -649,6 +654,7 @@ class WhatsAppChannel(BaseChannel):
             participant_jid=participant_jid,
             sender_id=sender_id,
             sender_phone_jid=sender_phone_jid,
+            sender_name=sender_name,
             is_group=bool(payload.get("isGroup", False)),
             text=text,
             timestamp=timestamp,
@@ -762,6 +768,7 @@ class WhatsAppChannel(BaseChannel):
             participant_jid=last.participant_jid,
             sender_id=last.sender_id,
             sender_phone_jid=last.sender_phone_jid,
+            sender_name=last.sender_name,
             is_group=last.is_group,
             text=combined_text or last.text,
             timestamp=last.timestamp,
@@ -795,6 +802,7 @@ class WhatsAppChannel(BaseChannel):
                     if event.sender_phone_jid
                     else event.sender_id
                 ) or event.sender_id,
+                sender_name=event.sender_name,
                 text=event.text,
                 timestamp=event.timestamp,
             )

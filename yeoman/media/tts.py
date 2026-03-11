@@ -433,6 +433,70 @@ class OpenRouterAudioTTSProvider:
         return ogg_bytes, None
 
 
+class FishAudioTTSProvider:
+    """Text-to-speech provider using Fish Audio's /v1/tts endpoint."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        api_base: str | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("FISH_API_KEY")
+        base = (api_base or "https://api.fish.audio").rstrip("/")
+        self.api_url = base + "/v1/tts"
+        self.timeout_seconds = timeout_seconds
+
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        model: str,
+        voice: str,
+        format: str,
+    ) -> tuple[bytes | None, str | None]:
+        if not self.api_key:
+            logger.warning("Fish Audio API key not configured for TTS")
+            return None, "fish_audio_api_key_missing"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, object] = {
+            "text": text,
+            "reference_id": voice,
+            "format": format or "opus",
+            "model": model or "s2-pro",
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as e:
+                logger.error("Fish Audio TTS request failed {}: {}", e.__class__.__name__, e)
+                return None, f"fish_audio_request_failed:{e.__class__.__name__}"
+
+        try:
+            response.raise_for_status()
+        except Exception as e:
+            logger.error(
+                "Fish Audio TTS error {}: {}",
+                e.__class__.__name__,
+                getattr(response, "text", ""),
+            )
+            status = getattr(response, "status_code", "unknown")
+            return None, f"fish_audio_http_{status}"
+
+        return bytes(response.content or b""), None
+
+
 class TTSSynthesizer:
     """Synthesize speech using the route-selected TTS backend."""
 
@@ -450,6 +514,9 @@ class TTSSynthesizer:
         openrouter_api_key: str | None = None,
         openrouter_api_base: str | None = None,
         openrouter_extra_headers: dict[str, str] | None = None,
+        fish_api_key: str | None = None,
+        fish_api_base: str | None = None,
+        fish_default_voice_id: str | None = None,
         max_concurrency: int = 2,
     ) -> None:
         self._openai_api_key = openai_api_key
@@ -463,6 +530,9 @@ class TTSSynthesizer:
         self._openrouter_api_key = openrouter_api_key
         self._openrouter_api_base = openrouter_api_base
         self._openrouter_extra_headers = openrouter_extra_headers
+        self._fish_api_key = fish_api_key
+        self._fish_api_base = fish_api_base
+        self._fish_default_voice_id = fish_default_voice_id
         self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
 
     async def synthesize(
@@ -553,6 +623,19 @@ class TTSSynthesizer:
                 timeout_seconds=timeout_s,
             )
             audio, error = await client.synthesize(text=text, model=model, voice=voice, format=format)
+            return (audio or None), error
+
+        if provider in {"fish_audio"}:
+            model = profile.model or "s2-pro"
+            voice_candidate = str(voice or "").strip()
+            if not voice_candidate or voice_candidate == "alloy":
+                voice_candidate = str(self._fish_default_voice_id or "").strip()
+            client = FishAudioTTSProvider(
+                api_key=self._fish_api_key,
+                api_base=self._fish_api_base,
+                timeout_seconds=timeout_s,
+            )
+            audio, error = await client.synthesize(text=text, model=model, voice=voice_candidate, format=format)
             return (audio or None), error
 
         return None, f"tts_provider_unsupported:{provider}"

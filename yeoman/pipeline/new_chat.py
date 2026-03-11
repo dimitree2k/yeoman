@@ -92,7 +92,7 @@ class NewChatNotifyMiddleware:
         chat_type = "group" if is_group else "chat"
 
         lines = [
-            f"🔔 Nano was added to a new WhatsApp {chat_type}",
+            f"🔔 Arvid was added to a new WhatsApp {chat_type}",
         ]
         if group_name:
             lines.append(f"📛 Name: {group_name}")

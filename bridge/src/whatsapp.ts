@@ -42,6 +42,7 @@ export interface InboundMessageV2 {
   participantJid: string;
   senderId: string;
   senderPhoneJid?: string;
+  senderName?: string;
   isGroup: boolean;
   text: string;
   timestamp: number;
@@ -1287,6 +1288,7 @@ export class WhatsAppClient {
           participantJid,
           senderId,
           senderPhoneJid: this.resolvePhoneJid(participantJid) || undefined,
+          senderName: (msg.pushName || '').trim() || undefined,
           isGroup,
           text: limitText(extracted.text, 8_000),
           timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),

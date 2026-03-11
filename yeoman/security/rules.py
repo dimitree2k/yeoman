@@ -97,7 +97,7 @@ def _hits_for_input(norm: NormalizedText) -> list[RuleHit]:
         hits.append(RuleHit(tag="tool_abuse", severity="high", reason="Tool approval bypass pattern"))
     if _match_any(_INPUT_WARN, norm.lowered):
         hits.append(RuleHit(tag="safety_bypass_signal", severity="medium", reason="Suspicious safety-bypass phrasing"))
-    # Persona manipulation detection - blocks attempts to change Nano's persona/address
+    # Persona manipulation detection - blocks attempts to change Arvid's persona/address
     if _match_any(_PERSONA_MANIPULATION, norm.lowered):
         hits.append(RuleHit(tag="persona_manipulation", severity="high", reason="Persona/address manipulation attempt detected"))
     return hits

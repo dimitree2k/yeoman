@@ -338,6 +338,7 @@ def build_gateway_runtime(
     openai_compat = resolve_openai_compatible_credentials(config)
     elevenlabs = config.providers.elevenlabs
     openrouter = config.providers.openrouter
+    fish_api_key = os.environ.get("FISH_API_KEY") or ""
     tts = TTSSynthesizer(
         openai_api_key=openai_compat.api_key if openai_compat else None,
         openai_api_base=openai_compat.api_base if openai_compat else None,
@@ -350,6 +351,8 @@ def build_gateway_runtime(
         openrouter_api_key=openrouter.api_key or None,
         openrouter_api_base=openrouter.api_base,
         openrouter_extra_headers=openrouter.extra_headers,
+        fish_api_key=fish_api_key or None,
+        fish_default_voice_id="71c095ed4c03459fb98500db63b88fbe",
         max_concurrency=config.channels.whatsapp.media.max_tts_concurrency,
     )
 
@@ -388,6 +391,18 @@ def build_gateway_runtime(
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
+
+    # Wire /voice command callback: reuses the send_voice tool.
+    async def _voice_send_callback(content: str, chat_id: str) -> str:
+        return await responder.tools.execute("send_voice", {
+            "content": content,
+            "channel": "whatsapp",
+            "chat_id": chat_id,
+            "voice": "71c095ed4c03459fb98500db63b88fbe",
+            "verbatim": True,
+        })
+
+    policy_adapter.set_voice_send_callback(_voice_send_callback)
 
     # Update policy adapter with actual tool names
     policy_adapter._known_tools = set(responder.tool_names)

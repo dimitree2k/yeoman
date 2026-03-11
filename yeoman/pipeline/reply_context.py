@@ -7,6 +7,7 @@ them into ``event.raw_metadata``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,12 @@ from yeoman.core.ports import ReplyArchivePort
 
 if TYPE_CHECKING:
     from yeoman.contacts.service import ContactsService
+
+# Bridge placeholders that are not meaningful reply text — the archive
+# transcript (if available) should take precedence.
+_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^\[(?:Voice Message|Video|Image|Document|Sticker|Audio)\]$"
+)
 
 
 class ReplyContextMiddleware:
@@ -55,7 +62,13 @@ class ReplyContextMiddleware:
             return event, False, False
 
         reply_to_message_id = (event.reply_to_message_id or "").strip()
-        has_payload_reply_text = bool((event.reply_to_text or "").strip())
+        payload_reply_text = (event.reply_to_text or "").strip()
+        # Bridge re-extracts quoted text from the proto, so voice messages
+        # arrive as "[Voice Message]" even if the archive has a transcript.
+        is_media_placeholder = bool(
+            payload_reply_text and _MEDIA_PLACEHOLDER_RE.match(payload_reply_text)
+        )
+        has_payload_reply_text = bool(payload_reply_text) and not is_media_placeholder
         ambient_lines = self._build_ambient_window(event)
 
         if not reply_to_message_id:
@@ -159,5 +172,5 @@ class ReplyContextMiddleware:
                 if name:
                     return name
         return (
-            row.sender_id or row.participant or "unknown"
+            row.sender_name or row.sender_id or row.participant or "unknown"
         ).strip() or "unknown"

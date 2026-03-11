@@ -89,4 +89,5 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
             text=str(row.get("text") or ""),
             timestamp=timestamp,
             created_at=str(row.get("created_at") or ""),
+            sender_name=str(row.get("sender_name")) if row.get("sender_name") else None,
         )

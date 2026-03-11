@@ -369,7 +369,7 @@ class OutboundMiddleware:
         from yeoman.pipeline.new_chat import _normalize_owner_target
 
         content = (
-            f"⚠️ Nano diagnostic\nvoice fallback in {channel}:{chat_id}\nreason={reason_compact}"
+            f"⚠️ Arvid diagnostic\nvoice fallback in {channel}:{chat_id}\nreason={reason_compact}"
         )
         normalized_targets: list[str] = []
         for raw in targets_raw:

@@ -168,6 +168,7 @@ class EnginePolicyAdapter(PolicyPort):
                 StartCommandHandler(self),
                 StopCommandHandler(self),
                 VoiceMessagesCommandHandler(self),
+                VoiceSendCommandHandler(self),
                 ResetSessionCommandHandler(self),
             ]
         )
@@ -699,6 +700,9 @@ class EnginePolicyAdapter(PolicyPort):
         return bool(self._owner_policy_for_context(ctx))
 
     def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx))
+
+    def voice_send_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
 
     def response_control_is_applicable(self, ctx: AdminCommandContext) -> bool:
@@ -1297,7 +1301,7 @@ class EnginePolicyAdapter(PolicyPort):
                 lines.append("")
                 lines.extend(self._policy_admin_service.registry.usage_lines())
         else:
-            lines.append("In your DM with Nano: /policy help")
+            lines.append("In your DM with Arvid: /policy help")
         return AdminCommandResult(
             status="handled",
             response="\n".join(lines),
@@ -1432,6 +1436,74 @@ class EnginePolicyAdapter(PolicyPort):
                 AdminMetricEvent(
                     name="voice_messages_set_total",
                     labels=(("channel", ctx.channel), ("mode", effective.voice_output_mode)),
+                ),
+            ),
+        )
+
+    # ── /voice ad-hoc send ────────────────────────────────────────────────
+
+    _voice_send_callback: Any | None = None  # async (content, group) -> str
+
+    def set_voice_send_callback(
+        self,
+        callback: Any,
+    ) -> None:
+        """Set async callback: (content: str, group: str) -> str."""
+        self._voice_send_callback = callback
+
+    def voice_send_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if len(argv) < 2:
+            return AdminCommandResult(
+                status="handled",
+                response='Usage: /voice "group name or slug" "message to speak"',
+                command_name="voice",
+                outcome="invalid",
+            )
+
+        group_ref = argv[0]
+        message = " ".join(argv[1:])
+
+        # Resolve group to verify it exists.
+        chat_id, err = self.resolve_whatsapp_group(group_ref)
+        if err or not chat_id:
+            return AdminCommandResult(
+                status="handled",
+                response=f"Could not resolve group: {err or 'unknown'}",
+                command_name="voice",
+                outcome="error",
+            )
+
+        if self._voice_send_callback is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Voice sending is not configured.",
+                command_name="voice",
+                outcome="error",
+            )
+
+        # Fire-and-forget: schedule async TTS + send, return ack immediately.
+        loop = asyncio.get_running_loop()
+        callback = self._voice_send_callback
+
+        async def _do_send() -> None:
+            try:
+                await callback(message, chat_id)
+            except Exception as exc:
+                from loguru import logger
+                logger.error("/voice send failed for {}: {}", chat_id, exc)
+
+        loop.create_task(_do_send())
+
+        short_group = group_ref if len(group_ref) <= 30 else group_ref[:27] + "..."
+        return AdminCommandResult(
+            status="handled",
+            response=f"Sending voice to {short_group}...",
+            command_name="voice",
+            outcome="sent",
+            metric_events=(
+                AdminMetricEvent(
+                    name="voice_send_command_total",
+                    labels=(("channel", ctx.channel),),
                 ),
             ),
         )
@@ -2180,6 +2252,28 @@ class VoiceMessagesCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/voicemessages"
+
+
+class VoiceSendCommandHandler(AdminCommandHandler):
+    """Ad-hoc `/voice` command: synthesize TTS and send to a WhatsApp group.
+
+    Usage: /voice "group name or slug" "message to speak"
+    """
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "voice"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.voice_send_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.voice_send_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return '/voice "group" "message"'
 
 
 class ApproveCommandHandler(AdminCommandHandler):

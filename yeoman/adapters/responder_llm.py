@@ -745,12 +745,12 @@ class LLMResponder(ResponderPort):
         if self._is_probably_german(text):
             return (
                 "Bro, du bist heute extrem gespraechig zum selben Thema. "
-                "Nano braucht kurz Pause. "
+                "Arvid braucht kurz Pause. "
                 "Wenn du 24/7 quatschen willst, goenn dir ein OpenAI/Kimi/Anthropic-Abo."
             )
         return (
             "Bro, you are very talkative on the same topic today. "
-            "Nano needs a short break. "
+            "Arvid needs a short break. "
             "If you want 24/7 bot chat, get an OpenAI/Kimi/Anthropic subscription."
         )
 

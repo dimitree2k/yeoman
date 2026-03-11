@@ -36,6 +36,7 @@ class ArchivedMessage:
     text: str
     timestamp: int | None
     created_at: str
+    sender_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
