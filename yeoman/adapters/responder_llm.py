@@ -88,6 +88,7 @@ class LLMResponder(ResponderPort):
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
+        recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
     ) -> None:
         from yeoman.config.schema import ExecToolConfig
 
@@ -111,6 +112,7 @@ class LLMResponder(ResponderPort):
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
+        self._recording_notifier = recording_notifier
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -374,6 +376,13 @@ class LLMResponder(ResponderPort):
         if not limited:
             return "Error: Nothing to synthesize after normalization"
 
+        # Switch presence from "composing" (typing dots) to "recording" (mic icon)
+        if self._recording_notifier is not None:
+            try:
+                await self._recording_notifier(channel, chat_id)
+            except Exception:
+                pass  # best-effort
+
         try:
             audio, tts_error = await self._tts.synthesize_with_status(
                 limited,
@@ -402,7 +411,7 @@ class LLMResponder(ResponderPort):
                 media=[str(path)],
             )
         )
-        return f"Voice message sent to {channel}:{chat_id}"
+        return f"Voice message delivered to {channel}:{chat_id}. Delivery complete — now produce your brief text confirmation."
 
     @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
@@ -502,6 +511,9 @@ class LLMResponder(ResponderPort):
     ) -> str:
         iteration = 0
         final_content: str | None = None
+        # Guard against the model looping on the same side-effecting tool call
+        _sent_calls: set[tuple[str, str]] = set()
+        _SEND_TOOLS = frozenset({"message", "send_voice", "send_media"})
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -555,6 +567,25 @@ class LLMResponder(ResponderPort):
                             metadata={"arguments": args_preview[:500]},
                             parent_span_id=iter_span.span_id if iter_span else None,
                         ) if trace is not None else None
+
+                        # --- dedup guard for send-type tools ---
+                        if tool_call.name in _SEND_TOOLS:
+                            call_key = (tool_call.name, args_preview)
+                            if call_key in _sent_calls:
+                                result = (
+                                    f"Blocked: you already called {tool_call.name} "
+                                    "with these exact arguments earlier in this turn. "
+                                    "The message was already delivered. "
+                                    "Tell the user it was already sent."
+                                )
+                                logger.warning("Blocked duplicate tool call: {}", tool_call.name)
+                                lf.end_span(tool_span, output=result)
+                                messages = self.context.add_tool_result(
+                                    messages, tool_call.id, tool_call.name, result,
+                                )
+                                continue
+                            _sent_calls.add(call_key)
+
                         if tool_call.name not in allowed_tools:
                             result = (
                                 f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."

@@ -121,6 +121,6 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
-            return f"Message sent to {channel}:{chat_id}"
+            return f"Message delivered to {channel}:{chat_id}. Delivery complete — now produce your brief text confirmation."
         except Exception as e:
             return f"Error sending message: {str(e)}"

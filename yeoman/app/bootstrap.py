@@ -429,6 +429,13 @@ def build_gateway_runtime(
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
+
+    # Wire recording indicator: responder switches presence to mic icon during TTS
+    async def _recording_notifier(channel: str, chat_id: str) -> None:
+        await channels.set_recording(channel, chat_id)
+
+    responder._recording_notifier = _recording_notifier
+
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
         policy=policy_adapter,

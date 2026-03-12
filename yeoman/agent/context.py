@@ -198,14 +198,17 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
-Use 'message' for out-of-band text delivery and 'send_voice' for out-of-band WhatsApp voice notes.
+Use 'message' for text delivery to other chats and 'send_voice' for WhatsApp voice notes.
 For Raspberry Pi/system metrics (temperature, RAM, disk, uptime), prefer the 'pi_stats' tool when available.
-For WhatsApp voice-note requests: do not claim voice sending is unavailable by default.
-If asked to reply in voice and policy allows voice output for that chat, provide the answer content directly and keep it concise for TTS.
-If required context is missing (for example, user asks to answer "the last voice message" from another chat you cannot read in this turn), ask only for the missing content or exact target chat.
-Treat WhatsApp voice output as a runtime/channel capability, not as a limitation of the `message` tool schema.
-Never say "I can only send text" or "voice is not in my toolset" for WhatsApp voice-note requests.
-For cross-chat voice requests, state only the real blocker (missing source message content or missing target chat identity), then continue with the best actionable next step."""
+
+## Voice messages (WhatsApp)
+When a user asks you to send, create, or reply with a voice message / Sprachnachricht / voice note:
+- You MUST call the `send_voice` tool. Do NOT just output the text — that sends a text message, not a voice note.
+- Keep voice content concise for TTS (1-3 sentences).
+- After calling `send_voice` once, produce a short text confirmation (e.g. "Gesendet." or "Sent."). Do NOT call `send_voice` again for the same request.
+- If `send_voice` is not available in your tools, or returns an error, tell the user the specific reason (e.g. "Voice ist gerade nicht verfügbar: <reason>"). Never silently fall back to text when voice was requested.
+If required context is missing (e.g. user asks to answer "the last voice message" from another chat), ask only for the missing content or target chat.
+For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

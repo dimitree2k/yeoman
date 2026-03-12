@@ -473,7 +473,11 @@ class WhatsAppChannel(BaseChannel):
 
     async def start_typing(self, chat_id: str) -> None:
         """Public typing API used by policy-aware orchestration."""
-        await self._start_typing(chat_id)
+        await self._start_typing(chat_id, state="composing")
+
+    async def start_recording(self, chat_id: str) -> None:
+        """Show recording indicator (microphone icon) instead of typing dots."""
+        await self._start_typing(chat_id, state="recording")
 
     async def stop_typing(self, chat_id: str) -> None:
         """Public typing API used by policy-aware orchestration."""
@@ -1147,11 +1151,11 @@ class WhatsAppChannel(BaseChannel):
             },
         )
 
-    async def _start_typing(self, chat_jid: str) -> None:
+    async def _start_typing(self, chat_jid: str, *, state: str = "composing") -> None:
         if not chat_jid:
             return
         await self._stop_typing(chat_jid, send_paused=False)
-        self._typing_tasks[chat_jid] = asyncio.create_task(self._typing_loop(chat_jid))
+        self._typing_tasks[chat_jid] = asyncio.create_task(self._typing_loop(chat_jid, state=state))
 
     async def _stop_typing(self, chat_jid: str, *, send_paused: bool = True) -> None:
         task = self._typing_tasks.pop(chat_jid, None)
@@ -1162,7 +1166,7 @@ class WhatsAppChannel(BaseChannel):
         if send_paused:
             await self._send_presence(chat_jid, "paused")
 
-    async def _typing_loop(self, chat_jid: str) -> None:
+    async def _typing_loop(self, chat_jid: str, *, state: str = "composing") -> None:
         task = asyncio.current_task()
         started_at = asyncio.get_running_loop().time()
         while (
@@ -1170,7 +1174,7 @@ class WhatsAppChannel(BaseChannel):
             and self._connected
             and asyncio.get_running_loop().time() - started_at < TYPING_MAX_DURATION_SECONDS
         ):
-            await self._send_presence(chat_jid, "composing")
+            await self._send_presence(chat_jid, state)
             await asyncio.sleep(TYPING_LOOP_INTERVAL_SECONDS)
 
         if self._typing_tasks.get(chat_jid) is task:

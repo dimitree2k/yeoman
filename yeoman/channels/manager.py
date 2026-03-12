@@ -256,6 +256,24 @@ class ChannelManager:
                 e,
             )
 
+    async def set_recording(self, channel_name: str, chat_id: str) -> None:
+        """Switch presence to recording indicator (microphone icon)."""
+        channel = self.channels.get(channel_name)
+        if channel is None:
+            return
+        method = getattr(channel, "start_recording", None)
+        if not callable(method):
+            return
+        try:
+            await method(chat_id)
+        except Exception as e:
+            logger.debug(
+                "Failed to set recording channel={} chat={}: {}",
+                channel_name,
+                chat_id,
+                e,
+            )
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)
