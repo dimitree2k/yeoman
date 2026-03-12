@@ -1443,6 +1443,7 @@ class EnginePolicyAdapter(PolicyPort):
     # ── /voice ad-hoc send ────────────────────────────────────────────────
 
     _voice_send_callback: Any | None = None  # async (content, group) -> str
+    _admin_notify_callback: Any | None = None  # async (channel, chat_id, text) -> None
 
     def set_voice_send_callback(
         self,
@@ -1450,6 +1451,13 @@ class EnginePolicyAdapter(PolicyPort):
     ) -> None:
         """Set async callback: (content: str, group: str) -> str."""
         self._voice_send_callback = callback
+
+    def set_admin_notify_callback(
+        self,
+        callback: Any,
+    ) -> None:
+        """Set async callback: (channel: str, chat_id: str, text: str) -> None."""
+        self._admin_notify_callback = callback
 
     def voice_send_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         if len(argv) < 2:
@@ -1481,16 +1489,34 @@ class EnginePolicyAdapter(PolicyPort):
                 outcome="error",
             )
 
-        # Fire-and-forget: schedule async TTS + send, return ack immediately.
+        # Fire-and-forget: schedule async TTS + send, report result to source chat.
         loop = asyncio.get_running_loop()
         callback = self._voice_send_callback
+        notify = self._admin_notify_callback
+        source_channel = ctx.channel
+        source_chat_id = ctx.chat_id
 
         async def _do_send() -> None:
+            from loguru import logger
+
             try:
-                await callback(message, chat_id)
+                result = await callback(message, chat_id)
             except Exception as exc:
-                from loguru import logger
-                logger.error("/voice send failed for {}: {}", chat_id, exc)
+                result = f"Error: /voice exception ({type(exc).__name__}: {exc})"
+
+            result = str(result or "").strip()
+            is_error = result.lower().startswith("error")
+
+            if is_error:
+                logger.error("/voice send failed for {}: {}", chat_id, result)
+            else:
+                logger.info("/voice send ok for {}: {}", chat_id, result)
+
+            if notify is not None:
+                try:
+                    await notify(source_channel, source_chat_id, result)
+                except Exception as exc:
+                    logger.error("/voice notify failed: {}", exc)
 
         loop.create_task(_do_send())
 

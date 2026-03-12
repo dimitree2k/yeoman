@@ -404,6 +404,14 @@ def build_gateway_runtime(
 
     policy_adapter.set_voice_send_callback(_voice_send_callback)
 
+    # Wire admin notify callback: sends text to a given channel+chat.
+    async def _admin_notify(channel: str, chat_id: str, text: str) -> None:
+        await bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=text)
+        )
+
+    policy_adapter.set_admin_notify_callback(_admin_notify)
+
     # Update policy adapter with actual tool names
     policy_adapter._known_tools = set(responder.tool_names)
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
