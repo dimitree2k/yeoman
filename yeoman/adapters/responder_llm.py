@@ -21,7 +21,8 @@ from yeoman.agent.tools.exec_isolation import SandboxMount
 from yeoman.agent.tools.file_access import FileAccessResolver, enable_grants
 from yeoman.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from yeoman.agent.tools.message import MessageTool
-from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.ops import OpsTool
+from yeoman.agent.tools.ops_manage import OpsManageTool
 from yeoman.agent.tools.registry import ToolRegistry
 from yeoman.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from yeoman.agent.tools.shell import ExecTool
@@ -180,7 +181,8 @@ class LLMResponder(ResponderPort):
             grant_container_prefixes=grant_container_prefixes,
         )
         self.tools.register(exec_tool)
-        self.tools.register(PiStatsTool())
+        self.tools.register(OpsTool())
+        self.tools.register(OpsManageTool())
 
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
@@ -262,6 +264,10 @@ class LLMResponder(ResponderPort):
         contacts_tool = self.tools.get("contacts")
         if isinstance(contacts_tool, ContactsTool):
             contacts_tool.set_context(channel, chat_id)
+
+        ops_manage_tool = self.tools.get("ops_manage")
+        if isinstance(ops_manage_tool, OpsManageTool):
+            ops_manage_tool.set_context(channel, chat_id)
 
     @staticmethod
     def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 from yeoman.agent.tools.exec_isolation import SandboxMount
 from yeoman.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
-from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.ops import OpsTool
 from yeoman.agent.tools.registry import ToolRegistry
 from yeoman.agent.tools.shell import ExecTool
 from yeoman.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
@@ -237,7 +237,7 @@ class SubagentManager:
             )
             exec_tool.set_session_context(f"subagent:{task_id}")
             tools.register(exec_tool)
-            tools.register(PiStatsTool())
+            tools.register(OpsTool())
             tools.register(WebSearchTool(api_key=self.tavily_api_key))
             tools.register(WebFetchTool(api_key=self.tavily_api_key))
             tools.register(DeepResearchTool(api_key=self.tavily_api_key))

@@ -350,3 +350,17 @@ async def test_ops_manage_stop_already_stopped():
     with patch("yeoman.agent.tools.ops_manage.read_pid_file", return_value=None):
         result = await tool.execute(action="stop", service="bridge")
     assert "not running" in result.lower()
+
+
+def test_ops_tool_registers_with_correct_schema():
+    tool = OpsTool()
+    schema = tool.to_schema()
+    assert schema["function"]["name"] == "ops"
+    assert "action" in schema["function"]["parameters"]["properties"]
+
+
+def test_ops_manage_tool_registers_with_correct_schema():
+    tool = OpsManageTool()
+    schema = tool.to_schema()
+    assert schema["function"]["name"] == "ops_manage"
+    assert "action" in schema["function"]["parameters"]["properties"]
