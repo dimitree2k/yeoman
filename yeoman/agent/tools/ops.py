@@ -112,7 +112,7 @@ class OpsTool(Tool):
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 200,
+                    "maximum": 100,
                     "description": "Max number of log lines to return (for log_scan). Default 50.",
                 },
             },
