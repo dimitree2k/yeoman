@@ -216,3 +216,35 @@ async def test_log_scan_filters_by_time_range(tmp_path):
     assert "recent error" in result
     assert "old error" not in result
     assert "very recent error" not in result
+
+
+# ── service_status tests ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_service_status_all_reports_both(tmp_path):
+    tool = OpsTool()
+    with patch("yeoman.agent.tools.ops._GATEWAY_PID", tmp_path / "gw.pid"), \
+         patch("yeoman.agent.tools.ops._BRIDGE_PID", tmp_path / "br.pid"):
+        result = await tool.execute(action="service_status", service="all")
+    assert "gateway" in result.lower()
+    assert "bridge" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_service_status_stopped_no_pid_file(tmp_path):
+    tool = OpsTool()
+    with patch("yeoman.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"):
+        result = await tool.execute(action="service_status", service="gateway")
+    assert "stopped" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_service_status_stale_pid(tmp_path):
+    pid_file = tmp_path / "gateway.pid"
+    pid_file.write_text("999999")
+    tool = OpsTool()
+    with patch("yeoman.agent.tools.ops._GATEWAY_PID", pid_file), \
+         patch("yeoman.agent.tools.ops.pid_alive", return_value=False):
+        result = await tool.execute(action="service_status", service="gateway")
+    assert "stale" in result.lower() or "stopped" in result.lower()

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from yeoman.agent.tools.base import Tool
+from yeoman.utils.process import pid_alive, read_pid_file
 
 _LOGS_DIR = Path("~/.yeoman/var/logs").expanduser()
 _GATEWAY_LOG = _LOGS_DIR / "gateway.log"
@@ -23,6 +24,29 @@ _LOGURU_LEVEL_RE = re.compile(r"\|\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|")
 _DURATION_RE = re.compile(r"^(\d+)([smhd])$")
 
 _LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+
+
+def _fmt_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_duration(seconds: int) -> str:
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
 
 
 def _parse_time_spec(spec: str, *, now: datetime | None = None) -> datetime:
@@ -89,7 +113,7 @@ class OpsTool(Tool):
                 },
                 "service": {
                     "type": "string",
-                    "enum": ["gateway", "bridge"],
+                    "enum": ["gateway", "bridge", "all"],
                     "description": "Target service (for log_scan and service_status).",
                 },
                 "level": {
@@ -126,7 +150,7 @@ class OpsTool(Tool):
         elif action == "log_scan":
             return await self._log_scan(**kwargs)
         elif action == "service_status":
-            return self._service_status(**kwargs)
+            return await self._service_status(**kwargs)
         return f"Unknown action: {action}"
 
     # ── system_stats ─────────────────────────────────────────────
@@ -471,7 +495,95 @@ class OpsTool(Tool):
         footer = f"[END LOG OUTPUT - {len(matches)} lines matched]"
         return header + "\n" + "\n".join(matches) + "\n" + footer
 
-    # ── service_status (stub) ────────────────────────────────────
+    # ── service_status ──────────────────────────────────────────
 
-    def _service_status(self, **kwargs: Any) -> str:
-        return "Not yet implemented"
+    async def _service_status(self, **kwargs: Any) -> str:
+        service = kwargs.get("service", "all")
+        lines: list[str] = []
+        if service in ("all", "gateway"):
+            lines.append(self._gateway_status())
+        if service in ("all", "bridge"):
+            lines.append(await self._bridge_status())
+        return "\n\n".join(lines)
+
+    def _gateway_status(self) -> str:
+        lines = ["Gateway:"]
+        pid = read_pid_file(_GATEWAY_PID)
+        if pid is None:
+            lines.append("  status: stopped (no PID file)")
+        elif not pid_alive(pid):
+            lines.append(f"  status: stopped (stale PID file, pid={pid})")
+        else:
+            lines.append(f"  status: running (pid={pid})")
+            uptime = self._process_uptime(pid)
+            if uptime:
+                lines.append(f"  uptime: {uptime}")
+            port_ok = self._check_tcp_port(18790)
+            lines.append(f"  port 18790: {'reachable' if port_ok else 'unreachable'}")
+        if _GATEWAY_LOG.exists():
+            size = os.path.getsize(_GATEWAY_LOG)
+            lines.append(f"  log: {_fmt_size(size)}")
+        return "\n".join(lines)
+
+    async def _bridge_status(self) -> str:
+        lines = ["Bridge:"]
+        pid = read_pid_file(_BRIDGE_PID)
+        if pid is None:
+            lines.append("  status: stopped (no PID file)")
+        elif not pid_alive(pid):
+            lines.append(f"  status: stopped (stale PID file, pid={pid})")
+        else:
+            lines.append(f"  status: running (pid={pid})")
+            uptime = self._process_uptime(pid)
+            if uptime:
+                lines.append(f"  uptime: {uptime}")
+            try:
+                health = await self._bridge_health_check()
+                wa = health.get("whatsapp", {})
+                lines.append(f"  whatsapp: {wa.get('state', 'unknown')}")
+                queue = health.get("queue", {})
+                lines.append(
+                    f"  queue: {queue.get('inflight', 0)} inflight,"
+                    f" {queue.get('dropped', 0)} dropped"
+                )
+            except Exception as exc:
+                lines.append(f"  health check: failed ({exc})")
+        if _BRIDGE_LOG.exists():
+            size = os.path.getsize(_BRIDGE_LOG)
+            lines.append(f"  log: {_fmt_size(size)}")
+        return "\n".join(lines)
+
+    def _process_uptime(self, pid: int) -> str | None:
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            rparen = stat_line.rfind(")")
+            if rparen == -1:
+                return None
+            fields = stat_line[rparen + 2 :].split()
+            starttime_ticks = int(fields[19])
+            clk_tck = os.sysconf("SC_CLK_TCK")
+            uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+            proc_start_s = starttime_ticks / clk_tck
+            elapsed = uptime_s - proc_start_s
+            return _fmt_duration(int(elapsed))
+        except (OSError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _check_tcp_port(port: int, timeout: float = 0.1) -> bool:
+        import socket
+
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    async def _bridge_health_check(self, timeout_s: float = 3.0) -> dict[str, Any]:
+        """Delegate to WhatsAppRuntimeManager._health_check_async()."""
+        from yeoman.channels.whatsapp_runtime import WhatsAppRuntimeManager
+        from yeoman.config.loader import load_config
+
+        config = load_config()
+        runtime = WhatsAppRuntimeManager(config=config)
+        return await runtime._health_check_async(timeout_s)
