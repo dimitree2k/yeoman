@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from yeoman.agent.tools.ops import OpsTool, _parse_loguru_line, _parse_time_spec
+from yeoman.agent.tools.ops_manage import OpsManageTool
 
 
 @pytest.mark.asyncio
@@ -248,3 +249,104 @@ async def test_service_status_stale_pid(tmp_path):
          patch("yeoman.agent.tools.ops.pid_alive", return_value=False):
         result = await tool.execute(action="service_status", service="gateway")
     assert "stale" in result.lower() or "stopped" in result.lower()
+
+
+# ── OpsManageTool tests ─────────────────────────────────────
+
+
+def _mock_service_running():
+    """Returns two context managers to mock a service as running."""
+    return (
+        patch("yeoman.agent.tools.ops_manage.read_pid_file", return_value=12345),
+        patch("yeoman.agent.tools.ops_manage.pid_alive", return_value=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_request_returns_confirmation_code():
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "owner-chat-id")
+    p1, p2 = _mock_service_running()
+    with p1, p2:
+        result = await tool.execute(action="restart", service="bridge")
+    assert "code" in result.lower() or "confirm" in result.lower()
+    import re
+    codes = re.findall(r"\b(\d{4})\b", result)
+    assert len(codes) == 1
+    assert 1000 <= int(codes[0]) <= 9999
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_confirm_wrong_code():
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "owner-chat-id")
+    p1, p2 = _mock_service_running()
+    with p1, p2:
+        await tool.execute(action="restart", service="bridge")
+    result = await tool.execute(action="confirm", code="0000")
+    assert "invalid" in result.lower() or "expired" in result.lower() or "no pending" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_confirm_expired(monkeypatch):
+    import time
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "owner-chat-id")
+    p1, p2 = _mock_service_running()
+    with p1, p2:
+        await tool.execute(action="restart", service="bridge")
+    key = ("whatsapp", "owner-chat-id")
+    tool._pending[key] = tool._pending[key]._replace(expires_at=time.time() - 1)
+    code = tool._pending[key].code
+    result = await tool.execute(action="confirm", code=code)
+    assert "expired" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_chat_scoping():
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "chat-A")
+    p1, p2 = _mock_service_running()
+    with p1, p2:
+        await tool.execute(action="restart", service="bridge")
+    tool.set_context("whatsapp", "chat-B")
+    result = await tool.execute(action="confirm", code="1234")
+    assert "no pending" in result.lower()
+
+
+def test_ops_manage_tool_name():
+    tool = OpsManageTool()
+    assert tool.name == "ops_manage"
+
+
+def test_ops_manage_schema_has_actions():
+    tool = OpsManageTool()
+    schema = tool.parameters
+    action_enum = schema["properties"]["action"]["enum"]
+    assert "restart" in action_enum
+    assert "stop" in action_enum
+    assert "confirm" in action_enum
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_confirm_happy_path():
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "owner-chat-id")
+    p1, p2 = _mock_service_running()
+    with p1, p2:
+        request_result = await tool.execute(action="restart", service="bridge")
+    import re
+    code = re.findall(r"\b(\d{4})\b", request_result)[0]
+    with patch.object(tool, "_manage_bridge", new_callable=AsyncMock,
+                      return_value="Bridge restarted. Status: running"):
+        confirm_result = await tool.execute(action="confirm", code=code)
+    assert "restarted" in confirm_result.lower() or "running" in confirm_result.lower()
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_stop_already_stopped():
+    tool = OpsManageTool()
+    tool.set_context("whatsapp", "owner-chat-id")
+    with patch("yeoman.agent.tools.ops_manage.read_pid_file", return_value=None):
+        result = await tool.execute(action="stop", service="bridge")
+    assert "not running" in result.lower()
