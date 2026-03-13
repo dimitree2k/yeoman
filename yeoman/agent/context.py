@@ -199,7 +199,7 @@ Your workspace is at: {workspace_path}
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
 Use 'message' for text delivery to other chats and 'send_voice' for WhatsApp voice notes.
-For Raspberry Pi/system metrics (temperature, RAM, disk, uptime), prefer the 'pi_stats' tool when available.
+For system metrics (temperature, RAM, disk, uptime), use the 'ops' tool with action="system_stats".
 
 ## Voice messages (WhatsApp)
 When a user asks you to send, create, or reply with a voice message / Sprachnachricht / voice note:
