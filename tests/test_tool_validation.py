@@ -20,7 +20,7 @@ from yeoman.agent.tools.exec_isolation import (
 )
 from yeoman.agent.tools.filesystem import ReadFileTool
 from yeoman.agent.tools.message import MessageTool
-from yeoman.agent.tools.pi_stats import PiStatsTool
+from yeoman.agent.tools.ops import OpsTool
 from yeoman.agent.tools.registry import ToolRegistry
 from yeoman.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from yeoman.agent.tools.shell import ExecTool
@@ -270,32 +270,14 @@ async def test_exec_tool_blocks_host_execution_when_disabled(tmp_path: Path) -> 
     assert "Host exec is disabled by configuration" in result
 
 
-async def test_pi_stats_tool_json_format() -> None:
-    tool = PiStatsTool()
-    result = await tool.execute(format="json")
-    data = json.loads(result)
-    assert "temperature_c" in data
-    assert "cpu_usage_pct" in data
-    assert "memory_total_mb" in data
-    assert "disk_root_used_gb" in data
-    assert "top_processes" in data
-    assert isinstance(data["top_processes"], list)
-
-
-async def test_pi_stats_tool_text_format() -> None:
-    tool = PiStatsTool()
-    result = await tool.execute(format="text")
-    assert "Raspberry Pi Stats" in result
-    assert "temperature_c:" in result
-    assert "cpu_usage_pct:" in result
-    assert "top_processes:" in result
-
-
-async def test_pi_stats_tool_top_n_limit() -> None:
-    tool = PiStatsTool()
-    result = await tool.execute(format="json", top_n=3)
-    data = json.loads(result)
-    assert len(data.get("top_processes", [])) <= 3
+async def test_ops_tool_system_stats() -> None:
+    tool = OpsTool()
+    result = await tool.execute(action="system_stats")
+    assert "System Stats" in result
+    assert "cpu_usage_pct" in result
+    assert "memory_total_mb" in result
+    assert "disk_root_total_gb" in result
+    assert "top_processes" in result
 
 
 def test_exec_isolation_defaults_and_camel_case_roundtrip() -> None:
