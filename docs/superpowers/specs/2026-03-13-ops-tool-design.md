@@ -191,6 +191,15 @@ Key scenarios the skill should cover:
 - **"How's the Pi doing?"** → `ops(action="system_stats")`
 - **"Search logs for X"** → `ops(action="log_scan", keyword="X", service="gateway")`
 - **"Restart the bridge"** → `ops_manage(action="restart", service="bridge")` → wait for code
+- **"What can you do?" / "help" / "ops help"** → the bot should respond with a concise
+  summary of available ops capabilities, e.g.:
+  > I can help you with:
+  > - **Log scanning** — search logs by level, keyword, time range (gateway & bridge)
+  > - **Service status** — check if gateway/bridge are running, uptime, health
+  > - **System stats** — CPU, memory, disk, temperature, top processes
+  > - **Service management** — restart or stop gateway/bridge (requires confirmation code)
+  >
+  > Just ask naturally, e.g. "any errors in the last hour?" or "is the bridge running?"
 - Guidance on presenting results conversationally (summarize, don't dump raw output)
 - Guidance on combining actions (check status first, then scan logs if something is down)
 
