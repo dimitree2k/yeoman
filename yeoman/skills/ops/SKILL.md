@@ -1,6 +1,7 @@
 ---
 name: ops
 description: System operations — check logs, service health, system stats, and manage services.
+always: true
 ---
 
 # Ops
@@ -56,11 +57,31 @@ Same confirmation flow applies.
 - `keyword`: case-insensitive text search
 - `limit`: max lines (1–100, default 50)
 
+## Architecture Ground Truth
+
+These are facts about how you run. NEVER contradict or fabricate alternatives.
+
+- **Gateway**: Python process, managed via PID file (`~/.yeoman/var/run/gateway.pid`).
+- **Bridge**: Node.js process (`node dist/index.js`), holds a live WebSocket to `web.whatsapp.com`.
+  Managed via PID file (`~/.yeoman/var/run/whatsapp-bridge.pid`).
+- **Gateway ↔ Bridge**: connected via `ws://localhost:3001` (protocol v2).
+- **No systemd/systemctl units exist.** Do not suggest `systemctl restart yeoman-*`.
+- **No webhooks, no cached relay, no inbound proxy.** Messages flow:
+  `WhatsApp servers → Bridge (WebSocket) → Gateway (local WS) → Orchestrator pipeline → LLM → reply back`.
+- **DNS errors** (`getaddrinfo EAI_AGAIN`) = transient network issue on the host, not a code bug.
+  The bridge retries automatically.
+- **"Opening handshake has timed out"** = WhatsApp's WebSocket server unreachable. Same category — network, not code.
+- **Disconnected → reconnecting → connected** sequences are normal keepalive resets.
+  Only escalate if reconnection fails repeatedly (>5 min).
+
 ## Guidance
 
-- When asked "any errors?" or "how's everything?", combine: first `service_status(service="all")`, then `log_scan(level="error", since="1h")` if needed.
+- **ALWAYS call tools first.** When asked about status, errors, or connectivity:
+  1. `ops(action="service_status", service="all")`
+  2. `ops(action="log_scan", service="gateway", level="error", since="1h")` if needed
+  Never answer infrastructure questions from memory or guesswork.
 - Summarize results conversationally. Don't dump raw log output — pick out the key findings.
-- If a service is down, proactively suggest what to do (check logs, restart).
+- If a service is down, proactively suggest what to do (check logs, restart via `ops_manage`).
 - When the user asks "what can you do?" or "help" about ops:
   > I can help you with:
   > - **Log scanning** — search logs by level, keyword, time range (gateway & bridge)

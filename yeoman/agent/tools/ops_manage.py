@@ -84,7 +84,7 @@ class OpsManageTool(Tool):
             return "Error: 'service' must be 'gateway' or 'bridge'."
 
         # Pre-action state validation
-        pid_path = Path("~/.yeoman/run").expanduser() / (
+        pid_path = Path("~/.yeoman/var/run").expanduser() / (
             "gateway.pid" if service == "gateway" else "whatsapp-bridge.pid"
         )
         pid = read_pid_file(pid_path)

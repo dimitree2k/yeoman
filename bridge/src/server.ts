@@ -364,6 +364,8 @@ export class BridgeServer {
         },
         { clients: 0, inflight: 0, dropped: 0 },
       );
+      // The health request itself is counted as inflight — subtract it
+      totals.inflight = Math.max(0, totals.inflight - 1);
       return {
         version: PROTOCOL_VERSION,
         protocolVersion: PROTOCOL_VERSION,

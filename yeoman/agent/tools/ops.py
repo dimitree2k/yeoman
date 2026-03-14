@@ -15,7 +15,7 @@ from yeoman.utils.process import pid_alive, read_pid_file
 _LOGS_DIR = Path("~/.yeoman/var/logs").expanduser()
 _GATEWAY_LOG = _LOGS_DIR / "gateway.log"
 _BRIDGE_LOG = _LOGS_DIR / "whatsapp-bridge.log"
-_RUN_DIR = Path("~/.yeoman/run").expanduser()
+_RUN_DIR = Path("~/.yeoman/var/run").expanduser()
 _GATEWAY_PID = _RUN_DIR / "gateway.pid"
 _BRIDGE_PID = _RUN_DIR / "whatsapp-bridge.pid"
 
@@ -509,17 +509,19 @@ class OpsTool(Tool):
     def _gateway_status(self) -> str:
         lines = ["Gateway:"]
         pid = read_pid_file(_GATEWAY_PID)
-        if pid is None:
-            lines.append("  status: stopped (no PID file)")
-        elif not pid_alive(pid):
-            lines.append(f"  status: stopped (stale PID file, pid={pid})")
-        else:
+        port_ok = self._check_tcp_port(18790)
+        if pid is not None and pid_alive(pid):
             lines.append(f"  status: running (pid={pid})")
             uptime = self._process_uptime(pid)
             if uptime:
                 lines.append(f"  uptime: {uptime}")
-            port_ok = self._check_tcp_port(18790)
-            lines.append(f"  port 18790: {'reachable' if port_ok else 'unreachable'}")
+        elif port_ok:
+            lines.append("  status: running (port 18790 reachable, no PID file)")
+        elif pid is not None:
+            lines.append(f"  status: stopped (stale PID file, pid={pid})")
+        else:
+            lines.append("  status: stopped")
+        lines.append(f"  port 18790: {'reachable' if port_ok else 'unreachable'}")
         if _GATEWAY_LOG.exists():
             size = os.path.getsize(_GATEWAY_LOG)
             lines.append(f"  log: {_fmt_size(size)}")
@@ -528,26 +530,39 @@ class OpsTool(Tool):
     async def _bridge_status(self) -> str:
         lines = ["Bridge:"]
         pid = read_pid_file(_BRIDGE_PID)
-        if pid is None:
-            lines.append("  status: stopped (no PID file)")
-        elif not pid_alive(pid):
-            lines.append(f"  status: stopped (stale PID file, pid={pid})")
-        else:
+        has_pid = pid is not None and pid_alive(pid)
+
+        # Always try health check — it's the real source of truth
+        health: dict[str, Any] | None = None
+        health_err = ""
+        try:
+            health = await self._bridge_health_check()
+        except Exception as exc:
+            health_err = str(exc)
+
+        if has_pid:
             lines.append(f"  status: running (pid={pid})")
             uptime = self._process_uptime(pid)
             if uptime:
                 lines.append(f"  uptime: {uptime}")
-            try:
-                health = await self._bridge_health_check()
-                wa = health.get("whatsapp", {})
-                lines.append(f"  whatsapp: {wa.get('state', 'unknown')}")
-                queue = health.get("queue", {})
-                lines.append(
-                    f"  queue: {queue.get('inflight', 0)} inflight,"
-                    f" {queue.get('dropped', 0)} dropped"
-                )
-            except Exception as exc:
-                lines.append(f"  health check: failed ({exc})")
+        elif health is not None:
+            lines.append("  status: running (health check ok, no PID file)")
+        elif pid is not None:
+            lines.append(f"  status: stopped (stale PID file, pid={pid})")
+        else:
+            lines.append("  status: stopped")
+
+        if health is not None:
+            wa = health.get("whatsapp", {})
+            lines.append(f"  whatsapp: {wa.get('state', 'unknown')}")
+            queue = health.get("queue", {})
+            lines.append(
+                f"  queue: {queue.get('inflight', 0)} inflight,"
+                f" {queue.get('dropped', 0)} dropped"
+            )
+        elif has_pid:
+            lines.append(f"  health check: failed ({health_err})")
+
         if _BRIDGE_LOG.exists():
             size = os.path.getsize(_BRIDGE_LOG)
             lines.append(f"  log: {_fmt_size(size)}")
