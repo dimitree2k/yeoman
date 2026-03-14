@@ -57,6 +57,27 @@ Same confirmation flow applies.
 - `keyword`: case-insensitive text search
 - `limit`: max lines (1–100, default 50)
 
+## CLI Reference
+
+The CLI is `yeoman` (or `./bin/yeoman` in dev). These are the exact commands — do not guess.
+
+```
+yeoman gateway [start|stop|restart|status]   # manage gateway process
+yeoman channels bridge [start|stop|restart|status]  # manage WhatsApp bridge
+yeoman channels whatsapp ensure              # ensure bridge + protocol health
+yeoman channels whatsapp repair-sender       # fix decrypt issues for a sender
+yeoman channels status                       # show all channel status
+yeoman channels login                        # link WhatsApp via QR
+yeoman doctor                                # full health check
+yeoman status                                # show overall status
+yeoman logs                                  # view logs (lnav)
+yeoman env                                   # show runtime info
+yeoman cron [list|add|remove|enable|run]     # manage scheduled jobs
+yeoman memory [status|search|add|prune]      # manage long-term memory
+yeoman policy [path|explain|cmd]             # manage chat policy
+yeoman config                                # manage configuration
+```
+
 ## Architecture Ground Truth
 
 These are facts about how you run. NEVER contradict or fabricate alternatives.
