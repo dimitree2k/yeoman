@@ -6,6 +6,8 @@ import json
 import os
 import re
 import socket
+import time
+from collections import deque
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,18 +23,44 @@ _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 _TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 
 
+class _WebRateLimiter:
+    """Sliding-window rate limiter for web tool calls."""
+
+    def __init__(self, max_requests: int = 20, window_seconds: float = 60.0):
+        self._timestamps: deque[float] = deque()
+        self._max = max_requests
+        self._window = window_seconds
+
+    def check(self) -> bool:
+        now = time.monotonic()
+        while self._timestamps and now - self._timestamps[0] > self._window:
+            self._timestamps.popleft()
+        if len(self._timestamps) >= self._max:
+            return False
+        self._timestamps.append(now)
+        return True
+
+    def configure(self, max_requests: int, window_seconds: float = 60.0) -> None:
+        self._max = max_requests
+        self._window = window_seconds
+
+
+# Module-level singleton shared across all web tool instances
+_rate_limiter = _WebRateLimiter()
+
+
 def _strip_tags(text: str) -> str:
     """Remove HTML tags and decode entities."""
-    text = re.sub(r'<script[\s\S]*?</script>', '', text, flags=re.I)
-    text = re.sub(r'<style[\s\S]*?</style>', '', text, flags=re.I)
-    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
     return html.unescape(text).strip()
 
 
 def _normalize(text: str) -> str:
     """Normalize whitespace."""
-    text = re.sub(r'[ \t]+', ' ', text)
-    return re.sub(r'\n{3,}', '\n\n', text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _is_private_ip(host: str) -> bool:
@@ -67,11 +95,31 @@ def _host_resolves_private(hostname: str) -> bool:
     return False
 
 
-def _validate_url(url: str) -> tuple[bool, str]:
+def _validate_domain(host: str, blocked: list[str], allowed: list[str]) -> tuple[bool, str]:
+    """Check host against blocked/allowed domain lists. Matches subdomains."""
+    h = host.lower().strip(".")
+    for d in blocked:
+        d = d.lower().strip(".")
+        if h == d or h.endswith("." + d):
+            return False, f"Blocked domain: {host}"
+    if allowed:
+        for d in allowed:
+            d = d.lower().strip(".")
+            if h == d or h.endswith("." + d):
+                return True, ""
+        return False, f"Domain not in allowed list: {host}"
+    return True, ""
+
+
+def _validate_url(
+    url: str,
+    blocked_domains: list[str] | None = None,
+    allowed_domains: list[str] | None = None,
+) -> tuple[bool, str]:
     """Validate URL and block SSRF to local/private targets."""
     try:
         p = urlparse(url)
-        if p.scheme not in ('http', 'https'):
+        if p.scheme not in ("http", "https"):
             return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
         if not p.netloc:
             return False, "Missing domain"
@@ -85,6 +133,15 @@ def _validate_url(url: str) -> tuple[bool, str]:
             return False, f"Blocked private IP target: {host}"
         if _host_resolves_private(host):
             return False, f"Blocked private-network DNS target: {host}"
+
+        # Domain allowlist/blocklist
+        ok, err = _validate_domain(
+            host,
+            blocked=blocked_domains or [],
+            allowed=allowed_domains or [],
+        )
+        if not ok:
+            return False, err
 
         return True, ""
     except Exception as e:
@@ -104,9 +161,14 @@ class WebSearchTool(Tool):
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
-            "count": {"type": "integer", "description": "Results (1-10)", "minimum": 1, "maximum": 10}
+            "count": {
+                "type": "integer",
+                "description": "Results (1-10)",
+                "minimum": 1,
+                "maximum": 10,
+            },
         },
-        "required": ["query"]
+        "required": ["query"],
     }
 
     def __init__(self, api_key: str | None = None, max_results: int = 5):
@@ -165,9 +227,9 @@ class WebFetchTool(Tool):
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
             "extract_mode": {"type": "string", "enum": ["markdown", "text"], "default": "markdown"},
-            "max_chars": {"type": "integer", "minimum": 100}
+            "max_chars": {"type": "integer", "minimum": 100},
         },
-        "required": ["url"]
+        "required": ["url"],
     }
 
     def __init__(self, api_key: str | None = None, max_chars: int = 50000):
@@ -186,10 +248,12 @@ class WebFetchTool(Tool):
 
         # YouTube pages don't yield transcripts via web_fetch — redirect to the dedicated tool
         if "youtube.com" in url or "youtu.be" in url:
-            return json.dumps({
-                "error": "YouTube URLs cannot be fetched this way — web_fetch only gets page HTML, not video transcripts.",
-                "action": f"Use the youtube_transcript tool instead: youtube_transcript(url=\"{url}\")"
-            })
+            return json.dumps(
+                {
+                    "error": "YouTube URLs cannot be fetched this way — web_fetch only gets page HTML, not video transcripts.",
+                    "action": f'Use the youtube_transcript tool instead: youtube_transcript(url="{url}")',
+                }
+            )
 
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key:
@@ -227,30 +291,31 @@ class WebFetchTool(Tool):
 
         truncated = len(raw_content) > max_chars
         text = raw_content[:max_chars] if truncated else raw_content
-        return json.dumps({
-            "url": url,
-            "finalUrl": url,
-            "extractor": "tavily",
-            "truncated": truncated,
-            "length": len(text),
-            "text": text,
-        })
+        return json.dumps(
+            {
+                "url": url,
+                "finalUrl": url,
+                "extractor": "tavily",
+                "truncated": truncated,
+                "length": len(text),
+                "text": text,
+            }
+        )
 
     async def _direct_fetch(self, url: str, extract_mode: str, max_chars: int) -> str:
         """Direct HTTP fetch with Readability extraction."""
         from readability import Document
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=30.0
-            ) as client:
+            async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
                 next_url = url
                 redirects = 0
                 while True:
                     is_valid, error_msg = _validate_url(next_url)
                     if not is_valid:
-                        return json.dumps({"error": f"URL validation failed: {error_msg}", "url": next_url})
+                        return json.dumps(
+                            {"error": f"URL validation failed: {error_msg}", "url": next_url}
+                        )
 
                     r = await client.get(next_url, headers={"User-Agent": USER_AGENT})
 
@@ -260,7 +325,9 @@ class WebFetchTool(Tool):
                             return json.dumps({"error": "Too many redirects", "url": url})
                         location = r.headers.get("location", "")
                         if not location:
-                            return json.dumps({"error": "Redirect missing location header", "url": next_url})
+                            return json.dumps(
+                                {"error": "Redirect missing location header", "url": next_url}
+                            )
                         next_url = str(r.url.join(location))
                         continue
 
@@ -276,7 +343,9 @@ class WebFetchTool(Tool):
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
                 doc = Document(r.text)
                 content = (
-                    self._to_markdown(doc.summary()) if extract_mode == "markdown" else _strip_tags(doc.summary())
+                    self._to_markdown(doc.summary())
+                    if extract_mode == "markdown"
+                    else _strip_tags(doc.summary())
                 )
                 text = f"# {doc.title()}\n\n{content}" if doc.title() else content
                 extractor = "readability"
@@ -287,10 +356,17 @@ class WebFetchTool(Tool):
             if truncated:
                 text = text[:max_chars]
 
-            return json.dumps({
-                "url": url, "finalUrl": str(r.url), "status": r.status_code,
-                "extractor": extractor, "truncated": truncated, "length": len(text), "text": text,
-            })
+            return json.dumps(
+                {
+                    "url": url,
+                    "finalUrl": str(r.url),
+                    "status": r.status_code,
+                    "extractor": extractor,
+                    "truncated": truncated,
+                    "length": len(text),
+                    "text": text,
+                }
+            )
         except Exception as e:
             return json.dumps({"error": str(e), "url": url})
 
@@ -299,15 +375,21 @@ class WebFetchTool(Tool):
         # Convert links, headings, lists before stripping tags
         text = re.sub(
             r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-            lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_text, flags=re.I,
+            lambda m: f"[{_strip_tags(m[2])}]({m[1]})",
+            html_text,
+            flags=re.I,
         )
         text = re.sub(
-            r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
-            lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I,
+            r"<h([1-6])[^>]*>([\s\S]*?)</h\1>",
+            lambda m: f"\n{'#' * int(m[1])} {_strip_tags(m[2])}\n",
+            text,
+            flags=re.I,
         )
-        text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
-        text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
-        text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
+        text = re.sub(
+            r"<li[^>]*>([\s\S]*?)</li>", lambda m: f"\n- {_strip_tags(m[1])}", text, flags=re.I
+        )
+        text = re.sub(r"</(p|div|section|article)>", "\n\n", text, flags=re.I)
+        text = re.sub(r"<(br|hr)\s*/?>", "\n", text, flags=re.I)
         return _normalize(_strip_tags(text))
 
 
@@ -409,9 +491,7 @@ class DeepResearchTool(Tool):
             r.raise_for_status()
         return r.json()  # type: ignore[no-any-return]
 
-    def _extract_follow_up_queries(
-        self, original: str, results: list[dict[str, Any]]
-    ) -> list[str]:
+    def _extract_follow_up_queries(self, original: str, results: list[dict[str, Any]]) -> list[str]:
         """Derive meaningful follow-up queries from primary result titles."""
         follow_ups: list[str] = []
         seen: set[str] = set()
@@ -422,7 +502,7 @@ class DeepResearchTool(Tool):
             if not title or title.lower() == original_lower:
                 continue
             # Capitalised multi-word phrases as candidate sub-topics
-            phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', title)
+            phrases = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", title)
             for phrase in phrases:
                 key = phrase.lower()
                 if key not in seen and key not in original_lower:
@@ -435,9 +515,7 @@ class DeepResearchTool(Tool):
 
         return follow_ups[:3]
 
-    def _format_report(
-        self, query: str, answers: list[str], results: list[dict[str, Any]]
-    ) -> str:
+    def _format_report(self, query: str, answers: list[str], results: list[dict[str, Any]]) -> str:
         """Format a concise research report."""
         # Deduplicate results by URL
         seen_urls: set[str] = set()
@@ -470,6 +548,7 @@ class DeepResearchTool(Tool):
 def _extract_youtube_id(url: str) -> str | None:
     """Extract the YouTube video ID from various URL formats."""
     import re
+
     patterns = [
         r"youtu\.be/([A-Za-z0-9_-]{11})",
         r"youtube\.com/watch\?.*v=([A-Za-z0-9_-]{11})",
@@ -512,7 +591,11 @@ class YoutubeTranscriptTool(Tool):
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
         except ImportError:
-            return json.dumps({"error": "youtube-transcript-api is not installed. Run: uv pip install youtube-transcript-api"})
+            return json.dumps(
+                {
+                    "error": "youtube-transcript-api is not installed. Run: uv pip install youtube-transcript-api"
+                }
+            )
 
         api = YouTubeTranscriptApi()
         # Try preferred language first, then English, then any available
@@ -526,7 +609,12 @@ class YoutubeTranscriptTool(Tool):
             except Exception:
                 continue
         else:
-            return json.dumps({"error": f"No transcript available for video {video_id}. The video may have no captions.", "video_id": video_id})
+            return json.dumps(
+                {
+                    "error": f"No transcript available for video {video_id}. The video may have no captions.",
+                    "video_id": video_id,
+                }
+            )
 
         snippets = transcript.snippets
         text = " ".join(s.text for s in snippets).strip()
@@ -534,10 +622,12 @@ class YoutubeTranscriptTool(Tool):
         if len(text) > 12000:
             text = text[:12000] + "\n\n[transcript truncated]"
 
-        return json.dumps({
-            "video_id": video_id,
-            "url": url,
-            "language": getattr(transcript, "language_code", language),
-            "transcript": text,
-            "snippet_count": len(snippets),
-        })
+        return json.dumps(
+            {
+                "video_id": video_id,
+                "url": url,
+                "language": getattr(transcript, "language_code", language),
+                "transcript": text,
+                "snippet_count": len(snippets),
+            }
+        )

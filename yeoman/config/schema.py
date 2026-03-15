@@ -77,15 +77,25 @@ class WhatsAppMediaConfig(BaseModel):
     persist_incoming_audio: bool = bool(DEFAULT_WHATSAPP_MEDIA["persist_incoming_audio"])
     transcribe_audio: bool = bool(DEFAULT_WHATSAPP_MEDIA["transcribe_audio"])
     max_audio_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_audio_bytes_mb"])
-    delete_audio_after_transcription: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_audio_after_transcription"])
-    max_asr_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_asr_concurrency"]), ge=1)
-    max_tts_concurrency: int = Field(default=int(DEFAULT_WHATSAPP_MEDIA["max_tts_concurrency"]), ge=1)
+    delete_audio_after_transcription: bool = bool(
+        DEFAULT_WHATSAPP_MEDIA["delete_audio_after_transcription"]
+    )
+    max_asr_concurrency: int = Field(
+        default=int(DEFAULT_WHATSAPP_MEDIA["max_asr_concurrency"]), ge=1
+    )
+    max_tts_concurrency: int = Field(
+        default=int(DEFAULT_WHATSAPP_MEDIA["max_tts_concurrency"]), ge=1
+    )
     describe_videos: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_videos"])
     max_video_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_video_bytes_mb"])
     video_frame_count: int = int(DEFAULT_WHATSAPP_MEDIA["video_frame_count"])
-    delete_video_after_description: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_video_after_description"])
+    delete_video_after_description: bool = bool(
+        DEFAULT_WHATSAPP_MEDIA["delete_video_after_description"]
+    )
     describe_stickers: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_stickers"])
-    delete_sticker_after_description: bool = bool(DEFAULT_WHATSAPP_MEDIA["delete_sticker_after_description"])
+    delete_sticker_after_description: bool = bool(
+        DEFAULT_WHATSAPP_MEDIA["delete_sticker_after_description"]
+    )
 
     @property
     def incoming_path(self) -> Path:
@@ -196,7 +206,9 @@ class ChannelsConfig(BaseModel):
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
+    model_config = ConfigDict(
+        extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
+    )
     workspace: str = "~/.yeoman/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
@@ -223,7 +235,9 @@ class ProviderConfig(BaseModel):
 class ElevenLabsProviderConfig(ProviderConfig):
     """ElevenLabs provider config with optional TTS defaults."""
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
+    model_config = ConfigDict(
+        extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
+    )
 
     voice_id: str | None = Field(default=None, alias="voiceId")
     model_id: str | None = Field(default=None, alias="modelId")
@@ -297,6 +311,18 @@ class WebToolsConfig(BaseModel):
     """Web tools configuration."""
 
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    max_fetch_bytes: int = 2_097_152  # 2 MB streaming cap
+    blocked_domains: list[str] = Field(default_factory=list)
+    allowed_domains: list[str] = Field(default_factory=list)  # empty = all allowed
+    rate_limit_rpm: int = 20  # requests per minute across all web tools
+    allowed_content_types: list[str] = Field(
+        default_factory=lambda: [
+            "text/",
+            "application/json",
+            "application/xml",
+            "application/xhtml+xml",
+        ]
+    )
 
 
 class MemoryCaptureConfig(BaseModel):
@@ -438,7 +464,10 @@ class BusConfig(BaseModel):
 
 class Config(BaseSettings):
     """Root configuration for yeoman."""
-    model_config = ConfigDict(extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__")
+
+    model_config = ConfigDict(
+        extra="ignore", populate_by_name=True, env_prefix="YEOMAN_", env_nested_delimiter="__"
+    )
 
     config_version: int = 2
     models: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
@@ -456,6 +485,7 @@ class Config(BaseSettings):
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         from yeoman.utils.helpers import get_data_path
+
         candidate = Path(self.agents.defaults.workspace).expanduser()
         return candidate if candidate.is_absolute() else get_data_path() / candidate
 
