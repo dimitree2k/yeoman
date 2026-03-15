@@ -146,3 +146,40 @@ async def test_web_fetch_rate_limited():
     # Second call should be rate-limited
     r2 = await tool.execute(url="http://example.com")
     assert "rate limit" in r2.lower()
+
+
+# --- Task 10: Full hardening integration test ---
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_full_hardening_integration():
+    """Verify all hardening measures work together."""
+    import json as _json
+
+    from yeoman.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+
+    cfg = WebToolsConfig(
+        rate_limit_rpm=100,
+        blocked_domains=["blocked.example"],
+        max_fetch_bytes=1_000_000,
+    )
+    tool = WebFetchTool(api_key="", web_config=cfg)
+
+    # Blocked domain
+    result = await tool.execute(url="http://blocked.example/page")
+    data = _json.loads(result)
+    assert "error" in data
+    assert "blocked" in data["error"].lower() or "Blocked" in data["error"]
+
+    # Private IP
+    result = await tool.execute(url="http://192.168.1.1/admin")
+    data = _json.loads(result)
+    assert "error" in data
+
+    # YouTube redirect
+    result = await tool.execute(url="https://www.youtube.com/watch?v=abc123")
+    data = _json.loads(result)
+    assert "youtube_transcript" in data.get("action", "").lower()

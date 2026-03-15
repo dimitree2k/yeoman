@@ -12,7 +12,7 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from yeoman.agent.tools.file_access import FileAccessResolver
-    from yeoman.config.schema import ExecToolConfig
+    from yeoman.config.schema import ExecToolConfig, WebToolsConfig
 
 from yeoman.agent.tools.exec_isolation import SandboxMount
 from yeoman.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
@@ -41,6 +41,7 @@ class SubagentManager:
         bus: MessageBus,
         model: str | None = None,
         tavily_api_key: str | None = None,
+        web_config: "WebToolsConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         file_access_resolver: "FileAccessResolver | None" = None,
@@ -51,6 +52,7 @@ class SubagentManager:
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.tavily_api_key = tavily_api_key
+        self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.file_access_resolver = file_access_resolver
@@ -140,8 +142,8 @@ class SubagentManager:
             tools.register(ReadFileTool(allowed_dir=allowed_dir))
             tools.register(ListDirTool(allowed_dir=allowed_dir))
 
-        tools.register(WebSearchTool(api_key=self.tavily_api_key))
-        tools.register(WebFetchTool(api_key=self.tavily_api_key))
+        tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
 
         system_prompt = self._build_subagent_prompt(task)
         if memory_context:
@@ -238,9 +240,9 @@ class SubagentManager:
             exec_tool.set_session_context(f"subagent:{task_id}")
             tools.register(exec_tool)
             tools.register(OpsTool())
-            tools.register(WebSearchTool(api_key=self.tavily_api_key))
-            tools.register(WebFetchTool(api_key=self.tavily_api_key))
-            tools.register(DeepResearchTool(api_key=self.tavily_api_key))
+            tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+            tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+            tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)

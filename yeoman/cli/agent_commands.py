@@ -56,6 +56,7 @@ def agent(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         tavily_api_key=config.tools.web.search.tavily_api_key or None,
+        web_config=config.tools.web,
         exec_config=exec_config,
         restrict_to_workspace=restrict_to_workspace,
         memory_service=memory_service,

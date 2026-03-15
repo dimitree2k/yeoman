@@ -44,7 +44,7 @@ from yeoman.telemetry import tracing as lf
 
 if TYPE_CHECKING:
     from yeoman.caldav.service import CalDAVService
-    from yeoman.config.schema import ExecToolConfig
+    from yeoman.config.schema import ExecToolConfig, WebToolsConfig
     from yeoman.contacts.service import ContactsService
     from yeoman.cron.service import CronService
     from yeoman.media.router import ModelRouter
@@ -73,6 +73,7 @@ class LLMResponder(ResponderPort):
         subagent_model: str | None = None,
         max_iterations: int = 20,
         tavily_api_key: str | None = None,
+        web_config: "WebToolsConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         contacts_service: "ContactsService | None" = None,
@@ -99,6 +100,7 @@ class LLMResponder(ResponderPort):
         self.model = model or provider.get_default_model()
         self.max_iterations = max(1, int(max_iterations))
         self.tavily_api_key = tavily_api_key
+        self.web_config = web_config
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.contacts_service = contacts_service
@@ -131,6 +133,7 @@ class LLMResponder(ResponderPort):
             bus=bus,
             model=subagent_model_to_use,
             tavily_api_key=tavily_api_key,
+            web_config=web_config,
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
             file_access_resolver=file_access_resolver,
@@ -184,9 +187,9 @@ class LLMResponder(ResponderPort):
         self.tools.register(OpsTool())
         self.tools.register(OpsManageTool())
 
-        self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
-        self.tools.register(WebFetchTool(api_key=self.tavily_api_key))
-        self.tools.register(DeepResearchTool(api_key=self.tavily_api_key))
+        self.tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(YoutubeTranscriptTool())
 
         from yeoman.agent.tools.browse import BrowseTool

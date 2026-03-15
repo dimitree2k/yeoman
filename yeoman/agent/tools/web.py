@@ -198,9 +198,18 @@ class WebSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, api_key: str | None = None, max_results: int = 5):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        max_results: int = 5,
+        web_config: "WebToolsConfig | None" = None,
+    ):
+        from yeoman.config.schema import WebToolsConfig as WebToolsCfg
+
+        self._config = web_config or WebToolsCfg()
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
         self.max_results = max_results
+        _rate_limiter.configure(self._config.rate_limit_rpm)
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         logger.info("web_search query={!r} count={}", query, count or self.max_results)
@@ -560,8 +569,12 @@ class DeepResearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, web_config: "WebToolsConfig | None" = None):
+        from yeoman.config.schema import WebToolsConfig as WebToolsCfg
+
+        self._config = web_config or WebToolsCfg()
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
+        _rate_limiter.configure(self._config.rate_limit_rpm)
 
     async def execute(
         self, query: str, depth: str = "advanced", max_results: int = 5, **kwargs: Any

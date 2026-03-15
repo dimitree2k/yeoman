@@ -373,6 +373,7 @@ def build_gateway_runtime(
         subagent_model=config.agents.defaults.subagent_model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         tavily_api_key=config.tools.web.search.tavily_api_key or None,
+        web_config=config.tools.web,
         exec_config=exec_config,
         restrict_to_workspace=restrict_to_workspace,
         session_manager=session_manager,
