@@ -1,5 +1,6 @@
 """Web tools: web_search, web_fetch, and deep_research (all powered by Tavily)."""
 
+import asyncio
 import html
 import ipaddress
 import json
@@ -8,12 +9,16 @@ import re
 import socket
 import time
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
+from loguru import logger
 
 from yeoman.agent.tools.base import Tool
+
+if TYPE_CHECKING:
+    from yeoman.config.schema import WebToolsConfig
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -148,6 +153,28 @@ def _validate_url(
         return False, str(e)
 
 
+async def _async_validate_dns(hostname: str) -> None:
+    """Async DNS resolve + private-IP validation. Raises ValueError on failure.
+
+    Called immediately before httpx request to minimize TOCTOU window.
+    Note: a theoretical gap remains because httpx resolves DNS independently.
+    Eliminating it entirely would require a custom httpcore network backend.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(f"DNS resolution failed for {hostname}: {e}") from e
+
+    if not infos:
+        raise ValueError(f"DNS resolution returned no results for {hostname}")
+
+    for family, type_, proto, canonname, sockaddr in infos:
+        ip = sockaddr[0]
+        if _is_private_ip(ip):
+            raise ValueError(f"DNS rebinding blocked: {hostname} resolved to private IP {ip}")
+
+
 def _tavily_auth_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -176,6 +203,10 @@ class WebSearchTool(Tool):
         self.max_results = max_results
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        logger.info("web_search query={!r} count={}", query, count or self.max_results)
+        if not _rate_limiter.check():
+            return "Error: Rate limit exceeded. Try again shortly."
+
         if not self.api_key:
             return "Error: TAVILY_API_KEY not configured"
 
@@ -232,17 +263,45 @@ class WebFetchTool(Tool):
         "required": ["url"],
     }
 
-    def __init__(self, api_key: str | None = None, max_chars: int = 50000):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        max_chars: int = 50000,
+        web_config: "WebToolsConfig | None" = None,
+    ):
+        from yeoman.config.schema import WebToolsConfig as WebToolsCfg
+
+        self._config = web_config or WebToolsCfg()
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
         self.max_chars = max_chars
+        self._max_fetch_bytes = self._config.max_fetch_bytes
+        self._allowed_content_types = self._config.allowed_content_types
+        self._blocked_domains = self._config.blocked_domains
+        self._allowed_domains = self._config.allowed_domains
+        _rate_limiter.configure(self._config.rate_limit_rpm)
+
+    def _is_allowed_content_type(self, ctype: str) -> bool:
+        """Check if response content-type matches allowed prefixes."""
+        if not ctype:
+            return True  # Allow missing content-type (best-effort)
+        ctype_lower = ctype.lower().split(";")[0].strip()
+        return any(ctype_lower.startswith(allowed) for allowed in self._allowed_content_types)
 
     async def execute(
         self, url: str, extract_mode: str = "markdown", max_chars: int | None = None, **kwargs: Any
     ) -> str:
+        logger.info("web_fetch url={!r} mode={}", url, extract_mode)
+        if not _rate_limiter.check():
+            return json.dumps({"error": "Rate limit exceeded. Try again shortly.", "url": url})
+
         max_chars = max_chars or self.max_chars
 
         # Validate URL before fetching
-        is_valid, error_msg = _validate_url(url)
+        is_valid, error_msg = _validate_url(
+            url,
+            blocked_domains=self._blocked_domains,
+            allowed_domains=self._allowed_domains,
+        )
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})
 
@@ -303,45 +362,111 @@ class WebFetchTool(Tool):
         )
 
     async def _direct_fetch(self, url: str, extract_mode: str, max_chars: int) -> str:
-        """Direct HTTP fetch with Readability extraction."""
+        """Direct HTTP fetch with streaming size guard + content-type filter."""
         from readability import Document
 
         try:
-            async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=30.0,
+            ) as client:
                 next_url = url
                 redirects = 0
+                final_status = 200
+                final_url = url
                 while True:
-                    is_valid, error_msg = _validate_url(next_url)
+                    is_valid, error_msg = _validate_url(
+                        next_url,
+                        blocked_domains=self._blocked_domains,
+                        allowed_domains=self._allowed_domains,
+                    )
                     if not is_valid:
                         return json.dumps(
                             {"error": f"URL validation failed: {error_msg}", "url": next_url}
                         )
 
-                    r = await client.get(next_url, headers={"User-Agent": USER_AGENT})
+                    # Async DNS validation (minimize TOCTOU)
+                    parsed = urlparse(next_url)
+                    hostname = (parsed.hostname or "").strip().lower()
+                    if hostname and not _is_private_ip(hostname):
+                        try:
+                            await _async_validate_dns(hostname)
+                        except ValueError as e:
+                            return json.dumps({"error": str(e), "url": next_url})
 
-                    if r.status_code in {301, 302, 303, 307, 308} and "location" in r.headers:
-                        redirects += 1
-                        if redirects > MAX_REDIRECTS:
-                            return json.dumps({"error": "Too many redirects", "url": url})
-                        location = r.headers.get("location", "")
-                        if not location:
-                            return json.dumps(
-                                {"error": "Redirect missing location header", "url": next_url}
+                    async with client.stream(
+                        "GET", next_url, headers={"User-Agent": USER_AGENT}
+                    ) as r:
+                        if r.status_code in {301, 302, 303, 307, 308} and "location" in r.headers:
+                            redirects += 1
+                            if redirects > MAX_REDIRECTS:
+                                return json.dumps({"error": "Too many redirects", "url": url})
+                            location = r.headers.get("location", "")
+                            if not location:
+                                return json.dumps(
+                                    {
+                                        "error": "Redirect missing location header",
+                                        "url": next_url,
+                                    }
+                                )
+                            next_url = str(r.url.join(location))
+                            continue
+
+                        r.raise_for_status()
+
+                        # Content-type filter
+                        ctype = r.headers.get("content-type", "")
+                        if not self._is_allowed_content_type(ctype):
+                            logger.warning(
+                                "web_fetch error url={!r} err={!r}",
+                                url,
+                                f"Blocked content type: {ctype}",
                             )
-                        next_url = str(r.url.join(location))
-                        continue
+                            return json.dumps(
+                                {
+                                    "error": f"Blocked content type: {ctype}",
+                                    "url": next_url,
+                                }
+                            )
 
-                    r.raise_for_status()
-                    break
+                        # Streaming size guard: check Content-Length header
+                        content_length = r.headers.get("content-length")
+                        if content_length and int(content_length) > self._max_fetch_bytes:
+                            logger.warning(
+                                "web_fetch error url={!r} err={!r}",
+                                url,
+                                f"Response too large: {content_length} bytes",
+                            )
+                            return json.dumps(
+                                {
+                                    "error": (
+                                        f"Response too large: {content_length} bytes"
+                                        f" (limit {self._max_fetch_bytes})"
+                                    ),
+                                    "url": next_url,
+                                }
+                            )
 
-            ctype = r.headers.get("content-type", "")
+                        # Read body in chunks up to max_fetch_bytes
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in r.aiter_bytes(4096):
+                            total += len(chunk)
+                            if total > self._max_fetch_bytes:
+                                break
+                            chunks.append(chunk)
 
-            # JSON
+                        raw_bytes = b"".join(chunks)
+                        body_text = raw_bytes.decode("utf-8", errors="replace")
+                        final_status = r.status_code
+                        final_url = str(r.url)
+                        break
+
+            # Parse based on content type
             if "application/json" in ctype:
-                text, extractor = json.dumps(r.json(), indent=2), "json"
-            # HTML
-            elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
-                doc = Document(r.text)
+                text, extractor = json.dumps(json.loads(body_text), indent=2), "json"
+            elif "text/html" in ctype or body_text[:256].lower().startswith(("<!doctype", "<html")):
+                doc = Document(body_text)
                 content = (
                     self._to_markdown(doc.summary())
                     if extract_mode == "markdown"
@@ -350,17 +475,18 @@ class WebFetchTool(Tool):
                 text = f"# {doc.title()}\n\n{content}" if doc.title() else content
                 extractor = "readability"
             else:
-                text, extractor = r.text, "raw"
+                text, extractor = body_text, "raw"
 
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
 
+            logger.info("web_fetch ok url={!r} extractor={} len={}", url, extractor, len(text))
             return json.dumps(
                 {
                     "url": url,
-                    "finalUrl": str(r.url),
-                    "status": r.status_code,
+                    "finalUrl": final_url,
+                    "status": final_status,
                     "extractor": extractor,
                     "truncated": truncated,
                     "length": len(text),
@@ -368,6 +494,7 @@ class WebFetchTool(Tool):
                 }
             )
         except Exception as e:
+            logger.warning("web_fetch error url={!r} err={!r}", url, str(e))
             return json.dumps({"error": str(e), "url": url})
 
     def _to_markdown(self, html_text: str) -> str:
@@ -439,6 +566,10 @@ class DeepResearchTool(Tool):
     async def execute(
         self, query: str, depth: str = "advanced", max_results: int = 5, **kwargs: Any
     ) -> str:
+        logger.info("deep_research query={!r} depth={}", query, depth)
+        if not _rate_limiter.check():
+            return "Error: Rate limit exceeded. Try again shortly."
+
         if not self.api_key:
             return "Error: TAVILY_API_KEY not configured"
 

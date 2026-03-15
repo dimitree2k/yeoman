@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from yeoman.agent.tools.web import _validate_domain, _WebRateLimiter
 from yeoman.config.schema import WebToolsConfig
 
@@ -78,3 +80,69 @@ def test_validate_domain_not_in_allowlist():
 def test_validate_domain_allowed_subdomain():
     ok, err = _validate_domain("sub.good.com", blocked=[], allowed=["good.com"])
     assert ok is True
+
+
+# --- Task 4: Async DNS validation ---
+
+
+@pytest.mark.asyncio
+async def test_async_validate_dns_private():
+    from yeoman.agent.tools.web import _async_validate_dns
+
+    with pytest.raises(ValueError, match="private"):
+        await _async_validate_dns("localhost")
+
+
+@pytest.mark.asyncio
+async def test_async_validate_dns_no_resolve():
+    from yeoman.agent.tools.web import _async_validate_dns
+
+    with pytest.raises(ValueError):
+        await _async_validate_dns("this-domain-does-not-exist-xyz123.invalid")
+
+
+# --- Task 5: WebFetchTool config + content-type filter ---
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_respects_max_fetch_bytes():
+    from yeoman.agent.tools.web import WebFetchTool
+
+    cfg = WebToolsConfig(max_fetch_bytes=500)
+    tool = WebFetchTool(api_key="", web_config=cfg)
+    assert tool._max_fetch_bytes == 500
+
+
+def test_web_fetch_content_type_check():
+    from yeoman.agent.tools.web import WebFetchTool
+
+    cfg = WebToolsConfig()
+    tool = WebFetchTool(api_key="", web_config=cfg)
+    assert tool._is_allowed_content_type("text/html; charset=utf-8") is True
+    assert tool._is_allowed_content_type("application/json") is True
+    assert tool._is_allowed_content_type("image/png") is False
+    assert tool._is_allowed_content_type("application/octet-stream") is False
+    assert tool._is_allowed_content_type("") is True  # missing = allow
+
+
+# --- Task 7: Rate limiter wiring ---
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rate_limited():
+    import json as _json
+
+    from yeoman.agent.tools.web import WebFetchTool, _rate_limiter
+
+    cfg = WebToolsConfig(rate_limit_rpm=1)
+    tool = WebFetchTool(api_key="", web_config=cfg)
+    _rate_limiter.configure(1)
+    _rate_limiter._timestamps.clear()
+
+    # First call proceeds (will fail on actual fetch but not on rate limit)
+    r1 = await tool.execute(url="http://example.com")
+    assert "rate limit" not in r1.lower()
+
+    # Second call should be rate-limited
+    r2 = await tool.execute(url="http://example.com")
+    assert "rate limit" in r2.lower()
