@@ -128,3 +128,80 @@ class TestPersistCandidatePersonProfile:
             limit=5,
         )
         assert len(user_hits) == 1
+
+
+class TestRecallContactScope:
+    def test_person_profile_recalled_from_different_group(self, tmp_path: Path) -> None:
+        jid = "491786@s.whatsapp.net"
+        contact_id = "frank-uuid-001"
+        svc = _service_with_contact(tmp_path, jid, contact_id)
+
+        candidate = ExtractedCandidate(
+            sector="semantic",
+            kind="person_profile",
+            content="Frank: is a doctor",
+            salience=0.9,
+            confidence=0.9,
+        )
+        svc._persist_candidate(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=jid,
+            role="user",
+            source_message_id=None,
+            candidate=candidate,
+        )
+
+        # Recall from group-b with Frank as sender — should surface group-a fact
+        hits = svc.recall_for_event(
+            channel="whatsapp",
+            chat_id="group-b",
+            sender_id=jid,
+            query="Frank doctor",
+        )
+        assert any("Frank" in h.entry.content for h in hits)
+
+    def test_recall_includes_reply_to_contact_scope(self, tmp_path: Path) -> None:
+        frank_jid = "491786@s.whatsapp.net"
+        contact_id = "frank-uuid-001"
+        svc = _service_with_contact(tmp_path, frank_jid, contact_id)
+
+        candidate = ExtractedCandidate(
+            sector="semantic",
+            kind="person_profile",
+            content="Frank: is a doctor",
+            salience=0.9,
+            confidence=0.9,
+        )
+        svc._persist_candidate(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=frank_jid,
+            role="user",
+            source_message_id=None,
+            candidate=candidate,
+        )
+
+        # Owner replies to Frank — should surface Frank's profile
+        hits = svc.recall_for_event(
+            channel="whatsapp",
+            chat_id="group-b",
+            sender_id="owner@wa",
+            query="what does Frank do",
+            reply_to_jid=frank_jid,
+        )
+        assert any("Frank" in h.entry.content for h in hits)
+
+    def test_recall_no_crash_when_sender_and_reply_same_contact(self, tmp_path: Path) -> None:
+        jid = "491786@s.whatsapp.net"
+        contact_id = "frank-uuid-001"
+        svc = _service_with_contact(tmp_path, jid, contact_id)
+
+        hits = svc.recall_for_event(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=jid,
+            query="anything",
+            reply_to_jid=jid,
+        )
+        assert isinstance(hits, list)

@@ -996,6 +996,7 @@ class LLMResponder(ResponderPort):
                         sender_id=sender_id,
                         query=memory_query,
                         reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
+                        reply_to_jid=str(metadata.get("reply_to_participant") or "").strip() or None,
                     )
                     retrieved_hits_count = len(retrieved_hits)
                 except Exception as e:

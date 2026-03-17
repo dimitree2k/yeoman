@@ -394,6 +394,7 @@ class MemoryService:
         sender_id: str | None,
         query: str,
         reply_to_text: str | None = None,
+        reply_to_jid: str | None = None,
     ) -> tuple[str, list[MemoryHit]]:
         hits = self.recall_for_event(
             channel=channel,
@@ -401,6 +402,7 @@ class MemoryService:
             sender_id=sender_id,
             query=query,
             reply_to_text=reply_to_text,
+            reply_to_jid=reply_to_jid,
         )
         rendered = self._render_hits(hits, max_chars=int(self.config.recall.max_prompt_chars))
         return rendered, hits
@@ -413,6 +415,7 @@ class MemoryService:
         sender_id: str | None,
         query: str,
         reply_to_text: str | None = None,
+        reply_to_jid: str | None = None,
     ) -> list[MemoryHit]:
         if not self.config.enabled:
             return []
@@ -426,6 +429,12 @@ class MemoryService:
             self.chat_scope_key(channel, chat_id),
             self.user_scope_key(channel, (sender_id or chat_id).strip()),
         ]
+        seen_contact_ids: set[str] = set()
+        for jid in filter(None, [sender_id, reply_to_jid]):
+            cid = self._resolve_contact_id(jid)
+            if cid and cid not in seen_contact_ids:
+                scope_keys.append(self.contact_scope_key(cid))
+                seen_contact_ids.add(cid)
         lexical_hits = self.store.search_lexical(
             workspace_id=self.workspace_id,
             query=query_text,
