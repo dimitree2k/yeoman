@@ -224,6 +224,18 @@ class ContactsService:
                 lines.append(f"- {entry['name']}")
         return "\n".join(lines)
 
+    # ── fields ────────────────────────────────────────────────────────────
+
+    def upsert_field(
+        self,
+        *,
+        contact_id: str,
+        kind: str,
+        value: str,
+        label: str | None = None,
+    ) -> None:
+        self.store.upsert_field(contact_id=contact_id, kind=kind, value=value, label=label)
+
     # ── memory backfill ────────────────────────────────────────────────────
 
     def backfill_memory(self, memory_store: object) -> int:

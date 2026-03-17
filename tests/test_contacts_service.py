@@ -118,3 +118,13 @@ class TestContactsService:
         contact = service.store.get_contact(cid)
         assert contact is not None
         assert contact.is_owner is True
+
+
+def test_upsert_field_delegates_to_store(tmp_path: Path) -> None:
+    from yeoman.contacts.service import ContactsService
+    svc = ContactsService(db_path=tmp_path / "c.db")
+    c = svc.store.create_contact(display_name="Frank")
+    svc.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")
+    fields = svc.store.get_fields(c.id)
+    assert len(fields) == 1
+    assert fields[0].kind == "person_profile"
