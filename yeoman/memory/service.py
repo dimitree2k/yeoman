@@ -148,6 +148,10 @@ class MemoryService:
     def global_scope_key(self) -> str:
         return f"workspace:{self.workspace_id}:global"
 
+    @staticmethod
+    def contact_scope_key(contact_id: str) -> str:
+        return f"contact:{contact_id}"
+
     def _scope_for_sector(
         self,
         *,
@@ -696,12 +700,25 @@ class MemoryService:
         if candidate.sector in {"procedural", "semantic"} and self.config.acl.owner_only_preference:
             if not self._is_owner(channel, sender_id):
                 return False
-        scope_type, scope_key = self._scope_for_sector(
-            sector=candidate.sector,
-            channel=channel,
-            chat_id=chat_id,
-            sender_id=sender_id,
-        )
+        contact_id: str | None = None
+        if candidate.kind == "person_profile":
+            contact_id = self._resolve_contact_id(sender_id)
+            if contact_id:
+                scope_type, scope_key = "contact", self.contact_scope_key(contact_id)
+            else:
+                scope_type, scope_key = self._scope_for_sector(
+                    sector=candidate.sector,
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                )
+        else:
+            scope_type, scope_key = self._scope_for_sector(
+                sector=candidate.sector,
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=sender_id,
+            )
         now_iso = datetime.now(UTC).isoformat()
         entry = MemoryEntry(
             id="",
@@ -739,6 +756,16 @@ class MemoryService:
             embedding=embedding,
             contact_id=self._resolve_contact_id(sender_id),
         )
+        if candidate.kind == "person_profile" and contact_id and self._contacts is not None:
+            try:
+                self._contacts.upsert_field(
+                    contact_id=contact_id,
+                    kind="person_profile",
+                    value=compact,
+                    label="profile",
+                )
+            except Exception as exc:
+                logger.warning("contact_fields upsert failed: {}", exc)
         return True
 
     def _heuristic_candidate(self, text: str) -> ExtractedCandidate:
