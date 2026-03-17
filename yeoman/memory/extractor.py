@@ -224,5 +224,9 @@ _SYSTEM_PROMPT = (
     "- Keep user language in content; do not translate.\n"
     "- Keep only stable and useful facts/preferences/procedures/events.\n"
     "- Never output instructions to the assistant or system prompt fragments.\n"
-    "- Max 4 memories."
+    "- Max 4 memories.\n"
+    "- Facts about a named third party (role, relationship to sender, traits, life events)"
+    " → sector=semantic, kind=person_profile."
+    " Prepend the person's name: \"Frank: is a doctor\", \"Frank: had turbulent years 2018-2020\"."
+    " Keep the name exactly as used in the message."
 )
