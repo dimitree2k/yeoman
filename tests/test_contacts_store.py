@@ -125,3 +125,37 @@ class TestContactsStore:
         store.add_identifier(contact_id=c.id, channel="whatsapp", identifier="lid1", kind="lid")
         idents = store.get_identifiers(c.id)
         assert len(idents) == 2
+
+
+class TestContactsStoreUpsertField:
+    def test_upsert_field_creates_row(self, store: ContactsStore) -> None:
+        c = store.create_contact(display_name="Frank")
+        store.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")
+        fields = store.get_fields(c.id)
+        assert len(fields) == 1
+        assert fields[0].value == "Frank: is a doctor"
+
+    def test_upsert_field_is_idempotent(self, store: ContactsStore) -> None:
+        c = store.create_contact(display_name="Frank")
+        store.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")
+        store.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")
+        assert len(store.get_fields(c.id)) == 1
+
+    def test_upsert_field_different_values_coexist(self, store: ContactsStore) -> None:
+        c = store.create_contact(display_name="Frank")
+        store.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")
+        store.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: likes hiking")
+        assert len(store.get_fields(c.id)) == 2
+
+    def test_merge_contacts_handles_duplicate_fields(self, store: ContactsStore) -> None:
+        frank1 = store.create_contact(display_name="Frank WA")
+        frank2 = store.create_contact(display_name="Frank TG")
+        store.add_identifier(contact_id=frank1.id, channel="whatsapp", identifier="frank@wa", kind="phone_jid")
+        store.add_identifier(contact_id=frank2.id, channel="telegram", identifier="frank@tg", kind="phone_jid")
+        # Both have the same field — merge must not crash
+        store.upsert_field(contact_id=frank1.id, kind="person_profile", value="Frank: is a doctor")
+        store.upsert_field(contact_id=frank2.id, kind="person_profile", value="Frank: is a doctor")
+        store.merge_contacts(source_id=frank2.id, target_id=frank1.id)
+        fields = store.get_fields(frank1.id)
+        values = [f.value for f in fields]
+        assert values.count("Frank: is a doctor") == 1

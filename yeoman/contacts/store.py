@@ -92,6 +92,18 @@ class ContactsStore:
             )
             self._conn.commit()
 
+            # Migration: dedup existing rows then add unique index on contact_fields.
+            self._conn.executescript("""
+                DELETE FROM contact_fields
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM contact_fields
+                    GROUP BY contact_id, kind, value
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cf_dedupe
+                    ON contact_fields (contact_id, kind, value);
+            """)
+
     # ── row converters ───────────────────────────────────────────────────
 
     @staticmethod
@@ -325,6 +337,26 @@ class ContactsStore:
             updated_at=now,
         )
 
+    def upsert_field(
+        self,
+        *,
+        contact_id: str,
+        kind: str,
+        value: str,
+        label: str | None = None,
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO contact_fields (contact_id, kind, value, label, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (contact_id, kind, value) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (contact_id, kind, value, label, now, now),
+            )
+            self._conn.commit()
+
     def get_fields(self, contact_id: str) -> list[ContactField]:
         with self._lock:
             rows = self._conn.execute(
@@ -369,7 +401,16 @@ class ContactsStore:
                 (target_id, source_id),
             )
 
-            # Move fields
+            # Move fields — remove source fields that already exist on target (avoids UNIQUE violation after migration).
+            self._conn.execute(
+                """
+                DELETE FROM contact_fields
+                WHERE contact_id = ? AND (kind, value) IN (
+                    SELECT kind, value FROM contact_fields WHERE contact_id = ?
+                )
+                """,
+                (source_id, target_id),
+            )
             self._conn.execute(
                 "UPDATE contact_fields SET contact_id = ? WHERE contact_id = ?",
                 (target_id, source_id),
