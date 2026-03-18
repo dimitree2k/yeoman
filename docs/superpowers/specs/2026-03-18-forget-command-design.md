@@ -14,7 +14,9 @@ conversation history (session messages), not the memory store.
 
 1. Let the owner search memories by free-text query and preview matches.
 2. Let the owner soft-delete all or selected matches after previewing.
-3. Keep the flow stateless — no server-side preview state to manage or time out.
+3. Keep the flow lightweight — the adapter holds a single transient preview slot
+   (list of matched IDs) validated by a hash token. No persistent state, no timeout
+   logic. If the slot is stale or empty, the user simply re-runs `/forget`.
 
 ## Non-Goals
 
@@ -40,12 +42,17 @@ Bot:   Forgot 3 memories.
 
 ## Architecture
 
-### Hash-based stateless confirmation
+### Hash-based confirmation with transient preview slot
 
 The preview computes a 4-character confirmation token: first 4 hex chars of
-`SHA256(sorted entry IDs joined by newline)`. The confirm step recomputes the hash from
-the provided IDs and validates it matches. Short enough to type on a phone,
-collision-resistant enough for this use case.
+`SHA256(sorted entry IDs joined by newline)`. The adapter stores the matched IDs in a
+single transient slot (`_forget_preview_ids`). On confirm, the hash is recomputed from
+the stored IDs and validated against the user-provided token. If the slot is empty or
+the hash mismatches, the user is told to re-run `/forget`.
+
+This is not fully stateless — the adapter holds one preview result in memory. This is
+acceptable because only one owner uses the bot, preview → confirm happens within
+seconds, and there is no persistence or timeout logic to manage.
 
 ### Components
 
@@ -66,7 +73,7 @@ Delegates to `store.soft_delete(ids)`. Returns deletion count.
 **4. `ForgetCommandHandler` (WhatsApp admin command)**
 
 - `namespace()` → `"forget"`
-- `is_applicable()` → owner-only, same check as `/reset`
+- `is_applicable()` → owner-only, DM-only (preview may contain sensitive cross-chat data)
 - `handle(ctx, argv)` routes based on argv:
 
 | argv pattern | Action |
@@ -105,12 +112,13 @@ Add `ForgetCommandHandler(self)` to the handler list in
 | No results | "No memories found matching '\<query\>'." |
 | Invalid/expired hash | "Preview expired or invalid. Run /forget again." |
 | Index out of range | "Index N out of range (1-M). Run /forget again." |
-| More than 10 matches | Show top 10, note: "Showing top 10 of N matches. Refine your query." |
+| More than 10 matches | Top 10 shown (search pipeline caps results); user refines query if needed |
 
 ## Files Changed
 
 | File | Change |
 |---|---|
 | `yeoman/memory/store.py` | Add `soft_delete(ids) -> int` |
+| `yeoman/memory/store.py` | Add `distinct_scope_keys(workspace_id) -> list[str]` |
 | `yeoman/memory/service.py` | Add `forget(query) -> list[MemoryHit]`, `forget_confirm(ids) -> int` |
 | `yeoman/adapters/policy_engine.py` | Add `ForgetCommandHandler`, `forget_is_applicable()`, `forget_handle()`, register handler |
