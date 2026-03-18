@@ -466,6 +466,31 @@ class MemoryStore:
                 self._conn.commit()
             return hits
 
+    def soft_delete(self, ids: list[str]) -> int:
+        """Mark entries as deleted. Returns count of rows affected."""
+        if not ids:
+            return 0
+        now_iso = datetime.now(UTC).isoformat()
+        placeholders = ",".join(["?"] * len(ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE memory2_nodes SET is_deleted = 1, updated_at = ?"
+                f" WHERE id IN ({placeholders}) AND is_deleted = 0",
+                (now_iso, *ids),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def distinct_scope_keys(self, workspace_id: str) -> list[str]:
+        """Return all distinct scope_keys for a workspace (active entries only)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT scope_key FROM memory2_nodes"
+                " WHERE workspace_id = ? AND is_deleted = 0",
+                (workspace_id,),
+            ).fetchall()
+        return [str(row["scope_key"]) for row in rows]
+
     def stats(self, *, workspace_id: str) -> dict[str, int]:
         with self._lock:
             total_nodes = self._conn.execute(
