@@ -910,6 +910,44 @@ class MemoryService:
         del older_than_days, kinds, scope_keys, dry_run
         return 0
 
+    def forget(self, *, query: str, limit: int = 10) -> list[MemoryHit]:
+        """Search all scopes for memories matching *query*. Preview only — does not delete."""
+        if not query.strip():
+            return []
+        # Search across all scope keys by using a broad lexical search.
+        scope_keys = self.store.distinct_scope_keys(self.workspace_id)
+        lexical_hits = self.store.search_lexical(
+            workspace_id=self.workspace_id,
+            query=query,
+            scope_keys=scope_keys,
+            limit=max(1, int(limit)),
+        )
+        vector_hits: list[MemoryHit] = []
+        if self.embedding is not None:
+            vector = self.embedding.embed(self._normalize_content(query))
+            if vector:
+                vector_hits = self.store.search_vector(
+                    workspace_id=self.workspace_id,
+                    query_vector=vector,
+                    scope_keys=scope_keys,
+                    limit=max(1, int(limit)),
+                )
+        merged: dict[str, MemoryHit] = {}
+        for hit in lexical_hits:
+            merged[hit.entry.id] = hit
+        for hit in vector_hits:
+            existing = merged.get(hit.entry.id)
+            if existing is None:
+                merged[hit.entry.id] = hit
+            else:
+                existing.vector_score = max(existing.vector_score, hit.vector_score)
+        ranked = self._rank_hits(list(merged.values()))
+        return ranked[:max(1, int(limit))]
+
+    def forget_confirm(self, ids: list[str]) -> int:
+        """Soft-delete memory entries by ID. Returns count deleted."""
+        return self.store.soft_delete(ids)
+
     def reindex(self) -> None:
         self.store.reindex()
 
