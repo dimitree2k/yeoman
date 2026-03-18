@@ -187,15 +187,25 @@ class EnginePolicyAdapter(PolicyPort):
             self._reload_check_interval_seconds = 30.0
         else:
             runtime = engine.policy.runtime
-            self._reload_on_change = runtime.reload_on_change if reload_on_change is None else reload_on_change
+            self._reload_on_change = (
+                runtime.reload_on_change if reload_on_change is None else reload_on_change
+            )
             self._reload_check_interval_seconds = (
                 runtime.reload_check_interval_seconds
                 if reload_check_interval_seconds is None
                 else reload_check_interval_seconds
             )
         if self._policy_path is not None:
-            workspace = self._engine.workspace if self._engine is not None else Path.home() / ".yeoman" / "workspace"
-            apply_channels = self._engine.apply_channels if self._engine is not None else {"telegram", "whatsapp"}
+            workspace = (
+                self._engine.workspace
+                if self._engine is not None
+                else Path.home() / ".yeoman" / "workspace"
+            )
+            apply_channels = (
+                self._engine.apply_channels
+                if self._engine is not None
+                else {"telegram", "whatsapp"}
+            )
             self._policy_admin_service = PolicyAdminService(
                 policy_path=self._policy_path,
                 workspace=workspace,
@@ -254,7 +264,7 @@ class EnginePolicyAdapter(PolicyPort):
     def _normalize_pause_until(value: object) -> int:
         try:
             parsed = int(str(value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0
         if parsed == _PAUSE_INDEFINITE:
             return _PAUSE_INDEFINITE
@@ -327,9 +337,7 @@ class EnginePolicyAdapter(PolicyPort):
             changed = True
 
         expired = [
-            key
-            for key, until in self._chat_pause_until_ms.items()
-            if until > 0 and until <= now
+            key for key, until in self._chat_pause_until_ms.items() if until > 0 and until <= now
         ]
         if expired:
             changed = True
@@ -501,7 +509,9 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_use_llm_message = False
         contacts_disclosure = False
         model_profile: str | None = None
-        when_to_reply_mode: Literal["all", "mention_only", "allowed_senders", "owner_only", "off"] = "all"
+        when_to_reply_mode: Literal[
+            "all", "mention_only", "allowed_senders", "owner_only", "off"
+        ] = "all"
         if event.channel in self._engine.apply_channels:
             try:
                 effective = self._engine.resolve_policy(event.channel, event.chat_id)
@@ -513,19 +523,13 @@ class EnginePolicyAdapter(PolicyPort):
                 voice_output_max_sentences = effective.voice_output_max_sentences
                 voice_output_max_chars = effective.voice_output_max_chars
                 talkative_cooldown_enabled = effective.talkative_cooldown_enabled
-                talkative_cooldown_streak_threshold = (
-                    effective.talkative_cooldown_streak_threshold
-                )
+                talkative_cooldown_streak_threshold = effective.talkative_cooldown_streak_threshold
                 talkative_cooldown_topic_overlap_threshold = (
                     effective.talkative_cooldown_topic_overlap_threshold
                 )
-                talkative_cooldown_cooldown_seconds = (
-                    effective.talkative_cooldown_cooldown_seconds
-                )
+                talkative_cooldown_cooldown_seconds = effective.talkative_cooldown_cooldown_seconds
                 talkative_cooldown_delay_seconds = effective.talkative_cooldown_delay_seconds
-                talkative_cooldown_use_llm_message = (
-                    effective.talkative_cooldown_use_llm_message
-                )
+                talkative_cooldown_use_llm_message = effective.talkative_cooldown_use_llm_message
                 contacts_disclosure = effective.contacts_disclosure
                 model_profile = effective.model_profile
             except Exception:
@@ -727,6 +731,7 @@ class EnginePolicyAdapter(PolicyPort):
         # Try chat_registry first
         try:
             from yeoman.storage.chat_registry import ChatRegistry
+
             registry = ChatRegistry()
             try:
                 chat_info = registry.get_chat("whatsapp", chat_id)
@@ -814,7 +819,9 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
-    def approve_mention_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+    def approve_mention_handle(
+        self, ctx: AdminCommandContext, argv: list[str]
+    ) -> AdminCommandResult:
         """Handle /approve-mention <chat_id> - allow group + set reply mode to 'mention_only'."""
         if len(argv) != 1:
             return AdminCommandResult(
@@ -875,7 +882,9 @@ class EnginePolicyAdapter(PolicyPort):
             outcome="applied",
             source="dm",
             metric_events=(
-                AdminMetricEvent(name="approve_mention_command_total", labels=(("channel", ctx.channel),)),
+                AdminMetricEvent(
+                    name="approve_mention_command_total", labels=(("channel", ctx.channel),)
+                ),
             ),
         )
 
@@ -1028,7 +1037,9 @@ class EnginePolicyAdapter(PolicyPort):
                 self._set_global_pause(_PAUSE_INDEFINITE)
                 response = "⏸️ Responses paused for all chats until /start all."
             else:
-                self._set_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id, until_ms=_PAUSE_INDEFINITE)
+                self._set_chat_pause(
+                    channel=ctx.channel, chat_id=ctx.chat_id, until_ms=_PAUSE_INDEFINITE
+                )
                 if self._is_global_pause_active():
                     response = (
                         "⏸️ Responses paused for this chat. "
@@ -1178,7 +1189,11 @@ class EnginePolicyAdapter(PolicyPort):
         try:
             if scope == "all":
                 changed = self._clear_all_pauses()
-                response = "✅ Responses resumed for all chats." if changed else "Responses are already active everywhere."
+                response = (
+                    "✅ Responses resumed for all chats."
+                    if changed
+                    else "Responses are already active everywhere."
+                )
             else:
                 cleared = self._clear_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id)
                 if self._is_global_pause_active():
@@ -1188,9 +1203,15 @@ class EnginePolicyAdapter(PolicyPort):
                             "Global pause is still active; use /start all to resume everywhere."
                         )
                     else:
-                        response = "Global pause is still active; use /start all to resume everywhere."
+                        response = (
+                            "Global pause is still active; use /start all to resume everywhere."
+                        )
                 else:
-                    response = "✅ Responses resumed for this chat." if cleared else "Responses are already active for this chat."
+                    response = (
+                        "✅ Responses resumed for this chat."
+                        if cleared
+                        else "Responses are already active for this chat."
+                    )
         except Exception as e:
             return AdminCommandResult(
                 status="handled",
@@ -1440,7 +1461,9 @@ class EnginePolicyAdapter(PolicyPort):
             return name or chat_id
         return "DM"
 
-    def command_catalog_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+    def command_catalog_handle(
+        self, ctx: AdminCommandContext, argv: list[str]
+    ) -> AdminCommandResult:
         include_all = False
         if argv:
             normalized = argv[0].strip().lower()
@@ -1477,7 +1500,9 @@ class EnginePolicyAdapter(PolicyPort):
             lines.append("- /panic [now] — emergency stop gateway + WhatsApp bridge")
         if self.approve_is_applicable(ctx):
             lines.append("- /approve <chat_id@g.us> — approve new chat (allow + reply all)")
-            lines.append("- /approve-mention <chat_id@g.us> — approve new chat (allow + mention only)")
+            lines.append(
+                "- /approve-mention <chat_id@g.us> — approve new chat (allow + mention only)"
+            )
             lines.append("- /deny <chat_id@g.us> — block chat (owners only)")
         if self.policy_admin_is_applicable(ctx):
             lines.append("- /policy help — policy admin commands")
@@ -1534,7 +1559,9 @@ class EnginePolicyAdapter(PolicyPort):
         if voice.input is None and voice.output is None:
             override.voice = None
 
-    def voice_messages_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+    def voice_messages_handle(
+        self, ctx: AdminCommandContext, argv: list[str]
+    ) -> AdminCommandResult:
         if len(argv) > 1:
             return AdminCommandResult(
                 status="handled",
@@ -1721,11 +1748,15 @@ class EnginePolicyAdapter(PolicyPort):
     def policy_admin_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         policy = self._load_policy_for_admin()
         if policy is None:
-            return AdminCommandResult(status="handled", response="Policy admin unavailable: policy engine is not active.")
+            return AdminCommandResult(
+                status="handled", response="Policy admin unavailable: policy engine is not active."
+            )
         if not self._is_whatsapp_owner(ctx, policy):
             return AdminCommandResult(status="ignored")
         if self._policy_admin_service is None:
-            return AdminCommandResult(status="handled", response="Policy admin service unavailable.")
+            return AdminCommandResult(
+                status="handled", response="Policy admin service unavailable."
+            )
 
         subcommand = argv[0] if argv else "help"
         command = PolicyCommand(
@@ -1791,7 +1822,10 @@ class EnginePolicyAdapter(PolicyPort):
                 ),
             )
         ]
-        if self._policy_admin_service is not None and self._policy_admin_service.registry.is_mutating(command_name):
+        if (
+            self._policy_admin_service is not None
+            and self._policy_admin_service.registry.is_mutating(command_name)
+        ):
             metrics.append(
                 AdminMetricEvent(
                     name="policy_admin_mutation_total",
@@ -1887,11 +1921,15 @@ class EnginePolicyAdapter(PolicyPort):
         mode = aliases.get(mode, mode)
         valid = {"all", "mention_only", "allowed_senders", "owner_only", "off"}
         if mode not in valid:
-            raise ValueError("mode must be one of: all, mention_only, allowed_senders, owner_only, off")
+            raise ValueError(
+                "mode must be one of: all, mention_only, allowed_senders, owner_only, off"
+            )
         return mode  # type: ignore[return-value]
 
     def _sender_keys(self, senders: list[str]) -> set[str]:
-        return {normalize_identity_token(value) for value in senders if normalize_identity_token(value)}
+        return {
+            normalize_identity_token(value) for value in senders if normalize_identity_token(value)
+        }
 
     def _whatsapp_chat_override(self, policy: PolicyConfig, chat_id: str) -> ChatPolicyOverride:
         channel = policy.channels.get("whatsapp")
@@ -2023,7 +2061,9 @@ class EnginePolicyAdapter(PolicyPort):
             self._save_policy_and_reload(policy)
         except Exception as e:
             return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: personaFile cleared (inherits channel/default policy)."
+        return (
+            f"Policy updated for {chat_id}: personaFile cleared (inherits channel/default policy)."
+        )
 
     def _cmd_block_sender(self, tokens: list[str], policy: PolicyConfig) -> str:
         if len(tokens) != 4:
@@ -2125,7 +2165,9 @@ class EnginePolicyAdapter(PolicyPort):
                 if comment:
                     rec["comment"] = comment
 
-        base_dir = self._policy_path.parent if self._policy_path is not None else Path.home() / ".yeoman"
+        base_dir = (
+            self._policy_path.parent if self._policy_path is not None else Path.home() / ".yeoman"
+        )
 
         # Session files show groups observed by runtime.
         sessions_dir = base_dir / "data" / "inbound"
@@ -2208,7 +2250,9 @@ class EnginePolicyAdapter(PolicyPort):
 
         if len(rows) > max_rows:
             lines.append(f"... and {len(rows) - max_rows} more")
-        lines.append("Use: /policy allow-group <chat_id@g.us> or /policy block-group <chat_id@g.us>")
+        lines.append(
+            "Use: /policy allow-group <chat_id@g.us> or /policy block-group <chat_id@g.us>"
+        )
         return "\n".join(lines)
 
     def _list_group_subjects_from_bridge(self, ids: list[str]) -> dict[str, str]:

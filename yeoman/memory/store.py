@@ -246,7 +246,9 @@ class MemoryStore:
                     return existing_entry, False
                 merged = self._row_to_entry(row)
                 if embedding_model and embedding is not None:
-                    self._upsert_embedding(merged.id, merged.workspace_id, embedding_model, embedding)
+                    self._upsert_embedding(
+                        merged.id, merged.workspace_id, embedding_model, embedding
+                    )
                 self._conn.commit()
                 return merged, False
 
@@ -562,4 +564,4 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
         norm_b += y * y
     if norm_a <= 0.0 or norm_b <= 0.0:
         return 0.0
-    return dot / ((norm_a ** 0.5) * (norm_b ** 0.5))
+    return dot / ((norm_a**0.5) * (norm_b**0.5))

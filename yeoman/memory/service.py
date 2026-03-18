@@ -317,10 +317,14 @@ class MemoryService:
         effective_mode = self._resolve_background_mode(requested_mode, payload, len(buf.events))
         if effective_mode == "hybrid":
             self._background_notes_mode_hybrid_total += 1
-            logger.debug("memory notes flush mode=hybrid chat={} events={}", buf.chat_id, len(buf.events))
+            logger.debug(
+                "memory notes flush mode=hybrid chat={} events={}", buf.chat_id, len(buf.events)
+            )
         else:
             self._background_notes_mode_heuristic_total += 1
-            logger.debug("memory notes flush mode=heuristic chat={} events={}", buf.chat_id, len(buf.events))
+            logger.debug(
+                "memory notes flush mode=heuristic chat={} events={}", buf.chat_id, len(buf.events)
+            )
 
         source_message_id = next(
             (event.message_id for event in reversed(buf.events) if event.message_id),
@@ -791,11 +795,18 @@ class MemoryService:
 
     def _classify(self, text: str) -> tuple[MemorySector, str, float]:
         lowered = text.lower()
-        if re.search(r"\b(i prefer|my preference|call me|my name is|i like|ich mag|ich bevorzuge)\b", lowered):
+        if re.search(
+            r"\b(i prefer|my preference|call me|my name is|i like|ich mag|ich bevorzuge)\b", lowered
+        ):
             return "semantic", "preference", 0.85
-        if re.search(r"\b(always|every time|workflow|steps|procedure|immer|ablauf|schritte)\b", lowered):
+        if re.search(
+            r"\b(always|every time|workflow|steps|procedure|immer|ablauf|schritte)\b", lowered
+        ):
             return "procedural", "instruction", 0.8
-        if re.search(r"\b(i feel|i am sad|i am happy|i am angry|i am worried|ich fuhle|ich bin traurig|ich bin froh)\b", lowered):
+        if re.search(
+            r"\b(i feel|i am sad|i am happy|i am angry|i am worried|ich fuhle|ich bin traurig|ich bin froh)\b",
+            lowered,
+        ):
             return "emotional", "state", 0.75
         return "episodic", "utterance", 0.6
 
@@ -866,7 +877,8 @@ class MemoryService:
             valid_from=now_iso,
         )
         saved, inserted = self.store.upsert_node(
-            entry, contact_id=self._resolve_contact_id(sender_id),
+            entry,
+            contact_id=self._resolve_contact_id(sender_id),
         )
         return saved, inserted
 
@@ -942,7 +954,7 @@ class MemoryService:
             else:
                 existing.vector_score = max(existing.vector_score, hit.vector_score)
         ranked = self._rank_hits(list(merged.values()))
-        return ranked[:max(1, int(limit))]
+        return ranked[: max(1, int(limit))]
 
     def forget_confirm(self, ids: list[str]) -> int:
         """Soft-delete memory entries by ID. Returns count deleted."""

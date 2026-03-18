@@ -18,9 +18,9 @@ from yeoman.adapters.responder_llm import LLMResponder
 from yeoman.adapters.typing_channel_manager import ChannelManagerTypingAdapter
 from yeoman.agent.tools.file_access import build_file_access_resolver
 from yeoman.bus.events import InboundMessage, OutboundMessage, ReactionMessage
-from yeoman.contacts.service import ContactsService
 from yeoman.bus.queue import MessageBus
 from yeoman.channels.manager import ChannelManager
+from yeoman.contacts.service import ContactsService
 from yeoman.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
@@ -45,8 +45,7 @@ from yeoman.providers.openai_compatible import resolve_openai_compatible_credent
 from yeoman.security import NoopSecurity, SecurityEngine
 from yeoman.session.manager import SessionManager
 from yeoman.storage.inbound_archive import InboundArchive
-from yeoman.telemetry import InMemoryTelemetry
-from yeoman.telemetry import tracing
+from yeoman.telemetry import InMemoryTelemetry, tracing
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -363,6 +362,7 @@ def build_gateway_runtime(
     _caldav_pass = os.environ.get("ICLOUD_CALDAV_APP_PASSWORD")
     if _caldav_user and _caldav_pass:
         from yeoman.caldav.service import CalDAVService
+
         _caldav_service = CalDAVService(_caldav_user, _caldav_pass)
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
@@ -396,21 +396,22 @@ def build_gateway_runtime(
 
     # Wire /voice command callback: reuses the send_voice tool.
     async def _voice_send_callback(content: str, chat_id: str) -> str:
-        return await responder.tools.execute("send_voice", {
-            "content": content,
-            "channel": "whatsapp",
-            "chat_id": chat_id,
-            "voice": "71c095ed4c03459fb98500db63b88fbe",
-            "verbatim": True,
-        })
+        return await responder.tools.execute(
+            "send_voice",
+            {
+                "content": content,
+                "channel": "whatsapp",
+                "chat_id": chat_id,
+                "voice": "71c095ed4c03459fb98500db63b88fbe",
+                "verbatim": True,
+            },
+        )
 
     policy_adapter.set_voice_send_callback(_voice_send_callback)
 
     # Wire admin notify callback: sends text to a given channel+chat.
     async def _admin_notify(channel: str, chat_id: str, text: str) -> None:
-        await bus.publish_outbound(
-            OutboundMessage(channel=channel, chat_id=chat_id, content=text)
-        )
+        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=text))
 
     policy_adapter.set_admin_notify_callback(_admin_notify)
 
