@@ -61,7 +61,14 @@ class InputSecurityMiddleware:
             return
 
         # Layer 2: LLM classifier (async, only when regex allowed).
-        if self._classifier is not None and ctx.event.content:
+        # Skip for owner in private DM — trusted sender, avoids false positives
+        # on legitimate questions about config/persona files.
+        is_owner_dm = (
+            ctx.decision is not None
+            and ctx.decision.is_owner
+            and not ctx.event.is_group
+        )
+        if self._classifier is not None and ctx.event.content and not is_owner_dm:
             try:
                 llm_decision = await self._classifier.classify(ctx.event.content)
             except Exception as exc:
