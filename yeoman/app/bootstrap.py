@@ -329,6 +329,7 @@ def build_gateway_runtime(
         workspace=workspace,
         memory_state_dir=memory_state_dir,
     )
+    policy_adapter.set_memory_service(memory_service)
 
     file_access_resolver = build_file_access_resolver(
         workspace=workspace,

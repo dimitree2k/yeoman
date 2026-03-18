@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -155,6 +156,7 @@ class EnginePolicyAdapter(PolicyPort):
             self._workspace = (Path.home() / ".yeoman" / "workspace").resolve()
         self._memory_state_dir = str(memory_state_dir or "memory/session-state")
         self._policy_admin_service: PolicyAdminService | None = None
+        self._memory_service: object | None = None
         self._admin_router = AdminCommandRouter(
             [
                 ApproveCommandHandler(self),
@@ -170,6 +172,7 @@ class EnginePolicyAdapter(PolicyPort):
                 VoiceMessagesCommandHandler(self),
                 VoiceSendCommandHandler(self),
                 ResetSessionCommandHandler(self),
+                ForgetCommandHandler(self),
             ]
         )
         self._pause_state_path = self._resolve_pause_state_path()
@@ -201,6 +204,10 @@ class EnginePolicyAdapter(PolicyPort):
                 on_policy_applied=self._on_policy_applied,
                 group_subject_resolver=lambda ids: self._list_group_subjects_from_bridge(ids),
             )
+
+    def set_memory_service(self, memory_service: object) -> None:
+        """Late-binding setter for MemoryService (avoids circular bootstrap)."""
+        self._memory_service = memory_service
 
     @property
     def known_tools(self) -> frozenset[str]:
@@ -695,6 +702,9 @@ class EnginePolicyAdapter(PolicyPort):
 
     def session_reset_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
+
+    def forget_is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
 
     def command_catalog_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
@@ -1255,6 +1265,180 @@ class EnginePolicyAdapter(PolicyPort):
                 AdminMetricEvent(name="session_reset_total", labels=(("channel", ctx.channel),)),
             ),
         )
+
+    def forget_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if not argv:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /forget <query>",
+                command_name="forget",
+                outcome="usage",
+                source="dm",
+            )
+
+        # Confirm sub-command: /forget confirm <hash> [indices]
+        if argv[0].lower() == "confirm":
+            return self._forget_confirm(ctx, argv[1:])
+
+        # Preview sub-command: /forget <query tokens...>
+        return self._forget_preview(ctx, argv)
+
+    def _forget_preview(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if self._memory_service is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Memory service is not available.",
+                command_name="forget",
+                outcome="error",
+                source="dm",
+            )
+
+        query = " ".join(argv)
+        hits = self._memory_service.forget(query=query, limit=10)
+        if not hits:
+            return AdminCommandResult(
+                status="handled",
+                response=f"No memories found matching '{query}'.",
+                command_name="forget",
+                outcome="empty",
+                source="dm",
+            )
+
+        total = len(hits)
+        ids = [h.entry.id for h in hits]
+        token = self._forget_hash(ids)
+        self._forget_preview_ids = ids
+
+        lines = [f"Found {total} memor{'y' if total == 1 else 'ies'}:"]
+        for i, hit in enumerate(hits, 1):
+            chat_label = self._forget_chat_label(hit.entry.chat_id)
+            content = hit.entry.content
+            if len(content) > 80:
+                content = content[:77] + "..."
+            lines.append(f'{i}. ({chat_label}, {hit.entry.created_at[:10]}) "{content}"')
+
+        lines.append("")
+        lines.append(f"/forget confirm {token} — delete all")
+        if total > 1:
+            lines.append(f"/forget confirm {token} 1,3 — delete selected")
+
+        return AdminCommandResult(
+            status="handled",
+            response="\n".join(lines),
+            command_name="forget",
+            outcome="preview",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(
+                    name="memory_forget_preview_total",
+                    labels=(("channel", ctx.channel),),
+                ),
+            ),
+        )
+
+    def _forget_confirm(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if self._memory_service is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Memory service is not available.",
+                command_name="forget",
+                outcome="error",
+                source="dm",
+            )
+
+        if not argv:
+            return AdminCommandResult(
+                status="handled",
+                response="Usage: /forget confirm <hash> [indices]",
+                command_name="forget",
+                outcome="usage",
+                source="dm",
+            )
+
+        provided_hash = argv[0].strip().lower()
+
+        # Parse optional index filter: /forget confirm abc1 1,3,5
+        index_filter: list[int] | None = None
+        if len(argv) > 1:
+            try:
+                index_filter = [int(x.strip()) for x in argv[1].split(",") if x.strip()]
+            except ValueError:
+                return AdminCommandResult(
+                    status="handled",
+                    response="Invalid index format. Use: /forget confirm <hash> 1,3,5",
+                    command_name="forget",
+                    outcome="error",
+                    source="dm",
+                )
+
+        preview_ids = getattr(self, "_forget_preview_ids", None)
+        if not preview_ids:
+            return AdminCommandResult(
+                status="handled",
+                response="Preview expired or invalid. Run /forget again.",
+                command_name="forget",
+                outcome="expired",
+                source="dm",
+            )
+
+        expected_hash = self._forget_hash(preview_ids)
+        if provided_hash != expected_hash:
+            return AdminCommandResult(
+                status="handled",
+                response="Preview expired or invalid. Run /forget again.",
+                command_name="forget",
+                outcome="expired",
+                source="dm",
+            )
+
+        # Apply index filter if provided
+        if index_filter is not None:
+            max_idx = len(preview_ids)
+            out_of_range = [i for i in index_filter if i < 1 or i > max_idx]
+            if out_of_range:
+                return AdminCommandResult(
+                    status="handled",
+                    response=f"Index {out_of_range[0]} out of range (1-{max_idx}). Run /forget again.",
+                    command_name="forget",
+                    outcome="error",
+                    source="dm",
+                )
+            ids_to_delete = [preview_ids[i - 1] for i in index_filter]
+        else:
+            ids_to_delete = list(preview_ids)
+
+        count = self._memory_service.forget_confirm(ids_to_delete)
+        self._forget_preview_ids = None  # Clear after confirm
+
+        return AdminCommandResult(
+            status="handled",
+            response=f"Forgot {count} memor{'y' if count == 1 else 'ies'}.",
+            command_name="forget",
+            outcome="applied",
+            source="dm",
+            metric_events=(
+                AdminMetricEvent(
+                    name="memory_forget_total",
+                    labels=(("channel", ctx.channel),),
+                    value=count,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _forget_hash(ids: list[str]) -> str:
+        """4-char hex hash over sorted entry IDs."""
+        payload = "\n".join(sorted(ids))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:4]
+
+    def _forget_chat_label(self, chat_id: str | None) -> str:
+        """Human-readable label for a chat_id in the preview."""
+        if not chat_id:
+            return "unknown"
+        if chat_id.endswith("@g.us"):
+            name = self._get_group_name(chat_id)
+            return name or chat_id
+        return "DM"
 
     def command_catalog_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         include_all = False
@@ -2145,6 +2329,25 @@ class ResetSessionCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/reset"
+
+
+class ForgetCommandHandler(AdminCommandHandler):
+    """Deterministic `/forget` command for soft-deleting memories."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "forget"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.forget_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.forget_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/forget <query>"
 
 
 class CommandCatalogCommandHandler(AdminCommandHandler):
