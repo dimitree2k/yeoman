@@ -1,2 +1,0 @@
-"""Application composition root."""
-
