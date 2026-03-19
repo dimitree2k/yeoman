@@ -1,0 +1,18 @@
+[project]
+name = "yeoman-overseer"
+version = "0.6.0"
+description = "Yeoman overseer — autonomous orchestration layer"
+requires-python = ">=3.14"
+dependencies = [
+    "yeoman-shared",
+    "pyyaml>=6.0.2",
+    "croniter>=6.0.0",
+    "httpx>=0.28.1",
+]
+
+[tool.uv.sources]
+yeoman-shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
