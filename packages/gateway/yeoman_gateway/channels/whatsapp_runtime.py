@@ -119,7 +119,8 @@ class WhatsAppRuntimeManager:
 
         package_bridge = Path(__file__).resolve().parents[1] / "bridge"
         repo_bridge = Path(__file__).resolve().parents[2] / "bridge"
-        for candidate in (package_bridge, repo_bridge):
+        monorepo_bridge = Path(__file__).resolve().parents[3] / "bridge"
+        for candidate in (package_bridge, repo_bridge, monorepo_bridge):
             if (candidate / "package.json").exists() and (candidate / MANIFEST_FILENAME).exists():
                 return candidate
         raise RuntimeError("Bridge source not found. Install yeoman with packaged bridge artifacts.")
