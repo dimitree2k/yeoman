@@ -2,8 +2,8 @@ import time
 
 import pytest
 
-from yeoman.agent.tools.web import _validate_domain, _WebRateLimiter
-from yeoman.config.schema import WebToolsConfig
+from yeoman_gateway.agent.tools.web import _validate_domain, _WebRateLimiter
+from yeoman_shared.config.schema import WebToolsConfig
 
 
 def test_web_tools_config_defaults():
@@ -87,7 +87,7 @@ def test_validate_domain_allowed_subdomain():
 
 @pytest.mark.asyncio
 async def test_async_validate_dns_private():
-    from yeoman.agent.tools.web import _async_validate_dns
+    from yeoman_gateway.agent.tools.web import _async_validate_dns
 
     with pytest.raises(ValueError, match="private"):
         await _async_validate_dns("localhost")
@@ -95,7 +95,7 @@ async def test_async_validate_dns_private():
 
 @pytest.mark.asyncio
 async def test_async_validate_dns_no_resolve():
-    from yeoman.agent.tools.web import _async_validate_dns
+    from yeoman_gateway.agent.tools.web import _async_validate_dns
 
     with pytest.raises(ValueError):
         await _async_validate_dns("this-domain-does-not-exist-xyz123.invalid")
@@ -106,7 +106,7 @@ async def test_async_validate_dns_no_resolve():
 
 @pytest.mark.asyncio
 async def test_web_fetch_respects_max_fetch_bytes():
-    from yeoman.agent.tools.web import WebFetchTool
+    from yeoman_gateway.agent.tools.web import WebFetchTool
 
     cfg = WebToolsConfig(max_fetch_bytes=500)
     tool = WebFetchTool(api_key="", web_config=cfg)
@@ -114,7 +114,7 @@ async def test_web_fetch_respects_max_fetch_bytes():
 
 
 def test_web_fetch_content_type_check():
-    from yeoman.agent.tools.web import WebFetchTool
+    from yeoman_gateway.agent.tools.web import WebFetchTool
 
     cfg = WebToolsConfig()
     tool = WebFetchTool(api_key="", web_config=cfg)
@@ -132,7 +132,7 @@ def test_web_fetch_content_type_check():
 async def test_web_fetch_rate_limited():
     import json as _json
 
-    from yeoman.agent.tools.web import WebFetchTool, _rate_limiter
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
 
     cfg = WebToolsConfig(rate_limit_rpm=1)
     tool = WebFetchTool(api_key="", web_config=cfg)
@@ -156,7 +156,7 @@ async def test_web_fetch_full_hardening_integration():
     """Verify all hardening measures work together."""
     import json as _json
 
-    from yeoman.agent.tools.web import WebFetchTool, _rate_limiter
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
 
     _rate_limiter._timestamps.clear()
     _rate_limiter.configure(100)

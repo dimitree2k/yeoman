@@ -6,11 +6,11 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from yeoman.adapters.policy_engine import EnginePolicyAdapter
-from yeoman.core.admin_commands import AdminCommandContext
-from yeoman.memory.models import MemoryEntry
-from yeoman.memory.service import MemoryService
-from yeoman.config.schema import Config
+from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+from yeoman_gateway.core.admin_commands import AdminCommandContext
+from yeoman_gateway.memory.models import MemoryEntry
+from yeoman_gateway.memory.service import MemoryService
+from yeoman_shared.config.schema import Config
 
 
 def _ctx(raw_text: str) -> AdminCommandContext:
@@ -31,7 +31,7 @@ def _make_memory_service(tmp_path: Path) -> MemoryService:
     config.memory.enabled = True
     config.memory.capture.enabled = False
     config.memory.db_path = str(tmp_path / "memory.db")
-    with patch("yeoman.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
         return MemoryService(workspace=workspace, config=config.memory)
 
 

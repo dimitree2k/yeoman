@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from yeoman.contacts.service import ContactsService
+from yeoman_gateway.contacts.service import ContactsService
 
 
 @pytest.fixture
@@ -121,7 +121,7 @@ class TestContactsService:
 
 
 def test_upsert_field_delegates_to_store(tmp_path: Path) -> None:
-    from yeoman.contacts.service import ContactsService
+    from yeoman_gateway.contacts.service import ContactsService
     svc = ContactsService(db_path=tmp_path / "c.db")
     c = svc.store.create_contact(display_name="Frank")
     svc.upsert_field(contact_id=c.id, kind="person_profile", value="Frank: is a doctor")

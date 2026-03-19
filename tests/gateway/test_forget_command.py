@@ -5,8 +5,8 @@ import hashlib
 import uuid
 from unittest.mock import MagicMock
 
-from yeoman.core.admin_commands import AdminCommandContext, AdminCommandResult, AdminCommandRouter
-from yeoman.memory.models import MemoryEntry, MemoryHit
+from yeoman_gateway.core.admin_commands import AdminCommandContext, AdminCommandResult, AdminCommandRouter
+from yeoman_gateway.memory.models import MemoryEntry, MemoryHit
 
 
 def _ctx(raw_text: str, *, owner: bool = True) -> AdminCommandContext:
@@ -47,7 +47,7 @@ def _compute_hash(ids: list[str]) -> str:
 
 
 def _make_handler_and_router():
-    from yeoman.adapters.policy_engine import EnginePolicyAdapter, ForgetCommandHandler
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter, ForgetCommandHandler
 
     adapter = MagicMock(spec=EnginePolicyAdapter)
     adapter.forget_is_applicable.return_value = True

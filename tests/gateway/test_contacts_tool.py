@@ -3,8 +3,8 @@
 import pytest
 from pathlib import Path
 
-from yeoman.contacts.service import ContactsService
-from yeoman.agent.tools.contacts import ContactsTool
+from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.agent.tools.contacts import ContactsTool
 
 
 @pytest.fixture

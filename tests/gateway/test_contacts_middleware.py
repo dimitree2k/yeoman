@@ -4,11 +4,11 @@ import pytest
 from dataclasses import replace
 from pathlib import Path
 
-from yeoman.contacts.service import ContactsService
-from yeoman.core.models import ArchivedMessage, InboundEvent
-from yeoman.core.pipeline import PipelineContext
-from yeoman.pipeline.contacts import ContactsMiddleware
-from yeoman.pipeline.reply_context import ReplyContextMiddleware
+from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
+from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.pipeline.contacts import ContactsMiddleware
+from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 
 
 def _make_event(**overrides: object) -> InboundEvent:

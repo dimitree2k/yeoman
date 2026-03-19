@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from dataclasses import dataclass
-from yeoman.agent.subagent import SubagentManager
+from yeoman_gateway.agent.subagent import SubagentManager
 
 
 @dataclass

@@ -6,9 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from yeoman.config.schema import MemoryAclConfig, MemoryConfig
-from yeoman.memory.extractor import ExtractedCandidate
-from yeoman.memory.service import MemoryService
+from yeoman_shared.config.schema import MemoryAclConfig, MemoryConfig
+from yeoman_gateway.memory.extractor import ExtractedCandidate
+from yeoman_gateway.memory.service import MemoryService
 
 
 def _service(tmp_path: Path) -> MemoryService:

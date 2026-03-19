@@ -1,6 +1,6 @@
 # tests/test_session_tool_traces.py
 import pytest
-from yeoman.session.manager import Session
+from yeoman_gateway.session.manager import Session
 
 
 def test_session_stores_tool_call():

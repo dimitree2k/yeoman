@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from yeoman.contacts.store import ContactsStore
+from yeoman_gateway.contacts.store import ContactsStore
 
 
 @pytest.fixture

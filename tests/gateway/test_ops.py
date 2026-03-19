@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from yeoman.agent.tools.ops import OpsTool, _parse_loguru_line, _parse_time_spec
-from yeoman.agent.tools.ops_manage import OpsManageTool
+from yeoman_gateway.agent.tools.ops import OpsTool, _parse_loguru_line, _parse_time_spec
+from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
 
 
 @pytest.mark.asyncio
@@ -105,7 +105,7 @@ async def test_log_scan_missing_service():
 @pytest.mark.asyncio
 async def test_log_scan_missing_log_file(tmp_path):
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", tmp_path / "nonexistent.log"):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", tmp_path / "nonexistent.log"):
         result = await tool.execute(action="log_scan", service="gateway")
     assert "No log file found" in result
 
@@ -120,7 +120,7 @@ async def test_log_scan_filters_by_level(tmp_path):
         "2026-03-13 10:00:03.000 | ERROR    | mod:fn:4 - error line\n"
     )
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
             action="log_scan",
             service="gateway",
@@ -141,7 +141,7 @@ async def test_log_scan_filters_by_keyword(tmp_path):
         "2026-03-13 10:00:01.000 | ERROR    | mod:fn:2 - disk full\n"
     )
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
             action="log_scan",
             service="gateway",
@@ -161,7 +161,7 @@ async def test_log_scan_respects_limit(tmp_path):
     ]
     log_file.write_text("".join(lines))
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
             action="log_scan",
             service="gateway",
@@ -180,7 +180,7 @@ async def test_log_scan_wraps_output_with_untrusted_header(tmp_path):
         "2026-03-13 10:00:00.000 | ERROR    | mod:fn:1 - test error\n"
     )
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
             action="log_scan",
             service="gateway",
@@ -202,7 +202,7 @@ async def test_log_scan_bridge_keyword_filter(tmp_path):
         "connection error: auth failed\n"
     )
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._BRIDGE_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._BRIDGE_LOG", log_file):
         result = await tool.execute(
             action="log_scan", service="bridge", keyword="auth", since="1d"
         )
@@ -219,7 +219,7 @@ async def test_log_scan_filters_by_time_range(tmp_path):
         "2026-03-13 11:30:00.000 | ERROR    | mod:fn:3 - very recent error\n"
     )
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
             action="log_scan",
             service="gateway",
@@ -238,8 +238,8 @@ async def test_log_scan_filters_by_time_range(tmp_path):
 @pytest.mark.asyncio
 async def test_service_status_all_reports_both(tmp_path):
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_PID", tmp_path / "gw.pid"), \
-         patch("yeoman.agent.tools.ops._BRIDGE_PID", tmp_path / "br.pid"):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", tmp_path / "gw.pid"), \
+         patch("yeoman_gateway.agent.tools.ops._BRIDGE_PID", tmp_path / "br.pid"):
         result = await tool.execute(action="service_status", service="all")
     assert "gateway" in result.lower()
     assert "bridge" in result.lower()
@@ -248,7 +248,7 @@ async def test_service_status_all_reports_both(tmp_path):
 @pytest.mark.asyncio
 async def test_service_status_stopped_no_pid_file(tmp_path):
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", tmp_path / "nonexistent.pid"):
         result = await tool.execute(action="service_status", service="gateway")
     assert "stopped" in result.lower()
 
@@ -258,8 +258,8 @@ async def test_service_status_stale_pid(tmp_path):
     pid_file = tmp_path / "gateway.pid"
     pid_file.write_text("999999")
     tool = OpsTool()
-    with patch("yeoman.agent.tools.ops._GATEWAY_PID", pid_file), \
-         patch("yeoman.agent.tools.ops.pid_alive", return_value=False):
+    with patch("yeoman_gateway.agent.tools.ops._GATEWAY_PID", pid_file), \
+         patch("yeoman_gateway.agent.tools.ops.pid_alive", return_value=False):
         result = await tool.execute(action="service_status", service="gateway")
     assert "stale" in result.lower() or "stopped" in result.lower()
 
@@ -270,8 +270,8 @@ async def test_service_status_stale_pid(tmp_path):
 def _mock_service_running():
     """Returns two context managers to mock a service as running."""
     return (
-        patch("yeoman.agent.tools.ops_manage.read_pid_file", return_value=12345),
-        patch("yeoman.agent.tools.ops_manage.pid_alive", return_value=True),
+        patch("yeoman_gateway.agent.tools.ops_manage.read_pid_file", return_value=12345),
+        patch("yeoman_gateway.agent.tools.ops_manage.pid_alive", return_value=True),
     )
 
 
@@ -360,7 +360,7 @@ async def test_ops_manage_confirm_happy_path():
 async def test_ops_manage_stop_already_stopped():
     tool = OpsManageTool()
     tool.set_context("whatsapp", "owner-chat-id")
-    with patch("yeoman.agent.tools.ops_manage.read_pid_file", return_value=None):
+    with patch("yeoman_gateway.agent.tools.ops_manage.read_pid_file", return_value=None):
         result = await tool.execute(action="stop", service="bridge")
     assert "not running" in result.lower()
 

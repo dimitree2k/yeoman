@@ -1,6 +1,6 @@
 """Tests for contacts disclosure policy field."""
 
-from yeoman.policy.schema import ChatPolicy, ChatPolicyOverride
+from yeoman_gateway.policy.schema import ChatPolicy, ChatPolicyOverride
 
 
 class TestContactsDisclosurePolicy:

@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from yeoman.agent.tools.calendar import CalendarTool
-from yeoman.caldav.types import CalendarInfo, EventInfo
+from yeoman_gateway.agent.tools.calendar import CalendarTool
+from yeoman_gateway.caldav.types import CalendarInfo, EventInfo
 
 
 @pytest.fixture

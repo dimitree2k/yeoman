@@ -1,6 +1,6 @@
 """Tests for contacts domain models."""
 
-from yeoman.contacts.models import Contact, ContactIdentifier, ContactAlias, ContactField
+from yeoman_gateway.contacts.models import Contact, ContactIdentifier, ContactAlias, ContactField
 
 
 class TestContactModels:

@@ -4,8 +4,8 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from yeoman.memory.models import MemoryEntry
-from yeoman.memory.store import MemoryStore
+from yeoman_gateway.memory.models import MemoryEntry
+from yeoman_gateway.memory.store import MemoryStore
 
 
 def _make_entry(workspace_id: str = "ws1", scope_key: str = "test:scope") -> MemoryEntry:

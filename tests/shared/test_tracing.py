@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from yeoman.telemetry import tracing
+from yeoman_shared.telemetry import tracing
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -282,7 +282,7 @@ class TestFlush:
         assert tracing._client is not None
         with (
             patch.object(tracing._client, "post", new_callable=AsyncMock, return_value=mock_response),
-            patch("yeoman.telemetry.tracing.logger") as mock_logger,
+            patch("yeoman_shared.telemetry.tracing.logger") as mock_logger,
         ):
             await tracing.flush()
             mock_logger.warning.assert_called()
@@ -302,7 +302,7 @@ class TestFlush:
                 new_callable=AsyncMock,
                 side_effect=httpx.ConnectError("connection refused"),
             ),
-            patch("yeoman.telemetry.tracing.logger") as mock_logger,
+            patch("yeoman_shared.telemetry.tracing.logger") as mock_logger,
         ):
             # Must not raise.
             await tracing.flush()

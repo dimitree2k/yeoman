@@ -3,11 +3,11 @@
 import pytest
 from pathlib import Path
 
-from yeoman.contacts.service import ContactsService
-from yeoman.core.models import InboundEvent
-from yeoman.core.pipeline import PipelineContext
-from yeoman.core.intents import SendOutboundIntent
-from yeoman.pipeline.outbound import OutboundMiddleware
+from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.core.models import InboundEvent
+from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.core.intents import SendOutboundIntent
+from yeoman_gateway.pipeline.outbound import OutboundMiddleware
 
 
 def _make_event(**overrides: object) -> InboundEvent:

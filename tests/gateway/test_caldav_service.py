@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 import icalendar
 import pytest
 
-from yeoman.caldav.service import CalDAVService
-from yeoman.caldav.types import CalendarInfo
+from yeoman_gateway.caldav.service import CalDAVService
+from yeoman_gateway.caldav.types import CalendarInfo
 
 
 SAMPLE_ICAL = """BEGIN:VCALENDAR
