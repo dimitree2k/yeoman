@@ -1,0 +1,42 @@
+[project]
+name = "yeoman-gateway"
+version = "0.6.0"
+description = "Yeoman gateway — message processing and agent runtime"
+requires-python = ">=3.14"
+dependencies = [
+    "yeoman-shared",
+    "typer>=0.24.1",
+    "litellm>=1.82.0",
+    "websockets>=16.0",
+    "websocket-client>=1.9.0",
+    "httpx[socks]>=0.28.1",
+    "croniter>=6.0.0",
+    "python-telegram-bot[socks]>=22.6",
+    "pyyaml>=6.0.2",
+    "python-dotenv>=1.1.0",
+    "readability-lxml>=0.8.4.1",
+    "rich>=14.3.3",
+    "lark-oapi>=1.5.3",
+    "socksio>=1.0.0",
+    "youtube-transcript-api>=1.2.4",
+    "caldav>=3.0.1",
+    "icalendar>=7.0.3",
+]
+
+[tool.uv.sources]
+yeoman-shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel.force-include]
+"../bridge" = "yeoman_gateway/bridge"
+
+[tool.hatch.build]
+include = [
+    "yeoman_gateway/**/*.py",
+    "yeoman_gateway/skills/**/*.md",
+    "yeoman_gateway/skills/**/*.py",
+    "yeoman_gateway/skills/**/*.sh",
+]
