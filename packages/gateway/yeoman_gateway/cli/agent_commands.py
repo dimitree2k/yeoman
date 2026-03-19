@@ -6,7 +6,7 @@ import asyncio
 
 import typer
 
-from yeoman import __logo__
+from yeoman_gateway import __logo__
 
 from .core import app, console, make_memory_service, make_provider
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from yeoman import __logo__, __version__
+from yeoman_gateway import __logo__, __version__
 
 app = typer.Typer(
     name="yeoman",

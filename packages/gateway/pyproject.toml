@@ -23,6 +23,9 @@ dependencies = [
     "icalendar>=7.0.3",
 ]
 
+[project.scripts]
+yeoman = "yeoman_gateway.__main__:main"
+
 [tool.uv.sources]
 yeoman-shared = { workspace = true }
 

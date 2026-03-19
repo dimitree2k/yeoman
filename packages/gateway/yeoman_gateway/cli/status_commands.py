@@ -6,7 +6,7 @@ from pathlib import Path
 
 import typer
 
-from yeoman import __logo__
+from yeoman_gateway import __logo__
 
 from .channel_commands import _bridge_log_path
 from .core import app, console

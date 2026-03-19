@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from yeoman import __logo__
+from yeoman_gateway import __logo__
 from yeoman_shared.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
 
 from .core import app, console, make_policy_engine, make_provider

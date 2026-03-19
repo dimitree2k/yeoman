@@ -8,7 +8,7 @@ from pathlib import Path
 import typer
 from rich.table import Table
 
-from yeoman import __logo__
+from yeoman_gateway import __logo__
 
 from .core import app, console
 from .gateway_commands import _find_gateway_pids, _start_gateway_daemon, _stop_gateway_processes
