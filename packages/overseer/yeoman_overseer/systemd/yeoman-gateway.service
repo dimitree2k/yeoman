@@ -1,0 +1,23 @@
+[Unit]
+Description=Yeoman Gateway — message processing service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yeoman gateway start --foreground
+Restart=always
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+MemoryMax=512M
+
+BindPaths=%h/.yeoman
+ReadOnlyPaths=%h/Documents/yeoman
+
+Environment=YEOMAN_HOME=%h/.yeoman
+
+[Install]
+WantedBy=default.target

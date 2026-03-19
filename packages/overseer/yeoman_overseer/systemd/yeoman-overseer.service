@@ -1,0 +1,29 @@
+[Unit]
+Description=Yeoman Overseer — autonomous orchestration layer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yeoman overseer start --foreground
+Restart=always
+StartLimitBurst=5
+StartLimitIntervalSec=300
+WatchdogSec=60
+OnFailure=yeoman-overseer-alert.service
+
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+MemoryMax=512M
+CPUQuota=80%
+
+BindPaths=%h/.yeoman
+ReadOnlyPaths=%h/Documents/yeoman
+
+Environment=YEOMAN_HOME=%h/.yeoman
+
+[Install]
+WantedBy=default.target

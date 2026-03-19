@@ -1,0 +1,25 @@
+[Unit]
+Description=Yeoman WhatsApp Bridge — Baileys WebSocket bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.yeoman/var/cache/bridge/dist/server.js
+Restart=always
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+MemoryMax=256M
+
+BindPaths=%h/.yeoman/var/cache/bridge
+BindPaths=%h/.yeoman/secrets/whatsapp-auth
+ReadOnlyPaths=%h/.yeoman/var/run
+
+Environment=YEOMAN_HOME=%h/.yeoman
+WorkingDirectory=%h/.yeoman/var/cache/bridge
+
+[Install]
+WantedBy=default.target

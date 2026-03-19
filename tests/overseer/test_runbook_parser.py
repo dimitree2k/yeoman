@@ -1,0 +1,71 @@
+"""Tests for runbook Markdown+YAML parser."""
+from __future__ import annotations
+from pathlib import Path
+from textwrap import dedent
+import pytest
+from yeoman_overseer.runbook.parser import parse_runbook, parse_runbook_dir, Runbook
+
+SAMPLE_RUNBOOK = dedent("""\
+    ---
+    name: gateway-health
+    domain: health
+    enabled: true
+    version: 1
+    trigger:
+      kind: poll
+      interval_s: 30
+      condition:
+        check: process_alive
+        target: yeoman-gateway
+        operator: "=="
+        value: true
+    escalate_to_llm: false
+    safety:
+      max_actions_per_hour: 10
+      rollback: true
+      cooldown_s: 300
+    ---
+    # Gateway Health
+    ## Context
+    The gateway is the core message processing service.
+    ## Actions
+    1. Check if process is alive via PID file
+    2. If dead: restart via systemctl
+    ## Escalation
+    After 3 failed restarts, alert owner.
+""")
+
+def test_parse_valid_runbook(tmp_path: Path) -> None:
+    f = tmp_path / "health-gateway.md"
+    f.write_text(SAMPLE_RUNBOOK)
+    rb = parse_runbook(f)
+    assert rb.meta.name == "gateway-health"
+    assert rb.meta.domain == "health"
+    assert rb.meta.trigger.kind == "poll"
+    assert rb.body.startswith("# Gateway Health")
+    assert rb.path == f
+
+def test_parse_missing_frontmatter(tmp_path: Path) -> None:
+    f = tmp_path / "bad.md"
+    f.write_text("# No frontmatter here\nJust plain markdown.")
+    with pytest.raises(ValueError, match="frontmatter"):
+        parse_runbook(f)
+
+def test_parse_invalid_yaml(tmp_path: Path) -> None:
+    f = tmp_path / "bad.md"
+    f.write_text("---\nname: [invalid yaml\n---\n# Body")
+    with pytest.raises(ValueError, match="YAML|parse"):
+        parse_runbook(f)
+
+def test_parse_runbook_dir(tmp_path: Path) -> None:
+    (tmp_path / "a.md").write_text(SAMPLE_RUNBOOK)
+    disabled = SAMPLE_RUNBOOK.replace("enabled: true", "enabled: false")
+    (tmp_path / "b.md").write_text(disabled)
+    (tmp_path / "not-a-runbook.txt").write_text("ignore me")
+    runbooks = parse_runbook_dir(tmp_path)
+    assert len(runbooks) == 2
+    names = {rb.meta.name for rb in runbooks}
+    assert "gateway-health" in names
+
+def test_parse_runbook_dir_empty(tmp_path: Path) -> None:
+    assert parse_runbook_dir(tmp_path) == []
