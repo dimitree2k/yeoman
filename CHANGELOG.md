@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.6.0 — Mar 2026
+
+### Memory & Contacts
+- Added contact-scope memory recall with `reply_to_jid` support and person-profile routing.
+- Added soft-delete support to the memory store and `forget()` / `forget_confirm()` flows in `MemoryService`.
+- Added `upsert_field` support in the contacts service and store, plus merge/dedupe fixes.
+
+### Admin & Ops
+- Added `/forget` for preview-confirm memory deletion from admin flows.
+- Added `OpsTool` with `system_stats`, `log_scan`, and `service_status` actions.
+- Added `OpsManageTool` with a 4-digit confirmation flow for guarded management actions.
+- Bundled the new ops skill and CLI command reference updates.
+- Removed the legacy `pi_stats` tool in favor of the new ops tooling.
+
+### Security & Web
+- Hardened the web tool with DNS pinning, rate limiting, content-type filtering, streaming size guards, and audit logging.
+- Wired `WebToolsConfig` through all web tool registration sites.
+- Skipped LLM security classification for owner private DMs.
+
+### Tests
+- Added coverage for ops tooling, web hardening, memory forget flows, person-profile extraction, contacts updates, and `/forget` integration.
+
+### Docs
+- Added ops tool and `/forget` design/spec documents.
+- Removed obsolete completed planning docs from `plans/`.
+
 ## v0.5.0 — Mar 2026
 
 ### Contacts CRM

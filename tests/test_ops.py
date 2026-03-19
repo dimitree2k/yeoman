@@ -122,7 +122,10 @@ async def test_log_scan_filters_by_level(tmp_path):
     tool = OpsTool()
     with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
-            action="log_scan", service="gateway", level="warning", since="1d"
+            action="log_scan",
+            service="gateway",
+            level="warning",
+            since="2026-03-13 00:00",
         )
     assert "warning line" in result
     assert "error line" in result
@@ -140,7 +143,10 @@ async def test_log_scan_filters_by_keyword(tmp_path):
     tool = OpsTool()
     with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
-            action="log_scan", service="gateway", keyword="connection", since="1d"
+            action="log_scan",
+            service="gateway",
+            keyword="connection",
+            since="2026-03-13 00:00",
         )
     assert "connection refused" in result
     assert "disk full" not in result
@@ -157,7 +163,11 @@ async def test_log_scan_respects_limit(tmp_path):
     tool = OpsTool()
     with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
-            action="log_scan", service="gateway", level="error", since="1d", limit=5
+            action="log_scan",
+            service="gateway",
+            level="error",
+            since="2026-03-13 00:00",
+            limit=5,
         )
     log_lines = [line for line in result.splitlines() if "error " in line]
     assert len(log_lines) == 5
@@ -172,7 +182,10 @@ async def test_log_scan_wraps_output_with_untrusted_header(tmp_path):
     tool = OpsTool()
     with patch("yeoman.agent.tools.ops._GATEWAY_LOG", log_file):
         result = await tool.execute(
-            action="log_scan", service="gateway", level="error", since="1d"
+            action="log_scan",
+            service="gateway",
+            level="error",
+            since="2026-03-13 00:00",
         )
     assert "[LOG OUTPUT" in result
     assert "untrusted" in result.lower()
