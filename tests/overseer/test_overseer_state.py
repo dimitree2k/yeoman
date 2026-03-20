@@ -9,7 +9,10 @@ def test_load_creates_default(tmp_path: Path) -> None:
     assert state.locks == {}
     assert state.circuit_breakers == {}
     assert state.maintenance == {}
-    assert state.budget == {"actions_hour": 0, "llm_daily": 0}
+    assert state.budget == {
+        "actions_hour": 0, "llm_daily": 0,
+        "tokens_daily": 0, "budget_reset_date": "",
+    }
 
 def test_save_and_reload(tmp_path: Path) -> None:
     path = tmp_path / "state.json"

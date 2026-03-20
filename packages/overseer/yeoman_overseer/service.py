@@ -30,6 +30,7 @@ class OverseerConfig:
     tick_interval_s: float = 1.0
     actions_per_hour: int = 30
     llm_calls_per_day: int = 20
+    llm_tokens_per_day: int = 500_000
     failure_threshold: int = 3
     max_quarantines: int = 3
 

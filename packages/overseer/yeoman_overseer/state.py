@@ -16,8 +16,13 @@ class OverseerState:
     locks: dict[str, Any] = field(default_factory=dict)
     circuit_breakers: dict[str, Any] = field(default_factory=dict)
     maintenance: dict[str, Any] = field(default_factory=dict)
-    budget: dict[str, int] = field(
-        default_factory=lambda: {"actions_hour": 0, "llm_daily": 0}
+    budget: dict[str, Any] = field(
+        default_factory=lambda: {
+            "actions_hour": 0,
+            "llm_daily": 0,
+            "tokens_daily": 0,
+            "budget_reset_date": "",
+        }
     )
     action_log: list[dict[str, Any]] = field(default_factory=list)
     causal_graph: dict[str, Any] = field(default_factory=dict)
@@ -32,7 +37,10 @@ class OverseerState:
                 locks=raw.get("locks", {}),
                 circuit_breakers=raw.get("circuit_breakers", {}),
                 maintenance=raw.get("maintenance", {}),
-                budget=raw.get("budget", {"actions_hour": 0, "llm_daily": 0}),
+                budget=raw.get("budget", {
+                    "actions_hour": 0, "llm_daily": 0,
+                    "tokens_daily": 0, "budget_reset_date": "",
+                }),
                 action_log=raw.get("action_log", []),
                 causal_graph=raw.get("causal_graph", {}),
             )
