@@ -9,8 +9,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from yeoman_overseer.agent.budget import BudgetTracker
+from yeoman_overseer.agent.loop import AgentLoop, AgentResult, BudgetExhaustedError
+from yeoman_overseer.agent.tools import ToolContext
 from yeoman_overseer.audit.git import InternalGit
 from yeoman_overseer.audit.logger import AuditLogger, AuditEntry
+from yeoman_overseer.comms.cascading import CascadingComms
 from yeoman_overseer.maintenance import MaintenanceManager
 from yeoman_overseer.runbook.parser import Runbook, parse_runbook_dir
 from yeoman_overseer.safety.causal import CausalChainDetector
@@ -46,6 +50,8 @@ class OverseerService:
     _git: InternalGit | None = None
     _audit: AuditLogger | None = None
     _evaluator: TriggerEvaluator | None = None
+    _comms: CascadingComms | None = None
+    _agent_loop: AgentLoop | None = None
     _socket: OverseerSocket | None = None
     _running: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -99,6 +105,28 @@ class OverseerService:
             state=self._state,
         )
 
+        # Comms — no channels yet; local_log=True ensures alerts are never silently lost
+        self._comms = CascadingComms(channels=[], local_log=True)
+
+        # Load config for model profiles
+        import json as _json
+        config_path = self.data_dir.parent / "config.json"
+        raw_config = _json.loads(config_path.read_text()) if config_path.exists() else {}
+
+        tool_ctx = ToolContext(
+            yeoman_home=self.data_dir.parent,
+            source_dir=Path.home() / "Documents" / "yeoman",
+            audit=self._audit,
+            comms=self._comms,
+            data_dir=self.data_dir,
+        )
+        _budget = BudgetTracker(
+            self._state,
+            calls_per_day=self.config.llm_calls_per_day,
+            tokens_per_day=self.config.llm_tokens_per_day,
+        )
+        self._agent_loop = AgentLoop(tool_ctx=tool_ctx, budget=_budget, config=raw_config)
+
         self._socket = OverseerSocket(self.socket_path, stats_callback=self._get_stats)
 
     async def run(self) -> None:
@@ -148,6 +176,27 @@ class OverseerService:
     async def _on_runbook_triggered(self, runbook: Runbook, check_result: CheckResult) -> None:
         start = time.monotonic()
         logger.info("Runbook triggered: %s", runbook.meta.name)
+
+        escalated = False
+        result_str = "success"
+        llm_tokens = llm_calls = reasoning = None
+        llm_profile = None
+
+        if runbook.meta.escalate_to_llm and self._agent_loop:
+            try:
+                observations = {
+                    "check": check_result.value,
+                    "message": check_result.detail,
+                }
+                agent_result = await self._agent_loop.run(runbook, observations)
+                escalated = True
+                llm_tokens = agent_result.tokens_used
+                llm_calls = agent_result.tool_calls_made
+                reasoning = agent_result.summary[:500] if agent_result.summary else None
+                llm_profile = agent_result.llm_profile
+            except BudgetExhaustedError as exc:
+                result_str = f"budget_exhausted: {exc}"
+
         duration_ms = int((time.monotonic() - start) * 1000)
         if self._audit:
             self._audit.append(AuditEntry(
@@ -155,10 +204,14 @@ class OverseerService:
                 trigger=runbook.meta.trigger.kind,
                 action="triggered",
                 target=runbook.meta.trigger.condition.target if runbook.meta.trigger.condition else "",
-                result="success",
+                result=result_str,
                 duration_ms=duration_ms,
-                escalated_to_llm=False,
+                escalated_to_llm=escalated,
                 domain=runbook.meta.domain,
+                llm_tokens_used=llm_tokens,
+                llm_tool_calls=llm_calls,
+                llm_profile=llm_profile,
+                reasoning_summary=reasoning,
             ))
 
     def _get_stats(self) -> dict:
