@@ -19,6 +19,10 @@ class AuditEntry:
     escalated_to_llm: bool
     domain: str = ""
     budget_remaining: dict[str, int] | None = None
+    llm_tokens_used: int | None = None
+    llm_tool_calls: int | None = None
+    llm_profile: str | None = None
+    reasoning_summary: str | None = None
 
 
 @dataclass
@@ -69,7 +73,7 @@ class AuditLogger:
         with self._tombstone_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-    def query_tombstones(self, *, name: str | None = None) -> list[dict[str, Any]]:
+    def query_tombstones(self, *, name: str | None = None, domain: str | None = None) -> list[dict[str, Any]]:
         if not self._tombstone_path.exists():
             return []
         results: list[dict[str, Any]] = []
@@ -78,6 +82,8 @@ class AuditLogger:
                 continue
             entry = json.loads(line)
             if name and entry.get("name") != name:
+                continue
+            if domain and entry.get("domain") and entry["domain"] != domain:
                 continue
             results.append(entry)
         return results
