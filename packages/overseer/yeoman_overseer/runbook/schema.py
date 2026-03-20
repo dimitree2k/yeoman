@@ -54,8 +54,9 @@ class SafetyConfig(BaseModel):
 class LLMBudget(BaseModel):
     """Budget constraints for LLM-escalated runbooks."""
 
-    max_tokens: int = 4096
-    max_tool_calls: int = 10
+    max_tokens: int = 30_000
+    max_tool_calls: int = 100
+    llm_profile: str = "overseerDefault"
 
 
 class RunbookFrontmatter(BaseModel):

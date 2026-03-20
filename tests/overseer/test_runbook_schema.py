@@ -33,10 +33,12 @@ def test_safety_defaults() -> None:
     assert s.on_lock_conflict == "skip"
 
 def test_llm_budget_defaults() -> None:
-    fm = RunbookFrontmatter(name="test", domain="evolution", trigger=TriggerConfig(kind="cron", expr="0 3 * * 0"), escalate_to_llm=True, llm_budget=LLMBudget(max_tokens=4096, max_tool_calls=10))
+    fm = RunbookFrontmatter(name="test", domain="evolution", trigger=TriggerConfig(kind="cron", expr="0 3 * * 0"), escalate_to_llm=True, llm_budget=LLMBudget())
     assert fm.escalate_to_llm is True
     assert fm.llm_budget is not None
-    assert fm.llm_budget.max_tokens == 4096
+    assert fm.llm_budget.max_tokens == 30_000
+    assert fm.llm_budget.max_tool_calls == 100
+    assert fm.llm_budget.llm_profile == "overseerDefault"
 
 def test_operator_validation() -> None:
     c = TriggerCondition(check="disk_usage_above", target="/home", operator=">=", value=80)
