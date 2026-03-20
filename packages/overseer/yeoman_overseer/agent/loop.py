@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid as _uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -101,6 +102,12 @@ class AgentLoop:
         total_tokens = 0
         summary = ""
 
+        # requires_tests gate setup
+        requires_tests = getattr(runbook.meta.safety, 'requires_tests', False)
+        patcher = Patcher() if requires_tests else None
+        patch_ctx: PatchContext | None = None
+        run_id = _uuid.uuid4().hex[:12]
+
         while tool_calls_made <= llm_budget.max_tool_calls:
             remaining_tokens = llm_budget.max_tokens - total_tokens
             if remaining_tokens <= 0:
@@ -127,8 +134,22 @@ class AgentLoop:
                 for block in response.content:
                     if block.type == "tool_use":
                         tool_calls_made += 1
+                        tool_input = dict(block.input)  # copy so we can mutate
+
+                        # requires_tests gate: intercept write paths
+                        if requires_tests and block.name in ("write_file", "edit_file") and "path" in tool_input:
+                            if patch_ctx is None:
+                                patch_ctx = patcher.create_worktree(self._tool_ctx.source_dir, run_id)
+                            translated = _route_write_path(
+                                Path(tool_input["path"]).expanduser(),
+                                self._tool_ctx.source_dir,
+                                patch_ctx=patch_ctx,
+                                requires_tests=True,
+                            )
+                            tool_input["path"] = str(translated)
+
                         try:
-                            result = await dispatch(block.name, block.input, self._tool_ctx)
+                            result = await dispatch(block.name, tool_input, self._tool_ctx)
                         except Exception as exc:
                             result = f"ERROR: {exc}"
                         tool_results.append({
@@ -139,6 +160,13 @@ class AgentLoop:
                 messages.append({"role": "user", "content": tool_results})
             else:
                 break
+
+        # requires_tests gate: finalize patch
+        if patch_ctx is not None:
+            from yeoman_overseer.agent.tools.run_tests import run_tests as _run_tests
+            patch_result = _finalize_patch(patch_ctx, patcher, _run_tests, self._tool_ctx)
+            if not patch_result["patch_applied"]:
+                summary += f"\n[PATCH REJECTED: tests failed]\n{patch_result['test_output']}"
 
         self._budget.consume(total_tokens, 1)
 

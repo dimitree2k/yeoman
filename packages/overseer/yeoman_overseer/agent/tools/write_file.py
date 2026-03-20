@@ -28,7 +28,7 @@ def _is_allowed(path: Path, ctx: object) -> bool:
 
 def write_file(path: str, content: str, ctx: object) -> dict:
     """Write content to path. Returns {ok, path} or {ok: False, error}."""
-    target = Path(path)
+    target = Path(path).expanduser()
 
     if not _is_allowed(target, ctx):
         return {"ok": False, "error": f"path denied: {path}"}

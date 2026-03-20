@@ -33,6 +33,7 @@ class TombstoneEntry:
     reason: str
     runbook: str
     origin: str = "manual"
+    domain: str = ""
 
 
 class AuditLogger:

@@ -9,7 +9,7 @@ from yeoman_overseer.agent.tools.write_file import _is_allowed
 
 def edit_file(path: str, old_string: str, new_string: str, ctx: object) -> dict:
     """Replace old_string with new_string in path. Returns {ok, path} or {ok: False, error}."""
-    target = Path(path)
+    target = Path(path).expanduser()
 
     if not _is_allowed(target, ctx):
         return {"ok": False, "error": f"path denied: {path}"}

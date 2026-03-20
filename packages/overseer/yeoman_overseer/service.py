@@ -119,6 +119,9 @@ class OverseerService:
             audit=self._audit,
             comms=self._comms,
             data_dir=self.data_dir,
+            sandbox=self._create_sandbox(),
+            memory_db=self.data_dir / "memory" / "memory.db",
+            git=self._git,
         )
         _budget = BudgetTracker(
             self._state,
@@ -173,6 +176,18 @@ class OverseerService:
         self._state.save(self.data_dir / "state.json")
         logger.info("Overseer service stopped")
 
+    @staticmethod
+    def _create_sandbox():
+        """Try to create a Sandbox instance; return None if bwrap unavailable."""
+        from yeoman_overseer.agent.sandbox import Sandbox, SandboxUnavailableError
+        try:
+            sandbox = Sandbox()
+            sandbox._find_bwrap()
+            return sandbox
+        except SandboxUnavailableError:
+            logger.warning("bwrap not found — sandbox-dependent tools will be unavailable")
+            return None
+
     async def _on_runbook_triggered(self, runbook: Runbook, check_result: CheckResult) -> None:
         start = time.monotonic()
         logger.info("Runbook triggered: %s", runbook.meta.name)
@@ -183,6 +198,10 @@ class OverseerService:
         llm_profile = None
 
         if runbook.meta.escalate_to_llm and self._agent_loop:
+            # Set per-runbook context
+            self._agent_loop._tool_ctx.runbook_name = runbook.meta.name
+            self._agent_loop._tool_ctx.domain = runbook.meta.domain
+            self._agent_loop._tool_ctx.shell_timeout_s = runbook.meta.safety.shell_timeout_s
             try:
                 observations = {
                     "check": check_result.value,
