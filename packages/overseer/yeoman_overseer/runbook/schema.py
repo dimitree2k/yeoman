@@ -49,6 +49,7 @@ class SafetyConfig(BaseModel):
     cooldown_s: int = 300
     requires_tests: bool = False
     on_lock_conflict: Literal["queue", "skip"] = "skip"
+    shell_timeout_s: int = 60
 
 
 class LLMBudget(BaseModel):
