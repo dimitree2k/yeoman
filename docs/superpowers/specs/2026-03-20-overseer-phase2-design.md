@@ -98,14 +98,38 @@ Tracks daily token consumption and API call count across all LLM runbooks. `Budg
 
 ## Tool Set (Read-Only / Safe)
 
+### Summary
+
 | Tool | Safety | Behavior |
 |------|--------|----------|
-| `read_file` | read-only | Read any file under `~/.yeoman/` or `~/Documents/yeoman/`. Rejects paths outside these roots. |
-| `query_db` | read-only | Run `SELECT` on any SQLite DB. Rejects non-SELECT statements. |
+| `read_file` | read-only | Read files under `~/.yeoman/` or `~/Documents/yeoman/`. Explicit deny-list blocks secrets. |
+| `query_db` | read-only | Run SELECT on any SQLite DB via read-only URI connection. |
 | `query_memory` | read-only | Semantic search on `memory.db`. Returns formatted results. |
 | `check_health` | read-only | Delegates to `trigger/checks.py`. Returns structured check result. |
 | `git_log` | read-only | Inspect git history of source repo or internal overseer git. |
-| `send_alert` | safe | Send via `comms/cascading.py`. Audit-logged. No concurrent calls — dispatched sequentially within a single agent invocation. |
+| `send_alert` | safe | Send via `comms/cascading.py`. Audit-logged. Dispatched sequentially within a single agent invocation. |
+
+### `read_file` — security detail
+
+Path validation enforces two layers:
+
+1. **Root allowlist:** path must resolve under `~/.yeoman/` or `~/Documents/yeoman/`. Symlink traversal and `..` sequences are resolved before checking.
+2. **Explicit deny-list:** even within the allowed roots, the following are rejected:
+   - Any path containing `.env` as a path component (e.g., `~/.yeoman/.env`)
+   - Any path under `secrets/` (e.g., `~/.yeoman/secrets/`)
+   - Any path under `.git/` (prevents reading credential files or hooks)
+
+Rationale: a poisoned observation could instruct the LLM to read `.env` and exfiltrate secrets via `send_alert` or the audit log. The deny-list makes this architecturally impossible regardless of the LLM's instructions.
+
+### `query_db` — security detail
+
+Connects using SQLite's read-only URI mode:
+
+```python
+sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+```
+
+This enforces read-only access at the SQLite engine level — the file descriptor is opened with `O_RDONLY`. No application-level SQL parsing or `SELECT`-prefix checking is needed or used. Attempts to write, modify the schema, or run `PRAGMA writable_schema=ON` fail at the engine before any query executes. CTE-wrapped mutations and comment-obfuscated statements are equally blocked.
 
 ---
 
@@ -180,8 +204,8 @@ Shipped with Phase 2 into `packages/overseer/yeoman_overseer/starter_runbooks/` 
 | `test_agent_context.py` | Audit log slicing, domain-filtered tombstone injection, system state formatting |
 | `test_agent_loop.py` | Tool dispatch, hard limit enforcement, budget abort, `AgentResult` structure |
 | `test_agent_budget.py` | 80%/100% thresholds, date-based midnight reset, `state.json` persistence |
-| `test_tool_read_file.py` | Path traversal rejection, valid reads |
-| `test_tool_query_db.py` | SELECT-only enforcement, non-SELECT rejection |
+| `test_tool_read_file.py` | Path traversal rejection, root allowlist, deny-list (`.env`, `secrets/`, `.git/`) |
+| `test_tool_query_db.py` | Read-only URI connection, write attempt rejected at engine level |
 | `test_tool_query_memory.py` | Semantic search result formatting |
 | `test_tool_check_health.py` | Correct delegation to `trigger/checks.py` |
 | `test_tool_git_log.py` | Log parsing, empty repo handling |
@@ -200,4 +224,5 @@ Shipped with Phase 2 into `packages/overseer/yeoman_overseer/starter_runbooks/` 
 - Cryptographic runbook signing — Phase 4
 - Owner signature workflow — Phase 4
 - Event bus triggers — Phase 4
-- A2A protocol integration — future consideration
+
+See `docs/superpowers/specs/future-considerations.md` for deferred architectural items (Workspace Pattern, typed DB APIs, ephemeral DB replica, A2A).
