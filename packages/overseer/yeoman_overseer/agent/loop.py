@@ -3,16 +3,52 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from anthropic import Anthropic
 
 from yeoman_overseer.agent.context import build_context
+from yeoman_overseer.agent.patcher import Patcher, PatchContext
 from yeoman_overseer.agent.tools import TOOL_DEFINITIONS, ToolContext, dispatch
 
 if TYPE_CHECKING:
     from yeoman_overseer.agent.budget import BudgetTracker
     from yeoman_overseer.runbook.parser import Runbook
+
+
+def _route_write_path(
+    original: Path,
+    source_dir: Path,
+    *,
+    patch_ctx: PatchContext | None,
+    requires_tests: bool,
+) -> Path:
+    """Return worktree-translated path if requires_tests gate is active, else original."""
+    if not requires_tests or patch_ctx is None:
+        return original
+    try:
+        original.resolve().relative_to(source_dir.resolve())
+    except ValueError:
+        return original  # Not under source_dir — no translation needed
+    patcher = Patcher()
+    return patcher.translate_path(patch_ctx, original)
+
+
+def _finalize_patch(
+    patch_ctx: PatchContext,
+    patcher: Patcher,
+    run_tests_fn: Any,
+    ctx: object,
+) -> dict:
+    """Run tests against worktree; apply on pass, discard on fail."""
+    test_result = run_tests_fn(source_root=patch_ctx.worktree_path, ctx=ctx)
+    if test_result["passed"]:
+        patcher.apply(patch_ctx)
+        return {"patch_applied": True, "test_output": test_result["output"]}
+    else:
+        patcher.discard(patch_ctx)
+        return {"patch_applied": False, "test_output": test_result["output"]}
 
 
 class BudgetExhaustedError(Exception):
