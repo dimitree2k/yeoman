@@ -14,6 +14,7 @@ from . import memory_commands as _memory_commands  # noqa: F401
 from . import policy_commands as _policy_commands  # noqa: F401
 from . import status_commands as _status_commands  # noqa: F401
 from . import overseer_commands as _overseer_commands  # noqa: F401
+from . import deploy_commands as _deploy_commands  # noqa: F401
 from .core import app, console
 from .gateway_commands import _stop_gateway_processes
 
