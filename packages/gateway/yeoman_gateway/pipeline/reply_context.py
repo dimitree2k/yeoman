@@ -166,11 +166,9 @@ class ReplyContextMiddleware:
 
     def _resolve_speaker(self, row: ArchivedMessage) -> str:
         if self._contacts is not None and row.sender_id:
-            contact_id = self._contacts.known_jids.get(row.sender_id)
-            if contact_id:
-                name = self._contacts.get_display_name(contact_id)
-                if name:
-                    return name
+            name = self._contacts.resolve_jid_to_name(row.sender_id)
+            if name:
+                return name
         return (
             row.sender_name or row.sender_id or row.participant or "unknown"
         ).strip() or "unknown"
