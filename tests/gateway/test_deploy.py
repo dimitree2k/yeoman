@@ -115,3 +115,19 @@ class TestFindSourceRepo:
 
         monkeypatch.setenv("YEOMAN_SOURCE_DIR", str(tmp_path / "nonexistent"))
         assert find_source_repo() is None
+
+
+import os
+import subprocess
+
+
+def test_deploy_dry_run_exits_zero() -> None:
+    """Integration test: yeoman deploy --dry-run should succeed."""
+    result = subprocess.run(
+        ["yeoman", "deploy", "--dry-run"],
+        capture_output=True,
+        text=True,
+        cwd=str(Path.home() / "Documents" / "yeoman"),
+        env={**os.environ, "YEOMAN_SOURCE_DIR": str(Path.home() / "Documents" / "yeoman")},
+    )
+    assert result.returncode == 0, f"deploy --dry-run failed:\n{result.stderr}"

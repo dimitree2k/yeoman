@@ -146,20 +146,32 @@ def _restart_running_services() -> None:
 
         console.print(f"  Restarting {name}...")
         if name == "overseer":
+            # Overseer start blocks (asyncio.run), so stop + re-launch as daemon
             subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, check=False)
-            result = subprocess.run(
-                [yeoman_bin, "overseer", "start"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            import time
+            time.sleep(0.5)
+            log_path = get_run_path().parent / "logs" / "overseer.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as log_file:
+                proc = subprocess.Popen(
+                    [yeoman_bin, "overseer", "start"],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            # Brief check that it didn't immediately crash
+            time.sleep(1.0)
+            if proc.poll() is not None:
+                console.print(f"  {name}: [red]restart failed[/red] (exited immediately)")
+            else:
+                console.print(f"  {name}: restarted (PID {proc.pid})")
         else:
             result = subprocess.run(restart_cmd, capture_output=True, text=True)
-
-        if result.returncode == 0:
-            console.print(f"  {name}: restarted")
-        else:
-            console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
+            if result.returncode == 0:
+                console.print(f"  {name}: restarted")
+            else:
+                console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
 
 
 def _report_running_services() -> None:
