@@ -61,6 +61,12 @@ class InboundArchive:
                 ON inbound_messages (channel, chat_id, created_at)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_inbound_messages_chat_timestamp
+                ON inbound_messages (channel, chat_id, timestamp)
+                """
+            )
             # Migrate: add sender_name column if missing (existing DBs).
             try:
                 self._conn.execute(
@@ -220,6 +226,61 @@ class InboundArchive:
                     """,
                     (str(channel), str(chat_id), anchor_created_at, effective_limit),
                 ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def lookup_messages_in_range(
+        self,
+        channel: str,
+        chat_id: str,
+        since: datetime,
+        until: datetime | None = None,
+        *,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        """Return messages between two timestamps, oldest first.
+
+        *since* and *until* are UTC datetimes.  *until* defaults to now.
+        Hard cap at 300 rows.
+        """
+        if not channel or not chat_id:
+            return []
+        effective_limit = max(1, min(int(limit), 300))
+        since_epoch = int(since.timestamp())
+        until_dt = until or datetime.now(UTC)
+        until_epoch = int(until_dt.timestamp())
+        since_iso = since.isoformat()
+        until_iso = until_dt.isoformat()
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT channel, chat_id, message_id, participant, sender_id,
+                       text, timestamp, created_at, sender_name
+                FROM inbound_messages
+                WHERE channel = ? AND chat_id = ?
+                  AND (
+                    (timestamp IS NOT NULL AND timestamp >= ? AND timestamp <= ?)
+                    OR
+                    (timestamp IS NULL AND created_at >= ? AND created_at <= ?)
+                  )
+                ORDER BY
+                    CASE WHEN timestamp IS NOT NULL THEN timestamp
+                         ELSE CAST(strftime('%s', created_at) AS INTEGER)
+                    END ASC,
+                    created_at ASC
+                LIMIT ?
+                """,
+                (
+                    str(channel),
+                    str(chat_id),
+                    since_epoch,
+                    until_epoch,
+                    since_iso,
+                    until_iso,
+                    effective_limit,
+                ),
+            ).fetchall()
 
         return [dict(row) for row in rows]
 

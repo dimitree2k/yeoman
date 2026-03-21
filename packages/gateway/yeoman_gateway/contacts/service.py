@@ -107,6 +107,13 @@ class ContactsService:
         self._display_names[contact_id] = contact.display_name
         return contact.display_name
 
+    def resolve_jid_to_name(self, jid: str) -> str | None:
+        """Resolve a JID or bare token to a display name via cache."""
+        contact_id = self.known_jids.get(jid)
+        if contact_id:
+            return self.get_display_name(contact_id)
+        return None
+
     # ── name resolution ───────────────────────────────────────────────────
 
     def resolve_name_to_jid(
