@@ -54,10 +54,21 @@ def _expand_channel_aliases(channel: str, token: str) -> set[str]:
     return aliases
 
 
-def normalize_sender_list(channel: str, values: list[str]) -> frozenset[str]:
-    """Normalize policy sender list entries."""
+def normalize_sender_list(
+    channel: str,
+    values: list[str],
+    owner_senders: frozenset[str] | None = None,
+) -> frozenset[str]:
+    """Normalize policy sender list entries.
+
+    The special token ``$owner`` expands to all owner identifiers for the
+    channel when *owner_senders* is provided.
+    """
     normalized: set[str] = set()
     for value in values:
+        if value.strip().lower() == "$owner" and owner_senders is not None:
+            normalized.update(owner_senders)
+            continue
         token = normalize_identity_token(value)
         normalized.update(_expand_channel_aliases(channel, token))
     return frozenset(normalized)

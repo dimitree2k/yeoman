@@ -240,6 +240,34 @@ Adding a new provider requires only 2 changes: a `ProviderSpec` in `providers/re
 | **Scoped file grants** | Explicit path grants with blocked paths/patterns override |
 | **I/O validation** | Three-stage security middleware: input → tool → output checks with sensitive data redaction |
 
+## Overseer
+
+The **overseer** is an autonomous orchestration layer that runs alongside the gateway. It executes **runbooks** — declarative maintenance scripts that monitor health, clean up resources, prune memory, audit policy, and sample response quality.
+
+```bash
+yeoman overseer start              # start the service
+yeoman overseer status             # check PID, heartbeat, budget
+yeoman overseer runbooks           # list loaded runbooks
+yeoman logs                        # tail all logs (gateway + bridge + overseer)
+```
+
+Runbooks are Markdown files with YAML frontmatter. Two modes:
+
+- **Deterministic** — check a condition, send an alert. No LLM, no cost.
+- **LLM-escalated** — spin up a Claude agent with scoped tools and a token budget, sandboxed via bubblewrap.
+
+Safety is layered: circuit breakers, rate limits (30 actions/hr, 20 LLM calls/day), budget caps (500K tokens/day), cooldowns, lock management, and network-isolated sandboxing.
+
+12 starter runbooks ship out of the box (health checks, log rotation, memory pruning, policy audit, and more). See [`packages/overseer/README.md`](packages/overseer/README.md) for full documentation.
+
+For persistent operation:
+
+```bash
+yeoman overseer install-units
+systemctl --user daemon-reload
+systemctl --user enable --now yeoman-overseer
+```
+
 ## Health Check
 
 If yeoman includes the bundled `agent-doctor` skill, you can run a local health check for memory,
@@ -290,7 +318,7 @@ The doctor does not auto-fix anything; it reports findings and proposed fixes fi
 | `yeoman status` | Runtime status |
 | `yeoman env` | Show active launcher and Python environment |
 | `yeoman doctor` | Run health checks and report issues |
-| `yeoman logs` | View gateway/bridge logs |
+| `yeoman logs` | View gateway/bridge/overseer logs |
 | **Channels** | |
 | `yeoman channels login` | Link WhatsApp (scan QR) |
 | `yeoman channels status` | Show channel status |
@@ -309,6 +337,12 @@ The doctor does not auto-fix anything; it reports findings and proposed fixes fi
 | `yeoman memory notes status\|set` | Per-chat background notes config |
 | **Config** | |
 | `yeoman config migrate-to-env` | Move secrets from config.json to .env |
+| **Overseer** | |
+| `yeoman overseer start [--foreground]` | Start the overseer service |
+| `yeoman overseer stop` | Stop the overseer service |
+| `yeoman overseer status` | PID, heartbeat, budget snapshot |
+| `yeoman overseer runbooks` | List loaded runbooks |
+| `yeoman overseer install-units` | Install systemd user units |
 | **Cron** | |
 | `yeoman cron list\|add\|remove\|enable\|run` | Manage scheduled tasks |
 | `yeoman cron add-voice` | Schedule voice broadcast jobs |
@@ -323,27 +357,31 @@ docker run -v ~/.yeoman:/root/.yeoman -p 18790:18790 yeoman gateway
 ## Project Structure
 
 ```
-yeoman/
-├── agent/        Core agent loop, prompt builder, skills, tools
-├── core/         Orchestrator pipeline, ports, intents, models
-├── adapters/     Port implementations (policy, LLM, archive, telemetry)
-├── app/          Runtime bootstrap
-├── channels/     Telegram, WhatsApp, Discord, Feishu
-├── bus/          Async message queue with dedup
-├── config/       Pydantic schema, loader, defaults
-├── providers/    LLM registry, LiteLLM wrapper, transcription
-├── policy/       Engine, schema, identity normalization, personas
-├── memory/       SQLite store, embeddings, extractor, sessions
-├── media/        ASR, TTS, vision, routing
-├── storage/      Inbound message archive
-├── security/     Rule engine, bubblewrap isolation
-├── skills/       Bundled skills (github, weather, cron, tmux...)
-├── session/      Conversation session state
-├── cron/         Scheduled task service
-├── heartbeat/    Proactive wake-up timer
-├── utils/        Shared utilities
-└── cli/          typer commands
-bridge/           WhatsApp bridge (TypeScript / Baileys)
+packages/
+├── gateway/      Main gateway service
+│   └── yeoman_gateway/
+│       ├── agent/        Core agent loop, prompt builder, skills, tools
+│       ├── core/         Orchestrator pipeline, ports, intents, models
+│       ├── adapters/     Port implementations (policy, LLM, archive, telemetry)
+│       ├── channels/     Telegram, WhatsApp, Discord, Feishu
+│       ├── providers/    LLM registry, LiteLLM wrapper, transcription
+│       ├── policy/       Engine, schema, identity normalization, personas
+│       ├── memory/       SQLite store, embeddings, extractor, sessions
+│       ├── media/        ASR, TTS, vision, routing
+│       ├── security/     Rule engine, bubblewrap isolation
+│       ├── skills/       Bundled skills (github, weather, cron, tmux...)
+│       └── cli/          typer commands
+├── overseer/     Autonomous orchestration layer
+│   └── yeoman_overseer/
+│       ├── agent/        LLM agent loop, budget tracker, tool dispatch
+│       ├── runbook/      Schema, parser, starter runbooks
+│       ├── trigger/      Evaluator, health checks (poll/cron/event)
+│       ├── safety/       Circuit breaker, rate limiter
+│       ├── audit/        JSONL logger, internal git
+│       ├── comms/        Cascading alerts (Telegram, SMTP)
+│       └── systemd/      Service unit files
+├── shared/       Shared config schema, utilities
+└── bridge/       WhatsApp bridge (TypeScript / Baileys)
 ```
 
 ## Changelog

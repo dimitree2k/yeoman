@@ -1,7 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -44,6 +44,8 @@ class ModelProfile(BaseModel):
     fallback: list[str] = Field(default_factory=list)
     # Cooldown seconds after a 429/5xx error before retrying this profile
     cooldown_seconds: int = 60
+    # OpenRouter reasoning tokens config: {enabled, effort, max_tokens, exclude}
+    reasoning: dict[str, Any] | None = None
 
 
 class ModelRoutingConfig(BaseModel):
@@ -56,6 +58,11 @@ class ModelRoutingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_routes(self) -> "ModelRoutingConfig":
+        # Normalize route values (profile references) to snake_case so that
+        # camelCase values in JSON match profile keys converted by convert_keys().
+        from yeoman_shared.config.loader import camel_to_snake
+
+        self.routes = {key: camel_to_snake(val) for key, val in self.routes.items()}
         missing = sorted({name for name in self.routes.values() if name not in self.profiles})
         if missing:
             raise ValueError("models.routes references unknown profiles: " + ", ".join(missing))
@@ -211,8 +218,6 @@ class AgentDefaults(BaseModel):
     )
     workspace: str = "~/.yeoman/workspace"
     model: str = "anthropic/claude-opus-4-5"
-    max_tokens: int = 8192
-    temperature: float = 0.7
     max_tool_iterations: int = 20
     timing_logs_enabled: bool = False
     subagent_model: str | None = Field(default=None, alias="subagentModel")
@@ -545,13 +550,4 @@ class Config(BaseSettings):
             if env_key:
                 return env_key
 
-        return None
-
-        for spec in PROVIDERS:
-            if (
-                spec.is_gateway
-                and spec.default_api_base
-                and p == getattr(self.providers, spec.name, None)
-            ):
-                return spec.default_api_base
         return None

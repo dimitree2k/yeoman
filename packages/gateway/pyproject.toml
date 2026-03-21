@@ -23,11 +23,15 @@ dependencies = [
     "icalendar>=7.0.3",
 ]
 
+[project.optional-dependencies]
+overseer = ["yeoman-overseer"]
+
 [project.scripts]
 yeoman = "yeoman_gateway.__main__:main"
 
 [tool.uv.sources]
 yeoman-shared = { workspace = true }
+yeoman-overseer = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

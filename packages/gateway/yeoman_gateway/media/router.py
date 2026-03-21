@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import ModelProfile, ModelRoutingConfig
@@ -32,6 +32,8 @@ class ResolvedProfile:
     fallback: tuple[str, ...] = ()
     # Cooldown seconds for this profile
     cooldown_seconds: int = 60
+    # OpenRouter reasoning tokens config
+    reasoning: dict[str, Any] | None = None
 
 
 @dataclass
@@ -133,12 +135,16 @@ class ModelRouter:
     def resolve_by_profile(self, profile_name: str) -> ResolvedProfile:
         """Resolve directly by profile name, bypassing route lookup.
 
+        Accepts both camelCase and snake_case names.
         Raises KeyError if the profile does not exist.
         """
-        profile = self._routing.profiles.get(profile_name)
+        from yeoman_shared.config.loader import camel_to_snake
+
+        normalized = camel_to_snake(profile_name)
+        profile = self._routing.profiles.get(normalized)
         if profile is None:
             raise KeyError(f"No model profile named '{profile_name}'")
-        return self._to_resolved(profile_name, profile_name, profile)
+        return self._to_resolved(normalized, normalized, profile)
 
     def is_in_cooldown(self, profile_name: str) -> bool:
         """Check if a profile is currently in cooldown."""
@@ -199,4 +205,5 @@ class ModelRouter:
             timeout_ms=profile.timeout_ms,
             fallback=tuple(profile.fallback),
             cooldown_seconds=profile.cooldown_seconds,
+            reasoning=profile.reasoning,
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 import typer
 
 from yeoman_gateway.cli.core import app
-from yeoman_shared.utils.helpers import get_operational_data_path, get_run_path
+from yeoman_shared.utils.helpers import get_logs_path, get_operational_data_path, get_run_path
 
 overseer_app = typer.Typer(help="Manage the yeoman overseer service.")
 app.add_typer(overseer_app, name="overseer")
@@ -26,6 +27,10 @@ def _pid_path() -> Path:
 
 def _sock_path() -> Path:
     return get_run_path() / "overseer.sock"
+
+
+def _overseer_log_path() -> Path:
+    return get_logs_path() / "overseer.log"
 
 
 @overseer_app.command()
@@ -44,6 +49,17 @@ def start(
             raise typer.Exit(1)
         except (ProcessLookupError, ValueError):
             pid_path.unlink(missing_ok=True)
+
+    log_path = _overseer_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            *([] if not foreground else [logging.StreamHandler()]),
+        ],
+    )
 
     config = OverseerConfig()
     service = OverseerService(

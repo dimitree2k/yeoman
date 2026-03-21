@@ -212,19 +212,20 @@ class PolicyEngine:
 
         channels_to_compile = set(self.apply_channels) | set(self.policy.channels.keys())
         for channel in channels_to_compile:
+            owners = self._owner_index.get(channel, frozenset())
             merged = self.policy.defaults.model_dump()
             channel_policy = self.policy.channels.get(channel)
             if channel_policy:
                 merged = _deep_merge(merged, dump_override(channel_policy.default))
             resolved = ChatPolicy.model_validate(merged)
-            compiled_default = self._compile_chat_policy(channel, resolved)
+            compiled_default = self._compile_chat_policy(channel, resolved, owners)
             self._channel_defaults[channel] = compiled_default
 
             if channel_policy:
                 for chat_id, override in channel_policy.chats.items():
                     chat_merged = _deep_merge(merged, dump_override(override))
                     chat_resolved = ChatPolicy.model_validate(chat_merged)
-                    self._chat_rules[(channel, chat_id)] = self._compile_chat_policy(channel, chat_resolved)
+                    self._chat_rules[(channel, chat_id)] = self._compile_chat_policy(channel, chat_resolved, owners)
 
         self._resolved_cache.clear()
         self._compile_memory_notes()
@@ -263,20 +264,24 @@ class PolicyEngine:
                 )
 
     @staticmethod
-    def _compile_chat_policy(channel: str, resolved: ChatPolicy) -> _CompiledPolicy:
+    def _compile_chat_policy(
+        channel: str,
+        resolved: ChatPolicy,
+        channel_owners: frozenset[str] | None = None,
+    ) -> _CompiledPolicy:
         return _CompiledPolicy(
             who_can_talk_mode=resolved.who_can_talk.mode,
-            who_can_talk_senders=normalize_sender_list(channel, resolved.who_can_talk.senders),
+            who_can_talk_senders=normalize_sender_list(channel, resolved.who_can_talk.senders, channel_owners),
             when_to_reply_mode=resolved.when_to_reply.mode,
-            when_to_reply_senders=normalize_sender_list(channel, resolved.when_to_reply.senders),
-            blocked_senders=normalize_sender_list(channel, resolved.blocked_senders.senders),
+            when_to_reply_senders=normalize_sender_list(channel, resolved.when_to_reply.senders, channel_owners),
+            blocked_senders=normalize_sender_list(channel, resolved.blocked_senders.senders, channel_owners),
             allowed_tools_mode=resolved.allowed_tools.mode,
             allowed_tools_tools=_normalize_tool_names(resolved.allowed_tools.tools),
             allowed_tools_deny=_normalize_tool_names(resolved.allowed_tools.deny),
             tool_access_rules={
                 tool_name.strip(): _CompiledToolAccessRule(
                     mode=rule.mode,
-                    senders=normalize_sender_list(channel, rule.senders),
+                    senders=normalize_sender_list(channel, rule.senders, channel_owners),
                 )
                 for tool_name, rule in resolved.tool_access.items()
                 if tool_name.strip()

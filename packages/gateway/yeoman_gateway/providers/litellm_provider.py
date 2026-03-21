@@ -105,6 +105,7 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -115,6 +116,8 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            reasoning: Optional reasoning config for OpenRouter
+                       (e.g. {"enabled": true} or {"effort": "high"}).
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -142,6 +145,12 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+        # Pass reasoning config via extra_body for OpenRouter
+        if reasoning:
+            extra_body = kwargs.get("extra_body", {})
+            extra_body["reasoning"] = reasoning
+            kwargs["extra_body"] = extra_body
 
         try:
             response = await acompletion(**kwargs)

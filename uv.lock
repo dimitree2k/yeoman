@@ -1728,6 +1728,11 @@ dependencies = [
     { name = "youtube-transcript-api" },
 ]
 
+[package.optional-dependencies]
+overseer = [
+    { name = "yeoman-overseer" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "caldav", specifier = ">=3.0.1" },
@@ -1745,9 +1750,11 @@ requires-dist = [
     { name = "typer", specifier = ">=0.24.1" },
     { name = "websocket-client", specifier = ">=1.9.0" },
     { name = "websockets", specifier = ">=16.0" },
+    { name = "yeoman-overseer", marker = "extra == 'overseer'", editable = "packages/overseer" },
     { name = "yeoman-shared", editable = "packages/shared" },
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
 ]
+provides-extras = ["overseer"]
 
 [[package]]
 name = "yeoman-overseer"

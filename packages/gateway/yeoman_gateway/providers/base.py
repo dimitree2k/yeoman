@@ -1,5 +1,7 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,6 +49,7 @@ class LLMProvider(ABC):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -57,6 +60,8 @@ class LLMProvider(ABC):
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            reasoning: Optional reasoning config for OpenRouter
+                       (e.g. {"enabled": true} or {"effort": "high"}).
 
         Returns:
             LLMResponse with content and/or tool calls.

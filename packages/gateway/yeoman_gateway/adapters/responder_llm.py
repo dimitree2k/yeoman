@@ -487,6 +487,17 @@ class LLMResponder(ResponderPort):
         except KeyError:
             return None
 
+    def _reasoning_for_profile(self, profile_name: str | None) -> dict[str, object] | None:
+        """Return the reasoning config for a named profile, or None."""
+        if not profile_name or self._model_router is None:
+            return None
+        from yeoman_shared.config.loader import camel_to_snake
+        snake_name = camel_to_snake(profile_name)
+        try:
+            return self._model_router.resolve_by_profile(snake_name).reasoning
+        except KeyError:
+            return None
+
     def _should_enable_grants(self, is_owner: bool) -> bool:
         """Check whether grants should be activated for tool execution."""
         if self.file_access_resolver is None or not self.file_access_resolver.has_grants:
@@ -516,6 +527,7 @@ class LLMResponder(ResponderPort):
         security_context: dict[str, object] | None = None,
         is_owner: bool = False,
         model: str | None = None,
+        reasoning: dict[str, object] | None = None,
         trace: Any = None,
     ) -> str:
         iteration = 0
@@ -535,6 +547,7 @@ class LLMResponder(ResponderPort):
                     messages=messages,
                     tools=self._tool_definitions(allowed_tools),
                     model=model or self.model,
+                    reasoning=reasoning,
                 )
                 lf.log_generation(
                     parent=iter_span or trace,
@@ -1057,6 +1070,7 @@ class LLMResponder(ResponderPort):
                     },
                     is_owner=is_owner,
                     model=self._model_for_profile(model_profile),
+                    reasoning=self._reasoning_for_profile(model_profile),
                     trace=trace,
                 )
                 self._current_session = None

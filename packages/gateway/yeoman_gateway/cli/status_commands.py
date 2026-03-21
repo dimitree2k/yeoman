@@ -11,6 +11,7 @@ from yeoman_gateway import __logo__
 from .channel_commands import _bridge_log_path
 from .core import app, console
 from .gateway_commands import _gateway_log_path
+from .overseer_commands import _overseer_log_path
 
 
 @app.command()
@@ -19,6 +20,7 @@ def logs(
     lines: int = typer.Option(200, "--lines", "-n", min=1, help="Initial lines for tail mode"),
     gateway: bool = typer.Option(True, "--gateway/--no-gateway", help="Include gateway log"),
     bridge: bool = typer.Option(True, "--bridge/--no-bridge", help="Include WhatsApp bridge log"),
+    overseer: bool = typer.Option(True, "--overseer/--no-overseer", help="Include overseer log"),
     raw: bool = typer.Option(False, "--raw", help="Use tail instead of lnav"),
 ) -> None:
     """View yeoman logs (uses lnav when available)."""
@@ -30,9 +32,11 @@ def logs(
         paths.append(_gateway_log_path())
     if bridge:
         paths.append(_bridge_log_path())
+    if overseer:
+        paths.append(_overseer_log_path())
 
     if not paths:
-        console.print("[red]No logs selected. Enable --gateway and/or --bridge.[/red]")
+        console.print("[red]No logs selected. Enable --gateway, --bridge, and/or --overseer.[/red]")
         raise typer.Exit(1)
 
     for path in paths:
