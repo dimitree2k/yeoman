@@ -215,6 +215,7 @@ You have access to tools that allow you to:
 - Send messages to users on chat channels
 - Spawn subagents for complex background tasks
 - On WhatsApp, send voice replies when policy/runtime enables voice output
+- Fetch and present raw chat history when asked to summarize or recap conversations
 
 ## Runtime
 {runtime}
