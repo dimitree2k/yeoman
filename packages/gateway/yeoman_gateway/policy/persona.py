@@ -25,7 +25,7 @@ def resolve_persona_path(persona_file: str, workspace: Path) -> Path:
 
 
 def load_persona_text(persona_file: str | None, workspace: Path) -> str | None:
-    """Load persona text. Missing files are warned and ignored."""
+    """Load persona text and optional evolution layer. Missing files are warned and ignored."""
     if not persona_file:
         return None
     path = resolve_persona_path(persona_file, workspace)
@@ -35,4 +35,20 @@ def load_persona_text(persona_file: str | None, workspace: Path) -> str | None:
     if not path.is_file():
         logger.warning(f"persona path is not a file: {path}")
         return None
-    return path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+
+    # Load evolution layer by convention: alpha-2.md → alpha-2.evolution.md
+    evolution_path = path.parent / f"{path.stem}.evolution{path.suffix}"
+    if evolution_path.is_file():
+        evolution_text = evolution_path.read_text(encoding="utf-8")
+        text += (
+            "\n\n# Evolution Layer (Lived Experience)\n\n"
+            "This section reflects accumulated experience from past conversations. "
+            "It supplements the base persona above — trait tendencies, domain confidence, "
+            "and relationship context that have developed over time. "
+            "Base persona invariants always take precedence over evolution drift.\n\n"
+            + evolution_text
+        )
+        logger.debug(f"loaded evolution layer: {evolution_path}")
+
+    return text

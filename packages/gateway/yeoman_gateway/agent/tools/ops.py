@@ -509,19 +509,15 @@ class OpsTool(Tool):
     def _gateway_status(self) -> str:
         lines = ["Gateway:"]
         pid = read_pid_file(_GATEWAY_PID)
-        port_ok = self._check_tcp_port(18790)
         if pid is not None and pid_alive(pid):
             lines.append(f"  status: running (pid={pid})")
             uptime = self._process_uptime(pid)
             if uptime:
                 lines.append(f"  uptime: {uptime}")
-        elif port_ok:
-            lines.append("  status: running (port 18790 reachable, no PID file)")
         elif pid is not None:
             lines.append(f"  status: stopped (stale PID file, pid={pid})")
         else:
             lines.append("  status: stopped")
-        lines.append(f"  port 18790: {'reachable' if port_ok else 'unreachable'}")
         if _GATEWAY_LOG.exists():
             size = os.path.getsize(_GATEWAY_LOG)
             lines.append(f"  log: {_fmt_size(size)}")
@@ -583,16 +579,6 @@ class OpsTool(Tool):
             return _fmt_duration(int(elapsed))
         except (OSError, ValueError, IndexError):
             return None
-
-    @staticmethod
-    def _check_tcp_port(port: int, timeout: float = 0.1) -> bool:
-        import socket
-
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-                return True
-        except OSError:
-            return False
 
     async def _bridge_health_check(self, timeout_s: float = 3.0) -> dict[str, Any]:
         """Delegate to WhatsAppRuntimeManager._health_check_async()."""

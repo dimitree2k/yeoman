@@ -1188,6 +1188,7 @@ class LLMResponder(ResponderPort):
         allowed_tools: set[str] | None = None,
         persona_text: str | None = None,
         is_owner: bool = True,
+        model_profile: str | None = None,
     ) -> str:
         return await self._generate(
             session_key=session_key,
@@ -1206,6 +1207,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_delay_seconds=2.5,
             talkative_cooldown_use_llm_message=False,
             is_owner=is_owner,
+            model_profile=model_profile,
         )
 
     async def aclose(self) -> None:

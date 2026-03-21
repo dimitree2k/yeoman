@@ -503,6 +503,7 @@ def build_gateway_runtime(
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
+            model_profile=job.payload.model_profile,
         )
         if job.payload.deliver and job.payload.to:
             await bus.publish_outbound(

@@ -38,6 +38,8 @@ class CronPayload:
     voice_verbatim: bool = True
     voice_max_sentences: int | None = None
     voice_max_chars: int | None = None
+    # Model profile override (e.g. "overseerDefault" to use a cheaper model)
+    model_profile: str | None = None
 
 
 @dataclass

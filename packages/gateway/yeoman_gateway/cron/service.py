@@ -92,6 +92,7 @@ class CronService:
                             voice_verbatim=bool(j["payload"].get("voiceVerbatim", True)),
                             voice_max_sentences=j["payload"].get("voiceMaxSentences"),
                             voice_max_chars=j["payload"].get("voiceMaxChars"),
+                            model_profile=j["payload"].get("modelProfile"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -149,6 +150,7 @@ class CronService:
                         "voiceVerbatim": j.payload.voice_verbatim,
                         "voiceMaxSentences": j.payload.voice_max_sentences,
                         "voiceMaxChars": j.payload.voice_max_chars,
+                        "modelProfile": j.payload.model_profile,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -328,6 +330,7 @@ class CronService:
         channel: str | None = None,
         to: str | None = None,
         delete_after_run: bool = False,
+        model_profile: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         store = self._load_store()
@@ -344,6 +347,7 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
+                model_profile=model_profile,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,
