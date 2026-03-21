@@ -56,3 +56,20 @@ BREAKING CHANGE: config key renamed; update ~/.yeoman/config.json manually.
 - Never commit secrets, API keys, or personal data (`~/.yeoman/` runtime data is gitignored).
 - Keep PRs focused — one logical change per commit where practical.
 - Run `pytest tests/` and `ruff check yeoman/` before pushing.
+
+## Deployment Rules
+
+### Source of Truth
+All code changes go in ~/Documents/yeoman/. Never edit installed copies.
+Python changes are live immediately (editable install). Bridge or dependency
+changes require `yeoman deploy`.
+
+### Forbidden Paths (read-only for agents)
+- ~/.local/share/uv/tools/yeoman-gateway/  (managed by uv)
+- ~/.local/share/uv/tools/yeoman/          (stale legacy env — do not use)
+- ~/.yeoman/var/cache/bridge/               (managed by ensure_runtime)
+
+### After Code Changes
+For Python-only changes: restart affected services.
+For bridge or dependency changes: run `yeoman deploy` from ~/Documents/yeoman/.
+Do not manually copy files between source and installed locations.

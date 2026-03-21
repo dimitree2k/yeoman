@@ -219,3 +219,19 @@ Also fed into `memory.build_retrieved_context(query=…)` in `responder_llm.py` 
 the semantic/FTS recall signal for vague one-liner messages.
 
 See `docs/ambient-context-window.md` for the full design (local only, gitignored).
+
+
+## Deployment Rules
+
+**Source of truth**: `~/Documents/yeoman/` — ALL code changes happen here.
+Python changes are live immediately (editable install). Bridge or dependency
+changes require `yeoman deploy`.
+
+**NEVER modify files in these derived locations:**
+- `~/.local/share/uv/tools/yeoman-gateway/` — managed by `uv tool install`
+- `~/.local/share/uv/tools/yeoman/` — stale legacy env, do not use
+- `~/.yeoman/var/cache/bridge/` — managed by `ensure_runtime()`
+
+**NEVER manually copy files** between source, installed package, or bridge cache.
+After bridge or dependency changes, run `yeoman deploy` from this directory
+(or `bin/deploy` for first install / recovery).
