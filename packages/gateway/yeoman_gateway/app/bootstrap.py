@@ -390,6 +390,7 @@ def build_gateway_runtime(
         model_router=model_router,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
+        inbound_archive=inbound_archive,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))

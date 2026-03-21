@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
 @dataclass
@@ -91,6 +92,7 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
+        inbound_archive: "InboundArchive | None" = None,
     ) -> None:
         from yeoman_shared.config.schema import ExecToolConfig
 
@@ -116,6 +118,7 @@ class LLMResponder(ResponderPort):
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._recording_notifier = recording_notifier
+        self.inbound_archive = inbound_archive
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -230,6 +233,14 @@ class LLMResponder(ResponderPort):
             from yeoman_gateway.agent.tools.calendar import CalendarTool
             self.tools.register(CalendarTool(self.caldav_service))
 
+        # Summarize history — only if archive is available
+        if self.inbound_archive is not None:
+            from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
+
+            self.tools.register(
+                SummarizeHistoryTool(self.inbound_archive, self.contacts_service)
+            )
+
     def _metric(
         self,
         name: str,
@@ -271,6 +282,12 @@ class LLMResponder(ResponderPort):
         ops_manage_tool = self.tools.get("ops_manage")
         if isinstance(ops_manage_tool, OpsManageTool):
             ops_manage_tool.set_context(channel, chat_id)
+
+        from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
+
+        summarize_tool = self.tools.get("summarize_history")
+        if isinstance(summarize_tool, SummarizeHistoryTool):
+            summarize_tool.set_context(channel, chat_id)
 
     @staticmethod
     def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:
