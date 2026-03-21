@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# bin/deploy — bootstrap or recover yeoman installation
+#
+# Use when:
+#   - First install (yeoman not yet on PATH)
+#   - Broken tool env (yeoman crashes on import)
+# After first use, prefer: yeoman deploy
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ ! -f "$REPO_DIR/pyproject.toml" ]; then
+    printf 'Error: pyproject.toml not found at %s\n' "$REPO_DIR" >&2
+    exit 1
+fi
+
+if ! grep -q '\[tool\.uv\.workspace\]' "$REPO_DIR/pyproject.toml"; then
+    printf 'Error: %s/pyproject.toml is not a uv workspace root\n' "$REPO_DIR" >&2
+    exit 1
+fi
+
+if ! command -v uv &>/dev/null; then
+    printf 'Error: uv not found on PATH. Install: https://docs.astral.sh/uv/\n' >&2
+    exit 1
+fi
+
+printf '==> Syncing dev venv...\n'
+cd "$REPO_DIR"
+uv sync
+
+# Build bridge if dist is missing
+BRIDGE_DIR="$REPO_DIR/packages/bridge"
+if [ ! -d "$BRIDGE_DIR/dist" ] || [ ! -f "$BRIDGE_DIR/dist/server.js" ]; then
+    printf '==> Bridge dist missing, building...\n'
+    if command -v npm &>/dev/null; then
+        cd "$BRIDGE_DIR"
+        npm run build
+        cd "$REPO_DIR"
+    else
+        printf 'Error: npm not found. Run "npm run build" in %s manually.\n' "$BRIDGE_DIR" >&2
+        exit 1
+    fi
+fi
+
+# Remove stale legacy tool env if present
+if uv tool list 2>/dev/null | grep -q '^yeoman '; then
+    printf '==> Removing stale legacy "yeoman" tool env...\n'
+    uv tool uninstall yeoman || true
+fi
+
+printf '==> Installing tool env...\n'
+cd "$REPO_DIR"
+uv tool install --reinstall --editable 'packages/gateway[overseer]'
+
+printf '\n✓ Bootstrapped. From now on, use: yeoman deploy\n'
