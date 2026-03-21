@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 
@@ -27,3 +28,29 @@ def bridge_is_stale(src_dir: Path, dist_dir: Path) -> bool:
     stored = hash_file.read_text().strip()
     current = hash_bridge_sources(src_dir)
     return stored != current
+
+
+def find_source_repo() -> Path | None:
+    """Locate the yeoman source repo. Returns None if not found or invalid."""
+    env_dir = os.environ.get("YEOMAN_SOURCE_DIR", "")
+    if env_dir:
+        candidate = Path(env_dir)
+    else:
+        candidate = Path.home() / "Documents" / "yeoman"
+
+    if not candidate.is_dir():
+        return None
+
+    pyproject = candidate / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+
+    try:
+        content = pyproject.read_text()
+    except OSError:
+        return None
+
+    if "[tool.uv.workspace]" not in content:
+        return None
+
+    return candidate

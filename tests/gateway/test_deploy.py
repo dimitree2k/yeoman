@@ -85,3 +85,33 @@ class TestBridgeIsStale:
         h = hash_bridge_sources(bridge / "src")
         (bridge / "dist" / ".build-hash").write_text(h)
         assert bridge_is_stale(bridge / "src", bridge / "dist") is False
+
+
+class TestFindSourceRepo:
+    def test_finds_via_env_var(self, tmp_path: Path, monkeypatch) -> None:
+        from yeoman_gateway.deploy import find_source_repo
+
+        toml = tmp_path / "pyproject.toml"
+        toml.write_text('[tool.uv.workspace]\nmembers = []\n')
+        monkeypatch.setenv("YEOMAN_SOURCE_DIR", str(tmp_path))
+        assert find_source_repo() == tmp_path
+
+    def test_returns_none_when_no_toml(self, tmp_path: Path, monkeypatch) -> None:
+        from yeoman_gateway.deploy import find_source_repo
+
+        monkeypatch.setenv("YEOMAN_SOURCE_DIR", str(tmp_path))
+        assert find_source_repo() is None
+
+    def test_returns_none_when_no_workspace_section(self, tmp_path: Path, monkeypatch) -> None:
+        from yeoman_gateway.deploy import find_source_repo
+
+        toml = tmp_path / "pyproject.toml"
+        toml.write_text('[project]\nname = "foo"\n')
+        monkeypatch.setenv("YEOMAN_SOURCE_DIR", str(tmp_path))
+        assert find_source_repo() is None
+
+    def test_returns_none_when_dir_missing(self, tmp_path: Path, monkeypatch) -> None:
+        from yeoman_gateway.deploy import find_source_repo
+
+        monkeypatch.setenv("YEOMAN_SOURCE_DIR", str(tmp_path / "nonexistent"))
+        assert find_source_repo() is None
