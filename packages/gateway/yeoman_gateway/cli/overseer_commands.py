@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -33,6 +34,10 @@ def _overseer_log_path() -> Path:
     return get_logs_path() / "overseer.log"
 
 
+def _lock_path() -> Path:
+    return get_run_path() / "overseer.lock"
+
+
 @overseer_app.command()
 def start(
     foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground"),
@@ -40,15 +45,25 @@ def start(
     """Start the overseer service."""
     from yeoman_overseer.service import OverseerService, OverseerConfig
 
+    # Acquire exclusive flock — held for process lifetime, released on exit
+    lock_file = _lock_path()
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_file, "w")  # noqa: SIM115 — intentionally kept open
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pid_path = _pid_path()
+        pid_info = ""
+        if pid_path.exists():
+            try:
+                pid_info = f" (PID {pid_path.read_text().strip()})"
+            except Exception:
+                pass
+        typer.echo(f"Overseer already running{pid_info}")
+        lock_fd.close()
+        raise typer.Exit(1)
+
     pid_path = _pid_path()
-    if pid_path.exists():
-        try:
-            pid = int(pid_path.read_text().strip())
-            os.kill(pid, 0)
-            typer.echo(f"Overseer already running (PID {pid})")
-            raise typer.Exit(1)
-        except (ProcessLookupError, ValueError):
-            pid_path.unlink(missing_ok=True)
 
     log_path = _overseer_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)

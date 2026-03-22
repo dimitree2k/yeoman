@@ -17,10 +17,18 @@ class TelegramDirectChannel(CommsChannel):
 
     async def send(self, message: str) -> None:
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+        # Truncate to Telegram's 4096-char limit
+        text = message[:4096]
         async with httpx.AsyncClient(timeout=10) as client:
+            # Try Markdown first; fall back to plain text if it fails
             resp = await client.post(url, json={
                 "chat_id": self._chat_id,
-                "text": message,
+                "text": text,
                 "parse_mode": "Markdown",
             })
+            if resp.status_code == 400:
+                resp = await client.post(url, json={
+                    "chat_id": self._chat_id,
+                    "text": text,
+                })
             resp.raise_for_status()

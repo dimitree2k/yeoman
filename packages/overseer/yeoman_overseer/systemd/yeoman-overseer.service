@@ -3,7 +3,7 @@ Description=Yeoman Overseer — autonomous orchestration layer
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=%h/.local/bin/yeoman overseer start --foreground
 Restart=always
 StartLimitBurst=5

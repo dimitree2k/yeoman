@@ -92,7 +92,21 @@ def deploy(
     else:
         console.print("  venv: [yellow]would sync[/yellow]")
 
-    # Step 3: uv tool install
+    # Step 3: Stop overseer before reinstall (binary gets replaced)
+    _overseer_was_running = False
+    if not dry_run:
+        unit_active = subprocess.run(
+            ["systemctl", "--user", "is-active", "yeoman-overseer.service"],
+            capture_output=True, text=True,
+        )
+        if unit_active.returncode == 0:
+            _overseer_was_running = True
+            subprocess.run(
+                ["systemctl", "--user", "stop", "yeoman-overseer.service"],
+                capture_output=True,
+            )
+
+    # Step 4: uv tool install
     console.print("Reinstalling tool env (uv tool install)...")
     if not dry_run:
         result = subprocess.run(
@@ -110,7 +124,7 @@ def deploy(
 
     # Step 4: Restart running services
     if not dry_run:
-        _restart_running_services()
+        _restart_running_services(_overseer_was_running)
     else:
         _report_running_services()
 
@@ -121,7 +135,7 @@ def deploy(
     console.print("\n[bold green]yeoman deploy — ok[/bold green]")
 
 
-def _restart_running_services() -> None:
+def _restart_running_services(overseer_was_running: bool = False) -> None:
     """Restart services that are currently running."""
     from yeoman_shared.utils.helpers import get_run_path
     from yeoman_shared.utils.process import pid_alive, read_pid_file
@@ -140,32 +154,63 @@ def _restart_running_services() -> None:
 
     for name, pid_file, restart_cmd in services:
         pid = read_pid_file(run_dir / pid_file)
-        if not (pid and pid_alive(pid)):
+        is_running = pid and pid_alive(pid)
+        # For overseer, also check if it was stopped pre-reinstall
+        if not is_running and name == "overseer":
+            is_running = overseer_was_running
+        if not is_running:
             console.print(f"  {name}: not running (skipped)")
             continue
 
         console.print(f"  Restarting {name}...")
         if name == "overseer":
-            # Overseer start blocks (asyncio.run), so stop + re-launch as daemon
-            subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, check=False)
-            import time
-            time.sleep(0.5)
-            log_path = get_run_path().parent / "logs" / "overseer.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "a") as log_file:
-                proc = subprocess.Popen(
-                    [yeoman_bin, "overseer", "start"],
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
+            # Prefer systemctl if the unit is enabled, otherwise fall back to CLI
+            unit_check = subprocess.run(
+                ["systemctl", "--user", "is-enabled", "yeoman-overseer.service"],
+                capture_output=True, text=True,
+            )
+            if unit_check.returncode == 0:
+                result = subprocess.run(
+                    ["systemctl", "--user", "restart", "yeoman-overseer.service"],
+                    capture_output=True, text=True,
                 )
-            # Brief check that it didn't immediately crash
-            time.sleep(1.0)
-            if proc.poll() is not None:
-                console.print(f"  {name}: [red]restart failed[/red] (exited immediately)")
+                if result.returncode == 0:
+                    # Read PID from systemd
+                    show = subprocess.run(
+                        ["systemctl", "--user", "show", "-p", "MainPID",
+                         "yeoman-overseer.service"],
+                        capture_output=True, text=True,
+                    )
+                    svc_pid = show.stdout.strip().split("=")[-1] if show.returncode == 0 else "?"
+                    console.print(f"  {name}: restarted (PID {svc_pid})")
+                else:
+                    console.print(
+                        f"  {name}: [red]systemctl restart failed[/red]"
+                        f" — {result.stderr[:200]}"
+                    )
             else:
-                console.print(f"  {name}: restarted (PID {proc.pid})")
+                subprocess.run(
+                    [yeoman_bin, "overseer", "stop"], capture_output=True, check=False,
+                )
+                import time
+                time.sleep(0.5)
+                log_path = get_run_path().parent / "logs" / "overseer.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "a") as log_file:
+                    proc = subprocess.Popen(
+                        [yeoman_bin, "overseer", "start"],
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                time.sleep(1.0)
+                if proc.poll() is not None:
+                    console.print(
+                        f"  {name}: [red]restart failed[/red] (exited immediately)"
+                    )
+                else:
+                    console.print(f"  {name}: restarted (PID {proc.pid})")
         else:
             result = subprocess.run(restart_cmd, capture_output=True, text=True)
             if result.returncode == 0:
@@ -206,7 +251,7 @@ def _verify_deploy(bridge_src: Path, bridge_dist: Path) -> None:
     )
     if tool_python.exists():
         result = subprocess.run(
-            [str(tool_python), "-c", "import anthropic; import croniter"],
+            [str(tool_python), "-c", "import openai; import croniter"],
             capture_output=True,
             text=True,
         )

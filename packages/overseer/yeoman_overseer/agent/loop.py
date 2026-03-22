@@ -1,13 +1,14 @@
-"""Agent loop — invoke Anthropic API with tools, enforce limits, return AgentResult."""
+"""Agent loop — invoke LLM via OpenRouter (OpenAI-compatible), enforce limits, return AgentResult."""
 from __future__ import annotations
 
+import json
 import os
 import uuid as _uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from anthropic import Anthropic
+from openai import OpenAI
 
 from yeoman_overseer.agent.context import build_context
 from yeoman_overseer.agent.patcher import Patcher, PatchContext
@@ -16,6 +17,21 @@ from yeoman_overseer.agent.tools import TOOL_DEFINITIONS, ToolContext, dispatch
 if TYPE_CHECKING:
     from yeoman_overseer.agent.budget import BudgetTracker
     from yeoman_overseer.runbook.parser import Runbook
+
+
+def _anthropic_to_openai_tools(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Anthropic-style tool definitions to OpenAI function-calling format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        }
+        for t in tool_defs
+    ]
 
 
 def _route_write_path(
@@ -90,12 +106,18 @@ class AgentLoop:
 
         profile_name = llm_budget.llm_profile
         profile = self._config.get("models", {}).get("profiles", {}).get(profile_name, {})
-        model = profile.get("model", "claude-haiku-4-5-20251001")
+        model = profile.get("model", "openai/gpt-4o-mini")
 
         context = build_context(runbook, observations, self._tool_ctx.audit)
 
-        client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        client = OpenAI(
+            api_key=os.environ.get("OPENROUTER_API_KEY"),
+            base_url="https://openrouter.ai/api/v1",
+        )
+        openai_tools = _anthropic_to_openai_tools(TOOL_DEFINITIONS)
+
         messages: list[dict[str, Any]] = [
+            {"role": "system", "content": context.system_prompt},
             {"role": "user", "content": context.user_message},
         ]
         tool_calls_made = 0
@@ -113,53 +135,52 @@ class AgentLoop:
             if remaining_tokens <= 0:
                 break
 
-            response = client.messages.create(
+            response = client.chat.completions.create(
                 model=model,
                 max_tokens=min(4096, remaining_tokens),
-                system=context.system_prompt,
                 messages=messages,
-                tools=TOOL_DEFINITIONS,
+                tools=openai_tools,
             )
-            total_tokens += response.usage.input_tokens + response.usage.output_tokens
+            choice = response.choices[0]
+            usage = response.usage
+            if usage:
+                total_tokens += (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
 
-            if response.stop_reason == "end_turn":
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        summary = block.text
+            if choice.finish_reason in ("stop", "length") or not choice.message.tool_calls:
+                summary = choice.message.content or ""
                 break
 
-            if response.stop_reason == "tool_use":
-                messages.append({"role": "assistant", "content": response.content})
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_calls_made += 1
-                        tool_input = dict(block.input)  # copy so we can mutate
+            # Tool calls
+            messages.append(choice.message.model_dump())
+            for tc in choice.message.tool_calls:
+                tool_calls_made += 1
+                tool_name = tc.function.name
+                try:
+                    tool_input = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    tool_input = {}
 
-                        # requires_tests gate: intercept write paths
-                        if requires_tests and block.name in ("write_file", "edit_file") and "path" in tool_input:
-                            if patch_ctx is None:
-                                patch_ctx = patcher.create_worktree(self._tool_ctx.source_dir, run_id)
-                            translated = _route_write_path(
-                                Path(tool_input["path"]).expanduser(),
-                                self._tool_ctx.source_dir,
-                                patch_ctx=patch_ctx,
-                                requires_tests=True,
-                            )
-                            tool_input["path"] = str(translated)
+                # requires_tests gate: intercept write paths
+                if requires_tests and tool_name in ("write_file", "edit_file") and "path" in tool_input:
+                    if patch_ctx is None:
+                        patch_ctx = patcher.create_worktree(self._tool_ctx.source_dir, run_id)
+                    translated = _route_write_path(
+                        Path(tool_input["path"]).expanduser(),
+                        self._tool_ctx.source_dir,
+                        patch_ctx=patch_ctx,
+                        requires_tests=True,
+                    )
+                    tool_input["path"] = str(translated)
 
-                        try:
-                            result = await dispatch(block.name, tool_input, self._tool_ctx)
-                        except Exception as exc:
-                            result = f"ERROR: {exc}"
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(result),
-                        })
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                break
+                try:
+                    result = await dispatch(tool_name, tool_input, self._tool_ctx)
+                except Exception as exc:
+                    result = f"ERROR: {exc}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
 
         # requires_tests gate: finalize patch
         if patch_ctx is not None:

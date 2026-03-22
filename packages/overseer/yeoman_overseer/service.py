@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import sdnotify
+
 from yeoman_overseer.agent.budget import BudgetTracker
 from yeoman_overseer.agent.loop import AgentLoop, AgentResult, BudgetExhaustedError
 from yeoman_overseer.agent.tools import ToolContext
@@ -55,6 +57,7 @@ class OverseerService:
     _socket: OverseerSocket | None = None
     _running: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    _sd_notifier: sdnotify.SystemdNotifier = field(default_factory=sdnotify.SystemdNotifier)
 
     async def init(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -105,16 +108,24 @@ class OverseerService:
             state=self._state,
         )
 
-        # Comms — no channels yet; local_log=True ensures alerts are never silently lost
-        self._comms = CascadingComms(channels=[], local_log=True)
-
-        # Load config for model profiles
+        # Load .env, config, and policy
+        # data_dir is ~/.yeoman/data/overseer — yeoman_home is two levels up
+        import os as _os
+        _yeoman_home_env = _os.environ.get("YEOMAN_HOME", "").strip()
+        yeoman_home = Path(_yeoman_home_env) if _yeoman_home_env else Path.home() / ".yeoman"
+        self._load_dotenv()
         import json as _json
-        config_path = self.data_dir.parent / "config.json"
+        config_path = yeoman_home / "config.json"
         raw_config = _json.loads(config_path.read_text()) if config_path.exists() else {}
+        policy_path = yeoman_home / "policy.json"
+        raw_policy = _json.loads(policy_path.read_text()) if policy_path.exists() else {}
+
+        # Build comms channels from config
+        channels = self._build_comms_channels(raw_config, raw_policy)
+        self._comms = CascadingComms(channels=channels, local_log=True)
 
         tool_ctx = ToolContext(
-            yeoman_home=self.data_dir.parent,
+            yeoman_home=yeoman_home,
             source_dir=Path.home() / "Documents" / "yeoman",
             audit=self._audit,
             comms=self._comms,
@@ -140,6 +151,7 @@ class OverseerService:
             await self._socket.start()
 
         logger.info("Overseer service started")
+        self._sd_notifier.notify("READY=1")
         try:
             while self._running:
                 try:
@@ -150,6 +162,7 @@ class OverseerService:
 
                 self._state.heartbeat_ts = datetime.now(timezone.utc).isoformat()
                 self._state.save(self.data_dir / "state.json")
+                self._sd_notifier.notify("WATCHDOG=1")
 
                 try:
                     await asyncio.wait_for(
@@ -168,6 +181,7 @@ class OverseerService:
 
     async def stop(self) -> None:
         self._running = False
+        self._sd_notifier.notify("STOPPING=1")
         if self._socket:
             await self._socket.stop()
         if self._evaluator:
@@ -175,6 +189,60 @@ class OverseerService:
             self._state.maintenance = self._evaluator.maintenance.export_state()
         self._state.save(self.data_dir / "state.json")
         logger.info("Overseer service stopped")
+
+    @staticmethod
+    def _load_dotenv() -> None:
+        """Load ~/.yeoman/.env into os.environ (same logic as gateway config loader)."""
+        import os
+        yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+        base = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+        env_file = base / ".env"
+        if not env_file.is_file():
+            return
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+    @staticmethod
+    def _build_comms_channels(
+        config: dict, policy: dict
+    ) -> list:
+        """Build notification channels from gateway config + policy."""
+        import os
+        from yeoman_overseer.comms.cascading import CommsChannel
+
+        channels: list[CommsChannel] = []
+
+        # Telegram: resolve bot token from config or env, chat ID from policy owners
+        tg_config = config.get("channels", {}).get("telegram", {})
+        bot_token = (tg_config.get("token") or "").strip() or os.environ.get(
+            "TELEGRAM_BOT_TOKEN", ""
+        ).strip()
+        owner_tg_ids = policy.get("owners", {}).get("telegram", [])
+
+        if bot_token and owner_tg_ids:
+            from yeoman_overseer.comms.telegram import TelegramDirectChannel
+            channels.append(TelegramDirectChannel(
+                bot_token=bot_token,
+                chat_id=str(owner_tg_ids[0]),
+            ))
+            logger.info("Comms: Telegram channel configured (chat_id=%s)", owner_tg_ids[0])
+        else:
+            logger.warning(
+                "Comms: Telegram not configured (token=%s, owners=%d)",
+                "present" if bot_token else "missing",
+                len(owner_tg_ids),
+            )
+
+        return channels
 
     @staticmethod
     def _create_sandbox():
@@ -215,6 +283,9 @@ class OverseerService:
                 llm_profile = agent_result.llm_profile
             except BudgetExhaustedError as exc:
                 result_str = f"budget_exhausted: {exc}"
+            except Exception as exc:
+                logger.error("Runbook %s agent error: %s", runbook.meta.name, exc)
+                result_str = f"error: {exc}"
 
         duration_ms = int((time.monotonic() - start) * 1000)
         if self._audit:
