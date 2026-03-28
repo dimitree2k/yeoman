@@ -13,6 +13,10 @@ def execute(args: dict[str, Any], ctx: ToolContext) -> str:
     db_path = Path(args["db_path"]).expanduser()
     query = args["query"]
 
+    # Resolve relative paths against the yeoman data directory
+    if not db_path.is_absolute():
+        db_path = (ctx.yeoman_home / "data" / db_path).resolve()
+
     if not db_path.exists():
         return f"[query_db] ERROR: database not found: {db_path}"
 

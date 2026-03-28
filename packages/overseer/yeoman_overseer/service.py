@@ -131,7 +131,7 @@ class OverseerService:
             comms=self._comms,
             data_dir=self.data_dir,
             sandbox=self._create_sandbox(),
-            memory_db=self.data_dir / "memory" / "memory.db",
+            memory_db=yeoman_home / "data" / "memory" / "memory.db",
             git=self._git,
         )
         _budget = BudgetTracker(

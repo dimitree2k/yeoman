@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 def execute(args: dict[str, Any], ctx: ToolContext) -> str:
     query = args["query"]
     limit = int(args.get("limit", 10))
-    db_path = ctx.data_dir / "memory" / "memory.db"
+    db_path = ctx.memory_db or (ctx.yeoman_home / "data" / "memory" / "memory.db")
 
     if not db_path.exists():
         return "[query_memory] ERROR: memory.db not found"

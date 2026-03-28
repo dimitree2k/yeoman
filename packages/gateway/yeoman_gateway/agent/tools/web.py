@@ -261,7 +261,10 @@ class WebFetchTool(Tool):
     """
 
     name = "web_fetch"
-    description = "Fetch URL and extract readable content (HTML → markdown/text)."
+    description = (
+        "Fetch URL and extract readable content (HTML → markdown/text). "
+        "Not suitable for JS-heavy apps (Google Maps, Twitter/X, Instagram, SPAs) — use browse instead."
+    )
     parameters = {
         "type": "object",
         "properties": {

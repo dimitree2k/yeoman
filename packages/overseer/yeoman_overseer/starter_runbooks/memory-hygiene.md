@@ -21,7 +21,7 @@ Review the semantic memory database for stale or low-quality entries.
 ### Your task
 
 1. Use `query_memory` to sample recent entries across different topics.
-2. Use `query_db` to count entries by age and salience:
+2. Use `query_db` (db_path: `memory/memory.db`) to count entries by age and salience:
    ```sql
    SELECT COUNT(*), AVG(salience) FROM memory2_nodes WHERE created_at < date('now', '-90 days')
    ```

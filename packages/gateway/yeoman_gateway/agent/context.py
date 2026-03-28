@@ -426,7 +426,7 @@ For cross-chat voice requests, state only the real blocker (missing source messa
         raw_ambient = metadata.get("ambient_context_window")
         ambient_lines: list[str] = []
         if isinstance(raw_ambient, list):
-            for item in raw_ambient[:10]:
+            for item in raw_ambient[-15:]:
                 if not isinstance(item, str):
                     continue
                 compact = " ".join(item.split())
