@@ -194,16 +194,13 @@ def _restart_running_services(overseer_was_running: bool = False) -> None:
                 )
                 import time
                 time.sleep(0.5)
-                log_path = get_run_path().parent / "logs" / "overseer.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_path, "a") as log_file:
-                    proc = subprocess.Popen(
-                        [yeoman_bin, "overseer", "start"],
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
+                proc = subprocess.Popen(
+                    [yeoman_bin, "overseer", "start"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
                 time.sleep(1.0)
                 if proc.poll() is not None:
                     console.print(

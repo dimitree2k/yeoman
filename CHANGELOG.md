@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.0 — Mar 2026
+
+### Overseer
+- Fixed 4 broken overseer runbooks (ops-source-cleanup, ops-memory-prune, governance-policy-audit, quality-response-sample) that referenced nonexistent databases, wrong table names, and invalid health check names.
+- Added `yeoman overseer trigger <name>` CLI command for manually running runbooks outside their cron schedule, with optional `--dry` validation mode.
+
+### CLI & Daemon
+- Switched gateway and overseer daemon processes to use Loguru rotating file sinks instead of raw file handle redirection, fixing log rotation and compression.
+- Added crash logging with `logger.exception` for unhandled gateway errors.
+- Overseer start now uses `RotatingFileHandler` (10 MB, 3 backups) instead of unbounded `FileHandler`.
+- Import sorting cleanup across CLI modules.
+
+### Deploy
+- Simplified overseer restart in deploy flow: daemon output routed to DEVNULL (logs go to their own file sinks).
+
 ## v0.6.0 — Mar 2026
 
 ### Memory & Contacts

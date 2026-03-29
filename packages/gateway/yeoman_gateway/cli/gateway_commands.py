@@ -6,9 +6,9 @@ import asyncio
 from pathlib import Path
 
 import typer
+from yeoman_shared.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
 
 from yeoman_gateway import __logo__
-from yeoman_shared.utils.process import command_for_pid, pid_alive, read_pid_file, signal_pid
 
 from .core import app, console, make_policy_engine, make_provider
 
@@ -188,8 +188,9 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
     import sys
     import time
 
-    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
     config = load_config()
     if ensure_whatsapp and config.channels.whatsapp.enabled:
@@ -214,17 +215,16 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
     if verbose:
         cmd.append("--verbose")
 
-    with open(log_path, "a") as log_file:
-        env = dict(os.environ)
-        env["Yeoman_GATEWAY_DAEMON"] = "1"
-        proc = subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+    env = dict(os.environ)
+    env["Yeoman_GATEWAY_DAEMON"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
     started = False
     for _ in range(20):
@@ -245,12 +245,35 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
     console.print(f"Log: {log_path}")
 
 
+def _setup_daemon_logging(log_path: Path) -> None:
+    """Replace Loguru's default stderr sink with a rotating file sink."""
+    from loguru import logger
+
+    logger.remove()
+    logger.add(
+        log_path,
+        rotation="10 MB",
+        retention=3,
+        compression="gz",
+        enqueue=True,
+        backtrace=True,
+        diagnose=False,
+    )
+
+
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     """Start the yeoman gateway in foreground."""
+    import os
+
+    from loguru import logger
+    from yeoman_shared.config.loader import load_config
+
     from yeoman_gateway.app.bootstrap import build_gateway_runtime
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
-    from yeoman_shared.config.loader import load_config
+
+    if os.environ.get("Yeoman_GATEWAY_DAEMON") == "1":
+        _setup_daemon_logging(_gateway_log_path())
 
     if verbose:
         import logging
@@ -303,6 +326,9 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
             runtime.cron.stop()
             runtime.orchestrator.stop()
             await runtime.channels.stop_all()
+        except Exception:
+            logger.exception("Gateway crashed")
+            raise
 
     asyncio.run(run())
 
