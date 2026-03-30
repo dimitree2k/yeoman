@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.1 — Mar 2026
+
+### Provider & Performance
+- Moved temporal grounding out of the system prompt into a per-turn system message, enabling LLM prefix caching across turns (~90% input token discount on Anthropic).
+- Added LiteLLM transient retry (`num_retries=2`) for automatic recovery from 429/500/network errors.
+
+### Reliability
+- Added per-session `asyncio.Lock` in `LLMResponder._generate()` to serialize concurrent messages for the same chat, preventing session state corruption.
+
 ## v0.7.0 — Mar 2026
 
 ### Overseer

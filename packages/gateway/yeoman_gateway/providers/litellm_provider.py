@@ -49,6 +49,9 @@ class LiteLLMProvider(LLMProvider):
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
 
+        # Retry transient failures (429, 500, network errors) with exponential backoff
+        litellm.num_retries = 2
+
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
         if self._gateway:

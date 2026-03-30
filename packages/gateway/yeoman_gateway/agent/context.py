@@ -56,7 +56,8 @@ class ContextBuilder:
 
         # Core identity
         parts.append(self._get_identity())
-        parts.append(self._build_temporal_grounding())
+        # NOTE: temporal grounding is injected as a separate message in build_messages()
+        # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
@@ -308,6 +309,10 @@ For cross-chat voice requests, state only the real blocker (missing source messa
                     messages.append(msg)
         else:
             messages.extend(history)
+
+        # Temporal grounding — injected per-turn outside the system prompt so that
+        # the (stable) system prompt benefits from provider prefix caching.
+        messages.append({"role": "system", "content": self._build_temporal_grounding()})
 
         # Retrieved long-term memory (bounded, synthetic system context)
         if retrieved_memory_text:

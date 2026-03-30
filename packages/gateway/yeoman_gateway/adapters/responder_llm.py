@@ -128,6 +128,7 @@ class LLMResponder(ResponderPort):
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace, sessions_dir=workspace / "sessions")
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self.tools = ToolRegistry()  # type: ignore[no-untyped-call]  # boundary-any
         subagent_model_to_use = subagent_model or self.model
         self.subagents = SubagentManager(
@@ -932,6 +933,51 @@ class LLMResponder(ResponderPort):
         return self._talkative_message_for(content)
 
     async def _generate(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        content: str,
+        sender_id: str | None,
+        media: tuple[str, ...],
+        metadata: dict[str, object],
+        allowed_tools: set[str],
+        persona_text: str | None,
+        talkative_cooldown_enabled: bool = False,
+        talkative_cooldown_streak_threshold: int = 7,
+        talkative_cooldown_topic_overlap_threshold: float = 0.34,
+        talkative_cooldown_cooldown_seconds: int = 900,
+        talkative_cooldown_delay_seconds: float = 2.5,
+        talkative_cooldown_use_llm_message: bool = False,
+        is_owner: bool = False,
+        model_profile: str | None = None,
+    ) -> str:
+        # Serialize concurrent calls for the same session to prevent session
+        # state corruption (lost messages, overwritten saves).
+        lock = self._session_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            return await self._generate_locked(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                sender_id=sender_id,
+                media=media,
+                metadata=metadata,
+                allowed_tools=allowed_tools,
+                persona_text=persona_text,
+                talkative_cooldown_enabled=talkative_cooldown_enabled,
+                talkative_cooldown_streak_threshold=talkative_cooldown_streak_threshold,
+                talkative_cooldown_topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
+                talkative_cooldown_cooldown_seconds=talkative_cooldown_cooldown_seconds,
+                talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
+                talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
+                is_owner=is_owner,
+                model_profile=model_profile,
+            )
+
+    async def _generate_locked(
         self,
         *,
         session_key: str,
