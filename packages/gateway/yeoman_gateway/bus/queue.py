@@ -8,8 +8,8 @@ from loguru import logger
 from yeoman_gateway.bus.events import (
     GatewayEvent,
     InboundMessage,
-    OverseerCommand,
     OutboundMessage,
+    OverseerCommand,
     ReactionMessage,
 )
 
