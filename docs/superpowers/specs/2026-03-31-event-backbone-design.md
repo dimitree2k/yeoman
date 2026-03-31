@@ -69,8 +69,9 @@ All are frozen dataclasses, same pattern as `core/intents.py`.
 New members on the existing `MessageBus` class in `bus/queue.py`:
 
 ```python
-# New queue alongside inbound/outbound/reaction
-self._event_queue: asyncio.Queue[GatewayEvent]
+# Two new queues — separated so webhook floods cannot starve IPC commands
+self._event_queue: asyncio.Queue[GatewayEvent]    # WebhookEvent, SystemEvent (bounded)
+self._ipc_queue: asyncio.Queue[OverseerCommand]    # OverseerCommand only (unbounded)
 
 # Typed handler registry (keyed by event class name)
 self._event_handlers: dict[str, list[Callable[[GatewayEvent], Awaitable[None]]]]
@@ -78,12 +79,16 @@ self._event_handlers: dict[str, list[Callable[[GatewayEvent], Awaitable[None]]]]
 # Public API
 def subscribe_event(self, event_type: str, handler: Callable) -> None: ...
 async def publish_event(self, event: GatewayEvent) -> None: ...
-async def dispatch_events(self) -> None:  # background loop
+async def dispatch_events(self) -> None:  # background loop for both queues
 ```
 
 The existing `inbound`/`outbound`/`reaction` queues stay untouched. Chat
-messages flow through them exactly as before. The event system is additive — a
-fourth queue with its own dispatch loop.
+messages flow through them exactly as before. The event system is additive.
+
+**Queue isolation**: `OverseerCommand` gets its own unbounded queue. A burst of
+webhook events can fill and drop from `_event_queue` without affecting IPC
+commands. This prevents a noisy external source from starving critical internal
+communication.
 
 ### Subscribers
 
@@ -201,6 +206,24 @@ class IpcConfig(BaseModel):
 | `yeoman_gateway/app/bootstrap.py` | Start gateway socket in `GatewayRuntime.run()` |
 | `yeoman_shared/config/schema.py` | Add `IpcConfig` section |
 
+### Connection lifecycle and resilience
+
+Process startup order is not guaranteed. The overseer may restart while the
+gateway is running, or vice versa. Both client implementations
+(`overseer_client.py`, `gateway/client.py`) must handle dead sockets gracefully:
+
+- **Connect on first use, not on startup.** Clients open the socket lazily when
+  the first command is sent, not during `__init__`.
+- **Retry with backoff on connection failure.** If the socket is unavailable,
+  retry up to 3 times with 1s/2s/4s delays. If all retries fail, log a warning
+  and return an error response to the caller — never crash the host process.
+- **No persistent connections.** Each command opens a connection, sends the
+  request, reads the response, and closes. This avoids stale connection state
+  after a peer restart.
+- **Socket file cleanup on startup.** Each server removes its own stale `.sock`
+  file before binding (standard Unix socket pattern — prevents "address already
+  in use" after unclean shutdown).
+
 ### Dependencies
 
 Zero. `asyncio.start_unix_server` / `asyncio.open_unix_connection` (stdlib).
@@ -260,8 +283,13 @@ Minimal, source-specific extractors. No external libraries for payload parsing:
 def _normalize_webhook(source: str, event_type: str, payload: dict) -> str:
     if source == "github":
         return _normalize_github(event_type, payload)
-    # Generic fallback: truncated JSON
-    return f"[Webhook: {source}] {event_type}: {json.dumps(payload)[:500]}"
+    # Generic fallback: pretty-printed JSON truncated to 1000 chars.
+    # The LLM is smart enough to read raw JSON from unknown sources
+    # (smart home sensors, calendar events, etc.) without a dedicated normalizer.
+    raw = json.dumps(payload, indent=2, default=str)
+    if len(raw) > 1000:
+        raw = raw[:1000] + "\n...[truncated]"
+    return f"[Webhook: {source}] event={event_type}\n{raw}"
 
 def _normalize_github(event_type: str, payload: dict) -> str:
     repo = payload.get("repository", {}).get("full_name", "unknown")

@@ -89,6 +89,7 @@ After a job completes and produces output, three outcomes:
 next_job = cron.get_job(current_job.payload.next_job_id)
 if not next_job:
     logger.warning("chained job {} not found", current_job.payload.next_job_id)
+    await _notify_owner(f"Workflow chain broken: job {current_job.payload.next_job_id} not found.")
     return
 
 # Depth guard
@@ -98,9 +99,13 @@ if remaining <= 0:
     return
 
 # Build prompt with optional output passing
+_MAX_PREVIOUS_OUTPUT_CHARS = 4000  # ~1000 tokens — protects context window
 if next_job.payload.input_from_previous:
+    truncated = job_output[:_MAX_PREVIOUS_OUTPUT_CHARS]
+    if len(job_output) > _MAX_PREVIOUS_OUTPUT_CHARS:
+        truncated += "\n...[truncated]"
     prompt = (
-        f"[Previous step output]\n{job_output}\n\n"
+        f"[Previous step output]\n{truncated}\n\n"
         f"[Your task]\n{next_job.payload.message}"
     )
 else:
@@ -156,6 +161,11 @@ class PendingApproval:
 
 Persisted as JSON at `~/.yeoman/data/cron/pending_approvals.json`. Loaded on
 startup. Checked on every inbound owner message.
+
+**Concurrency**: All reads and writes to the JSON file are protected by an
+`asyncio.Lock()` in the `WorkflowState` manager. This prevents corruption if
+two workflows reach approval gates simultaneously. Writes use atomic
+temp-file + rename (same pattern as `CronService` job persistence).
 
 ### Step 3: Match approval in pipeline
 
@@ -228,6 +238,24 @@ Chained jobs use the same `process_direct()` path as regular cron jobs. Each
 agent turn passes through `SecurityPort`. No privilege escalation possible —
 the chained job cannot gain tools or permissions the originating job didn't have.
 
+### Chain failure handling
+
+When a chained job fails (LLM error, tool timeout, `process_direct()` raises):
+
+1. **The chain halts.** The next job is not triggered.
+2. **Owner is notified.** A message is sent to the workflow's `approval_channel`
+   (or the originating job's `deliver_to`):
+   `"Workflow 'weekly-summary' failed at step 2: Error calling LLM: 429 Too Many Requests.
+   The remaining steps have been paused. Use /cron workflow_list to review."`
+3. **The workflow is not destroyed.** Failed workflows stay in place so the owner
+   can manually trigger the failed step with `/cron run <job_id>` after the issue
+   is resolved. The chain resumes from that point.
+
+Detection: `process_direct()` returns a string. If the response starts with
+`"Error calling LLM:"` (the existing error-as-content pattern from
+`LiteLLMProvider.chat()`), treat it as a failure. Also wrap the call in
+try/except for unexpected exceptions.
+
 ### Cost control
 
 Each step is one `process_direct()` call — same token budget as any cron job.
@@ -274,22 +302,55 @@ Workflow: weekly-family-summary
 
 ### Workflow creation by agent
 
-The agent creates multi-step workflows by calling `cron add` multiple times and
-chaining via `chain_to`. No special "create workflow" command needed — the
-agent composes jobs naturally:
+**Primary method: `add_workflow` batch action.** LLMs are bad at relational ID
+chaining across multiple tool calls — they hallucinate job IDs, forget to link
+steps, or get confused about ordering. A single batch call eliminates this:
 
+```python
+"add_workflow": {
+    "type": "object",
+    "properties": {
+        "workflow_name": {"type": "string"},
+        "trigger": {"type": "string", "description": "Cron expression for step 1"},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "requires_approval": {"type": "boolean", "default": false},
+                    "deliver": {"type": "boolean", "default": false},
+                    "to": {"type": "string"}
+                },
+                "required": ["message"]
+            },
+            "minItems": 2,
+            "maxItems": 5
+        }
+    },
+    "required": ["workflow_name", "trigger", "steps"]
+}
 ```
-1. cron add "Pull my calendar for this week" cron="0 9 * * 1" workflow_name="weekly-summary"
-   → returns job_id: "abc123"
 
-2. cron add "Summarize the calendar" chain_to=None requires_approval=true workflow_name="weekly-summary"
-   → returns job_id: "def456"
-   → then: cron update abc123 chain_to=def456
+The tool internally creates N `CronJob` entries and wires `next_job_id` and
+`input_from_previous` between them. The agent never handles job IDs.
 
-3. cron add "Send summary to family group" deliver=true to="family-jid" workflow_name="weekly-summary"
-   → returns job_id: "ghi789"
-   → then: cron update def456 chain_to=ghi789
+Example tool call:
+```json
+{
+    "action": "add_workflow",
+    "workflow_name": "weekly-summary",
+    "trigger": "0 9 * * 1",
+    "steps": [
+        {"message": "Pull my calendar for this week and summarize it"},
+        {"message": "Present the summary for review", "requires_approval": true},
+        {"message": "Send the approved summary to the family group", "deliver": true, "to": "family-jid"}
+    ]
+}
 ```
+
+**Fallback method**: Individual `cron add` + `cron update` with explicit
+`chain_to` IDs. Available for advanced cases but not the expected path.
 
 ---
 
