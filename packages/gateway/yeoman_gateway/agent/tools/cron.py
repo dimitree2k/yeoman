@@ -192,11 +192,14 @@ class CronTool(Tool):
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
 
+        # Validate all steps before creating any jobs
+        for i, step in enumerate(steps):
+            if not step.get("message", ""):
+                return f"Error: step {i + 1} missing 'message'"
+
         created_jobs: list[CronJob] = []
         for i, step in enumerate(steps):
-            msg = step.get("message", "")
-            if not msg:
-                return f"Error: step {i + 1} missing 'message'"
+            msg = step["message"]
 
             if i == 0:
                 schedule = CronSchedule(kind="cron", expr=trigger)

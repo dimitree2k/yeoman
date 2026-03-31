@@ -471,17 +471,19 @@ def build_gateway_runtime(
     cron._on_approval_expired = _on_approval_expired
 
     async def _handle_approved_job(approval: PendingApproval) -> None:
+        from uuid import uuid4
         next_job = cron.get_job(approval.next_job_id)
         if not next_job:
             logger.warning("Approved job {} not found", approval.next_job_id)
             return
+        run_id = uuid4().hex[:8]
         prompt = build_chained_prompt(
             approval.previous_output, next_job.payload.message,
             input_from_previous=next_job.payload.input_from_previous,
         )
         next_job.payload.max_chain_depth = approval.remaining_depth
         response = await responder.process_direct(
-            prompt, session_key=f"cron:{next_job.id}",
+            prompt, session_key=f"cron:{next_job.id}:{run_id}",
             channel=next_job.payload.channel or "cli",
             chat_id=next_job.payload.to or "direct",
             model_profile=next_job.payload.model_profile,
@@ -492,7 +494,7 @@ def build_gateway_runtime(
                 chat_id=next_job.payload.to, content=response or "",
             ))
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
-            await _handle_chain(next_job, response)
+            await _handle_chain(next_job, response, run_id)
 
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
@@ -582,11 +584,13 @@ def build_gateway_runtime(
                     content=f"Workflow '{wf_name}' failed at step {job.payload.workflow_step}: {response[:200]}. Use /cron workflow_list to review.",
                 ))
             else:
-                await _handle_chain(job, response)
+                from uuid import uuid4
+                run_id = uuid4().hex[:8]
+                await _handle_chain(job, response, run_id)
 
         return response
 
-    async def _handle_chain(job: CronJob, output: str) -> None:
+    async def _handle_chain(job: CronJob, output: str, run_id: str = "") -> None:
         next_job = cron.get_job(job.payload.next_job_id) if job.payload.next_job_id else None
         if not next_job:
             logger.warning("Chained job {} not found", job.payload.next_job_id)
@@ -634,7 +638,7 @@ def build_gateway_runtime(
             next_job.payload.max_chain_depth = remaining
             chain_response = await responder.process_direct(
                 prompt,
-                session_key=f"cron:{next_job.id}",
+                session_key=f"cron:{next_job.id}:{run_id}",
                 channel=next_job.payload.channel or "cli",
                 chat_id=next_job.payload.to or "direct",
                 model_profile=next_job.payload.model_profile,
@@ -646,7 +650,7 @@ def build_gateway_runtime(
                     content=chain_response or "",
                 ))
             if next_job.payload.next_job_id and chain_response is not None and not is_chain_failure(chain_response):
-                await _handle_chain(next_job, chain_response)
+                await _handle_chain(next_job, chain_response, run_id)
 
     cron.on_job = on_cron_job
 

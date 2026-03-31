@@ -67,10 +67,13 @@ class WorkflowState:
 
     async def match_and_consume(self, text: str) -> PendingApproval | None:
         async with self._lock:
+            now = time.time()
             for i, a in enumerate(self._approvals):
                 if a.approval_id == text:
                     consumed = self._approvals.pop(i)
                     self._save()
+                    if consumed.expires_at < now:
+                        return None  # Expired — don't honor it
                     return consumed
             return None
 
