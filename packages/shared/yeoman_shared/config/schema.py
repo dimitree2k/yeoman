@@ -460,11 +460,36 @@ class SecurityConfig(BaseModel):
     redact_placeholder: str = str(DEFAULT_SECURITY["redact_placeholder"])
 
 
+class IpcConfig(BaseModel):
+    """Inter-process communication configuration."""
+
+    gateway_socket_path: str = "~/.yeoman/run/gateway.sock"
+    overseer_socket_path: str = "~/.yeoman/run/overseer.sock"
+    command_rate_limit: int = 10  # max commands per second
+
+
+class WebhookSourceConfig(BaseModel):
+    """Configuration for a single webhook source."""
+
+    secret_env: str  # env var name holding HMAC secret
+    deliver_to: dict[str, str]  # {"channel": "whatsapp", "chat_id": "..."}
+    allowed_events: list[str] | None = None  # None = allow all, [] = block all
+    rate_limit: int = 30  # requests per minute
+
+
+class WebhooksConfig(BaseModel):
+    """Webhook ingestion configuration."""
+
+    enabled: bool = False
+    sources: dict[str, WebhookSourceConfig] = Field(default_factory=dict)
+
+
 class BusConfig(BaseModel):
     """Message bus configuration."""
 
     inbound_maxsize: int = 2000
     outbound_maxsize: int = 2000
+    event_maxsize: int = 100
 
 
 class Config(BaseSettings):
@@ -485,6 +510,8 @@ class Config(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     bus: BusConfig = Field(default_factory=BusConfig)
+    ipc: IpcConfig = Field(default_factory=IpcConfig)
+    webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
 
     @property
     def workspace_path(self) -> Path:
