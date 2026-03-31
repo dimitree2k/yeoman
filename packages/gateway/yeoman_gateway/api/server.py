@@ -26,10 +26,11 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
-
-    from yeoman_gateway.channels.manager import ChannelManager
     from yeoman_shared.config.loader import Config
     from yeoman_shared.telemetry.base import TelemetryPort
+
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.channels.manager import ChannelManager
 
 
 @dataclass
@@ -107,6 +108,7 @@ def create_app(
     channel_manager: ChannelManager | None = None,
     telemetry: TelemetryPort | None = None,
     api_config: APIConfig | None = None,
+    bus: "MessageBus | None" = None,
 ) -> "FastAPI":
     """Create the FastAPI application.
 
@@ -145,7 +147,17 @@ def create_app(
         lifespan=lifespan,
     )
 
-    def verify_auth(request: Request, credentials: HTTPAuthorizationCredentials | None = None) -> None:
+    # Mount webhook router if configured and bus available
+    if bus and config.webhooks.enabled:
+        from yeoman_gateway.api.webhooks import create_webhook_router
+
+        webhook_router = create_webhook_router(config.webhooks, bus)
+        app.include_router(webhook_router)
+        logger.info("Webhook router mounted with {} source(s)", len(config.webhooks.sources))
+
+    def verify_auth(
+        request: Request, credentials: HTTPAuthorizationCredentials | None = None
+    ) -> None:
         """Verify authentication for protected endpoints."""
         if not api_config.auth_token:
             # No auth token configured - allow all (development mode)

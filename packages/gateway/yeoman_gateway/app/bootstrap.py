@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, assert_never
 
 from loguru import logger
+from yeoman_shared.telemetry import InMemoryTelemetry, tracing
 
 from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
 from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
@@ -45,12 +46,13 @@ from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.storage.inbound_archive import InboundArchive
-from yeoman_shared.telemetry import InMemoryTelemetry, tracing
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from yeoman_shared.config.schema import Config, ExecToolConfig
+
+    from yeoman_gateway.ipc.gateway_socket import GatewaySocket
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.providers.base import LLMProvider
 
@@ -223,17 +225,22 @@ class GatewayRuntime:
     responder: LLMResponder
     memory: MemoryService
     contacts: ContactsService
+    gateway_socket: "GatewaySocket | None" = None
 
     async def run(self) -> None:
         tracing.init()
         try:
             await self.cron.start()
             await self.heartbeat.start()
+            if self.gateway_socket:
+                await self.gateway_socket.start()
             await asyncio.gather(
                 self.orchestrator.run(),
                 self.channels.start_all(),
             )
         finally:
+            if self.gateway_socket:
+                await self.gateway_socket.stop()
             self.heartbeat.stop()
             self.cron.stop()
             self.orchestrator.stop()
@@ -541,6 +548,51 @@ def build_gateway_runtime(
         memory=memory_service,
     )
 
+    # IPC socket for overseer commands
+    import time
+    from pathlib import Path
+
+    from yeoman_gateway.ipc.gateway_socket import GatewaySocket
+
+    ipc_config = config.ipc
+    socket_path = Path(ipc_config.gateway_socket_path).expanduser()
+
+    async def ipc_send_message(channel: str, chat_id: str, content: str) -> dict:
+        await bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+        )
+        return {"delivered": True}
+
+    async def ipc_trigger_agent_turn(
+        prompt: str,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        model_profile: str | None = None,
+    ) -> dict:
+        response = await responder.process_direct(
+            prompt,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            model_profile=model_profile,
+        )
+        return {"response": response}
+
+    async def ipc_publish_event(kind: str, detail: dict) -> dict:
+        from yeoman_gateway.bus.events import SystemEvent
+
+        await bus.publish_event(SystemEvent(kind=kind, detail=detail, timestamp=time.time()))
+        return {"published": True}
+
+    gateway_socket = GatewaySocket(
+        path=socket_path,
+        send_message_handler=ipc_send_message,
+        trigger_agent_turn_handler=ipc_trigger_agent_turn,
+        publish_event_handler=ipc_publish_event,
+        rate_limit=ipc_config.command_rate_limit,
+    )
+
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -550,4 +602,5 @@ def build_gateway_runtime(
         responder=responder,
         memory=memory_service,
         contacts=contacts_service,
+        gateway_socket=gateway_socket,
     )
