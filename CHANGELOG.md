@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.0 — Mar 2026
+
+### Autonomous Workflows
+- Added multi-step workflow support to the CronService with job chaining, approval gates, and output passing between steps.
+- Extended `CronPayload` with workflow fields: `next_job_id`, `requires_approval`, `approval_channel`, `input_from_previous`, `workflow_id`, `workflow_step`, `max_chain_depth`.
+- Added `WorkflowState` manager for pending approval gates with atomic JSON persistence and asyncio-safe concurrency.
+- Added workflow chain helpers: `build_chained_prompt` (truncated output injection), `detect_chain_cycle`, `is_chain_failure`.
+- Wired chaining logic into `on_cron_job` bootstrap callback with recursive `_handle_chain` supporting direct chains and approval-gated chains.
+- Added `ApprovalMiddleware` to the pipeline — intercepts owner messages matching `wf-approve-*` codes, consumes the approval, and triggers the next workflow step.
+- Added `add_workflow` and `workflow_list` actions to the CronTool for batch workflow creation and status display.
+- Added approval expiry check to the CronService timer loop with owner notification on expiry.
+- Session keys now include a per-run UUID to isolate recurring workflow executions.
+
 ## v0.8.0 — Mar 2026
 
 ### Event Backbone

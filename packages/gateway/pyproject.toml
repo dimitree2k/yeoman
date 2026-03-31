@@ -1,6 +1,6 @@
 [project]
 name = "yeoman-gateway"
-version = "0.8.0"
+version = "0.9.0"
 description = "Yeoman gateway — message processing and agent runtime"
 requires-python = ">=3.14"
 dependencies = [

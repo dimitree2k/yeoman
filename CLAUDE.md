@@ -1,7 +1,7 @@
 # yeoman — Source Code
 
 Lightweight, policy-first personal AI assistant runtime (~18k core lines).
-Version: **0.8.0**
+Version: **0.9.0**
 
 
 ## Quick Reference
