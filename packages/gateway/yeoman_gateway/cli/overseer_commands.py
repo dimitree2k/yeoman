@@ -1,4 +1,5 @@
 """CLI commands for yeoman-overseer management."""
+
 from __future__ import annotations
 
 import asyncio
@@ -123,6 +124,36 @@ def stop() -> None:
 
 
 @overseer_app.command()
+def restart(
+    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground"),
+) -> None:
+    """Restart the overseer service (stop + start)."""
+    import time
+
+    pid_path = _pid_path()
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            typer.echo(f"Stopping overseer (PID {pid})...")
+            for _ in range(50):  # wait up to 5s
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                typer.echo("Overseer did not stop in time, proceeding anyway")
+            pid_path.unlink(missing_ok=True)
+        except ProcessLookupError:
+            pid_path.unlink(missing_ok=True)
+        except ValueError:
+            pid_path.unlink(missing_ok=True)
+
+    start(foreground=foreground)
+
+
+@overseer_app.command()
 def status() -> None:
     """Show overseer status."""
     pid_path = _pid_path()
@@ -142,7 +173,9 @@ def status() -> None:
         state = json.loads(state_path.read_text())
         typer.echo(f"Last heartbeat: {state.get('heartbeat_ts', 'never')}")
         budget = state.get("budget", {})
-        typer.echo(f"Budget: actions/hr={budget.get('actions_hour', 0)}, llm/day={budget.get('llm_daily', 0)}")
+        typer.echo(
+            f"Budget: actions/hr={budget.get('actions_hour', 0)}, llm/day={budget.get('llm_daily', 0)}"
+        )
 
 
 @overseer_app.command()
@@ -162,7 +195,9 @@ def runbooks() -> None:
 
     for rb in rbs:
         rb_status = "enabled" if rb.meta.enabled else "disabled"
-        typer.echo(f"  {rb.meta.name:30s} {rb.meta.domain:12s} {rb.meta.trigger.kind:6s} {rb_status}")
+        typer.echo(
+            f"  {rb.meta.name:30s} {rb.meta.domain:12s} {rb.meta.trigger.kind:6s} {rb_status}"
+        )
 
 
 @overseer_app.command()
@@ -237,15 +272,16 @@ def trigger(
         )
 
         config = OverseerConfig()
-        budget = BudgetTracker(state, calls_per_day=config.llm_calls_per_day,
-                               tokens_per_day=config.llm_tokens_per_day)
+        budget = BudgetTracker(
+            state, calls_per_day=config.llm_calls_per_day, tokens_per_day=config.llm_tokens_per_day
+        )
         agent = AgentLoop(tool_ctx=tool_ctx, budget=budget, config=raw_config)
 
         typer.echo(f"Triggering {runbook.meta.name}...")
         check_result = CheckResult(value=True, detail="manual trigger")
         try:
             result = await agent.run(runbook, {"check": True, "message": "manual trigger"})
-            typer.echo(f"\n{'='*60}")
+            typer.echo(f"\n{'=' * 60}")
             typer.echo(f"Result: {runbook.meta.name}")
             typer.echo(f"  Tokens: {result.tokens_used}")
             typer.echo(f"  Tool calls: {result.tool_calls_made}")
@@ -269,6 +305,7 @@ def install_units() -> None:
     import shutil
 
     from yeoman_overseer import __file__ as overseer_pkg
+
     src_dir = Path(overseer_pkg).parent / "systemd"
     dest_dir = Path.home() / ".config" / "systemd" / "user"
     dest_dir.mkdir(parents=True, exist_ok=True)
