@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, assert_never
 
 from loguru import logger
@@ -471,6 +473,13 @@ def build_gateway_runtime(
         owner_alert_resolver=policy_adapter.owner_recipients,
     )
 
+    from yeoman_gateway.cron.workflow_chain import build_chained_prompt, is_chain_failure
+    from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
+
+    workflow_state = WorkflowState(
+        store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
+    )
+
     async def on_cron_job(job: CronJob) -> str | None:
         if job.payload.kind == "voice_broadcast":
             phrases = [str(v).strip() for v in list(job.payload.voice_messages) if str(v).strip()]
@@ -525,7 +534,83 @@ def build_gateway_runtime(
                     content=response or "",
                 )
             )
+
+        # Workflow chaining
+        if job.payload.next_job_id and response is not None:
+            if is_chain_failure(response):
+                fail_channel = job.payload.approval_channel or job.payload.channel or "cli"
+                fail_chat = job.payload.to or "direct"
+                wf_name = job.payload.workflow_id or job.id
+                await bus.publish_outbound(OutboundMessage(
+                    channel=fail_channel, chat_id=fail_chat,
+                    content=f"Workflow '{wf_name}' failed at step {job.payload.workflow_step}: {response[:200]}. Use /cron workflow_list to review.",
+                ))
+            else:
+                await _handle_chain(job, response)
+
         return response
+
+    async def _handle_chain(job: CronJob, output: str) -> None:
+        next_job = cron.get_job(job.payload.next_job_id) if job.payload.next_job_id else None
+        if not next_job:
+            logger.warning("Chained job {} not found", job.payload.next_job_id)
+            return
+
+        remaining = job.payload.max_chain_depth - 1
+        if remaining <= 0:
+            wf_name = job.payload.workflow_id or job.id
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.approval_channel or job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+                content=f"Workflow '{wf_name}' stopped: max chain depth reached.",
+            ))
+            return
+
+        if job.payload.requires_approval:
+            from uuid import uuid4
+            approval_id = f"wf-approve-{job.id}-{uuid4().hex[:8]}"
+            approval_channel = job.payload.approval_channel or job.payload.channel or "cli"
+            approval_chat = job.payload.to or "direct"
+
+            await workflow_state.add(PendingApproval(
+                approval_id=approval_id,
+                next_job_id=next_job.id,
+                previous_output=output,
+                channel=approval_channel,
+                chat_id=approval_chat,
+                created_at=time.time(),
+                expires_at=time.time() + 86400,
+                workflow_id=job.payload.workflow_id,
+                remaining_depth=remaining,
+            ))
+
+            await bus.publish_outbound(OutboundMessage(
+                channel=approval_channel, chat_id=approval_chat,
+                content=(
+                    f"{output}\n\n---\n"
+                    f"Workflow step {job.payload.workflow_step} complete.\n"
+                    f"Next: {next_job.name}\n"
+                    f"Reply with this code to approve: {approval_id}"
+                ),
+            ))
+        else:
+            prompt = build_chained_prompt(output, next_job.payload.message, input_from_previous=next_job.payload.input_from_previous)
+            next_job.payload.max_chain_depth = remaining
+            chain_response = await responder.process_direct(
+                prompt,
+                session_key=f"cron:{next_job.id}",
+                channel=next_job.payload.channel or "cli",
+                chat_id=next_job.payload.to or "direct",
+                model_profile=next_job.payload.model_profile,
+            )
+            if next_job.payload.deliver and next_job.payload.to:
+                await bus.publish_outbound(OutboundMessage(
+                    channel=next_job.payload.channel or "cli",
+                    chat_id=next_job.payload.to,
+                    content=chain_response or "",
+                ))
+            if next_job.payload.next_job_id and chain_response is not None and not is_chain_failure(chain_response):
+                await _handle_chain(next_job, chain_response)
 
     cron.on_job = on_cron_job
 
@@ -553,9 +638,6 @@ def build_gateway_runtime(
     )
 
     # IPC socket for overseer commands
-    import time
-    from pathlib import Path
-
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 
     ipc_config = config.ipc
