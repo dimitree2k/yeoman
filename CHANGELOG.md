@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.8.0 — Mar 2026
+
+### Event Backbone
+- Added typed event pub/sub to the message bus: `WebhookEvent`, `OverseerCommand`, `SystemEvent` frozen dataclasses with a `GatewayEvent` union type.
+- Extended `MessageBus` with a bounded event queue and an unbounded IPC queue (overseer commands are never dropped), plus `subscribe_event` / `publish_event` / `dispatch_events` methods.
+- Added `IpcConfig`, `WebhookSourceConfig`, and `WebhooksConfig` to the shared config schema.
+
+### IPC (Gateway ↔ Overseer)
+- Added `GatewaySocket` — Unix domain socket server receiving commands from the overseer (send_message, trigger_agent_turn, publish_event, get_session_state, ping). Rate-limited, `chmod 0o600`.
+- Added `OverseerClient` — gateway-side client for querying the overseer socket with connect-per-command retry and exponential backoff.
+- Added `GatewayClient` — overseer-side client for sending commands to the gateway socket (send_message, trigger_agent_turn, publish_event, notify_runbook_result).
+- Added `get_runbook_status` command to the overseer socket server.
+
+### Webhooks
+- Added HMAC-SHA256 verified webhook router (`/webhooks/{source}`) mounted on the existing FastAPI server.
+- GitHub-specific payload normalization for push and pull_request events; generic truncated JSON fallback for other sources.
+- Per-source rate limiting and event type filtering via config.
+
+### Wiring
+- Wired event dispatch loop, IPC socket lifecycle, and webhook router into the gateway bootstrap and runtime.
+
 ## v0.7.1 — Mar 2026
 
 ### Provider & Performance
