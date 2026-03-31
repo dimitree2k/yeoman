@@ -5,7 +5,13 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
-from yeoman_gateway.bus.events import InboundMessage, OutboundMessage, ReactionMessage
+from yeoman_gateway.bus.events import (
+    GatewayEvent,
+    InboundMessage,
+    OverseerCommand,
+    OutboundMessage,
+    ReactionMessage,
+)
 
 
 class MessageBus:
@@ -17,7 +23,12 @@ class MessageBus:
     """
 
     def __init__(
-        self, *, inbound_maxsize: int = 0, outbound_maxsize: int = 0, reaction_maxsize: int = 0
+        self,
+        *,
+        inbound_maxsize: int = 0,
+        outbound_maxsize: int = 0,
+        reaction_maxsize: int = 0,
+        event_maxsize: int = 100,
     ):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=max(0, inbound_maxsize))
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(
@@ -32,10 +43,16 @@ class MessageBus:
         self._reaction_subscribers: dict[
             str, list[Callable[[ReactionMessage], Awaitable[None]]]
         ] = {}
+        self._event_queue: asyncio.Queue[GatewayEvent] = asyncio.Queue(
+            maxsize=max(0, event_maxsize)
+        )
+        self._ipc_queue: asyncio.Queue[OverseerCommand] = asyncio.Queue()  # unbounded
+        self._event_handlers: dict[str, list[Callable[[GatewayEvent], Awaitable[None]]]] = {}
         self._running = False
         self._inbound_dropped = 0
         self._outbound_dropped = 0
         self._reaction_dropped = 0
+        self._event_dropped = 0
 
     async def _put_bounded(self, queue: asyncio.Queue, msg: object, channel: str) -> None:
         if queue.maxsize > 0 and queue.full():
@@ -44,6 +61,9 @@ class MessageBus:
                 if channel == "inbound":
                     self._inbound_dropped += 1
                     dropped = self._inbound_dropped
+                elif channel == "event":
+                    self._event_dropped += 1
+                    dropped = self._event_dropped
                 else:
                     self._outbound_dropped += 1
                     dropped = self._outbound_dropped
@@ -92,6 +112,42 @@ class MessageBus:
         if channel not in self._outbound_subscribers:
             self._outbound_subscribers[channel] = []
         self._outbound_subscribers[channel].append(callback)
+
+    def subscribe_event(
+        self, event_type: str, handler: Callable[[GatewayEvent], Awaitable[None]]
+    ) -> None:
+        """Subscribe to a specific event type by class name."""
+        if event_type not in self._event_handlers:
+            self._event_handlers[event_type] = []
+        self._event_handlers[event_type].append(handler)
+
+    async def publish_event(self, event: GatewayEvent) -> None:
+        """Publish an event. OverseerCommands go to unbounded IPC queue, others to bounded event queue."""
+        if isinstance(event, OverseerCommand):
+            await self._ipc_queue.put(event)
+        else:
+            await self._put_bounded(self._event_queue, event, "event")
+
+    async def dispatch_events(self) -> None:
+        """Dispatch events from both event and IPC queues to handlers."""
+        self._running = True
+        while self._running:
+            # Drain both queues with short timeout
+            dispatched = False
+            for queue in (self._ipc_queue, self._event_queue):
+                try:
+                    event = queue.get_nowait()
+                    type_name = type(event).__name__
+                    for handler in self._event_handlers.get(type_name, []):
+                        try:
+                            await handler(event)
+                        except Exception as e:
+                            logger.error(f"Error dispatching {type_name}: {e}")
+                    dispatched = True
+                except asyncio.QueueEmpty:
+                    continue
+            if not dispatched:
+                await asyncio.sleep(0.05)
 
     async def dispatch_outbound(self) -> None:
         """
@@ -159,3 +215,8 @@ class MessageBus:
     def reaction_dropped(self) -> int:
         """Number of dropped reaction messages due to queue overflow."""
         return self._reaction_dropped
+
+    @property
+    def event_dropped(self) -> int:
+        """Number of dropped events due to queue overflow."""
+        return self._event_dropped
