@@ -6,7 +6,7 @@ from typing import Any
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.cron.service import CronService
-from yeoman_gateway.cron.types import CronSchedule
+from yeoman_gateway.cron.types import CronJob, CronSchedule
 
 
 class CronTool(Tool):
@@ -28,7 +28,7 @@ class CronTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove. Supports one-shot via at."
+        return "Schedule reminders, recurring tasks, and multi-step workflows. Actions: add, add_workflow, list, workflow_list, remove."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -37,7 +37,7 @@ class CronTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "list", "remove"],
+                    "enum": ["add", "add_workflow", "list", "workflow_list", "remove"],
                     "description": "Action to perform"
                 },
                 "message": {
@@ -59,6 +59,29 @@ class CronTool(Tool):
                 "job_id": {
                     "type": "string",
                     "description": "Job ID (for remove)"
+                },
+                "workflow_name": {
+                    "type": "string",
+                    "description": "Name for a multi-step workflow (for add_workflow)"
+                },
+                "trigger": {
+                    "type": "string",
+                    "description": "Cron expression for the first step (for add_workflow)"
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "Workflow steps (for add_workflow). Each has: message (required), requires_approval (bool), deliver (bool), to (string).",
+                    "items": {"type": "object"},
+                    "minItems": 2,
+                    "maxItems": 5
+                },
+                "chain_to": {
+                    "type": "string",
+                    "description": "Job ID to trigger after this job completes (for add)"
+                },
+                "requires_approval": {
+                    "type": "boolean",
+                    "description": "Pause for owner approval before chained job (for add)"
                 }
             },
             "required": ["action"]
@@ -72,12 +95,21 @@ class CronTool(Tool):
         cron_expr: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        workflow_name: str = "",
+        trigger: str = "",
+        steps: list[dict] | None = None,
+        chain_to: str | None = None,
+        requires_approval: bool = False,
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, at)
+            return self._add_job(message, every_seconds, cron_expr, at, chain_to=chain_to, requires_approval=requires_approval)
+        elif action == "add_workflow":
+            return self._add_workflow(workflow_name, trigger, steps or [])
         elif action == "list":
             return self._list_jobs()
+        elif action == "workflow_list":
+            return self._workflow_list()
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
@@ -101,6 +133,8 @@ class CronTool(Tool):
         every_seconds: int | None,
         cron_expr: str | None,
         at: str | None,
+        chain_to: str | None = None,
+        requires_approval: bool = False,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -140,7 +174,86 @@ class CronTool(Tool):
             to=self._chat_id,
             delete_after_run=delete_after_run,
         )
+        if chain_to:
+            job.payload.next_job_id = chain_to
+            job.payload.requires_approval = requires_approval
+            self._cron._save_store()
         return f"Created job '{job.name}' (id: {job.id})"
+
+    def _add_workflow(self, workflow_name: str, trigger: str, steps: list[dict]) -> str:
+        if not workflow_name:
+            return "Error: workflow_name is required"
+        if not trigger:
+            return "Error: trigger (cron expression) is required"
+        if len(steps) < 2:
+            return "Error: workflow needs at least 2 steps"
+        if len(steps) > 5:
+            return "Error: workflow limited to 5 steps"
+        if not self._channel or not self._chat_id:
+            return "Error: no session context (channel/chat_id)"
+
+        created_jobs: list[CronJob] = []
+        for i, step in enumerate(steps):
+            msg = step.get("message", "")
+            if not msg:
+                return f"Error: step {i + 1} missing 'message'"
+
+            if i == 0:
+                schedule = CronSchedule(kind="cron", expr=trigger)
+            else:
+                schedule = CronSchedule(kind="at", at_ms=0)
+
+            deliver = bool(step.get("deliver", False))
+            to = step.get("to", self._chat_id)
+
+            job = self._cron.add_job(
+                name=f"{workflow_name}:{i + 1}",
+                schedule=schedule,
+                message=msg,
+                deliver=deliver,
+                channel=self._channel,
+                to=to,
+                delete_after_run=False,
+            )
+            job.payload.workflow_id = workflow_name
+            job.payload.workflow_step = i
+            job.payload.requires_approval = bool(step.get("requires_approval", False))
+            job.payload.input_from_previous = i > 0
+            created_jobs.append(job)
+
+            if i > 0:
+                job.enabled = False
+
+        for i in range(len(created_jobs) - 1):
+            created_jobs[i].payload.next_job_id = created_jobs[i + 1].id
+
+        self._cron._save_store()
+
+        job_ids = ", ".join(j.id for j in created_jobs)
+        return f"Created workflow '{workflow_name}' with {len(created_jobs)} steps (ids: {job_ids})"
+
+    def _workflow_list(self) -> str:
+        jobs = self._cron.list_jobs(include_disabled=True)
+        workflows: dict[str, list[CronJob]] = {}
+        for job in jobs:
+            wf_id = job.payload.workflow_id
+            if wf_id:
+                if wf_id not in workflows:
+                    workflows[wf_id] = []
+                workflows[wf_id].append(job)
+
+        if not workflows:
+            return "No active workflows."
+
+        lines = []
+        for wf_id, wf_jobs in workflows.items():
+            wf_jobs.sort(key=lambda j: j.payload.workflow_step)
+            lines.append(f"Workflow: {wf_id}")
+            for job in wf_jobs:
+                status = job.state.last_status or "waiting"
+                lines.append(f"  Step {job.payload.workflow_step + 1}: {job.name} — {status}")
+            lines.append("")
+        return "\n".join(lines).strip()
 
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()
