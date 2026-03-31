@@ -47,10 +47,14 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         sessions_dir: Path | None = None,
+        workflow_state: Any | None = None,
+        on_approval_expired: Callable[..., Coroutine[Any, Any, None]] | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
         self.sessions_dir = sessions_dir
+        self._workflow_state = workflow_state
+        self._on_approval_expired = on_approval_expired
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -290,6 +294,17 @@ class CronService:
 
         for job in due_jobs:
             await self._execute_job(job)
+
+        # Check for expired workflow approvals
+        if self._workflow_state:
+            try:
+                expired = await self._workflow_state.purge_expired()
+                for approval in expired:
+                    logger.info("Workflow approval expired: {}", approval.approval_id)
+                    if self._on_approval_expired:
+                        await self._on_approval_expired(approval)
+            except Exception as e:
+                logger.warning("Error checking approval expiry: {}", e)
 
         self._save_store()
         self._arm_timer()

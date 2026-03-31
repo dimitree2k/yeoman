@@ -460,6 +460,16 @@ def build_gateway_runtime(
         store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
     )
 
+    async def _on_approval_expired(approval: PendingApproval) -> None:
+        await bus.publish_outbound(OutboundMessage(
+            channel=approval.channel,
+            chat_id=approval.chat_id,
+            content=f"Workflow approval expired: {approval.approval_id}. Use /cron workflow_list to review.",
+        ))
+
+    cron._workflow_state = workflow_state
+    cron._on_approval_expired = _on_approval_expired
+
     async def _handle_approved_job(approval: PendingApproval) -> None:
         next_job = cron.get_job(approval.next_job_id)
         if not next_job:
