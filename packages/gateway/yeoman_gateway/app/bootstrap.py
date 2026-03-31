@@ -453,6 +453,37 @@ def build_gateway_runtime(
 
     responder._recording_notifier = _recording_notifier
 
+    from yeoman_gateway.cron.workflow_chain import build_chained_prompt, is_chain_failure
+    from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
+
+    workflow_state = WorkflowState(
+        store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
+    )
+
+    async def _handle_approved_job(approval: PendingApproval) -> None:
+        next_job = cron.get_job(approval.next_job_id)
+        if not next_job:
+            logger.warning("Approved job {} not found", approval.next_job_id)
+            return
+        prompt = build_chained_prompt(
+            approval.previous_output, next_job.payload.message,
+            input_from_previous=next_job.payload.input_from_previous,
+        )
+        next_job.payload.max_chain_depth = approval.remaining_depth
+        response = await responder.process_direct(
+            prompt, session_key=f"cron:{next_job.id}",
+            channel=next_job.payload.channel or "cli",
+            chat_id=next_job.payload.to or "direct",
+            model_profile=next_job.payload.model_profile,
+        )
+        if next_job.payload.deliver and next_job.payload.to:
+            await bus.publish_outbound(OutboundMessage(
+                channel=next_job.payload.channel or "cli",
+                chat_id=next_job.payload.to, content=response or "",
+            ))
+        if next_job.payload.next_job_id and response and not is_chain_failure(response):
+            await _handle_chain(next_job, response)
+
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
         policy=policy_adapter,
@@ -471,13 +502,8 @@ def build_gateway_runtime(
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         owner_alert_resolver=policy_adapter.owner_recipients,
-    )
-
-    from yeoman_gateway.cron.workflow_chain import build_chained_prompt, is_chain_failure
-    from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
-
-    workflow_state = WorkflowState(
-        store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
+        workflow_state=workflow_state,
+        approval_trigger=_handle_approved_job,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:
