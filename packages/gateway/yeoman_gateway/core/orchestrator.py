@@ -18,6 +18,7 @@ from yeoman_gateway.core.pipeline import Pipeline
 from yeoman_gateway.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
 from yeoman_gateway.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
 from yeoman_gateway.pipeline.admin import AdminCommandMiddleware
+from yeoman_gateway.pipeline.approval import ApprovalMiddleware
 from yeoman_gateway.pipeline.archive import ArchiveMiddleware
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 from yeoman_gateway.pipeline.dedup import DeduplicationMiddleware
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from yeoman_gateway.contacts.service import ContactsService
+    from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier
@@ -69,6 +71,8 @@ class Orchestrator:
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
         owner_alert_cooldown_seconds: int = 300,
+        workflow_state: "WorkflowState | None" = None,
+        approval_trigger: "Callable[[PendingApproval], Awaitable[None]] | None" = None,
     ) -> None:
         layers: list = [
             NormalizationMiddleware(),
@@ -87,6 +91,10 @@ class Orchestrator:
             ),
             AdminCommandMiddleware(handler=policy_admin_handler),
             PolicyMiddleware(policy=policy),
+        ])
+        if workflow_state and approval_trigger:
+            layers.append(ApprovalMiddleware(workflow_state=workflow_state, trigger_callback=approval_trigger))
+        layers.extend([
             IdeaCaptureMiddleware(security=security),
             AccessControlMiddleware(security=security),
             NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver),

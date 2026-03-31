@@ -47,10 +47,14 @@ class CronService:
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
         sessions_dir: Path | None = None,
+        workflow_state: Any | None = None,
+        on_approval_expired: Callable[..., Coroutine[Any, Any, None]] | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
         self.sessions_dir = sessions_dir
+        self._workflow_state = workflow_state
+        self._on_approval_expired = on_approval_expired
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
@@ -93,6 +97,13 @@ class CronService:
                             voice_max_sentences=j["payload"].get("voiceMaxSentences"),
                             voice_max_chars=j["payload"].get("voiceMaxChars"),
                             model_profile=j["payload"].get("modelProfile"),
+                            next_job_id=j["payload"].get("nextJobId"),
+                            requires_approval=bool(j["payload"].get("requiresApproval", False)),
+                            approval_channel=j["payload"].get("approvalChannel"),
+                            input_from_previous=bool(j["payload"].get("inputFromPrevious", False)),
+                            workflow_id=j["payload"].get("workflowId"),
+                            workflow_step=int(j["payload"].get("workflowStep", 0)),
+                            max_chain_depth=int(j["payload"].get("maxChainDepth", 5)),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -151,6 +162,13 @@ class CronService:
                         "voiceMaxSentences": j.payload.voice_max_sentences,
                         "voiceMaxChars": j.payload.voice_max_chars,
                         "modelProfile": j.payload.model_profile,
+                        "nextJobId": j.payload.next_job_id,
+                        "requiresApproval": j.payload.requires_approval,
+                        "approvalChannel": j.payload.approval_channel,
+                        "inputFromPrevious": j.payload.input_from_previous,
+                        "workflowId": j.payload.workflow_id,
+                        "workflowStep": j.payload.workflow_step,
+                        "maxChainDepth": j.payload.max_chain_depth,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -276,6 +294,17 @@ class CronService:
 
         for job in due_jobs:
             await self._execute_job(job)
+
+        # Check for expired workflow approvals
+        if self._workflow_state:
+            try:
+                expired = await self._workflow_state.purge_expired()
+                for approval in expired:
+                    logger.info("Workflow approval expired: {}", approval.approval_id)
+                    if self._on_approval_expired:
+                        await self._on_approval_expired(approval)
+            except Exception as e:
+                logger.warning("Error checking approval expiry: {}", e)
 
         self._save_store()
         self._arm_timer()
@@ -435,6 +464,14 @@ class CronService:
             logger.info(f"Cron: removed job {job_id}")
 
         return removed
+
+    def get_job(self, job_id: str) -> CronJob | None:
+        """Get a job by ID."""
+        store = self._load_store()
+        for job in store.jobs:
+            if job.id == job_id:
+                return job
+        return None
 
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
         """Enable or disable a job."""

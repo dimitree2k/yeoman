@@ -40,6 +40,15 @@ class CronPayload:
     voice_max_chars: int | None = None
     # Model profile override (e.g. "overseerDefault" to use a cheaper model)
     model_profile: str | None = None
+    # Workflow chaining
+    next_job_id: str | None = None
+    requires_approval: bool = False
+    approval_channel: str | None = None
+    input_from_previous: bool = False
+    # Workflow metadata
+    workflow_id: str | None = None
+    workflow_step: int = 0
+    max_chain_depth: int = 5
 
 
 @dataclass
