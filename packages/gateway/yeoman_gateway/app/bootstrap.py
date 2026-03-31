@@ -225,6 +225,7 @@ class GatewayRuntime:
     responder: LLMResponder
     memory: MemoryService
     contacts: ContactsService
+    bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
 
     async def run(self) -> None:
@@ -234,10 +235,13 @@ class GatewayRuntime:
             await self.heartbeat.start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
-            await asyncio.gather(
+            tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
-            )
+            ]
+            if self.bus:
+                tasks.append(self.bus.dispatch_events())
+            await asyncio.gather(*tasks)
         finally:
             if self.gateway_socket:
                 await self.gateway_socket.stop()
@@ -602,5 +606,6 @@ def build_gateway_runtime(
         responder=responder,
         memory=memory_service,
         contacts=contacts_service,
+        bus=bus,
         gateway_socket=gateway_socket,
     )

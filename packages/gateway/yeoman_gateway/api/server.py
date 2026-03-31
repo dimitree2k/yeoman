@@ -309,6 +309,7 @@ def run_server(
     channel_manager: ChannelManager | None = None,
     telemetry: TelemetryPort | None = None,
     api_config: APIConfig | None = None,
+    bus: "MessageBus | None" = None,
 ) -> None:
     """Run the Control Plane API server.
 
@@ -319,6 +320,7 @@ def run_server(
         channel_manager: Optional channel manager
         telemetry: Optional telemetry backend
         api_config: API-specific configuration
+        bus: Optional message bus for webhook event publishing
     """
     import uvicorn
 
@@ -328,7 +330,7 @@ def run_server(
         logger.info("Control Plane API disabled")
         return
 
-    app = create_app(config, channel_manager, telemetry, api_config)
+    app = create_app(config, channel_manager, telemetry, api_config, bus)
 
     uvicorn.run(
         app,
