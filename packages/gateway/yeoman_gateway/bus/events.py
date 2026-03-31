@@ -44,3 +44,35 @@ class ReactionMessage:
     message_id: str
     emoji: str
     participant_jid: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WebhookEvent:
+    """Event received from an external webhook."""
+
+    source: str
+    event_type: str
+    payload: dict[str, Any]
+    signature_verified: bool
+    received_at: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OverseerCommand:
+    """Command received from the overseer via IPC socket."""
+
+    command: str
+    args: dict[str, Any]
+    correlation_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SystemEvent:
+    """Internal gateway system event."""
+
+    kind: str
+    detail: dict[str, Any]
+    timestamp: float
+
+
+type GatewayEvent = WebhookEvent | OverseerCommand | SystemEvent
