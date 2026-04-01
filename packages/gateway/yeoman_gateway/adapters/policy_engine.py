@@ -1293,22 +1293,13 @@ class EnginePolicyAdapter(PolicyPort):
         )
 
     def new_session_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        if argv:
-            return AdminCommandResult(status="handled", response="Usage: /new")
-
         policy = self._load_policy_for_admin()
         if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Session boundary unavailable: policy engine is not active.",
-            )
+            return AdminCommandResult(status="ignored")
         if not self._is_whatsapp_owner(ctx, policy):
             return AdminCommandResult(status="ignored")
         if self._session_manager is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Session boundary unavailable: session manager is not configured.",
-            )
+            return AdminCommandResult(status="ignored")
 
         session_key = f"{ctx.channel}:{ctx.chat_id}"
         try:
@@ -1320,7 +1311,8 @@ class EnginePolicyAdapter(PolicyPort):
 
         return AdminCommandResult(
             status="handled",
-            response="New session started. Previous context will not be included.",
+            response=None,
+            reaction_emoji="\U0001f44d",
             command_name="new",
             outcome="applied",
             source="dm" if not ctx.is_group else "group",

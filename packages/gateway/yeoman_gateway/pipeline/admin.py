@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from yeoman_gateway.core.intents import RecordMetricIntent, SendOutboundIntent
+from yeoman_gateway.core.intents import RecordMetricIntent, SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 
@@ -87,6 +87,15 @@ class AdminCommandMiddleware:
                             chat_id=ctx.event.chat_id,
                             content=admin_result.response,
                         )
+                    )
+                )
+            if admin_result.reaction_emoji and ctx.event.message_id:
+                ctx.intents.append(
+                    SendReactionIntent(
+                        channel=ctx.event.channel,
+                        chat_id=ctx.event.chat_id,
+                        message_id=ctx.event.message_id,
+                        emoji=admin_result.reaction_emoji,
                     )
                 )
             ctx.halt()

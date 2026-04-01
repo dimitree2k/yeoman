@@ -38,6 +38,7 @@ class AdminCommandResult:
     outcome: str = ""
     source: str = ""
     dry_run: bool = False
+    reaction_emoji: str | None = None
     metric_events: tuple[AdminMetricEvent, ...] = ()
 
     @property
