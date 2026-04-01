@@ -51,3 +51,57 @@ class TestAmbientWindowSkipDM:
         mw._build_ambient_window(event)
 
         archive.lookup_messages_before.assert_called_once()
+
+
+from yeoman_gateway.session.manager import Session
+
+
+class TestSessionBoundary:
+    """Session.get_history() should stop at the most recent session_boundary."""
+
+    def test_no_boundary_returns_all(self):
+        s = Session(key="test")
+        s.add_message("user", "msg1")
+        s.add_message("assistant", "reply1")
+        s.add_message("user", "msg2")
+        s.add_message("assistant", "reply2")
+        history = s.get_history(max_messages=50)
+        assert len(history) == 4
+
+    def test_boundary_limits_history(self):
+        s = Session(key="test")
+        s.add_message("user", "old message")
+        s.add_message("assistant", "old reply")
+        s.add_boundary()
+        s.add_message("user", "new message")
+        s.add_message("assistant", "new reply")
+        history = s.get_history(max_messages=50)
+        assert len(history) == 2
+        assert history[0]["content"] == "new message"
+        assert history[1]["content"] == "new reply"
+
+    def test_multiple_boundaries_uses_latest(self):
+        s = Session(key="test")
+        s.add_message("user", "ancient")
+        s.add_boundary()
+        s.add_message("user", "old")
+        s.add_boundary()
+        s.add_message("user", "recent")
+        history = s.get_history(max_messages=50)
+        assert len(history) == 1
+        assert history[0]["content"] == "recent"
+
+    def test_boundary_with_max_messages_uses_smaller(self):
+        s = Session(key="test")
+        s.add_boundary()
+        for i in range(20):
+            s.add_message("user", f"msg {i}")
+        history = s.get_history(max_messages=5)
+        assert len(history) == 5
+
+    def test_boundary_at_end_returns_empty(self):
+        s = Session(key="test")
+        s.add_message("user", "hello")
+        s.add_boundary()
+        history = s.get_history(max_messages=50)
+        assert len(history) == 0

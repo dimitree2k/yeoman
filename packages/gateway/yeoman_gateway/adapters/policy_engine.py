@@ -172,6 +172,7 @@ class EnginePolicyAdapter(PolicyPort):
                 VoiceMessagesCommandHandler(self),
                 VoiceSendCommandHandler(self),
                 ResetSessionCommandHandler(self),
+                NewSessionCommandHandler(self),
                 ForgetCommandHandler(self),
             ]
         )
@@ -1291,6 +1292,40 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
+    def new_session_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if argv:
+            return AdminCommandResult(status="handled", response="Usage: /new")
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session boundary unavailable: policy engine is not active.",
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+        if self._session_manager is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session boundary unavailable: session manager is not configured.",
+            )
+
+        session_key = f"{ctx.channel}:{ctx.chat_id}"
+        try:
+            session = self._session_manager.get_or_create(session_key)
+            session.add_boundary()
+            self._session_manager.save(session)
+        except Exception as e:
+            return AdminCommandResult(status="handled", response=f"Session boundary failed: {e}")
+
+        return AdminCommandResult(
+            status="handled",
+            response="New session started. Previous context will not be included.",
+            command_name="new",
+            outcome="applied",
+            source="dm" if not ctx.is_group else "group",
+        )
+
     def forget_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         if not argv:
             return AdminCommandResult(
@@ -2377,6 +2412,25 @@ class ResetSessionCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/reset"
+
+
+class NewSessionCommandHandler(AdminCommandHandler):
+    """Deterministic `/new` command for inserting a session boundary."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "new"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.session_reset_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.new_session_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/new"
 
 
 class ForgetCommandHandler(AdminCommandHandler):
