@@ -5,9 +5,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-
+from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
+from yeoman_gateway.session.manager import Session, SessionManager
 
 
 def _make_event(
@@ -51,9 +52,6 @@ class TestAmbientWindowSkipDM:
         mw._build_ambient_window(event)
 
         archive.lookup_messages_before.assert_called_once()
-
-
-from yeoman_gateway.session.manager import Session
 
 
 class TestSessionBoundary:
@@ -128,11 +126,6 @@ class TestPreflightHeuristic:
         assert not _has_backward_reference("can you help me?")
 
 
-import pytest
-from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
-from yeoman_gateway.session.manager import SessionManager
-
-
 class TestRecallConversationTool:
     """recall_conversation tool should search session history."""
 
@@ -186,5 +179,75 @@ class TestRecallConversationTool:
         session_manager.save(session)
 
         result = await tool.execute(query="topic", max_messages=5)
-        lines = [l for l in result.strip().split("\n") if l.strip() and not l.startswith("Found")]
+        lines = [line for line in result.strip().split("\n") if line.strip() and not line.startswith("Found")]
         assert len(lines) <= 5
+
+
+class TestHistoryLimitResolution:
+    """Test the full resolution chain: per-chat policy > heuristic > global default."""
+
+    def test_config_defaults(self):
+        from yeoman_shared.config.schema import WhatsAppConfig
+
+        c = WhatsAppConfig()
+        assert c.session_history_limit == 15
+        assert c.session_history_limit_group == 20
+
+    def test_policy_decision_carries_limit(self):
+        from yeoman_gateway.core.models import PolicyDecision
+
+        d = PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="ok",
+            session_history_limit=30,
+        )
+        assert d.session_history_limit == 30
+
+    def test_policy_decision_defaults_to_none(self):
+        from yeoman_gateway.core.models import PolicyDecision
+
+        d = PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="ok",
+        )
+        assert d.session_history_limit is None
+
+    def test_heuristic_expansion(self):
+        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
+
+        assert _has_backward_reference("as we discussed earlier")
+        # base=20, expanded=min(20*3, 50) = 50
+        # base=15, expanded=min(15*3, 50) = 45
+
+    def test_session_boundary_and_max_messages_combined(self):
+        s = Session(key="test")
+        for i in range(30):
+            s.add_message("user", f"old msg {i}")
+        s.add_boundary()
+        for i in range(5):
+            s.add_message("user", f"new msg {i}")
+
+        # With limit=50, boundary wins (5 messages)
+        assert len(s.get_history(max_messages=50)) == 5
+        # With limit=3, max_messages wins (3 messages)
+        assert len(s.get_history(max_messages=3)) == 3
+
+    def test_boundary_persists_through_save_load(self, tmp_path):
+        """Boundary markers survive JSONL save/load cycle."""
+        mgr = SessionManager(workspace=tmp_path, sessions_dir=tmp_path / "sessions")
+        session = mgr.get_or_create("test:boundary-persist")
+        session.add_message("user", "old message")
+        session.add_boundary()
+        session.add_message("user", "new message")
+        mgr.save(session)
+
+        # Clear cache and reload
+        mgr._cache.clear()
+        reloaded = mgr.get_or_create("test:boundary-persist")
+        history = reloaded.get_history(max_messages=50)
+        assert len(history) == 1
+        assert history[0]["content"] == "new message"
