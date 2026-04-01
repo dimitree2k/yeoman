@@ -105,3 +105,24 @@ class TestSessionBoundary:
         s.add_boundary()
         history = s.get_history(max_messages=50)
         assert len(history) == 0
+
+
+class TestPreflightHeuristic:
+    """Preflight heuristic should detect backward references in messages."""
+
+    def test_detects_earlier_reference(self):
+        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
+
+        assert _has_backward_reference("as we discussed earlier, the plan was...")
+        assert _has_backward_reference("you mentioned something about auth")
+        assert _has_backward_reference("remember when we talked about the API?")
+        assert _has_backward_reference("go back to what you said about config")
+        assert _has_backward_reference("what about the idea from before?")
+
+    def test_ignores_normal_messages(self):
+        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
+
+        assert not _has_backward_reference("hello")
+        assert not _has_backward_reference("what's the weather?")
+        assert not _has_backward_reference("please write a function that adds two numbers")
+        assert not _has_backward_reference("can you help me?")

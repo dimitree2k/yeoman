@@ -53,6 +53,23 @@ if TYPE_CHECKING:
     from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
+_BACKWARD_REF_RE = re.compile(
+    r"\b(?:"
+    r"earlier|previously|as (?:we|i|you) (?:discussed|said|mentioned|talked)"
+    r"|you (?:said|mentioned|told me|suggested)"
+    r"|remember when|go back to|what about the"
+    r"|we (?:discussed|agreed|decided|talked about)"
+    r"|i (?:said|asked|mentioned)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_backward_reference(text: str) -> bool:
+    """Return True if the message appears to reference earlier conversation."""
+    return bool(_BACKWARD_REF_RE.search(text))
+
+
 @dataclass
 class _TalkativeCooldownState:
     sender_id: str = ""
@@ -294,13 +311,21 @@ class LLMResponder(ResponderPort):
         if isinstance(summarize_tool, SummarizeHistoryTool):
             summarize_tool.set_context(channel, chat_id)
 
-    def _resolve_history_limit(self, chat_id: str, session_history_limit: int | None) -> int:
-        """Resolve session history limit: per-chat policy > global config default."""
+    def _resolve_history_limit(
+        self, chat_id: str, session_history_limit: int | None, content: str = "",
+    ) -> int:
+        """Resolve session history limit: per-chat policy > heuristic > global config default."""
         if session_history_limit is not None:
-            return int(session_history_limit)
-        if chat_id.endswith("@g.us"):
-            return self._session_history_limit_group
-        return self._session_history_limit
+            base = int(session_history_limit)
+        elif chat_id.endswith("@g.us"):
+            base = self._session_history_limit_group
+        else:
+            base = self._session_history_limit
+
+        # Expand window when message references earlier conversation.
+        if content and _has_backward_reference(content):
+            return min(base * 3, 50)
+        return base
 
     @staticmethod
     def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:
@@ -1125,7 +1150,7 @@ class LLMResponder(ResponderPort):
 
                 messages = self.context.build_messages(
                     history=session.get_history(
-                        max_messages=self._resolve_history_limit(chat_id, session_history_limit),
+                        max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
                     ),
                     current_message=content,
                     current_metadata=metadata,
