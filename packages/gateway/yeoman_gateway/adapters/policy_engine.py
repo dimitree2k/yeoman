@@ -172,6 +172,7 @@ class EnginePolicyAdapter(PolicyPort):
                 VoiceMessagesCommandHandler(self),
                 VoiceSendCommandHandler(self),
                 ResetSessionCommandHandler(self),
+                NewSessionCommandHandler(self),
                 ForgetCommandHandler(self),
             ]
         )
@@ -488,6 +489,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_cooldown_seconds=900,
                 talkative_cooldown_delay_seconds=2.5,
                 talkative_cooldown_use_llm_message=False,
+                session_history_limit=None,
                 source="disabled",
             )
 
@@ -508,6 +510,7 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_delay_seconds = 2.5
         talkative_cooldown_use_llm_message = False
         contacts_disclosure = False
+        session_history_limit: int | None = None
         model_profile: str | None = None
         when_to_reply_mode: Literal[
             "all", "mention_only", "allowed_senders", "owner_only", "off"
@@ -531,6 +534,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_delay_seconds = effective.talkative_cooldown_delay_seconds
                 talkative_cooldown_use_llm_message = effective.talkative_cooldown_use_llm_message
                 contacts_disclosure = effective.contacts_disclosure
+                session_history_limit = effective.session_history_limit
                 model_profile = effective.model_profile
             except Exception:
                 # Policy voice output settings are optional and should never break evaluation.
@@ -573,6 +577,7 @@ class EnginePolicyAdapter(PolicyPort):
             talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
             model_profile=model_profile,
             contacts_disclosure=contacts_disclosure,
+            session_history_limit=session_history_limit,
             is_owner=is_owner,
             source=str(self._policy_path) if self._policy_path else "in-memory",
         )
@@ -1285,6 +1290,40 @@ class EnginePolicyAdapter(PolicyPort):
             metric_events=(
                 AdminMetricEvent(name="session_reset_total", labels=(("channel", ctx.channel),)),
             ),
+        )
+
+    def new_session_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        if argv:
+            return AdminCommandResult(status="handled", response="Usage: /new")
+
+        policy = self._load_policy_for_admin()
+        if policy is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session boundary unavailable: policy engine is not active.",
+            )
+        if not self._is_whatsapp_owner(ctx, policy):
+            return AdminCommandResult(status="ignored")
+        if self._session_manager is None:
+            return AdminCommandResult(
+                status="handled",
+                response="Session boundary unavailable: session manager is not configured.",
+            )
+
+        session_key = f"{ctx.channel}:{ctx.chat_id}"
+        try:
+            session = self._session_manager.get_or_create(session_key)
+            session.add_boundary()
+            self._session_manager.save(session)
+        except Exception as e:
+            return AdminCommandResult(status="handled", response=f"Session boundary failed: {e}")
+
+        return AdminCommandResult(
+            status="handled",
+            response="New session started. Previous context will not be included.",
+            command_name="new",
+            outcome="applied",
+            source="dm" if not ctx.is_group else "group",
         )
 
     def forget_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
@@ -2373,6 +2412,25 @@ class ResetSessionCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return "/reset"
+
+
+class NewSessionCommandHandler(AdminCommandHandler):
+    """Deterministic `/new` command for inserting a session boundary."""
+
+    def __init__(self, adapter: EnginePolicyAdapter) -> None:
+        self._adapter = adapter
+
+    def namespace(self) -> str:
+        return "new"
+
+    def is_applicable(self, ctx: AdminCommandContext) -> bool:
+        return self._adapter.session_reset_is_applicable(ctx)
+
+    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
+        return self._adapter.new_session_handle(ctx, argv)
+
+    def help_hint(self) -> str:
+        return "/new"
 
 
 class ForgetCommandHandler(AdminCommandHandler):

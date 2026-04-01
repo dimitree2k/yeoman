@@ -404,6 +404,8 @@ def build_gateway_runtime(
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
+        whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
+        whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))

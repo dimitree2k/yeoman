@@ -102,6 +102,7 @@ class EffectivePolicy:
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
     contacts_disclosure: bool
+    session_history_limit: int | None
 
 
 @dataclass(slots=True)
@@ -160,6 +161,7 @@ class _CompiledPolicy:
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
     contacts_disclosure: bool
+    session_history_limit: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +308,7 @@ class PolicyEngine:
             talkative_cooldown_delay_seconds=float(resolved.talkative_cooldown.delay_seconds),
             talkative_cooldown_use_llm_message=bool(resolved.talkative_cooldown.use_llm_message),
             contacts_disclosure=bool(resolved.contacts_disclosure),
+            session_history_limit=resolved.session_history_limit,
         )
 
     def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
@@ -467,6 +470,7 @@ class PolicyEngine:
             talkative_cooldown_delay_seconds=resolved.talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=resolved.talkative_cooldown_use_llm_message,
             contacts_disclosure=resolved.contacts_disclosure,
+            session_history_limit=resolved.session_history_limit,
         )
 
     @staticmethod

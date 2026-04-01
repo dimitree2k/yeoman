@@ -55,36 +55,49 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    def add_boundary(self) -> None:
+        """Insert a session boundary marker. get_history() will not look past this."""
+        self.messages.append({
+            "role": "session_boundary",
+            "timestamp": datetime.now().isoformat(),
+        })
+        self.updated_at = datetime.now()
+
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.
 
-        Args:
-            max_messages: Maximum messages to return.
-
-        Returns:
-            List of messages in LLM format (tool traces excluded).
+        Scans backwards from the end and stops at the most recent
+        ``session_boundary`` marker or at *max_messages*, whichever comes first.
         """
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        # Find the most recent session boundary.
+        boundary_idx = -1
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "session_boundary":
+                boundary_idx = i
+                break
 
-        # Convert to LLM format (just role and content), skipping internal or malformed rows.
+        start = boundary_idx + 1 if boundary_idx >= 0 else 0
+        candidates = self.messages[start:]
+
+        # Apply max_messages limit.
+        if len(candidates) > max_messages:
+            candidates = candidates[-max_messages:]
+
+        # Convert to LLM format, skipping internal or malformed rows.
         history: list[dict[str, Any]] = []
         allowed_roles = {"system", "user", "assistant"}
-        for message in recent:
+        for message in candidates:
             role = str(message.get("role") or "").strip()
             if role == "tool_trace" or role not in allowed_roles:
                 continue
-
             if "content" not in message:
-                # Backward compatibility for legacy rows that were not user/assistant text.
                 continue
-
             content = message.get("content")
             if content is None:
                 content = ""
             if not isinstance(content, (str, list, dict)):
                 content = str(content)
-
             history.append({"role": role, "content": content})
         return history
 

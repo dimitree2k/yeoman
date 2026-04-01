@@ -142,6 +142,8 @@ class WhatsAppConfig(BaseModel):
     reply_context_window_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["window_limit"])
     reply_context_line_max_chars: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["line_max_chars"])
     ambient_window_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["ambient_window_limit"])
+    session_history_limit: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["session_history_limit"])
+    session_history_limit_group: int = int(DEFAULT_WHATSAPP_REPLY_CONTEXT["session_history_limit_group"])
     media: WhatsAppMediaConfig = Field(default_factory=WhatsAppMediaConfig)
 
     @property

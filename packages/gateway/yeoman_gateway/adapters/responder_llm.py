@@ -53,6 +53,22 @@ if TYPE_CHECKING:
     from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 
+_BACKWARD_REF_RE = re.compile(
+    r"\b(?:"
+    r"as (?:we|i|you) (?:discussed|said|mentioned|talked)"
+    r"|you (?:said|mentioned|told me|suggested)"
+    r"|remember when|go back to"
+    r"|we (?:discussed|agreed|decided|talked about)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_backward_reference(text: str) -> bool:
+    """Return True if the message appears to reference earlier conversation."""
+    return bool(_BACKWARD_REF_RE.search(text))
+
+
 @dataclass
 class _TalkativeCooldownState:
     sender_id: str = ""
@@ -93,6 +109,8 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
         inbound_archive: "InboundArchive | None" = None,
+        whatsapp_session_history_limit: int = 15,
+        whatsapp_session_history_limit_group: int = 20,
     ) -> None:
         from yeoman_shared.config.schema import ExecToolConfig
 
@@ -119,6 +137,8 @@ class LLMResponder(ResponderPort):
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._recording_notifier = recording_notifier
         self.inbound_archive = inbound_archive
+        self._session_history_limit = whatsapp_session_history_limit
+        self._session_history_limit_group = whatsapp_session_history_limit_group
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
@@ -242,6 +262,12 @@ class LLMResponder(ResponderPort):
                 SummarizeHistoryTool(self.inbound_archive, self.contacts_service)
             )
 
+        # Recall conversation — search session history on demand
+        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+
+        self._recall_tool = RecallConversationTool(session_manager=self.sessions)
+        self.tools.register(self._recall_tool)
+
     def _metric(
         self,
         name: str,
@@ -289,6 +315,29 @@ class LLMResponder(ResponderPort):
         summarize_tool = self.tools.get("summarize_history")
         if isinstance(summarize_tool, SummarizeHistoryTool):
             summarize_tool.set_context(channel, chat_id)
+
+        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+
+        recall_tool = self.tools.get("recall_conversation")
+        if isinstance(recall_tool, RecallConversationTool):
+            recall_tool.set_context(channel, chat_id)
+
+    def _resolve_history_limit(
+        self, chat_id: str, session_history_limit: int | None, content: str = "",
+    ) -> int:
+        """Resolve session history limit: per-chat policy > heuristic > global config default."""
+        if session_history_limit is not None:
+            base = int(session_history_limit)
+        elif chat_id.endswith("@g.us"):
+            base = self._session_history_limit_group
+        else:
+            base = self._session_history_limit
+
+        # Expand window when message references earlier conversation,
+        # but only when no explicit per-chat policy override is set.
+        if session_history_limit is None and content and _has_backward_reference(content):
+            return min(base * 3, 50)
+        return base
 
     @staticmethod
     def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:
@@ -952,6 +1001,7 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_use_llm_message: bool = False,
         is_owner: bool = False,
         model_profile: str | None = None,
+        session_history_limit: int | None = None,
     ) -> str:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
@@ -975,6 +1025,7 @@ class LLMResponder(ResponderPort):
                 talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
                 is_owner=is_owner,
                 model_profile=model_profile,
+                session_history_limit=session_history_limit,
             )
 
     async def _generate_locked(
@@ -997,6 +1048,7 @@ class LLMResponder(ResponderPort):
         talkative_cooldown_use_llm_message: bool = False,
         is_owner: bool = False,
         model_profile: str | None = None,
+        session_history_limit: int | None = None,
     ) -> str:
         # Handle owner approve/deny commands
         if is_owner and channel == "whatsapp":
@@ -1110,7 +1162,7 @@ class LLMResponder(ResponderPort):
 
                 messages = self.context.build_messages(
                     history=session.get_history(
-                        max_messages=20 if chat_id.endswith("@g.us") else 50
+                        max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
                     ),
                     current_message=content,
                     current_metadata=metadata,
@@ -1239,6 +1291,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_use_llm_message=decision.talkative_cooldown_use_llm_message,
             is_owner=decision.is_owner,
             model_profile=decision.model_profile,
+            session_history_limit=decision.session_history_limit,
         )
 
     async def process_direct(
