@@ -106,6 +106,8 @@ DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
     "window_limit": 6,
     "line_max_chars": 256,
     "ambient_window_limit": 8,
+    "session_history_limit": 15,
+    "session_history_limit_group": 20,
 }
 
 DEFAULT_MEMORY: dict[str, Any] = {
