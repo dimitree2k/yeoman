@@ -103,6 +103,12 @@ class ContextBuilder:
             )
             parts.append(f"# Channel Persona\n\n{persona_text}")
 
+        # Context recall hint
+        parts.append(
+            "If the user references something outside your visible conversation history, "
+            "use the `recall_conversation` tool to search for it."
+        )
+
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
