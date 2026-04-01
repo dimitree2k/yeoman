@@ -263,6 +263,12 @@ class LLMResponder(ResponderPort):
                 SummarizeHistoryTool(self.inbound_archive, self.contacts_service)
             )
 
+        # Recall conversation — search session history on demand
+        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+
+        self._recall_tool = RecallConversationTool(session_manager=self.sessions)
+        self.tools.register(self._recall_tool)
+
     def _metric(
         self,
         name: str,
@@ -310,6 +316,12 @@ class LLMResponder(ResponderPort):
         summarize_tool = self.tools.get("summarize_history")
         if isinstance(summarize_tool, SummarizeHistoryTool):
             summarize_tool.set_context(channel, chat_id)
+
+        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+
+        recall_tool = self.tools.get("recall_conversation")
+        if isinstance(recall_tool, RecallConversationTool):
+            recall_tool.set_context(channel, chat_id)
 
     def _resolve_history_limit(
         self, chat_id: str, session_history_limit: int | None, content: str = "",

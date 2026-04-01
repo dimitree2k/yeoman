@@ -126,3 +126,65 @@ class TestPreflightHeuristic:
         assert not _has_backward_reference("what's the weather?")
         assert not _has_backward_reference("please write a function that adds two numbers")
         assert not _has_backward_reference("can you help me?")
+
+
+import pytest
+from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+from yeoman_gateway.session.manager import SessionManager
+
+
+class TestRecallConversationTool:
+    """recall_conversation tool should search session history."""
+
+    @pytest.fixture
+    def session_manager(self, tmp_path):
+        return SessionManager(workspace=tmp_path, sessions_dir=tmp_path / "sessions")
+
+    @pytest.fixture
+    def tool(self, session_manager):
+        t = RecallConversationTool(session_manager=session_manager)
+        t.set_context("whatsapp", "owner@s.whatsapp.net")
+        return t
+
+    @pytest.mark.asyncio
+    async def test_finds_matching_messages(self, tool, session_manager):
+        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
+        session.add_message("user", "let's use PostgreSQL for the database")
+        session.add_message("assistant", "sure, PostgreSQL is a good choice")
+        session.add_message("user", "what about Redis for caching?")
+        session_manager.save(session)
+
+        result = await tool.execute(query="PostgreSQL")
+        assert "PostgreSQL" in result
+        assert "Redis" not in result
+
+    @pytest.mark.asyncio
+    async def test_returns_no_matches(self, tool, session_manager):
+        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
+        session.add_message("user", "hello world")
+        session_manager.save(session)
+
+        result = await tool.execute(query="kubernetes")
+        assert "No matching" in result or "no match" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_searches_across_boundaries(self, tool, session_manager):
+        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
+        session.add_message("user", "use PostgreSQL")
+        session.add_boundary()
+        session.add_message("user", "hello")
+        session_manager.save(session)
+
+        result = await tool.execute(query="PostgreSQL")
+        assert "PostgreSQL" in result
+
+    @pytest.mark.asyncio
+    async def test_respects_max_messages(self, tool, session_manager):
+        session = session_manager.get_or_create("whatsapp:owner@s.whatsapp.net")
+        for i in range(50):
+            session.add_message("user", f"message about topic {i}")
+        session_manager.save(session)
+
+        result = await tool.execute(query="topic", max_messages=5)
+        lines = [l for l in result.strip().split("\n") if l.strip() and not l.startswith("Found")]
+        assert len(lines) <= 5
