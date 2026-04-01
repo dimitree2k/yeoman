@@ -55,11 +55,10 @@ if TYPE_CHECKING:
 
 _BACKWARD_REF_RE = re.compile(
     r"\b(?:"
-    r"earlier|previously|as (?:we|i|you) (?:discussed|said|mentioned|talked)"
+    r"as (?:we|i|you) (?:discussed|said|mentioned|talked)"
     r"|you (?:said|mentioned|told me|suggested)"
-    r"|remember when|go back to|what about the"
+    r"|remember when|go back to"
     r"|we (?:discussed|agreed|decided|talked about)"
-    r"|i (?:said|asked|mentioned)"
     r")\b",
     re.IGNORECASE,
 )
@@ -334,8 +333,9 @@ class LLMResponder(ResponderPort):
         else:
             base = self._session_history_limit
 
-        # Expand window when message references earlier conversation.
-        if content and _has_backward_reference(content):
+        # Expand window when message references earlier conversation,
+        # but only when no explicit per-chat policy override is set.
+        if session_history_limit is None and content and _has_backward_reference(content):
             return min(base * 3, 50)
         return base
 

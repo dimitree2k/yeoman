@@ -115,7 +115,7 @@ class TestPreflightHeuristic:
         assert _has_backward_reference("you mentioned something about auth")
         assert _has_backward_reference("remember when we talked about the API?")
         assert _has_backward_reference("go back to what you said about config")
-        assert _has_backward_reference("what about the idea from before?")
+        assert _has_backward_reference("we discussed that last time")
 
     def test_ignores_normal_messages(self):
         from yeoman_gateway.adapters.responder_llm import _has_backward_reference
@@ -216,12 +216,20 @@ class TestHistoryLimitResolution:
         )
         assert d.session_history_limit is None
 
-    def test_heuristic_expansion(self):
-        from yeoman_gateway.adapters.responder_llm import _has_backward_reference
+    def test_resolve_history_limit_heuristic(self):
+        from yeoman_gateway.adapters.responder_llm import LLMResponder
 
-        assert _has_backward_reference("as we discussed earlier")
-        # base=20, expanded=min(20*3, 50) = 50
-        # base=15, expanded=min(15*3, 50) = 45
+        r = LLMResponder.__new__(LLMResponder)
+        r._session_history_limit = 15
+        r._session_history_limit_group = 20
+        # Heuristic expands DM from 15 → 45
+        assert r._resolve_history_limit("user@s.whatsapp.net", None, "as we discussed") == 45
+        # Normal DM stays 15
+        assert r._resolve_history_limit("user@s.whatsapp.net", None, "hello") == 15
+        # Group expands from 20 → 50 (capped)
+        assert r._resolve_history_limit("group@g.us", None, "you mentioned") == 50
+        # Explicit policy override is NOT expanded by heuristic
+        assert r._resolve_history_limit("user@s.whatsapp.net", 5, "as we discussed") == 5
 
     def test_session_boundary_and_max_messages_combined(self):
         s = Session(key="test")
