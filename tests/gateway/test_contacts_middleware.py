@@ -116,7 +116,7 @@ class TestSpeakerLabelResolution:
         )
         archive = _FakeArchive(messages=[archived])
         mw = ReplyContextMiddleware(archive=archive, contacts=contacts)
-        event = _make_event(message_id="msg-002")
+        event = _make_event(message_id="msg-002", is_group=True)
         ctx = PipelineContext(event=event)
 
         async def next_fn(c: PipelineContext) -> None: pass

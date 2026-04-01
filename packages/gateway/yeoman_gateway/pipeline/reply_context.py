@@ -141,6 +141,9 @@ class ReplyContextMiddleware:
     def _build_ambient_window(self, event: InboundEvent) -> list[str]:
         if self._archive is None or self._ambient_limit <= 0 or not event.message_id:
             return []
+        # Skip ambient window for DMs — session history already covers these messages.
+        if not event.is_group:
+            return []
         try:
             before = self._archive.lookup_messages_before(
                 event.channel,
