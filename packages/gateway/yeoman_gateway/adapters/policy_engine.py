@@ -1312,6 +1312,7 @@ class EnginePolicyAdapter(PolicyPort):
         return AdminCommandResult(
             status="handled",
             response=None,
+            reaction_emoji="\U0001f44d",
             command_name="new",
             outcome="applied",
             source="dm" if not ctx.is_group else "group",
