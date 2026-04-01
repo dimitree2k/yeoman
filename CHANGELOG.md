@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.0 — Apr 2026
+
+### Smart Context Windowing
+- Ambient context window is now skipped for DM chats — session history already provides full context, eliminating redundant tokens.
+- Added `session_history_limit` (default 15) and `session_history_limit_group` (default 20) to WhatsApp config for configurable session history sizes.
+- Added per-chat `sessionHistoryLimit` policy override in `policy.json` for fine-grained control.
+- Added `/new` command — inserts a session boundary marker. History stops at the boundary, providing a lightweight "fresh start" without deleting conversation history.
+- Added preflight heuristic that detects backward references ("as we discussed", "you mentioned") and expands the history window 3x (capped at 50) to surface relevant context automatically.
+- Added `recall_conversation` tool — lets the LLM search across all session history (including past boundaries) for messages matching a query, as a fallback when the heuristic isn't enough.
+- Added system prompt hint directing the LLM to use `recall_conversation` when users reference something outside visible context.
+
 ## v0.9.0 — Mar 2026
 
 ### Autonomous Workflows
