@@ -69,6 +69,7 @@ class PolicyDecision:
     talkative_cooldown_use_llm_message: bool = False
     model_profile: str | None = None
     contacts_disclosure: bool = False
+    session_history_limit: int | None = None
     is_owner: bool = False
     source: str = "disabled"
 

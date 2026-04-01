@@ -184,6 +184,7 @@ class ChatPolicy(PolicyModel):
         default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
     )
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
+    session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
 
 class ChatPolicyOverride(PolicyModel):
@@ -205,6 +206,7 @@ class ChatPolicyOverride(PolicyModel):
         default=None, alias="talkativeCooldown"
     )
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
+    session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 
 
 class ChannelPolicy(PolicyModel):
