@@ -523,12 +523,16 @@ class Config(BaseSettings):
         candidate = Path(self.agents.defaults.workspace).expanduser()
         return candidate if candidate.is_absolute() else get_data_path() / candidate
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+    def get_provider(
+        self, model: str | None = None, *, provider_name: str | None = None
+    ) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
-        Env vars from ProviderSpec.env_key are used as fallback when config.api_key is empty."""
+        Env vars from ProviderSpec.env_key are used as fallback when config.api_key is empty.
+        When *provider_name* is given (e.g. from a profile's ``provider`` field),
+        that provider is returned directly — skipping keyword matching."""
         import os
 
-        from yeoman_gateway.providers.registry import PROVIDERS, ProviderSpec
+        from yeoman_gateway.providers.registry import PROVIDERS, ProviderSpec, find_by_name
 
         def _has_api_key(provider_config: ProviderConfig, spec: ProviderSpec) -> bool:
             """Check if provider has api_key in config or env."""
@@ -536,6 +540,20 @@ class Config(BaseSettings):
                 return True
             # Fallback to env var
             return bool(os.environ.get(spec.env_key))
+
+        # Explicit provider override — skip keyword matching entirely.
+        # When the caller names a provider, routing is strict: either that
+        # provider resolves with credentials, or we return None. Falling
+        # through to keyword/gateway fallback would silently misroute the
+        # request (e.g. an openai-pinned embedding call ending up at
+        # OpenRouter because OPENAI_API_KEY is missing).
+        if provider_name:
+            spec = find_by_name(provider_name)
+            if spec:
+                p = getattr(self.providers, spec.name, None)
+                if p and _has_api_key(p, spec):
+                    return p
+            return None
 
         model_lower = (model or self.agents.defaults.model).lower()
 

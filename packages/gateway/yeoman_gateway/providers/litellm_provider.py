@@ -43,8 +43,11 @@ class LiteLLMProvider(LLMProvider):
         if api_key:
             self._setup_env(api_key, api_base, default_model)
 
-        if api_base:
-            litellm.api_base = api_base
+        # Note: api_base is stored on the instance (self.api_base via super().__init__)
+        # and passed per-call to acompletion/embedding. Do NOT set litellm.api_base
+        # globally — it's a module-level attribute and would leak into every other
+        # litellm call in the process (e.g. memory embeddings routed to the wrong
+        # endpoint because the primary chat provider set a base URL).
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True

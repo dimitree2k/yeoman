@@ -271,8 +271,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 def find_by_model(model: str) -> ProviderSpec | None:
     """Match a standard provider by model-name keyword (case-insensitive).
-    Skips gateways/local — those are matched by api_key/api_base instead."""
+    Skips gateways/local — those are matched by api_key/api_base instead.
+
+    If the model has a LiteLLM-style provider prefix (``groq/...``, ``openai/...``),
+    match on the first segment only. Substring matching in the full model string
+    is a footgun for prefixed names like ``groq/openai/gpt-oss-20b`` — both "groq"
+    and "openai" appear there, and the one that wins depends on PROVIDERS order,
+    not on the actual hosting provider.
+    """
     model_lower = model.lower()
+    if "/" in model_lower:
+        prefix = model_lower.split("/", 1)[0]
+        for spec in PROVIDERS:
+            if spec.is_gateway or spec.is_local:
+                continue
+            if prefix in spec.keywords or prefix == spec.litellm_prefix:
+                return spec
+        # Explicit prefix didn't match any standard provider — don't guess.
+        return None
+    # Unprefixed model: substring keyword match (legacy).
     for spec in PROVIDERS:
         if spec.is_gateway or spec.is_local:
             continue

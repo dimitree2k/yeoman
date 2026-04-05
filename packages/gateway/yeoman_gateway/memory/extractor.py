@@ -43,7 +43,7 @@ class MemoryExtractorService:
         self._model = (self._profile.model or "").strip()
         self._max_tokens = int(self._profile.max_tokens or 700)
         self._temperature = float(self._profile.temperature if self._profile.temperature is not None else 0.0)
-        self._provider = self._create_provider(self._model)
+        self._provider = self._create_provider(self._model, self._profile.provider)
 
     def _resolve_profile(self) -> tuple[str, "ModelProfile"]:
         route_name = self._config.models.routes.get(self._route_key)
@@ -62,11 +62,16 @@ class MemoryExtractorService:
             raise ValueError(f"profile '{route_name}' does not define a model")
         return route_name, profile
 
-    def _create_provider(self, model: str) -> LiteLLMProvider:
-        provider_cfg = self._config.get_provider(model)
-        api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
-        api_base = provider_cfg.api_base if provider_cfg else None
-        extra_headers = provider_cfg.extra_headers if provider_cfg else None
+    def _create_provider(self, model: str, provider_name: str | None) -> LiteLLMProvider:
+        provider_cfg = self._config.get_provider(model, provider_name=provider_name)
+        if provider_cfg is None:
+            raise ValueError(
+                f"no provider with credentials for memory capture route '{self._route_key}' "
+                f"(model={model!r}, provider={provider_name or 'auto'!r})"
+            )
+        api_key = provider_cfg.api_key if provider_cfg.api_key else None
+        api_base = provider_cfg.api_base
+        extra_headers = provider_cfg.extra_headers
         return LiteLLMProvider(
             api_key=api_key,
             api_base=api_base,

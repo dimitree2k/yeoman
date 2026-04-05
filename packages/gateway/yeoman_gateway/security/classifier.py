@@ -81,7 +81,7 @@ class InputClassifier:
         self._temperature = float(
             self._profile.temperature if self._profile.temperature is not None else 0.0
         )
-        self._provider = _create_provider(config, self._model)
+        self._provider = _create_provider(config, self._model, self._profile.provider)
         logger.info(
             "security classifier ready  model={} profile={}",
             self._model,
@@ -145,8 +145,10 @@ def _resolve_profile(config: "Config") -> tuple[str, "ModelProfile"]:
     return route_name, profile
 
 
-def _create_provider(config: "Config", model: str) -> LiteLLMProvider:
-    provider_cfg = config.get_provider(model)
+def _create_provider(
+    config: "Config", model: str, provider_name: str | None = None
+) -> LiteLLMProvider:
+    provider_cfg = config.get_provider(model, provider_name=provider_name)
     api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
     api_base = provider_cfg.api_base if provider_cfg else None
     extra_headers = provider_cfg.extra_headers if provider_cfg else None
