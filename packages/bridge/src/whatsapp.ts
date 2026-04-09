@@ -1212,7 +1212,7 @@ export class WhatsAppClient {
       for (const msg of messages) {
         if (!this.running) return;
         const remoteJidRaw = String(msg?.key?.remoteJid || '');
-        if (!remoteJidRaw || remoteJidRaw === 'status@broadcast') continue;
+        if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) continue;
 
         const chatJid = normalizeJid(remoteJidRaw);
         if (!chatJid) continue;

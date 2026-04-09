@@ -152,8 +152,24 @@ class OverseerService:
 
         logger.info("Overseer service started")
         self._sd_notifier.notify("READY=1")
+        last_hourly_reset = time.monotonic()
+        last_daily_reset = time.monotonic()
         try:
             while self._running:
+                now = time.monotonic()
+
+                # Periodic rate-limiter resets
+                if now - last_hourly_reset >= 3600:
+                    last_hourly_reset = now
+                    if self._evaluator:
+                        self._evaluator.rate_limiter.reset_hourly()
+                    self._state.reset_hourly_budget()
+                if now - last_daily_reset >= 86400:
+                    last_daily_reset = now
+                    if self._evaluator:
+                        self._evaluator.rate_limiter.reset_daily()
+                    self._prune_action_log()
+
                 try:
                     if self._evaluator:
                         await self._evaluator.tick()
@@ -303,6 +319,11 @@ class OverseerService:
                 llm_profile=llm_profile,
                 reasoning_summary=reasoning,
             ))
+
+    def _prune_action_log(self, keep: int = 500) -> None:
+        """Trim the persisted action_log to the most recent *keep* entries."""
+        if len(self._state.action_log) > keep:
+            self._state.action_log = self._state.action_log[-keep:]
 
     def _get_stats(self) -> dict:
         return {

@@ -306,13 +306,33 @@ class MemoryService:
                 logger.warning("memory background notes flush failed: {}", exc)
             self._background_notes_stop.wait(timeout=2.0)
 
+    _CHUNK_SIZE = 12
+    """Messages per extraction window. Each chunk gets its own 4-memory budget."""
+
     def _flush_background_buffer(self, buf: _BackgroundNoteBuffer) -> None:
         if not buf.events:
             return
         self._background_notes_flushed_total += 1
+        chunks = self._chunk_events(buf.events)
+        total_accepted = 0
+        for chunk_events in chunks:
+            chunk_buf = _BackgroundNoteBuffer(
+                channel=buf.channel,
+                chat_id=buf.chat_id,
+                is_group=buf.is_group,
+                events=chunk_events,
+                first_ts=chunk_events[0].ts,
+                batch_interval_seconds=buf.batch_interval_seconds,
+                batch_max_messages=buf.batch_max_messages,
+            )
+            accepted = self._flush_single_chunk(chunk_buf)
+            total_accepted += accepted
+        self._background_notes_saved_total += total_accepted
+
+    def _flush_single_chunk(self, buf: _BackgroundNoteBuffer) -> int:
         payload = self._build_background_payload(buf)
         if not payload:
-            return
+            return 0
         requested_mode = buf.events[-1].mode if buf.events else "adaptive"
         effective_mode = self._resolve_background_mode(requested_mode, payload, len(buf.events))
         if effective_mode == "hybrid":
@@ -334,7 +354,7 @@ class MemoryService:
             (event.sender_id for event in reversed(buf.events) if event.sender_id),
             "",
         )
-        accepted = self._capture_text(
+        return self._capture_text(
             channel=buf.channel,
             chat_id=buf.chat_id,
             sender_id=sender_id or None,
@@ -343,7 +363,43 @@ class MemoryService:
             source_message_id=source_message_id,
             mode_override=effective_mode,
         )
-        self._background_notes_saved_total += max(0, int(accepted))
+
+    @classmethod
+    def _chunk_events(
+        cls, events: list[_BackgroundNoteEvent],
+    ) -> list[list[_BackgroundNoteEvent]]:
+        """Split events into extraction windows, keeping topic continuity.
+
+        Uses time gaps (>5 min silence) as natural topic boundaries.
+        Falls back to fixed-size windows of _CHUNK_SIZE messages.
+        """
+        if len(events) <= cls._CHUNK_SIZE:
+            return [events]
+
+        # Phase 1: split on time gaps > 5 minutes (natural topic boundaries)
+        segments: list[list[_BackgroundNoteEvent]] = []
+        current: list[_BackgroundNoteEvent] = [events[0]]
+        for prev, evt in zip(events, events[1:]):
+            gap = evt.ts - prev.ts
+            if gap > 300:  # 5-minute silence = topic break
+                segments.append(current)
+                current = [evt]
+            else:
+                current.append(evt)
+        if current:
+            segments.append(current)
+
+        # Phase 2: split any oversized segments into fixed windows
+        chunks: list[list[_BackgroundNoteEvent]] = []
+        for seg in segments:
+            if len(seg) <= cls._CHUNK_SIZE:
+                chunks.append(seg)
+            else:
+                for i in range(0, len(seg), cls._CHUNK_SIZE):
+                    window = seg[i : i + cls._CHUNK_SIZE]
+                    if window:
+                        chunks.append(window)
+        return chunks
 
     def _build_background_payload(self, buf: _BackgroundNoteBuffer) -> str:
         lines = ["[group_notes_batch]"]
@@ -710,12 +766,14 @@ class MemoryService:
         compact = self._normalize_content(candidate.content)
         if not compact or self._looks_like_injection(compact):
             return False
+        # Use about_sender override from extractor when available (group batch attribution)
+        effective_sender = candidate.about_sender or sender_id
         if candidate.sector in {"procedural", "semantic"} and self.config.acl.owner_only_preference:
-            if not self._is_owner(channel, sender_id):
+            if not self._is_owner(channel, effective_sender):
                 return False
         contact_id: str | None = None
         if candidate.kind == "person_profile":
-            contact_id = self._resolve_contact_id(sender_id)
+            contact_id = self._resolve_contact_id(effective_sender)
             if contact_id:
                 scope_type, scope_key = "contact", self.contact_scope_key(contact_id)
             else:
@@ -723,14 +781,14 @@ class MemoryService:
                     sector=candidate.sector,
                     channel=channel,
                     chat_id=chat_id,
-                    sender_id=sender_id,
+                    sender_id=effective_sender,
                 )
         else:
             scope_type, scope_key = self._scope_for_sector(
                 sector=candidate.sector,
                 channel=channel,
                 chat_id=chat_id,
-                sender_id=sender_id,
+                sender_id=effective_sender,
             )
         now_iso = datetime.now(UTC).isoformat()
         entry = MemoryEntry(
@@ -740,7 +798,7 @@ class MemoryService:
             scope_key=scope_key,
             channel=channel,
             chat_id=chat_id,
-            sender_id=sender_id,
+            sender_id=effective_sender,
             sector=candidate.sector,
             kind=candidate.kind,
             content=compact,

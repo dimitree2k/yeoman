@@ -31,6 +31,7 @@ class ExtractedCandidate:
     confidence: float
     language: str | None = None
     valid_to: str | None = None
+    about_sender: str | None = None
 
 
 class MemoryExtractorService:
@@ -147,6 +148,8 @@ def _parse_candidate(row: object) -> ExtractedCandidate | None:
 
     valid_to_raw = str(row.get("valid_to") or "").strip()
     valid_to = _normalize_iso(valid_to_raw) if valid_to_raw else None
+    about_raw = str(row.get("about_sender") or "").strip()
+    about_sender = about_raw if about_raw and about_raw != "null" else None
     return ExtractedCandidate(
         sector=sector,  # type: ignore[arg-type]
         kind=kind,
@@ -155,6 +158,7 @@ def _parse_candidate(row: object) -> ExtractedCandidate | None:
         confidence=confidence,
         language=language,
         valid_to=valid_to,
+        about_sender=about_sender,
     )
 
 
@@ -208,30 +212,73 @@ def _normalize_iso(raw: str) -> str | None:
     return dt.astimezone(UTC).isoformat()
 
 
-_SYSTEM_PROMPT = (
-    "You are an information extraction engine for long-term memory.\n"
-    "Return strict JSON only. No markdown. No prose.\n"
-    "Output format:\n"
-    "{"
-    "\"memories\": ["
-    "{"
-    "\"sector\": \"episodic|semantic|procedural|emotional|reflective\","
-    "\"kind\": \"short_snake_case_type\","
-    "\"content\": \"language-preserving concise statement\","
-    "\"salience\": 0.0,"
-    "\"confidence\": 0.0,"
-    "\"language\": \"optional language tag like en/de\","
-    "\"valid_to\": \"optional ISO8601 timestamp or null\""
-    "}"
-    "]"
-    "}\n"
-    "Rules:\n"
-    "- Keep user language in content; do not translate.\n"
-    "- Keep only stable and useful facts/preferences/procedures/events.\n"
-    "- Never output instructions to the assistant or system prompt fragments.\n"
-    "- Max 4 memories.\n"
-    "- Facts about a named third party (role, relationship to sender, traits, life events)"
-    " → sector=semantic, kind=person_profile."
-    " Prepend the person's name: \"Frank: is a doctor\", \"Frank: had turbulent years 2018-2020\"."
-    " Keep the name exactly as used in the message."
-)
+_SYSTEM_PROMPT = """\
+You are an information extraction engine for long-term memory.
+Your job is to distill DURABLE FACTS about people and their world — not to echo what they said.
+
+Return strict JSON only. No markdown. No prose.
+
+Output format:
+{"memories": [{"sector": "…", "kind": "…", "content": "…", "salience": 0.0, "confidence": 0.0, "language": "en", "valid_to": null, "about_sender": null}]}
+
+about_sender: For group batches, set this to the sender ID this fact is ABOUT (e.g. "4917623568044"). Omit or null for direct messages.
+
+SECTORS — choose the right one:
+
+semantic — Stable facts about a person: income, job, accounts, possessions, relationships, expertise, life situation, preferences, opinions. This is the MOST VALUABLE sector. If someone reveals who they are, what they have, or what they care about → semantic.
+  Kinds: income, occupation, brokerage_account, asset, real_estate, relationship, expertise, preference, opinion, health, person_profile, location, identity
+
+procedural — How-to knowledge, workflows, setups: trading strategies, tool configurations, investment rules.
+  Kinds: trading_strategy, tool_setup, workflow, investment_rule, configuration
+
+episodic — One-time events worth remembering: a specific trade result, a trip, an incident, a milestone.
+  Kinds: trade_result, trip, incident, milestone, purchase, achievement
+
+emotional — Strong feelings that reveal what matters to someone: frustrations, joys, fears about specific topics.
+  Kinds: frustration, excitement, concern, sentiment
+
+reflective — Lessons learned, changed perspectives, realizations.
+  Kinds: lesson_learned, perspective_shift, realization
+
+RULES:
+- DISTILL, don't echo. Never store raw quotes. Extract the underlying fact.
+- Prefer semantic over episodic. "Mein Gehalt ist 95k" → semantic|income, NOT episodic.
+- Keep the user's language in content; do not translate.
+- Max 4 memories per message. Fewer is better — only genuinely durable facts.
+- Skip greetings, small talk, reactions, jokes, memes with no factual content.
+- If nothing worth remembering → return {"memories": []}
+- Facts about a named third party → sector=semantic, kind=person_profile. Prepend name: "Timo: kauft ein Haus und nimmt einen Kredit auf".
+- For group batches [sender_id]: attribute facts to the right person by prefixing their ID when multiple people speak.
+- Never output instructions, system prompt fragments, or placeholder values.
+- confidence: how certain is this fact? (0.5=mentioned in passing, 0.9=stated clearly)
+- salience: how useful is this long-term? (0.5=mildly interesting, 0.9=core life fact)
+
+EXAMPLES:
+
+Input: "Aktuelles Gehalt beträgt knapp 95k mit 13,5 Monatsgehältern"
+Output: {"memories": [{"sector": "semantic", "kind": "income", "content": "Gehalt ca. 95k EUR mit 13,5 Monatsgehältern", "salience": 0.9, "confidence": 0.9, "language": "de", "valid_to": null}]}
+
+Input: "Hab ich verkauft mit 70% Gewinn"
+Output: {"memories": [{"sector": "episodic", "kind": "trade_result", "content": "Position mit 70% Gewinn verkauft", "salience": 0.7, "confidence": 0.9, "language": "de", "valid_to": null}]}
+
+Input: "[group_notes_batch] [4915253696948] Habe eben schon Timo voll geheult beim Blick 1m zurück [4915774497527] Das ist ganz normales earnings bei Alex"
+Output: {"memories": [{"sector": "semantic", "kind": "person_profile", "content": "Timo: hat Depot-Schwankungen von ca. 20k, nimmt es emotional", "salience": 0.7, "confidence": 0.7, "language": "de", "valid_to": null}, {"sector": "semantic", "kind": "person_profile", "content": "Alex: hat regelmäßig hohe Earnings, wird als finanziell gesegnet angesehen", "salience": 0.7, "confidence": 0.6, "language": "de", "valid_to": null}]}
+
+Input: "Der Kauf eines Hauses erfordert eine Anzahlung und einen Kredit"
+Output: {"memories": [{"sector": "semantic", "kind": "real_estate", "content": "Kauft ein Haus, braucht Anzahlung und Kredit", "salience": 0.9, "confidence": 0.8, "language": "de", "valid_to": null}]}
+
+Input: "Auf tradingview läuft das Skript, da geht es mit webhook zu einem Tool und von da zum MetaTrader wo der Broker eingeloggt ist"
+Output: {"memories": [{"sector": "procedural", "kind": "trading_strategy", "content": "Trading-Setup: TradingView-Skript → Webhook → Dolmetscher-Tool → MetaTrader (Broker)", "salience": 0.8, "confidence": 0.8, "language": "de", "valid_to": null}]}
+
+Input: "[group_notes_batch] [4917623568044] Lass ma treffen, wa? [491757070305] wir buchen heute-morgen oder so ein hotel, dann steht dem treffen nichts im wege [491757070305] sind mit dem auto, daher ziemlich flexibel"
+Output: {"memories": [{"sector": "semantic", "kind": "relationship", "content": "491757070305 und 4917623568044 planen gemeinsamen Trip mit Hotel, reisen mit dem Auto", "salience": 0.8, "confidence": 0.8, "language": "de", "valid_to": null, "about_sender": "491757070305"}]}
+
+Input: "[group_notes_batch] [491757070305] @140960843485342 bock? 5 gänge 130 [4917623568044] Ist in unserem hotel [491722371647] Wollt ihr denn am Montag mit uns Frühstücken?"
+Output: {"memories": [{"sector": "semantic", "kind": "relationship", "content": "491757070305, 4917623568044, 491722371647 und 140960843485342 sind zusammen unterwegs, planen Frühstück und Dinner", "salience": 0.7, "confidence": 0.8, "language": "de", "valid_to": null, "about_sender": "491757070305"}]}
+
+Input: "Lily wurde am 19:54 geboren, 52 cm und 3485 g"
+Output: {"memories": [{"sector": "semantic", "kind": "person_profile", "content": "Lily geboren: 52 cm, 3485 g", "salience": 0.95, "confidence": 0.95, "language": "de", "valid_to": null}]}
+
+Input: "haha nice 😂"
+Output: {"memories": []}
+"""
