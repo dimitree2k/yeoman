@@ -1133,6 +1133,7 @@ class WhatsAppChannel(BaseChannel):
                 "participant": effective_participant,
                 "participant_lid": event.participant_jid if event.sender_phone_jid else None,
                 "sender": effective_sender or event.sender_id,
+                "sender_name": event.sender_name,
                 "is_group": event.is_group,
                 "mentioned_bot": event.mentioned_bot,
                 "reply_to_bot": event.reply_to_bot,

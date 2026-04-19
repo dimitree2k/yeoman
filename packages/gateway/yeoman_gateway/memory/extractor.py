@@ -107,17 +107,25 @@ class MemoryExtractorService:
                 )
             )
         except Exception as exc:
-            logger.debug("memory extractor request failed: {}", exc)
+            logger.warning("memory extractor request failed: {}", exc)
             return []
 
         content = (response.content or "").strip()
         if not content:
+            logger.info("memory extractor returned empty content")
             return []
+        logger.debug("memory extractor raw response: {}", content[:800])
         payload = _extract_json_payload(content)
         if payload is None:
+            logger.warning(
+                "memory extractor returned unparseable content: {}", content[:200]
+            )
             return []
         rows = payload.get("memories") if isinstance(payload, dict) else payload
         if not isinstance(rows, list):
+            logger.warning(
+                "memory extractor payload missing 'memories' list: {}", str(payload)[:200]
+            )
             return []
 
         out: list[ExtractedCandidate] = []
@@ -125,6 +133,9 @@ class MemoryExtractorService:
             candidate = _parse_candidate(row)
             if candidate is not None:
                 out.append(candidate)
+        logger.info(
+            "memory extractor returned {} candidates (raw rows={})", len(out), len(rows)
+        )
         return out
 
 

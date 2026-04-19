@@ -129,13 +129,26 @@ class MemoryService:
         self._contacts = contacts
 
     def _resolve_contact_id(self, sender_id: str | None) -> str | None:
-        """Look up contact_id for a sender_id via the contacts cache."""
+        """Look up contact_id for a sender_id via the contacts cache.
+
+        The inbound archive and LLM extractor emit WhatsApp senders as the
+        stripped user token (e.g. "4915774497527"), but ContactsService keys
+        known_jids by the full identifier ("4915774497527@s.whatsapp.net" or
+        "<lid>@lid"). Try the exact match first, then fall back to the two
+        WhatsApp suffix forms so person_profile candidates route to
+        contact:<uuid> scope instead of user:<token>.
+        """
         if not sender_id or self._contacts is None:
             return None
         jids = getattr(self._contacts, "known_jids", None)
-        if jids and isinstance(jids, dict):
-            return jids.get(sender_id)
-        return None
+        if not (jids and isinstance(jids, dict)):
+            return None
+        direct = jids.get(sender_id)
+        if direct:
+            return direct
+        if "@" in sender_id:
+            return None
+        return jids.get(f"{sender_id}@s.whatsapp.net") or jids.get(f"{sender_id}@lid")
 
     @staticmethod
     def chat_scope_key(channel: str, chat_id: str) -> str:
@@ -769,7 +782,10 @@ class MemoryService:
         # Use about_sender override from extractor when available (group batch attribution)
         effective_sender = candidate.about_sender or sender_id
         if candidate.sector in {"procedural", "semantic"} and self.config.acl.owner_only_preference:
-            if not self._is_owner(channel, effective_sender):
+            # person_profile facts describe a third party and are scoped to
+            # that target's contact/user scope below — they do not pollute
+            # the owner's workspace, so the owner-only gate does not apply.
+            if candidate.kind != "person_profile" and not self._is_owner(channel, effective_sender):
                 return False
         contact_id: str | None = None
         if candidate.kind == "person_profile":
