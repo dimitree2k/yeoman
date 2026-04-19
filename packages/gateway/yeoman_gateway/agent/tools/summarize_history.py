@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
 
@@ -23,15 +23,21 @@ class SummarizeHistoryTool(Tool):
         self,
         archive: "InboundArchive",
         contacts: "ContactsService | None" = None,
+        group_resolver: "Callable[[str], tuple[str | None, str | None]] | None" = None,
     ) -> None:
         self._archive = archive
         self._contacts = contacts
+        self._group_resolver = group_resolver
         self._channel = ""
         self._chat_id = ""
+        self._is_owner = False
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(
+        self, channel: str, chat_id: str, *, is_owner: bool = False
+    ) -> None:
         self._channel = channel
         self._chat_id = chat_id
+        self._is_owner = is_owner
 
     @property
     def name(self) -> str:
@@ -59,6 +65,13 @@ class SummarizeHistoryTool(Tool):
                     "minimum": 1,
                     "maximum": 48,
                 },
+                "group": {
+                    "type": "string",
+                    "description": (
+                        "Optional (owner DM only): WhatsApp group alias/name/chat id "
+                        "to fetch history from a different chat."
+                    ),
+                },
             },
             "required": [],
         }
@@ -67,11 +80,28 @@ class SummarizeHistoryTool(Tool):
         if not self._channel or not self._chat_id:
             return "Error: no chat context set."
 
+        group_ref = str(kwargs.get("group") or "").strip()
+        target_channel = self._channel
+        target_chat_id = self._chat_id
+
+        if group_ref:
+            if not self._is_owner:
+                return "Error: cross-chat access is owner-only."
+            if self._chat_id.endswith("@g.us"):
+                return "Error: cross-chat reads are only available from DMs."
+            if self._group_resolver is None:
+                return "Error: WhatsApp group resolver is not configured."
+            resolved_chat_id, err = self._group_resolver(group_ref)
+            if err is not None or not resolved_chat_id:
+                return f"Error: {err or 'failed to resolve group'}"
+            target_channel = "whatsapp"
+            target_chat_id = resolved_chat_id
+
         hours_back = kwargs.get("hours_back")
         since = self._compute_since(hours_back)
 
         rows = self._archive.lookup_messages_in_range(
-            self._channel, self._chat_id, since, limit=300
+            target_channel, target_chat_id, since, limit=300
         )
         if not rows:
             return "No messages found in the requested time range."

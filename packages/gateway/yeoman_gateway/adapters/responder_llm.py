@@ -259,7 +259,11 @@ class LLMResponder(ResponderPort):
             from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
 
             self.tools.register(
-                SummarizeHistoryTool(self.inbound_archive, self.contacts_service)
+                SummarizeHistoryTool(
+                    self.inbound_archive,
+                    self.contacts_service,
+                    group_resolver=self._resolve_group_reference,
+                )
             )
 
         # Recall conversation — search session history on demand
@@ -281,7 +285,9 @@ class LLMResponder(ResponderPort):
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.debug("telemetry incr failed {}={}: {}", name, value, exc)
 
-    def _set_tool_context(self, *, channel: str, chat_id: str, session_key: str) -> None:
+    def _set_tool_context(
+        self, *, channel: str, chat_id: str, session_key: str, is_owner: bool = False,
+    ) -> None:
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(channel, chat_id)
@@ -314,7 +320,7 @@ class LLMResponder(ResponderPort):
 
         summarize_tool = self.tools.get("summarize_history")
         if isinstance(summarize_tool, SummarizeHistoryTool):
-            summarize_tool.set_context(channel, chat_id)
+            summarize_tool.set_context(channel, chat_id, is_owner=is_owner)
 
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
@@ -1080,7 +1086,9 @@ class LLMResponder(ResponderPort):
         else:
             _user_message_already_added = False
 
-        self._set_tool_context(channel=channel, chat_id=chat_id, session_key=session_key)
+        self._set_tool_context(
+            channel=channel, chat_id=chat_id, session_key=session_key, is_owner=is_owner,
+        )
 
         if self.memory is not None:
             try:

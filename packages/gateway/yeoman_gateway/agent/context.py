@@ -254,7 +254,10 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
 - After calling `send_voice` once, produce a short text confirmation (e.g. "Gesendet." or "Sent."). Do NOT call `send_voice` again for the same request.
 - If `send_voice` is not available in your tools, or returns an error, tell the user the specific reason (e.g. "Voice ist gerade nicht verfügbar: <reason>"). Never silently fall back to text when voice was requested.
 If required context is missing (e.g. user asks to answer "the last voice message" from another chat), ask only for the missing content or target chat.
-For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step."""
+For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step.
+
+## Cross-chat history (owner DM only)
+When the owner asks in a DM to see messages from another group, use `summarize_history` with the `group` parameter (group name, alias, or chat id). This only works in owner DMs — never from groups or for non-owners."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
