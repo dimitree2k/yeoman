@@ -30,10 +30,14 @@ from yeoman_gateway.pipeline.policy import PolicyMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.pipeline.responder import ResponderMiddleware
 from yeoman_gateway.pipeline.security_input import InputSecurityMiddleware
+from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+    from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.media.router import ModelRouter
@@ -73,6 +77,9 @@ class Orchestrator:
         owner_alert_cooldown_seconds: int = 300,
         workflow_state: "WorkflowState | None" = None,
         approval_trigger: "Callable[[PendingApproval], Awaitable[None]] | None" = None,
+        bus: "MessageBus | None" = None,
+        speakup_approval_store: "SpeakupApprovalStore | None" = None,
+        speakup_log: "SpeakupLog | None" = None,
     ) -> None:
         layers: list = [
             NormalizationMiddleware(),
@@ -92,6 +99,15 @@ class Orchestrator:
             AdminCommandMiddleware(handler=policy_admin_handler),
             PolicyMiddleware(policy=policy),
         ])
+        if bus is not None and speakup_approval_store is not None and speakup_log is not None and security is not None:
+            layers.append(
+                SpeakupApprovalMiddleware(
+                    approval_store=speakup_approval_store,
+                    bus=bus,
+                    log=speakup_log,
+                    security=security,
+                )
+            )
         if workflow_state and approval_trigger:
             layers.append(ApprovalMiddleware(workflow_state=workflow_state, trigger_callback=approval_trigger))
         layers.extend([

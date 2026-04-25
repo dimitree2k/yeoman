@@ -8,7 +8,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from loguru import logger
 
@@ -30,6 +30,8 @@ class PendingSpeakupApproval:
     created_at: float
     expires_at: float
     context_snapshot: dict[str, object]
+    trigger: str = "cron"
+    daily_cap: int = 1
 
     @property
     def approve_code(self) -> str:
@@ -43,10 +45,16 @@ class PendingSpeakupApproval:
 class SpeakupApprovalStore:
     """Manages pending speakup approvals with atomic JSON persistence."""
 
-    def __init__(self, store_path: Path) -> None:
+    def __init__(
+        self,
+        store_path: Path,
+        *,
+        now: Callable[[], float] | None = None,
+    ) -> None:
         self._path = store_path
         self._lock = asyncio.Lock()
         self._approvals: list[PendingSpeakupApproval] = []
+        self._now = now or time.time
         self._load()
 
     def _load(self) -> None:
@@ -95,16 +103,24 @@ class SpeakupApprovalStore:
             self._save()
 
     async def match_and_consume(
-        self, text: str
+        self,
+        text: str,
+        *,
+        owner_channel: str | None = None,
+        owner_chat_id: str | None = None,
     ) -> tuple[SpeakupApprovalAction, PendingSpeakupApproval] | None:
         parsed = self._parse_code(text)
         if parsed is None:
             return None
         action, proposal_id = parsed
         async with self._lock:
-            now = time.time()
+            now = self._now()
             for index, approval in enumerate(self._approvals):
                 if approval.proposal_id == proposal_id:
+                    if owner_channel and approval.owner_channel != owner_channel:
+                        return None
+                    if owner_chat_id and approval.owner_chat_id != owner_chat_id:
+                        return None
                     consumed = self._approvals.pop(index)
                     self._save()
                     if consumed.expires_at < now:
@@ -114,7 +130,7 @@ class SpeakupApprovalStore:
 
     async def purge_expired(self) -> list[PendingSpeakupApproval]:
         async with self._lock:
-            now = time.time()
+            now = self._now()
             expired = [approval for approval in self._approvals if approval.expires_at < now]
             if expired:
                 self._approvals = [
@@ -126,4 +142,3 @@ class SpeakupApprovalStore:
     async def list_pending(self) -> list[PendingSpeakupApproval]:
         async with self._lock:
             return list(self._approvals)
-

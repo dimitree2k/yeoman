@@ -230,6 +230,7 @@ class GatewayRuntime:
     contacts: ContactsService
     bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
+    speakup_log: object | None = None
 
     async def run(self) -> None:
         tracing.init()
@@ -258,6 +259,8 @@ class GatewayRuntime:
             await self.channels.stop_all()
             await self.responder.aclose()
             self.inbound_archive.close()
+            if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
+                self.speakup_log.close()
             self.contacts.close()
             self.memory.close()
             await tracing.shutdown()
@@ -503,6 +506,18 @@ def build_gateway_runtime(
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
 
+    speakup_log = None
+    speakup_approval_store = None
+    if config.consciousness.enabled and policy_engine is not None:
+        from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+        from yeoman_gateway.consciousness.log import SpeakupLog
+
+        consciousness_data_dir = get_operational_data_path() / "consciousness"
+        speakup_log = SpeakupLog(consciousness_data_dir / "speakups.db")
+        speakup_approval_store = SpeakupApprovalStore(
+            consciousness_data_dir / "pending_approvals.json"
+        )
+
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     orchestrator = Orchestrator(
         policy=policy_adapter,
@@ -523,6 +538,9 @@ def build_gateway_runtime(
         owner_alert_resolver=policy_adapter.owner_recipients,
         workflow_state=workflow_state,
         approval_trigger=_handle_approved_job,
+        bus=bus,
+        speakup_approval_store=speakup_approval_store,
+        speakup_log=speakup_log,
     )
 
     async def on_cron_job(job: CronJob) -> str | None:
@@ -729,13 +747,9 @@ def build_gateway_runtime(
     consciousness_service = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
-        from yeoman_gateway.consciousness.log import SpeakupLog
         from yeoman_gateway.consciousness.service import ConsciousnessService
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
 
-        speakup_log = SpeakupLog(
-            get_operational_data_path() / "consciousness" / "speakups.db"
-        )
         consciousness_tools = ConsciousnessTools(
             config=config,
             policy_engine=policy_engine,
@@ -744,6 +758,7 @@ def build_gateway_runtime(
             inbound_archive=inbound_archive,
             memory=memory_service,
             security=security,
+            approval_store=speakup_approval_store,
         )
 
         async def _consciousness_planner(prompt: str) -> str:
@@ -776,4 +791,5 @@ def build_gateway_runtime(
         contacts=contacts_service,
         bus=bus,
         gateway_socket=gateway_socket,
+        speakup_log=speakup_log,
     )

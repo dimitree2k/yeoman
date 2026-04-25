@@ -122,21 +122,36 @@ class SpeakupLog:
             )
             self._conn.commit()
 
-    async def mark_rejected(self, proposal_id: str, *, reason: str) -> None:
+    async def mark_status(
+        self,
+        proposal_id: str,
+        *,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE speakups
-                SET status = ?, context_snapshot_json = json_set(
-                    COALESCE(NULLIF(context_snapshot_json, ''), '{}'),
-                    '$.reject_reason',
-                    ?
+            if reason is None:
+                self._conn.execute(
+                    "UPDATE speakups SET status = ? WHERE id = ?",
+                    (status, proposal_id),
                 )
-                WHERE id = ?
-                """,
-                ("rejected", reason, proposal_id),
-            )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE speakups
+                    SET status = ?, context_snapshot_json = json_set(
+                        COALESCE(NULLIF(context_snapshot_json, ''), '{}'),
+                        '$.status_reason',
+                        ?
+                    )
+                    WHERE id = ?
+                    """,
+                    (status, reason, proposal_id),
+                )
             self._conn.commit()
+
+    async def mark_rejected(self, proposal_id: str, *, reason: str) -> None:
+        await self.mark_status(proposal_id, status="rejected", reason=reason)
 
     async def record_silent_pass(
         self,
@@ -252,4 +267,3 @@ class SpeakupLog:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
-

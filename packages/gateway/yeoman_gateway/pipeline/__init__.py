@@ -16,6 +16,7 @@ from yeoman_gateway.pipeline.policy import PolicyMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.pipeline.responder import ResponderMiddleware
 from yeoman_gateway.pipeline.security_input import InputSecurityMiddleware
+from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 
 __all__ = [
     "AccessControlMiddleware",
@@ -31,4 +32,5 @@ __all__ = [
     "PolicyMiddleware",
     "ReplyContextMiddleware",
     "ResponderMiddleware",
+    "SpeakupApprovalMiddleware",
 ]

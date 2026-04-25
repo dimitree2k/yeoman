@@ -33,6 +33,7 @@ tests/*
 !tests/gateway/
 tests/gateway/*
 !tests/gateway/test_consciousness_phase1.py
+!tests/gateway/test_consciousness_phase2.py
 .mypy_cache
 .ruff_cache
 node_modules/

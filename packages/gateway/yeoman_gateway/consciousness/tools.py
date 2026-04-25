@@ -12,6 +12,7 @@ from yeoman_shared.config.schema import Config
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -21,6 +22,14 @@ DEFAULT_HELPFUL_ACTIONS = {
     "surface_memory",
     "correct_error",
     "observation",
+}
+DEFAULT_BALANCED_ACTIONS = DEFAULT_HELPFUL_ACTIONS | {
+    "share_opinion",
+    "light_humor",
+}
+DEFAULT_PERMISSIVE_ACTIONS = DEFAULT_BALANCED_ACTIONS | {
+    "cold_joke",
+    "contrarian",
 }
 MIN_CONFIDENCE = 0.75
 
@@ -45,6 +54,10 @@ class EligibleChat:
     profile: str
     daily_cap: int
     allowed_actions: frozenset[str]
+    owner_channel: str
+    owner_chat_id: str
+    preview: str
+    is_group: bool
 
 
 class ConsciousnessTools:
@@ -60,6 +73,7 @@ class ConsciousnessTools:
         inbound_archive: InboundArchive,
         memory: object | None,
         security: object,
+        approval_store: SpeakupApprovalStore | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
@@ -69,6 +83,7 @@ class ConsciousnessTools:
         self.inbound_archive = inbound_archive
         self.memory = memory
         self.security = security
+        self.approval_store = approval_store
         self._now = now or (lambda: datetime.now(UTC))
         self._proposals: dict[str, SpeakupProposal] = {}
         self._commit_lock = asyncio.Lock()
@@ -86,6 +101,8 @@ class ConsciousnessTools:
                 "profile": chat.profile,
                 "daily_cap": chat.daily_cap,
                 "allowed_actions": sorted(chat.allowed_actions),
+                "preview": chat.preview,
+                "is_group": chat.is_group,
             }
             for chat in self._eligible_chats()
         ]
@@ -203,6 +220,60 @@ class ConsciousnessTools:
                 await self.log.mark_rejected(proposal.proposal_id, reason="daily_cap_reached")
                 return {"status": "rejected", "reason": "daily_cap_reached"}
 
+            if eligible.is_group and eligible.preview == "owner_dm":
+                if self.approval_store is None:
+                    await self.log.mark_rejected(
+                        proposal.proposal_id,
+                        reason="approval_store_unavailable",
+                    )
+                    return {"status": "rejected", "reason": "approval_store_unavailable"}
+                approval = PendingSpeakupApproval(
+                    proposal_id=proposal.proposal_id,
+                    target_channel=proposal.channel,
+                    target_chat_id=proposal.chat_id,
+                    owner_channel=eligible.owner_channel,
+                    owner_chat_id=eligible.owner_chat_id,
+                    message=proposal.message,
+                    action_type=proposal.action_type,
+                    profile=proposal.profile,
+                    created_at=self._now().timestamp(),
+                    expires_at=(
+                        self._now().timestamp()
+                        + float(self.config.consciousness.approval_timeout_seconds)
+                    ),
+                    context_snapshot=dict(proposal.context_snapshot),
+                    trigger=proposal.trigger,
+                    daily_cap=eligible.daily_cap,
+                )
+                await self.approval_store.add(approval)
+                await self.log.mark_status(
+                    proposal.proposal_id,
+                    status="queued_for_approval",
+                )
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=approval.owner_channel,
+                        chat_id=approval.owner_chat_id,
+                        content=(
+                            f"Proposed spontaneous message for {approval.target_chat_id}\n"
+                            f"Message: {proposal.message}\n"
+                            f"Approve: {approval.approve_code}\n"
+                            f"Deny: {approval.deny_code}"
+                        ),
+                        metadata={
+                            "spontaneous": True,
+                            "preview": True,
+                            "proposal_id": proposal.proposal_id,
+                            "target_chat_id": approval.target_chat_id,
+                            "action_type": proposal.action_type,
+                            "profile": proposal.profile,
+                            "trigger": proposal.trigger,
+                        },
+                    )
+                )
+                self._proposals.pop(proposal.proposal_id, None)
+                return {"status": "queued_for_approval", "proposal_id": proposal.proposal_id}
+
             output = self.security.check_output(
                 proposal.message,
                 context={
@@ -270,6 +341,13 @@ class ConsciousnessTools:
         for channel, owners in self.policy_engine.policy.owners.items():
             if channel not in self.policy_engine.apply_channels:
                 continue
+            owner_chat_id = ""
+            for owner in owners:
+                owner_chat_id = self._owner_dm_chat_id(channel, owner)
+                if owner_chat_id:
+                    break
+            if not owner_chat_id:
+                continue
             for owner in owners:
                 chat_id = self._owner_dm_chat_id(channel, owner)
                 if not chat_id or self._is_group_chat(channel, chat_id):
@@ -299,7 +377,7 @@ class ConsciousnessTools:
                 allowed = (
                     frozenset(resolved.spontaneity_allowed_actions)
                     if resolved.spontaneity_allowed_actions is not None
-                    else frozenset(DEFAULT_HELPFUL_ACTIONS)
+                    else self._default_allowed_actions(profile)
                 )
                 eligible.append(
                     EligibleChat(
@@ -308,6 +386,53 @@ class ConsciousnessTools:
                         profile=profile,
                         daily_cap=int(daily_cap),
                         allowed_actions=allowed,
+                        owner_channel=channel,
+                        owner_chat_id=owner_chat_id,
+                        preview=resolved.spontaneity_preview or "none",
+                        is_group=False,
+                    )
+                )
+            channel_policy = self.policy_engine.policy.channels.get(channel)
+            if channel_policy is None:
+                continue
+            for chat_id, override in channel_policy.chats.items():
+                if not self._is_group_chat(channel, chat_id):
+                    continue
+                if override.spontaneity is None or override.spontaneity.enabled is not True:
+                    continue
+                resolved = self.policy_engine.resolve_policy(channel, chat_id)
+                if self._in_quiet_hours(
+                    resolved.spontaneity_quiet_hours_start,
+                    resolved.spontaneity_quiet_hours_end,
+                ):
+                    continue
+                profile = resolved.spontaneity_profile
+                if profile in {"", "off"}:
+                    continue
+                daily_cap = (
+                    resolved.spontaneity_daily_cap
+                    if resolved.spontaneity_daily_cap is not None
+                    else self.config.consciousness.default_daily_cap
+                )
+                if daily_cap <= 0:
+                    continue
+                preview = resolved.spontaneity_preview or "owner_dm"
+                allowed = (
+                    frozenset(resolved.spontaneity_allowed_actions)
+                    if resolved.spontaneity_allowed_actions is not None
+                    else self._default_allowed_actions(profile)
+                )
+                eligible.append(
+                    EligibleChat(
+                        channel=channel,
+                        chat_id=chat_id,
+                        profile=profile,
+                        daily_cap=int(daily_cap),
+                        allowed_actions=allowed,
+                        owner_channel=channel,
+                        owner_chat_id=owner_chat_id,
+                        preview=preview,
+                        is_group=True,
                     )
                 )
         return eligible
@@ -334,6 +459,14 @@ class ConsciousnessTools:
     def _is_group_chat(channel: str, chat_id: str) -> bool:
         return channel == "whatsapp" and chat_id.endswith("@g.us")
 
+    @staticmethod
+    def _default_allowed_actions(profile: str) -> frozenset[str]:
+        if profile == "permissive":
+            return frozenset(DEFAULT_PERMISSIVE_ACTIONS)
+        if profile == "balanced":
+            return frozenset(DEFAULT_BALANCED_ACTIONS)
+        return frozenset(DEFAULT_HELPFUL_ACTIONS)
+
     def _in_quiet_hours(self, start: str | None, end: str | None) -> bool:
         if not start or not end:
             return False
@@ -358,4 +491,3 @@ class ConsciousnessTools:
         if hour < 0 or hour > 23 or minute < 0 or minute > 59:
             return None
         return hour * 60 + minute
-

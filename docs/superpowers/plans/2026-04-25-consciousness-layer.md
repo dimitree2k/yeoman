@@ -60,17 +60,17 @@ Exit criteria:
 
 Goal: add explicit group opt-in with owner-DM preview before group delivery.
 
-- [ ] Add `pipeline/speakup_approval.py`.
-- [ ] Wire `SpeakupApprovalMiddleware` into the pipeline after policy resolution.
-- [ ] Queue group proposals in `SpeakupApprovalStore` when preview is `owner_dm`.
-- [ ] Send owner preview messages with `spk-approve-*` and `spk-deny-*` codes.
-- [ ] On approve, publish to the target chat.
-- [ ] On deny, expire, or timeout, do not send and do not consume daily cap.
-- [ ] Tests: group opt-in is required.
-- [ ] Tests: group preview queues owner approval instead of sending directly.
-- [ ] Tests: approve code sends to target chat.
-- [ ] Tests: deny code prevents send.
-- [ ] Tests: expired approval does not send and does not consume daily cap.
+- [x] Add `pipeline/speakup_approval.py`.
+- [x] Wire `SpeakupApprovalMiddleware` into the pipeline after policy resolution.
+- [x] Queue group proposals in `SpeakupApprovalStore` when preview is `owner_dm`.
+- [x] Send owner preview messages with `spk-approve-*` and `spk-deny-*` codes.
+- [x] On approve, publish to the target chat.
+- [x] On deny, expire, or timeout, do not send and do not consume daily cap.
+- [x] Tests: group opt-in is required.
+- [x] Tests: group preview queues owner approval instead of sending directly.
+- [x] Tests: approve code sends to target chat.
+- [x] Tests: deny code prevents send.
+- [x] Tests: expired approval does not send and does not consume daily cap.
 
 Exit criteria:
 
@@ -113,9 +113,9 @@ Exit criteria:
 
 ## Always-On Safety Checklist
 
-- [ ] `consciousness.enabled = false` disables all proactive behavior.
-- [ ] No proactive group message without explicit group opt-in.
-- [ ] Daily cap is enforced atomically at commit time.
-- [ ] Tool boundary refuses non-eligible chat ids.
-- [ ] Logs and transcripts stay under private runtime paths, not source.
+- [x] `consciousness.enabled = false` disables all proactive behavior.
+- [x] No proactive group message without explicit group opt-in.
+- [x] Daily cap is enforced atomically at commit time.
+- [x] Tool boundary refuses non-eligible chat ids.
+- [x] Logs and transcripts stay under private runtime paths, not source.
 - [ ] Property test passes: adversarial agent sequences cannot exceed daily cap.
