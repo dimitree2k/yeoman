@@ -62,6 +62,14 @@ class ConsciousnessAgent:
         chat_id: str,
         eligible: list[dict[str, object]],
     ) -> str:
+        enriched_eligible = []
+        for chat in eligible:
+            enriched = dict(chat)
+            usage = await self._tools.read_daily_usage(str(chat.get("chat_id") or ""))
+            if usage.get("status") == "ok":
+                enriched["sent_today"] = usage["sent_today"]
+                enriched["daily_remaining"] = usage["daily_remaining"]
+            enriched_eligible.append(enriched)
         window = await self._tools.read_chat_window(chat_id, n=20)
         memory = await self._tools.search_memory("", chat_id, limit=5)
         history = await self._tools.read_speakup_history(chat_id, n=10)
@@ -69,9 +77,12 @@ class ConsciousnessAgent:
             {
                 "instruction": (
                     "Return JSON only. Either {\"silence\": true, \"reason\": \"...\"} "
-                    "or one proposal with chat_id, message, action_type, confidence."
+                    "or one proposal with chat_id, message, action_type, confidence. "
+                    "Do not claim the daily cap is reached unless sent_today is greater "
+                    "than or equal to daily_cap. Treat speakup_history status 'denied' "
+                    "as owner feedback; 'rejected' and 'expired' are system outcomes."
                 ),
-                "eligible_chats": eligible,
+                "eligible_chats": enriched_eligible,
                 "chat_window": window,
                 "memory": memory,
                 "speakup_history": history,
@@ -91,4 +102,3 @@ class ConsciousnessAgent:
         except json.JSONDecodeError:
             return {"silence": True, "reason": "invalid_planner_json"}
         return parsed if isinstance(parsed, dict) else {"silence": True, "reason": "invalid_planner_json"}
-

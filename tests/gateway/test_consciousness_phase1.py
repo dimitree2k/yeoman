@@ -224,6 +224,38 @@ async def test_fake_agent_can_stay_silent_and_logs_pass(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_prompt_includes_daily_cap_state(tmp_path: Path) -> None:
+    tools = _tools(tmp_path)
+    await tools.log.record_sent(
+        proposal_id="existing",
+        channel="whatsapp",
+        chat_id="owner@s.whatsapp.net",
+        action_type="observation",
+        profile="helpful",
+        message="already sent",
+        trigger="cron",
+        context_snapshot={},
+        now=datetime(2026, 4, 25, 9, 0, tzinfo=UTC).timestamp(),
+    )
+    captured: dict[str, object] = {}
+
+    def planner(prompt: str) -> str:
+        captured.update(json.loads(prompt))
+        return json.dumps({"silence": True, "reason": "test"})
+
+    agent = ConsciousnessAgent(tools=tools, planner=planner)
+
+    await agent.run_once(trigger="cron")
+
+    eligible = captured["eligible_chats"]
+    assert isinstance(eligible, list)
+    assert eligible[0]["daily_cap"] == 1
+    assert eligible[0]["sent_today"] == 1
+    assert eligible[0]["daily_remaining"] == 0
+    assert "status 'denied' as owner feedback" in str(captured["instruction"])
+
+
+@pytest.mark.asyncio
 async def test_security_output_block_prevents_commit(tmp_path: Path) -> None:
     tools = _tools(tmp_path, security=_FakeSecurity(action="block"))
     proposal = await tools.propose_speakup(

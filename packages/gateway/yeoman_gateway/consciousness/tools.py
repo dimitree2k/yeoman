@@ -119,6 +119,7 @@ class ConsciousnessTools:
             since,
             now,
             limit=max(1, min(int(n), 50)),
+            latest=True,
         )
         return {"status": "ok", "messages": rows}
 
@@ -152,6 +153,22 @@ class ConsciousnessTools:
             limit=max(1, min(int(n), 50)),
         )
         return {"status": "ok", "history": history}
+
+    async def read_daily_usage(self, chat_id: str) -> dict[str, object]:
+        eligible = self._eligible_by_chat().get(chat_id)
+        if eligible is None:
+            return {"status": "rejected", "reason": "chat_not_eligible"}
+        sent_today = await self.log.count_sent_today(
+            channel=eligible.channel,
+            chat_id=eligible.chat_id,
+            now=self._now(),
+        )
+        return {
+            "status": "ok",
+            "daily_cap": eligible.daily_cap,
+            "sent_today": sent_today,
+            "daily_remaining": max(0, eligible.daily_cap - sent_today),
+        }
 
     async def propose_speakup(
         self,
@@ -451,6 +468,8 @@ class ConsciousnessTools:
         value = str(owner or "").strip()
         if not value:
             return ""
+        if channel == "whatsapp" and value.startswith("+"):
+            value = value[1:]
         if channel == "whatsapp" and "@" not in value:
             return f"{value}@s.whatsapp.net"
         return value

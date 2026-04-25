@@ -166,6 +166,46 @@ async def test_group_preview_queues_owner_approval_instead_of_sending_directly(t
 
 
 @pytest.mark.asyncio
+async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
+    tools, _, _ = _tools(tmp_path, opt_in_group=True)
+    archive = tools.inbound_archive
+    for index, (timestamp, text) in enumerate(
+        [
+            (1776581816, "old-1"),
+            (1776581817, "old-2"),
+            (1776581818, "old-3"),
+            (1777100000, "recent-1"),
+            (1777100001, "recent-2"),
+            (1777100002, "recent-3"),
+        ]
+    ):
+        archive.record_inbound(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            message_id=f"msg-{index}",
+            participant="user@s.whatsapp.net",
+            sender_id="user@s.whatsapp.net",
+            text=text,
+            timestamp=timestamp,
+        )
+
+    window = await tools.read_chat_window("group@g.us", n=3)
+
+    assert [message["text"] for message in window["messages"]] == [
+        "recent-1",
+        "recent-2",
+        "recent-3",
+    ]
+
+
+def test_whatsapp_owner_phone_normalizes_to_dm_jid() -> None:
+    assert (
+        ConsciousnessTools._owner_dm_chat_id("whatsapp", "+491757070305")
+        == "491757070305@s.whatsapp.net"
+    )
+
+
+@pytest.mark.asyncio
 async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
     tools, store, log = _tools(tmp_path, opt_in_group=True)
     proposal = await tools.propose_speakup(

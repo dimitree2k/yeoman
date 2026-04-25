@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-
 from yeoman_shared.utils.helpers import ensure_dir, get_data_path
 
 DEFAULT_RETENTION_DAYS = 30
@@ -244,11 +243,13 @@ class InboundArchive:
         until: datetime | None = None,
         *,
         limit: int = 300,
+        latest: bool = False,
     ) -> list[dict[str, Any]]:
         """Return messages between two timestamps, oldest first.
 
         *since* and *until* are UTC datetimes.  *until* defaults to now.
-        Hard cap at 300 rows.
+        Hard cap at 300 rows.  When *latest* is true, the newest limited
+        slice is selected first and then returned oldest first.
         """
         if not channel or not chat_id:
             return []
@@ -259,9 +260,32 @@ class InboundArchive:
         since_iso = since.isoformat()
         until_iso = until_dt.isoformat()
 
-        with self._lock:
-            rows = self._conn.execute(
+        order_expr = """
+            CASE WHEN timestamp IS NOT NULL THEN timestamp
+                 ELSE CAST(strftime('%s', created_at) AS INTEGER)
+            END
+        """
+        if latest:
+            sql = f"""
+                SELECT *
+                FROM (
+                    SELECT channel, chat_id, message_id, participant, sender_id,
+                           text, timestamp, created_at, sender_name,
+                           {order_expr} AS sort_ts
+                    FROM inbound_messages
+                    WHERE channel = ? AND chat_id = ?
+                      AND (
+                        (timestamp IS NOT NULL AND timestamp >= ? AND timestamp <= ?)
+                        OR
+                        (timestamp IS NULL AND created_at >= ? AND created_at <= ?)
+                      )
+                    ORDER BY sort_ts DESC, created_at DESC
+                    LIMIT ?
+                )
+                ORDER BY sort_ts ASC, created_at ASC
                 """
+        else:
+            sql = f"""
                 SELECT channel, chat_id, message_id, participant, sender_id,
                        text, timestamp, created_at, sender_name
                 FROM inbound_messages
@@ -271,13 +295,13 @@ class InboundArchive:
                     OR
                     (timestamp IS NULL AND created_at >= ? AND created_at <= ?)
                   )
-                ORDER BY
-                    CASE WHEN timestamp IS NOT NULL THEN timestamp
-                         ELSE CAST(strftime('%s', created_at) AS INTEGER)
-                    END ASC,
-                    created_at ASC
+                ORDER BY {order_expr} ASC, created_at ASC
                 LIMIT ?
-                """,
+                """
+
+        with self._lock:
+            rows = self._conn.execute(
+                sql,
                 (
                     str(channel),
                     str(chat_id),
