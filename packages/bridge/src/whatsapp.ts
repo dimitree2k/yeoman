@@ -25,6 +25,7 @@ const OUTBOUND_SELF_FILTER_TTL_MS = 10 * 60_000;
 const OUTBOUND_SELF_FILTER_MAX = 5_000;
 const OUTBOUND_SELF_FILTER_CLEANUP_INTERVAL_MS = 30_000;
 const INBOUND_IMAGE_RETRY_DELAYS_MS = [250, 500, 1000];
+const QUOTED_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 
@@ -52,6 +53,7 @@ export interface InboundMessageV2 {
   replyToMessageId?: string;
   replyToParticipantJid?: string;
   replyToText?: string;
+  replyToMedia?: InboundMedia;
   media?: InboundMedia;
 }
 
@@ -984,11 +986,12 @@ export class WhatsAppClient {
     return null;
   }
 
-  private extractReplyMeta(msg: any): {
+  private async buildReplyMeta(msg: any, chatJid: string): Promise<{
     replyToMessageId?: string;
     replyToParticipantJid?: string;
     replyToText?: string;
-  } {
+    replyToMedia?: InboundMedia;
+  }> {
     const context = this.extractContextInfo(msg) || {};
     const replyToMessageIdRaw = String(context.stanzaId || '').trim();
     const replyToParticipantJidRaw = normalizeJid(String(context.participant || ''));
@@ -998,7 +1001,115 @@ export class WhatsAppClient {
     const replyToParticipantJid = replyToParticipantJidRaw || undefined;
     const replyToText = replyToTextRaw ? limitText(replyToTextRaw, 1_000) : undefined;
 
-    return { replyToMessageId, replyToParticipantJid, replyToText };
+    let replyToMedia: InboundMedia | undefined;
+    if (replyToMessageId && context.quotedMessage) {
+      const quotedMsg = this.unwrapNestedMessage(context.quotedMessage);
+      if (quotedMsg?.imageMessage) {
+        replyToMedia = await this.persistQuotedImage(
+          chatJid,
+          replyToMessageId,
+          replyToParticipantJid,
+          quotedMsg,
+        );
+      }
+    }
+
+    return { replyToMessageId, replyToParticipantJid, replyToText, replyToMedia };
+  }
+
+  private async persistQuotedImage(
+    chatJid: string,
+    quotedMessageId: string,
+    quotedParticipant: string | undefined,
+    quotedMessage: any,
+  ): Promise<InboundMedia | undefined> {
+    if (!this.sock || !quotedMessage?.imageMessage) return undefined;
+
+    const imageMessage = quotedMessage.imageMessage;
+    const mimeType = typeof imageMessage.mimetype === 'string' ? imageMessage.mimetype : undefined;
+    const declaredSize =
+      typeof imageMessage.fileLength === 'number'
+        ? imageMessage.fileLength
+        : typeof imageMessage.fileLength === 'string'
+          ? Number(imageMessage.fileLength)
+          : undefined;
+    if (declaredSize && Number.isFinite(declaredSize) && declaredSize > QUOTED_IMAGE_MAX_BYTES) {
+      return undefined;
+    }
+
+    const now = new Date();
+    const yyyy = String(now.getUTCFullYear());
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const dayDir = join(this.mediaIncomingDir, yyyy, mm, dd);
+    try {
+      await ensureDirPrivate(dayDir);
+    } catch {
+      return undefined;
+    }
+
+    const ext = mediaExtension('image', mimeType, undefined);
+    const filePath = join(dayDir, `quoted-${quotedMessageId}${ext}`);
+
+    // Reuse cached downloads when the same quoted image comes up twice.
+    try {
+      const st = await fs.stat(filePath);
+      if (st.size > 0) {
+        return { kind: 'image', mimeType, path: filePath, bytes: st.size };
+      }
+    } catch {
+      // Not cached — fall through to download.
+    }
+
+    const envelope = {
+      key: {
+        remoteJid: chatJid,
+        id: quotedMessageId,
+        fromMe: false,
+        participant: quotedParticipant,
+      },
+      message: quotedMessage,
+    };
+
+    let buffer: Buffer | null = null;
+    for (let attempt = 0; attempt <= INBOUND_IMAGE_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const downloaded = await downloadMediaMessage(
+          envelope as any,
+          'buffer',
+          {},
+          {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: this.sock.updateMediaMessage,
+          },
+        );
+        buffer = decodeDownloadedMedia(downloaded);
+      } catch {
+        if (attempt >= INBOUND_IMAGE_RETRY_DELAYS_MS.length) {
+          return undefined;
+        }
+      }
+      if (buffer && buffer.length > 0) break;
+      const backoffMs = INBOUND_IMAGE_RETRY_DELAYS_MS[attempt];
+      if (backoffMs && backoffMs > 0) {
+        await sleep(backoffMs);
+      }
+    }
+    if (!buffer || buffer.length === 0) return undefined;
+    if (buffer.length > QUOTED_IMAGE_MAX_BYTES) return undefined;
+
+    try {
+      await fs.writeFile(filePath, buffer);
+      try {
+        await fs.chmod(filePath, 0o600);
+      } catch {
+        // chmod may be unsupported on some filesystems.
+      }
+    } catch {
+      return undefined;
+    }
+
+    return { kind: 'image', mimeType, path: filePath, bytes: buffer.length };
   }
 
   private extractMentionMeta(msg: any, text: string): {
@@ -1269,7 +1380,7 @@ export class WhatsAppClient {
         }
 
         const mention = this.extractMentionMeta(msg, extracted.text);
-        const reply = this.extractReplyMeta(msg);
+        const reply = await this.buildReplyMeta(msg, chatJid);
         const tsRaw = msg?.messageTimestamp;
         const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
 
@@ -1298,6 +1409,7 @@ export class WhatsAppClient {
           replyToMessageId: reply.replyToMessageId,
           replyToParticipantJid: reply.replyToParticipantJid,
           replyToText: reply.replyToText,
+          replyToMedia: reply.replyToMedia,
           media: inboundMedia,
         });
       }

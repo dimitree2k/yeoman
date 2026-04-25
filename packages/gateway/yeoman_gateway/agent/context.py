@@ -59,6 +59,7 @@ class ContextBuilder:
         # NOTE: temporal grounding is injected as a separate message in build_messages()
         # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
+        parts.append(self._build_url_fetch_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
         parts.append(
@@ -168,6 +169,20 @@ Skills with available="false" need dependencies installed first - you can try in
                 "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
                 "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
                 "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
+            ]
+        )
+
+    @staticmethod
+    def _build_url_fetch_guardrails() -> str:
+        """Rules for handling user-shared URLs when fetch tools fail or substitute content."""
+        return "\n".join(
+            [
+                "# URL Summarisation",
+                "When the user shares a specific URL and asks you to summarise / explain / translate / react to it, the source of truth is the content of THAT URL — not search results, not memory, not chat context.",
+                "Do not poison search queries with keywords from recent chat context. If you fall back to web_search, key the query on the URL itself (e.g. site:domain path tokens, exact title), never on unrelated topics the chat was just discussing.",
+                "If browse / web_fetch return an error, paywall (401/403/451), empty body, or redirect to a login/consent wall, treat the article as inaccessible. Do NOT substitute a different URL's content from web_search results and present it as if it were the requested article.",
+                "When the targeted URL cannot be read, say so plainly in one short sentence (e.g. 'Artikel ist hinter Paywall, komme nicht ran' / 'page blocks scraping'). You may offer the headline/dek if visible, or a related public source — but label it clearly as such, not as the article's content.",
+                "Never claim or imply you summarised an article you did not actually read. A confident-sounding summary built only from search-result snippets about adjacent topics is a hallucination.",
             ]
         )
 

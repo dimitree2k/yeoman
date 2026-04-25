@@ -5,7 +5,12 @@ import asyncio
 import time
 
 import pytest
-from yeoman_gateway.bus.events import OverseerCommand, WebhookEvent
+from yeoman_gateway.bus.events import (
+    InboundMessage,
+    InboundObservedEvent,
+    OverseerCommand,
+    WebhookEvent,
+)
 from yeoman_gateway.bus.queue import MessageBus
 
 
@@ -84,4 +89,63 @@ async def test_event_dropped_counter() -> None:
             source="b", event_type="t", payload={}, signature_verified=True, received_at=0.0
         )
     )
+    assert bus.event_dropped >= 1
+
+
+@pytest.mark.asyncio
+async def test_publish_inbound_emits_observation_and_keeps_inbound() -> None:
+    bus = MessageBus(event_maxsize=10)
+    received: list[InboundObservedEvent] = []
+
+    async def handler(ev: InboundObservedEvent) -> None:
+        received.append(ev)
+
+    bus.subscribe_event("InboundObservedEvent", handler)
+    msg = InboundMessage(
+        channel="whatsapp",
+        sender_id="user",
+        chat_id="group@g.us",
+        content="hello",
+        metadata={"message_id": "m1", "is_group": True},
+    )
+    await bus.publish_inbound(msg)
+
+    inbound = await bus.consume_inbound()
+    dispatch_task = asyncio.create_task(bus.dispatch_events())
+    await asyncio.sleep(0.05)
+    bus.stop()
+    await dispatch_task
+
+    assert inbound is msg
+    assert len(received) == 1
+    assert received[0].channel == "whatsapp"
+    assert received[0].chat_id == "group@g.us"
+    assert received[0].sender_id == "user"
+    assert received[0].content == "hello"
+    assert received[0].message_id == "m1"
+    assert received[0].is_group is True
+
+
+@pytest.mark.asyncio
+async def test_event_queue_overflow_does_not_block_inbound_delivery() -> None:
+    bus = MessageBus(inbound_maxsize=1, event_maxsize=1)
+    await bus.publish_event(
+        WebhookEvent(
+            source="existing",
+            event_type="full",
+            payload={},
+            signature_verified=True,
+            received_at=0.0,
+        )
+    )
+    msg = InboundMessage(
+        channel="whatsapp",
+        sender_id="user",
+        chat_id="group@g.us",
+        content="hello",
+    )
+
+    await asyncio.wait_for(bus.publish_inbound(msg), timeout=0.1)
+
+    assert await bus.consume_inbound() is msg
     assert bus.event_dropped >= 1

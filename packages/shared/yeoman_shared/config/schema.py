@@ -494,6 +494,23 @@ class BusConfig(BaseModel):
     event_maxsize: int = 100
 
 
+class ConsciousnessConfig(BaseModel):
+    """Global controls for proactive consciousness service behavior."""
+
+    enabled: bool = False
+    owner_dm_default_enabled: bool = Field(default=False, alias="ownerDmDefaultEnabled")
+    cron_hour: int = Field(default=19, alias="cronHour", ge=0, le=23)
+    cron_minute: int = Field(default=0, alias="cronMinute", ge=0, le=59)
+    agent_max_iterations: int = Field(default=3, alias="agentMaxIterations", ge=1, le=8)
+    agent_max_input_tokens: int = Field(default=10000, alias="agentMaxInputTokens", ge=1000)
+    max_speakup_length_chars: int = Field(default=500, alias="maxSpeakupLengthChars", ge=1)
+    default_daily_cap: int = Field(default=1, alias="defaultDailyCap", ge=0, le=10)
+    approval_timeout_seconds: int = Field(default=3600, alias="approvalTimeoutSeconds", ge=60)
+    burst_enabled: bool = Field(default=False, alias="burstEnabled")
+    burst_threshold_messages: int = Field(default=8, alias="burstThresholdMessages", ge=2)
+    burst_window_minutes: int = Field(default=15, alias="burstWindowMinutes", ge=1)
+
+
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -514,6 +531,7 @@ class Config(BaseSettings):
     bus: BusConfig = Field(default_factory=BusConfig)
     ipc: IpcConfig = Field(default_factory=IpcConfig)
     webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
+    consciousness: ConsciousnessConfig = Field(default_factory=ConsciousnessConfig)
 
     @property
     def workspace_path(self) -> Path:

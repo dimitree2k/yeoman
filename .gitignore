@@ -3,7 +3,16 @@
 *.pyc
 dist/
 build/
-docs/
+docs/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/plans/
+docs/superpowers/plans/*
+!docs/superpowers/plans/2026-04-25-consciousness-layer.md
+!docs/superpowers/specs/
+docs/superpowers/specs/*
+!docs/superpowers/specs/2026-04-25-consciousness-layer-design.md
+!docs/superpowers/specs/2026-04-25-consciousness-layer-design-superseded.md
 *.egg-info/
 *.egg
 *.pyc

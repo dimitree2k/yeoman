@@ -4,6 +4,7 @@ import time
 
 from yeoman_gateway.bus.events import (
     GatewayEvent,
+    InboundObservedEvent,
     OverseerCommand,
     SystemEvent,
     WebhookEvent,
@@ -45,6 +46,28 @@ def test_system_event_fields() -> None:
         timestamp=time.time(),
     )
     assert ev.kind == "channel_connected"
+
+
+def test_inbound_observed_event_fields() -> None:
+    ev = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        sender_id="user",
+        content="hello",
+        timestamp=123.0,
+        message_id="m1",
+        is_group=True,
+        metadata={"source": "test"},
+    )
+    assert ev.channel == "whatsapp"
+    assert ev.chat_id == "group@g.us"
+    assert ev.message_id == "m1"
+    assert ev.is_group is True
+    try:
+        ev.content = "other"  # type: ignore[misc]
+        raise AssertionError("should be frozen")
+    except AttributeError:
+        pass
 
 
 def test_gateway_event_union() -> None:

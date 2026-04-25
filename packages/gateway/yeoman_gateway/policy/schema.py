@@ -20,6 +20,17 @@ AllowedToolsMode = Literal["all", "allowlist"]
 ToolAccessMode = Literal["everyone", "allowlist", "owner_only"]
 MemoryNotesMode = Literal["adaptive", "heuristic", "hybrid"]
 VoiceOutputMode = Literal["text", "in_kind", "always", "off"]
+ActionType = Literal[
+    "answer_open_question",
+    "surface_memory",
+    "correct_error",
+    "share_opinion",
+    "light_humor",
+    "cold_joke",
+    "observation",
+    "contrarian",
+]
+PreviewMode = Literal["none", "owner_dm"]
 
 
 class WhoCanTalkPolicy(PolicyModel):
@@ -164,6 +175,30 @@ class TalkativeCooldownPolicyOverride(PolicyModel):
     use_llm_message: bool | None = Field(default=None, alias="useLlmMessage")
 
 
+class SpontaneityPolicy(PolicyModel):
+    """Per-chat eligibility and safety policy for proactive speakups."""
+
+    enabled: bool = False
+    profile: str = "off"
+    daily_cap: int | None = Field(default=None, alias="dailyCap", ge=0, le=10)
+    allowed_actions: list[ActionType] | None = Field(default=None, alias="allowedActions")
+    preview: PreviewMode | None = None
+    quiet_hours_start: str | None = Field(default=None, alias="quietHoursStart")
+    quiet_hours_end: str | None = Field(default=None, alias="quietHoursEnd")
+
+
+class SpontaneityPolicyOverride(PolicyModel):
+    """Partial override for proactive speakup policy."""
+
+    enabled: bool | None = None
+    profile: str | None = None
+    daily_cap: int | None = Field(default=None, alias="dailyCap", ge=0, le=10)
+    allowed_actions: list[ActionType] | None = Field(default=None, alias="allowedActions")
+    preview: PreviewMode | None = None
+    quiet_hours_start: str | None = Field(default=None, alias="quietHoursStart")
+    quiet_hours_end: str | None = Field(default=None, alias="quietHoursEnd")
+
+
 class ChatPolicy(PolicyModel):
     """Resolved chat policy (no optional fields)."""
 
@@ -183,6 +218,7 @@ class ChatPolicy(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicy = Field(
         default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
     )
+    spontaneity: SpontaneityPolicy = Field(default_factory=SpontaneityPolicy)
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
@@ -205,6 +241,7 @@ class ChatPolicyOverride(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(
         default=None, alias="talkativeCooldown"
     )
+    spontaneity: SpontaneityPolicyOverride | None = None
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 

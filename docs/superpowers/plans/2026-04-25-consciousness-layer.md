@@ -1,0 +1,121 @@
+# Consciousness Layer Implementation Plan
+
+> For agentic workers: implement this plan phase-by-phase. Keep the checkbox
+> state updated as tasks land so progress survives session changes.
+
+Status: in_progress
+Spec: `../specs/2026-04-25-consciousness-layer-design.md`
+Superseded draft: `../specs/2026-04-25-consciousness-layer-design-superseded.md`
+
+## Phase 0 - Integration Fixes
+
+Goal: add the codebase primitives needed by later phases without enabling any
+proactive bot behavior.
+
+- [x] Policy schema: add `SpontaneityPolicy` and `SpontaneityPolicyOverride` in `packages/gateway/yeoman_gateway/policy/schema.py`.
+- [x] Policy schema: add `spontaneity` to `ChatPolicy` and `ChatPolicyOverride`.
+- [x] Policy engine: expose resolved spontaneity policy for a `(channel, chat_id)` target.
+- [x] Global config: add `ConsciousnessConfig` in `packages/shared/yeoman_shared/config/schema.py`.
+- [x] Global config: add `Config.consciousness`.
+- [x] Bus events: add `InboundObservedEvent` in `packages/gateway/yeoman_gateway/bus/events.py`.
+- [x] Bus publish: emit `InboundObservedEvent` from `MessageBus.publish_inbound()` without blocking normal inbound delivery.
+- [x] Approval primitives: add `PendingSpeakupApproval` and `SpeakupApprovalStore`.
+- [x] Tests: policy schema accepts and rejects expected spontaneity fields.
+- [x] Tests: `MessageBus.publish_inbound()` emits observation events and still enqueues inbound messages.
+- [x] Tests: event queue overflow cannot block inbound delivery.
+- [x] Tests: `SpeakupApprovalStore` persists, reloads, expires, approves, and denies proposals.
+
+Exit criteria:
+
+- [x] Phase 0 tests pass.
+- [x] No service task starts by default.
+- [x] No proactive message can be sent yet.
+
+## Phase 1 - Owner DM Helpful Cron
+
+Goal: prove one low-blast-radius proactive path with owner DMs only.
+
+- [ ] Add `consciousness/service.py` with cron-loop orchestration.
+- [ ] Add `consciousness/log.py` with SQLite speakup log and daily counters.
+- [ ] Add `consciousness/tools.py` with the hard tool boundary.
+- [ ] Add `consciousness/agent.py` with one-proposal-or-silence behavior.
+- [ ] Wire `ConsciousnessService` in `build_gateway_runtime()` behind `config.consciousness.enabled`.
+- [ ] Enforce owner-DM-only eligibility.
+- [ ] Enforce global kill switch, daily cap, quiet hours, action allowlist, length cap, and confidence threshold.
+- [ ] Publish `OutboundMessage(metadata={"spontaneous": true, ...})` on successful commit.
+- [ ] Tests: global kill switch prevents service start and commit.
+- [ ] Tests: daily cap cannot be exceeded.
+- [ ] Tests: quiet hours prevent commits.
+- [ ] Tests: non-eligible chat ids are rejected by tools.
+- [ ] Tests: fake agent can propose exactly one outbound message.
+- [ ] Tests: fake agent can stay silent and silent pass is logged.
+- [ ] Tests: security classifier rejection prevents commit.
+
+Exit criteria:
+
+- [ ] One week of owner-DM runs has no cap violations.
+- [ ] Owner reports messages are useful often enough to continue.
+
+## Phase 2 - Opt-In Groups With Preview
+
+Goal: add explicit group opt-in with owner-DM preview before group delivery.
+
+- [ ] Add `pipeline/speakup_approval.py`.
+- [ ] Wire `SpeakupApprovalMiddleware` into the pipeline after policy resolution.
+- [ ] Queue group proposals in `SpeakupApprovalStore` when preview is `owner_dm`.
+- [ ] Send owner preview messages with `spk-approve-*` and `spk-deny-*` codes.
+- [ ] On approve, publish to the target chat.
+- [ ] On deny, expire, or timeout, do not send and do not consume daily cap.
+- [ ] Tests: group opt-in is required.
+- [ ] Tests: group preview queues owner approval instead of sending directly.
+- [ ] Tests: approve code sends to target chat.
+- [ ] Tests: deny code prevents send.
+- [ ] Tests: expired approval does not send and does not consume daily cap.
+
+Exit criteria:
+
+- [ ] Preview flow works end-to-end for at least one opt-in group.
+- [ ] No group message is sent without explicit `preview: "none"` or owner approval.
+
+## Phase 3 - Outcome And Taste
+
+Goal: add self-improvement from logged behavior after enough data exists.
+
+- [ ] Add `consciousness/outcomes.py` delayed outcome classifier.
+- [ ] Add provider route `consciousness.outcome`.
+- [ ] Update `SpeakupLog` records with outcome labels.
+- [ ] Add `consciousness/taste.py` distiller.
+- [ ] Add provider route `consciousness.taste`.
+- [ ] Write compact chat-scope taste memory only after enough samples.
+- [ ] Tests: outcome enricher classifies scripted post-speakup windows.
+- [ ] Tests: taste distiller writes patterns, not raw speakup messages.
+
+Exit criteria:
+
+- [ ] Distilled chat taste records improve proposal quality without polluting memory retrieval.
+
+## Phase 4 - Burst Trigger
+
+Goal: allow opportunistic wakeups from observed chat activity without bypassing rails.
+
+- [ ] Add `consciousness/burst.py`.
+- [ ] Subscribe `BurstObserver` to `InboundObservedEvent`.
+- [ ] Maintain rolling counts per `(channel, chat_id)`.
+- [ ] Persist burst debounce state across restarts.
+- [ ] Enforce at-most-one burst between daily cron firings per chat.
+- [ ] Tests: burst trigger fires only when threshold/window are met.
+- [ ] Tests: burst trigger never bypasses eligibility, daily cap, preview, quiet hours, or profile rails.
+- [ ] Tests: debounce state survives restart.
+
+Exit criteria:
+
+- [ ] Burst fires only within configured limits over two weeks of normal traffic.
+
+## Always-On Safety Checklist
+
+- [ ] `consciousness.enabled = false` disables all proactive behavior.
+- [ ] No proactive group message without explicit group opt-in.
+- [ ] Daily cap is enforced atomically at commit time.
+- [ ] Tool boundary refuses non-eligible chat ids.
+- [ ] Logs and transcripts stay under private runtime paths, not source.
+- [ ] Property test passes: adversarial agent sequences cannot exceed daily cap.

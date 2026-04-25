@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
-
+from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
 from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
 
 
@@ -94,3 +94,69 @@ async def test_list_pending() -> None:
         ))
         pending = await state.list_pending()
         assert len(pending) == 2
+
+
+def _speakup(proposal_id: str, *, expires_at: float | None = None) -> PendingSpeakupApproval:
+    return PendingSpeakupApproval(
+        proposal_id=proposal_id,
+        target_channel="whatsapp",
+        target_chat_id="group@g.us",
+        owner_channel="whatsapp",
+        owner_chat_id="owner",
+        message="hello group",
+        action_type="observation",
+        profile="careful",
+        created_at=time.time(),
+        expires_at=expires_at if expires_at is not None else time.time() + 3600,
+        context_snapshot={"reason": "test"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_speakup_approval_approve_consumes() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = SpeakupApprovalStore(store_path=Path(tmpdir) / "speakups.json")
+        await store.add(_speakup("abc123"))
+
+        matched = await store.match_and_consume("spk-approve-abc123")
+        assert matched is not None
+        action, approval = matched
+        assert action == "approve"
+        assert approval.proposal_id == "abc123"
+
+        assert await store.match_and_consume("spk-approve-abc123") is None
+
+
+@pytest.mark.asyncio
+async def test_speakup_approval_deny_consumes() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = SpeakupApprovalStore(store_path=Path(tmpdir) / "speakups.json")
+        await store.add(_speakup("abc123"))
+
+        matched = await store.match_and_consume("spk-deny-abc123")
+        assert matched is not None
+        action, approval = matched
+        assert action == "deny"
+        assert approval.proposal_id == "abc123"
+
+        pending = await store.list_pending()
+        assert pending == []
+
+
+@pytest.mark.asyncio
+async def test_speakup_approval_persists_reloads_and_expires() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "speakups.json"
+        store1 = SpeakupApprovalStore(store_path=path)
+        await store1.add(_speakup("fresh"))
+        await store1.add(_speakup("expired", expires_at=time.time() - 1))
+
+        store2 = SpeakupApprovalStore(store_path=path)
+        expired = await store2.purge_expired()
+        pending = await store2.list_pending()
+
+        assert [item.proposal_id for item in expired] == ["expired"]
+        assert [item.proposal_id for item in pending] == ["fresh"]
+        matched = await store2.match_and_consume("spk-approve-fresh")
+        assert matched is not None
+        assert matched[1].message == "hello group"

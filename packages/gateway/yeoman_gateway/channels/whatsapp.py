@@ -139,6 +139,10 @@ class InboundEvent:
     media_description: str | None
     voice_transcript: str | None
     sender_name: str | None = None
+    reply_to_media_kind: str | None = None
+    reply_to_media_type: str | None = None
+    reply_to_media_path: str | None = None
+    reply_to_media_bytes: int | None = None
 
 
 class WhatsAppChannel(BaseChannel):
@@ -640,6 +644,35 @@ class WhatsAppChannel(BaseChannel):
         reply_to_text = str(payload.get("replyToText") or "").strip() or None
         reply_to_bot = bool(payload.get("replyToBot", False))
 
+        reply_media = (
+            payload.get("replyToMedia")
+            if isinstance(payload.get("replyToMedia"), dict)
+            else None
+        )
+        reply_to_media_kind = (
+            str(reply_media.get("kind"))
+            if isinstance(reply_media, dict) and reply_media.get("kind")
+            else None
+        )
+        reply_to_media_type = (
+            str(reply_media.get("mimeType"))
+            if isinstance(reply_media, dict) and reply_media.get("mimeType")
+            else None
+        )
+        reply_to_media_path = (
+            str(reply_media.get("path")).strip()
+            if isinstance(reply_media, dict) and isinstance(reply_media.get("path"), str)
+            else ""
+        ) or None
+        reply_to_media_bytes_raw = (
+            reply_media.get("bytes") if isinstance(reply_media, dict) else None
+        )
+        reply_to_media_bytes = (
+            int(reply_to_media_bytes_raw)
+            if isinstance(reply_to_media_bytes_raw, (int, float))
+            else None
+        )
+
         if reply_to_bot or reply_to_message_id or reply_to_text:
             logger.debug(
                 "whatsapp_inbound_reply_meta chat={} message_id={} reply_to_bot={} "
@@ -674,6 +707,10 @@ class WhatsAppChannel(BaseChannel):
             media_bytes=media_bytes,
             media_description=None,
             voice_transcript=None,
+            reply_to_media_kind=reply_to_media_kind,
+            reply_to_media_type=reply_to_media_type,
+            reply_to_media_path=reply_to_media_path,
+            reply_to_media_bytes=reply_to_media_bytes,
         )
 
     async def _ingest_inbound_event(self, event: InboundEvent) -> None:
@@ -838,6 +875,75 @@ class WhatsAppChannel(BaseChannel):
             logger.warning(f"Failed to update chat registry for {event.chat_jid}: {e}")
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
+        event = await self._enrich_primary_media_event(event)
+        event = await self._enrich_quoted_image_event(event)
+        return event
+
+    async def _enrich_quoted_image_event(self, event: InboundEvent) -> InboundEvent:
+        if (
+            not self.config.media.enabled
+            or not self.config.media.describe_images
+            or event.reply_to_media_kind != "image"
+            or not event.reply_to_media_path
+            or self._vision_describer is None
+            or self._model_router is None
+        ):
+            return event
+        if event.reply_to_text and "[image_description]" in event.reply_to_text:
+            return event
+
+        validated_path = self._media_storage.validate_incoming_path(event.reply_to_media_path)
+        if validated_path is None:
+            logger.warning(
+                "Skipping WhatsApp quoted-image description due to invalid media path: {}",
+                event.reply_to_media_path,
+            )
+            return event
+        try:
+            size_bytes = validated_path.stat().st_size
+        except OSError:
+            return event
+        max_bytes = max(1, int(self.config.media.max_image_bytes_mb)) * 1024 * 1024
+        if size_bytes > max_bytes:
+            logger.info(
+                "Skipping WhatsApp quoted-image description due to size limit: path={} bytes={} limit={}",
+                validated_path,
+                size_bytes,
+                max_bytes,
+            )
+            return event
+
+        try:
+            profile = self._model_router.resolve("vision.describe_image", channel=self.name)
+        except KeyError as e:
+            logger.warning(
+                f"Skipping WhatsApp quoted-image description due to missing route: {e}"
+            )
+            return event
+
+        try:
+            description = await self._vision_describer.describe(validated_path, profile)
+        except Exception as e:
+            logger.warning(
+                "WhatsApp quoted-image description failed {}: {}",
+                e.__class__.__name__,
+                e,
+            )
+            return event
+        if not description:
+            return event
+
+        base = (event.reply_to_text or "").strip()
+        if not base or base == "[Image]":
+            caption = "[Image]"
+        elif base.startswith("[Image] "):
+            caption = base
+        else:
+            caption = f"[Image] {base}"
+        enriched_reply_text = f"{caption}\n[image_description] {description}"
+        return replace(event, reply_to_text=enriched_reply_text)
+
+    async def _enrich_primary_media_event(self, event: InboundEvent) -> InboundEvent:
         if not self.config.media.enabled:
             return event
 

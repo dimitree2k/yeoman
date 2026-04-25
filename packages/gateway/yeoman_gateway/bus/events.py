@@ -47,6 +47,20 @@ class ReactionMessage:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InboundObservedEvent:
+    """Best-effort observation copy of an inbound message."""
+
+    channel: str
+    chat_id: str
+    sender_id: str
+    content: str
+    timestamp: float
+    message_id: str | None = None
+    is_group: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WebhookEvent:
     """Event received from an external webhook."""
 
@@ -75,4 +89,4 @@ class SystemEvent:
     timestamp: float
 
 
-type GatewayEvent = WebhookEvent | OverseerCommand | SystemEvent
+type GatewayEvent = InboundObservedEvent | WebhookEvent | OverseerCommand | SystemEvent

@@ -8,6 +8,7 @@ from loguru import logger
 from yeoman_gateway.bus.events import (
     GatewayEvent,
     InboundMessage,
+    InboundObservedEvent,
     OutboundMessage,
     OverseerCommand,
     ReactionMessage,
@@ -73,9 +74,57 @@ class MessageBus:
                 pass
         await queue.put(msg)
 
+    def _put_event_best_effort(self, event: GatewayEvent) -> None:
+        """Publish an event without letting observation backpressure block inbound delivery."""
+        try:
+            if self._event_queue.maxsize > 0 and self._event_queue.full():
+                try:
+                    self._event_queue.get_nowait()
+                    self._event_dropped += 1
+                    if self._event_dropped == 1 or self._event_dropped % 100 == 0:
+                        logger.warning(
+                            f"MessageBus event queue overflow: dropped={self._event_dropped}"
+                        )
+                except asyncio.QueueEmpty:
+                    pass
+            self._event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self._event_dropped += 1
+            if self._event_dropped == 1 or self._event_dropped % 100 == 0:
+                logger.warning(f"MessageBus event queue overflow: dropped={self._event_dropped}")
+
+    @staticmethod
+    def _metadata_message_id(metadata: dict[str, object]) -> str | None:
+        for key in ("message_id", "messageId", "id"):
+            value = metadata.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    @staticmethod
+    def _metadata_is_group(msg: InboundMessage) -> bool:
+        value = msg.metadata.get("is_group", msg.metadata.get("isGroup"))
+        if value is not None:
+            return bool(value)
+        return str(msg.chat_id).endswith("@g.us")
+
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
         await self._put_bounded(self.inbound, msg, "inbound")
+        self._put_event_best_effort(
+            InboundObservedEvent(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                sender_id=msg.sender_id,
+                content=msg.content,
+                timestamp=msg.timestamp.timestamp(),
+                message_id=self._metadata_message_id(msg.metadata),
+                is_group=self._metadata_is_group(msg),
+                metadata=dict(msg.metadata),
+            )
+        )
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""

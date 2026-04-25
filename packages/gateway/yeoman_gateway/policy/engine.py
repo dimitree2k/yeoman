@@ -8,7 +8,12 @@ from typing import Any
 
 from yeoman_gateway.policy.identity import normalize_identity_token, normalize_sender_list
 from yeoman_gateway.policy.persona import load_persona_text, resolve_persona_path
-from yeoman_gateway.policy.schema import ChatPolicy, ChatPolicyOverride, MemoryNotesMode, PolicyConfig
+from yeoman_gateway.policy.schema import (
+    ChatPolicy,
+    ChatPolicyOverride,
+    MemoryNotesMode,
+    PolicyConfig,
+)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -101,6 +106,13 @@ class EffectivePolicy:
     talkative_cooldown_cooldown_seconds: int
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
+    spontaneity_enabled: bool
+    spontaneity_profile: str
+    spontaneity_daily_cap: int | None
+    spontaneity_allowed_actions: list[str] | None
+    spontaneity_preview: str | None
+    spontaneity_quiet_hours_start: str | None
+    spontaneity_quiet_hours_end: str | None
     contacts_disclosure: bool
     session_history_limit: int | None
 
@@ -160,6 +172,13 @@ class _CompiledPolicy:
     talkative_cooldown_cooldown_seconds: int
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
+    spontaneity_enabled: bool
+    spontaneity_profile: str
+    spontaneity_daily_cap: int | None
+    spontaneity_allowed_actions: tuple[str, ...] | None
+    spontaneity_preview: str | None
+    spontaneity_quiet_hours_start: str | None
+    spontaneity_quiet_hours_end: str | None
     contacts_disclosure: bool
     session_history_limit: int | None
 
@@ -307,6 +326,21 @@ class PolicyEngine:
             talkative_cooldown_cooldown_seconds=int(resolved.talkative_cooldown.cooldown_seconds),
             talkative_cooldown_delay_seconds=float(resolved.talkative_cooldown.delay_seconds),
             talkative_cooldown_use_llm_message=bool(resolved.talkative_cooldown.use_llm_message),
+            spontaneity_enabled=bool(resolved.spontaneity.enabled),
+            spontaneity_profile=str(resolved.spontaneity.profile),
+            spontaneity_daily_cap=resolved.spontaneity.daily_cap,
+            spontaneity_allowed_actions=(
+                tuple(str(action) for action in resolved.spontaneity.allowed_actions)
+                if resolved.spontaneity.allowed_actions is not None
+                else None
+            ),
+            spontaneity_preview=(
+                str(resolved.spontaneity.preview)
+                if resolved.spontaneity.preview is not None
+                else None
+            ),
+            spontaneity_quiet_hours_start=resolved.spontaneity.quiet_hours_start,
+            spontaneity_quiet_hours_end=resolved.spontaneity.quiet_hours_end,
             contacts_disclosure=bool(resolved.contacts_disclosure),
             session_history_limit=resolved.session_history_limit,
         )
@@ -469,6 +503,17 @@ class PolicyEngine:
             talkative_cooldown_cooldown_seconds=resolved.talkative_cooldown_cooldown_seconds,
             talkative_cooldown_delay_seconds=resolved.talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=resolved.talkative_cooldown_use_llm_message,
+            spontaneity_enabled=resolved.spontaneity_enabled,
+            spontaneity_profile=resolved.spontaneity_profile,
+            spontaneity_daily_cap=resolved.spontaneity_daily_cap,
+            spontaneity_allowed_actions=(
+                list(resolved.spontaneity_allowed_actions)
+                if resolved.spontaneity_allowed_actions is not None
+                else None
+            ),
+            spontaneity_preview=resolved.spontaneity_preview,
+            spontaneity_quiet_hours_start=resolved.spontaneity_quiet_hours_start,
+            spontaneity_quiet_hours_end=resolved.spontaneity_quiet_hours_end,
             contacts_disclosure=resolved.contacts_disclosure,
             session_history_limit=resolved.session_history_limit,
         )

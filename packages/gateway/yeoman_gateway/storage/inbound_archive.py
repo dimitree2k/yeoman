@@ -96,10 +96,17 @@ class InboundArchive:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT OR IGNORE INTO inbound_messages (
+                INSERT INTO inbound_messages (
                     channel, chat_id, message_id, participant, sender_id, text,
                     timestamp, created_at, sender_name
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel, chat_id, message_id) DO UPDATE SET
+                    text = CASE
+                        WHEN instr(excluded.text, '[image_description]') > 0
+                             AND instr(inbound_messages.text, '[image_description]') = 0
+                        THEN excluded.text
+                        ELSE inbound_messages.text
+                    END
                 """,
                 (
                     str(channel),
