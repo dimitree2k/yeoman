@@ -28,6 +28,11 @@ __pycache__/*
 poetry.lock
 .pytest_cache/
 tests/
+!tests/
+tests/*
+!tests/gateway/
+tests/gateway/*
+!tests/gateway/test_consciousness_phase1.py
 .mypy_cache
 .ruff_cache
 node_modules/

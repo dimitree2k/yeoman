@@ -1,0 +1,255 @@
+"""SQLite log for proactive speakup proposals and commits."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from yeoman_shared.utils.helpers import ensure_dir
+
+
+class SpeakupLog:
+    """Append-oriented speakup log with daily sent counters."""
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path.expanduser()
+        ensure_dir(self.db_path.parent)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._create_schema()
+
+    def _create_schema(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS speakups (
+                    id TEXT PRIMARY KEY,
+                    created_at REAL NOT NULL,
+                    committed_at REAL,
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    context_snapshot_json TEXT NOT NULL,
+                    outcome TEXT,
+                    outcome_classified_at REAL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_speakups_chat_day
+                ON speakups(channel, chat_id, committed_at)
+                """
+            )
+            self._conn.commit()
+
+    async def record_proposed(
+        self,
+        *,
+        proposal_id: str | None,
+        channel: str,
+        chat_id: str,
+        action_type: str,
+        profile: str,
+        message: str,
+        trigger: str,
+        context_snapshot: dict[str, object],
+        now: float | None = None,
+    ) -> str:
+        entry_id = proposal_id or uuid.uuid4().hex
+        created_at = float(now if now is not None else time.time())
+        self._insert(
+            entry_id=entry_id,
+            created_at=created_at,
+            committed_at=None,
+            channel=channel,
+            chat_id=chat_id,
+            action_type=action_type,
+            profile=profile,
+            message=message,
+            status="proposed",
+            trigger=trigger,
+            context_snapshot=context_snapshot,
+        )
+        return entry_id
+
+    async def record_sent(
+        self,
+        *,
+        proposal_id: str,
+        channel: str,
+        chat_id: str,
+        action_type: str,
+        profile: str,
+        message: str,
+        trigger: str,
+        context_snapshot: dict[str, object],
+        now: float | None = None,
+    ) -> None:
+        ts = float(now if now is not None else time.time())
+        self._insert(
+            entry_id=proposal_id,
+            created_at=ts,
+            committed_at=ts,
+            channel=channel,
+            chat_id=chat_id,
+            action_type=action_type,
+            profile=profile,
+            message=message,
+            status="sent",
+            trigger=trigger,
+            context_snapshot=context_snapshot,
+            replace=True,
+        )
+
+    async def mark_sent(self, proposal_id: str, *, now: float | None = None) -> None:
+        ts = float(now if now is not None else time.time())
+        with self._lock:
+            self._conn.execute(
+                "UPDATE speakups SET status = ?, committed_at = ? WHERE id = ?",
+                ("sent", ts, proposal_id),
+            )
+            self._conn.commit()
+
+    async def mark_rejected(self, proposal_id: str, *, reason: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE speakups
+                SET status = ?, context_snapshot_json = json_set(
+                    COALESCE(NULLIF(context_snapshot_json, ''), '{}'),
+                    '$.reject_reason',
+                    ?
+                )
+                WHERE id = ?
+                """,
+                ("rejected", reason, proposal_id),
+            )
+            self._conn.commit()
+
+    async def record_silent_pass(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        profile: str,
+        trigger: str,
+        reason: str,
+        context_snapshot: dict[str, object] | None = None,
+        now: float | None = None,
+    ) -> str:
+        entry_id = uuid.uuid4().hex
+        snapshot = dict(context_snapshot or {})
+        snapshot["reason"] = reason
+        self._insert(
+            entry_id=entry_id,
+            created_at=float(now if now is not None else time.time()),
+            committed_at=None,
+            channel=channel,
+            chat_id=chat_id,
+            action_type="silent_pass",
+            profile=profile,
+            message="",
+            status="silent_pass",
+            trigger=trigger,
+            context_snapshot=snapshot,
+        )
+        return entry_id
+
+    async def count_sent_today(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        now: datetime | None = None,
+    ) -> int:
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        start = current.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM speakups
+                WHERE channel = ?
+                  AND chat_id = ?
+                  AND status = 'sent'
+                  AND committed_at >= ?
+                  AND committed_at < ?
+                """,
+                (channel, chat_id, start.timestamp(), end.timestamp()),
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    async def history(self, channel: str, chat_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM speakups
+                WHERE channel = ? AND chat_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (channel, chat_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _insert(
+        self,
+        *,
+        entry_id: str,
+        created_at: float,
+        committed_at: float | None,
+        channel: str,
+        chat_id: str,
+        action_type: str,
+        profile: str,
+        message: str,
+        status: str,
+        trigger: str,
+        context_snapshot: dict[str, object],
+        replace: bool = False,
+    ) -> None:
+        sql = "INSERT OR REPLACE" if replace else "INSERT"
+        with self._lock:
+            self._conn.execute(
+                f"""
+                {sql} INTO speakups (
+                    id, created_at, committed_at, channel, chat_id, action_type,
+                    profile, message, status, trigger, context_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_id,
+                    created_at,
+                    committed_at,
+                    channel,
+                    chat_id,
+                    action_type,
+                    profile,
+                    message,
+                    status,
+                    trigger,
+                    json.dumps(context_snapshot, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+

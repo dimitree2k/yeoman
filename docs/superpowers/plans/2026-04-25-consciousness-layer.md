@@ -35,21 +35,21 @@ Exit criteria:
 
 Goal: prove one low-blast-radius proactive path with owner DMs only.
 
-- [ ] Add `consciousness/service.py` with cron-loop orchestration.
-- [ ] Add `consciousness/log.py` with SQLite speakup log and daily counters.
-- [ ] Add `consciousness/tools.py` with the hard tool boundary.
-- [ ] Add `consciousness/agent.py` with one-proposal-or-silence behavior.
-- [ ] Wire `ConsciousnessService` in `build_gateway_runtime()` behind `config.consciousness.enabled`.
-- [ ] Enforce owner-DM-only eligibility.
-- [ ] Enforce global kill switch, daily cap, quiet hours, action allowlist, length cap, and confidence threshold.
-- [ ] Publish `OutboundMessage(metadata={"spontaneous": true, ...})` on successful commit.
-- [ ] Tests: global kill switch prevents service start and commit.
-- [ ] Tests: daily cap cannot be exceeded.
-- [ ] Tests: quiet hours prevent commits.
-- [ ] Tests: non-eligible chat ids are rejected by tools.
-- [ ] Tests: fake agent can propose exactly one outbound message.
-- [ ] Tests: fake agent can stay silent and silent pass is logged.
-- [ ] Tests: security classifier rejection prevents commit.
+- [x] Add `consciousness/service.py` with cron-loop orchestration.
+- [x] Add `consciousness/log.py` with SQLite speakup log and daily counters.
+- [x] Add `consciousness/tools.py` with the hard tool boundary.
+- [x] Add `consciousness/agent.py` with one-proposal-or-silence behavior.
+- [x] Wire `ConsciousnessService` in `build_gateway_runtime()` behind `config.consciousness.enabled`.
+- [x] Enforce owner-DM-only eligibility.
+- [x] Enforce global kill switch, daily cap, quiet hours, action allowlist, length cap, and confidence threshold.
+- [x] Publish `OutboundMessage(metadata={"spontaneous": true, ...})` on successful commit.
+- [x] Tests: global kill switch prevents service start and commit.
+- [x] Tests: daily cap cannot be exceeded.
+- [x] Tests: quiet hours prevent commits.
+- [x] Tests: non-eligible chat ids are rejected by tools.
+- [x] Tests: fake agent can propose exactly one outbound message.
+- [x] Tests: fake agent can stay silent and silent pass is logged.
+- [x] Tests: security classifier rejection prevents commit.
 
 Exit criteria:
 

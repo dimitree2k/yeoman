@@ -223,6 +223,7 @@ class GatewayRuntime:
     channels: ChannelManager
     cron: CronService
     heartbeat: HeartbeatService
+    consciousness: object | None
     inbound_archive: InboundArchive
     responder: LLMResponder
     memory: MemoryService
@@ -235,6 +236,8 @@ class GatewayRuntime:
         try:
             await self.cron.start()
             await self.heartbeat.start()
+            if self.consciousness is not None:
+                await self.consciousness.start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
             tasks = [
@@ -248,6 +251,8 @@ class GatewayRuntime:
             if self.gateway_socket:
                 await self.gateway_socket.stop()
             self.heartbeat.stop()
+            if self.consciousness is not None:
+                self.consciousness.stop()
             self.cron.stop()
             self.orchestrator.stop()
             await self.channels.stop_all()
@@ -721,11 +726,50 @@ def build_gateway_runtime(
         rate_limit=ipc_config.command_rate_limit,
     )
 
+    consciousness_service = None
+    if config.consciousness.enabled and policy_engine is not None:
+        from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+        from yeoman_gateway.consciousness.log import SpeakupLog
+        from yeoman_gateway.consciousness.service import ConsciousnessService
+        from yeoman_gateway.consciousness.tools import ConsciousnessTools
+
+        speakup_log = SpeakupLog(
+            get_operational_data_path() / "consciousness" / "speakups.db"
+        )
+        consciousness_tools = ConsciousnessTools(
+            config=config,
+            policy_engine=policy_engine,
+            bus=bus,
+            log=speakup_log,
+            inbound_archive=inbound_archive,
+            memory=memory_service,
+            security=security,
+        )
+
+        async def _consciousness_planner(prompt: str) -> str:
+            return await responder.process_direct(
+                prompt,
+                session_key="consciousness:cron",
+                channel="consciousness",
+                chat_id="owner_dm_cron",
+                model_profile=None,
+            )
+
+        consciousness_agent = ConsciousnessAgent(
+            tools=consciousness_tools,
+            planner=_consciousness_planner,
+        )
+        consciousness_service = ConsciousnessService(
+            config=config,
+            agent=consciousness_agent,
+        )
+
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
         cron=cron,
         heartbeat=heartbeat,
+        consciousness=consciousness_service,
         inbound_archive=inbound_archive,
         responder=responder,
         memory=memory_service,
