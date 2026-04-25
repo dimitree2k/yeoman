@@ -74,21 +74,26 @@ Goal: add explicit group opt-in with owner-DM preview before group delivery.
 
 Exit criteria:
 
-- [ ] Preview flow works end-to-end for at least one opt-in group.
-- [ ] No group message is sent without explicit `preview: "none"` or owner approval.
+- [x] Preview flow works end-to-end for at least one opt-in group.
+- [x] No group message is sent without explicit `preview: "none"` or owner approval.
 
 ## Phase 3 - Outcome And Taste
 
 Goal: add self-improvement from logged behavior after enough data exists.
 
-- [ ] Add `consciousness/outcomes.py` delayed outcome classifier.
-- [ ] Add provider route `consciousness.outcome`.
-- [ ] Update `SpeakupLog` records with outcome labels.
-- [ ] Add `consciousness/taste.py` distiller.
-- [ ] Add provider route `consciousness.taste`.
-- [ ] Write compact chat-scope taste memory only after enough samples.
-- [ ] Tests: outcome enricher classifies scripted post-speakup windows.
-- [ ] Tests: taste distiller writes patterns, not raw speakup messages.
+- [x] Add `consciousness/outcomes.py` delayed outcome classifier.
+- [x] Add provider route `consciousness.outcome`.
+- [x] Update `SpeakupLog` records with outcome labels.
+- [x] Add `consciousness/taste.py` distiller.
+- [x] Add provider route `consciousness.taste`.
+- [x] Write compact chat-scope taste memory only after enough samples.
+- [x] Tests: outcome enricher classifies scripted post-speakup windows.
+- [x] Tests: taste distiller writes patterns, not raw speakup messages.
+
+Implementation note:
+
+- Phase 3 outcome/taste primitives and model routes are implemented and tested.
+- Runtime scheduling/wiring is intentionally not enabled yet; no autonomous outcome/taste loop runs until wired into the gateway runtime.
 
 Exit criteria:
 

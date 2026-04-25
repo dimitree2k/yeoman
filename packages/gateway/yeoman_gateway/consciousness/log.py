@@ -153,6 +153,21 @@ class SpeakupLog:
     async def mark_rejected(self, proposal_id: str, *, reason: str) -> None:
         await self.mark_status(proposal_id, status="rejected", reason=reason)
 
+    async def mark_outcome(
+        self,
+        proposal_id: str,
+        *,
+        outcome: str,
+        now: float | None = None,
+    ) -> None:
+        ts = float(now if now is not None else time.time())
+        with self._lock:
+            self._conn.execute(
+                "UPDATE speakups SET outcome = ?, outcome_classified_at = ? WHERE id = ?",
+                (outcome, ts, proposal_id),
+            )
+            self._conn.commit()
+
     async def record_silent_pass(
         self,
         *,
@@ -220,6 +235,46 @@ class SpeakupLog:
                 LIMIT ?
                 """,
                 (channel, chat_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def pending_outcome_rows(self, *, before: float, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM speakups
+                WHERE status = 'sent'
+                  AND committed_at IS NOT NULL
+                  AND committed_at <= ?
+                  AND outcome IS NULL
+                ORDER BY committed_at ASC
+                LIMIT ?
+                """,
+                (float(before), max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def outcome_samples(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM speakups
+                WHERE channel = ?
+                  AND chat_id = ?
+                  AND status = 'sent'
+                  AND outcome IS NOT NULL
+                ORDER BY committed_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (channel, chat_id, max(1, min(int(limit), 200))),
             ).fetchall()
         return [dict(row) for row in rows]
 

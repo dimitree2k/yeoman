@@ -91,3 +91,11 @@ def test_config_has_consciousness() -> None:
     cfg = Config()
     assert isinstance(cfg.consciousness, ConsciousnessConfig)
     assert cfg.consciousness.enabled is False
+
+
+def test_config_has_consciousness_model_routes() -> None:
+    cfg = Config()
+    assert cfg.models.routes["consciousness.agent"] == "consciousness_judgment"
+    assert cfg.models.routes["consciousness.outcome"] == "consciousness_judgment"
+    assert cfg.models.routes["consciousness.taste"] == "consciousness_judgment"
+    assert "consciousness_judgment" in cfg.models.profiles
