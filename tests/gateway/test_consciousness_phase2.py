@@ -108,14 +108,20 @@ def _tools(
     return tools, approval_store, log
 
 
-def _owner_ctx(content: str) -> PipelineContext:
+def _owner_ctx(
+    content: str,
+    *,
+    chat_id: str = "owner@s.whatsapp.net",
+    participant: str | None = None,
+) -> PipelineContext:
     ctx = PipelineContext(
         event=InboundEvent(
             channel="whatsapp",
             sender_id="owner@s.whatsapp.net",
-            chat_id="owner@s.whatsapp.net",
+            chat_id=chat_id,
             content=content,
             timestamp=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+            participant=participant,
         )
     )
     ctx.decision = PolicyDecision(
@@ -236,6 +242,42 @@ async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
         chat_id="group@g.us",
         now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
     ) == 1
+    assert next_fn.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_path: Path) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    proposal = await tools.propose_speakup(
+        chat_id="group@g.us",
+        message="hello group",
+        action_type="observation",
+        confidence=0.9,
+    )
+    await tools.commit_speakup(str(proposal["proposal_id"]))
+    preview = await tools.bus.consume_outbound()
+    code = preview.content.split("Approve: ", 1)[1].splitlines()[0].strip()
+
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+    )
+    next_fn = AsyncMock()
+    await middleware(
+        _owner_ctx(
+            code,
+            chat_id="owner-lid@lid",
+            participant="owner@s.whatsapp.net",
+        ),
+        next_fn,
+    )
+
+    assert tools.bus.outbound_size == 1
+    outbound = await tools.bus.consume_outbound()
+    assert outbound.chat_id == "group@g.us"
+    assert outbound.content == "hello group"
     assert next_fn.await_count == 0
 
 

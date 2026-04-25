@@ -42,11 +42,15 @@ class SpeakupApprovalMiddleware:
             await next(ctx)
             return
 
-        matched = await self._store.match_and_consume(
-            content,
-            owner_channel=ctx.event.channel,
-            owner_chat_id=ctx.event.chat_id,
-        )
+        matched = None
+        for owner_chat_id in self._owner_chat_candidates(ctx):
+            matched = await self._store.match_and_consume(
+                content,
+                owner_channel=ctx.event.channel,
+                owner_chat_id=owner_chat_id,
+            )
+            if matched is not None:
+                break
         if matched is None:
             await next(ctx)
             return
@@ -114,3 +118,25 @@ class SpeakupApprovalMiddleware:
             await self._log.mark_status(approval.proposal_id, status="denied")
 
         ctx.halt()
+
+    @staticmethod
+    def _owner_chat_candidates(ctx: PipelineContext) -> list[str]:
+        candidates: list[str] = []
+        for value in (ctx.event.chat_id, ctx.event.participant, ctx.event.sender_id):
+            text = str(value or "").strip()
+            if not text:
+                continue
+            candidates.append(text)
+            if ctx.event.channel == "whatsapp":
+                normalized = text[1:] if text.startswith("+") else text
+                candidates.append(normalized)
+                if "@" not in normalized:
+                    candidates.append(f"{normalized}@s.whatsapp.net")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                deduped.append(candidate)
+        return deduped

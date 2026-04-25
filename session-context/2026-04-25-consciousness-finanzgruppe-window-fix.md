@@ -30,3 +30,13 @@ Short description: Fixed the manual Phase 2 trial reading stale group history an
 - A manual group-focused tick after the fixes saw current `Finanzgruppe` messages and no longer claimed the daily cap was reached.
 - The model still chose `silent_pass` under the `balanced` profile: `No new messages; prior summary proposal rejected (system outcome), hair joke too fleeting for balanced profile intervention.`
 - Pending approval queue is empty after clearing the stale approval created before JID normalization.
+- A forced owner-DM preview for `Finanzgruppe` was queued with proposal id `71104570c2494ce082df2c76f3da5b42`.
+- The owner approval reply arrived in LID chat `34596062240904@lid` with participant `491757070305@s.whatsapp.net`, while the pending approval had owner chat `491757070305@s.whatsapp.net`.
+- Approval matching now tries owner chat identity candidates from the inbound event, so LID chats can approve phone-JID previews.
+- The existing approval was replayed through the fixed middleware and delivered to `Finanzgruppe`; the speakup row is now `sent`.
+
+## Taste Note
+
+- The `ist das Pelonis haar?` message referred to the top of a head visible in the Intel-trade screenshot.
+- The joke was an indirect Nancy Pelosi trading joke: Pelosi is culturally associated with getting rich from market trades, so the hairline in the screenshot was interpreted as possibly hers.
+- The bot did not appear to recognize the visual cue. That is acceptable, but future taste logic should allow light humor when the current chat context makes the joke legible and the profile permits it.
