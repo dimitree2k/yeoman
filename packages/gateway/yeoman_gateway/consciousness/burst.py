@@ -45,6 +45,8 @@ class BurstObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
+        if self._is_direct_bot_interaction(event):
+            return
         if not await self._eligible(channel, chat_id):
             return
 
@@ -104,3 +106,18 @@ class BurstObserver:
     @staticmethod
     def _state_key(channel: str, chat_id: str) -> str:
         return f"{channel}:{chat_id}"
+
+    @staticmethod
+    def _is_direct_bot_interaction(event: InboundObservedEvent) -> bool:
+        metadata = event.metadata
+        return any(
+            bool(metadata.get(key))
+            for key in (
+                "mentioned_bot",
+                "mentionedBot",
+                "reply_to_bot",
+                "replyToBot",
+                "from_me",
+                "fromMe",
+            )
+        )

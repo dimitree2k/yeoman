@@ -70,14 +70,27 @@ def _policy(*, group_enabled: bool = True, daily_cap: int = 1) -> PolicyConfig:
     )
 
 
-def _event(*, at: datetime, chat_id: str = "group@g.us") -> InboundObservedEvent:
+def _event(
+    *,
+    at: datetime,
+    chat_id: str = "group@g.us",
+    sender_id: str = "user@s.whatsapp.net",
+    mentioned_bot: bool = False,
+    reply_to_bot: bool = False,
+    from_me: bool = False,
+) -> InboundObservedEvent:
     return InboundObservedEvent(
         channel="whatsapp",
         chat_id=chat_id,
-        sender_id="user@s.whatsapp.net",
+        sender_id=sender_id,
         content="message",
         timestamp=at.timestamp(),
         is_group=True,
+        metadata={
+            "mentioned_bot": mentioned_bot,
+            "reply_to_bot": reply_to_bot,
+            "from_me": from_me,
+        },
     )
 
 
@@ -113,6 +126,26 @@ async def test_burst_observer_is_disabled_by_default(tmp_path: Path) -> None:
 
     for index in range(3):
         await observer.handle(_event(at=base + timedelta(minutes=index)))
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    observer = BurstObserver(
+        config=_config(),
+        state_path=tmp_path / "burst.json",
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    await observer.handle(_event(at=base, mentioned_bot=True))
+    await observer.handle(_event(at=base + timedelta(minutes=1), reply_to_bot=True))
+    await observer.handle(_event(at=base + timedelta(minutes=2), from_me=True))
+    await observer.handle(_event(at=base + timedelta(minutes=3)))
+    await observer.handle(_event(at=base + timedelta(minutes=4)))
 
     assert calls == []
 
