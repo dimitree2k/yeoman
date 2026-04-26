@@ -107,6 +107,12 @@ class ConsciousnessTools:
             for chat in self._eligible_chats()
         ]
 
+    def is_chat_eligible(self, channel: str, chat_id: str) -> bool:
+        return any(
+            chat.channel == channel and chat.chat_id == chat_id
+            for chat in self._eligible_chats()
+        )
+
     async def read_chat_window(self, chat_id: str, n: int = 20) -> dict[str, object]:
         eligible = self._eligible_by_chat().get(chat_id)
         if eligible is None:

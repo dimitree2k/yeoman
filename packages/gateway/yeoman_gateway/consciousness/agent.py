@@ -19,10 +19,29 @@ class ConsciousnessAgent:
         self._tools = tools
         self._planner = planner
 
-    async def run_once(self, *, trigger: str) -> dict[str, object]:
+    async def run_once(
+        self,
+        *,
+        trigger: str,
+        target_channel: str | None = None,
+        target_chat_id: str | None = None,
+    ) -> dict[str, object]:
         self._tools.begin_run(trigger=trigger)
         eligible = await self._tools.read_eligible_chats()
+        if target_chat_id:
+            eligible = [
+                chat
+                for chat in eligible
+                if str(chat.get("chat_id") or "") == target_chat_id
+                and (target_channel is None or str(chat.get("channel") or "") == target_channel)
+            ]
         if not eligible:
+            if target_chat_id:
+                return {
+                    "status": "silent_pass",
+                    "reason": "target_chat_not_eligible",
+                    "chat_id": target_chat_id,
+                }
             return {"status": "silent_pass", "reason": "no_eligible_chats"}
 
         chat_id = str(eligible[0]["chat_id"])
@@ -45,9 +64,16 @@ class ConsciousnessAgent:
                 reason="empty_planner_response",
                 trigger=trigger,
             )
+        decision_chat_id = str(decision.get("chat_id") or chat_id)
+        if target_chat_id and decision_chat_id != target_chat_id:
+            return await self._tools.record_silent_pass(
+                chat_id=chat_id,
+                reason="target_chat_mismatch",
+                trigger=trigger,
+            )
 
         proposal = await self._tools.propose_speakup(
-            chat_id=str(decision.get("chat_id") or chat_id),
+            chat_id=decision_chat_id,
             message=message,
             action_type=str(decision.get("action_type") or "observation"),
             confidence=float(decision.get("confidence") or 0.0),

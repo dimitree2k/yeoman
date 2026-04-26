@@ -58,10 +58,22 @@ class ConsciousnessService:
             self._task.cancel()
             self._task = None
 
-    async def tick_once(self) -> dict[str, object]:
+    async def tick_once(
+        self,
+        *,
+        trigger: str = "cron",
+        target_channel: str | None = None,
+        target_chat_id: str | None = None,
+    ) -> dict[str, object]:
         if not self._config.consciousness.enabled:
             return {"status": "disabled"}
-        result = dict(await self._agent.run_once(trigger="cron"))
+        result = dict(
+            await self._agent.run_once(
+                trigger=trigger,
+                target_channel=target_channel,
+                target_chat_id=target_chat_id,
+            )
+        )
         if self._outcome_enricher is not None:
             result["outcomes"] = await self._outcome_enricher.run_once()
         if self._taste_distiller is not None and self._speakup_log is not None:

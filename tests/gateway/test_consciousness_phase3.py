@@ -25,7 +25,14 @@ class _FakeMemory:
 
 
 class _FakeAgent:
-    async def run_once(self, *, trigger: str) -> dict[str, object]:
+    async def run_once(
+        self,
+        *,
+        trigger: str,
+        target_channel: str | None = None,
+        target_chat_id: str | None = None,
+    ) -> dict[str, object]:
+        del target_channel, target_chat_id
         return {"status": "silent_pass", "trigger": trigger}
 
 

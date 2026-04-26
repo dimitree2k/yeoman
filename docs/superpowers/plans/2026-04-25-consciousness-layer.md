@@ -104,14 +104,19 @@ Exit criteria:
 
 Goal: allow opportunistic wakeups from observed chat activity without bypassing rails.
 
-- [ ] Add `consciousness/burst.py`.
-- [ ] Subscribe `BurstObserver` to `InboundObservedEvent`.
-- [ ] Maintain rolling counts per `(channel, chat_id)`.
-- [ ] Persist burst debounce state across restarts.
-- [ ] Enforce at-most-one burst between daily cron firings per chat.
-- [ ] Tests: burst trigger fires only when threshold/window are met.
-- [ ] Tests: burst trigger never bypasses eligibility, daily cap, preview, quiet hours, or profile rails.
-- [ ] Tests: debounce state survives restart.
+- [x] Add `consciousness/burst.py`.
+- [x] Subscribe `BurstObserver` to `InboundObservedEvent`.
+- [x] Maintain rolling counts per `(channel, chat_id)`.
+- [x] Persist burst debounce state across restarts.
+- [x] Enforce at-most-one burst between daily cron firings per chat.
+- [x] Tests: burst trigger fires only when threshold/window are met.
+- [x] Tests: burst trigger never bypasses eligibility, daily cap, preview, quiet hours, or profile rails.
+- [x] Tests: debounce state survives restart.
+
+Implementation note:
+
+- Burst remains disabled by default via `consciousness.burstEnabled = false`.
+- Burst requests target the triggering chat and reuse `ConsciousnessTools` eligibility, daily cap, preview, action, confidence, and quiet-hour rails.
 
 Exit criteria:
 

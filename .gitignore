@@ -35,6 +35,7 @@ tests/gateway/*
 !tests/gateway/test_consciousness_phase1.py
 !tests/gateway/test_consciousness_phase2.py
 !tests/gateway/test_consciousness_phase3.py
+!tests/gateway/test_consciousness_phase4.py
 .mypy_cache
 .ruff_cache
 node_modules/

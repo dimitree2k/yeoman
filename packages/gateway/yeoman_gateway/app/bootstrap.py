@@ -747,6 +747,7 @@ def build_gateway_runtime(
     consciousness_service = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+        from yeoman_gateway.consciousness.burst import BurstObserver
         from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
         from yeoman_gateway.consciousness.service import ConsciousnessService
         from yeoman_gateway.consciousness.taste import TasteDistiller
@@ -802,6 +803,17 @@ def build_gateway_runtime(
             taste_distiller=taste_distiller,
             speakup_log=speakup_log,
         )
+        burst_observer = BurstObserver(
+            config=config,
+            state_path=consciousness_data_dir / "burst_state.json",
+            on_burst=lambda channel, chat_id: consciousness_service.tick_once(
+                trigger="burst",
+                target_channel=channel,
+                target_chat_id=chat_id,
+            ),
+            is_eligible=consciousness_tools.is_chat_eligible,
+        )
+        bus.subscribe_event("InboundObservedEvent", burst_observer.handle)
 
     return GatewayRuntime(
         orchestrator=orchestrator_service,
