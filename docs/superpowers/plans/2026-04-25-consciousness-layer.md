@@ -129,4 +129,4 @@ Exit criteria:
 - [x] Daily cap is enforced atomically at commit time.
 - [x] Tool boundary refuses non-eligible chat ids.
 - [x] Logs and transcripts stay under private runtime paths, not source.
-- [ ] Property test passes: adversarial agent sequences cannot exceed daily cap.
+- [x] Property test passes: adversarial agent sequences cannot exceed daily cap.
