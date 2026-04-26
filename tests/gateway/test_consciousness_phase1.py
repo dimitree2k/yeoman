@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -130,7 +129,7 @@ async def test_daily_cap_cannot_be_exceeded(tmp_path: Path) -> None:
         message="already sent",
         trigger="cron",
         context_snapshot={},
-        now=time.time(),
+        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp(),
     )
 
     proposal = await tools.propose_speakup(

@@ -93,7 +93,8 @@ Goal: add self-improvement from logged behavior after enough data exists.
 Implementation note:
 
 - Phase 3 outcome/taste primitives and model routes are implemented and tested.
-- Runtime scheduling/wiring is intentionally not enabled yet; no autonomous outcome/taste loop runs until wired into the gateway runtime.
+- Runtime wiring is enabled on `ConsciousnessService.tick_once()`: after the planner tick, it classifies pending outcomes and distills taste for chats with classified samples.
+- Outcome/taste jobs use explicit `consciousness.*` model routes and do not publish outbound messages.
 
 Exit criteria:
 

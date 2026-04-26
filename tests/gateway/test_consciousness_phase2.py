@@ -240,7 +240,7 @@ async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
     assert await log.count_sent_today(
         channel="whatsapp",
         chat_id="group@g.us",
-        now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
+        now=datetime.now(UTC),
     ) == 1
     assert next_fn.await_count == 0
 

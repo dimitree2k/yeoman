@@ -278,6 +278,22 @@ class SpeakupLog:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def outcome_sample_chats(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT channel, chat_id, MAX(COALESCE(committed_at, created_at)) AS latest_at
+                FROM speakups
+                WHERE status = 'sent'
+                  AND outcome IS NOT NULL
+                GROUP BY channel, chat_id
+                ORDER BY latest_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def _insert(
         self,
         *,

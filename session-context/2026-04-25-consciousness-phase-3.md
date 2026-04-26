@@ -11,7 +11,24 @@ Implemented the first Phase 3 slice for post-speakup learning:
 
 ## Important Constraint
 
-This phase adds the tested primitives and provider routes, but it does not yet wire a scheduled runtime loop into the gateway. No autonomous outcome or taste distillation job runs until `build_gateway_runtime()` or an equivalent service loop schedules it.
+The second Phase 3 slice wires outcome and taste jobs into `ConsciousnessService.tick_once()`. When consciousness is enabled, `build_gateway_runtime()` now constructs:
+
+- `OutcomeEnricher` using the explicit `consciousness.outcome` model route.
+- `TasteDistiller` using the explicit `consciousness.taste` model route.
+- The planner using the explicit `consciousness.agent` model route.
+
+The service sequence is planner tick, outcome classification, then taste distillation for chats that have classified outcome samples. Outcome/taste jobs do not publish outbound messages.
+
+## 2026-04-26 Runtime Wiring Update
+
+Changed files:
+
+- `packages/gateway/yeoman_gateway/app/bootstrap.py`
+- `packages/gateway/yeoman_gateway/consciousness/service.py`
+- `packages/gateway/yeoman_gateway/consciousness/log.py`
+- `tests/gateway/test_consciousness_phase3.py`
+
+Also fixed date-sensitive Phase 1/2 tests that assumed April 25 while runtime code used the current date.
 
 ## Verification
 
@@ -35,6 +52,20 @@ Lint:
 
 ```bash
 uv run ruff check packages/gateway/yeoman_gateway/consciousness packages/gateway/yeoman_gateway/storage/inbound_archive.py packages/shared/yeoman_shared/config/defaults.py tests/gateway/test_consciousness_phase1.py tests/gateway/test_consciousness_phase2.py tests/gateway/test_consciousness_phase3.py tests/shared/test_config_ipc_webhooks.py
+```
+
+Result: `All checks passed`.
+
+Runtime wiring checks on 2026-04-26:
+
+```bash
+uv run python -m pytest tests/gateway/test_consciousness_phase1.py tests/gateway/test_consciousness_phase2.py tests/gateway/test_consciousness_phase3.py tests/gateway/test_inbound_archive_range.py tests/gateway/test_event_bus.py tests/gateway/test_workflow_state.py tests/shared/test_config_ipc_webhooks.py -q
+```
+
+Result: `50 passed`.
+
+```bash
+uv run ruff check packages/gateway/yeoman_gateway/consciousness packages/gateway/yeoman_gateway/app/bootstrap.py tests/gateway/test_consciousness_phase1.py tests/gateway/test_consciousness_phase2.py tests/gateway/test_consciousness_phase3.py
 ```
 
 Result: `All checks passed`.

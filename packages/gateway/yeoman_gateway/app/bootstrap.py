@@ -747,7 +747,9 @@ def build_gateway_runtime(
     consciousness_service = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+        from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
         from yeoman_gateway.consciousness.service import ConsciousnessService
+        from yeoman_gateway.consciousness.taste import TasteDistiller
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
 
         consciousness_tools = ConsciousnessTools(
@@ -761,22 +763,44 @@ def build_gateway_runtime(
             approval_store=speakup_approval_store,
         )
 
-        async def _consciousness_planner(prompt: str) -> str:
-            return await responder.process_direct(
-                prompt,
-                session_key="consciousness:cron",
-                channel="consciousness",
-                chat_id="owner_dm_cron",
-                model_profile=None,
+        async def _consciousness_route_call(route: str, prompt: str) -> str:
+            profile = model_router.resolve(route)
+            if not profile.model:
+                raise RuntimeError(f"Consciousness route {route!r} has no model")
+            routed_provider = provider_factory.create_chat_provider(profile.model)
+            response = await routed_provider.chat(
+                [{"role": "user", "content": prompt}],
+                tools=[],
+                model=profile.model,
+                max_tokens=profile.max_tokens or 700,
+                temperature=profile.temperature if profile.temperature is not None else 0.1,
+                reasoning=profile.reasoning,
             )
+            return response.content or "{}"
+
+        async def _consciousness_planner(prompt: str) -> str:
+            return await _consciousness_route_call("consciousness.agent", prompt)
 
         consciousness_agent = ConsciousnessAgent(
             tools=consciousness_tools,
             planner=_consciousness_planner,
         )
+        outcome_enricher = OutcomeEnricher(
+            log=speakup_log,
+            inbound_archive=inbound_archive,
+            classifier=lambda prompt: _consciousness_route_call("consciousness.outcome", prompt),
+        )
+        taste_distiller = TasteDistiller(
+            log=speakup_log,
+            memory=memory_service,
+            distiller=lambda prompt: _consciousness_route_call("consciousness.taste", prompt),
+        )
         consciousness_service = ConsciousnessService(
             config=config,
             agent=consciousness_agent,
+            outcome_enricher=outcome_enricher,
+            taste_distiller=taste_distiller,
+            speakup_log=speakup_log,
         )
 
     return GatewayRuntime(

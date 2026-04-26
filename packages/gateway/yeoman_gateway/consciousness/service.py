@@ -4,19 +4,36 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import Config
 
 from yeoman_gateway.consciousness.agent import ConsciousnessAgent
 
+if TYPE_CHECKING:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
+    from yeoman_gateway.consciousness.taste import TasteDistiller
+
 
 class ConsciousnessService:
-    """Run the Phase 1 consciousness agent at the configured local time."""
+    """Run proactive consciousness jobs at the configured local time."""
 
-    def __init__(self, *, config: Config, agent: ConsciousnessAgent) -> None:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        agent: ConsciousnessAgent,
+        outcome_enricher: "OutcomeEnricher | None" = None,
+        taste_distiller: "TasteDistiller | None" = None,
+        speakup_log: "SpeakupLog | None" = None,
+    ) -> None:
         self._config = config
         self._agent = agent
+        self._outcome_enricher = outcome_enricher
+        self._taste_distiller = taste_distiller
+        self._speakup_log = speakup_log
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._last_run_day: str | None = None
@@ -44,7 +61,25 @@ class ConsciousnessService:
     async def tick_once(self) -> dict[str, object]:
         if not self._config.consciousness.enabled:
             return {"status": "disabled"}
-        return await self._agent.run_once(trigger="cron")
+        result = dict(await self._agent.run_once(trigger="cron"))
+        if self._outcome_enricher is not None:
+            result["outcomes"] = await self._outcome_enricher.run_once()
+        if self._taste_distiller is not None and self._speakup_log is not None:
+            result["taste"] = await self._run_taste_distillation()
+        return result
+
+    async def _run_taste_distillation(self) -> list[dict[str, Any]]:
+        assert self._speakup_log is not None
+        assert self._taste_distiller is not None
+        results: list[dict[str, Any]] = []
+        for target in await self._speakup_log.outcome_sample_chats():
+            channel = str(target.get("channel") or "")
+            chat_id = str(target.get("chat_id") or "")
+            if not channel or not chat_id:
+                continue
+            distilled = await self._taste_distiller.run_once(channel=channel, chat_id=chat_id)
+            results.append({"channel": channel, "chat_id": chat_id, **distilled})
+        return results
 
     async def _run_loop(self) -> None:
         while self._running:
@@ -64,4 +99,3 @@ class ConsciousnessService:
             except Exception as exc:
                 logger.warning("Consciousness tick failed: {}", exc)
                 await asyncio.sleep(30)
-
