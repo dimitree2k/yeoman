@@ -72,6 +72,32 @@ def test_consciousness_config_accepts_aliases() -> None:
     assert cfg.burst_enabled is True
 
 
+def test_consciousness_config_accepts_snake_case_from_loader() -> None:
+    cfg = ConsciousnessConfig.model_validate(
+        {
+            "enabled": True,
+            "owner_dm_default_enabled": True,
+            "cron_hour": 8,
+            "cron_minute": 30,
+            "agent_max_iterations": 4,
+            "agent_max_input_tokens": 12000,
+            "max_speakup_length_chars": 240,
+            "default_daily_cap": 2,
+            "approval_timeout_seconds": 900,
+            "burst_enabled": True,
+            "burst_threshold_messages": 6,
+            "burst_window_minutes": 10,
+        }
+    )
+    assert cfg.enabled is True
+    assert cfg.owner_dm_default_enabled is True
+    assert cfg.cron_hour == 8
+    assert cfg.default_daily_cap == 2
+    assert cfg.burst_enabled is True
+    assert cfg.burst_threshold_messages == 6
+    assert cfg.burst_window_minutes == 10
+
+
 @pytest.mark.parametrize(
     "payload",
     [

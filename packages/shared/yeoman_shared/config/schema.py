@@ -497,6 +497,8 @@ class BusConfig(BaseModel):
 class ConsciousnessConfig(BaseModel):
     """Global controls for proactive consciousness service behavior."""
 
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
     enabled: bool = False
     owner_dm_default_enabled: bool = Field(default=False, alias="ownerDmDefaultEnabled")
     cron_hour: int = Field(default=19, alias="cronHour", ge=0, le=23)
