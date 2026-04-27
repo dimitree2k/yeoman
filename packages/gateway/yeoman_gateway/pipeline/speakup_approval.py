@@ -37,8 +37,6 @@ class SpeakupApprovalMiddleware:
         is_speakup_code = (
             content.startswith("spk-approve-")
             or content.startswith("spk-deny-")
-            or content.lower().startswith("/spk ")
-            or content.lower().startswith("/speakup ")
         )
 
         if not is_speakup_code:
