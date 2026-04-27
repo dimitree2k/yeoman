@@ -42,6 +42,14 @@ class PendingSpeakupApproval:
     def deny_code(self) -> str:
         return f"spk-deny-{self.proposal_id}"
 
+    @property
+    def approve_command(self) -> str:
+        return f"/spk approve {self.proposal_id}"
+
+    @property
+    def deny_command(self) -> str:
+        return f"/spk deny {self.proposal_id}"
+
 
 @dataclass(slots=True)
 class SpeakupApprovalMatch:
@@ -101,6 +109,14 @@ class SpeakupApprovalStore:
     @staticmethod
     def _parse_code(text: str) -> tuple[SpeakupApprovalAction, str] | None:
         stripped = str(text or "").strip()
+        parts = stripped.split()
+        if len(parts) == 3 and parts[0].lower() in {"/spk", "/speakup"}:
+            action = parts[1].lower()
+            proposal_id = parts[2].strip()
+            if action == "approve" and proposal_id:
+                return ("approve", proposal_id)
+            if action == "deny" and proposal_id:
+                return ("deny", proposal_id)
         if stripped.startswith("spk-approve-"):
             proposal_id = stripped.removeprefix("spk-approve-").strip()
             return ("approve", proposal_id) if proposal_id else None

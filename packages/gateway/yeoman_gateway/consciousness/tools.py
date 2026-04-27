@@ -350,8 +350,10 @@ class ConsciousnessTools:
                 preview_lines.extend(
                     [
                         f"Message: {proposal.message}",
-                        f"Approve: {approval.approve_code}",
-                        f"Deny: {approval.deny_code}",
+                        f"Approve: {approval.approve_command}",
+                        f"Deny: {approval.deny_command}",
+                        f"Legacy approve: {approval.approve_code}",
+                        f"Legacy deny: {approval.deny_code}",
                     ]
                 )
                 await self.bus.publish_outbound(

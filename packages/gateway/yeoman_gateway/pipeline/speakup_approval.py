@@ -34,7 +34,12 @@ class SpeakupApprovalMiddleware:
             return
 
         content = ctx.event.content.strip()
-        is_speakup_code = content.startswith("spk-approve-") or content.startswith("spk-deny-")
+        is_speakup_code = (
+            content.startswith("spk-approve-")
+            or content.startswith("spk-deny-")
+            or content.lower().startswith("/spk ")
+            or content.lower().startswith("/speakup ")
+        )
 
         if not is_speakup_code:
             expired = await self._store.purge_expired()
