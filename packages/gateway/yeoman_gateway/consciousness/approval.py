@@ -32,6 +32,7 @@ class PendingSpeakupApproval:
     context_snapshot: dict[str, object]
     trigger: str = "cron"
     daily_cap: int = 1
+    reply_to_message_id: str | None = None
 
     @property
     def approve_code(self) -> str:
@@ -40,6 +41,20 @@ class PendingSpeakupApproval:
     @property
     def deny_code(self) -> str:
         return f"spk-deny-{self.proposal_id}"
+
+
+@dataclass(slots=True)
+class SpeakupApprovalMatch:
+    action: SpeakupApprovalAction
+    approval: PendingSpeakupApproval
+    expired: bool = False
+
+    def __iter__(self):
+        yield self.action
+        yield self.approval
+
+    def __getitem__(self, index: int):
+        return (self.action, self.approval)[index]
 
 
 class SpeakupApprovalStore:
@@ -108,7 +123,7 @@ class SpeakupApprovalStore:
         *,
         owner_channel: str | None = None,
         owner_chat_id: str | None = None,
-    ) -> tuple[SpeakupApprovalAction, PendingSpeakupApproval] | None:
+    ) -> SpeakupApprovalMatch | None:
         parsed = self._parse_code(text)
         if parsed is None:
             return None
@@ -123,9 +138,11 @@ class SpeakupApprovalStore:
                         return None
                     consumed = self._approvals.pop(index)
                     self._save()
-                    if consumed.expires_at < now:
-                        return None
-                    return action, consumed
+                    return SpeakupApprovalMatch(
+                        action=action,
+                        approval=consumed,
+                        expired=consumed.expires_at < now,
+                    )
             return None
 
     async def purge_expired(self) -> list[PendingSpeakupApproval]:

@@ -57,7 +57,9 @@ class Sandbox:
             "--ro-bind", "/dev/null", str(yeoman_home / ".env"),
             # Ephemeral writable tmp — unique per call
             "--bind", str(tmpdir), "/tmp",
-            "--proc", "/proc",
+            # ro-bind (not --proc) so this works under systemd's ProtectKernelTunables=yes,
+            # which blocks unprivileged procfs mount in a child namespace.
+            "--ro-bind", "/proc", "/proc",
             "--dev", "/dev",
             "--unshare-net",
             "--unshare-pid",

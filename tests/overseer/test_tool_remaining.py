@@ -31,6 +31,27 @@ def test_check_health_delegates_to_checks():
         mock_check.assert_called_once()
 
 
+def test_check_health_forwards_extra_kwargs():
+    with patch("yeoman_overseer.trigger.checks.run_check") as mock_check:
+        mock_check.return_value = MagicMock(value=False, detail="ok")
+        check_health_execute(
+            {"check": "disk_usage_above", "target": "/", "threshold": 85},
+            _ctx(),
+        )
+        mock_check.assert_called_once_with(
+            "disk_usage_above", target="/", threshold=85
+        )
+
+
+def test_check_health_runs_disk_usage_above_end_to_end(tmp_path):
+    result = check_health_execute(
+        {"check": "disk_usage_above", "target": str(tmp_path), "threshold": 0},
+        _ctx(),
+    )
+    assert "ERROR" not in result
+    assert "disk_usage_above" in result
+
+
 def test_check_health_unknown_check():
     result = check_health_execute(
         {"check": "nonexistent_check", "target": "x"}, _ctx()

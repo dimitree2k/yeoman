@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -41,28 +43,106 @@ class TasteDistiller:
                 "samples": len(samples),
             }
 
-        raw = self._distiller(self._build_prompt(samples))
-        if inspect.isawaitable(raw):
-            raw = await raw
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-        if not isinstance(parsed, dict):
-            return {"distilled": False, "reason": "invalid_distiller_response", "samples": len(samples)}
-        pattern = " ".join(str(parsed.get("pattern") or "").split()).strip()
-        if not pattern:
-            return {"distilled": False, "reason": "empty_pattern", "samples": len(samples)}
-        confidence = float(parsed.get("confidence") or 0.8)
-        text = f"Proactive speakup taste pattern: {pattern}"
-        self._memory.record_manual(
+        sample_fingerprint = self._sample_fingerprint(samples)
+        claimed = await self._log.claim_taste_distillation(
             channel=channel,
             chat_id=chat_id,
-            sender_id=None,
-            scope_type="chat",
-            kind="preference",
-            text=text,
-            importance=0.75,
-            confidence=max(0.0, min(1.0, confidence)),
+            sample_fingerprint=sample_fingerprint,
         )
+        if not claimed:
+            return {
+                "distilled": False,
+                "reason": "already_distilled",
+                "samples": len(samples),
+            }
+
+        async def rollback() -> None:
+            await self._log.delete_taste_distillation(
+                channel=channel,
+                chat_id=chat_id,
+                sample_fingerprint=sample_fingerprint,
+            )
+
+        try:
+            raw = self._distiller(self._build_prompt(samples))
+            if inspect.isawaitable(raw):
+                raw = await raw
+        except Exception:
+            await rollback()
+            raise
+
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            await rollback()
+            return {
+                "distilled": False,
+                "reason": "invalid_distiller_response",
+                "samples": len(samples),
+            }
+
+        try:
+            if not isinstance(parsed, dict):
+                await rollback()
+                return {"distilled": False, "reason": "invalid_distiller_response", "samples": len(samples)}
+            pattern = " ".join(str(parsed.get("pattern") or "").split()).strip()
+            if not pattern:
+                await rollback()
+                return {"distilled": False, "reason": "empty_pattern", "samples": len(samples)}
+            raw_confidence = parsed.get("confidence", 0.8)
+            try:
+                confidence = float(raw_confidence)
+            except (TypeError, ValueError):
+                await rollback()
+                return {
+                    "distilled": False,
+                    "reason": "invalid_distiller_response",
+                    "samples": len(samples),
+                }
+            if not math.isfinite(confidence):
+                await rollback()
+                return {
+                    "distilled": False,
+                    "reason": "invalid_distiller_response",
+                    "samples": len(samples),
+                }
+            text = f"Proactive speakup taste pattern: {pattern}"
+            self._memory.record_manual(
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=None,
+                scope_type="chat",
+                kind="preference",
+                text=text,
+                importance=0.75,
+                confidence=max(0.0, min(1.0, confidence)),
+            )
+        except Exception:
+            await rollback()
+            raise
         return {"distilled": True, "samples": len(samples)}
+
+    @staticmethod
+    def _sample_fingerprint(samples: list[dict[str, Any]]) -> str:
+        payload = [
+            {
+                "action_type": str(sample.get("action_type") or ""),
+                "profile": str(sample.get("profile") or ""),
+                "message": str(sample.get("message") or ""),
+                "outcome": str(sample.get("outcome") or ""),
+            }
+            for sample in samples
+        ]
+        payload.sort(
+            key=lambda sample: (
+                sample["action_type"],
+                sample["profile"],
+                sample["message"],
+                sample["outcome"],
+            )
+        )
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _build_prompt(samples: list[dict[str, Any]]) -> str:

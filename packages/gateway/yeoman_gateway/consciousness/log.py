@@ -52,6 +52,17 @@ class SpeakupLog:
                 ON speakups(channel, chat_id, committed_at)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS taste_distillations (
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    sample_fingerprint TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (channel, chat_id, sample_fingerprint)
+                )
+                """
+            )
             self._conn.commit()
 
     async def record_proposed(
@@ -332,6 +343,83 @@ class SpeakupLog:
                     trigger,
                     json.dumps(context_snapshot, sort_keys=True),
                 ),
+            )
+            self._conn.commit()
+
+    async def has_taste_distillation(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sample_fingerprint: str,
+    ) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM taste_distillations
+                WHERE channel = ? AND chat_id = ? AND sample_fingerprint = ?
+                LIMIT 1
+                """,
+                (channel, chat_id, sample_fingerprint),
+            ).fetchone()
+        return row is not None
+
+    async def record_taste_distillation(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sample_fingerprint: str,
+        now: float | None = None,
+    ) -> None:
+        ts = float(now if now is not None else time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO taste_distillations (
+                    channel, chat_id, sample_fingerprint, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (channel, chat_id, sample_fingerprint, ts),
+            )
+            self._conn.commit()
+
+    async def claim_taste_distillation(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sample_fingerprint: str,
+        now: float | None = None,
+    ) -> bool:
+        ts = float(now if now is not None else time.time())
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO taste_distillations (
+                    channel, chat_id, sample_fingerprint, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (channel, chat_id, sample_fingerprint, ts),
+            )
+            self._conn.commit()
+        return cursor.rowcount == 1
+
+    async def delete_taste_distillation(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sample_fingerprint: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                DELETE FROM taste_distillations
+                WHERE channel = ? AND chat_id = ? AND sample_fingerprint = ?
+                """,
+                (channel, chat_id, sample_fingerprint),
             )
             self._conn.commit()
 

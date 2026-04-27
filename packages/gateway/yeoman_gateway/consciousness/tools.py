@@ -15,6 +15,7 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.policy.engine import PolicyEngine
+from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 DEFAULT_HELPFUL_ACTIONS = {
@@ -45,6 +46,7 @@ class SpeakupProposal:
     confidence: float
     trigger: str
     context_snapshot: dict[str, object]
+    reply_to_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +115,16 @@ class ConsciousnessTools:
             for chat in self._eligible_chats()
         )
 
-    async def read_chat_window(self, chat_id: str, n: int = 20) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+    async def read_chat_window(
+        self,
+        chat_id: str,
+        n: int = 20,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id", "messages": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "messages": []}
         now = self._now()
@@ -129,8 +139,17 @@ class ConsciousnessTools:
         )
         return {"status": "ok", "messages": rows}
 
-    async def search_memory(self, query: str, chat_id: str, limit: int = 5) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+    async def search_memory(
+        self,
+        query: str,
+        chat_id: str,
+        limit: int = 5,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id", "hits": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "hits": []}
         if self.memory is None or not hasattr(self.memory, "search"):
@@ -149,8 +168,16 @@ class ConsciousnessTools:
             rendered.append({"content": str(content)})
         return {"status": "ok", "hits": rendered}
 
-    async def read_speakup_history(self, chat_id: str, n: int = 20) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+    async def read_speakup_history(
+        self,
+        chat_id: str,
+        n: int = 20,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id", "history": []}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "history": []}
         history = await self.log.history(
@@ -160,8 +187,33 @@ class ConsciousnessTools:
         )
         return {"status": "ok", "history": history}
 
-    async def read_daily_usage(self, chat_id: str) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+    async def read_persona_for_chat(
+        self,
+        chat_id: str,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id"}
+        if eligible is None:
+            return {"status": "rejected", "reason": "chat_not_eligible"}
+        resolved = self.policy_engine.resolve_policy(eligible.channel, eligible.chat_id)
+        try:
+            text = load_persona_text(resolved.persona_file, self.policy_engine.workspace)
+        except Exception:
+            return {"status": "ok", "persona": None}
+        return {"status": "ok", "persona": text}
+
+    async def read_daily_usage(
+        self,
+        chat_id: str,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id"}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible"}
         sent_today = await self.log.count_sent_today(
@@ -183,8 +235,12 @@ class ConsciousnessTools:
         message: str,
         action_type: str,
         confidence: float,
+        channel: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id"}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible"}
         content = str(message or "").strip()
@@ -197,6 +253,16 @@ class ConsciousnessTools:
         if float(confidence) < MIN_CONFIDENCE:
             return {"status": "rejected", "reason": "low_confidence"}
 
+        validated_reply_to: str | None = None
+        if reply_to_message_id:
+            candidate = str(reply_to_message_id).strip()
+            if candidate:
+                row = self.inbound_archive.lookup_message(
+                    eligible.channel, eligible.chat_id, candidate
+                )
+                if row is not None:
+                    validated_reply_to = candidate
+
         proposal_id = uuid.uuid4().hex
         proposal = SpeakupProposal(
             proposal_id=proposal_id,
@@ -208,6 +274,7 @@ class ConsciousnessTools:
             confidence=float(confidence),
             trigger=self._trigger,
             context_snapshot={"confidence": float(confidence)},
+            reply_to_message_id=validated_reply_to,
         )
         self._proposals[proposal_id] = proposal
         await self.log.record_proposed(
@@ -230,7 +297,7 @@ class ConsciousnessTools:
             proposal = self._proposals.get(str(proposal_id))
             if proposal is None:
                 return {"status": "rejected", "reason": "proposal_not_found"}
-            eligible = self._eligible_by_chat().get(proposal.chat_id)
+            eligible = self._resolve_eligible(proposal.chat_id, channel=proposal.channel)
             if eligible is None:
                 await self.log.mark_rejected(proposal.proposal_id, reason="chat_not_eligible")
                 return {"status": "rejected", "reason": "chat_not_eligible"}
@@ -267,22 +334,31 @@ class ConsciousnessTools:
                     context_snapshot=dict(proposal.context_snapshot),
                     trigger=proposal.trigger,
                     daily_cap=eligible.daily_cap,
+                    reply_to_message_id=proposal.reply_to_message_id,
                 )
                 await self.approval_store.add(approval)
                 await self.log.mark_status(
                     proposal.proposal_id,
                     status="queued_for_approval",
                 )
+                preview_lines = [
+                    f"Proposed spontaneous message for {approval.target_chat_id}",
+                ]
+                quoted = self._render_quoted_preview(proposal)
+                if quoted:
+                    preview_lines.append(quoted)
+                preview_lines.extend(
+                    [
+                        f"Message: {proposal.message}",
+                        f"Approve: {approval.approve_code}",
+                        f"Deny: {approval.deny_code}",
+                    ]
+                )
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=approval.owner_channel,
                         chat_id=approval.owner_chat_id,
-                        content=(
-                            f"Proposed spontaneous message for {approval.target_chat_id}\n"
-                            f"Message: {proposal.message}\n"
-                            f"Approve: {approval.approve_code}\n"
-                            f"Deny: {approval.deny_code}"
-                        ),
+                        content="\n".join(preview_lines),
                         metadata={
                             "spontaneous": True,
                             "preview": True,
@@ -291,6 +367,7 @@ class ConsciousnessTools:
                             "action_type": proposal.action_type,
                             "profile": proposal.profile,
                             "trigger": proposal.trigger,
+                            "reply_to_message_id": proposal.reply_to_message_id,
                         },
                     )
                 )
@@ -321,6 +398,7 @@ class ConsciousnessTools:
                     channel=proposal.channel,
                     chat_id=proposal.chat_id,
                     content=content,
+                    reply_to=proposal.reply_to_message_id,
                     metadata={
                         "spontaneous": True,
                         "proposal_id": proposal.proposal_id,
@@ -340,8 +418,11 @@ class ConsciousnessTools:
         chat_id: str,
         reason: str,
         trigger: str,
+        channel: str | None = None,
     ) -> dict[str, object]:
-        eligible = self._eligible_by_chat().get(chat_id)
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "silent_pass", "reason": "ambiguous_chat_id"}
         if eligible is None:
             return {"status": "silent_pass", "reason": reason}
         entry_id = await self.log.record_silent_pass(
@@ -354,8 +435,46 @@ class ConsciousnessTools:
         )
         return {"status": "silent_pass", "entry_id": entry_id, "reason": reason}
 
-    def _eligible_by_chat(self) -> dict[str, EligibleChat]:
-        return {chat.chat_id: chat for chat in self._eligible_chats()}
+    def _render_quoted_preview(self, proposal: SpeakupProposal) -> str | None:
+        if not proposal.reply_to_message_id:
+            return None
+        row = self.inbound_archive.lookup_message(
+            proposal.channel, proposal.chat_id, proposal.reply_to_message_id
+        )
+        if row is None:
+            return None
+        sender = str(row.get("sender_name") or row.get("sender_id") or "?").strip() or "?"
+        text = str(row.get("text") or "").strip().replace("\n", " ")
+        if len(text) > 140:
+            text = text[:137] + "..."
+        return f'In reply to {sender}: "{text}"'
+
+    def _eligible_by_chat(self) -> dict[tuple[str, str], EligibleChat]:
+        return {(chat.channel, chat.chat_id): chat for chat in self._eligible_chats()}
+
+    def _resolve_eligible(
+        self,
+        chat_id: str,
+        *,
+        channel: str | None = None,
+    ) -> EligibleChat | None | str:
+        chat_id = str(chat_id or "").strip()
+        channel = str(channel or "").strip() or None
+        if not chat_id:
+            return None
+        by_key = self._eligible_by_chat()
+        if channel is not None:
+            return by_key.get((channel, chat_id))
+        matches = [
+            chat
+            for (_candidate_channel, candidate_chat_id), chat in by_key.items()
+            if candidate_chat_id == chat_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return "ambiguous_chat_id"
+        return None
 
     def _eligible_chats(self) -> list[EligibleChat]:
         if not self.config.consciousness.enabled:
@@ -474,10 +593,10 @@ class ConsciousnessTools:
         value = str(owner or "").strip()
         if not value:
             return ""
-        if channel == "whatsapp" and value.startswith("+"):
-            value = value[1:]
         if channel == "whatsapp" and "@" not in value:
-            return f"{value}@s.whatsapp.net"
+            phone = value[1:] if value.startswith("+") else value
+            if phone.isdigit():
+                return f"{phone}@s.whatsapp.net"
         return value
 
     @staticmethod

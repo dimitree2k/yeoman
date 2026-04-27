@@ -354,3 +354,98 @@ async def test_expired_approval_does_not_send_and_does_not_consume_daily_cap(tmp
     assert await log.count_sent_today(channel="whatsapp", chat_id="group@g.us", now=datetime(2026, 4, 25, 12, 0, tzinfo=UTC)) == 0
     history = await log.history("whatsapp", "group@g.us", limit=5)
     assert history[0]["status"] == "expired"
+    assert next_fn.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_speakup_code_halts_after_expired_approval_was_purged(
+    tmp_path: Path,
+) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    fixed_ts = datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp()
+    proposal_id = await log.record_proposed(
+        proposal_id="expired-proposal",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        action_type="observation",
+        profile="balanced",
+        message="expired",
+        trigger="cron",
+        context_snapshot={},
+        now=fixed_ts,
+    )
+    await log.mark_status(proposal_id, status="queued_for_approval")
+    await store.add(
+        PendingSpeakupApproval(
+            proposal_id=proposal_id,
+            target_channel="whatsapp",
+            target_chat_id="group@g.us",
+            owner_channel="whatsapp",
+            owner_chat_id="owner@s.whatsapp.net",
+            message="expired",
+            action_type="observation",
+            profile="balanced",
+            created_at=fixed_ts - 10,
+            expires_at=fixed_ts - 1,
+            context_snapshot={},
+        )
+    )
+
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+    )
+    non_code_next = AsyncMock()
+    await middleware(_owner_ctx("ordinary owner message"), non_code_next)
+
+    assert non_code_next.await_count == 1
+    history = await log.history("whatsapp", "group@g.us", limit=5)
+    assert history[0]["status"] == "expired"
+
+    code_next = AsyncMock()
+    await middleware(_owner_ctx("spk-approve-expired-proposal"), code_next)
+
+    assert tools.bus.outbound_size == 0
+    assert code_next.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_approve_carries_reply_to_message_id_into_outbound(tmp_path: Path) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message_id="msg-anchor",
+        participant="part-1",
+        sender_id="sender-1",
+        text="anchor in group",
+        timestamp=int(datetime(2026, 4, 25, 11, 50, tzinfo=UTC).timestamp()),
+        sender_name="Robin",
+    )
+    proposal = await tools.propose_speakup(
+        chat_id="group@g.us",
+        message="anchored reply",
+        action_type="observation",
+        confidence=0.9,
+        reply_to_message_id="msg-anchor",
+    )
+    await tools.commit_speakup(str(proposal["proposal_id"]))
+    preview = await tools.bus.consume_outbound()
+    assert "In reply to Robin" in preview.content
+    code = preview.content.split("Approve: ", 1)[1].splitlines()[0].strip()
+
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+    )
+    next_fn = AsyncMock()
+    await middleware(_owner_ctx(code), next_fn)
+
+    outbound = await tools.bus.consume_outbound()
+    assert outbound.chat_id == "group@g.us"
+    assert outbound.reply_to == "msg-anchor"
+    assert next_fn.await_count == 0

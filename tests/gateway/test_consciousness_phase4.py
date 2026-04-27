@@ -177,6 +177,41 @@ async def test_burst_debounce_state_survives_restart(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_burst_state_is_not_saved_when_callback_fails(tmp_path: Path) -> None:
+    state_path = tmp_path / "burst.json"
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    async def failing_burst(channel: str, chat_id: str) -> None:
+        del channel, chat_id
+        raise RuntimeError("planner failed")
+
+    first = BurstObserver(
+        config=_config(),
+        state_path=state_path,
+        on_burst=failing_burst,
+        is_eligible=lambda channel, chat_id: True,
+    )
+
+    with pytest.raises(RuntimeError, match="planner failed"):
+        for index in range(3):
+            await first.handle(_event(at=base + timedelta(minutes=index)))
+
+    assert not state_path.exists()
+
+    calls: list[tuple[str, str]] = []
+    restarted = BurstObserver(
+        config=_config(),
+        state_path=state_path,
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+    for index in range(3):
+        await restarted.handle(_event(at=base + timedelta(minutes=20 + index)))
+
+    assert calls == [("whatsapp", "group@g.us")]
+
+
+@pytest.mark.asyncio
 async def test_burst_tick_targets_trigger_chat_and_uses_existing_rails(tmp_path: Path) -> None:
     cfg = _config()
     bus = MessageBus()

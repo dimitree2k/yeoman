@@ -89,7 +89,10 @@ class OutcomeEnricher:
         raw = self._classifier(json.dumps(payload, default=str, ensure_ascii=False))
         if inspect.isawaitable(raw):
             raw = await raw
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return None
         if not isinstance(parsed, dict):
             return None
         outcome = str(parsed.get("outcome") or "").strip()

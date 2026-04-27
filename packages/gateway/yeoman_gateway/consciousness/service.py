@@ -37,6 +37,7 @@ class ConsciousnessService:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._last_run_day: str | None = None
+        self._tick_lock = asyncio.Lock()
 
     @property
     def started(self) -> bool:
@@ -67,18 +68,19 @@ class ConsciousnessService:
     ) -> dict[str, object]:
         if not self._config.consciousness.enabled:
             return {"status": "disabled"}
-        result = dict(
-            await self._agent.run_once(
-                trigger=trigger,
-                target_channel=target_channel,
-                target_chat_id=target_chat_id,
+        async with self._tick_lock:
+            result = dict(
+                await self._agent.run_once(
+                    trigger=trigger,
+                    target_channel=target_channel,
+                    target_chat_id=target_chat_id,
+                )
             )
-        )
-        if self._outcome_enricher is not None:
-            result["outcomes"] = await self._outcome_enricher.run_once()
-        if self._taste_distiller is not None and self._speakup_log is not None:
-            result["taste"] = await self._run_taste_distillation()
-        return result
+            if self._outcome_enricher is not None:
+                result["outcomes"] = await self._outcome_enricher.run_once()
+            if self._taste_distiller is not None and self._speakup_log is not None:
+                result["taste"] = await self._run_taste_distillation()
+            return result
 
     async def _run_taste_distillation(self) -> list[dict[str, Any]]:
         assert self._speakup_log is not None

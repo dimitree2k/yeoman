@@ -102,6 +102,36 @@ async def test_outcome_enricher_classifies_post_speakup_window(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_outcome_enricher_tolerates_invalid_classifier_json(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    archive = InboundArchive(tmp_path / "inbound.db")
+    committed_at = datetime(2026, 4, 25, 12, 0, tzinfo=UTC).timestamp()
+    await log.record_sent(
+        proposal_id="spk-invalid-outcome",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        action_type="observation",
+        profile="balanced",
+        message="message",
+        trigger="manual",
+        context_snapshot={},
+        now=committed_at,
+    )
+
+    enricher = OutcomeEnricher(
+        log=log,
+        inbound_archive=archive,
+        classifier=lambda prompt: "not json",
+    )
+
+    result = await enricher.run_once(now=datetime.fromtimestamp(committed_at + 3600, UTC))
+    history = await log.history("whatsapp", "group@g.us", limit=5)
+
+    assert result == {"classified": 0}
+    assert history[0]["outcome"] is None
+
+
+@pytest.mark.asyncio
 async def test_taste_distiller_writes_patterns_not_raw_messages(tmp_path: Path) -> None:
     log = SpeakupLog(tmp_path / "speakups.db")
     base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
@@ -143,6 +173,292 @@ async def test_taste_distiller_writes_patterns_not_raw_messages(tmp_path: Path) 
     assert record["kind"] == "preference"
     assert "Light finance-politics jokes land" in str(record["text"])
     assert "raw joke text" not in str(record["text"])
+
+
+@pytest.mark.asyncio
+async def test_taste_distiller_tolerates_invalid_distiller_json(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-invalid-taste-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    taste = TasteDistiller(
+        log=log,
+        memory=memory,
+        distiller=lambda prompt: "not json",
+        min_samples=3,
+    )
+
+    result = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert result == {
+        "distilled": False,
+        "reason": "invalid_distiller_response",
+        "samples": 3,
+    }
+    assert memory.records == []
+
+
+@pytest.mark.asyncio
+async def test_taste_distiller_tolerates_invalid_confidence(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-invalid-confidence-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    taste = TasteDistiller(
+        log=log,
+        memory=memory,
+        distiller=lambda prompt: {"pattern": "Short jokes worked.", "confidence": "high"},
+        min_samples=3,
+    )
+
+    result = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert result == {
+        "distilled": False,
+        "reason": "invalid_distiller_response",
+        "samples": 3,
+    }
+    assert memory.records == []
+
+
+@pytest.mark.asyncio
+async def test_taste_distiller_preserves_zero_confidence(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-zero-confidence-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    taste = TasteDistiller(
+        log=log,
+        memory=memory,
+        distiller=lambda prompt: {"pattern": "Short jokes worked.", "confidence": 0.0},
+        min_samples=3,
+    )
+
+    result = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert result == {"distilled": True, "samples": 3}
+    assert memory.records[0]["confidence"] == 0.0
+
+
+@pytest.mark.parametrize("confidence", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.asyncio
+async def test_taste_distiller_rejects_non_finite_confidence(
+    tmp_path: Path,
+    confidence: str,
+) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-nonfinite-confidence-{confidence}-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    taste = TasteDistiller(
+        log=log,
+        memory=memory,
+        distiller=lambda prompt: {"pattern": "Short jokes worked.", "confidence": confidence},
+        min_samples=3,
+    )
+
+    result = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert result == {
+        "distilled": False,
+        "reason": "invalid_distiller_response",
+        "samples": 3,
+    }
+    assert memory.records == []
+
+
+@pytest.mark.asyncio
+async def test_taste_distiller_skips_unchanged_sample_set(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-dedupe-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    calls = 0
+
+    async def distiller(prompt: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"pattern": "Short concrete jokes worked.", "confidence": 0.9}
+
+    taste = TasteDistiller(log=log, memory=memory, distiller=distiller, min_samples=3)
+
+    first = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+    second = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert first == {"distilled": True, "samples": 3}
+    assert second == {
+        "distilled": False,
+        "reason": "already_distilled",
+        "samples": 3,
+    }
+    assert calls == 1
+    assert len(memory.records) == 1
+
+
+def test_taste_distiller_sample_fingerprint_is_order_stable() -> None:
+    samples_a = [
+        {
+            "id": "spk-order-1",
+            "action_type": "light_humor",
+            "profile": "balanced",
+            "message": "message 1",
+            "outcome": "replied",
+        },
+        {
+            "id": "spk-order-2",
+            "action_type": "observation",
+            "profile": "quiet",
+            "message": "message 2",
+            "outcome": "ignored",
+        },
+    ]
+    samples_b = list(reversed(samples_a))
+
+    assert TasteDistiller._sample_fingerprint(samples_a) == TasteDistiller._sample_fingerprint(samples_b)
+
+
+def test_taste_distiller_sample_fingerprint_uses_prompt_fields() -> None:
+    base_sample = {
+        "id": "spk-fields",
+        "action_type": "light_humor",
+        "profile": "balanced",
+        "message": "message",
+        "outcome": "replied",
+        "outcome_classified_at": 1777118400.0,
+    }
+    base_fingerprint = TasteDistiller._sample_fingerprint([base_sample])
+
+    for field, value in [
+        ("action_type", "observation"),
+        ("profile", "quiet"),
+        ("message", "different message"),
+        ("outcome", "ignored"),
+    ]:
+        changed_sample = dict(base_sample)
+        changed_sample[field] = value
+        assert TasteDistiller._sample_fingerprint([changed_sample]) != base_fingerprint
+
+    id_changed = dict(base_sample)
+    id_changed["id"] = "spk-fields-2"
+    assert TasteDistiller._sample_fingerprint([id_changed]) == base_fingerprint
+
+    timestamp_changed = dict(base_sample)
+    timestamp_changed["outcome_classified_at"] = 1777118460.0
+    assert TasteDistiller._sample_fingerprint([timestamp_changed]) == base_fingerprint
+
+
+@pytest.mark.asyncio
+async def test_taste_distiller_invalid_response_allows_retry(tmp_path: Path) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+    for index in range(3):
+        proposal_id = f"spk-retry-{index}"
+        await log.record_sent(
+            proposal_id=proposal_id,
+            channel="whatsapp",
+            chat_id="group@g.us",
+            action_type="light_humor",
+            profile="balanced",
+            message=f"message {index}",
+            trigger="manual",
+            context_snapshot={},
+            now=(base + timedelta(minutes=index)).timestamp(),
+        )
+        await log.mark_outcome(proposal_id, outcome="replied")
+
+    memory = _FakeMemory()
+    calls = 0
+
+    async def distiller(prompt: str) -> dict[str, object] | str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "not json"
+        return {"pattern": "Short concrete jokes worked.", "confidence": 0.9}
+
+    taste = TasteDistiller(log=log, memory=memory, distiller=distiller, min_samples=3)
+
+    first = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+    second = await taste.run_once(channel="whatsapp", chat_id="group@g.us")
+
+    assert first == {
+        "distilled": False,
+        "reason": "invalid_distiller_response",
+        "samples": 3,
+    }
+    assert second == {"distilled": True, "samples": 3}
+    assert calls == 2
+    assert len(memory.records) == 1
 
 
 @pytest.mark.asyncio

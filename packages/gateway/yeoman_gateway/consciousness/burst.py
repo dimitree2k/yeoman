@@ -64,11 +64,11 @@ class BurstObserver:
         if self._last_fired_day.get(state_key) == day:
             return
 
-        self._last_fired_day[state_key] = day
-        self._save_state()
         raw = self._on_burst(channel, chat_id)
         if inspect.isawaitable(raw):
             await raw
+        self._last_fired_day[state_key] = day
+        self._save_state()
 
     async def _eligible(self, channel: str, chat_id: str) -> bool:
         if self._is_eligible is None:

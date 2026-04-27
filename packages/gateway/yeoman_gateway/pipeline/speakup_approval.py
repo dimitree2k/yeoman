@@ -33,12 +33,13 @@ class SpeakupApprovalMiddleware:
             await next(ctx)
             return
 
-        expired = await self._store.purge_expired()
-        for approval in expired:
-            await self._log.mark_status(approval.proposal_id, status="expired")
-
         content = ctx.event.content.strip()
-        if not (content.startswith("spk-approve-") or content.startswith("spk-deny-")):
+        is_speakup_code = content.startswith("spk-approve-") or content.startswith("spk-deny-")
+
+        if not is_speakup_code:
+            expired = await self._store.purge_expired()
+            for approval in expired:
+                await self._log.mark_status(approval.proposal_id, status="expired")
             await next(ctx)
             return
 
@@ -52,10 +53,16 @@ class SpeakupApprovalMiddleware:
             if matched is not None:
                 break
         if matched is None:
-            await next(ctx)
+            ctx.halt()
             return
 
-        action, approval = matched
+        action = matched.action
+        approval = matched.approval
+        if matched.expired:
+            await self._log.mark_status(approval.proposal_id, status="expired")
+            ctx.halt()
+            return
+
         if action == "approve":
             sent_today = await self._log.count_sent_today(
                 channel=approval.target_channel,
@@ -102,6 +109,7 @@ class SpeakupApprovalMiddleware:
                     channel=approval.target_channel,
                     chat_id=approval.target_chat_id,
                     content=content,
+                    reply_to=approval.reply_to_message_id,
                     metadata={
                         "spontaneous": True,
                         "approved": True,
