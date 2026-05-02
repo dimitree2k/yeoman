@@ -122,8 +122,8 @@ class VoiceOutputPolicy(PolicyModel):
     tts_route: str = Field(default="tts.speak", alias="ttsRoute")
     voice: str = "alloy"
     format: str = "opus"
-    max_sentences: int = Field(default=2, alias="maxSentences", ge=1)
-    max_chars: int = Field(default=150, alias="maxChars", ge=1)
+    max_sentences: int = Field(default=3, alias="maxSentences", ge=1)
+    max_chars: int = Field(default=500, alias="maxChars", ge=1)
 
 
 class VoiceOutputPolicyOverride(PolicyModel):

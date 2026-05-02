@@ -35,10 +35,37 @@ class _FakeSecurity:
         )
 
 
+class _FakeEntry:
+    def __init__(
+        self,
+        content: str,
+        *,
+        confidence: float = 0.8,
+        updated_at: str = "2026-04-25T12:00:00+00:00",
+    ) -> None:
+        self.content = content
+        self.confidence = confidence
+        self.updated_at = updated_at
+
+
+class _FakeHit:
+    def __init__(self, content: str) -> None:
+        self.entry = _FakeEntry(content)
+
+
 class _FakeMemory:
+    def __init__(self, learned_taste: list[str] | None = None) -> None:
+        self.learned_taste = learned_taste or []
+        self.search_calls: list[dict[str, object]] = []
+        self.learned_taste_calls: list[dict[str, object]] = []
+
     def search(self, **kwargs: object) -> list[object]:
-        del kwargs
+        self.search_calls.append(dict(kwargs))
         return []
+
+    def learned_chat_taste(self, **kwargs: object) -> list[object]:
+        self.learned_taste_calls.append(dict(kwargs))
+        return [_FakeHit(content) for content in self.learned_taste]
 
 
 def _config(**overrides: object) -> Config:
@@ -79,6 +106,7 @@ def _tools(
     config: Config | None = None,
     policy: PolicyConfig | None = None,
     security: object | None = None,
+    memory: object | None = None,
 ) -> ConsciousnessTools:
     return ConsciousnessTools(
         config=config or _config(),
@@ -86,7 +114,7 @@ def _tools(
         bus=MessageBus(),
         log=SpeakupLog(tmp_path / "speakups.db"),
         inbound_archive=InboundArchive(tmp_path / "inbound.db"),
-        memory=_FakeMemory(),
+        memory=memory if memory is not None else _FakeMemory(),
         security=security or _FakeSecurity(),
         now=lambda: datetime(2026, 4, 25, 12, 0, tzinfo=UTC),
     )
@@ -253,6 +281,95 @@ async def test_agent_prompt_includes_daily_cap_state(tmp_path: Path) -> None:
     assert eligible[0]["sent_today"] == 1
     assert eligible[0]["daily_remaining"] == 0
     assert "status 'denied' as owner feedback" in str(captured["instruction"])
+
+
+@pytest.mark.asyncio
+async def test_agent_prompt_includes_learned_chat_taste(tmp_path: Path) -> None:
+    memory = _FakeMemory(
+        learned_taste=[
+            "Proactive speakup taste pattern: Short market comments work better than broad jokes."
+        ]
+    )
+    tools = _tools(tmp_path, memory=memory)
+    captured: dict[str, object] = {}
+
+    def planner(prompt: str) -> str:
+        captured.update(json.loads(prompt))
+        return json.dumps({"silence": True, "reason": "test"})
+
+    agent = ConsciousnessAgent(tools=tools, planner=planner)
+
+    await agent.run_once(trigger="cron")
+
+    learned_taste = captured["learned_taste"]
+    assert isinstance(learned_taste, dict)
+    assert learned_taste["status"] == "ok"
+    assert learned_taste["patterns"] == [
+        {
+            "content": (
+                "Proactive speakup taste pattern: Short market comments work better "
+                "than broad jokes."
+            ),
+            "confidence": 0.8,
+            "updated_at": "2026-04-25T12:00:00+00:00",
+        }
+    ]
+    assert memory.learned_taste_calls == [
+        {"channel": "whatsapp", "chat_id": "owner@s.whatsapp.net", "limit": 5}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_search_memory_with_empty_query(tmp_path: Path) -> None:
+    memory = _FakeMemory()
+    tools = _tools(tmp_path, memory=memory)
+    captured: dict[str, object] = {}
+
+    def planner(prompt: str) -> str:
+        captured.update(json.loads(prompt))
+        return json.dumps({"silence": True, "reason": "test"})
+
+    agent = ConsciousnessAgent(tools=tools, planner=planner)
+
+    await agent.run_once(trigger="cron")
+
+    assert captured["memory"] == {"status": "ok", "hits": []}
+    assert memory.search_calls == []
+    assert memory.learned_taste_calls == [
+        {"channel": "whatsapp", "chat_id": "owner@s.whatsapp.net", "limit": 5}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_searches_memory_with_chat_window_text(tmp_path: Path) -> None:
+    memory = _FakeMemory()
+    tools = _tools(tmp_path, memory=memory)
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="owner@s.whatsapp.net",
+        message_id="m1",
+        participant=None,
+        sender_id="owner@s.whatsapp.net",
+        text="NVDA earnings reaction looks overextended.",
+        timestamp=int(datetime(2026, 4, 25, 11, 59, tzinfo=UTC).timestamp()),
+    )
+
+    agent = ConsciousnessAgent(
+        tools=tools,
+        planner=lambda prompt: json.dumps({"silence": True, "reason": "test"}),
+    )
+
+    await agent.run_once(trigger="cron")
+
+    assert memory.search_calls == [
+        {
+            "query": "NVDA earnings reaction looks overextended.",
+            "channel": "whatsapp",
+            "chat_id": "owner@s.whatsapp.net",
+            "scope": "chat",
+            "limit": 5,
+        }
+    ]
 
 
 @pytest.mark.asyncio

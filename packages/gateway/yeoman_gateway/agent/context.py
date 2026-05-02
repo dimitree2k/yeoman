@@ -9,7 +9,6 @@ from typing import Any
 
 from yeoman_gateway.agent.skills import SkillsLoader
 
-
 _EXTERNAL_CHANNELS = frozenset({"whatsapp", "telegram", "discord", "feishu"})
 
 
@@ -266,7 +265,7 @@ Architecture facts:
 When a user asks you to send, create, or reply with a voice message / Sprachnachricht / voice note:
 - You MUST call the `send_voice` tool. Do NOT just output the text — that sends a text message, not a voice note.
 - Keep voice content concise for TTS (1-3 sentences).
-- After calling `send_voice` once, produce a short text confirmation (e.g. "Gesendet." or "Sent."). Do NOT call `send_voice` again for the same request.
+- After calling `send_voice` once, do not send a visible text confirmation. Do NOT call `send_voice` again for the same request.
 - If `send_voice` is not available in your tools, or returns an error, tell the user the specific reason (e.g. "Voice ist gerade nicht verfügbar: <reason>"). Never silently fall back to text when voice was requested.
 If required context is missing (e.g. user asks to answer "the last voice message" from another chat), ask only for the missing content or target chat.
 For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step.
@@ -415,15 +414,15 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
         if not metadata or not bool(metadata.get("voice_reply_expected", False)):
             return text
 
-        max_sentences = max(1, int(metadata.get("voice_reply_max_sentences") or 2))
-        max_chars = max(1, int(metadata.get("voice_reply_max_chars") or 150))
+        max_sentences = min(3, max(1, int(metadata.get("voice_reply_max_sentences") or 3)))
+        max_chars = min(500, max(1, int(metadata.get("voice_reply_max_chars") or 500)))
 
         prefix = (
             "[Voice Reply Guidance]\n"
             "target: concise_for_tts\n"
-            f"limit_sentences: {max_sentences}\n"
-            f"limit_chars: {max_chars}\n"
-            "instruction: Keep the answer naturally short and direct to fit these limits.\n"
+            f"target_sentences: {max_sentences}\n"
+            f"target_chars: {max_chars}\n"
+            "instruction: Keep the answer naturally short, complete, and direct for a voice note.\n"
         )
         return f"{prefix}\n{text}"
 

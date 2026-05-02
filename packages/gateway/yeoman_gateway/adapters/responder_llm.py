@@ -8,10 +8,12 @@ import re
 import shlex
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, override
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, override
 
 from loguru import logger
+from yeoman_shared.telemetry import tracing as lf
 
 from yeoman_gateway.agent.context import ContextBuilder
 from yeoman_gateway.agent.subagent import SubagentManager
@@ -19,7 +21,12 @@ from yeoman_gateway.agent.tools.contacts import ContactsTool
 from yeoman_gateway.agent.tools.cron import CronTool
 from yeoman_gateway.agent.tools.exec_isolation import SandboxMount
 from yeoman_gateway.agent.tools.file_access import FileAccessResolver, enable_grants
-from yeoman_gateway.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from yeoman_gateway.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from yeoman_gateway.agent.tools.message import MessageTool
 from yeoman_gateway.agent.tools.ops import OpsTool
 from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
@@ -37,14 +44,18 @@ from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import ResponderPort, SecurityPort, TelemetryPort
-from yeoman_gateway.media.tts import strip_markdown_for_tts, truncate_for_voice, write_tts_audio_file
+from yeoman_gateway.media.tts import (
+    strip_markdown_for_tts,
+    truncate_for_voice,
+    write_tts_audio_file,
+)
 from yeoman_gateway.providers.base import LLMProvider
 from yeoman_gateway.session.manager import SessionManager
-from yeoman_shared.telemetry import tracing as lf
 
 if TYPE_CHECKING:
-    from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
+
+    from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.media.router import ModelRouter
@@ -62,11 +73,40 @@ _BACKWARD_REF_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_BANTER_MARKER_RE = re.compile(
+    r"\b(?:"
+    r"cringe|glitzer|bro|bruder|junge|haha|lol|lmao|witz|joke|roast|meme|"
+    r"lost|cope|based|skill issue|killer|mutter"
+    r")\b",
+    re.IGNORECASE,
+)
+_NEW_VALUE_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"erkl(?:ä|ae)r\w*|check|such|fass|analys|warum|wieso|weshalb|quelle|quellen|"
+    r"zahl(?:en)?|news|chart|preis|aktuell|strategie|risk|risiko|bewert|"
+    r"rechne|vergleich|was ist|wie genau|wie findest|wann aussteigen|"
+    r"explain|why|how|source|sources|search|look up|summari[sz]e|calculate|compare"
+    r")\b",
+    re.IGNORECASE,
+)
+_CLARIFYING_QUESTION_START_RE = re.compile(
+    r"^\s*(?:"
+    r"was|wer|wie|warum|wieso|weshalb|wo|wann|welch(?:e|er|es|en|em)?|"
+    r"kannst|kann|soll|sollen|meinst|brauchst|"
+    r"what|who|how|why|where|when|which|can|could|should|do|does|did"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _has_backward_reference(text: str) -> bool:
     """Return True if the message appears to reference earlier conversation."""
     return bool(_BACKWARD_REF_RE.search(text))
+
+
+def _last_sentence(text: str) -> str:
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return parts[-1].strip() if parts else ""
 
 
 @dataclass
@@ -104,6 +144,7 @@ class LLMResponder(ResponderPort):
         file_access_resolver: FileAccessResolver | None = None,
         group_resolver: "Callable[[str], tuple[str | None, str | None]] | None" = None,
         model_router: "ModelRouter | None" = None,
+        routed_provider_factory: "Callable[[str, str | None], LLMProvider] | None" = None,
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
@@ -132,6 +173,7 @@ class LLMResponder(ResponderPort):
         self.file_access_resolver = file_access_resolver
         self.group_resolver = group_resolver
         self._model_router = model_router
+        self._routed_provider_factory = routed_provider_factory
         self._tts = tts
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
@@ -493,7 +535,7 @@ class LLMResponder(ResponderPort):
                 media=[str(path)],
             )
         )
-        return f"Voice message delivered to {channel}:{chat_id}. Delivery complete — now produce your brief text confirmation."
+        return f"Voice message delivered to {channel}:{chat_id}."
 
     @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
@@ -545,8 +587,8 @@ class LLMResponder(ResponderPort):
             if schema.get("function", {}).get("name") in allowed_tools
         ]
 
-    def _model_for_profile(self, profile_name: str | None) -> str | None:
-        """Return the model string for a named profile, or None if unresolvable.
+    def _profile_for_name(self, profile_name: str | None) -> object | None:
+        """Return the resolved model profile object, or None if unresolvable.
 
         Profile names in policy.json are camelCase (e.g. "grokFast") but config
         loader converts dict keys to snake_case (e.g. "grok_fast"), so we normalize.
@@ -556,20 +598,29 @@ class LLMResponder(ResponderPort):
         from yeoman_shared.config.loader import camel_to_snake
         snake_name = camel_to_snake(profile_name)
         try:
-            return self._model_router.resolve_by_profile(snake_name).model
+            return self._model_router.resolve_by_profile(snake_name)
         except KeyError:
             return None
 
+    def _model_for_profile(self, profile_name: str | None) -> str | None:
+        """Return the model string for a named profile, or None if unresolvable."""
+        profile = self._profile_for_name(profile_name)
+        return str(getattr(profile, "model", "") or "").strip() or None
+
     def _reasoning_for_profile(self, profile_name: str | None) -> dict[str, object] | None:
         """Return the reasoning config for a named profile, or None."""
-        if not profile_name or self._model_router is None:
+        profile = self._profile_for_name(profile_name)
+        reasoning = getattr(profile, "reasoning", None)
+        return reasoning if isinstance(reasoning, dict) else None
+
+    def _provider_for_profile(self, profile: object | None) -> LLMProvider | None:
+        if self._routed_provider_factory is None or profile is None:
             return None
-        from yeoman_shared.config.loader import camel_to_snake
-        snake_name = camel_to_snake(profile_name)
-        try:
-            return self._model_router.resolve_by_profile(snake_name).reasoning
-        except KeyError:
+        model = str(getattr(profile, "model", "") or "").strip()
+        if not model:
             return None
+        provider = str(getattr(profile, "provider", "") or "").strip() or None
+        return self._routed_provider_factory(model, provider)
 
     def _should_enable_grants(self, is_owner: bool) -> bool:
         """Check whether grants should be activated for tool execution."""
@@ -585,7 +636,7 @@ class LLMResponder(ResponderPort):
         arguments: dict[str, Any],
         *,
         is_owner: bool,
-    ) -> str:
+    ) -> str | None:
         """Execute a tool call, activating grant context when appropriate."""
         if self._should_enable_grants(is_owner):
             with enable_grants():
@@ -600,14 +651,16 @@ class LLMResponder(ResponderPort):
         security_context: dict[str, object] | None = None,
         is_owner: bool = False,
         model: str | None = None,
+        provider: LLMProvider | None = None,
         reasoning: dict[str, object] | None = None,
         trace: Any = None,
-    ) -> str:
+    ) -> str | None:
         iteration = 0
         final_content: str | None = None
+        chat_provider = provider or self.provider
         # Guard against the model looping on the same side-effecting tool call
         _sent_calls: set[tuple[str, str]] = set()
-        _SEND_TOOLS = frozenset({"message", "send_voice", "send_media"})
+        _send_tools = frozenset({"message", "send_voice", "send_media"})
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -616,7 +669,7 @@ class LLMResponder(ResponderPort):
                 name=f"iteration-{iteration}",
             ) if trace is not None else None
             try:
-                response = await self.provider.chat(
+                response = await chat_provider.chat(
                     messages=messages,
                     tools=self._tool_definitions(allowed_tools),
                     model=model or self.model,
@@ -664,7 +717,7 @@ class LLMResponder(ResponderPort):
                         ) if trace is not None else None
 
                         # --- dedup guard for send-type tools ---
-                        if tool_call.name in _SEND_TOOLS:
+                        if tool_call.name in _send_tools:
                             call_key = (tool_call.name, args_preview)
                             if call_key in _sent_calls:
                                 result = (
@@ -735,6 +788,11 @@ class LLMResponder(ResponderPort):
                             tool_call.name,
                             result,
                         )
+                        if (
+                            tool_call.name == "send_voice"
+                            and result.startswith("Voice message delivered")
+                        ):
+                            return None
                     continue
 
                 final_content = response.content
@@ -832,6 +890,107 @@ class LLMResponder(ResponderPort):
         if not union:
             return 0.0
         return len(left & right) / len(union)
+
+    @staticmethod
+    def _looks_like_new_value_request(text: str) -> bool:
+        compact = " ".join(str(text or "").strip().split())
+        if not compact:
+            return False
+        if _NEW_VALUE_REQUEST_RE.search(compact):
+            return True
+        if compact.endswith("?") and _CLARIFYING_QUESTION_START_RE.search(compact):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_social_reply(text: str) -> bool:
+        compact = " ".join(str(text or "").strip().split())
+        if not compact:
+            return False
+        if compact.startswith("::reaction::"):
+            return True
+        if compact.endswith("?") and _CLARIFYING_QUESTION_START_RE.search(compact):
+            return False
+        if _BANTER_MARKER_RE.search(compact):
+            return True
+        if len(compact) > 180:
+            return False
+        if re.search(r"https?://|\b\d+(?:[.,]\d+)?\s*(?:%|usd|eur|mrd|billion|million)\b", compact, re.IGNORECASE):
+            return False
+        return not _NEW_VALUE_REQUEST_RE.search(compact)
+
+    @staticmethod
+    def _should_hold_back_after_social_reply(
+        *,
+        session_messages: list[dict[str, Any]],
+        content: str,
+        metadata: dict[str, object],
+        is_owner: bool = False,
+        sender_id: str | None = None,
+    ) -> bool:
+        if is_owner:
+            return False
+        if not bool(metadata.get("is_group", False)):
+            return False
+        if not (bool(metadata.get("reply_to_bot", False)) or bool(metadata.get("mentioned_bot", False))):
+            return False
+        if LLMResponder._looks_like_new_value_request(content):
+            return False
+
+        last_assistant_idx: int | None = None
+        for index in range(len(session_messages) - 1, -1, -1):
+            if str(session_messages[index].get("role") or "") == "assistant":
+                last_assistant_idx = index
+                break
+        if last_assistant_idx is None:
+            return False
+
+        last_assistant = str(session_messages[last_assistant_idx].get("content") or "").strip()
+        if not LLMResponder._looks_like_social_reply(last_assistant):
+            return False
+
+        last_assistant_ts = LLMResponder._parse_session_timestamp(
+            session_messages[last_assistant_idx].get("timestamp")
+        )
+        if last_assistant_ts is not None:
+            now = datetime.now(last_assistant_ts.tzinfo) if last_assistant_ts.tzinfo else datetime.now()
+            if (now - last_assistant_ts) > timedelta(minutes=10):
+                return False
+
+        prior_user_sender: str | None = None
+        for index in range(last_assistant_idx - 1, -1, -1):
+            row = session_messages[index]
+            if str(row.get("role") or "") != "user":
+                continue
+            sender = row.get("sender_id")
+            prior_user_sender = str(sender).strip() if sender else None
+            break
+        current_sender = (sender_id or "").strip()
+        if not (prior_user_sender and current_sender and prior_user_sender == current_sender):
+            return False
+
+        return True
+
+    @staticmethod
+    def _parse_session_timestamp(value: object) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _normalize_social_question_ending(text: str, metadata: dict[str, object]) -> str:
+        compact = str(text or "").rstrip()
+        if not compact or not bool(metadata.get("is_group", False)):
+            return compact
+        if not compact.endswith("?"):
+            return compact
+        sentence = _last_sentence(compact)
+        if _CLARIFYING_QUESTION_START_RE.search(sentence):
+            return compact
+        return compact[:-1].rstrip() + "."
 
     @staticmethod
     def _is_probably_german(text: str) -> bool:
@@ -1008,7 +1167,7 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
-    ) -> str:
+    ) -> str | None:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
@@ -1055,7 +1214,7 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
-    ) -> str:
+    ) -> str | None:
         # Handle owner approve/deny commands
         if is_owner and channel == "whatsapp":
             approval_response = await self._handle_approve_command(channel, sender_id or "", content)
@@ -1079,7 +1238,7 @@ class LLMResponder(ResponderPort):
 
         # Save session immediately on first message (even if no response yet)
         if not session.messages:
-            session.add_message("user", content)
+            session.add_message("user", content, sender_id=sender_id)
             self.sessions.save(session)
             # Track that we've already added the user message to avoid duplication
             _user_message_already_added = True
@@ -1101,6 +1260,27 @@ class LLMResponder(ResponderPort):
                 )
             except Exception as e:
                 logger.warning("memory wal pre-write failed: {}", e)
+
+        if self._should_hold_back_after_social_reply(
+            session_messages=session.messages,
+            content=content,
+            metadata=metadata,
+            is_owner=is_owner,
+            sender_id=sender_id,
+        ):
+            if not _user_message_already_added:
+                session.add_message("user", content, sender_id=sender_id)
+            self.sessions.save(session)
+            self._metric("social_holdback")
+            logger.info(
+                "social_holdback fired channel={} chat={} sender={} content_preview={!r}",
+                channel,
+                chat_id,
+                sender_id,
+                content[:80],
+            )
+            self._current_trace = None
+            return None
 
         owner_raw_voice_reply = await self._maybe_handle_owner_raw_voice_command(
             channel=channel,
@@ -1182,6 +1362,7 @@ class LLMResponder(ResponderPort):
                 )
 
                 self._current_session = session
+                resolved_profile = self._profile_for_name(model_profile)
                 final_content = await self._chat_loop(
                     messages=messages,
                     allowed_tools=allowed_tools,
@@ -1192,11 +1373,25 @@ class LLMResponder(ResponderPort):
                         "session_key": session_key,
                     },
                     is_owner=is_owner,
-                    model=self._model_for_profile(model_profile),
-                    reasoning=self._reasoning_for_profile(model_profile),
+                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
+                    provider=self._provider_for_profile(resolved_profile),
+                    reasoning=(
+                        getattr(resolved_profile, "reasoning", None)
+                        if isinstance(getattr(resolved_profile, "reasoning", None), dict)
+                        else None
+                    ),
                     trace=trace,
                 )
                 self._current_session = None
+
+        if final_content is None:
+            if not _user_message_already_added:
+                session.add_message("user", content, sender_id=sender_id)
+            self.sessions.save(session)
+            self._current_trace = None
+            return None
+
+        final_content = self._normalize_social_question_ending(final_content, metadata)
 
         if self.memory is not None:
             try:
@@ -1258,10 +1453,10 @@ class LLMResponder(ResponderPort):
         ):
             metadata["voice_reply_expected"] = True
             metadata["voice_reply_max_sentences"] = int(
-                getattr(decision, "voice_output_max_sentences", 2) or 2
+                getattr(decision, "voice_output_max_sentences", 3) or 3
             )
             metadata["voice_reply_max_chars"] = int(
-                getattr(decision, "voice_output_max_chars", 150) or 150
+                getattr(decision, "voice_output_max_chars", 500) or 500
             )
         # Inject contacts roster for group chats with disclosure enabled
         if (
@@ -1332,7 +1527,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_use_llm_message=False,
             is_owner=is_owner,
             model_profile=model_profile,
-        )
+        ) or ""
 
     async def aclose(self) -> None:
         exec_tool = self.tools.get("exec")

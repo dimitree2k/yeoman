@@ -8,6 +8,16 @@ from typing import Any, Awaitable, Callable
 from yeoman_gateway.agent.tools.base import Tool
 
 
+def _normalize_whatsapp_chat_id(chat_id: str) -> str:
+    token = str(chat_id or "").strip()
+    if not token or "@" in token:
+        return token
+    phone = token.removeprefix("+")
+    if phone.isdigit():
+        return f"{phone}@s.whatsapp.net"
+    return token
+
+
 @dataclass(frozen=True, slots=True)
 class VoiceSendRequest:
     """Typed request envelope for voice sending callbacks."""
@@ -161,6 +171,8 @@ class SendVoiceTool(Tool):
 
         if not resolved_channel or not resolved_chat_id:
             return "Error: No target channel/chat specified"
+        if resolved_channel == "whatsapp":
+            resolved_chat_id = _normalize_whatsapp_chat_id(resolved_chat_id)
         if not self._send_callback:
             return "Error: Voice sending is not configured"
 

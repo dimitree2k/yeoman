@@ -84,6 +84,7 @@ def memory_notes_status(
 ) -> None:
     """Show effective background memory-notes settings for one chat."""
     from yeoman_shared.config.loader import load_config
+
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.policy.loader import load_policy
 
@@ -196,6 +197,41 @@ def memory_status() -> None:
     for scope_name, count in sorted((stats.get("by_scope") or {}).items()):
         scope_table.add_row(str(scope_name), str(count))
     console.print(scope_table)
+
+
+@memory_app.command("taste-status")
+def memory_taste_status(
+    channel: str = typer.Option(..., "--channel", help="Channel for chat taste"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Chat id for chat taste"),
+    limit: int = typer.Option(5, "--limit", "-n", min=1, max=50),
+) -> None:
+    """Show learned proactive speakup taste for one chat."""
+    with _memory_service_context() as service:
+        hits = service.learned_chat_taste(channel=channel, chat_id=chat_id, limit=limit)
+
+    console.print("[bold]Learned Chat Taste[/bold]")
+    console.print(f"channel: {channel}")
+    console.print(f"chat_id: {chat_id}")
+    if not hits:
+        console.print("No learned proactive taste patterns.")
+        return
+
+    table = Table(title="Taste Patterns")
+    table.add_column("Score", justify="right")
+    table.add_column("Confidence", justify="right")
+    table.add_column("Updated")
+    table.add_column("Pattern")
+    for hit in hits:
+        content = " ".join(hit.entry.content.split())
+        if len(content) > 160:
+            content = content[:157] + "..."
+        table.add_row(
+            f"{hit.final_score:.2f}",
+            f"{hit.entry.confidence:.2f}",
+            hit.entry.updated_at[:19],
+            content,
+        )
+    console.print(table)
 
 
 @memory_app.command("search")

@@ -567,6 +567,40 @@ class MemoryService:
         )
         return self._rank_hits(lexical_hits)
 
+    def recent_chat_preferences(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        limit: int = 5,
+        content_prefix: str | None = None,
+    ) -> list[MemoryHit]:
+        """Return recent chat-scoped preference memories without requiring a search query."""
+        hits = self.store.list_recent(
+            workspace_id=self.workspace_id,
+            scope_keys=[self.chat_scope_key(channel, chat_id)],
+            sectors={"semantic"},
+            kinds={"preference"},
+            content_prefix=content_prefix,
+            limit=max(1, int(limit)),
+        )
+        return self._rank_hits(hits)
+
+    def learned_chat_taste(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        limit: int = 5,
+    ) -> list[MemoryHit]:
+        """Return tactical proactive speakup taste learned for one chat."""
+        return self.recent_chat_preferences(
+            channel=channel,
+            chat_id=chat_id,
+            limit=limit,
+            content_prefix="Proactive speakup taste pattern:",
+        )
+
     def _rank_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:
         if not hits:
             return hits

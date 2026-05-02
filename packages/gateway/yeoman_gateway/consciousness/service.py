@@ -68,6 +68,12 @@ class ConsciousnessService:
     ) -> dict[str, object]:
         if not self._config.consciousness.enabled:
             return {"status": "disabled"}
+        logger.info(
+            "consciousness tick start trigger={} channel={} chat={}",
+            trigger,
+            target_channel or "*",
+            target_chat_id or "*",
+        )
         async with self._tick_lock:
             result = dict(
                 await self._agent.run_once(
@@ -80,6 +86,14 @@ class ConsciousnessService:
                 result["outcomes"] = await self._outcome_enricher.run_once()
             if self._taste_distiller is not None and self._speakup_log is not None:
                 result["taste"] = await self._run_taste_distillation()
+            logger.info(
+                "consciousness tick end trigger={} channel={} chat={} status={} reason={}",
+                trigger,
+                target_channel or "*",
+                target_chat_id or "*",
+                result.get("status"),
+                result.get("reason"),
+            )
             return result
 
     async def _run_taste_distillation(self) -> list[dict[str, Any]]:

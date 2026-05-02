@@ -168,6 +168,38 @@ class ConsciousnessTools:
             rendered.append({"content": str(content)})
         return {"status": "ok", "hits": rendered}
 
+    async def read_learned_chat_taste(
+        self,
+        chat_id: str,
+        limit: int = 5,
+        *,
+        channel: str | None = None,
+    ) -> dict[str, object]:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if eligible == "ambiguous_chat_id":
+            return {"status": "rejected", "reason": "ambiguous_chat_id", "patterns": []}
+        if eligible is None:
+            return {"status": "rejected", "reason": "chat_not_eligible", "patterns": []}
+        if self.memory is None or not hasattr(self.memory, "learned_chat_taste"):
+            return {"status": "ok", "patterns": []}
+        hits = self.memory.learned_chat_taste(
+            channel=eligible.channel,
+            chat_id=eligible.chat_id,
+            limit=max(1, min(int(limit), 10)),
+        )
+        patterns: list[dict[str, object]] = []
+        for hit in hits:
+            entry = getattr(hit, "entry", None)
+            content = getattr(entry, "content", str(hit))
+            patterns.append(
+                {
+                    "content": str(content),
+                    "confidence": getattr(entry, "confidence", None),
+                    "updated_at": getattr(entry, "updated_at", None),
+                }
+            )
+        return {"status": "ok", "patterns": patterns}
+
     async def read_speakup_history(
         self,
         chat_id: str,

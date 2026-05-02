@@ -9,6 +9,7 @@ from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import Config
+
     from yeoman_gateway.providers.base import LLMProvider
 
 
@@ -18,9 +19,11 @@ class ProviderFactory:
 
     config: "Config"
 
-    def create_chat_provider(self, model: str) -> "LLMProvider":
+    def create_chat_provider(
+        self, model: str, provider_name: str | None = None
+    ) -> "LLMProvider":
         """Create a provider bound to the supplied model route."""
-        provider_cfg = self.config.get_provider(model)
+        provider_cfg = self.config.get_provider(model, provider_name=provider_name)
         api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else None
         api_base = provider_cfg.api_base if provider_cfg else None
         extra_headers = provider_cfg.extra_headers if provider_cfg else None

@@ -31,6 +31,13 @@ if TYPE_CHECKING:
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
 # Matches text followed by a reaction suffix: "some text\n\n::reaction::emoji"
 _REACTION_SUFFIX_RE = re.compile(r"^([\s\S]+?)\n+::reaction::([^\n]+?)\s*$")
+_TRACEBACK_RE = re.compile(r"(?im)^\s*traceback \(most recent call last\):")
+_STACK_FRAME_RE = re.compile(r'(?im)^\s*File "[^"]+", line \d+')
+_LOG_LINE_RE = re.compile(
+    r"(?im)^\s*(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|"
+    r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b)"
+)
+_VOICE_HARD_MAX_CHARS = 500
 
 
 def _normalize_whatsapp_jid(value: str) -> str:
@@ -70,6 +77,28 @@ def _collect_whatsapp_mention_candidates(event: "InboundEvent") -> list[str]:
         candidates.append(normalized)
 
     return candidates
+
+
+def _is_unsuitable_for_voice(text: str) -> bool:
+    """Return True for replies that should stay text instead of becoming TTS."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return True
+
+    if len(cleaned) > _VOICE_HARD_MAX_CHARS:
+        return True
+
+    if "```" in cleaned or _TRACEBACK_RE.search(cleaned) or _STACK_FRAME_RE.search(cleaned):
+        return True
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if len(lines) >= 4:
+        log_lines = sum(1 for line in lines if _LOG_LINE_RE.match(line))
+        jsonish_lines = sum(1 for line in lines if line.startswith(("{", "}", "[", "]")))
+        if log_lines >= 2 or jsonish_lines >= 3:
+            return True
+
+    return False
 
 
 class OutboundMiddleware:
@@ -278,23 +307,21 @@ class OutboundMiddleware:
             return None
 
         voice = str(getattr(decision, "voice_output_voice", "") or "").strip() or "alloy"
-        max_sentences = int(getattr(decision, "voice_output_max_sentences", 2) or 2)
-        max_chars = int(getattr(decision, "voice_output_max_chars", 150) or 150)
 
         from yeoman_gateway.media.tts import (
             strip_markdown_for_tts,
-            truncate_for_voice,
             write_tts_audio_file,
         )
 
         plain = strip_markdown_for_tts(reply)
-        limited = truncate_for_voice(plain, max_sentences=max_sentences, max_chars=max_chars)
-        if not limited:
+        if _is_unsuitable_for_voice(reply):
+            return None
+        if not plain:
             return None
 
         try:
             audio, tts_error = await self._tts.synthesize_with_status(
-                limited, profile=profile, voice=voice, format=fmt,
+                plain, profile=profile, voice=voice, format=fmt,
             )
         except Exception:
             self._append_owner_alert(

@@ -10,8 +10,9 @@ from array import array
 from datetime import UTC, datetime
 from pathlib import Path
 
-from yeoman_gateway.memory.models import MemoryEntry, MemoryHit, MemorySector
 from yeoman_shared.utils.helpers import ensure_dir
+
+from yeoman_gateway.memory.models import MemoryEntry, MemoryHit, MemorySector
 
 
 class MemoryStore:
@@ -464,6 +465,60 @@ class MemoryStore:
                 self._conn.execute(
                     f"UPDATE memory2_nodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
                     (now_iso, *hit_ids),
+                )
+                self._conn.commit()
+            return hits
+
+    def list_recent(
+        self,
+        *,
+        workspace_id: str,
+        scope_keys: list[str],
+        sectors: set[MemorySector] | None = None,
+        kinds: set[str] | None = None,
+        content_prefix: str | None = None,
+        limit: int = 12,
+    ) -> list[MemoryHit]:
+        """Return recent active memories for already-known scopes without lexical search."""
+        if not scope_keys:
+            return []
+        scope_placeholders = ",".join(["?"] * len(scope_keys))
+        where = [
+            "workspace_id = ?",
+            "is_deleted = 0",
+            f"scope_key IN ({scope_placeholders})",
+        ]
+        params: list[object] = [workspace_id, *scope_keys]
+        if sectors:
+            sector_values = sorted(sectors)
+            sector_placeholders = ",".join(["?"] * len(sector_values))
+            where.append(f"sector IN ({sector_placeholders})")
+            params.extend(sector_values)
+        if kinds:
+            kind_values = sorted(kinds)
+            kind_placeholders = ",".join(["?"] * len(kind_values))
+            where.append(f"kind IN ({kind_placeholders})")
+            params.extend(kind_values)
+        if content_prefix:
+            where.append("content LIKE ?")
+            params.append(f"{content_prefix}%")
+        sql = (
+            "SELECT * "
+            "FROM memory2_nodes "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY updated_at DESC "
+            "LIMIT ?"
+        )
+
+        with self._lock:
+            rows = self._conn.execute(sql, (*params, max(1, int(limit)))).fetchall()
+            hits = [MemoryHit(entry=self._row_to_entry(row)) for row in rows]
+            if hits:
+                now_iso = datetime.now(UTC).isoformat()
+                placeholders = ",".join(["?"] * len(hits))
+                self._conn.execute(
+                    f"UPDATE memory2_nodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
+                    (now_iso, *(hit.entry.id for hit in hits)),
                 )
                 self._conn.commit()
             return hits

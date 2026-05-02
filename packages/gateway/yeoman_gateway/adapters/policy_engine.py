@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
-
 from yeoman_shared.config.loader import load_config
+from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
+
 from yeoman_gateway.core.admin_commands import (
     AdminCommandContext,
     AdminCommandHandler,
@@ -48,7 +49,6 @@ from yeoman_gateway.policy.schema import (
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
 )
-from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
 
 if TYPE_CHECKING:
     from yeoman_gateway.session.manager import SessionManager
@@ -481,8 +481,8 @@ class EnginePolicyAdapter(PolicyPort):
                 voice_output_tts_route="tts.speak",
                 voice_output_voice="alloy",
                 voice_output_format="opus",
-                voice_output_max_sentences=2,
-                voice_output_max_chars=150,
+                voice_output_max_sentences=3,
+                voice_output_max_chars=500,
                 talkative_cooldown_enabled=False,
                 talkative_cooldown_streak_threshold=7,
                 talkative_cooldown_topic_overlap_threshold=0.34,
@@ -501,8 +501,8 @@ class EnginePolicyAdapter(PolicyPort):
         voice_output_tts_route = "tts.speak"
         voice_output_voice = "alloy"
         voice_output_format = "opus"
-        voice_output_max_sentences = 2
-        voice_output_max_chars = 150
+        voice_output_max_sentences = 3
+        voice_output_max_chars = 500
         talkative_cooldown_enabled = False
         talkative_cooldown_streak_threshold = 7
         talkative_cooldown_topic_overlap_threshold = 0.34

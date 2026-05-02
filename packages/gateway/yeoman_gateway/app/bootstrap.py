@@ -231,6 +231,7 @@ class GatewayRuntime:
     bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
+    lull_observer: object | None = None
 
     async def run(self) -> None:
         tracing.init()
@@ -239,6 +240,8 @@ class GatewayRuntime:
             await self.heartbeat.start()
             if self.consciousness is not None:
                 await self.consciousness.start()
+            if self.lull_observer is not None and hasattr(self.lull_observer, "start"):
+                await self.lull_observer.start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
             tasks = [
@@ -252,6 +255,8 @@ class GatewayRuntime:
             if self.gateway_socket:
                 await self.gateway_socket.stop()
             self.heartbeat.stop()
+            if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
+                self.lull_observer.stop()
             if self.consciousness is not None:
                 self.consciousness.stop()
             self.cron.stop()
@@ -409,6 +414,7 @@ def build_gateway_runtime(
         file_access_resolver=file_access_resolver,
         group_resolver=policy_adapter.resolve_whatsapp_group,
         model_router=model_router,
+        routed_provider_factory=provider_factory.create_chat_provider,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
@@ -745,9 +751,11 @@ def build_gateway_runtime(
     )
 
     consciousness_service = None
+    lull_observer = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
         from yeoman_gateway.consciousness.burst import BurstObserver
+        from yeoman_gateway.consciousness.lull import LullObserver
         from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
         from yeoman_gateway.consciousness.service import ConsciousnessService
         from yeoman_gateway.consciousness.taste import TasteDistiller
@@ -768,7 +776,7 @@ def build_gateway_runtime(
             profile = model_router.resolve(route)
             if not profile.model:
                 raise RuntimeError(f"Consciousness route {route!r} has no model")
-            routed_provider = provider_factory.create_chat_provider(profile.model)
+            routed_provider = provider_factory.create_chat_provider(profile.model, profile.provider)
             response = await routed_provider.chat(
                 [{"role": "user", "content": prompt}],
                 tools=[],
@@ -815,6 +823,19 @@ def build_gateway_runtime(
         )
         bus.subscribe_event("InboundObservedEvent", burst_observer.handle)
 
+        if config.consciousness.lull_enabled:
+            lull_observer = LullObserver(
+                config=config,
+                state_path=consciousness_data_dir / "lull_state.json",
+                on_lull=lambda channel, chat_id: consciousness_service.tick_once(
+                    trigger="lull",
+                    target_channel=channel,
+                    target_chat_id=chat_id,
+                ),
+                is_eligible=consciousness_tools.is_chat_eligible,
+            )
+            bus.subscribe_event("InboundObservedEvent", lull_observer.handle)
+
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -828,4 +849,5 @@ def build_gateway_runtime(
         bus=bus,
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
+        lull_observer=lull_observer,
     )

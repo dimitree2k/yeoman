@@ -32,6 +32,12 @@ class ConsciousnessAgent:
         target_chat_id: str | None = None,
     ) -> dict[str, object]:
         self._tools.begin_run(trigger=trigger)
+        logger.info(
+            "consciousness agent run_once trigger={} target_channel={} target_chat={}",
+            trigger,
+            target_channel or "*",
+            target_chat_id or "*",
+        )
         eligible = await self._tools.read_eligible_chats()
         if target_channel:
             eligible = [
@@ -119,12 +125,24 @@ class ConsciousnessAgent:
 
         reply_to_raw = decision.get("reply_to_message_id")
         reply_to = str(reply_to_raw).strip() if reply_to_raw else None
+        action_type = str(decision.get("action_type") or "observation")
+        confidence = float(decision.get("confidence") or 0.0)
+        logger.info(
+            "consciousness agent decision trigger={} channel={} chat={} action={} "
+            "confidence={:.2f} reply_to={}",
+            trigger,
+            decision_channel,
+            decision_chat_id,
+            action_type,
+            confidence,
+            reply_to or "-",
+        )
         proposal = await self._tools.propose_speakup(
             channel=decision_channel,
             chat_id=decision_chat_id,
             message=message,
-            action_type=str(decision.get("action_type") or "observation"),
-            confidence=float(decision.get("confidence") or 0.0),
+            action_type=action_type,
+            confidence=confidence,
             reply_to_message_id=reply_to or None,
         )
         if proposal.get("status") != "proposed":
@@ -150,7 +168,17 @@ class ConsciousnessAgent:
                 enriched["daily_remaining"] = usage["daily_remaining"]
             enriched_eligible.append(enriched)
         window = await self._tools.read_chat_window(chat_id, n=20, channel=channel)
-        memory = await self._tools.search_memory("", chat_id, limit=5, channel=channel)
+        memory_query = self._memory_query_from_window(window)
+        memory = (
+            await self._tools.search_memory(memory_query, chat_id, limit=5, channel=channel)
+            if memory_query
+            else {"status": "ok", "hits": []}
+        )
+        learned_taste = await self._tools.read_learned_chat_taste(
+            chat_id,
+            limit=5,
+            channel=channel,
+        )
         history = await self._tools.read_speakup_history(chat_id, n=10, channel=channel)
         persona_payload = await self._tools.read_persona_for_chat(chat_id, channel=channel)
         persona_text = (
@@ -194,10 +222,25 @@ class ConsciousnessAgent:
                 "eligible_chats": enriched_eligible,
                 "chat_window": window,
                 "memory": memory,
+                "learned_taste": learned_taste,
                 "speakup_history": history,
             },
             default=str,
         )
+
+    @staticmethod
+    def _memory_query_from_window(window: dict[str, object]) -> str:
+        messages = window.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        snippets: list[str] = []
+        for row in messages[:5]:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or "").strip()
+            if text:
+                snippets.append(text)
+        return " ".join(snippets).strip()
 
     @staticmethod
     def _parse_decision(raw: str | dict[str, Any]) -> dict[str, Any]:

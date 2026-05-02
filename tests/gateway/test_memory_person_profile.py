@@ -4,11 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
-from yeoman_shared.config.schema import MemoryAclConfig, MemoryConfig
 from yeoman_gateway.memory.extractor import ExtractedCandidate
 from yeoman_gateway.memory.service import MemoryService
+from yeoman_shared.config.schema import MemoryAclConfig, MemoryConfig
 
 
 def _service(tmp_path: Path) -> MemoryService:
@@ -31,6 +29,48 @@ def _service_with_contact(tmp_path: Path, jid: str, contact_id: str) -> MemorySe
 class TestContactScopeKey:
     def test_contact_scope_key_format(self) -> None:
         assert MemoryService.contact_scope_key("abc-123") == "contact:abc-123"
+
+
+class TestLearnedChatTaste:
+    def test_learned_chat_taste_returns_recent_proactive_patterns(self, tmp_path: Path) -> None:
+        svc = _service(tmp_path)
+        svc.record_manual(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=None,
+            scope_type="chat",
+            kind="preference",
+            text="Proactive speakup taste pattern: short numeric takes work.",
+            importance=0.75,
+            confidence=0.82,
+        )
+        svc.record_manual(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=None,
+            scope_type="chat",
+            kind="preference",
+            text="Ordinary chat preference, not tactical taste.",
+            importance=0.75,
+            confidence=0.7,
+        )
+        svc.record_manual(
+            channel="whatsapp",
+            chat_id="group-b",
+            sender_id=None,
+            scope_type="chat",
+            kind="preference",
+            text="Proactive speakup taste pattern: another chat only.",
+            importance=0.75,
+            confidence=0.9,
+        )
+
+        hits = svc.learned_chat_taste(channel="whatsapp", chat_id="group-a", limit=5)
+
+        assert [hit.entry.content for hit in hits] == [
+            "Proactive speakup taste pattern: short numeric takes work."
+        ]
+        assert hits[0].entry.confidence == 0.82
 
 
 class TestPersistCandidatePersonProfile:

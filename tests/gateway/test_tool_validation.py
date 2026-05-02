@@ -201,6 +201,22 @@ async def test_send_voice_tool_resolves_group_and_forwards_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_voice_tool_normalizes_whatsapp_phone_chat_id() -> None:
+    calls: list[VoiceSendRequest] = []
+
+    async def _send_voice(req: VoiceSendRequest) -> str:
+        calls.append(req)
+        return f"Voice message sent to {req.channel}:{req.chat_id}"
+
+    tool = SendVoiceTool(send_callback=_send_voice, default_channel="whatsapp")
+    result = await tool.execute(content="Kurzes Update", chat_id="491757070305")
+
+    assert result == "Voice message sent to whatsapp:491757070305@s.whatsapp.net"
+    assert len(calls) == 1
+    assert calls[0].chat_id == "491757070305@s.whatsapp.net"
+
+
+@pytest.mark.asyncio
 async def test_send_voice_tool_rejects_non_whatsapp_group_target() -> None:
     tool = SendVoiceTool(send_callback=None)
     result = await tool.execute(content="Hi", channel="telegram", group="Finanzgruppe")
@@ -598,8 +614,9 @@ class _CountingProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning: dict[str, object] | None = None,
     ) -> LLMResponse:
-        del messages, tools, model, max_tokens, temperature
+        del messages, tools, model, max_tokens, temperature, reasoning
         self.calls += 1
         return LLMResponse(content="llm-called")
 
@@ -628,6 +645,86 @@ class _FakeTTS:
         del profile, voice, format
         self.last_text = text
         return b"voice-bytes", None
+
+
+class _VoiceToolProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, object] | None = None,
+    ) -> LLMResponse:
+        del messages, tools, model, max_tokens, temperature, reasoning
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="voice1",
+                        name="send_voice",
+                        arguments={"content": "Kurze Sprachnachricht"},
+                    )
+                ],
+            )
+        return LLMResponse(content="Gesendet.")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+class _ProfileObject:
+    def __init__(self, model: str, provider: str | None = None) -> None:
+        self.model = model
+        self.provider = provider
+        self.reasoning = None
+
+
+class _ProfileRouter:
+    def resolve_by_profile(self, profile_name: str) -> _ProfileObject:
+        assert profile_name == "deepseek_v4_pro"
+        return _ProfileObject("deepseek-v4-pro", "deepseek")
+
+
+class _RoutedProvider(LLMProvider):
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, object] | None = None,
+    ) -> LLMResponse:
+        del messages, tools, model, max_tokens, temperature, reasoning
+        return LLMResponse(content="direct deepseek")
+
+    def get_default_model(self) -> str:
+        return "deepseek-v4-pro"
+
+
+class _BaseProvider(LLMProvider):
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, object] | None = None,
+    ) -> LLMResponse:
+        del messages, tools, model, max_tokens, temperature, reasoning
+        return LLMResponse(content="base provider")
+
+    def get_default_model(self) -> str:
+        return "openrouter/default"
 
 
 @pytest.mark.asyncio
@@ -726,6 +823,83 @@ async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
     assert outbound.content == ""
     assert len(outbound.media) == 1
     assert Path(outbound.media[0]).exists()
+
+
+@pytest.mark.asyncio
+async def test_send_voice_tool_call_does_not_emit_text_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bus = MessageBus()
+    provider = _VoiceToolProvider()
+    tts = _FakeTTS()
+
+    responder = LLMResponder(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        model_router=_FakeModelRouter(),  # type: ignore[arg-type]
+        tts=tts,  # type: ignore[arg-type]
+        whatsapp_tts_outgoing_dir=tmp_path,
+    )
+
+    out = await responder.process_direct(
+        "schick eine Sprachnachricht",
+        session_key="whatsapp:34596062240904@lid",
+        channel="whatsapp",
+        chat_id="34596062240904@lid",
+        allowed_tools={"send_voice"},
+        is_owner=True,
+    )
+    await responder.aclose()
+
+    assert out == ""
+    assert provider.calls == 1
+    assert tts.last_text == "Kurze Sprachnachricht."
+    outbound = await bus.consume_outbound()
+    assert outbound.channel == "whatsapp"
+    assert outbound.chat_id == "34596062240904@lid"
+    assert outbound.content == ""
+    assert len(outbound.media) == 1
+
+
+@pytest.mark.asyncio
+async def test_model_profile_uses_explicit_provider_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    factory_calls: list[tuple[str, str | None]] = []
+
+    def _factory(model: str, provider_name: str | None = None) -> LLMProvider:
+        factory_calls.append((model, provider_name))
+        return _RoutedProvider()
+
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=_BaseProvider(),
+        workspace=workspace,
+        model_router=_ProfileRouter(),  # type: ignore[arg-type]
+        routed_provider_factory=_factory,
+    )
+
+    out = await responder.process_direct(
+        "hi",
+        session_key="whatsapp:34596062240904@lid",
+        channel="whatsapp",
+        chat_id="34596062240904@lid",
+        allowed_tools=set(),
+        model_profile="deepseekV4Pro",
+    )
+    await responder.aclose()
+
+    assert out == "direct deepseek"
+    assert factory_calls == [("deepseek-v4-pro", "deepseek")]
 
 
 @pytest.mark.asyncio

@@ -511,6 +511,15 @@ class ConsciousnessConfig(BaseModel):
     burst_enabled: bool = Field(default=False, alias="burstEnabled")
     burst_threshold_messages: int = Field(default=8, alias="burstThresholdMessages", ge=2)
     burst_window_minutes: int = Field(default=15, alias="burstWindowMinutes", ge=1)
+    lull_enabled: bool = Field(default=False, alias="lullEnabled")
+    lull_silence_minutes: int = Field(default=25, alias="lullSilenceMinutes", ge=1)
+    lull_activity_window_minutes: int = Field(
+        default=120, alias="lullActivityWindowMinutes", ge=1
+    )
+    lull_min_recent_activity: int = Field(default=4, alias="lullMinRecentActivity", ge=1)
+    lull_check_interval_seconds: int = Field(
+        default=60, alias="lullCheckIntervalSeconds", ge=10
+    )
 
 
 class Config(BaseSettings):

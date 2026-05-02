@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -302,6 +303,58 @@ async def test_burst_tick_keeps_group_preview_approval_rail(tmp_path: Path) -> N
         chat_id="group@g.us",
         now=datetime(2026, 4, 26, 12, 0, tzinfo=UTC),
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_respects_configurable_daily_cap(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    cfg = _config(defaultDailyCap=3)
+    state_path = tmp_path / "burst.json"
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    observer = BurstObserver(
+        config=cfg,
+        state_path=state_path,
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+
+    for fire in range(4):
+        offset = fire * 30
+        for index in range(3):
+            await observer.handle(_event(at=base + timedelta(minutes=offset + index)))
+
+    assert calls == [("whatsapp", "group@g.us")] * 3
+
+    saved = json.loads(state_path.read_text())
+    fires_today = saved["fires_today"]["whatsapp:group@g.us"]
+    assert fires_today["count"] == 3
+    assert fires_today["date"] == "2026-04-26"
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_migrates_legacy_state_format(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    state_path = tmp_path / "burst.json"
+    state_path.write_text(
+        json.dumps({"last_fired_day": {"whatsapp:group@g.us": "2026-04-26"}})
+    )
+    cfg = _config(defaultDailyCap=2)
+    base = datetime(2026, 4, 26, 12, 30, tzinfo=UTC)
+
+    observer = BurstObserver(
+        config=cfg,
+        state_path=state_path,
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+
+    for index in range(3):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
+
+    assert calls == [("whatsapp", "group@g.us")]
+    saved = json.loads(state_path.read_text())
+    assert saved["fires_today"]["whatsapp:group@g.us"]["count"] == 2
 
 
 @pytest.mark.asyncio
