@@ -489,6 +489,50 @@ async def test_persona_loaded_when_persona_file_set(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cron_prompt_window_uses_recent_context_not_seven_day_backfill(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(lullActivityWindowMinutes=120)
+    now = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    tools = _tools(tmp_path, config=cfg)
+    tools._now = lambda: now
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="owner@s.whatsapp.net",
+        message_id="old-market-thread",
+        participant="timo@s.whatsapp.net",
+        sender_id="timo@s.whatsapp.net",
+        text="Old market thread from days ago",
+        timestamp=int((now - timedelta(days=3)).timestamp()),
+        sender_name="Timo",
+    )
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="owner@s.whatsapp.net",
+        message_id="fresh-thread",
+        participant="robin@s.whatsapp.net",
+        sender_id="robin@s.whatsapp.net",
+        text="Fresh topic from this hour",
+        timestamp=int((now - timedelta(minutes=30)).timestamp()),
+        sender_name="Robin",
+    )
+    captured: dict[str, object] = {}
+
+    def planner(prompt: str) -> str:
+        captured.update(json.loads(prompt))
+        return json.dumps({"silence": True, "reason": "test"})
+
+    agent = ConsciousnessAgent(tools=tools, planner=planner)
+
+    result = await agent.run_once(trigger="cron")
+
+    assert result["status"] == "silent_pass"
+    messages = captured["chat_window"]["messages"]
+    assert [message["message_id"] for message in messages] == ["fresh-thread"]
+    assert "old-market-thread" not in json.dumps(captured)
+
+
+@pytest.mark.asyncio
 async def test_reply_to_message_id_validates_against_archive(tmp_path: Path) -> None:
     tools = _tools(tmp_path)
     tools.inbound_archive.record_inbound(

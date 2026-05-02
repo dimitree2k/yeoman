@@ -407,3 +407,101 @@ async def test_burst_tick_keeps_daily_cap_rail(tmp_path: Path) -> None:
 
     assert result == {"status": "rejected", "reason": "daily_cap_reached"}
     assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_burst_prompt_window_excludes_messages_outside_burst_window(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(burstWindowMinutes=10)
+    now = datetime(2026, 5, 2, 7, 2, tzinfo=UTC)
+    tools = ConsciousnessTools(
+        config=cfg,
+        policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
+        bus=MessageBus(),
+        log=SpeakupLog(tmp_path / "speakups.db"),
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=None,
+        security=_FakeSecurity(),
+        approval_store=None,
+        now=lambda: now,
+    )
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message_id="old-options",
+        participant="timo@s.whatsapp.net",
+        sender_id="timo@s.whatsapp.net",
+        text="31 Win Streak options trader from days ago",
+        timestamp=int((now - timedelta(hours=40)).timestamp()),
+        sender_name="Timo",
+    )
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message_id="fresh-magic",
+        participant="robin@s.whatsapp.net",
+        sender_id="robin@s.whatsapp.net",
+        text="Current Magic card topic",
+        timestamp=int((now - timedelta(minutes=2)).timestamp()),
+        sender_name="Robin",
+    )
+    captured: dict[str, object] = {}
+
+    async def planner(prompt: str) -> dict[str, object]:
+        captured.update(json.loads(prompt))
+        return {"silence": True, "reason": "test"}
+
+    agent = ConsciousnessAgent(tools=tools, planner=planner)
+
+    result = await agent.run_once(
+        trigger="burst",
+        target_channel="whatsapp",
+        target_chat_id="group@g.us",
+    )
+
+    assert result["status"] == "silent_pass"
+    messages = captured["chat_window"]["messages"]
+    assert [message["message_id"] for message in messages] == ["fresh-magic"]
+    assert "old-options" not in json.dumps(captured)
+    assert captured["trigger"] == "burst"
+    assert any("current burst window" in rule for rule in captured["golden_rules"])
+
+
+@pytest.mark.asyncio
+async def test_burst_rejects_stale_reply_to_message_id(tmp_path: Path) -> None:
+    cfg = _config(burstWindowMinutes=10)
+    now = datetime(2026, 5, 2, 7, 2, tzinfo=UTC)
+    tools = ConsciousnessTools(
+        config=cfg,
+        policy_engine=PolicyEngine(_policy(), workspace=tmp_path),
+        bus=MessageBus(),
+        log=SpeakupLog(tmp_path / "speakups.db"),
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=None,
+        security=_FakeSecurity(),
+        approval_store=None,
+        now=lambda: now,
+    )
+    tools.begin_run(trigger="burst")
+    tools.inbound_archive.record_inbound(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message_id="old-options",
+        participant="timo@s.whatsapp.net",
+        sender_id="timo@s.whatsapp.net",
+        text="31 Win Streak options trader from days ago",
+        timestamp=int((now - timedelta(hours=40)).timestamp()),
+        sender_name="Timo",
+    )
+
+    result = await tools.propose_speakup(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message="Options-Streaks mit 100% Winrate sind selten.",
+        action_type="observation",
+        confidence=0.95,
+        reply_to_message_id="old-options",
+    )
+
+    assert result == {"status": "rejected", "reason": "stale_reply_to_message"}

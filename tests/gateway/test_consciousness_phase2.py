@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -175,14 +175,15 @@ async def test_group_preview_queues_owner_approval_instead_of_sending_directly(t
 async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
     tools, _, _ = _tools(tmp_path, opt_in_group=True)
     archive = tools.inbound_archive
+    base = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
     for index, (timestamp, text) in enumerate(
         [
-            (1776581816, "old-1"),
-            (1776581817, "old-2"),
-            (1776581818, "old-3"),
-            (1777100000, "recent-1"),
-            (1777100001, "recent-2"),
-            (1777100002, "recent-3"),
+            (int((base - timedelta(hours=3)).timestamp()), "old-1"),
+            (int((base - timedelta(hours=3) + timedelta(seconds=1)).timestamp()), "old-2"),
+            (int((base - timedelta(hours=3) + timedelta(seconds=2)).timestamp()), "old-3"),
+            (int((base - timedelta(minutes=3)).timestamp()), "recent-1"),
+            (int((base - timedelta(minutes=2)).timestamp()), "recent-2"),
+            (int((base - timedelta(minutes=1)).timestamp()), "recent-3"),
         ]
     ):
         archive.record_inbound(

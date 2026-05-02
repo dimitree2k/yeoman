@@ -95,6 +95,44 @@ class ConsciousnessTools:
         self._trigger = trigger
         self._proposals.clear()
 
+    def current_trigger(self) -> str:
+        return self._trigger
+
+    def _chat_window_since_for_trigger(self) -> datetime:
+        now = self._now()
+        if self._trigger == "burst":
+            return now - timedelta(
+                minutes=max(1, int(self.config.consciousness.burst_window_minutes))
+            )
+        return now - timedelta(
+            minutes=max(1, int(self.config.consciousness.lull_activity_window_minutes))
+        )
+
+    @staticmethod
+    def _message_observed_at(row: dict[str, object]) -> datetime | None:
+        raw_timestamp = row.get("timestamp")
+        if raw_timestamp is not None:
+            try:
+                return datetime.fromtimestamp(float(raw_timestamp), UTC)
+            except (TypeError, ValueError, OSError):
+                pass
+        raw_created_at = str(row.get("created_at") or "").strip()
+        if not raw_created_at:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw_created_at)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _reply_to_is_fresh_for_trigger(self, row: dict[str, object]) -> bool:
+        observed_at = self._message_observed_at(row)
+        if observed_at is None:
+            return False
+        return observed_at >= self._chat_window_since_for_trigger()
+
     async def read_eligible_chats(self) -> list[dict[str, object]]:
         return [
             {
@@ -128,7 +166,7 @@ class ConsciousnessTools:
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "messages": []}
         now = self._now()
-        since = now - timedelta(days=7)
+        since = self._chat_window_since_for_trigger()
         rows = self.inbound_archive.lookup_messages_in_range(
             eligible.channel,
             eligible.chat_id,
@@ -293,6 +331,11 @@ class ConsciousnessTools:
                     eligible.channel, eligible.chat_id, candidate
                 )
                 if row is not None:
+                    if not self._reply_to_is_fresh_for_trigger(row):
+                        return {
+                            "status": "rejected",
+                            "reason": "stale_reply_to_message",
+                        }
                     validated_reply_to = candidate
 
         proposal_id = uuid.uuid4().hex

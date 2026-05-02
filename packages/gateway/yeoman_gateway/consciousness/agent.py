@@ -184,6 +184,19 @@ class ConsciousnessAgent:
         persona_text = (
             persona_payload.get("persona") if isinstance(persona_payload, dict) else None
         )
+        trigger_rules: list[str] = []
+        trigger = self._tools.current_trigger()
+        if trigger == "burst":
+            trigger_rules.append(
+                "This is an active burst. React only to the current burst window. "
+                "If there is no useful current-topic contribution, stay silent."
+            )
+        elif trigger == "lull":
+            trigger_rules.append(
+                "This is a lull after recent activity went quiet. You may start a "
+                "standalone thought, callback, or fun fact, but do not pretend an old "
+                "message is the current thread."
+            )
         return json.dumps(
             {
                 "instruction": (
@@ -194,7 +207,9 @@ class ConsciousnessAgent:
                     "than or equal to daily_cap. Treat speakup_history status 'denied' "
                     "as owner feedback; 'rejected' and 'expired' are system outcomes."
                 ),
+                "trigger": trigger,
                 "golden_rules": [
+                    *trigger_rules,
                     "Do NOT echo, paraphrase, or restate any message in chat_window. "
                     "If your draft shares a 4-word run with any existing message, rewrite "
                     "it from a different angle or stay silent.",

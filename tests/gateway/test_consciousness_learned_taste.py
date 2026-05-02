@@ -34,6 +34,9 @@ class _LearnedTasteTools:
     def begin_run(self, *, trigger: str) -> None:
         self.trigger = trigger
 
+    def current_trigger(self) -> str:
+        return getattr(self, "trigger", "cron")
+
     async def read_eligible_chats(self) -> list[dict[str, object]]:
         return [
             {
