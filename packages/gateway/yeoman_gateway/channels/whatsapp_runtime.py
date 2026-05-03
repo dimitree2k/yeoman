@@ -17,7 +17,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from loguru import logger
-
 from yeoman_shared.config.loader import get_config_path, load_config, save_config
 from yeoman_shared.utils.process import (
     is_bridge_process,

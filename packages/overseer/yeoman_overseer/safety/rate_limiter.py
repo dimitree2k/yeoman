@@ -9,7 +9,7 @@ CRITICAL_DOMAINS = frozenset({"health"})
 @dataclass
 class RateLimiter:
     actions_per_hour: int = 30
-    llm_calls_per_day: int = 20
+    llm_calls_per_day: int = 80
     _action_count: int = 0
     _llm_count: int = 0
 

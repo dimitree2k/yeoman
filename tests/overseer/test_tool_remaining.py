@@ -1,9 +1,8 @@
 import subprocess
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
+from yeoman_overseer.agent.tools import TOOL_DEFINITIONS
 from yeoman_overseer.agent.tools.check_health import execute as check_health_execute
 from yeoman_overseer.agent.tools.git_log import execute as git_log_execute
 from yeoman_overseer.agent.tools.send_alert import execute as send_alert_execute
@@ -52,6 +51,12 @@ def test_check_health_runs_disk_usage_above_end_to_end(tmp_path):
     assert "disk_usage_above" in result
 
 
+def test_check_health_tool_schema_advertises_threshold():
+    definition = next(t for t in TOOL_DEFINITIONS if t["name"] == "check_health")
+    properties = definition["input_schema"]["properties"]
+    assert properties["threshold"]["type"] == "number"
+
+
 def test_check_health_unknown_check():
     result = check_health_execute(
         {"check": "nonexistent_check", "target": "x"}, _ctx()
@@ -94,5 +99,18 @@ async def test_send_alert_calls_comms():
     comms.send = AsyncMock(return_value=None)
     ctx = _ctx(comms=comms, audit=MagicMock())
     result = await send_alert_execute({"message": "test alert"}, ctx)
-    comms.send.assert_called_once_with("test alert")
+    comms.send.assert_called_once_with("🟢 INFO test alert")
     assert "sent" in result.lower() or "ok" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_alert_audit_logs_formatted_message():
+    comms = MagicMock()
+    comms.send = AsyncMock(return_value=None)
+    audit = MagicMock()
+    ctx = _ctx(comms=comms, audit=audit)
+    await send_alert_execute(
+        {"message": "ops-source-cleanup ABORTED. Deletion skipped."}, ctx
+    )
+    entry = audit.append.call_args[0][0]
+    assert entry.target.startswith("🟡 ACTION ")

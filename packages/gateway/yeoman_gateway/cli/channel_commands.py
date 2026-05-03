@@ -59,8 +59,9 @@ def whatsapp_ensure(
     ),
 ) -> None:
     """Ensure WhatsApp runtime, bridge process and protocol health are ready."""
-    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
     config = load_config()
     runtime = WhatsAppRuntimeManager(config=config)
@@ -114,8 +115,9 @@ def whatsapp_repair_sender(
     """Repair WhatsApp decrypt issues for one sender by resetting sender/session auth artifacts."""
     import shutil
 
-    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
     raw_sender = (sender_id or "").strip()
     sender_token = raw_sender.split("@", 1)[0].split(":", 1)[0].strip()
@@ -285,8 +287,9 @@ channels_app.add_typer(bridge_app, name="bridge")
 
 
 def _bridge_runtime(port: int | None):
-    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
     from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
     config = load_config()
     runtime = WhatsAppRuntimeManager(config=config)

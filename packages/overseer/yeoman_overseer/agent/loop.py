@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from openai import OpenAI
 
 from yeoman_overseer.agent.context import build_context
-from yeoman_overseer.agent.patcher import Patcher, PatchContext
+from yeoman_overseer.agent.patcher import PatchContext, Patcher
 from yeoman_overseer.agent.tools import TOOL_DEFINITIONS, ToolContext, dispatch
 
 if TYPE_CHECKING:

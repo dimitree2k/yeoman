@@ -12,10 +12,10 @@ from pathlib import Path
 import sdnotify
 
 from yeoman_overseer.agent.budget import BudgetTracker
-from yeoman_overseer.agent.loop import AgentLoop, AgentResult, BudgetExhaustedError
+from yeoman_overseer.agent.loop import AgentLoop, BudgetExhaustedError
 from yeoman_overseer.agent.tools import ToolContext
 from yeoman_overseer.audit.git import InternalGit
-from yeoman_overseer.audit.logger import AuditLogger, AuditEntry
+from yeoman_overseer.audit.logger import AuditEntry, AuditLogger
 from yeoman_overseer.comms.cascading import CascadingComms
 from yeoman_overseer.maintenance import MaintenanceManager
 from yeoman_overseer.runbook.parser import Runbook, parse_runbook_dir
@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 class OverseerConfig:
     tick_interval_s: float = 1.0
     actions_per_hour: int = 30
-    llm_calls_per_day: int = 20
-    llm_tokens_per_day: int = 500_000
+    llm_calls_per_day: int = 80
+    llm_tokens_per_day: int = 2_000_000
     failure_threshold: int = 3
     max_quarantines: int = 3
 
@@ -233,6 +233,7 @@ class OverseerService:
     ) -> list:
         """Build notification channels from gateway config + policy."""
         import os
+
         from yeoman_overseer.comms.cascading import CommsChannel
 
         channels: list[CommsChannel] = []

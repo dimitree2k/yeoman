@@ -7,8 +7,9 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from yeoman_gateway.agent.tools.base import Tool
 from yeoman_shared.utils.process import pid_alive, read_pid_file
+
+from yeoman_gateway.agent.tools.base import Tool
 
 _TTL_SECONDS = 120  # 2 minutes
 
@@ -129,8 +130,9 @@ class OpsManageTool(Tool):
         try:
             import asyncio
 
-            from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
             from yeoman_shared.config.loader import load_config
+
+            from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
             config = load_config()
             runtime = WhatsAppRuntimeManager(config=config)

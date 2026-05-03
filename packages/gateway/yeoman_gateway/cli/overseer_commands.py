@@ -207,7 +207,6 @@ def trigger(
 ) -> None:
     """Manually trigger a runbook outside of its cron schedule."""
     from yeoman_overseer.runbook.parser import parse_runbook
-    from yeoman_overseer.trigger.checks import CheckResult
 
     runbook_dir = _data_dir() / "runbooks"
     path = runbook_dir / f"{name}.md"
@@ -278,7 +277,6 @@ def trigger(
         agent = AgentLoop(tool_ctx=tool_ctx, budget=budget, config=raw_config)
 
         typer.echo(f"Triggering {runbook.meta.name}...")
-        check_result = CheckResult(value=True, detail="manual trigger")
         try:
             result = await agent.run(runbook, {"check": True, "message": "manual trigger"})
             typer.echo(f"\n{'=' * 60}")

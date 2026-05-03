@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from yeoman_gateway.agent.tools.base import Tool
 from yeoman_shared.utils.process import pid_alive, read_pid_file
+
+from yeoman_gateway.agent.tools.base import Tool
 
 _LOGS_DIR = Path("~/.yeoman/var/logs").expanduser()
 _GATEWAY_LOG = _LOGS_DIR / "gateway.log"
@@ -582,8 +583,9 @@ class OpsTool(Tool):
 
     async def _bridge_health_check(self, timeout_s: float = 3.0) -> dict[str, Any]:
         """Delegate to WhatsAppRuntimeManager._health_check_async()."""
-        from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
         from yeoman_shared.config.loader import load_config
+
+        from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
         config = load_config()
         runtime = WhatsAppRuntimeManager(config=config)

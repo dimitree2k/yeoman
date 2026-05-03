@@ -1,7 +1,7 @@
 """Tool registry: definitions for the Anthropic API and dispatch map."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "check": {"type": "string"},
                 "target": {"type": "string"},
+                "threshold": {"type": "number"},
+                "query": {"type": "string"},
             },
             "required": ["check", "target"],
         },
@@ -181,10 +183,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 async def dispatch(name: str, args: dict[str, Any], ctx: ToolContext) -> Any:
     """Dispatch a tool call by name. Raises ValueError for unknown tools."""
     from yeoman_overseer.agent.tools import (
-        check_health, git_log, query_db,
-        query_memory, read_file, send_alert,
-        write_file, edit_file, prune_memory, run_tests, git_revert,
-        dry_run_runbook, shell,
+        check_health,
+        dry_run_runbook,
+        edit_file,
+        git_log,
+        git_revert,
+        prune_memory,
+        query_db,
+        query_memory,
+        read_file,
+        run_tests,
+        send_alert,
+        shell,
+        write_file,
     )
     handlers: dict[str, Any] = {
         # Phase 2 tools

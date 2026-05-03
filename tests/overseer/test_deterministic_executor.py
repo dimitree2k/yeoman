@@ -1,8 +1,10 @@
 """Tests for deterministic action executor."""
 from __future__ import annotations
+
 import pytest
-from yeoman_overseer.executor.deterministic import DeterministicExecutor, ActionResult
 from yeoman_overseer.comms.cascading import CascadingComms
+from yeoman_overseer.executor.deterministic import DeterministicExecutor
+
 
 class FakeCommsChannel:
     def __init__(self) -> None:
@@ -20,7 +22,7 @@ async def test_execute_alert() -> None:
     executor = DeterministicExecutor(comms=comms)
     result = await executor.execute("alert", target="owner", message="gateway down")
     assert result.success is True
-    assert ch.sent == ["gateway down"]
+    assert ch.sent == ["🔴 CRITICAL gateway down"]
 
 @pytest.mark.asyncio
 async def test_execute_restart_unknown_service() -> None:

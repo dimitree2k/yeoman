@@ -1,8 +1,8 @@
 # tests/overseer/test_agent_sandbox.py
 from __future__ import annotations
-import subprocess
+
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from yeoman_overseer.agent.sandbox import Sandbox, SandboxUnavailableError
@@ -22,7 +22,7 @@ def test_run_returns_structured_result(tmp_path):
     mock_result.returncode = 0
 
     with patch("shutil.which", return_value="/usr/bin/bwrap"), \
-         patch("subprocess.run", return_value=mock_result) as mock_run:
+         patch("subprocess.run", return_value=mock_result):
         Sandbox._bwrap = None
         result = Sandbox().run(["echo", "hello"])
 
@@ -66,6 +66,28 @@ def test_sensitive_path_masking_in_args():
     joined = " ".join(captured_args)
     assert "secrets" in joined    # --tmpfs over secrets/
     assert ".env" in joined       # --ro-bind /dev/null over .env
+
+
+def test_cleanup_paths_are_writable_inside_sandbox(tmp_path):
+    mock_result = MagicMock(stdout="", stderr="", returncode=0)
+    captured_args = []
+
+    def fake_run(args, **kwargs):
+        captured_args.extend(str(a) for a in args)
+        return mock_result
+
+    with patch("shutil.which", return_value="/usr/bin/bwrap"), \
+         patch("subprocess.run", side_effect=fake_run):
+        Sandbox._bwrap = None
+        Sandbox().run(["true"])
+
+    args = list(captured_args)
+    cache_path = str(Path.home() / ".yeoman" / "var" / "cache")
+    incoming_path = str(Path.home() / ".yeoman" / "var" / "media" / "incoming")
+
+    assert "--bind-try" in args
+    assert cache_path in args
+    assert incoming_path in args
 
 
 def test_tmpdir_cleaned_up_on_success(tmp_path):

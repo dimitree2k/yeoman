@@ -8,11 +8,11 @@ from typing import Any
 import httpx
 import websockets
 from loguru import logger
+from yeoman_shared.config.schema import DiscordConfig
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
-from yeoman_shared.config.schema import DiscordConfig
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB

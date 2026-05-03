@@ -1,8 +1,8 @@
 # tests/overseer/test_tool_shell.py
 from __future__ import annotations
-from pathlib import Path
+
 from unittest.mock import MagicMock
-import pytest
+
 from yeoman_overseer.agent.tools.shell import shell
 
 
@@ -45,12 +45,12 @@ def test_shell_audit_logged():
     assert entry.action == "shell"
 
 
-def test_shell_command_split_correctly():
+def test_shell_runs_command_through_shell():
     ctx = _ctx()
     ctx.sandbox.run.return_value = {"stdout": "", "stderr": "", "exit_code": 0}
-    shell("echo foo bar", ctx=ctx)
+    shell("echo foo bar | head -1 2>/dev/null", ctx=ctx)
     cmd = ctx.sandbox.run.call_args[0][0]
-    assert cmd == ["echo", "foo", "bar"]
+    assert cmd == ["/bin/sh", "-c", "echo foo bar | head -1 2>/dev/null"]
 
 
 def test_shell_propagates_sandbox_exception():

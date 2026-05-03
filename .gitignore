@@ -44,6 +44,7 @@ tests/gateway/*
 !tests/gateway/test_consciousness_safety.py
 !tests/gateway/test_implicit_bot_address.py
 !tests/gateway/test_memory_disclosure.py
+!tests/gateway/test_control_plane_api_hardening.py
 !tests/gateway/test_outbound_voice_soft_limits.py
 !tests/gateway/test_responder_social_holdback.py
 !tests/gateway/test_responder_textual_tool_calls.py

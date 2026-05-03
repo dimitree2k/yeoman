@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+from yeoman_shared.config.schema import ExecIsolationConfig
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.agent.tools.file_access import grants_are_active
-from yeoman_shared.config.schema import ExecIsolationConfig
 
 if TYPE_CHECKING:
     from yeoman_gateway.agent.tools.exec_isolation import ExecSandboxManager, SandboxMount

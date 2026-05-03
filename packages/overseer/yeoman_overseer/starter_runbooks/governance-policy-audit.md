@@ -20,13 +20,18 @@ Review the current policy configuration for anomalies or drift.
 
 ### Your task
 
-1. Read `~/.yeoman/policy.example.json` to understand the expected schema.
-2. Use `query_db` on the audit log to check for recent policy changes:
-   ```sql
-   SELECT runbook, action, result, ts FROM audit_entries WHERE domain = 'governance' ORDER BY ts DESC LIMIT 20
+1. Read `~/.yeoman/policy.json` to understand the current policy configuration.
+2. Check recent overseer audit entries by reading the latest dated JSONL audit
+   log in `~/.yeoman/data/overseer/audit/`:
+   ```sh
+   latest=$(ls -1 ~/.yeoman/data/overseer/audit/*.jsonl 2>/dev/null | sort | tail -1)
+   test -n "$latest" && tail -30 "$latest" || true
    ```
+   If there is no dated audit file yet, report that no audit entries are
+   available; do not alert as an error.
 3. Check for newly detected chats by reading `~/.yeoman/data/seen_chats.json`.
-4. If any chat IDs are present in seen_chats but absent from policy, flag them in an alert.
+4. If any chat IDs are present in seen_chats but absent from policy, flag them
+   in an alert. If none are missing, report that the cross-reference is clean.
 5. Summarize governance health in your final response.
 
 Do not modify policy. Observe and report only.

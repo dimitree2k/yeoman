@@ -16,8 +16,9 @@ def config_migrate_to_env(
 ) -> None:
     """Migrate API keys and tokens from config.json to .env file."""
     from yeoman_shared.config.loader import get_config_path, load_config, save_config
-    from yeoman_gateway.providers.registry import PROVIDERS
     from yeoman_shared.utils.helpers import get_data_path
+
+    from yeoman_gateway.providers.registry import PROVIDERS
 
     env_path = get_data_path() / ".env"
     if env_path.exists() and not force:

@@ -6,10 +6,10 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+from yeoman_shared.config.schema import Config
 
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
-from yeoman_shared.config.schema import Config
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:

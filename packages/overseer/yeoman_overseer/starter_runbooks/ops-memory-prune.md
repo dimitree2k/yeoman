@@ -24,13 +24,18 @@ retrieval performance high.
 
 ## Procedure
 
-1. Query current memory stats via `query_memory` to understand volume and domain
-   distribution.
-2. Prune entries older than 60 days with salience below 0.3.
-3. Send a summary alert with rows deleted and snapshot path.
+1. Query current memory stats via `query_db` on `memory/memory.db` to understand
+   sector distribution and average salience.
+2. Check how many entries would be pruned: active rows older than 60 days with
+   salience below 0.3.
+3. If the would-prune count is `0`, do not call `prune_memory`; send a summary
+   alert that reports the stats and says nothing matched the prune criteria.
+4. If the would-prune count is greater than `0`, use the `prune_memory` tool
+   with `age_days=60` and `salience_below=0.3`.
+5. Send a summary alert with rows deleted, snapshot path, and before/after counts.
 
 ## Safety
 
 - `requires_tests: false` — no source code is touched.
-- A snapshot is taken before any deletion. Recovery is always possible.
-- Do not delete entries with salience > 0.5 regardless of age.
+- The `prune_memory` tool snapshots the database before any deletion.
+- Do not delete entries with salience >= 0.3 regardless of age.

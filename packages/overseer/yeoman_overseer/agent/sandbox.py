@@ -36,6 +36,10 @@ class Sandbox:
 
         yeoman_home = Path.home() / ".yeoman"
         source_dir = source_root or (Path.home() / "Documents" / "yeoman")
+        writable_yeoman_dirs = [
+            yeoman_home / "var" / "cache",
+            yeoman_home / "var" / "media" / "incoming",
+        ]
 
         tmpdir = Path(f"/tmp/overseer-{uuid.uuid4().hex}")
         tmpdir.mkdir(mode=0o700)
@@ -52,6 +56,12 @@ class Sandbox:
             # Application read-only
             "--ro-bind", str(yeoman_home), str(yeoman_home),
             "--ro-bind", str(source_dir), str(source_dir),
+            # Allow maintenance runbooks to prune only their intended runtime dirs.
+            *[
+                arg
+                for path in writable_yeoman_dirs
+                for arg in ("--bind-try", str(path), str(path))
+            ],
             # Sensitive path masking
             "--tmpfs", str(yeoman_home / "secrets"),
             "--ro-bind", "/dev/null", str(yeoman_home / ".env"),

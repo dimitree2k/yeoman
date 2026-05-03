@@ -16,6 +16,7 @@ Security:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -67,6 +68,24 @@ def _check_auth(auth_header: str | None, expected_token: str) -> bool:
         return False
     token = auth_header[7:]  # Remove "Bearer " prefix
     return hmac.compare_digest(token, expected_token)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return whether an API bind host is restricted to loopback."""
+    normalized = (host or "").strip().lower()
+    if normalized in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _auth_token_required(api_config: APIConfig) -> bool:
+    """Require auth when a token is configured or the API is not loopback-only."""
+    if api_config.auth_token:
+        return True
+    return not _is_loopback_host(api_config.host)
 
 
 def _rate_limit_key(request: Any) -> str:
@@ -159,9 +178,15 @@ def create_app(
         request: Request, credentials: HTTPAuthorizationCredentials | None = None
     ) -> None:
         """Verify authentication for protected endpoints."""
-        if not api_config.auth_token:
-            # No auth token configured - allow all (development mode)
+        del credentials
+        if not _auth_token_required(api_config):
+            # No token on a loopback-only bind is allowed for local development.
             return
+        if not api_config.auth_token:
+            raise HTTPException(
+                status_code=503,
+                detail="Control Plane API auth token is required for non-loopback bind hosts",
+            )
 
         auth_header = request.headers.get("Authorization")
         if not _check_auth(auth_header, api_config.auth_token):

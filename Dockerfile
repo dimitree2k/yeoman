@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim@sha256:7cf77f594be8042dab6daa9fe326f90962252268b4f120a7f5dccce4d947e6c1
 
 # Install Node.js 20 for the WhatsApp bridge
 RUN apt-get update && \
@@ -14,24 +14,23 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install Python dependencies first (cached layer)
-COPY pyproject.toml README.md LICENSE ./
-RUN mkdir -p yeoman bridge && touch yeoman/__init__.py && \
-    uv pip install --system --no-cache . && \
-    rm -rf yeoman bridge
+# Copy the workspace and build the WhatsApp bridge from the lockfile.
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY packages/ packages/
 
-# Copy the full source and install
-COPY yeoman/ yeoman/
-COPY bridge/ bridge/
-RUN uv pip install --system --no-cache .
-
-# Build the WhatsApp bridge
-WORKDIR /app/bridge
-RUN npm install && npm run build
+WORKDIR /app/packages/bridge
+RUN npm ci && npm run build && npm prune --omit=dev
 WORKDIR /app
 
-# Create config directory
-RUN mkdir -p /root/.yeoman
+# Install the gateway package after the bridge dist is available for packaging.
+RUN uv pip install --system --no-cache "./packages/gateway[overseer]"
+
+# Run the gateway as a non-root user; runtime state should be mounted here.
+RUN useradd --create-home --uid 10001 yeoman && \
+    mkdir -p /home/yeoman/.yeoman && \
+    chown -R yeoman:yeoman /home/yeoman/.yeoman /app
+USER yeoman
+ENV HOME=/home/yeoman
 
 # Gateway default port
 EXPOSE 18790

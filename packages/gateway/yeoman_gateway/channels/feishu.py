@@ -8,11 +8,11 @@ from collections import OrderedDict
 from typing import Any
 
 from loguru import logger
+from yeoman_shared.config.schema import FeishuConfig
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
-from yeoman_shared.config.schema import FeishuConfig
 
 try:
     import lark_oapi as lark

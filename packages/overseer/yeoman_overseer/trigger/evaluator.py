@@ -16,7 +16,7 @@ from yeoman_overseer.safety.causal import CausalChainDetector
 from yeoman_overseer.safety.circuit_breaker import CircuitBreaker
 from yeoman_overseer.safety.rate_limiter import RateLimiter
 from yeoman_overseer.state import OverseerState
-from yeoman_overseer.trigger.checks import run_check, CheckResult
+from yeoman_overseer.trigger.checks import CheckResult, run_check
 from yeoman_overseer.trigger.lock import LockManager
 
 logger = logging.getLogger(__name__)

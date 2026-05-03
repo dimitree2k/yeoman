@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 
 from loguru import logger
-
 from yeoman_shared.config.schema import SecurityConfig
+
 from yeoman_gateway.core.models import SecurityDecision, SecurityResult, SecurityStage
 from yeoman_gateway.core.ports import SecurityPort
 from yeoman_gateway.security.normalize import normalize_text

@@ -65,6 +65,7 @@ def logs(
 def status() -> None:
     """Show yeoman status."""
     from yeoman_shared.config.loader import get_config_path, load_config
+
     from yeoman_gateway.policy.loader import get_policy_path
 
     config_path = get_config_path()

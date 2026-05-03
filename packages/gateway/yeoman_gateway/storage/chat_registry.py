@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-
 from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path
 
 PURGE_INTERVAL_SECONDS = 3600

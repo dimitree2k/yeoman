@@ -6,7 +6,10 @@ import asyncio
 from pathlib import Path
 
 from yeoman_gateway.media.router import ResolvedProfile
-from yeoman_gateway.providers.transcription import GroqTranscriptionProvider, OpenAITranscriptionProvider
+from yeoman_gateway.providers.transcription import (
+    GroqTranscriptionProvider,
+    OpenAITranscriptionProvider,
+)
 
 
 class ASRTranscriber:

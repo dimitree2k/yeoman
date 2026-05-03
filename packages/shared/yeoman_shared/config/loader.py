@@ -61,8 +61,9 @@ def _apply_env_overrides(config: Config) -> Config:
     over values already present in config.json. This means the .env file
     is the canonical source for secrets; config.json can have empty keys.
     """
-    from yeoman_shared.config.schema import ProviderConfig
     from yeoman_gateway.providers.registry import PROVIDERS
+
+    from yeoman_shared.config.schema import ProviderConfig
 
     # Provider API keys — iterate registry so every provider is covered
     for spec in PROVIDERS:

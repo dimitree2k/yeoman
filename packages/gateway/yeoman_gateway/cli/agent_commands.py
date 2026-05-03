@@ -17,13 +17,14 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ) -> None:
     """Interact with the agent directly."""
+    from yeoman_shared.config.loader import load_config
+    from yeoman_shared.telemetry import InMemoryTelemetry
+
     from yeoman_gateway.adapters.responder_llm import LLMResponder
     from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
     from yeoman_gateway.bus.queue import MessageBus
-    from yeoman_shared.config.loader import load_config
     from yeoman_gateway.policy.loader import load_policy
     from yeoman_gateway.security import NoopSecurity, SecurityEngine
-    from yeoman_shared.telemetry import InMemoryTelemetry
 
     config = load_config()
     memory_service = make_memory_service(config)

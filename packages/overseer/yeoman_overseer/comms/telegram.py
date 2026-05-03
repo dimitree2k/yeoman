@@ -1,9 +1,9 @@
 """Direct Telegram Bot API client — no gateway dependency."""
 from __future__ import annotations
 
-from yeoman_overseer.comms.cascading import CommsChannel
-
 import httpx
+
+from yeoman_overseer.comms.cascading import CommsChannel
 
 
 class TelegramDirectChannel(CommsChannel):

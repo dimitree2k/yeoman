@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from yeoman_overseer.audit.logger import AuditEntry
 from yeoman_overseer.agent.tools.write_file import _is_allowed
+from yeoman_overseer.audit.logger import AuditEntry
 
 
 def edit_file(path: str, old_string: str, new_string: str, ctx: object) -> dict:

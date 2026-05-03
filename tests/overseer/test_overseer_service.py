@@ -1,10 +1,12 @@
 """Tests for OverseerService lifecycle."""
 from __future__ import annotations
+
 import asyncio
 from pathlib import Path
 from textwrap import dedent
+
 import pytest
-from yeoman_overseer.service import OverseerService, OverseerConfig
+from yeoman_overseer.service import OverseerConfig, OverseerService
 
 RUNBOOK = dedent("""\
     ---
@@ -37,7 +39,8 @@ def test_config_defaults() -> None:
     cfg = OverseerConfig()
     assert cfg.tick_interval_s == 1.0
     assert cfg.actions_per_hour == 30
-    assert cfg.llm_calls_per_day == 20
+    assert cfg.llm_calls_per_day == 80
+    assert cfg.llm_tokens_per_day == 2_000_000
 
 @pytest.mark.asyncio
 async def test_service_init_and_stop(overseer_dir: Path) -> None:

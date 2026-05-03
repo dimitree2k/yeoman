@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import websockets
-
 from yeoman_shared.config.loader import load_config
+
 from yeoman_gateway.policy.admin.audit import PolicyAuditEntry, PolicyAuditStore
 from yeoman_gateway.policy.admin.contracts import (
     PolicyActorContext,

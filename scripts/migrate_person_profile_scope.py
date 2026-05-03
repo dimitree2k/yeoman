@@ -24,7 +24,6 @@ from yeoman_gateway.contacts.service import ContactsService
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_data_path
 
-
 USER_SCOPE_RE = re.compile(r"^channel:[^:]+:user:(.+)$")
 
 

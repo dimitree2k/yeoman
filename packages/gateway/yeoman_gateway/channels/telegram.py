@@ -11,11 +11,11 @@ from telegram import BotCommand, Update
 from telegram.constants import MessageEntityType
 from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from yeoman_shared.config.schema import TelegramConfig
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
-from yeoman_shared.config.schema import TelegramConfig
 
 if TYPE_CHECKING:
     from yeoman_gateway.session.manager import SessionManager

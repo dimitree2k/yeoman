@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-
 from yeoman_shared.utils.helpers import get_sessions_path, safe_filename
 
 

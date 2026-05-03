@@ -1,14 +1,12 @@
 """Execute a shell command inside the bubblewrap sandbox."""
 from __future__ import annotations
 
-import shlex
-
 from yeoman_overseer.audit.logger import AuditEntry
 
 
 def shell(command: str, *, ctx: object) -> dict:
     """Run command string in sandbox. Returns {stdout, stderr, exit_code}."""
-    cmd = shlex.split(command)
+    cmd = ["/bin/sh", "-c", command]
 
     try:
         result = ctx.sandbox.run(cmd, timeout=ctx.shell_timeout_s)

@@ -51,8 +51,9 @@ def policy_explain(
     reply_to_bot: bool = typer.Option(False, "--reply-to-bot", help="Message is a reply to bot"),
 ) -> None:
     """Explain merged policy + decision for one actor/chat."""
-    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
     from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
 
     config = load_config()
     policy_engine, policy_path = make_policy_engine(config)
@@ -83,6 +84,7 @@ def policy_cmd(
     import getpass
 
     from yeoman_shared.config.loader import load_config
+
     from yeoman_gateway.policy.admin.contracts import PolicyActorContext, PolicyExecutionOptions
     from yeoman_gateway.policy.admin.service import PolicyAdminService
 
@@ -137,8 +139,8 @@ def policy_annotate_whatsapp_comments(
     import uuid
 
     import websockets
-
     from yeoman_shared.config.loader import load_config
+
     from yeoman_gateway.policy.loader import get_policy_path, load_policy, save_policy
 
     async def _list_groups(url: str, ids: list[str], token: str) -> dict[str, str]:

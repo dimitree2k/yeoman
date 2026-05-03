@@ -85,8 +85,9 @@ def onboard() -> None:
     """Initialize yeoman configuration and workspace."""
     from yeoman_shared.config.loader import get_config_path, save_config
     from yeoman_shared.config.schema import Config
-    from yeoman_gateway.policy.loader import ensure_policy_file
     from yeoman_shared.utils.helpers import get_workspace_path
+
+    from yeoman_gateway.policy.loader import ensure_policy_file
 
     config_path = get_config_path()
 

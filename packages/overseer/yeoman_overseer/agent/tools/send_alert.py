@@ -3,13 +3,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from yeoman_overseer.alerts.formatting import format_overseer_alert
+
 if TYPE_CHECKING:
     from yeoman_overseer.agent.tools import ToolContext
 
 
 async def execute(args: dict[str, Any], ctx: ToolContext) -> str:
     """CascadingComms.send is async — this tool must be async too."""
-    message = args["message"]
+    message = format_overseer_alert(args["message"])
     try:
         await ctx.comms.send(message)
         from yeoman_overseer.audit.logger import AuditEntry

@@ -114,8 +114,8 @@ def chats_sync(
     import uuid
 
     import websockets
-
     from yeoman_shared.config.loader import load_config
+
     from yeoman_gateway.storage.chat_registry import ChatRegistry
 
     console.print(f"[cyan]Syncing metadata from {channel} bridge...[/cyan]")

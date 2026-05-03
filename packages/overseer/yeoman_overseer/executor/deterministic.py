@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from yeoman_overseer.alerts.formatting import format_overseer_alert
 from yeoman_overseer.comms.cascading import CascadingComms
 
 logger = logging.getLogger(__name__)
@@ -43,9 +44,10 @@ class DeterministicExecutor:
             return ActionResult(success=False, detail=f"Error restarting {target}: {exc}")
 
     async def _alert(self, *, target: str, message: str = "", **_: str) -> ActionResult:
+        formatted_message = format_overseer_alert(message or f"Alert for {target}")
         try:
-            await self.comms.send(message or f"Alert for {target}")
-            return ActionResult(success=True, detail=f"Alert sent: {message}")
+            await self.comms.send(formatted_message)
+            return ActionResult(success=True, detail=f"Alert sent: {formatted_message}")
         except Exception as exc:
             return ActionResult(success=False, detail=f"Alert failed: {exc}")
 

@@ -25,14 +25,25 @@ to prevent unbounded disk growth.
 
 ## Procedure
 
-1. Check disk usage via `check_health`.
+1. Check disk usage via `check_health` with check `disk_usage_above`, target `/`,
+   and threshold `85` (percent). This is a pre-flight sanity check only.
 2. Use `shell` to list files older than 14 days in `~/.yeoman/var/cache/` and
-   `~/.yeoman/var/media/incoming/`.
-3. Use `shell` to delete them (`find ... -mtime +14 -delete`).
-4. Re-check disk usage and send a summary alert.
+   `~/.yeoman/var/media/incoming/`:
+   ```sh
+   find ~/.yeoman/var/cache/ -type f -mtime +14 2>/dev/null | head -50
+   find ~/.yeoman/var/media/incoming/ -type f -mtime +14 2>/dev/null | head -50
+   ```
+3. Use `shell` to delete them:
+   ```sh
+   find ~/.yeoman/var/cache/ -type f -mtime +14 -delete 2>/dev/null
+   find ~/.yeoman/var/media/incoming/ -type f -mtime +14 -delete 2>/dev/null
+   ```
+4. Re-check disk usage with `check_health` (same parameters) and send a summary
+   alert with files removed and current disk usage.
 
 ## Safety
 
 - `requires_tests: false` — no source code is touched.
 - Only touches `~/.yeoman/var/` subdirectories (cache and media).
-- Shell commands run inside bubblewrap — no network, no source code access.
+- If shell commands fail (e.g. sandbox unavailable), report the error in the
+  alert and skip deletion — do not retry or escalate.
