@@ -75,6 +75,7 @@ def _event(
     at: datetime,
     chat_id: str = "group@g.us",
     sender_id: str = "user@s.whatsapp.net",
+    content: str = "message",
     mentioned_bot: bool = False,
     reply_to_bot: bool = False,
     from_me: bool = False,
@@ -83,7 +84,7 @@ def _event(
         channel="whatsapp",
         chat_id=chat_id,
         sender_id=sender_id,
-        content="message",
+        content=content,
         timestamp=at.timestamp(),
         is_group=True,
         metadata={
@@ -119,6 +120,32 @@ async def test_lull_observer_fires_after_silence_following_recent_activity(
 
     now_holder["value"] = (base + timedelta(minutes=21)).timestamp()
     await observer._tick()
+    assert calls == [("whatsapp", "group@g.us")]
+
+
+@pytest.mark.asyncio
+async def test_lull_observer_clears_activity_after_callback(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+    now_holder = {"value": base.timestamp()}
+
+    observer = LullObserver(
+        config=_config(),
+        state_path=tmp_path / "lull.json",
+        on_lull=lambda channel, chat_id: calls.append((channel, chat_id))
+        or {"status": "silent_pass"},
+        is_eligible=lambda channel, chat_id: True,
+        clock=lambda: now_holder["value"],
+    )
+
+    for index in range(4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
+
+    now_holder["value"] = (base + timedelta(minutes=21)).timestamp()
+    await observer._tick()
+    now_holder["value"] = (base + timedelta(minutes=22)).timestamp()
+    await observer._tick()
+
     assert calls == [("whatsapp", "group@g.us")]
 
 
@@ -161,6 +188,29 @@ async def test_lull_observer_skips_direct_bot_interaction(tmp_path: Path) -> Non
     await observer.handle(_event(at=base, mentioned_bot=True))
     await observer.handle(_event(at=base + timedelta(minutes=1), reply_to_bot=True))
     await observer.handle(_event(at=base + timedelta(minutes=2), from_me=True))
+
+    now_holder["value"] = (base + timedelta(minutes=30)).timestamp()
+    await observer._tick()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_lull_observer_skips_plain_name_interaction(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+    now_holder = {"value": base.timestamp()}
+
+    observer = LullObserver(
+        config=_config(),
+        state_path=tmp_path / "lull.json",
+        on_lull=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+        clock=lambda: now_holder["value"],
+    )
+
+    await observer.handle(_event(at=base, content="Arvid kannst du Nokia checken"))
+    for index in range(1, 4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
 
     now_holder["value"] = (base + timedelta(minutes=30)).timestamp()
     await observer._tick()

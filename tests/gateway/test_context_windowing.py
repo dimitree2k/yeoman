@@ -126,6 +126,37 @@ class TestPreflightHeuristic:
         assert not _has_backward_reference("can you help me?")
 
 
+class TestConversationStateContext:
+    """Conversation state should be visible to the responder prompt."""
+
+    def test_current_message_includes_repair_guidance(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[],
+            current_message="keine gute antwort Arvid",
+            current_metadata={
+                "sender_id": "user@s.whatsapp.net",
+                "conversation_state": {
+                    "addressed_to_bot": True,
+                    "address_mode": "repair_feedback",
+                    "preferred_action": "answer",
+                    "answer_shape": "repair",
+                    "room_mode": "direct_thread",
+                },
+            },
+            channel="whatsapp",
+            chat_id="group@g.us",
+        )
+
+        user_text = str(messages[-1]["content"])
+        assert "[Conversation State]" in user_text
+        assert "address_mode: repair_feedback" in user_text
+        assert "preferred_action: answer" in user_text
+        assert "answer_shape: repair" in user_text
+        assert "Acknowledge the problem briefly, then correct the answer." in user_text
+
+
 class TestRecallConversationTool:
     """recall_conversation tool should search session history."""
 

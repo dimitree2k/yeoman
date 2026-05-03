@@ -1,9 +1,43 @@
 import time
+from typing import Any
 
 import pytest
-
 from yeoman_gateway.agent.tools.web import _validate_domain, _WebRateLimiter
 from yeoman_shared.config.schema import WebToolsConfig
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.status_code = 200
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _RecordingAsyncClient:
+    calls: list[dict[str, Any]] = []
+    response_payload: dict[str, Any] = {"results": []}
+
+    async def __aenter__(self) -> "_RecordingAsyncClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _FakeResponse:
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return _FakeResponse(self.response_payload)
 
 
 def test_web_tools_config_defaults():
@@ -125,12 +159,193 @@ def test_web_fetch_content_type_check():
     assert tool._is_allowed_content_type("") is True  # missing = allow
 
 
+@pytest.mark.asyncio
+async def test_web_search_forwards_tavily_controls(monkeypatch: pytest.MonkeyPatch):
+    from yeoman_gateway.agent.tools import web
+    from yeoman_gateway.agent.tools.web import WebSearchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _RecordingAsyncClient.calls = []
+    _RecordingAsyncClient.response_payload = {
+        "answer": "summary",
+        "results": [{"title": "Title", "url": "https://example.com", "content": "Snippet"}],
+    }
+    monkeypatch.setattr(web.httpx, "AsyncClient", _RecordingAsyncClient)
+
+    tool = WebSearchTool(api_key="tvly-test", web_config=WebToolsConfig(rate_limit_rpm=100))
+    result = await tool.execute(
+        query="latest AI agent search",
+        max_results=12,
+        search_depth="advanced",
+        topic="news",
+        time_range="week",
+        chunks_per_source=2,
+        include_domains=["docs.tavily.com"],
+        exclude_domains=["spam.example"],
+        include_raw_content="markdown",
+        include_favicon=True,
+        include_usage=True,
+    )
+
+    assert "Results for: latest AI agent search" in result
+    payload = _RecordingAsyncClient.calls[0]["json"]
+    assert payload == {
+        "query": "latest AI agent search",
+        "search_depth": "advanced",
+        "max_results": 12,
+        "include_answer": True,
+        "topic": "news",
+        "time_range": "week",
+        "chunks_per_source": 2,
+        "include_raw_content": "markdown",
+        "include_favicon": True,
+        "include_usage": True,
+        "include_domains": ["docs.tavily.com"],
+        "exclude_domains": ["spam.example"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_tavily_extract_accepts_query_focused_options(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import json as _json
+
+    from yeoman_gateway.agent.tools import web
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _RecordingAsyncClient.calls = []
+    _RecordingAsyncClient.response_payload = {
+        "results": [{"url": "https://example.com/a", "raw_content": "focused chunk"}]
+    }
+    monkeypatch.setattr(web.httpx, "AsyncClient", _RecordingAsyncClient)
+
+    tool = WebFetchTool(api_key="tvly-test", web_config=WebToolsConfig(rate_limit_rpm=100))
+    result = await tool.execute(
+        url="https://example.com/a",
+        query="pricing table",
+        chunks_per_source=4,
+        extract_depth="advanced",
+        include_images=True,
+        include_favicon=True,
+        include_usage=True,
+    )
+
+    data = _json.loads(result)
+    assert data["extractor"] == "tavily"
+    assert data["text"] == "focused chunk"
+    payload = _RecordingAsyncClient.calls[0]["json"]
+    assert payload == {
+        "urls": ["https://example.com/a"],
+        "query": "pricing table",
+        "chunks_per_source": 4,
+        "extract_depth": "advanced",
+        "format": "markdown",
+        "include_images": True,
+        "include_favicon": True,
+        "include_usage": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_map_tool_posts_tavily_map_payload(monkeypatch: pytest.MonkeyPatch):
+    import json as _json
+
+    from yeoman_gateway.agent.tools import web
+    from yeoman_gateway.agent.tools.web import WebMapTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _RecordingAsyncClient.calls = []
+    _RecordingAsyncClient.response_payload = {
+        "base_url": "docs.example.com",
+        "results": ["https://docs.example.com/a"],
+        "usage": {"credits": 1},
+    }
+    monkeypatch.setattr(web.httpx, "AsyncClient", _RecordingAsyncClient)
+
+    tool = WebMapTool(api_key="tvly-test", web_config=WebToolsConfig(rate_limit_rpm=100))
+    result = await tool.execute(
+        url="https://docs.example.com",
+        instructions="Find API pages",
+        max_depth=2,
+        limit=25,
+        select_paths=["/api/.*"],
+        exclude_paths=["/old/.*"],
+        allow_external=False,
+        include_usage=True,
+    )
+
+    assert _json.loads(result)["results"] == ["https://docs.example.com/a"]
+    assert _RecordingAsyncClient.calls[0]["url"] == "https://api.tavily.com/map"
+    assert _RecordingAsyncClient.calls[0]["json"] == {
+        "url": "https://docs.example.com",
+        "instructions": "Find API pages",
+        "max_depth": 2,
+        "limit": 25,
+        "select_paths": ["/api/.*"],
+        "exclude_paths": ["/old/.*"],
+        "allow_external": False,
+        "include_usage": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_crawl_tool_posts_tavily_crawl_payload(monkeypatch: pytest.MonkeyPatch):
+    import json as _json
+
+    from yeoman_gateway.agent.tools import web
+    from yeoman_gateway.agent.tools.web import WebCrawlTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _RecordingAsyncClient.calls = []
+    _RecordingAsyncClient.response_payload = {
+        "base_url": "docs.example.com",
+        "results": [{"url": "https://docs.example.com/a", "raw_content": "Page"}],
+    }
+    monkeypatch.setattr(web.httpx, "AsyncClient", _RecordingAsyncClient)
+
+    tool = WebCrawlTool(api_key="tvly-test", web_config=WebToolsConfig(rate_limit_rpm=100))
+    result = await tool.execute(
+        url="https://docs.example.com",
+        instructions="Find API pages",
+        chunks_per_source=3,
+        max_depth=2,
+        max_breadth=10,
+        limit=20,
+        select_domains=["^docs\\.example\\.com$"],
+        exclude_domains=["^private\\.example\\.com$"],
+        include_images=True,
+        extract_depth="advanced",
+        format="text",
+    )
+
+    assert _json.loads(result)["results"][0]["raw_content"] == "Page"
+    assert _RecordingAsyncClient.calls[0]["url"] == "https://api.tavily.com/crawl"
+    assert _RecordingAsyncClient.calls[0]["json"] == {
+        "url": "https://docs.example.com",
+        "instructions": "Find API pages",
+        "chunks_per_source": 3,
+        "max_depth": 2,
+        "max_breadth": 10,
+        "limit": 20,
+        "select_domains": ["^docs\\.example\\.com$"],
+        "exclude_domains": ["^private\\.example\\.com$"],
+        "include_images": True,
+        "extract_depth": "advanced",
+        "format": "text",
+    }
+
+
 # --- Task 7: Rate limiter wiring ---
 
 
 @pytest.mark.asyncio
 async def test_web_fetch_rate_limited():
-    import json as _json
 
     from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
 

@@ -20,8 +20,9 @@ def cron_list(
     """List scheduled jobs."""
     import time
 
-    from yeoman_gateway.cron.service import CronService
     from yeoman_shared.utils.helpers import get_operational_data_path
+
+    from yeoman_gateway.cron.service import CronService
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -75,9 +76,10 @@ def cron_add(
     ),
 ) -> None:
     """Add a scheduled job."""
+    from yeoman_shared.utils.helpers import get_operational_data_path
+
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.cron.types import CronSchedule
-    from yeoman_shared.utils.helpers import get_operational_data_path
 
     if every:
         schedule = CronSchedule(kind="every", every_ms=every * 1000)
@@ -138,6 +140,36 @@ def cron_add_voice(
     ),
     max_sentences: int = typer.Option(None, "--max-sentences", help="Sentence cap when normalized"),
     max_chars: int = typer.Option(None, "--max-chars", help="Character cap when normalized"),
+    wait_for_quiet: bool = typer.Option(
+        False,
+        "--wait-for-quiet/--send-immediately",
+        help="Defer the voice send until the target chat has been quiet",
+    ),
+    quiet_minutes: int = typer.Option(
+        None,
+        "--quiet-minutes",
+        help="Required silence duration before sending",
+    ),
+    retry_minutes: int = typer.Option(
+        None,
+        "--retry-minutes",
+        help="Retry interval while waiting for silence",
+    ),
+    window_end: str = typer.Option(
+        None,
+        "--window-end",
+        help="Latest local HH:MM time to keep retrying before skipping this occurrence",
+    ),
+    generate: bool = typer.Option(
+        False,
+        "--generate/--static",
+        help="Generate a fresh voice line before sending instead of only choosing a static phrase",
+    ),
+    prompt: str = typer.Option(
+        None,
+        "--prompt",
+        help="Optional generation prompt used with --generate",
+    ),
     every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
     cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * 1')"),
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
@@ -146,9 +178,10 @@ def cron_add_voice(
     import datetime
     from pathlib import Path
 
+    from yeoman_shared.utils.helpers import get_operational_data_path
+
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.cron.types import CronSchedule
-    from yeoman_shared.utils.helpers import get_operational_data_path
 
     chosen = [every is not None, bool(cron_expr), bool(at)]
     if sum(chosen) != 1:
@@ -200,6 +233,12 @@ def cron_add_voice(
         verbatim=verbatim,
         max_sentences=max_sentences,
         max_chars=max_chars,
+        wait_for_quiet=wait_for_quiet,
+        quiet_minutes=quiet_minutes,
+        retry_minutes=retry_minutes,
+        window_end=window_end,
+        generate=generate,
+        prompt=prompt,
         delete_after_run=delete_after_run,
     )
 
@@ -211,8 +250,9 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ) -> None:
     """Remove a scheduled job."""
-    from yeoman_gateway.cron.service import CronService
     from yeoman_shared.utils.helpers import get_operational_data_path
+
+    from yeoman_gateway.cron.service import CronService
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -229,8 +269,9 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ) -> None:
     """Enable or disable a job."""
-    from yeoman_gateway.cron.service import CronService
     from yeoman_shared.utils.helpers import get_operational_data_path
+
+    from yeoman_gateway.cron.service import CronService
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)
@@ -249,8 +290,9 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ) -> None:
     """Manually run a job."""
-    from yeoman_gateway.cron.service import CronService
     from yeoman_shared.utils.helpers import get_operational_data_path
+
+    from yeoman_gateway.cron.service import CronService
 
     store_path = get_operational_data_path() / "cron" / "jobs.json"
     service = CronService(store_path)

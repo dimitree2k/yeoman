@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from typing import Literal
 
 import typer
 from rich.table import Table
+
+from yeoman_gateway.memory.disclosure import (
+    DISCLOSURE_MODES,
+    SENSITIVITIES,
+    normalize_list,
+    normalize_metadata,
+)
+from yeoman_gateway.memory.disclosure_backfill import (
+    ModelDisclosureClassifier,
+    NarrowDisclosureClassifier,
+    run_disclosure_backfill,
+)
 
 from .core import app, console, make_memory_service
 
@@ -17,6 +30,8 @@ memory_app.add_typer(notes_app, name="notes")
 
 MEMORY_KINDS = {"preference", "decision", "fact", "episodic"}
 MEMORY_SCOPES = {"chat", "user", "global", "all"}
+MEMORY_SENSITIVITIES = set(SENSITIVITIES)
+MEMORY_DISCLOSURES = set(DISCLOSURE_MODES)
 NOTES_CHANNELS = {"whatsapp", "telegram"}
 
 
@@ -74,6 +89,33 @@ def _notes_parse_optional_mode(raw: str) -> Literal["adaptive", "heuristic", "hy
         option="value",
     )
     return None if value == "inherit" else value
+
+
+def _parse_csv(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    return list(normalize_list(raw))
+
+
+def _metadata_display(meta_json: str) -> tuple[str, str]:
+    metadata = normalize_metadata(meta_json)
+    topics = ",".join(metadata.topics)
+    return metadata.sensitivity, topics
+
+
+def _resolve_chat_profile(config, profile_name: str):
+    from yeoman_shared.config.loader import camel_to_snake
+
+    from yeoman_gateway.media.router import ModelRouter
+
+    profile = ModelRouter(config.models).resolve_by_profile(camel_to_snake(profile_name))
+    if profile.kind != "chat":
+        console.print(f"[red]Profile {profile_name!r} is kind={profile.kind!r}, expected chat[/red]")
+        raise typer.Exit(1)
+    if not profile.model:
+        console.print(f"[red]Profile {profile_name!r} has no model[/red]")
+        raise typer.Exit(1)
+    return profile
 
 
 @notes_app.command("status")
@@ -262,18 +304,23 @@ def memory_search(
 
     table = Table(title="Memory Search Results")
     table.add_column("Score", justify="right")
-    table.add_column("Kind")
+    table.add_column("Kind", min_width=10, no_wrap=True)
     table.add_column("Scope")
+    table.add_column("Sensitivity", min_width=11, no_wrap=True)
+    table.add_column("Topics", min_width=14, no_wrap=True)
     table.add_column("Updated")
     table.add_column("Content")
     for hit in hits:
         content = " ".join(hit.entry.content.split())
         if len(content) > 120:
             content = content[:117] + "..."
+        sensitivity, topics = _metadata_display(hit.entry.meta_json)
         table.add_row(
             f"{hit.final_score:.2f}",
             hit.entry.kind,
             hit.entry.scope_type,
+            sensitivity,
+            topics,
             hit.entry.updated_at[:19],
             content,
         )
@@ -290,10 +337,28 @@ def memory_add(
     sender_id: str | None = typer.Option(None, "--sender-id", help="Sender id for user scope"),
     importance: float = typer.Option(0.8, "--importance", min=0.0, max=1.0),
     confidence: float = typer.Option(1.0, "--confidence", min=0.0, max=1.0),
+    topics: str | None = typer.Option(None, "--topics", help="Comma-separated topic tags"),
+    sensitivity: str = typer.Option("normal", "--sensitivity", help="normal|sensitive|private|taboo"),
+    disclosure: str = typer.Option(
+        "speakable",
+        "--disclosure",
+        help="speakable|context_only|owner_only|never_initiate",
+    ),
+    subjects: str | None = typer.Option(None, "--subjects", help="Comma-separated subject tags"),
 ) -> None:
     """Add one manual memory entry."""
     kind_value = _normalize_choice(kind, choices=MEMORY_KINDS, option="--kind")
     scope_value = _normalize_choice(scope, choices=MEMORY_SCOPES - {"all"}, option="--scope")
+    sensitivity_value = _normalize_choice(
+        sensitivity,
+        choices=MEMORY_SENSITIVITIES,
+        option="--sensitivity",
+    )
+    disclosure_value = _normalize_choice(
+        disclosure,
+        choices=MEMORY_DISCLOSURES,
+        option="--disclosure",
+    )
 
     with _memory_service_context() as service:
         entry, inserted = service.record_manual(
@@ -305,11 +370,204 @@ def memory_add(
             text=text,
             importance=importance,
             confidence=confidence,
+            topics=_parse_csv(topics),
+            sensitivity=sensitivity_value,
+            disclosure_mode=disclosure_value,
+            subjects=_parse_csv(subjects),
         )
 
     action = "Inserted" if inserted else "Merged"
     console.print(f"[green]✓[/green] {action} memory entry: {entry.id}")
     console.print(f"scope={entry.scope_type}:{entry.scope_key}")
+
+
+@memory_app.command("tag")
+def memory_tag(
+    entry_id: str = typer.Argument(..., help="Memory entry id to update"),
+    topics: str | None = typer.Option(None, "--topics", help="Comma-separated topic tags"),
+    sensitivity: str | None = typer.Option(None, "--sensitivity", help="normal|sensitive|private|taboo"),
+    disclosure: str | None = typer.Option(
+        None,
+        "--disclosure",
+        help="speakable|context_only|owner_only|never_initiate",
+    ),
+    subjects: str | None = typer.Option(None, "--subjects", help="Comma-separated subject tags"),
+) -> None:
+    """Update disclosure metadata for an existing memory entry."""
+    sensitivity_value = (
+        _normalize_choice(sensitivity, choices=MEMORY_SENSITIVITIES, option="--sensitivity")
+        if sensitivity is not None
+        else None
+    )
+    disclosure_value = (
+        _normalize_choice(disclosure, choices=MEMORY_DISCLOSURES, option="--disclosure")
+        if disclosure is not None
+        else None
+    )
+    with _memory_service_context() as service:
+        entry = service.update_disclosure_metadata(
+            entry_id,
+            topics=_parse_csv(topics),
+            sensitivity=sensitivity_value,
+            disclosure_mode=disclosure_value,
+            subjects=_parse_csv(subjects),
+        )
+    if entry is None:
+        console.print(f"[red]Memory entry not found: {entry_id}[/red]")
+        raise typer.Exit(1)
+
+    metadata = normalize_metadata(entry.meta_json)
+    console.print(f"[green]✓[/green] Updated memory metadata: {entry.id}")
+    console.print(f"sensitivity={metadata.sensitivity}")
+    console.print(f"disclosure={metadata.disclosure_mode}")
+    console.print(f"topics={','.join(metadata.topics)}")
+
+
+@memory_app.command("disclosure-backfill")
+def memory_disclosure_backfill(
+    profile_name: str = typer.Option(
+        "gptNano",
+        "--profile",
+        help="Chat model profile to use for classification",
+    ),
+    batch_size: int = typer.Option(20, "--batch-size", min=1, max=50),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Limit rows for a sample run"),
+    only_missing: bool = typer.Option(
+        True,
+        "--only-missing/--all",
+        help="Classify only rows missing disclosure metadata or all active rows",
+    ),
+    all_workspaces: bool = typer.Option(
+        False,
+        "--all-workspaces",
+        help="Process every workspace_id in memory.db, not only the current checkout",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Persist suggestions to memory.db"),
+    backup: bool = typer.Option(True, "--backup/--no-backup", help="Backup memory.db before apply"),
+    sample_limit: int = typer.Option(10, "--sample-limit", min=0, max=50),
+) -> None:
+    """Classify existing memories with disclosure metadata using a cheap model."""
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.providers.factory import ProviderFactory
+
+    config = load_config()
+    profile = _resolve_chat_profile(config, profile_name)
+    provider = ProviderFactory(config=config).create_chat_provider(profile.model, profile.provider)
+    classifier = ModelDisclosureClassifier(
+        provider=provider,
+        model=profile.model,
+        max_tokens=min(int(profile.max_tokens or 4000), 6000),
+        temperature=0.0,
+        reasoning=profile.reasoning,
+    )
+    service = make_memory_service(config)
+    try:
+        result = asyncio.run(
+            run_disclosure_backfill(
+                memory=service,
+                classifier=classifier,
+                limit=limit,
+                batch_size=batch_size,
+                only_missing=only_missing,
+                all_workspaces=all_workspaces,
+                apply=apply,
+                backup=backup,
+                sample_limit=sample_limit,
+            )
+        )
+    finally:
+        service.close()
+
+    mode = "applied" if apply else "dry-run"
+    console.print("[bold]Disclosure Backfill[/bold]")
+    console.print(f"mode: {mode}")
+    console.print(f"profile: {profile.profile_name} ({profile.model})")
+    console.print(f"scanned: {result.scanned}")
+    console.print(f"suggested: {result.suggested}")
+    console.print(f"applied: {result.applied}")
+    console.print(f"failed_batches: {result.failed_batches}")
+    if result.backup_path is not None:
+        console.print(f"backup: {result.backup_path}")
+
+    if result.samples:
+        table = Table(title="Sample Suggestions")
+        table.add_column("Entry")
+        table.add_column("Sensitivity")
+        table.add_column("Disclosure")
+        table.add_column("Topics")
+        table.add_column("Subjects")
+        for suggestion in result.samples:
+            table.add_row(
+                suggestion.entry_id[:8],
+                suggestion.sensitivity,
+                suggestion.disclosure_mode,
+                ",".join(suggestion.topics),
+                ",".join(suggestion.subjects),
+            )
+        console.print(table)
+
+
+@memory_app.command("disclosure-retag-narrow")
+def memory_disclosure_retag_narrow(
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Limit rows for a sample run"),
+    all_workspaces: bool = typer.Option(
+        False,
+        "--all-workspaces",
+        help="Process every workspace_id in memory.db, not only the current checkout",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Persist deterministic retags to memory.db"),
+    backup: bool = typer.Option(True, "--backup/--no-backup", help="Backup memory.db before apply"),
+    sample_limit: int = typer.Option(10, "--sample-limit", min=0, max=50),
+) -> None:
+    """Retag existing memories with Yeoman's narrow deterministic disclosure policy."""
+    from yeoman_shared.config.loader import load_config
+
+    config = load_config()
+    service = make_memory_service(config)
+    try:
+        result = asyncio.run(
+            run_disclosure_backfill(
+                memory=service,
+                classifier=NarrowDisclosureClassifier(),
+                limit=limit,
+                batch_size=200,
+                only_missing=False,
+                all_workspaces=all_workspaces,
+                apply=apply,
+                backup=backup,
+                sample_limit=sample_limit,
+            )
+        )
+    finally:
+        service.close()
+
+    mode = "applied" if apply else "dry-run"
+    console.print("[bold]Narrow Disclosure Retag[/bold]")
+    console.print(f"mode: {mode}")
+    console.print(f"scanned: {result.scanned}")
+    console.print(f"suggested: {result.suggested}")
+    console.print(f"applied: {result.applied}")
+    console.print(f"failed_batches: {result.failed_batches}")
+    if result.backup_path is not None:
+        console.print(f"backup: {result.backup_path}")
+
+    if result.samples:
+        table = Table(title="Sample Retags")
+        table.add_column("Entry")
+        table.add_column("Sensitivity")
+        table.add_column("Disclosure")
+        table.add_column("Topics")
+        table.add_column("Subjects")
+        for suggestion in result.samples:
+            table.add_row(
+                suggestion.entry_id[:8],
+                suggestion.sensitivity,
+                suggestion.disclosure_mode,
+                ",".join(suggestion.topics),
+                ",".join(suggestion.subjects),
+            )
+        console.print(table)
 
 
 @memory_app.command("prune")

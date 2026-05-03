@@ -23,6 +23,10 @@ from yeoman_shared.config.schema import Config
 from yeoman_shared.utils.helpers import ensure_dir
 
 from yeoman_gateway.bus.events import GatewayEvent, InboundObservedEvent
+from yeoman_gateway.implicit_addressing import (
+    SessionManagerLike,
+    is_direct_bot_interaction,
+)
 
 LullCallback = Callable[[str, str], None | Awaitable[None]]
 EligibilityCallback = Callable[[str, str], bool | Awaitable[bool]]
@@ -40,13 +44,16 @@ class LullObserver:
         on_lull: LullCallback,
         is_eligible: EligibilityCallback | None = None,
         clock: ClockFn | None = None,
+        session_manager: SessionManagerLike | None = None,
     ) -> None:
         self._config = config
         self._state_path = state_path.expanduser()
         self._on_lull = on_lull
         self._is_eligible = is_eligible
         self._clock = clock or time.time
+        self._session_manager = session_manager
         self._activity: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+        self._last_direct_bot_interaction: dict[tuple[str, str], float] = {}
         self._fires_today: dict[str, dict[str, object]] = self._load_state()
         self._running = False
         self._task: asyncio.Task[None] | None = None
@@ -63,11 +70,20 @@ class LullObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
-        if self._is_direct_bot_interaction(event):
-            return
         key = (channel, chat_id)
         ts = float(event.timestamp)
-        cutoff = ts - (self._config.consciousness.lull_activity_window_minutes * 60)
+        if self._is_direct_bot_interaction(event):
+            self._activity.pop(key, None)
+            self._last_direct_bot_interaction[key] = ts
+            return
+        window_seconds = self._config.consciousness.lull_activity_window_minutes * 60
+        direct_ts = self._last_direct_bot_interaction.get(key)
+        if direct_ts is not None:
+            if direct_ts >= ts - window_seconds:
+                self._activity.pop(key, None)
+                return
+            self._last_direct_bot_interaction.pop(key, None)
+        cutoff = ts - window_seconds
         bucket = self._activity[key]
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
@@ -114,7 +130,7 @@ class LullObserver:
             silence_secs = self._config.consciousness.lull_silence_minutes * 60
             window_secs = self._config.consciousness.lull_activity_window_minutes * 60
             min_recent = max(1, int(self._config.consciousness.lull_min_recent_activity))
-            cap = max(0, int(self._config.consciousness.default_daily_cap))
+            cap = self._observer_daily_cap()
 
             for (channel, chat_id), bucket in list(self._activity.items()):
                 cutoff = now - window_secs
@@ -156,7 +172,7 @@ class LullObserver:
                 try:
                     raw = self._on_lull(channel, chat_id)
                     if inspect.isawaitable(raw):
-                        await raw
+                        raw = await raw
                 except Exception as exc:
                     logger.warning(
                         "lull observer callback failed channel={} chat={}: {}",
@@ -165,8 +181,10 @@ class LullObserver:
                         exc,
                     )
                     continue
-                self._increment_for_day(state_key, day)
-                self._save_state()
+                bucket.clear()
+                if self._should_count_fire(raw):
+                    self._increment_for_day(state_key, day)
+                    self._save_state()
 
     async def _eligible(self, channel: str, chat_id: str) -> bool:
         if self._is_eligible is None:
@@ -230,17 +248,25 @@ class LullObserver:
     def _state_key(channel: str, chat_id: str) -> str:
         return f"{channel}:{chat_id}"
 
+    def _observer_daily_cap(self) -> int:
+        base_cap = max(0, int(self._config.consciousness.default_daily_cap))
+        if not self._config.consciousness.dynamic_daily_cap_enabled:
+            return base_cap
+        return max(base_cap, int(self._config.consciousness.dynamic_daily_cap_max))
+
     @staticmethod
-    def _is_direct_bot_interaction(event: InboundObservedEvent) -> bool:
-        metadata = event.metadata
-        return any(
-            bool(metadata.get(key))
-            for key in (
-                "mentioned_bot",
-                "mentionedBot",
-                "reply_to_bot",
-                "replyToBot",
-                "from_me",
-                "fromMe",
-            )
+    def _should_count_fire(result: object) -> bool:
+        if not isinstance(result, dict):
+            return True
+        return result.get("status") in {"sent", "queued_for_approval"}
+
+    def _is_direct_bot_interaction(self, event: InboundObservedEvent) -> bool:
+        return is_direct_bot_interaction(
+            session_manager=self._session_manager,
+            channel=str(event.channel or ""),
+            chat_id=str(event.chat_id or ""),
+            event_time=datetime.fromtimestamp(float(event.timestamp), UTC),
+            content=str(event.content or ""),
+            metadata=dict(event.metadata or {}),
+            followup_window_seconds=10.0,
         )

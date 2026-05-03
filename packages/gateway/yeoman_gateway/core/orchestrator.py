@@ -23,6 +23,7 @@ from yeoman_gateway.pipeline.archive import ArchiveMiddleware
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 from yeoman_gateway.pipeline.dedup import DeduplicationMiddleware
 from yeoman_gateway.pipeline.idea_capture import IdeaCaptureMiddleware
+from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
 from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier
+    from yeoman_gateway.session.manager import SessionManager
 
 
 class Orchestrator:
@@ -80,6 +82,7 @@ class Orchestrator:
         bus: "MessageBus | None" = None,
         speakup_approval_store: "SpeakupApprovalStore | None" = None,
         speakup_log: "SpeakupLog | None" = None,
+        session_manager: "SessionManager | None" = None,
     ) -> None:
         layers: list = [
             NormalizationMiddleware(),
@@ -98,6 +101,7 @@ class Orchestrator:
             ),
             AdminCommandMiddleware(handler=policy_admin_handler),
             PolicyMiddleware(policy=policy),
+            ImplicitBotAddressMiddleware(session_manager=session_manager),
         ])
         if bus is not None and speakup_approval_store is not None and speakup_log is not None and security is not None:
             layers.append(

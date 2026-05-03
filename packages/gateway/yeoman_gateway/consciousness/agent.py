@@ -164,8 +164,13 @@ class ConsciousnessAgent:
                 channel=str(chat.get("channel") or ""),
             )
             if usage.get("status") == "ok":
+                enriched["daily_cap"] = usage["daily_cap"]
+                enriched["base_daily_cap"] = usage["base_daily_cap"]
+                enriched["max_daily_cap"] = usage["max_daily_cap"]
                 enriched["sent_today"] = usage["sent_today"]
                 enriched["daily_remaining"] = usage["daily_remaining"]
+                enriched["budget_allowed"] = usage["budget_allowed"]
+                enriched["budget_reason"] = usage["budget_reason"]
             enriched_eligible.append(enriched)
         window = await self._tools.read_chat_window(chat_id, n=20, channel=channel)
         memory_query = self._memory_query_from_window(window)

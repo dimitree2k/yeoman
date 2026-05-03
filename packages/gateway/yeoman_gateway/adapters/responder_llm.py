@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -36,7 +37,9 @@ from yeoman_gateway.agent.tools.shell import ExecTool
 from yeoman_gateway.agent.tools.spawn import SpawnTool
 from yeoman_gateway.agent.tools.web import (
     DeepResearchTool,
+    WebCrawlTool,
     WebFetchTool,
+    WebMapTool,
     WebSearchTool,
     YoutubeTranscriptTool,
 )
@@ -49,7 +52,7 @@ from yeoman_gateway.media.tts import (
     truncate_for_voice,
     write_tts_audio_file,
 )
-from yeoman_gateway.providers.base import LLMProvider
+from yeoman_gateway.providers.base import LLMProvider, ToolCallRequest
 from yeoman_gateway.session.manager import SessionManager
 
 if TYPE_CHECKING:
@@ -97,6 +100,19 @@ _CLARIFYING_QUESTION_START_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
+    {
+        "browse",
+        "deep_research",
+        "fact_check",
+        "ops",
+        "recall_conversation",
+        "summarize_history",
+        "web_fetch",
+        "web_search",
+        "youtube_transcript",
+    }
+)
 
 
 def _has_backward_reference(text: str) -> bool:
@@ -107,6 +123,44 @@ def _has_backward_reference(text: str) -> bool:
 def _last_sentence(text: str) -> str:
     parts = re.split(r"(?<=[.!?])\s+", text.strip())
     return parts[-1].strip() if parts else ""
+
+
+def _strip_single_code_fence(text: str) -> str:
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if len(lines) < 2 or not lines[0].lstrip().startswith("```"):
+        return stripped
+    if lines[-1].strip() != "```":
+        return stripped
+
+    first_payload = lines[0].lstrip()[3:].strip()
+    body = lines[1:-1]
+    if first_payload and not re.fullmatch(r"[A-Za-z0-9_+-]+", first_payload):
+        body = [first_payload, *body]
+    return "\n".join(body).strip()
+
+
+def _literal_tool_args_from_ast(call: ast.Call) -> dict[str, Any] | None:
+    args: dict[str, Any] = {}
+    if call.args:
+        if len(call.args) != 1 or call.keywords:
+            return None
+        try:
+            only_arg = ast.literal_eval(call.args[0])
+        except (ValueError, SyntaxError):
+            return None
+        if not isinstance(only_arg, dict):
+            return None
+        return dict(only_arg)
+
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            return None
+        try:
+            args[keyword.arg] = ast.literal_eval(keyword.value)
+        except (ValueError, SyntaxError):
+            return None
+    return args
 
 
 @dataclass
@@ -255,6 +309,8 @@ class LLMResponder(ResponderPort):
 
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(YoutubeTranscriptTool())
 
@@ -643,6 +699,69 @@ class LLMResponder(ResponderPort):
                 return await self.tools.execute(name, arguments)
         return await self.tools.execute(name, arguments)
 
+    @staticmethod
+    def _parse_textual_tool_call(
+        content: str | None,
+        *,
+        allowed_tools: set[str],
+    ) -> ToolCallRequest | None:
+        if not content:
+            return None
+        text = _strip_single_code_fence(content)
+        if not text:
+            return None
+
+        try:
+            parsed_json = json.loads(text)
+        except json.JSONDecodeError:
+            parsed_json = None
+
+        if isinstance(parsed_json, dict):
+            name = parsed_json.get("tool") or parsed_json.get("name")
+            arguments = (
+                parsed_json.get("arguments")
+                or parsed_json.get("args")
+                or parsed_json.get("parameters")
+                or {}
+            )
+            function = parsed_json.get("function")
+            if isinstance(function, dict):
+                name = name or function.get("name")
+                arguments = function.get("arguments", arguments)
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    return None
+            if isinstance(name, str) and isinstance(arguments, dict):
+                tool_name = name.strip()
+                if tool_name in allowed_tools:
+                    return ToolCallRequest(
+                        id=f"textual_tool_{int(time.time() * 1000)}",
+                        name=tool_name,
+                        arguments=dict(arguments),
+                    )
+            return None
+
+        try:
+            parsed_expr = ast.parse(text, mode="eval")
+        except SyntaxError:
+            return None
+        call = parsed_expr.body
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+            return None
+        tool_name = call.func.id
+        if tool_name not in allowed_tools:
+            return None
+        arguments = _literal_tool_args_from_ast(call)
+        if arguments is None:
+            return None
+        return ToolCallRequest(
+            id=f"textual_tool_{int(time.time() * 1000)}",
+            name=tool_name,
+            arguments=arguments,
+        )
+
     async def _chat_loop(
         self,
         *,
@@ -688,7 +807,40 @@ class LLMResponder(ResponderPort):
                     },
                 )
 
-                if response.has_tool_calls:
+                tool_calls = response.tool_calls
+                assistant_content = response.content
+                if not tool_calls:
+                    textual_tool_call = self._parse_textual_tool_call(
+                        response.content,
+                        allowed_tools=allowed_tools,
+                    )
+                    if textual_tool_call is not None:
+                        if textual_tool_call.name in _TEXTUAL_TOOL_COERCION_SAFE_TOOLS:
+                            logger.warning(
+                                "Coercing textual tool call into runtime tool call: {}",
+                                textual_tool_call.name,
+                            )
+                            tool_calls = [textual_tool_call]
+                            assistant_content = None
+                        else:
+                            logger.warning(
+                                "Rejected textual side-effecting tool call: {}",
+                                textual_tool_call.name,
+                            )
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Runtime rejected your previous output because it was a "
+                                        "tool call printed as user-visible text. Do not send JSON, "
+                                        "code fences, or function-call syntax to the chat. Use a "
+                                        "proper tool call if needed, otherwise answer in normal prose."
+                                    ),
+                                }
+                            )
+                            continue
+
+                if tool_calls:
                     tool_call_dicts: list[dict[str, Any]] = [
                         {
                             "id": tc.id,
@@ -698,15 +850,15 @@ class LLMResponder(ResponderPort):
                                 "arguments": json.dumps(tc.arguments),
                             },
                         }
-                        for tc in response.tool_calls
+                        for tc in tool_calls
                     ]
                     messages = self.context.add_assistant_message(
                         messages,
-                        response.content,
+                        assistant_content,
                         tool_call_dicts,
                     )
 
-                    for tool_call in response.tool_calls:
+                    for tool_call in tool_calls:
                         args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
                         tool_span = lf.start_span(
@@ -1313,6 +1465,7 @@ class LLMResponder(ResponderPort):
                         query=memory_query,
                         reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
                         reply_to_jid=str(metadata.get("reply_to_participant") or "").strip() or None,
+                        owner_context=is_owner,
                     )
                     retrieved_hits_count = len(retrieved_hits)
                 except Exception as e:

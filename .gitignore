@@ -9,10 +9,14 @@ docs/superpowers/*
 !docs/superpowers/plans/
 docs/superpowers/plans/*
 !docs/superpowers/plans/2026-04-25-consciousness-layer.md
+!docs/superpowers/plans/2026-05-02-disclosure-safe-memory-tags.md
 !docs/superpowers/specs/
 docs/superpowers/specs/*
 !docs/superpowers/specs/2026-04-25-consciousness-layer-design.md
 !docs/superpowers/specs/2026-04-25-consciousness-layer-design-superseded.md
+!docs/superpowers/specs/2026-05-02-disclosure-safe-memory-tags-design.md
+!docs/superpowers/specs/2026-05-02-topic-graph-memory-architecture.md
+!docs/superpowers/specs/2026-05-03-profile-gated-mcp-layer-design.md
 *.egg-info/
 *.egg
 *.pyc
@@ -38,8 +42,11 @@ tests/gateway/*
 !tests/gateway/test_consciousness_phase4.py
 !tests/gateway/test_consciousness_lull.py
 !tests/gateway/test_consciousness_safety.py
+!tests/gateway/test_implicit_bot_address.py
+!tests/gateway/test_memory_disclosure.py
 !tests/gateway/test_outbound_voice_soft_limits.py
 !tests/gateway/test_responder_social_holdback.py
+!tests/gateway/test_responder_textual_tool_calls.py
 .mypy_cache
 .ruff_cache
 node_modules/

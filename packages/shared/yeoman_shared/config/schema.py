@@ -507,6 +507,20 @@ class ConsciousnessConfig(BaseModel):
     agent_max_input_tokens: int = Field(default=10000, alias="agentMaxInputTokens", ge=1000)
     max_speakup_length_chars: int = Field(default=500, alias="maxSpeakupLengthChars", ge=1)
     default_daily_cap: int = Field(default=1, alias="defaultDailyCap", ge=0, le=10)
+    dynamic_daily_cap_enabled: bool = Field(default=False, alias="dynamicDailyCapEnabled")
+    dynamic_daily_cap_max: int = Field(default=6, alias="dynamicDailyCapMax", ge=0, le=20)
+    dynamic_daily_cap_min_confidence: float = Field(
+        default=0.9, alias="dynamicDailyCapMinConfidence", ge=0.0, le=1.0
+    )
+    dynamic_daily_cap_min_activity_messages: int = Field(
+        default=8, alias="dynamicDailyCapMinActivityMessages", ge=1
+    )
+    min_speakup_gap_minutes: int = Field(default=0, alias="minSpeakupGapMinutes", ge=0)
+    burst_max_per_window: int = Field(default=0, alias="burstMaxPerWindow", ge=0)
+    reserved_daily_slots: int = Field(default=0, alias="reservedDailySlots", ge=0, le=10)
+    reserve_daily_slots_until_hour: int = Field(
+        default=16, alias="reserveDailySlotsUntilHour", ge=0, le=23
+    )
     approval_timeout_seconds: int = Field(default=3600, alias="approvalTimeoutSeconds", ge=60)
     burst_enabled: bool = Field(default=False, alias="burstEnabled")
     burst_threshold_messages: int = Field(default=8, alias="burstThresholdMessages", ge=2)

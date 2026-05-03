@@ -26,6 +26,8 @@ MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
 _LOCAL_HOSTS = {"localhost", "localhost.localdomain"}
 _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 _TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+_TAVILY_MAP_URL = "https://api.tavily.com/map"
+_TAVILY_CRAWL_URL = "https://api.tavily.com/crawl"
 
 
 class _WebRateLimiter:
@@ -179,20 +181,120 @@ def _tavily_auth_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+def _add_optional(payload: dict[str, Any], **values: Any) -> dict[str, Any]:
+    for key, value in values.items():
+        if value is None:
+            continue
+        if value == "" or value == []:
+            continue
+        payload[key] = value
+    return payload
+
+
 class WebSearchTool(Tool):
     """Search the web using Tavily Search API."""
 
     name = "web_search"
-    description = "Search the web. Returns titles, URLs, snippets, and an AI-generated answer."
+    description = (
+        "Search the web with Tavily. Supports recency, news/finance topics, domain filters, "
+        "and depth controls. Returns titles, URLs, snippets, and optionally an AI answer."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search query"},
             "count": {
                 "type": "integer",
-                "description": "Results (1-10)",
+                "description": "Backward-compatible alias for max_results",
                 "minimum": 1,
-                "maximum": 10,
+                "maximum": 20,
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Results (1-20)",
+                "minimum": 1,
+                "maximum": 20,
+            },
+            "search_depth": {
+                "type": "string",
+                "enum": ["basic", "advanced", "fast", "ultra-fast"],
+                "description": "Tavily depth/speed mode. advanced costs more and may be slower.",
+            },
+            "topic": {
+                "type": "string",
+                "enum": ["general", "news", "finance"],
+                "description": "Search category.",
+            },
+            "chunks_per_source": {
+                "type": "integer",
+                "description": "Relevant chunks per result when supported by search_depth.",
+                "minimum": 1,
+                "maximum": 3,
+            },
+            "time_range": {
+                "type": "string",
+                "enum": ["day", "week", "month", "year", "d", "w", "m", "y"],
+                "description": "Relative publish/update time filter.",
+            },
+            "days": {
+                "type": "integer",
+                "description": "Days back for news searches.",
+                "minimum": 1,
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Start date filter in YYYY-MM-DD format.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "End date filter in YYYY-MM-DD format.",
+            },
+            "include_answer": {
+                "type": "boolean",
+                "description": "Include Tavily's generated answer.",
+            },
+            "include_raw_content": {
+                "type": "string",
+                "enum": ["markdown", "text"],
+                "description": "Include extracted source content. Increases latency and output size.",
+            },
+            "include_images": {
+                "type": "boolean",
+                "description": "Include image search results.",
+            },
+            "include_image_descriptions": {
+                "type": "boolean",
+                "description": "Describe included images.",
+            },
+            "include_favicon": {
+                "type": "boolean",
+                "description": "Include favicon URLs.",
+            },
+            "include_usage": {
+                "type": "boolean",
+                "description": "Include Tavily credit usage metadata.",
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Domains to include.",
+            },
+            "exclude_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Domains to exclude.",
+            },
+            "country": {
+                "type": "string",
+                "description": "Country boost for general searches, e.g. 'united states'.",
+            },
+            "auto_parameters": {
+                "type": "boolean",
+                "description": "Let Tavily infer parameters. May increase credits if it chooses advanced.",
+            },
+            "exact_match": {
+                "type": "boolean",
+                "description": "Require quoted phrases to match exactly.",
             },
         },
         "required": ["query"],
@@ -211,8 +313,34 @@ class WebSearchTool(Tool):
         self.max_results = max_results
         _rate_limiter.configure(self._config.rate_limit_rpm)
 
-    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        logger.info("web_search query={!r} count={}", query, count or self.max_results)
+    async def execute(
+        self,
+        query: str,
+        count: int | None = None,
+        max_results: int | None = None,
+        search_depth: str = "basic",
+        topic: str | None = None,
+        chunks_per_source: int | None = None,
+        time_range: str | None = None,
+        days: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        include_answer: bool = True,
+        include_raw_content: str | None = None,
+        include_images: bool | None = None,
+        include_image_descriptions: bool | None = None,
+        include_favicon: bool | None = None,
+        include_usage: bool | None = None,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+        country: str | None = None,
+        auto_parameters: bool | None = None,
+        exact_match: bool | None = None,
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        requested_results = max_results if max_results is not None else count
+        logger.info("web_search query={!r} count={}", query, requested_results or self.max_results)
         if not _rate_limiter.check():
             return "Error: Rate limit exceeded. Try again shortly."
 
@@ -220,13 +348,32 @@ class WebSearchTool(Tool):
             return "Error: TAVILY_API_KEY not configured"
 
         try:
-            n = min(max(count or self.max_results, 1), 10)
+            n = min(max(requested_results or self.max_results, 1), 20)
             payload: dict[str, Any] = {
                 "query": query,
-                "search_depth": "basic",
+                "search_depth": search_depth,
                 "max_results": n,
-                "include_answer": True,
+                "include_answer": include_answer,
             }
+            _add_optional(
+                payload,
+                topic=topic,
+                chunks_per_source=chunks_per_source,
+                time_range=time_range,
+                days=days,
+                start_date=start_date,
+                end_date=end_date,
+                include_raw_content=include_raw_content,
+                include_images=include_images,
+                include_image_descriptions=include_image_descriptions,
+                include_favicon=include_favicon,
+                include_usage=include_usage,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+                country=country,
+                auto_parameters=auto_parameters,
+                exact_match=exact_match,
+            )
             async with httpx.AsyncClient() as client:
                 r = await client.post(
                     _TAVILY_SEARCH_URL,
@@ -271,6 +418,33 @@ class WebFetchTool(Tool):
             "url": {"type": "string", "description": "URL to fetch"},
             "extract_mode": {"type": "string", "enum": ["markdown", "text"], "default": "markdown"},
             "max_chars": {"type": "integer", "minimum": 100},
+            "query": {
+                "type": "string",
+                "description": "Optional query for Tavily query-focused extraction.",
+            },
+            "chunks_per_source": {
+                "type": "integer",
+                "description": "Relevant chunks to return when query is provided.",
+                "minimum": 1,
+                "maximum": 5,
+            },
+            "extract_depth": {
+                "type": "string",
+                "enum": ["basic", "advanced"],
+                "description": "Tavily extraction depth. advanced is slower and costs more.",
+            },
+            "include_images": {
+                "type": "boolean",
+                "description": "Include extracted image URLs.",
+            },
+            "include_favicon": {
+                "type": "boolean",
+                "description": "Include favicon URL.",
+            },
+            "include_usage": {
+                "type": "boolean",
+                "description": "Include Tavily usage metadata.",
+            },
         },
         "required": ["url"],
     }
@@ -300,8 +474,19 @@ class WebFetchTool(Tool):
         return any(ctype_lower.startswith(allowed) for allowed in self._allowed_content_types)
 
     async def execute(
-        self, url: str, extract_mode: str = "markdown", max_chars: int | None = None, **kwargs: Any
+        self,
+        url: str,
+        extract_mode: str = "markdown",
+        max_chars: int | None = None,
+        query: str | None = None,
+        chunks_per_source: int | None = None,
+        extract_depth: str | None = None,
+        include_images: bool | None = None,
+        include_favicon: bool | None = None,
+        include_usage: bool | None = None,
+        **kwargs: Any,
     ) -> str:
+        del kwargs
         logger.info("web_fetch url={!r} mode={}", url, extract_mode)
         if not _rate_limiter.check():
             return json.dumps({"error": "Rate limit exceeded. Try again shortly.", "url": url})
@@ -329,7 +514,17 @@ class WebFetchTool(Tool):
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
         if self.api_key:
             try:
-                result = await self._tavily_extract(url, max_chars)
+                result = await self._tavily_extract(
+                    url,
+                    max_chars,
+                    query=query,
+                    chunks_per_source=chunks_per_source,
+                    extract_depth=extract_depth,
+                    extract_mode=extract_mode,
+                    include_images=include_images,
+                    include_favicon=include_favicon,
+                    include_usage=include_usage,
+                )
                 if result is not None:
                     return result
             except Exception:
@@ -338,12 +533,35 @@ class WebFetchTool(Tool):
         # Fallback: direct fetch with Readability
         return await self._direct_fetch(url, extract_mode, max_chars)
 
-    async def _tavily_extract(self, url: str, max_chars: int) -> str | None:
+    async def _tavily_extract(
+        self,
+        url: str,
+        max_chars: int,
+        *,
+        query: str | None = None,
+        chunks_per_source: int | None = None,
+        extract_depth: str | None = None,
+        extract_mode: str = "markdown",
+        include_images: bool | None = None,
+        include_favicon: bool | None = None,
+        include_usage: bool | None = None,
+    ) -> str | None:
         """Extract content via Tavily Extract API. Returns None on failure."""
+        payload: dict[str, Any] = {"urls": [url]}
+        _add_optional(
+            payload,
+            query=query,
+            chunks_per_source=chunks_per_source,
+            extract_depth=extract_depth,
+            format=extract_mode,
+            include_images=include_images,
+            include_favicon=include_favicon,
+            include_usage=include_usage,
+        )
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 _TAVILY_EXTRACT_URL,
-                json={"urls": [url]},
+                json=payload,
                 headers=_tavily_auth_headers(self.api_key),
                 timeout=30.0,
             )
@@ -530,6 +748,183 @@ class WebFetchTool(Tool):
         text = re.sub(r"</(p|div|section|article)>", "\n\n", text, flags=re.I)
         text = re.sub(r"<(br|hr)\s*/?>", "\n", text, flags=re.I)
         return _normalize(_strip_tags(text))
+
+
+class _TavilySiteTool(Tool):
+    def __init__(self, api_key: str | None = None, web_config: "WebToolsConfig | None" = None):
+        from yeoman_shared.config.schema import WebToolsConfig as WebToolsCfg
+
+        self._config = web_config or WebToolsCfg()
+        self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
+        self._blocked_domains = self._config.blocked_domains
+        self._allowed_domains = self._config.allowed_domains
+        _rate_limiter.configure(self._config.rate_limit_rpm)
+
+    async def _post_site_request(
+        self, endpoint: str, payload: dict[str, Any], timeout: float
+    ) -> str:
+        if not _rate_limiter.check():
+            return json.dumps({"error": "Rate limit exceeded. Try again shortly.", "url": payload.get("url")})
+        if not self.api_key:
+            return json.dumps({"error": "TAVILY_API_KEY not configured", "url": payload.get("url")})
+
+        url = str(payload.get("url") or "")
+        is_valid, error_msg = _validate_url(
+            url,
+            blocked_domains=self._blocked_domains,
+            allowed_domains=self._allowed_domains,
+        )
+        if not is_valid:
+            return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})
+
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                endpoint,
+                json=payload,
+                headers=_tavily_auth_headers(self.api_key),
+                timeout=timeout,
+            )
+            r.raise_for_status()
+        return json.dumps(r.json())
+
+
+class WebMapTool(_TavilySiteTool):
+    """Discover URLs on a website using Tavily Map."""
+
+    name = "web_map"
+    description = (
+        "Map a website with Tavily to discover URLs without extracting page content. "
+        "Use before crawl/extract when you need a site overview or URL list."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Root URL to map"},
+            "instructions": {"type": "string", "description": "Natural language mapping focus"},
+            "max_depth": {"type": "integer", "minimum": 1, "maximum": 5},
+            "max_breadth": {"type": "integer", "minimum": 1, "maximum": 500},
+            "limit": {"type": "integer", "minimum": 1},
+            "select_paths": {"type": "array", "items": {"type": "string"}},
+            "select_domains": {"type": "array", "items": {"type": "string"}},
+            "exclude_paths": {"type": "array", "items": {"type": "string"}},
+            "exclude_domains": {"type": "array", "items": {"type": "string"}},
+            "allow_external": {"type": "boolean"},
+            "timeout": {"type": "number", "minimum": 10, "maximum": 150},
+            "include_usage": {"type": "boolean"},
+        },
+        "required": ["url"],
+    }
+
+    async def execute(
+        self,
+        url: str,
+        instructions: str | None = None,
+        max_depth: int | None = None,
+        max_breadth: int | None = None,
+        limit: int | None = None,
+        select_paths: list[str] | None = None,
+        select_domains: list[str] | None = None,
+        exclude_paths: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+        allow_external: bool | None = None,
+        timeout: float | None = None,
+        include_usage: bool | None = None,
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        logger.info("web_map url={!r} limit={}", url, limit)
+        payload: dict[str, Any] = {"url": url}
+        _add_optional(
+            payload,
+            instructions=instructions,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            select_paths=select_paths,
+            select_domains=select_domains,
+            exclude_paths=exclude_paths,
+            exclude_domains=exclude_domains,
+            allow_external=allow_external,
+            include_usage=include_usage,
+        )
+        return await self._post_site_request(_TAVILY_MAP_URL, payload, timeout or 60.0)
+
+
+class WebCrawlTool(_TavilySiteTool):
+    """Crawl and extract website content using Tavily Crawl."""
+
+    name = "web_crawl"
+    description = (
+        "Crawl a website with Tavily and extract page content. Use for documentation ingestion, "
+        "site research, or focused multi-page extraction. Prefer web_map first for broad sites."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Root URL to crawl"},
+            "instructions": {"type": "string", "description": "Natural language crawl focus"},
+            "chunks_per_source": {"type": "integer", "minimum": 1, "maximum": 5},
+            "max_depth": {"type": "integer", "minimum": 1, "maximum": 5},
+            "max_breadth": {"type": "integer", "minimum": 1, "maximum": 500},
+            "limit": {"type": "integer", "minimum": 1},
+            "select_paths": {"type": "array", "items": {"type": "string"}},
+            "select_domains": {"type": "array", "items": {"type": "string"}},
+            "exclude_paths": {"type": "array", "items": {"type": "string"}},
+            "exclude_domains": {"type": "array", "items": {"type": "string"}},
+            "allow_external": {"type": "boolean"},
+            "include_images": {"type": "boolean"},
+            "extract_depth": {"type": "string", "enum": ["basic", "advanced"]},
+            "format": {"type": "string", "enum": ["markdown", "text"]},
+            "include_favicon": {"type": "boolean"},
+            "timeout": {"type": "number", "minimum": 10, "maximum": 150},
+            "include_usage": {"type": "boolean"},
+        },
+        "required": ["url"],
+    }
+
+    async def execute(
+        self,
+        url: str,
+        instructions: str | None = None,
+        chunks_per_source: int | None = None,
+        max_depth: int | None = None,
+        max_breadth: int | None = None,
+        limit: int | None = None,
+        select_paths: list[str] | None = None,
+        select_domains: list[str] | None = None,
+        exclude_paths: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+        allow_external: bool | None = None,
+        include_images: bool | None = None,
+        extract_depth: str | None = None,
+        format: str | None = None,
+        include_favicon: bool | None = None,
+        timeout: float | None = None,
+        include_usage: bool | None = None,
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        logger.info("web_crawl url={!r} limit={}", url, limit)
+        payload: dict[str, Any] = {"url": url}
+        _add_optional(
+            payload,
+            instructions=instructions,
+            chunks_per_source=chunks_per_source,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            select_paths=select_paths,
+            select_domains=select_domains,
+            exclude_paths=exclude_paths,
+            exclude_domains=exclude_domains,
+            allow_external=allow_external,
+            include_images=include_images,
+            extract_depth=extract_depth,
+            format=format,
+            include_favicon=include_favicon,
+            include_usage=include_usage,
+        )
+        return await self._post_site_request(_TAVILY_CRAWL_URL, payload, timeout or 120.0)
 
 
 class DeepResearchTool(Tool):

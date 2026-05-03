@@ -235,6 +235,54 @@ class SpeakupLog:
             ).fetchone()
         return int(row["c"] if row else 0)
 
+    async def count_sent_since(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        since: datetime,
+    ) -> int:
+        current_since = since
+        if current_since.tzinfo is None:
+            current_since = current_since.replace(tzinfo=UTC)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM speakups
+                WHERE channel = ?
+                  AND chat_id = ?
+                  AND status = 'sent'
+                  AND committed_at >= ?
+                """,
+                (channel, chat_id, current_since.astimezone(UTC).timestamp()),
+            ).fetchone()
+        return int(row["c"] if row else 0)
+
+    async def last_sent_at(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+    ) -> float | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT committed_at
+                FROM speakups
+                WHERE channel = ?
+                  AND chat_id = ?
+                  AND status = 'sent'
+                  AND committed_at IS NOT NULL
+                ORDER BY committed_at DESC
+                LIMIT 1
+                """,
+                (channel, chat_id),
+            ).fetchone()
+        if row is None or row["committed_at"] is None:
+            return None
+        return float(row["committed_at"])
+
     async def history(self, channel: str, chat_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

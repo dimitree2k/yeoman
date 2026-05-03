@@ -11,15 +11,22 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from yeoman_gateway.agent.tools.file_access import FileAccessResolver
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
+
+    from yeoman_gateway.agent.tools.file_access import FileAccessResolver
 
 from yeoman_gateway.agent.tools.exec_isolation import SandboxMount
 from yeoman_gateway.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from yeoman_gateway.agent.tools.ops import OpsTool
 from yeoman_gateway.agent.tools.registry import ToolRegistry
 from yeoman_gateway.agent.tools.shell import ExecTool
-from yeoman_gateway.agent.tools.web import DeepResearchTool, WebFetchTool, WebSearchTool
+from yeoman_gateway.agent.tools.web import (
+    DeepResearchTool,
+    WebCrawlTool,
+    WebFetchTool,
+    WebMapTool,
+    WebSearchTool,
+)
 from yeoman_gateway.bus.events import InboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.providers.base import LLMProvider
@@ -144,6 +151,8 @@ class SubagentManager:
 
         tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
 
         system_prompt = self._build_subagent_prompt(task)
         if memory_context:
@@ -242,6 +251,8 @@ class SubagentManager:
             tools.register(OpsTool())
             tools.register(WebSearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
             tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+            tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
+            tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
             tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
 
             # Build messages with subagent-specific prompt

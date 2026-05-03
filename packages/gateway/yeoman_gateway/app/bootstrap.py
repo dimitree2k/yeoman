@@ -36,13 +36,15 @@ from yeoman_gateway.core.intents import (
 )
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.orchestrator import Orchestrator
-from yeoman_gateway.cron.service import CronService
+from yeoman_gateway.cron.service import CronJobDeferredError, CronJobSkippedError, CronService
 from yeoman_gateway.cron.types import CronJob
+from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
 from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
 from yeoman_gateway.memory import MemoryService
+from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
@@ -547,7 +549,84 @@ def build_gateway_runtime(
         bus=bus,
         speakup_approval_store=speakup_approval_store,
         speakup_log=speakup_log,
+        session_manager=session_manager,
     )
+
+    def _choose_voice_phrase(job: CronJob, phrases: list[str]) -> str:
+        recent = [str(v).strip() for v in job.payload.voice_recent_messages if str(v).strip()]
+        available = [phrase for phrase in phrases if phrase not in set(recent)]
+        pool = available or phrases
+        return random.choice(pool) if job.payload.voice_random else pool[0]
+
+    def _remember_voice_phrase(job: CronJob, content: str) -> None:
+        text = str(content or "").strip()
+        if not text:
+            return
+        recent = [str(v).strip() for v in job.payload.voice_recent_messages if str(v).strip()]
+        recent = [value for value in recent if value != text]
+        recent.append(text)
+        job.payload.voice_recent_messages = recent[-8:]
+
+    def _clean_generated_voice(text: str) -> str:
+        cleaned = " ".join(line.strip() for line in str(text or "").splitlines() if line.strip())
+        cleaned = cleaned.strip().strip('"').strip("'").strip()
+        for prefix in ("Text:", "Voice:", "Nachricht:", "Sprachnachricht:"):
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):].strip()
+        if len(cleaned) > 360:
+            return ""
+        return cleaned
+
+    async def _generate_voice_phrase(
+        job: CronJob,
+        *,
+        channel: str,
+        chat_id: str,
+        fallback_phrases: list[str],
+    ) -> str:
+        fallback = _choose_voice_phrase(job, fallback_phrases)
+        if not job.payload.voice_generate:
+            return fallback
+
+        recent = [str(v).strip() for v in job.payload.voice_recent_messages if str(v).strip()]
+        recent_block = "\n".join(f"- {value}" for value in recent[-8:]) or "- none"
+        default_prompt = (
+            "Write one fresh German WhatsApp voice-note line for Arvid in Finanzgruppe. "
+            "It is a quiet weekly morning ritual, not a reply to the current chat. "
+            "Make it lightly funny, concise, and natural. Max two short sentences. "
+            "Do not ask a question. Do not use a visible label. Return only the line."
+        )
+        prompt = (
+            f"{job.payload.voice_prompt or default_prompt}\n\n"
+            "Avoid repeating or closely paraphrasing these previous weekly voice lines:\n"
+            f"{recent_block}"
+        )
+        persona_text = None
+        model_profile = job.payload.model_profile
+        if policy_engine is not None:
+            resolved = policy_engine.resolve_policy(channel, chat_id)
+            persona_text = load_persona_text(resolved.persona_file, Path(workspace))
+            model_profile = model_profile or resolved.model_profile
+
+        try:
+            generated = await responder.process_direct(
+                prompt,
+                session_key=f"cron:{job.id}:voice-generate:{int(time.time())}",
+                channel=channel,
+                chat_id=chat_id,
+                allowed_tools=set(),
+                persona_text=persona_text,
+                is_owner=True,
+                model_profile=model_profile,
+            )
+        except Exception as exc:
+            logger.warning("Cron voice generation failed for {}: {}", job.id, exc)
+            return fallback
+
+        cleaned = _clean_generated_voice(generated)
+        if not cleaned or cleaned in set(recent):
+            return fallback
+        return cleaned
 
     async def on_cron_job(job: CronJob) -> str | None:
         if job.payload.kind == "voice_broadcast":
@@ -557,7 +636,42 @@ def build_gateway_runtime(
             if not phrases:
                 raise ValueError("voice_broadcast job has no message candidates")
 
-            content = random.choice(phrases) if job.payload.voice_random else phrases[0]
+            voice_channel = str(job.payload.voice_channel or "").strip() or "whatsapp"
+            if str(job.payload.voice_group or "").strip():
+                if voice_channel != "whatsapp":
+                    raise ValueError("voice_broadcast group targets require WhatsApp")
+                chat_target, err = policy_adapter.resolve_whatsapp_group(
+                    str(job.payload.voice_group).strip()
+                )
+                if err is not None or not chat_target:
+                    raise ValueError(err or "failed to resolve voice_broadcast group")
+            else:
+                chat_target = (
+                    str(job.payload.voice_chat_id or "").strip()
+                    or str(job.payload.to or "").strip()
+                )
+                if not chat_target:
+                    raise ValueError("voice_broadcast job has no target chat")
+
+            quiet = evaluate_voice_quiet_gate(
+                payload=job.payload,
+                inbound_archive=inbound_archive,
+                channel=voice_channel,
+                chat_id=chat_target,
+                now=datetime.now(UTC).astimezone(),
+            )
+            if quiet.status == "defer":
+                retry_at_ms = quiet.retry_at_ms or int((time.time() + 1800) * 1000)
+                raise CronJobDeferredError(quiet.reason, retry_at_ms=retry_at_ms)
+            if quiet.status == "skip":
+                raise CronJobSkippedError(quiet.reason)
+
+            content = await _generate_voice_phrase(
+                job,
+                channel=voice_channel,
+                chat_id=chat_target,
+                fallback_phrases=phrases,
+            )
             args: dict[str, object] = {"content": content}
             if job.payload.voice_verbatim:
                 args["verbatim"] = True
@@ -570,22 +684,16 @@ def build_gateway_runtime(
             if job.payload.voice_max_chars is not None:
                 args["max_chars"] = int(job.payload.voice_max_chars)
 
-            voice_channel = str(job.payload.voice_channel or "").strip() or "whatsapp"
             args["channel"] = voice_channel
             if str(job.payload.voice_group or "").strip():
                 args["group"] = str(job.payload.voice_group).strip()
             else:
-                chat_target = (
-                    str(job.payload.voice_chat_id or "").strip()
-                    or str(job.payload.to or "").strip()
-                )
-                if not chat_target:
-                    raise ValueError("voice_broadcast job has no target chat")
                 args["chat_id"] = chat_target
 
             result = await responder.tools.execute("send_voice", args)
             if str(result).startswith("Error:"):
                 raise RuntimeError(str(result))
+            _remember_voice_phrase(job, content)
             return str(result)
 
         response = await responder.process_direct(
@@ -819,7 +927,12 @@ def build_gateway_runtime(
                 target_channel=channel,
                 target_chat_id=chat_id,
             ),
-            is_eligible=consciousness_tools.is_chat_eligible,
+            is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
+                channel,
+                chat_id,
+                trigger="burst",
+            ),
+            session_manager=session_manager,
         )
         bus.subscribe_event("InboundObservedEvent", burst_observer.handle)
 
@@ -832,7 +945,12 @@ def build_gateway_runtime(
                     target_channel=channel,
                     target_chat_id=chat_id,
                 ),
-                is_eligible=consciousness_tools.is_chat_eligible,
+                is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
+                    channel,
+                    chat_id,
+                    trigger="lull",
+                ),
+                session_manager=session_manager,
             )
             bus.subscribe_event("InboundObservedEvent", lull_observer.handle)
 

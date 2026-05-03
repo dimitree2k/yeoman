@@ -76,6 +76,7 @@ def _event(
     at: datetime,
     chat_id: str = "group@g.us",
     sender_id: str = "user@s.whatsapp.net",
+    content: str = "message",
     mentioned_bot: bool = False,
     reply_to_bot: bool = False,
     from_me: bool = False,
@@ -84,7 +85,7 @@ def _event(
         channel="whatsapp",
         chat_id=chat_id,
         sender_id=sender_id,
-        content="message",
+        content=content,
         timestamp=at.timestamp(),
         is_group=True,
         metadata={
@@ -110,6 +111,23 @@ async def test_burst_observer_fires_only_after_threshold_inside_window(tmp_path:
     await observer.handle(_event(at=base + timedelta(minutes=9)))
     await observer.handle(_event(at=base + timedelta(minutes=11)))
     await observer.handle(_event(at=base + timedelta(minutes=12)))
+
+    assert calls == [("whatsapp", "group@g.us")]
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_clears_window_after_fire(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    observer = BurstObserver(
+        config=_config(defaultDailyCap=3),
+        state_path=tmp_path / "burst.json",
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    for index in range(4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
 
     assert calls == [("whatsapp", "group@g.us")]
 
@@ -147,6 +165,84 @@ async def test_burst_observer_ignores_direct_bot_interaction_messages(tmp_path: 
     await observer.handle(_event(at=base + timedelta(minutes=2), from_me=True))
     await observer.handle(_event(at=base + timedelta(minutes=3)))
     await observer.handle(_event(at=base + timedelta(minutes=4)))
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_suppresses_window_after_direct_bot_interaction(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    observer = BurstObserver(
+        config=_config(burstThresholdMessages=3, burstWindowMinutes=10),
+        state_path=tmp_path / "burst.json",
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    await observer.handle(_event(at=base, mentioned_bot=True))
+    for index in range(1, 4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_suppresses_plain_name_interaction_window(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    observer = BurstObserver(
+        config=_config(burstThresholdMessages=3, burstWindowMinutes=10),
+        state_path=tmp_path / "burst.json",
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+    )
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+
+    await observer.handle(_event(at=base, content="Arvid kannst du Nokia checken"))
+    for index in range(1, 4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_burst_observer_suppresses_recent_assistant_followup_window(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    base = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+    assistant_wall_time = datetime.fromtimestamp(base.timestamp()) - timedelta(seconds=5)
+
+    class _Sessions:
+        def get_or_create(self, key: str) -> object:
+            assert key == "whatsapp:group@g.us"
+
+            class _Session:
+                messages = [
+                    {
+                        "role": "assistant",
+                        "content": "Nokia ist kurzfristig newsgetrieben.",
+                        "timestamp": assistant_wall_time.isoformat(),
+                    }
+                ]
+
+            return _Session()
+
+    observer = BurstObserver(
+        config=_config(burstThresholdMessages=3, burstWindowMinutes=10),
+        state_path=tmp_path / "burst.json",
+        on_burst=lambda channel, chat_id: calls.append((channel, chat_id)),
+        is_eligible=lambda channel, chat_id: True,
+        session_manager=_Sessions(),
+    )
+
+    await observer.handle(_event(at=base, content="was meinst du bei Intel"))
+    for index in range(1, 4):
+        await observer.handle(_event(at=base + timedelta(minutes=index)))
 
     assert calls == []
 
@@ -407,6 +503,174 @@ async def test_burst_tick_keeps_daily_cap_rail(tmp_path: Path) -> None:
 
     assert result == {"status": "rejected", "reason": "daily_cap_reached"}
     assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_dynamic_budget_allows_extra_slot_after_base_cap(tmp_path: Path) -> None:
+    cfg = _config(
+        dynamicDailyCapEnabled=True,
+        dynamicDailyCapMax=2,
+        minSpeakupGapMinutes=45,
+        dynamicDailyCapMinConfidence=0.9,
+    )
+    bus = MessageBus()
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await log.record_sent(
+        proposal_id="existing",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        action_type="observation",
+        profile="balanced",
+        message="already sent",
+        trigger="burst",
+        context_snapshot={},
+        now=datetime(2026, 4, 26, 12, 0, tzinfo=UTC).timestamp(),
+    )
+    tools = ConsciousnessTools(
+        config=cfg,
+        policy_engine=PolicyEngine(_policy(daily_cap=1), workspace=tmp_path),
+        bus=bus,
+        log=log,
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=None,
+        security=_FakeSecurity(),
+        approval_store=SpeakupApprovalStore(tmp_path / "pending_approvals.json"),
+        now=lambda: datetime(2026, 4, 26, 13, 0, tzinfo=UTC),
+    )
+
+    async def planner(prompt: str) -> dict[str, object]:
+        assert '"base_daily_cap": 1' in prompt
+        assert '"daily_cap": 2' in prompt
+        return {
+            "chat_id": "group@g.us",
+            "message": "extra slot",
+            "action_type": "observation",
+            "confidence": 0.95,
+        }
+
+    service = ConsciousnessService(
+        config=cfg,
+        agent=ConsciousnessAgent(tools=tools, planner=planner),
+    )
+
+    result = await service.tick_once(
+        trigger="lull",
+        target_channel="whatsapp",
+        target_chat_id="group@g.us",
+    )
+
+    assert result["status"] == "queued_for_approval"
+    assert bus.outbound_size == 1
+
+
+@pytest.mark.asyncio
+async def test_dynamic_budget_blocks_recent_speakup_cooldown(tmp_path: Path) -> None:
+    cfg = _config(
+        dynamicDailyCapEnabled=True,
+        dynamicDailyCapMax=2,
+        minSpeakupGapMinutes=45,
+    )
+    bus = MessageBus()
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await log.record_sent(
+        proposal_id="existing",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        action_type="observation",
+        profile="balanced",
+        message="recently sent",
+        trigger="burst",
+        context_snapshot={},
+        now=datetime(2026, 4, 26, 12, 30, tzinfo=UTC).timestamp(),
+    )
+    tools = ConsciousnessTools(
+        config=cfg,
+        policy_engine=PolicyEngine(_policy(daily_cap=1), workspace=tmp_path),
+        bus=bus,
+        log=log,
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=None,
+        security=_FakeSecurity(),
+        approval_store=SpeakupApprovalStore(tmp_path / "pending_approvals.json"),
+        now=lambda: datetime(2026, 4, 26, 13, 0, tzinfo=UTC),
+    )
+
+    async def planner(prompt: str) -> dict[str, object]:
+        del prompt
+        return {
+            "chat_id": "group@g.us",
+            "message": "too soon",
+            "action_type": "observation",
+            "confidence": 0.95,
+        }
+
+    service = ConsciousnessService(
+        config=cfg,
+        agent=ConsciousnessAgent(tools=tools, planner=planner),
+    )
+
+    result = await service.tick_once(
+        trigger="lull",
+        target_channel="whatsapp",
+        target_chat_id="group@g.us",
+    )
+
+    assert result == {"status": "rejected", "reason": "recent_speakup_cooldown"}
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_preflight_uses_explicit_burst_window(tmp_path: Path) -> None:
+    cfg = _config(
+        dynamicDailyCapEnabled=True,
+        dynamicDailyCapMax=2,
+        dynamicDailyCapMinActivityMessages=2,
+        burstWindowMinutes=10,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await log.record_sent(
+        proposal_id="existing",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        action_type="observation",
+        profile="balanced",
+        message="base cap spent",
+        trigger="burst",
+        context_snapshot={},
+        now=datetime(2026, 4, 26, 10, 0, tzinfo=UTC).timestamp(),
+    )
+    now = datetime(2026, 4, 26, 12, 0, tzinfo=UTC)
+    archive = InboundArchive(tmp_path / "inbound.db")
+    for index in range(2):
+        archive.record_inbound(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            message_id=f"old-{index}",
+            participant="user@s.whatsapp.net",
+            sender_id="user@s.whatsapp.net",
+            text="outside burst window",
+            timestamp=int((now - timedelta(minutes=60 + index)).timestamp()),
+            sender_name="User",
+        )
+    tools = ConsciousnessTools(
+        config=cfg,
+        policy_engine=PolicyEngine(_policy(daily_cap=1), workspace=tmp_path),
+        bus=MessageBus(),
+        log=log,
+        inbound_archive=archive,
+        memory=None,
+        security=_FakeSecurity(),
+        approval_store=SpeakupApprovalStore(tmp_path / "pending_approvals.json"),
+        now=lambda: now,
+    )
+
+    allowed = await tools.is_chat_within_opportunity_budget(
+        "whatsapp",
+        "group@g.us",
+        trigger="burst",
+    )
+
+    assert allowed is False
 
 
 @pytest.mark.asyncio

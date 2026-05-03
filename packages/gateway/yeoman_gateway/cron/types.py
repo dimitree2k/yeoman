@@ -38,6 +38,13 @@ class CronPayload:
     voice_verbatim: bool = True
     voice_max_sentences: int | None = None
     voice_max_chars: int | None = None
+    voice_wait_for_quiet: bool = False
+    voice_quiet_minutes: int | None = None
+    voice_retry_minutes: int | None = None
+    voice_window_end: str | None = None
+    voice_generate: bool = False
+    voice_prompt: str | None = None
+    voice_recent_messages: list[str] = field(default_factory=list)
     # Model profile override (e.g. "overseerDefault" to use a cheaper model)
     model_profile: str | None = None
     # Workflow chaining

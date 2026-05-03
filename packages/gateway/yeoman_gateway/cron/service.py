@@ -39,6 +39,23 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     return None
 
 
+class CronJobDeferredError(Exception):
+    """Signal that a due job should retry at a concrete timestamp."""
+
+    def __init__(self, reason: str, *, retry_at_ms: int) -> None:
+        super().__init__(reason)
+        self.reason = str(reason or "deferred")
+        self.retry_at_ms = int(retry_at_ms)
+
+
+class CronJobSkippedError(Exception):
+    """Signal that a due job intentionally skipped this occurrence."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = str(reason or "skipped")
+
+
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
@@ -96,6 +113,17 @@ class CronService:
                             voice_verbatim=bool(j["payload"].get("voiceVerbatim", True)),
                             voice_max_sentences=j["payload"].get("voiceMaxSentences"),
                             voice_max_chars=j["payload"].get("voiceMaxChars"),
+                            voice_wait_for_quiet=bool(
+                                j["payload"].get("voiceWaitForQuiet", False)
+                            ),
+                            voice_quiet_minutes=j["payload"].get("voiceQuietMinutes"),
+                            voice_retry_minutes=j["payload"].get("voiceRetryMinutes"),
+                            voice_window_end=j["payload"].get("voiceWindowEnd"),
+                            voice_generate=bool(j["payload"].get("voiceGenerate", False)),
+                            voice_prompt=j["payload"].get("voicePrompt"),
+                            voice_recent_messages=list(
+                                j["payload"].get("voiceRecentMessages", []) or []
+                            ),
                             model_profile=j["payload"].get("modelProfile"),
                             next_job_id=j["payload"].get("nextJobId"),
                             requires_approval=bool(j["payload"].get("requiresApproval", False)),
@@ -161,6 +189,13 @@ class CronService:
                         "voiceVerbatim": j.payload.voice_verbatim,
                         "voiceMaxSentences": j.payload.voice_max_sentences,
                         "voiceMaxChars": j.payload.voice_max_chars,
+                        "voiceWaitForQuiet": j.payload.voice_wait_for_quiet,
+                        "voiceQuietMinutes": j.payload.voice_quiet_minutes,
+                        "voiceRetryMinutes": j.payload.voice_retry_minutes,
+                        "voiceWindowEnd": j.payload.voice_window_end,
+                        "voiceGenerate": j.payload.voice_generate,
+                        "voicePrompt": j.payload.voice_prompt,
+                        "voiceRecentMessages": list(j.payload.voice_recent_messages),
                         "modelProfile": j.payload.model_profile,
                         "nextJobId": j.payload.next_job_id,
                         "requiresApproval": j.payload.requires_approval,
@@ -322,6 +357,25 @@ class CronService:
             job.state.last_error = None
             logger.info(f"Cron: job '{job.name}' completed")
 
+        except CronJobDeferredError as e:
+            job.state.last_status = "skipped"
+            job.state.last_error = e.reason
+            job.state.last_run_at_ms = start_ms
+            job.state.next_run_at_ms = e.retry_at_ms
+            job.updated_at_ms = _now_ms()
+            logger.info(
+                "Cron: job '{}' deferred until {} ({})",
+                job.name,
+                e.retry_at_ms,
+                e.reason,
+            )
+            return
+
+        except CronJobSkippedError as e:
+            job.state.last_status = "skipped"
+            job.state.last_error = e.reason
+            logger.info("Cron: job '{}' skipped ({})", job.name, e.reason)
+
         except Exception as e:
             job.state.last_status = "error"
             job.state.last_error = str(e)
@@ -406,6 +460,12 @@ class CronService:
         verbatim: bool = True,
         max_sentences: int | None = None,
         max_chars: int | None = None,
+        wait_for_quiet: bool = False,
+        quiet_minutes: int | None = None,
+        retry_minutes: int | None = None,
+        window_end: str | None = None,
+        generate: bool = False,
+        prompt: str | None = None,
         delete_after_run: bool = False,
     ) -> CronJob:
         """Add a new voice broadcast cron job."""
@@ -436,6 +496,12 @@ class CronService:
                 voice_verbatim=bool(verbatim),
                 voice_max_sentences=max_sentences,
                 voice_max_chars=max_chars,
+                voice_wait_for_quiet=bool(wait_for_quiet),
+                voice_quiet_minutes=quiet_minutes,
+                voice_retry_minutes=retry_minutes,
+                voice_window_end=str(window_end or "").strip() or None,
+                voice_generate=bool(generate),
+                voice_prompt=str(prompt or "").strip() or None,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

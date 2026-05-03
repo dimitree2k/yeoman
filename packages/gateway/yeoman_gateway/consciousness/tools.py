@@ -98,9 +98,26 @@ class ConsciousnessTools:
     def current_trigger(self) -> str:
         return self._trigger
 
-    def _chat_window_since_for_trigger(self) -> datetime:
+    async def is_chat_within_opportunity_budget(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        trigger: str | None = None,
+    ) -> bool:
+        eligible = self._resolve_eligible(chat_id, channel=channel)
+        if not isinstance(eligible, EligibleChat):
+            return False
+        budget = await self._evaluate_opportunity_budget(
+            eligible,
+            trigger=trigger or self._trigger,
+        )
+        return bool(budget["allowed"])
+
+    def _chat_window_since_for_trigger(self, *, trigger: str | None = None) -> datetime:
         now = self._now()
-        if self._trigger == "burst":
+        active_trigger = trigger or self._trigger
+        if active_trigger == "burst":
             return now - timedelta(
                 minutes=max(1, int(self.config.consciousness.burst_window_minutes))
             )
@@ -159,6 +176,7 @@ class ConsciousnessTools:
         n: int = 20,
         *,
         channel: str | None = None,
+        trigger: str | None = None,
     ) -> dict[str, object]:
         eligible = self._resolve_eligible(chat_id, channel=channel)
         if eligible == "ambiguous_chat_id":
@@ -166,7 +184,7 @@ class ConsciousnessTools:
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible", "messages": []}
         now = self._now()
-        since = self._chat_window_since_for_trigger()
+        since = self._chat_window_since_for_trigger(trigger=trigger)
         rows = self.inbound_archive.lookup_messages_in_range(
             eligible.channel,
             eligible.chat_id,
@@ -286,16 +304,19 @@ class ConsciousnessTools:
             return {"status": "rejected", "reason": "ambiguous_chat_id"}
         if eligible is None:
             return {"status": "rejected", "reason": "chat_not_eligible"}
-        sent_today = await self.log.count_sent_today(
-            channel=eligible.channel,
-            chat_id=eligible.chat_id,
-            now=self._now(),
+        budget = await self._evaluate_opportunity_budget(
+            eligible,
+            trigger=self._trigger,
         )
         return {
             "status": "ok",
-            "daily_cap": eligible.daily_cap,
-            "sent_today": sent_today,
-            "daily_remaining": max(0, eligible.daily_cap - sent_today),
+            "daily_cap": budget["effective_daily_cap"],
+            "base_daily_cap": budget["base_daily_cap"],
+            "max_daily_cap": budget["max_daily_cap"],
+            "sent_today": budget["sent_today"],
+            "daily_remaining": budget["daily_remaining"],
+            "budget_allowed": budget["allowed"],
+            "budget_reason": budget["reason"],
         }
 
     async def propose_speakup(
@@ -376,14 +397,15 @@ class ConsciousnessTools:
             if eligible is None:
                 await self.log.mark_rejected(proposal.proposal_id, reason="chat_not_eligible")
                 return {"status": "rejected", "reason": "chat_not_eligible"}
-            sent_today = await self.log.count_sent_today(
-                channel=proposal.channel,
-                chat_id=proposal.chat_id,
-                now=self._now(),
+            budget = await self._evaluate_opportunity_budget(
+                eligible,
+                trigger=proposal.trigger,
+                confidence=proposal.confidence,
             )
-            if sent_today >= eligible.daily_cap:
-                await self.log.mark_rejected(proposal.proposal_id, reason="daily_cap_reached")
-                return {"status": "rejected", "reason": "daily_cap_reached"}
+            if not budget["allowed"]:
+                reason = str(budget["reason"])
+                await self.log.mark_rejected(proposal.proposal_id, reason=reason)
+                return {"status": "rejected", "reason": reason}
 
             if eligible.is_group and eligible.preview == "owner_dm":
                 if self.approval_store is None:
@@ -509,6 +531,98 @@ class ConsciousnessTools:
             now=self._now().timestamp(),
         )
         return {"status": "silent_pass", "entry_id": entry_id, "reason": reason}
+
+    async def _evaluate_opportunity_budget(
+        self,
+        eligible: EligibleChat,
+        *,
+        trigger: str,
+        confidence: float | None = None,
+    ) -> dict[str, object]:
+        sent_today = await self.log.count_sent_today(
+            channel=eligible.channel,
+            chat_id=eligible.chat_id,
+            now=self._now(),
+        )
+        base_cap = max(0, int(eligible.daily_cap))
+        cfg = self.config.consciousness
+        dynamic_enabled = bool(cfg.dynamic_daily_cap_enabled)
+        max_cap = base_cap
+        if dynamic_enabled:
+            max_cap = max(base_cap, int(cfg.dynamic_daily_cap_max))
+        effective_cap = max_cap if dynamic_enabled else base_cap
+
+        def result(allowed: bool, reason: str, cap: int = effective_cap) -> dict[str, object]:
+            return {
+                "allowed": allowed,
+                "reason": reason,
+                "sent_today": sent_today,
+                "base_daily_cap": base_cap,
+                "max_daily_cap": max_cap,
+                "effective_daily_cap": cap,
+                "daily_remaining": max(0, cap - sent_today),
+            }
+
+        if max_cap <= 0:
+            return result(False, "daily_cap_disabled", cap=0)
+        if sent_today >= max_cap:
+            reason = "dynamic_daily_cap_reached" if dynamic_enabled else "daily_cap_reached"
+            return result(False, reason)
+
+        gap_minutes = int(cfg.min_speakup_gap_minutes)
+        if gap_minutes > 0:
+            last_sent_at = await self.log.last_sent_at(
+                channel=eligible.channel,
+                chat_id=eligible.chat_id,
+            )
+            if last_sent_at is not None:
+                age_seconds = self._now().timestamp() - last_sent_at
+                if age_seconds < gap_minutes * 60:
+                    return result(False, "recent_speakup_cooldown")
+
+        if trigger == "burst" and int(cfg.burst_max_per_window) > 0:
+            recent_sent = await self.log.count_sent_since(
+                channel=eligible.channel,
+                chat_id=eligible.chat_id,
+                since=self._now()
+                - timedelta(minutes=max(1, int(cfg.burst_window_minutes))),
+            )
+            if recent_sent >= int(cfg.burst_max_per_window):
+                return result(False, "burst_window_cap_reached")
+
+        if not dynamic_enabled:
+            if sent_today >= base_cap:
+                return result(False, "daily_cap_reached")
+            return result(True, "base_daily_cap_available")
+
+        reserved_slots = min(max(0, int(cfg.reserved_daily_slots)), base_cap)
+        reserve_until_hour = int(cfg.reserve_daily_slots_until_hour)
+        if (
+            reserved_slots
+            and self._now().hour < reserve_until_hour
+            and sent_today >= max(0, base_cap - reserved_slots)
+        ):
+            return result(False, "reserved_daily_slot", cap=max(0, base_cap - reserved_slots))
+
+        if sent_today < base_cap:
+            return result(True, "base_daily_cap_available")
+
+        if confidence is not None and confidence < float(cfg.dynamic_daily_cap_min_confidence):
+            return result(False, "dynamic_confidence_too_low")
+
+        if trigger == "burst":
+            window = await self.read_chat_window(
+                eligible.chat_id,
+                n=max(1, int(cfg.dynamic_daily_cap_min_activity_messages)),
+                channel=eligible.channel,
+                trigger=trigger,
+            )
+            messages = window.get("messages")
+            recent_activity = len(messages) if isinstance(messages, list) else 0
+            if recent_activity < int(cfg.dynamic_daily_cap_min_activity_messages):
+                return result(False, "dynamic_activity_too_low")
+
+        return result(True, "dynamic_extra_slot_available")
 
     def _render_quoted_preview(self, proposal: SpeakupProposal) -> str | None:
         if not proposal.reply_to_message_id:

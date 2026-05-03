@@ -538,6 +538,82 @@ class MemoryStore:
             self._conn.commit()
             return cursor.rowcount
 
+    def get_node(self, entry_id: str, *, workspace_id: str) -> MemoryEntry | None:
+        """Return one active entry by ID."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT *
+                FROM memory2_nodes
+                WHERE id = ? AND workspace_id = ? AND is_deleted = 0
+                LIMIT 1
+                """,
+                (entry_id, workspace_id),
+            ).fetchone()
+        return self._row_to_entry(row) if row is not None else None
+
+    def update_node_meta(
+        self,
+        entry_id: str,
+        *,
+        workspace_id: str,
+        meta_json: str,
+    ) -> MemoryEntry | None:
+        """Update metadata for one active entry and return the updated row."""
+        now_iso = datetime.now(UTC).isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory2_nodes
+                SET meta_json = ?, updated_at = ?
+                WHERE id = ? AND workspace_id = ? AND is_deleted = 0
+                """,
+                (meta_json, now_iso, entry_id, workspace_id),
+            )
+            if cursor.rowcount <= 0:
+                self._conn.commit()
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM memory2_nodes WHERE id = ? AND workspace_id = ? LIMIT 1",
+                (entry_id, workspace_id),
+            ).fetchone()
+            self._conn.commit()
+        return self._row_to_entry(row) if row is not None else None
+
+    def list_nodes_for_disclosure_backfill(
+        self,
+        *,
+        workspace_id: str | None,
+        only_missing: bool = True,
+        limit: int | None = None,
+    ) -> list[MemoryEntry]:
+        """Return active entries eligible for disclosure metadata backfill."""
+        where = ["is_deleted = 0"]
+        params: list[object] = []
+        if workspace_id is not None:
+            where.append("workspace_id = ?")
+            params.append(workspace_id)
+        if only_missing:
+            where.append(
+                "("
+                "meta_json IS NULL OR meta_json = '{}' "
+                "OR (meta_json NOT LIKE '%\"sensitivity\"%' "
+                "AND meta_json NOT LIKE '%\"topics\"%' "
+                "AND meta_json NOT LIKE '%\"disclosure_mode\"%')"
+                ")"
+            )
+        sql = (
+            "SELECT * FROM memory2_nodes "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY updated_at ASC, id ASC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
     def distinct_scope_keys(self, workspace_id: str) -> list[str]:
         """Return all distinct scope_keys for a workspace (active entries only)."""
         with self._lock:

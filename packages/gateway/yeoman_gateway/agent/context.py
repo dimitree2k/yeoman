@@ -367,6 +367,7 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
     ) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
         text_with_context = self._with_reply_context(text, metadata)
+        text_with_context = self._with_conversation_state(text_with_context, metadata)
         text_with_context = self._with_input_modality_context(text_with_context, metadata)
         text_with_context = self._with_voice_reply_guidance(text_with_context, metadata)
         if not media:
@@ -425,6 +426,45 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
             "instruction: Keep the answer naturally short, complete, and direct for a voice note.\n"
         )
         return f"{prefix}\n{text}"
+
+    def _with_conversation_state(self, text: str, metadata: dict[str, Any] | None) -> str:
+        """Append deterministic conversation-state guidance from the pipeline."""
+        if not metadata:
+            return text
+        raw_state = metadata.get("conversation_state")
+        if not isinstance(raw_state, dict):
+            return text
+
+        address_mode = str(raw_state.get("address_mode") or "none").strip() or "none"
+        preferred_action = (
+            str(raw_state.get("preferred_action") or "answer").strip() or "answer"
+        )
+        answer_shape = str(raw_state.get("answer_shape") or "short_take").strip() or "short_take"
+        room_mode = str(raw_state.get("room_mode") or "ambient").strip() or "ambient"
+        addressed = "true" if bool(raw_state.get("addressed_to_bot")) else "false"
+
+        guidance = "Use normal judgment."
+        if answer_shape == "repair":
+            guidance = "Acknowledge the problem briefly, then correct the answer."
+        elif address_mode == "recent_assistant_followup":
+            guidance = "Treat this as a continuation of your immediately previous answer."
+        elif answer_shape == "one_liner":
+            guidance = "Answer in one compact line unless a necessary caveat is missing."
+        elif answer_shape == "researched_answer":
+            guidance = "Use available tools for current factual claims before answering."
+        elif preferred_action == "react":
+            guidance = "A text answer is probably unnecessary; keep any answer extremely short."
+
+        lines = [
+            "[Conversation State]",
+            f"addressed_to_bot: {addressed}",
+            f"address_mode: {address_mode}",
+            f"preferred_action: {preferred_action}",
+            f"answer_shape: {answer_shape}",
+            f"room_mode: {room_mode}",
+            f"guidance: {guidance}",
+        ]
+        return f"{text}\n\n" + "\n".join(lines)
 
     def _with_reply_context(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append compact reply metadata so models can resolve quoted-message intent."""

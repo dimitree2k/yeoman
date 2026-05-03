@@ -14,6 +14,10 @@ from yeoman_shared.config.schema import Config
 from yeoman_shared.utils.helpers import ensure_dir
 
 from yeoman_gateway.bus.events import GatewayEvent, InboundObservedEvent
+from yeoman_gateway.implicit_addressing import (
+    SessionManagerLike,
+    is_direct_bot_interaction,
+)
 
 BurstCallback = Callable[[str, str], None | Awaitable[None]]
 EligibilityCallback = Callable[[str, str], bool | Awaitable[bool]]
@@ -29,12 +33,15 @@ class BurstObserver:
         state_path: Path,
         on_burst: BurstCallback,
         is_eligible: EligibilityCallback | None = None,
+        session_manager: SessionManagerLike | None = None,
     ) -> None:
         self._config = config
         self._state_path = state_path.expanduser()
         self._on_burst = on_burst
         self._is_eligible = is_eligible
+        self._session_manager = session_manager
         self._windows: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+        self._last_direct_bot_interaction: dict[tuple[str, str], float] = {}
         self._fires_today: dict[str, dict[str, object]] = self._load_state()
 
     async def handle(self, event: GatewayEvent) -> None:
@@ -46,17 +53,32 @@ class BurstObserver:
         chat_id = str(event.chat_id or "").strip()
         if not channel or not chat_id:
             return
+        key = (channel, chat_id)
+        event_ts = float(event.timestamp)
         if self._is_direct_bot_interaction(event):
+            self._windows.pop(key, None)
+            self._last_direct_bot_interaction[key] = event_ts
             return
+        window_seconds = self._config.consciousness.burst_window_minutes * 60
+        direct_ts = self._last_direct_bot_interaction.get(key)
+        if direct_ts is not None:
+            if direct_ts >= event_ts - window_seconds:
+                self._windows.pop(key, None)
+                logger.debug(
+                    "burst observer suppressing channel={} chat={} after direct bot interaction",
+                    channel,
+                    chat_id,
+                )
+                return
+            self._last_direct_bot_interaction.pop(key, None)
         if not await self._eligible(channel, chat_id):
             return
 
-        key = (channel, chat_id)
-        cutoff = float(event.timestamp) - (self._config.consciousness.burst_window_minutes * 60)
+        cutoff = event_ts - window_seconds
         window = self._windows[key]
         while window and window[0] < cutoff:
             window.popleft()
-        window.append(float(event.timestamp))
+        window.append(event_ts)
         threshold = self._config.consciousness.burst_threshold_messages
         if len(window) < threshold:
             logger.debug(
@@ -70,7 +92,7 @@ class BurstObserver:
 
         day = datetime.fromtimestamp(float(event.timestamp), UTC).date().isoformat()
         state_key = self._state_key(channel, chat_id)
-        cap = max(0, int(self._config.consciousness.default_daily_cap))
+        cap = self._observer_daily_cap()
         count_today = self._count_for_day(state_key, day)
         if cap and count_today >= cap:
             logger.info(
@@ -95,9 +117,11 @@ class BurstObserver:
         )
         raw = self._on_burst(channel, chat_id)
         if inspect.isawaitable(raw):
-            await raw
-        self._increment_for_day(state_key, day)
-        self._save_state()
+            raw = await raw
+        window.clear()
+        if self._should_count_fire(raw):
+            self._increment_for_day(state_key, day)
+            self._save_state()
 
     async def _eligible(self, channel: str, chat_id: str) -> bool:
         if self._is_eligible is None:
@@ -168,17 +192,25 @@ class BurstObserver:
     def _state_key(channel: str, chat_id: str) -> str:
         return f"{channel}:{chat_id}"
 
+    def _observer_daily_cap(self) -> int:
+        base_cap = max(0, int(self._config.consciousness.default_daily_cap))
+        if not self._config.consciousness.dynamic_daily_cap_enabled:
+            return base_cap
+        return max(base_cap, int(self._config.consciousness.dynamic_daily_cap_max))
+
     @staticmethod
-    def _is_direct_bot_interaction(event: InboundObservedEvent) -> bool:
-        metadata = event.metadata
-        return any(
-            bool(metadata.get(key))
-            for key in (
-                "mentioned_bot",
-                "mentionedBot",
-                "reply_to_bot",
-                "replyToBot",
-                "from_me",
-                "fromMe",
-            )
+    def _should_count_fire(result: object) -> bool:
+        if not isinstance(result, dict):
+            return True
+        return result.get("status") in {"sent", "queued_for_approval"}
+
+    def _is_direct_bot_interaction(self, event: InboundObservedEvent) -> bool:
+        return is_direct_bot_interaction(
+            session_manager=self._session_manager,
+            channel=str(event.channel or ""),
+            chat_id=str(event.chat_id or ""),
+            event_time=datetime.fromtimestamp(float(event.timestamp), UTC),
+            content=str(event.content or ""),
+            metadata=dict(event.metadata or {}),
+            followup_window_seconds=10.0,
         )
