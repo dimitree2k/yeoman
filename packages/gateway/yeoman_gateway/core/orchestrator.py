@@ -27,6 +27,7 @@ from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddlewar
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
 from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
+from yeoman_gateway.pipeline.persona_evolution_approval import PersonaEvolutionApprovalMiddleware
 from yeoman_gateway.pipeline.policy import PolicyMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.pipeline.responder import ResponderMiddleware
@@ -82,6 +83,8 @@ class Orchestrator:
         bus: "MessageBus | None" = None,
         speakup_approval_store: "SpeakupApprovalStore | None" = None,
         speakup_log: "SpeakupLog | None" = None,
+        persona_evolution_workspace: Path | None = None,
+        persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
     ) -> None:
         layers: list = [
@@ -110,6 +113,18 @@ class Orchestrator:
                     bus=bus,
                     log=speakup_log,
                     security=security,
+                )
+            )
+        if (
+            bus is not None
+            and persona_evolution_workspace is not None
+            and persona_evolution_state_db_path is not None
+        ):
+            layers.append(
+                PersonaEvolutionApprovalMiddleware(
+                    workspace=persona_evolution_workspace,
+                    state_db_path=persona_evolution_state_db_path,
+                    bus=bus,
                 )
             )
         if workflow_state and approval_trigger:

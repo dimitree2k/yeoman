@@ -125,6 +125,19 @@ class CronService:
                                 j["payload"].get("voiceRecentMessages", []) or []
                             ),
                             model_profile=j["payload"].get("modelProfile"),
+                            persona_file=j["payload"].get("personaFile"),
+                            persona_window_days=int(j["payload"].get("personaWindowDays", 1)),
+                            persona_limit=int(j["payload"].get("personaLimit", 20)),
+                            persona_output=j["payload"].get("personaOutput"),
+                            persona_min_meaningful_messages=int(
+                                j["payload"].get("personaMinMeaningfulMessages", 10)
+                            ),
+                            persona_min_signal_score=float(
+                                j["payload"].get("personaMinSignalScore", 3.0)
+                            ),
+                            persona_max_accumulation_days=int(
+                                j["payload"].get("personaMaxAccumulationDays", 14)
+                            ),
                             next_job_id=j["payload"].get("nextJobId"),
                             requires_approval=bool(j["payload"].get("requiresApproval", False)),
                             approval_channel=j["payload"].get("approvalChannel"),
@@ -197,6 +210,13 @@ class CronService:
                         "voicePrompt": j.payload.voice_prompt,
                         "voiceRecentMessages": list(j.payload.voice_recent_messages),
                         "modelProfile": j.payload.model_profile,
+                        "personaFile": j.payload.persona_file,
+                        "personaWindowDays": j.payload.persona_window_days,
+                        "personaLimit": j.payload.persona_limit,
+                        "personaOutput": j.payload.persona_output,
+                        "personaMinMeaningfulMessages": j.payload.persona_min_meaningful_messages,
+                        "personaMinSignalScore": j.payload.persona_min_signal_score,
+                        "personaMaxAccumulationDays": j.payload.persona_max_accumulation_days,
                         "nextJobId": j.payload.next_job_id,
                         "requiresApproval": j.payload.requires_approval,
                         "approvalChannel": j.payload.approval_channel,

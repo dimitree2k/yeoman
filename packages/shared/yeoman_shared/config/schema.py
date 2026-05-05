@@ -536,6 +536,19 @@ class ConsciousnessConfig(BaseModel):
     )
 
 
+class PersonaEvolutionConfig(BaseModel):
+    """Global guardrails for scheduled persona evolution."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    enabled: bool = True
+    cron_expression: str = Field(default="0 3 * * *", alias="cronExpression")
+    minimum_samples: int = Field(default=10, alias="minimumSamples", ge=0)
+    mode: Literal["preview", "auto_apply"] = "preview"
+    personas_allowlist: list[str] = Field(default_factory=list, alias="personasAllowlist")
+    proposal_ttl_seconds: int = Field(default=86400, alias="proposalTtlSeconds", ge=60)
+
+
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -557,6 +570,10 @@ class Config(BaseSettings):
     ipc: IpcConfig = Field(default_factory=IpcConfig)
     webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
     consciousness: ConsciousnessConfig = Field(default_factory=ConsciousnessConfig)
+    persona_evolution: PersonaEvolutionConfig = Field(
+        default_factory=PersonaEvolutionConfig,
+        alias="personaEvolution",
+    )
 
     @property
     def workspace_path(self) -> Path:

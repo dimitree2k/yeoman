@@ -103,9 +103,9 @@ Exit criteria:
 Goal: make outcome learning legible before feeding it into persona evolution.
 
 - [x] Add a CLI/status query for learned chat taste by channel and chat id.
-- [ ] Add a compact query for recent speakups, outcomes, and distillations.
-- [ ] Add log lines when taste distillation writes, skips, or fails.
-- [ ] Add a small operational check that reports:
+- [x] Add a compact query for recent speakups, outcomes, and distillations.
+- [x] Add log lines when taste distillation writes, skips, or fails.
+- [x] Add a small operational check that reports:
   - sent speakups
   - labeled outcomes
   - taste distillation count
@@ -113,7 +113,7 @@ Goal: make outcome learning legible before feeding it into persona evolution.
 
 Exit criteria:
 
-- [ ] It is possible to answer "what did Yeoman learn in this chat?" without
+- [x] It is possible to answer "what did Yeoman learn in this chat?" without
   directly opening SQLite.
 
 ## Phase 2 - Replace Broken `$evolve` Cron With In-Process Evolution Job
@@ -130,12 +130,13 @@ and files.
   - learned chat taste memories
   - recent semantic memories
   - bounded recent inbound archive counts
-- [ ] Add a distiller route, for example `persona.evolution`, with low
-  temperature and JSON output.
+- [x] Decide whether to add a distiller route such as `persona.evolution`.
+  Current decision: keep the deterministic structured proposal renderer until
+  a real LLM distillation need appears.
 - [x] Produce a structured proposed report, not a direct write in the first
   iteration.
-- [ ] Disable or replace the private `evo1a2md` cron entry after the new job is
-  wired.
+- [x] Replace the private `evo1a2md` behavior with the typed
+  `persona_evolution` cron payload while keeping the job id for continuity.
 - [x] Tests: evidence collector respects persona file mapping and chat scope.
 - [x] Tests: proposed updates never modify base persona files.
 - [x] Tests: raw messages are excluded or summarized before LLM distillation.
@@ -149,46 +150,47 @@ Exit criteria:
 
 Goal: make `.evolution.md` useful, bounded, and auditable.
 
-- [ ] Define a stable section contract:
+- [x] Define a stable section contract:
+  - `How This File Works`
   - `Trait Drift`
   - `Domain Confidence`
-  - `Relationship And Group Map`
+  - `Relationship Map`
   - `Schema Log`
   - `Consciousness Outcome Lessons`
   - `Consolidation Changelog`
-- [ ] Require evidence counts for every proposed change.
-- [ ] Require confidence and date on new durable lessons.
-- [ ] Limit each consolidation to small changes.
-- [ ] Preserve base persona invariants by reading the base persona before
+- [x] Require evidence counts for every proposed change.
+- [x] Require confidence and date on new durable lessons.
+- [x] Limit each consolidation to small changes.
+- [x] Preserve base persona invariants by reading the base persona before
   accepting proposed updates.
-- [ ] Tests: invalid section names, missing evidence, or invariant conflicts
-  are rejected.
+- [x] Tests: invalid section names and missing evidence are rejected; base
+  persona hash changes are rejected before apply.
 
 Exit criteria:
 
-- [ ] Evolution files grow in quality, not just length.
-- [ ] Every new durable lesson can be traced to enough supporting evidence.
+- [x] Evolution files grow in quality, not just length.
+- [x] Every new durable lesson can be traced to enough supporting evidence.
 
 ## Phase 4 - Owner Review And Apply
 
 Goal: keep persona mutation controlled until the loop proves reliable.
 
-- [ ] Add preview mode as the default for persona evolution.
-- [ ] Write proposed diffs under private runtime state, not source.
-- [ ] Add owner approval command or CLI command to apply a proposed evolution
+- [x] Add preview mode as the default for persona evolution.
+- [x] Write proposed diffs under private runtime state, not source.
+- [x] Add owner approval command or CLI command to apply a proposed evolution
   diff.
-- [ ] Record applied evolution metadata:
+- [x] Record applied evolution metadata:
   - persona file
   - previous hash
   - new hash
   - evidence window
   - approval source
-- [ ] Tests: rejected or expired proposals do not change files.
-- [ ] Tests: apply fails if the base or evolution file changed since proposal.
+- [x] Tests: rejected or expired proposals do not change files.
+- [x] Tests: apply fails if the base or evolution file changed since proposal.
 
 Exit criteria:
 
-- [ ] The system can propose persona evolution automatically while file changes
+- [x] The system can propose persona evolution automatically while file changes
   remain owner-controlled.
 
 ## Phase 5 - Scheduled Autonomy With Guardrails
@@ -196,21 +198,21 @@ Exit criteria:
 Goal: let the system maintain its lived-experience layer without making unsafe
 live edits.
 
-- [ ] Add config for persona evolution scheduling:
+- [x] Add config for persona evolution scheduling:
   - enabled
   - cron expression
   - minimum speakup/outcome samples
   - preview vs auto-apply
   - personas allowlist
-- [ ] Start with preview-only.
+- [x] Start with preview-only.
 - [ ] Allow auto-apply only for low-risk sections after enough successful
   reviewed runs.
-- [ ] Add metrics for proposed, applied, rejected, and no-op consolidations.
-- [ ] Add a runtime status summary showing next evolution run and last result.
+- [x] Add metrics for proposed, applied, rejected, and no-op consolidations.
+- [x] Add a runtime status summary showing next evolution run and last result.
 
 Exit criteria:
 
-- [ ] Persona evolution runs on schedule, proposes bounded changes, and never
+- [x] Persona evolution runs on schedule, proposes bounded changes, and never
   affects live message delivery during the same tick.
 
 ## Implementation Order

@@ -372,10 +372,13 @@ class TelegramChannel(BaseChannel):
                 "is_group": message.chat.type != "private",
                 "mentioned_bot": mention_meta["mentioned_bot"],
                 "reply_to_bot": mention_meta["reply_to_bot"],
+                "reply_to_message_id": mention_meta["reply_to_message_id"],
+                "reply_to_participant": mention_meta["reply_to_participant"],
+                "reply_to_text": mention_meta["reply_to_text"],
             }
         )
 
-    def _mention_metadata(self, message) -> dict[str, bool]:
+    def _mention_metadata(self, message) -> dict[str, object]:
         """Extract mention/reply-to-bot metadata for policy decisions."""
         text = message.text or message.caption or ""
         entities = list(message.entities or []) + list(message.caption_entities or [])
@@ -394,8 +397,18 @@ class TelegramChannel(BaseChannel):
                         break
 
         reply_to_bot = False
-        if message.reply_to_message and message.reply_to_message.from_user:
-            reply_user = message.reply_to_message.from_user
+        reply_to_message_id = None
+        reply_to_participant = None
+        reply_to_text = None
+        reply_message = getattr(message, "reply_to_message", None)
+        if reply_message:
+            raw_message_id = getattr(reply_message, "message_id", None)
+            reply_to_message_id = str(raw_message_id) if raw_message_id is not None else None
+            reply_to_text = getattr(reply_message, "text", None) or getattr(reply_message, "caption", None)
+
+        reply_user = getattr(reply_message, "from_user", None)
+        if reply_user:
+            reply_to_participant = str(reply_user.id)
             if self._bot_id is not None:
                 reply_to_bot = reply_user.id == self._bot_id
             else:
@@ -404,6 +417,9 @@ class TelegramChannel(BaseChannel):
         return {
             "mentioned_bot": mentioned_bot,
             "reply_to_bot": reply_to_bot,
+            "reply_to_message_id": reply_to_message_id,
+            "reply_to_participant": reply_to_participant,
+            "reply_to_text": reply_to_text,
         }
 
     def _start_typing(self, chat_id: str) -> None:

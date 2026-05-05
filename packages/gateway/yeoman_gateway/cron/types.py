@@ -21,7 +21,7 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn", "voice_broadcast"] = "agent_turn"
+    kind: Literal["system_event", "agent_turn", "voice_broadcast", "persona_evolution"] = "agent_turn"
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
@@ -47,6 +47,14 @@ class CronPayload:
     voice_recent_messages: list[str] = field(default_factory=list)
     # Model profile override (e.g. "overseerDefault" to use a cheaper model)
     model_profile: str | None = None
+    # Persona evolution settings (kind=persona_evolution)
+    persona_file: str | None = None
+    persona_window_days: int = 1
+    persona_limit: int = 20
+    persona_output: str | None = None
+    persona_min_meaningful_messages: int = 10
+    persona_min_signal_score: float = 3.0
+    persona_max_accumulation_days: int = 14
     # Workflow chaining
     next_job_id: str | None = None
     requires_approval: bool = False

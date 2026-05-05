@@ -353,6 +353,55 @@ class SpeakupLog:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def learning_summary(self, *, channel: str, chat_id: str) -> dict[str, Any]:
+        """Return compact learning counters for one chat without exposing raw messages."""
+        with self._lock:
+            sent = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM speakups
+                WHERE channel = ? AND chat_id = ? AND status = 'sent'
+                """,
+                (channel, chat_id),
+            ).fetchone()
+            labeled = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM speakups
+                WHERE channel = ? AND chat_id = ? AND outcome IS NOT NULL
+                """,
+                (channel, chat_id),
+            ).fetchone()
+            outcomes = self._conn.execute(
+                """
+                SELECT outcome, COUNT(*) AS c
+                FROM speakups
+                WHERE channel = ? AND chat_id = ? AND outcome IS NOT NULL
+                GROUP BY outcome
+                ORDER BY outcome
+                """,
+                (channel, chat_id),
+            ).fetchall()
+            distillations = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c, MAX(created_at) AS latest_at
+                FROM taste_distillations
+                WHERE channel = ? AND chat_id = ?
+                """,
+                (channel, chat_id),
+            ).fetchone()
+        return {
+            "sent_speakups": int(sent["c"] if sent else 0),
+            "labeled_outcomes": int(labeled["c"] if labeled else 0),
+            "outcomes": {str(row["outcome"]): int(row["c"]) for row in outcomes},
+            "taste_distillations": int(distillations["c"] if distillations else 0),
+            "last_taste_distillation_at": (
+                datetime.fromtimestamp(float(distillations["latest_at"]), UTC).isoformat()
+                if distillations and distillations["latest_at"] is not None
+                else None
+            ),
+        }
+
     def _insert(
         self,
         *,

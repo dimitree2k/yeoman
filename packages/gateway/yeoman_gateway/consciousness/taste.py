@@ -9,6 +9,8 @@ import math
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from loguru import logger
+
 from yeoman_gateway.consciousness.log import SpeakupLog
 
 TasteDistillerFn = Callable[[str], dict[str, Any] | str | Awaitable[dict[str, Any] | str]]
@@ -37,6 +39,13 @@ class TasteDistiller:
             limit=max(self._min_samples, 50),
         )
         if len(samples) < self._min_samples:
+            logger.info(
+                "taste distillation skipped: channel={} chat={} reason=not_enough_samples samples={} min_samples={}",
+                channel,
+                chat_id,
+                len(samples),
+                self._min_samples,
+            )
             return {
                 "distilled": False,
                 "reason": "not_enough_samples",
@@ -50,6 +59,12 @@ class TasteDistiller:
             sample_fingerprint=sample_fingerprint,
         )
         if not claimed:
+            logger.info(
+                "taste distillation skipped: channel={} chat={} reason=already_distilled samples={}",
+                channel,
+                chat_id,
+                len(samples),
+            )
             return {
                 "distilled": False,
                 "reason": "already_distilled",
@@ -69,12 +84,24 @@ class TasteDistiller:
                 raw = await raw
         except Exception:
             await rollback()
+            logger.exception(
+                "taste distillation failed: channel={} chat={} reason=distiller_exception samples={}",
+                channel,
+                chat_id,
+                len(samples),
+            )
             raise
 
         try:
             parsed = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, TypeError):
             await rollback()
+            logger.warning(
+                "taste distillation skipped: channel={} chat={} reason=invalid_distiller_response samples={}",
+                channel,
+                chat_id,
+                len(samples),
+            )
             return {
                 "distilled": False,
                 "reason": "invalid_distiller_response",
@@ -84,16 +111,34 @@ class TasteDistiller:
         try:
             if not isinstance(parsed, dict):
                 await rollback()
+                logger.warning(
+                    "taste distillation skipped: channel={} chat={} reason=invalid_distiller_response samples={}",
+                    channel,
+                    chat_id,
+                    len(samples),
+                )
                 return {"distilled": False, "reason": "invalid_distiller_response", "samples": len(samples)}
             pattern = " ".join(str(parsed.get("pattern") or "").split()).strip()
             if not pattern:
                 await rollback()
+                logger.warning(
+                    "taste distillation skipped: channel={} chat={} reason=empty_pattern samples={}",
+                    channel,
+                    chat_id,
+                    len(samples),
+                )
                 return {"distilled": False, "reason": "empty_pattern", "samples": len(samples)}
             raw_confidence = parsed.get("confidence", 0.8)
             try:
                 confidence = float(raw_confidence)
             except (TypeError, ValueError):
                 await rollback()
+                logger.warning(
+                    "taste distillation skipped: channel={} chat={} reason=invalid_distiller_response samples={}",
+                    channel,
+                    chat_id,
+                    len(samples),
+                )
                 return {
                     "distilled": False,
                     "reason": "invalid_distiller_response",
@@ -101,6 +146,12 @@ class TasteDistiller:
                 }
             if not math.isfinite(confidence):
                 await rollback()
+                logger.warning(
+                    "taste distillation skipped: channel={} chat={} reason=invalid_distiller_response samples={}",
+                    channel,
+                    chat_id,
+                    len(samples),
+                )
                 return {
                     "distilled": False,
                     "reason": "invalid_distiller_response",
@@ -119,7 +170,20 @@ class TasteDistiller:
             )
         except Exception:
             await rollback()
+            logger.exception(
+                "taste distillation failed: channel={} chat={} reason=memory_write_exception samples={}",
+                channel,
+                chat_id,
+                len(samples),
+            )
             raise
+        logger.info(
+            "taste distillation wrote memory: channel={} chat={} samples={} confidence={:.2f}",
+            channel,
+            chat_id,
+            len(samples),
+            max(0.0, min(1.0, confidence)),
+        )
         return {"distilled": True, "samples": len(samples)}
 
     @staticmethod

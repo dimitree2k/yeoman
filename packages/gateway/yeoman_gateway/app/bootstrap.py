@@ -7,6 +7,7 @@ import os
 import random
 import time
 import traceback
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,11 @@ from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
 from yeoman_gateway.memory import MemoryService
+from yeoman_gateway.persona_evolution import (
+    PersonaEvolutionLedger,
+    build_persona_evolution_approval_message,
+    run_persona_evolution_cron,
+)
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
@@ -234,6 +240,7 @@ class GatewayRuntime:
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
     lull_observer: object | None = None
+    startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def run(self) -> None:
         tracing.init()
@@ -250,6 +257,15 @@ class GatewayRuntime:
                 self.orchestrator.run(),
                 self.channels.start_all(),
             ]
+            if self.startup_hook is not None:
+                async def _run_startup_hook() -> None:
+                    await asyncio.sleep(2.0)
+                    try:
+                        await self.startup_hook()
+                    except Exception:
+                        logger.exception("Gateway startup hook failed")
+
+                tasks.append(_run_startup_hook())
             if self.bus:
                 tasks.append(self.bus.dispatch_events())
             await asyncio.gather(*tasks)
@@ -477,6 +493,7 @@ def build_gateway_runtime(
     workflow_state = WorkflowState(
         store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
     )
+    persona_evolution_state_db_path = Path(workspace) / "persona-evolution" / "persona-evolution.db"
 
     async def _on_approval_expired(approval: PendingApproval) -> None:
         await bus.publish_outbound(OutboundMessage(
@@ -549,6 +566,8 @@ def build_gateway_runtime(
         bus=bus,
         speakup_approval_store=speakup_approval_store,
         speakup_log=speakup_log,
+        persona_evolution_workspace=Path(workspace),
+        persona_evolution_state_db_path=persona_evolution_state_db_path,
         session_manager=session_manager,
     )
 
@@ -628,7 +647,112 @@ def build_gateway_runtime(
             return fallback
         return cleaned
 
+    async def _notify_persona_evolution_review(
+        proposal: dict[str, object],
+        *,
+        approval_channel: str | None = None,
+    ) -> None:
+        if proposal.get("notified_at"):
+            return
+        channel = str(approval_channel or "telegram").strip() or "telegram"
+        raw_targets = policy_adapter.owner_recipients(channel)
+        if not raw_targets:
+            logger.warning(
+                "Persona evolution proposal {} has no owner recipients for {}",
+                proposal.get("proposal_id"),
+                channel,
+            )
+            return
+        from yeoman_gateway.pipeline.new_chat import _normalize_owner_target
+
+        targets = sorted(
+            {
+                target
+                for raw in raw_targets
+                if (target := _normalize_owner_target(channel, str(raw)))
+            }
+        )
+        if not targets:
+            logger.warning(
+                "Persona evolution proposal {} had no valid owner targets for {}",
+                proposal.get("proposal_id"),
+                channel,
+            )
+            return
+        message = build_persona_evolution_approval_message(proposal)
+        for target in targets:
+            await bus.publish_outbound(
+                OutboundMessage(channel=channel, chat_id=target, content=message)
+            )
+        ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
+        try:
+            ledger.mark_notified(
+                str(proposal["proposal_id"]),
+                channel=channel,
+                chat_id=",".join(targets),
+            )
+        finally:
+            ledger.close()
+
+    async def _notify_pending_persona_evolution_reviews() -> None:
+        ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
+        try:
+            proposals = ledger.pending_proposals()
+        finally:
+            ledger.close()
+        for proposal in proposals:
+            await _notify_persona_evolution_review(proposal)
+
     async def on_cron_job(job: CronJob) -> str | None:
+        if job.payload.kind == "persona_evolution":
+            if not config.persona_evolution.enabled:
+                return "persona_evolution no proposal: disabled"
+            persona_file = str(job.payload.persona_file or "").strip()
+            if not persona_file:
+                raise ValueError("persona_evolution job requires personaFile")
+            allowlist = {
+                str(item).strip()
+                for item in config.persona_evolution.personas_allowlist
+                if str(item).strip()
+            }
+            if allowlist and persona_file not in allowlist:
+                return f"persona_evolution no proposal: persona_not_allowed persona_file={persona_file}"
+            output_path = None
+            if str(job.payload.persona_output or "").strip():
+                output_path = Path(str(job.payload.persona_output).strip())
+            result = await run_persona_evolution_cron(
+                policy=policy_engine.policy,
+                workspace=Path(workspace),
+                persona_file=persona_file,
+                memory=memory_service,
+                speakup_log=speakup_log,
+                inbound_archive=inbound_archive,
+                window_days=max(1, int(job.payload.persona_window_days)),
+                limit=max(1, int(job.payload.persona_limit)),
+                output_path=output_path,
+                min_meaningful_messages=max(
+                    0, int(job.payload.persona_min_meaningful_messages)
+                ),
+                min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
+                max_accumulation_days=max(1, int(job.payload.persona_max_accumulation_days)),
+                proposal_ttl_seconds=max(60, int(config.persona_evolution.proposal_ttl_seconds)),
+            )
+            if result and (
+                result.startswith("persona_evolution proposal written:")
+                or result.startswith("persona_evolution no proposal: pending_proposal")
+            ):
+                ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
+                try:
+                    proposal = ledger.pending_proposal(persona_file)
+                finally:
+                    ledger.close()
+                if proposal is not None:
+                    await _notify_persona_evolution_review(
+                        proposal,
+                        approval_channel=job.payload.approval_channel,
+                    )
+            return result
+
         if job.payload.kind == "voice_broadcast":
             phrases = [str(v).strip() for v in list(job.payload.voice_messages) if str(v).strip()]
             if not phrases and str(job.payload.message or "").strip():
@@ -968,4 +1092,5 @@ def build_gateway_runtime(
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
         lull_observer=lull_observer,
+        startup_hook=_notify_pending_persona_evolution_reviews,
     )
