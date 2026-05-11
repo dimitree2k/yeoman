@@ -45,7 +45,12 @@ class PersonaEvolutionApprovalMiddleware:
 
         parsed = self._parse_code(ctx.event.content)
         if parsed is None and ctx.event.reply_to_bot:
-            parsed = self._parse_reply_decision(ctx.event.content, ctx.event.reply_to_text)
+            parsed = self._parse_reply_decision(
+                ctx.event.content,
+                ctx.event.reply_to_text,
+                channel=ctx.event.channel,
+                chat_id=ctx.event.chat_id,
+            )
         if parsed is None:
             await next(ctx)
             return
@@ -96,9 +101,15 @@ class PersonaEvolutionApprovalMiddleware:
             return ("deny", proposal_id) if proposal_id else None
         return None
 
-    @classmethod
-    def _parse_reply_decision(cls, text: str, reply_to_text: str | None) -> tuple[str, str] | None:
-        action = cls._reply_action(text)
+    def _parse_reply_decision(
+        self,
+        text: str,
+        reply_to_text: str | None,
+        *,
+        channel: str,
+        chat_id: str,
+    ) -> tuple[str, str] | None:
+        action = self._reply_action(text)
         if action is None:
             return None
 
@@ -106,9 +117,43 @@ class PersonaEvolutionApprovalMiddleware:
             proposal_id
             for _code_action, proposal_id in _APPROVAL_CODE_RE.findall(str(reply_to_text or ""))
         }
-        if len(proposal_ids) != 1:
+        if len(proposal_ids) == 1:
+            return action, next(iter(proposal_ids))
+        if proposal_ids:
             return None
-        return action, next(iter(proposal_ids))
+        return self._parse_compact_reply_decision(action, reply_to_text, channel, chat_id)
+
+    def _parse_compact_reply_decision(
+        self,
+        action: str,
+        reply_to_text: str | None,
+        channel: str,
+        chat_id: str,
+    ) -> tuple[str, str] | None:
+        if "Persona evolution proposal" not in str(reply_to_text or ""):
+            return None
+
+        from yeoman_gateway.persona_evolution import PersonaEvolutionLedger
+
+        ledger = PersonaEvolutionLedger(self._state_db_path)
+        try:
+            matches = [
+                proposal
+                for proposal in ledger.pending_proposals()
+                if str(proposal.get("notification_channel") or "") == channel
+                and chat_id
+                in {
+                    target.strip()
+                    for target in str(proposal.get("notification_chat_id") or "").split(",")
+                    if target.strip()
+                }
+            ]
+        finally:
+            ledger.close()
+
+        if len(matches) != 1:
+            return None
+        return action, str(matches[0]["proposal_id"])
 
     @staticmethod
     def _reply_action(text: str) -> str | None:

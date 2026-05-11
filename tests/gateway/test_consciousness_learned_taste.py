@@ -61,8 +61,12 @@ class _LearnedTasteTools:
             "chat_id": chat_id,
             "channel": channel,
             "daily_cap": 1,
+            "base_daily_cap": 1,
+            "max_daily_cap": 1,
             "sent_today": 0,
             "daily_remaining": 1,
+            "budget_allowed": True,
+            "budget_reason": "base_daily_cap_available",
         }
 
     async def read_chat_window(

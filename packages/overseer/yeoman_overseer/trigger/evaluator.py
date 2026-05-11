@@ -67,7 +67,10 @@ class TriggerEvaluator:
                     should_fire = self._condition_met(trigger.condition, check_result)
 
             elif trigger.kind == "cron":
-                last_wall = self._last_cron.get(name, wall - 86400)
+                if name not in self._last_cron:
+                    self._last_cron[name] = wall
+                    continue
+                last_wall = self._last_cron[name]
                 cron = croniter(trigger.expr, last_wall)
                 next_run = cron.get_next(float)
                 if wall >= next_run:

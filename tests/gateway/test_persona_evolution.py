@@ -666,7 +666,7 @@ async def test_build_persona_evolution_status_summarizes_chat_learning(
     assert status["chat"]["last_learned_taste"].endswith("compact market numbers land.")
 
 
-def test_approval_message_contains_telegram_codes(tmp_path: Path) -> None:
+def test_approval_message_is_compact_for_telegram_review(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     state_db = tmp_path / "persona-evolution.db"
     proposal_path = tmp_path / "proposal.md"
@@ -685,10 +685,17 @@ def test_approval_message_contains_telegram_codes(tmp_path: Path) -> None:
     assert proposal is not None
     message = build_persona_evolution_approval_message(proposal)
 
-    assert "Persona evolution proposal" in message
-    assert str(proposal_path) in message
-    assert "pe-approve-abc123" in message
-    assert "pe-deny-abc123" in message
+    assert message == "\n".join(
+        [
+            "Persona evolution proposal for personas/alpha-2.md",
+            "Proposed change:",
+            "- 2026-05-04 `whatsapp:group-a` confidence=medium evidence=12 speakups: Compact market numbers land better than broad proactive takes.",
+            "Evidence window: 2026-04-20T03:00:00+00:00 -> 2026-05-04T03:00:00+00:00",
+        ]
+    )
+    assert str(proposal_path) not in message
+    assert "pe-approve-abc123" not in message
+    assert "pe-deny-abc123" not in message
 
 
 def test_telegram_metadata_includes_reply_target_text() -> None:
@@ -1105,13 +1112,11 @@ async def test_persona_evolution_approval_middleware_applies_reply_yes(
         proposal_path=proposal_path,
         proposal_id="abc123",
     )
-    ledger = PersonaEvolutionLedger(state_db)
-    try:
-        proposal = ledger.get_proposal("abc123")
-    finally:
-        ledger.close()
-    assert proposal is not None
-    approval_message = build_persona_evolution_approval_message(proposal)
+    approval_message = (
+        "Persona evolution proposal for personas/alpha-2.md\n"
+        "Approve: pe-approve-abc123\n"
+        "Deny: pe-deny-abc123"
+    )
     bus = MessageBus()
     middleware = PersonaEvolutionApprovalMiddleware(
         workspace=workspace,
@@ -1139,6 +1144,50 @@ async def test_persona_evolution_approval_middleware_applies_reply_yes(
 
 
 @pytest.mark.asyncio
+async def test_persona_evolution_approval_middleware_applies_compact_reply_yes(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    state_db = tmp_path / "persona-evolution.db"
+    proposal_path = tmp_path / "proposal.md"
+    _record_test_proposal(
+        workspace=workspace,
+        state_db=state_db,
+        proposal_path=proposal_path,
+        proposal_id="abc123",
+    )
+    ledger = PersonaEvolutionLedger(state_db)
+    try:
+        ledger.mark_notified("abc123", channel="telegram", chat_id="tg-owner")
+    finally:
+        ledger.close()
+    bus = MessageBus()
+    middleware = PersonaEvolutionApprovalMiddleware(
+        workspace=workspace,
+        state_db_path=state_db,
+        bus=bus,
+        now=lambda: datetime(2026, 5, 4, 12, 0, tzinfo=UTC),
+    )
+    next_fn = AsyncMock()
+
+    await middleware(
+        _owner_ctx(
+            "yes",
+            reply_to_bot=True,
+            reply_to_text="Persona evolution proposal for personas/alpha-2.md\nProposed change:\n- concise",
+            reply_to_message_id="tg-msg-1",
+        ),
+        next_fn,
+    )
+    confirmation = await asyncio.wait_for(bus.consume_outbound(), timeout=0.1)
+
+    assert next_fn.await_count == 0
+    assert confirmation.channel == "telegram"
+    assert confirmation.chat_id == "tg-owner"
+    assert "applied" in confirmation.content
+
+
+@pytest.mark.asyncio
 async def test_persona_evolution_approval_middleware_denies_reply_no(
     tmp_path: Path,
 ) -> None:
@@ -1153,13 +1202,11 @@ async def test_persona_evolution_approval_middleware_denies_reply_no(
         proposal_path=proposal_path,
         proposal_id="abc123",
     )
-    ledger = PersonaEvolutionLedger(state_db)
-    try:
-        proposal = ledger.get_proposal("abc123")
-    finally:
-        ledger.close()
-    assert proposal is not None
-    approval_message = build_persona_evolution_approval_message(proposal)
+    approval_message = (
+        "Persona evolution proposal for personas/alpha-2.md\n"
+        "Approve: pe-approve-abc123\n"
+        "Deny: pe-deny-abc123"
+    )
     bus = MessageBus()
     middleware = PersonaEvolutionApprovalMiddleware(
         workspace=workspace,

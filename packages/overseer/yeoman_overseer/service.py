@@ -17,6 +17,10 @@ from yeoman_overseer.agent.tools import ToolContext
 from yeoman_overseer.audit.git import InternalGit
 from yeoman_overseer.audit.logger import AuditEntry, AuditLogger
 from yeoman_overseer.comms.cascading import CascadingComms
+from yeoman_overseer.executor.deterministic import (
+    DeterministicExecutor,
+    parse_deterministic_actions,
+)
 from yeoman_overseer.maintenance import MaintenanceManager
 from yeoman_overseer.runbook.parser import Runbook, parse_runbook_dir
 from yeoman_overseer.safety.causal import CausalChainDetector
@@ -303,6 +307,31 @@ class OverseerService:
             except Exception as exc:
                 logger.error("Runbook %s agent error: %s", runbook.meta.name, exc)
                 result_str = f"error: {exc}"
+        elif self._comms:
+            actions = parse_deterministic_actions(runbook.body)
+            if actions:
+                executor = DeterministicExecutor(comms=self._comms)
+                for action in actions:
+                    action_start = time.monotonic()
+                    result = await executor.execute(
+                        action.action,
+                        target=action.target,
+                        **action.kwargs,
+                    )
+                    if not result.success:
+                        result_str = result.detail
+                    if self._audit:
+                        self._audit.append(AuditEntry(
+                            runbook=runbook.meta.name,
+                            trigger=runbook.meta.trigger.kind,
+                            action=action.action,
+                            target=action.target,
+                            result=result.detail,
+                            duration_ms=int((time.monotonic() - action_start) * 1000),
+                            escalated_to_llm=False,
+                            domain=runbook.meta.domain,
+                        ))
+                return
 
         duration_ms = int((time.monotonic() - start) * 1000)
         if self._audit:

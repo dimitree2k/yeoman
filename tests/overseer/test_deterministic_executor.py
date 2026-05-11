@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import pytest
 from yeoman_overseer.comms.cascading import CascadingComms
+from yeoman_overseer.executor import deterministic
 from yeoman_overseer.executor.deterministic import DeterministicExecutor
+from yeoman_overseer.executor.stale_agent_sessions import CleanupResult
 
 
 class FakeCommsChannel:
@@ -45,3 +47,27 @@ async def test_execute_noop() -> None:
     executor = DeterministicExecutor(comms=comms)
     result = await executor.execute("noop", target="x")
     assert result.success is True
+
+@pytest.mark.asyncio
+async def test_execute_cleanup_stale_agent_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, bool]] = []
+
+    async def fake_cleanup(*, min_age_seconds: int, dry_run: bool) -> CleanupResult:
+        calls.append((min_age_seconds, dry_run))
+        return CleanupResult(killed_pids=[123, 456], skipped_young=1, skipped_non_agent=2)
+
+    monkeypatch.setattr(deterministic, "cleanup_stale_agent_sessions", fake_cleanup)
+
+    comms = CascadingComms(channels=[], local_log=True)
+    executor = DeterministicExecutor(comms=comms)
+    result = await executor.execute(
+        "cleanup_stale_agent_sessions",
+        target="mosh-agent-sessions",
+        min_age_seconds="3600",
+        dry_run="true",
+    )
+
+    assert result.success is True
+    assert calls == [(3600, True)]
+    assert "would kill 2" in result.detail
+    assert "skipped_young=1" in result.detail

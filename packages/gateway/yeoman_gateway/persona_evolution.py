@@ -422,24 +422,35 @@ class PersonaEvolutionLedger:
 
 def build_persona_evolution_approval_message(proposal: dict[str, Any]) -> str:
     """Render the owner review prompt for a pending persona proposal."""
-    proposal_id = str(proposal.get("proposal_id") or "").strip()
     persona_file = str(proposal.get("persona_file") or "").strip()
     proposal_path = str(proposal.get("proposal_path") or "").strip()
-    total_messages = int(proposal.get("total_message_count") or 0)
-    signal_score = float(proposal.get("signal_score") or 0.0)
     evidence_from = str(proposal.get("evidence_from") or "").strip()
     evidence_to = str(proposal.get("evidence_to") or "").strip()
-    return "\n".join(
-        [
-            f"Persona evolution proposal for {persona_file}",
-            f"Path: {proposal_path}",
-            f"Evidence: {evidence_from} -> {evidence_to}",
-            f"Messages: {total_messages}; signal score: {signal_score:.2f}",
-            "",
-            f"Approve: pe-approve-{proposal_id}",
-            f"Deny: pe-deny-{proposal_id}",
-        ]
-    )
+    lines = [f"Persona evolution proposal for {persona_file}", "Proposed change:"]
+    lines.extend(_proposal_change_lines(Path(proposal_path)))
+    if evidence_from or evidence_to:
+        lines.append(f"Evidence window: {evidence_from} -> {evidence_to}")
+    return "\n".join(lines)
+
+
+def _proposal_change_lines(proposal_path: Path) -> list[str]:
+    try:
+        text = proposal_path.read_text(encoding="utf-8")
+    except OSError:
+        return ["- Proposed change details unavailable."]
+
+    capture = False
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line == "## Proposed Change":
+            capture = True
+            continue
+        if capture and line.startswith("## "):
+            break
+        if capture and line:
+            lines.append(line)
+    return lines or ["- Proposed change details unavailable."]
 
 
 def apply_persona_evolution_proposal(

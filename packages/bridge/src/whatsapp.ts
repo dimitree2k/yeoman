@@ -6,7 +6,6 @@ import { basename, extname, isAbsolute, join, relative, resolve } from 'path';
 import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
-  fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
@@ -28,6 +27,8 @@ const INBOUND_IMAGE_RETRY_DELAYS_MS = [250, 500, 1000];
 const QUOTED_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
+const WHATSAPP_WEB_VERSION: [number, number, number] = [2, 3000, 1033893291];
+const WHATSAPP_BROWSER: [string, string, string] = ['Yeoman', 'Chrome', '145.0.0'];
 
 export interface InboundMedia {
   kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
@@ -460,7 +461,6 @@ export class WhatsAppClient {
 
   private qrWaiters = new Set<(value: string) => void>();
   private connectWaiters = new Set<(value: boolean) => void>();
-  private baileysVersionCache: [number, number, number] | null = null;
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -1233,20 +1233,11 @@ export class WhatsAppClient {
     this.connectWaiters.clear();
   }
 
-  private async getBaileysVersion(): Promise<[number, number, number]> {
-    if (!this.baileysVersionCache) {
-      const { version } = await fetchLatestBaileysVersion();
-      this.baileysVersionCache = version as [number, number, number];
-    }
-    return this.baileysVersionCache;
-  }
-
   private async connectOnce(): Promise<void> {
     const logger = pino({ level: 'silent' });
     await ensureAuthSecurity(this.options.authDir);
 
     const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
-    const version = await this.getBaileysVersion();
 
     this.updateSelfIds(state);
 
@@ -1255,10 +1246,10 @@ export class WhatsAppClient {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
-      version,
+      version: WHATSAPP_WEB_VERSION,
       logger,
       printQRInTerminal: false,
-      browser: ['yeoman', 'bridge', VERSION],
+      browser: WHATSAPP_BROWSER,
       syncFullHistory: false,
       markOnlineOnConnect: true,
     });

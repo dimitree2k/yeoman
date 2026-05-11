@@ -202,6 +202,8 @@ class ConsciousnessAgent:
                 "standalone thought, callback, or fun fact, but do not pretend an old "
                 "message is the current thread."
             )
+        profile = str(chat.get("profile") or "").strip()
+        profile_rules = self._profile_rules(profile)
         return json.dumps(
             {
                 "instruction": (
@@ -215,6 +217,7 @@ class ConsciousnessAgent:
                 "trigger": trigger,
                 "golden_rules": [
                     *trigger_rules,
+                    *profile_rules,
                     "Do NOT echo, paraphrase, or restate any message in chat_window. "
                     "If your draft shares a 4-word run with any existing message, rewrite "
                     "it from a different angle or stay silent.",
@@ -230,6 +233,11 @@ class ConsciousnessAgent:
                     "renders it as a quoted reply. The chat may have moved on by the "
                     "time you post; the quote anchors your message to the right context. "
                     "If you have no specific anchor, omit reply_to_message_id.",
+                    "For action_type correct_error, reply_to_message_id must identify "
+                    "the message containing the claim being corrected. If that claim "
+                    "is not in the fresh chat_window but a related current question is, "
+                    "downgrade to answer_open_question and quote the current question "
+                    "instead.",
                 ],
                 "anti_patterns": [
                     "Restating someone else's joke or quip as your own.",
@@ -247,6 +255,22 @@ class ConsciousnessAgent:
             },
             default=str,
         )
+
+    @staticmethod
+    def _profile_rules(profile: str) -> list[str]:
+        if profile != "permissive":
+            return []
+        return [
+            "Permissive profile: when the chat is lively, a short low-risk line may "
+            "be useful even if it is not a data-heavy correction. Specific value can "
+            "be social warmth, a compact joke, or a concrete opinion.",
+            "For permissive chats, learned_taste is a caution, not a veto. Use it to "
+            "avoid bad timing and repetition, but do not let it suppress every "
+            "proactive social contribution.",
+            "In positive high-noise banter, light_humor and contrarian are acceptable "
+            "when they are brief, persona-matched, and non-echoing; the line does not "
+            "need a sourced fact every time.",
+        ]
 
     @staticmethod
     def _memory_query_from_window(window: dict[str, object]) -> str:

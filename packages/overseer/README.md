@@ -259,6 +259,7 @@ Shipped with the package, copied to `~/.yeoman/data/overseer/runbooks/` on first
 | `ops-session-cleanup` | ops | cron Sun 5am | no |
 | `ops-media-cleanup` | ops | cron daily 4am | no |
 | `ops-log-rotation` | ops | cron daily 3am | no |
+| `ops-stale-agent-session-cleanup` | ops | cron daily 4am | no |
 | `ops-source-cleanup` | ops | cron Sun 2am | yes (8K tokens) |
 | `ops-memory-prune` | ops | cron Sun 3am | yes (8K tokens) |
 | `memory-hygiene` | memory | cron daily 3am | yes (10K tokens) |

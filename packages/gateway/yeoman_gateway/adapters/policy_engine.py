@@ -265,7 +265,7 @@ class EnginePolicyAdapter(PolicyPort):
     def _normalize_pause_until(value: object) -> int:
         try:
             parsed = int(str(value))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return 0
         if parsed == _PAUSE_INDEFINITE:
             return _PAUSE_INDEFINITE

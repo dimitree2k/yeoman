@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Overseer
+- Added deterministic stale agent-session cleanup for old `mosh-server -> bash -> codex/claude` trees, with a 1-hour current-session guard and a daily 04:00 starter runbook.
+- Fixed cron trigger initialization so overseer restarts do not replay missed daily runbooks immediately on startup.
+
 ## v1.0.0 — Apr 2026
 
 ### Smart Context Windowing

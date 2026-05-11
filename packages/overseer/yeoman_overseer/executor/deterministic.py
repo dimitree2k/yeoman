@@ -8,8 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from yeoman_overseer.alerts.formatting import format_overseer_alert
 from yeoman_overseer.comms.cascading import CascadingComms
+from yeoman_overseer.executor.stale_agent_sessions import cleanup_stale_agent_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,13 @@ logger = logging.getLogger(__name__)
 class ActionResult:
     success: bool
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeterministicAction:
+    action: str
+    target: str
+    kwargs: dict[str, str]
 
 
 @dataclass
@@ -76,11 +86,85 @@ class DeterministicExecutor:
     async def _noop(self, **_: str) -> ActionResult:
         return ActionResult(success=True, detail="No-op executed")
 
+    async def _cleanup_stale_agent_sessions(
+        self,
+        *,
+        min_age_seconds: str = "3600",
+        dry_run: str = "false",
+        **_: str,
+    ) -> ActionResult:
+        try:
+            min_age = int(min_age_seconds)
+            is_dry_run = dry_run.lower() in {"1", "true", "yes"}
+            result = await cleanup_stale_agent_sessions(
+                min_age_seconds=min_age,
+                dry_run=is_dry_run,
+            )
+        except Exception as exc:
+            return ActionResult(success=False, detail=f"Stale agent session cleanup failed: {exc}")
+
+        verb = "would kill" if is_dry_run else "killed"
+        return ActionResult(
+            success=True,
+            detail=(
+                f"{verb} {len(result.killed_pids)} stale agent session(s): {result.killed_pids}; "
+                f"skipped_young={result.skipped_young}; "
+                f"skipped_non_agent={result.skipped_non_agent}"
+            ),
+        )
+
+
+def parse_deterministic_actions(body: str) -> list[DeterministicAction]:
+    actions_text = _extract_actions_block(body)
+    if not actions_text:
+        return []
+    try:
+        raw = yaml.safe_load(actions_text)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    actions: list[DeterministicAction] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        target = str(item.get("target") or "").strip()
+        if not action or not target:
+            continue
+        kwargs = {
+            str(key): str(value)
+            for key, value in item.items()
+            if key not in {"action", "target"} and value is not None
+        }
+        actions.append(DeterministicAction(action=action, target=target, kwargs=kwargs))
+    return actions
+
+
+def _extract_actions_block(body: str) -> str:
+    lines = body.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip().lower() == "## actions":
+            start = index + 1
+            break
+    if start is None:
+        return ""
+
+    block: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        block.append(line)
+    return "\n".join(block).strip()
+
 
 _ACTION_REGISTRY = {
     "restart_service": DeterministicExecutor._restart_service,
     "alert": DeterministicExecutor._alert,
     "rotate_logs": DeterministicExecutor._rotate_logs,
     "prune_files": DeterministicExecutor._prune_files,
+    "cleanup_stale_agent_sessions": DeterministicExecutor._cleanup_stale_agent_sessions,
     "noop": DeterministicExecutor._noop,
 }
