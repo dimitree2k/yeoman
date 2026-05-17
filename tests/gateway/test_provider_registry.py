@@ -16,12 +16,11 @@ wrong endpoint:
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import litellm
-
 from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 from yeoman_gateway.providers.registry import find_by_model
-
 
 # --------------------------------------------------------------------------
 # find_by_model: prefixed model names resolve by the first /-segment only.
@@ -95,3 +94,24 @@ def test_litellm_provider_groq_model_does_not_pollute_openai_env(
     )
     assert os.environ.get("GROQ_API_KEY") == "gsk_classifier_key"
     assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_litellm_provider_preserves_reasoning_content_from_response() -> None:
+    provider = LiteLLMProvider(default_model="deepseek-v4-flash")
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(
+                    content="I need to search.",
+                    reasoning_content="The user asked for current data, so I need a tool.",
+                    tool_calls=[],
+                ),
+            )
+        ],
+        usage=None,
+    )
+
+    parsed = provider._parse_response(response)
+
+    assert parsed.reasoning_content == "The user asked for current data, so I need a tool."

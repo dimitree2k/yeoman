@@ -31,6 +31,32 @@ PERSONA_EVOLUTION_ALLOWED_SECTIONS = {
     "Consciousness Outcome Lessons",
     "Consolidation Changelog",
 }
+_REDUNDANT_NOTE_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "better",
+    "chat",
+    "confidence",
+    "evidence",
+    "from",
+    "group",
+    "into",
+    "lesson",
+    "message",
+    "messages",
+    "most",
+    "note",
+    "profile",
+    "proposal",
+    "recent",
+    "share",
+    "speakup",
+    "speakups",
+    "that",
+    "this",
+    "with",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +486,8 @@ def apply_persona_evolution_proposal(
     proposal_id: str,
     approved_by_channel: str,
     approved_by_chat_id: str,
+    final_outcome: str = "approved",
+    allow_expired: bool = False,
     now: datetime | None = None,
 ) -> PersonaEvolutionDecisionResult:
     """Apply one pending proposal to its companion `.evolution.md` file."""
@@ -484,7 +512,7 @@ def apply_persona_evolution_proposal(
                 persona_file=persona_file,
                 message=f"persona evolution proposal is {proposal['status']}",
             )
-        if _proposal_expired(proposal, decided_at):
+        if not allow_expired and _proposal_expired(proposal, decided_at):
             ledger.close_proposal(
                 str(proposal_id),
                 status="expired",
@@ -569,7 +597,7 @@ def apply_persona_evolution_proposal(
         ledger.close_proposal(
             str(proposal_id),
             status="applied",
-            final_outcome="approved",
+            final_outcome=final_outcome,
             closed_at=decided_at,
             applied_hash=applied_hash,
             approval_channel=approved_by_channel,
@@ -1048,7 +1076,34 @@ def _proposed_change_notes(evidence: PersonaEvolutionEvidence) -> list[str]:
             f"{evidence.collected_at.date()} `{chat.channel}:{chat.chat_id}` "
             f"confidence=medium evidence={evidence_text}: {patterns[0]}"
         )
-    return notes
+    return [
+        note
+        for note in notes
+        if not _durable_note_already_covered(note, evidence.current_evolution_text)
+    ]
+
+
+def _durable_note_already_covered(note: str, current_evolution_text: str) -> bool:
+    if not current_evolution_text.strip():
+        return False
+    note_tokens = _redundancy_tokens(note)
+    current_tokens = _redundancy_tokens(current_evolution_text)
+    if not note_tokens or not current_tokens:
+        return False
+    overlap = note_tokens & current_tokens
+    denominator = max(1, min(len(note_tokens), len(current_tokens)))
+    return (len(overlap) / denominator) >= 0.20
+
+
+def _redundancy_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.findall(r"[a-zA-Z][a-zA-Z_-]{3,}", text.casefold()):
+        token = raw.strip("_-")
+        if token.endswith("s") and len(token) > 5:
+            token = token[:-1]
+        if token and token not in _REDUNDANT_NOTE_STOPWORDS:
+            tokens.add(token)
+    return tokens
 
 
 def _unique_taste_patterns(chat_evidence: ChatEvolutionEvidence) -> list[str]:
@@ -1123,6 +1178,7 @@ async def run_persona_evolution_cron(
     min_signal_score: float = 3.0,
     max_accumulation_days: int = 14,
     proposal_ttl_seconds: int = PERSONA_EVOLUTION_PROPOSAL_TTL_SECONDS,
+    proposal_mode: str = "preview",
     now: datetime | None = None,
 ) -> str:
     """Run typed persona-evolution cron and write an owner-reviewable proposal."""
@@ -1132,12 +1188,25 @@ async def run_persona_evolution_cron(
     collected_at = collected_at.astimezone(UTC)
 
     ledger_path = state_db_path or workspace / "persona-evolution" / "persona-evolution.db"
+    auto_apply_results: list[PersonaEvolutionDecisionResult] = []
+    if str(proposal_mode).strip() == "auto_apply":
+        auto_apply_results = _auto_apply_expired_pending(
+            workspace=workspace,
+            state_db_path=ledger_path,
+            persona_file=persona_file,
+            now=collected_at,
+            proposal_ttl_seconds=proposal_ttl_seconds,
+        )
     ledger = PersonaEvolutionLedger(ledger_path)
     try:
-        ledger.expire_pending(now=collected_at, max_age_seconds=proposal_ttl_seconds)
+        if str(proposal_mode).strip() != "auto_apply":
+            ledger.expire_pending(now=collected_at, max_age_seconds=proposal_ttl_seconds)
         pending = ledger.pending_proposal(persona_file)
         if pending is not None:
-            return f"persona_evolution no proposal: pending_proposal proposal_id={pending['proposal_id']}"
+            return _with_auto_apply_summary(
+                f"persona_evolution no proposal: pending_proposal proposal_id={pending['proposal_id']}",
+                auto_apply_results,
+            )
 
         since = collected_at - timedelta(days=max(1, int(max_accumulation_days)))
         watermark = ledger.latest_closed_watermark(persona_file)
@@ -1169,9 +1238,10 @@ async def run_persona_evolution_cron(
                 result="no_proposal",
                 reason="below_threshold",
             )
-            return (
+            return _with_auto_apply_summary(
                 "persona_evolution no proposal: below_threshold "
-                f"messages={total_messages} score={signal_score:.2f}"
+                f"messages={total_messages} score={signal_score:.2f}",
+                auto_apply_results,
             )
 
         proposed_changes = _proposed_change_notes(evidence)
@@ -1186,9 +1256,10 @@ async def run_persona_evolution_cron(
                 result="no_proposal",
                 reason="no_durable_changes",
             )
-            return (
+            return _with_auto_apply_summary(
                 "persona_evolution no proposal: no_durable_changes "
-                f"messages={total_messages} score={signal_score:.2f}"
+                f"messages={total_messages} score={signal_score:.2f}",
+                auto_apply_results,
             )
 
         proposal_id = uuid.uuid4().hex
@@ -1210,7 +1281,10 @@ async def run_persona_evolution_cron(
                 result="no_proposal",
                 reason="invalid_output_path",
             )
-            return f"persona_evolution no proposal: invalid_output_path {output_error}"
+            return _with_auto_apply_summary(
+                f"persona_evolution no proposal: invalid_output_path {output_error}",
+                auto_apply_results,
+            )
         ensure_dir(target.parent)
         target.write_text(rendered, encoding="utf-8")
         ledger.record_proposal(
@@ -1237,9 +1311,90 @@ async def run_persona_evolution_cron(
             result="proposal",
             proposal_id=proposal_id,
         )
-        return f"persona_evolution proposal written: {target}"
+        return _with_auto_apply_summary(
+            f"persona_evolution proposal written: {target}",
+            auto_apply_results,
+        )
     finally:
         ledger.close()
+
+
+def _auto_apply_expired_pending(
+    *,
+    workspace: Path,
+    state_db_path: Path,
+    persona_file: str,
+    now: datetime,
+    proposal_ttl_seconds: int,
+) -> list[PersonaEvolutionDecisionResult]:
+    ledger = PersonaEvolutionLedger(state_db_path)
+    try:
+        expired = [
+            proposal
+            for proposal in ledger.pending_proposals()
+            if str(proposal.get("persona_file") or "") == persona_file
+            and _proposal_expired(
+                proposal,
+                now,
+                max_age_seconds=proposal_ttl_seconds,
+            )
+        ]
+    finally:
+        ledger.close()
+
+    results: list[PersonaEvolutionDecisionResult] = []
+    for proposal in expired:
+        proposal_id = str(proposal["proposal_id"])
+        result = apply_persona_evolution_proposal(
+            workspace=workspace,
+            state_db_path=state_db_path,
+            proposal_id=proposal_id,
+            approved_by_channel="auto_apply",
+            approved_by_chat_id="ignored_ttl",
+            final_outcome="auto_approved",
+            allow_expired=True,
+            now=now,
+        )
+        if result.status == "blocked":
+            ledger = PersonaEvolutionLedger(state_db_path)
+            try:
+                ledger.close_proposal(
+                    proposal_id,
+                    status="blocked",
+                    final_outcome="auto_apply_blocked",
+                    closed_at=now,
+                    approval_channel="auto_apply",
+                    approval_chat_id="ignored_ttl",
+                )
+            finally:
+                ledger.close()
+        results.append(result)
+    return results
+
+
+def _with_auto_apply_summary(
+    result: str,
+    auto_apply_results: list[PersonaEvolutionDecisionResult],
+) -> str:
+    applied = [item.proposal_id for item in auto_apply_results if item.status == "applied"]
+    blocked = [
+        f"{item.proposal_id}:{item.message}"
+        for item in auto_apply_results
+        if item.status == "blocked"
+    ]
+    prefixes: list[str] = []
+    if applied:
+        prefixes.append(
+            "persona_evolution auto_applied ignored proposals: " + ",".join(applied)
+        )
+    if blocked:
+        prefixes.append(
+            "persona_evolution auto_apply blocked ignored proposals: "
+            + "; ".join(blocked)
+        )
+    if not prefixes:
+        return result
+    return "; ".join([*prefixes, result])
 
 
 def persona_evolution_signal_score(evidence: PersonaEvolutionEvidence) -> float:

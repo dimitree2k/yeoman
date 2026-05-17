@@ -200,6 +200,7 @@ class LiteLLMProvider(LLMProvider):
 
         return LLMResponse(
             content=message.content,
+            reasoning_content=getattr(message, "reasoning_content", None),
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,

@@ -856,6 +856,7 @@ class LLMResponder(ResponderPort):
                         messages,
                         assistant_content,
                         tool_call_dicts,
+                        reasoning_content=response.reasoning_content,
                     )
 
                     for tool_call in tool_calls:

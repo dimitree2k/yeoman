@@ -404,6 +404,63 @@ async def test_run_persona_evolution_cron_skips_without_durable_change(
 
 
 @pytest.mark.asyncio
+async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "personas" / "alpha-2.evolution.md").write_text(
+        "\n".join(
+            [
+                "# Evolution Layer: Alpha",
+                "",
+                "## Consciousness Outcome Lessons",
+                "- 2026-05-07 `whatsapp:group-a` confidence=medium evidence=50 speakups, 50 messages: Proactive speakups favor data-dense messages quantifying extreme market moves, trading dilutions, contrarian fiscal projections, or light humor; silences routine corporate metrics, broad sector trends, or basic fact corrections.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    memory = _memory(tmp_path)
+    memory.record_manual(
+        channel="whatsapp",
+        chat_id="group-a",
+        sender_id=None,
+        scope_type="chat",
+        kind="preference",
+        text="Proactive speakup taste pattern: Engages most with data-dense observations and error corrections on trading, markets, and finance; resists contrarian views and opinion-heavy shares.",
+        importance=0.75,
+        confidence=0.88,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    archive = InboundArchive(tmp_path / "reply_context.db")
+    output = workspace / "persona-evolution" / "proposal.md"
+    _record_messages(archive, day=1, count=3)
+
+    try:
+        result = await run_persona_evolution_cron(
+            policy=_policy(),
+            workspace=workspace,
+            persona_file="personas/alpha-2.md",
+            memory=memory,
+            speakup_log=log,
+            inbound_archive=archive,
+            window_days=1,
+            limit=10,
+            output_path=output,
+            min_meaningful_messages=1,
+            min_signal_score=0.0,
+            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+        )
+    finally:
+        memory.close()
+        log.close()
+        archive.close()
+
+    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
 async def test_cron_accumulates_below_threshold_messages_until_proposal(
     tmp_path: Path,
 ) -> None:
@@ -487,6 +544,62 @@ async def test_cron_accumulates_below_threshold_messages_until_proposal(
     assert third == f"persona_evolution proposal written: {output}"
     rendered = output.read_text(encoding="utf-8")
     assert "total_message_count: `27`" in rendered
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_mode_applies_ignored_expired_proposal(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    evolution_path = workspace / "personas" / "alpha-2.evolution.md"
+    state_db = tmp_path / "persona-evolution.db"
+    proposal_path = tmp_path / "proposal.md"
+    _record_test_proposal(
+        workspace=workspace,
+        state_db=state_db,
+        proposal_path=proposal_path,
+        proposal_id="ignored123",
+        created_at=datetime(2026, 5, 4, 3, 0, tzinfo=UTC),
+    )
+    memory = _memory(tmp_path)
+    log = SpeakupLog(tmp_path / "speakups.db")
+    archive = InboundArchive(tmp_path / "reply_context.db")
+
+    try:
+        result = await run_persona_evolution_cron(
+            policy=_policy(),
+            workspace=workspace,
+            persona_file="personas/alpha-2.md",
+            memory=memory,
+            speakup_log=log,
+            inbound_archive=archive,
+            state_db_path=state_db,
+            min_meaningful_messages=1,
+            min_signal_score=0.0,
+            proposal_ttl_seconds=3600,
+            proposal_mode="auto_apply",
+            now=datetime(2026, 5, 4, 4, 0, 1, tzinfo=UTC),
+        )
+    finally:
+        memory.close()
+        log.close()
+        archive.close()
+
+    ledger = PersonaEvolutionLedger(state_db)
+    try:
+        proposal = ledger.get_proposal("ignored123")
+    finally:
+        ledger.close()
+
+    assert result.startswith(
+        "persona_evolution auto_applied ignored proposals: ignored123; "
+    )
+    assert "Compact market numbers land" in evolution_path.read_text(encoding="utf-8")
+    assert proposal is not None
+    assert proposal["status"] == "applied"
+    assert proposal["final_outcome"] == "auto_approved"
+    assert proposal["approval_channel"] == "auto_apply"
+    assert proposal["approval_chat_id"] == "ignored_ttl"
 
 
 @pytest.mark.asyncio

@@ -736,6 +736,7 @@ def build_gateway_runtime(
                 min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
                 max_accumulation_days=max(1, int(job.payload.persona_max_accumulation_days)),
                 proposal_ttl_seconds=max(60, int(config.persona_evolution.proposal_ttl_seconds)),
+                proposal_mode=config.persona_evolution.mode,
             )
             if result and (
                 result.startswith("persona_evolution proposal written:")

@@ -8,7 +8,7 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.providers.base import LLMProvider, LLMResponse
+from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 class _TextualToolThenAnswerProvider(LLMProvider):
@@ -57,6 +57,42 @@ class _RecordingDeepResearchTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
         return "research result: eBay marketplace execution has declined"
+
+
+class _ReasoningToolThenAnswerProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.second_messages: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del tools, model, max_tokens, temperature, reasoning
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(
+                content="I need fresh data.",
+                reasoning_content="This requires a tool call before answering.",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_reasoning_1",
+                        name="deep_research",
+                        arguments={"query": "eBay strategic mistakes"},
+                    )
+                ],
+            )
+        self.second_messages = messages
+        return LLMResponse(content="eBay hat genug Baustellen: Search, Fees, Seller Trust.")
+
+    def get_default_model(self) -> str:
+        return "deepseek-v4-flash"
 
 
 def _event() -> InboundEvent:
@@ -148,3 +184,31 @@ async def test_json_textual_tool_call_is_executed_before_reply(tmp_path: Path) -
     assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
     assert provider.calls == 2
     assert tool.calls == [{"query": "eBay failures", "max_results": 4}]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_content_is_replayed_after_tool_call(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _ReasoningToolThenAnswerProvider()
+    tool = _RecordingDeepResearchTool()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+    responder.tools.register(tool)
+
+    out = await responder.generate_reply(_event(), _decision())
+
+    await responder.aclose()
+
+    assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
+    assert provider.calls == 2
+    assert provider.second_messages[-2]["role"] == "assistant"
+    assert provider.second_messages[-2]["reasoning_content"] == (
+        "This requires a tool call before answering."
+    )
+    assert provider.second_messages[-2]["tool_calls"][0]["id"] == "call_reasoning_1"
+    assert provider.second_messages[-1]["role"] == "tool"

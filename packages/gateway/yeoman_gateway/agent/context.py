@@ -565,6 +565,7 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
         messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
@@ -573,6 +574,8 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
             messages: Current message list.
             content: Message content.
             tool_calls: Optional tool calls.
+            reasoning_content: Optional model reasoning content to replay for
+                providers that require it after tool calls.
 
         Returns:
             Updated message list.
@@ -584,6 +587,9 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
 
         if tool_calls:
             msg["tool_calls"] = tool_calls
+
+        if reasoning_content is not None:
+            msg["reasoning_content"] = reasoning_content
 
         messages.append(msg)
         return messages
