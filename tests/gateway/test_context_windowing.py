@@ -129,6 +129,26 @@ class TestPreflightHeuristic:
 class TestConversationStateContext:
     """Conversation state should be visible to the responder prompt."""
 
+    def test_system_prompt_separates_repair_questions_from_engagement_bait(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_path).build_system_prompt()
+
+        assert "# Conversational Repair" in prompt
+        assert "ask one short clarification question" in prompt
+        assert "Do not ask questions to keep the conversation open" in prompt
+        assert "Do not end an otherwise complete answer with a question" in prompt
+
+    def test_system_prompt_allows_social_calibration_without_extra_engagement(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_path).build_system_prompt()
+
+        assert "# Social Calibration" in prompt
+        assert "brief affiliative marker" in prompt
+        assert "set one blunt boundary" in prompt
+        assert "Do not add a follow-up question" in prompt
+
     def test_current_message_includes_repair_guidance(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
 
@@ -155,6 +175,184 @@ class TestConversationStateContext:
         assert "preferred_action: answer" in user_text
         assert "answer_shape: repair" in user_text
         assert "Acknowledge the problem briefly, then correct the answer." in user_text
+
+    def test_current_message_includes_social_one_liner_guidance(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[],
+            current_message=(
+                "[Image] @203075365150770\n"
+                "[image_description] This image is a screenshot of a social media post. "
+                'The text reads, "Andrej Karpathy is the Sydney Sweeney of AI."'
+            ),
+            current_metadata={
+                "sender_id": "user@s.whatsapp.net",
+                "conversation_state": {
+                    "addressed_to_bot": True,
+                    "address_mode": "explicit_social_mention",
+                    "preferred_action": "answer",
+                    "answer_shape": "social_one_liner",
+                    "room_mode": "direct_thread",
+                },
+            },
+            channel="whatsapp",
+            chat_id="group@g.us",
+        )
+
+        user_text = str(messages[-1]["content"])
+        assert "answer_shape: social_one_liner" in user_text
+        assert "Treat this as a social beat, not a request for analysis." in user_text
+        assert "Do not explain the premise" in user_text
+
+
+class TestDeliveryRepairGate:
+    """Delivery tools should repair ambiguous targets instead of guessing."""
+
+    @pytest.mark.asyncio
+    async def test_message_tool_rejects_unresolved_whatsapp_chat_id(self):
+        from yeoman_gateway.agent.tools.message import MessageTool
+        from yeoman_gateway.bus.events import OutboundMessage
+
+        sent: list[OutboundMessage] = []
+
+        async def _send(message: OutboundMessage) -> None:
+            sent.append(message)
+
+        tool = MessageTool(
+            send_callback=_send,
+            default_channel="whatsapp",
+            default_chat_id="491234567890-123456789@g.us",
+        )
+
+        result = await tool.execute(content="kommst du?", chat_id="Martin")
+
+        assert result.startswith("Error: Cannot resolve WhatsApp target")
+        assert "Ask which WhatsApp chat/contact to use" in result
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_tool_rejects_unresolved_whatsapp_chat_id(self):
+        from yeoman_gateway.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
+
+        sent: list[VoiceSendRequest] = []
+
+        async def _send(request: VoiceSendRequest) -> str:
+            sent.append(request)
+            return "Voice message delivered."
+
+        tool = SendVoiceTool(
+            send_callback=_send,
+            default_channel="whatsapp",
+            default_chat_id="491234567890-123456789@g.us",
+        )
+
+        result = await tool.execute(content="kommst du?", chat_id="Martin")
+
+        assert result.startswith("Error: Cannot resolve WhatsApp target")
+        assert "Ask which WhatsApp chat/contact to use" in result
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_send_voice_tool_still_allows_current_whatsapp_context(self):
+        from yeoman_gateway.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
+
+        sent: list[VoiceSendRequest] = []
+
+        async def _send(request: VoiceSendRequest) -> str:
+            sent.append(request)
+            return "Voice message delivered."
+
+        tool = SendVoiceTool(
+            send_callback=_send,
+            default_channel="whatsapp",
+            default_chat_id="491234567890-123456789@g.us",
+        )
+
+        result = await tool.execute(content="kommst du?")
+
+        assert result == "Voice message delivered."
+        assert sent[0].chat_id == "491234567890-123456789@g.us"
+
+    @pytest.mark.asyncio
+    async def test_side_effecting_tool_without_explicit_target_gets_repair_result(
+        self,
+        tmp_path,
+    ):
+        from typing import Any
+
+        from yeoman_gateway.adapters.responder_llm import LLMResponder
+        from yeoman_gateway.bus.queue import MessageBus
+        from yeoman_gateway.core.models import PolicyDecision
+        from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+
+        class _VoiceToolWithoutTargetProvider(LLMProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+                self.second_messages: list[dict[str, Any]] = []
+
+            async def chat(
+                self,
+                messages: list[dict[str, Any]],
+                tools: list[dict[str, Any]] | None = None,
+                model: str | None = None,
+                max_tokens: int = 4096,
+                temperature: float = 0.7,
+                reasoning: dict[str, Any] | None = None,
+            ) -> LLMResponse:
+                del tools, model, max_tokens, temperature, reasoning
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(
+                        content=None,
+                        tool_calls=[
+                            ToolCallRequest(
+                                id="call_voice_1",
+                                name="send_voice",
+                                arguments={"content": "Kommst du?"},
+                            )
+                        ],
+                    )
+                self.second_messages = messages
+                return LLMResponse(content="Welchen Martin meinst du?")
+
+            def get_default_model(self) -> str:
+                return "dummy/model"
+
+        provider = _VoiceToolWithoutTargetProvider()
+        responder = LLMResponder(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            max_iterations=2,
+        )
+
+        out = await responder.generate_reply(
+            InboundEvent(
+                channel="whatsapp",
+                chat_id="491234567890-123456789@g.us",
+                sender_id="user@s.whatsapp.net",
+                content="Arvid schick eine Sprachnachricht an Martin: Kommst du?",
+                is_group=True,
+                mentioned_bot=True,
+            ),
+            PolicyDecision(
+                accept_message=True,
+                should_respond=True,
+                allowed_tools=frozenset({"send_voice"}),
+                reason="test",
+            ),
+        )
+
+        await responder.aclose()
+
+        assert out == "Welchen Martin meinst du?"
+        assert provider.calls == 2
+        assert provider.second_messages[-1]["role"] == "tool"
+        assert provider.second_messages[-1]["name"] == "send_voice"
+        assert "Repair required" in provider.second_messages[-1]["content"]
+        assert "Do not default to the current chat" in provider.second_messages[-1]["content"]
 
 
 class TestRecallConversationTool:

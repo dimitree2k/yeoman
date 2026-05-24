@@ -98,6 +98,58 @@ async def test_explicit_mention_gets_conversation_state_without_extra_promotion(
 
 
 @pytest.mark.asyncio
+async def test_explicit_mention_on_social_image_without_question_gets_social_one_liner() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content=(
+                "[Image] @203075365150770\n"
+                "[image_description] This image is a screenshot of a social media post "
+                'featuring side-by-side photos. The text above the images reads, '
+                '"Andrej Karpathy is the Sydney Sweeney of AI."'
+            ),
+            mentioned_bot=True,
+            raw_metadata={"media_kind": "image"},
+        ),
+        decision=_mention_only_decision(should_respond=True, reason="when_to_reply:mentioned_bot"),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["addressed_to_bot"] is True
+    assert state["address_mode"] == "explicit_social_mention"
+    assert state["preferred_action"] == "answer"
+    assert state["answer_shape"] == "social_one_liner"
+    assert ctx.decision is not None
+    assert ctx.decision.reason == "when_to_reply:mentioned_bot"
+
+
+@pytest.mark.asyncio
+async def test_explicit_mention_on_social_image_with_question_keeps_short_take() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content=(
+                "[Image] @203075365150770 wie findest du das?\n"
+                "[image_description] This image is a screenshot of a social media post "
+                'featuring side-by-side photos. The text above the images reads, '
+                '"Andrej Karpathy is the Sydney Sweeney of AI."'
+            ),
+            mentioned_bot=True,
+            raw_metadata={"media_kind": "image"},
+        ),
+        decision=_mention_only_decision(should_respond=True, reason="when_to_reply:mentioned_bot"),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "explicit_mention"
+    assert state["answer_shape"] == "short_take"
+
+
+@pytest.mark.asyncio
 async def test_question_without_question_mark_after_recent_assistant_reply_wakes() -> None:
     event_time = datetime(2026, 5, 2, 18, 0, 8, tzinfo=UTC)
     sessions = _Sessions(

@@ -359,3 +359,56 @@ async def test_group_holdback_decays_after_ten_minutes(tmp_path: Path) -> None:
 
     assert second == "Alright."
     assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_group_talkative_cooldown_sets_blunt_boundary(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _SequenceProvider(["Tesla bleibt volatil."])
+    responder = LLMResponder(bus=MessageBus(), provider=provider, workspace=workspace)
+
+    first = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Arvid check Tesla Aktie bitte",
+            is_group=True,
+            mentioned_bot=True,
+        ),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="test",
+            talkative_cooldown_enabled=True,
+            talkative_cooldown_streak_threshold=2,
+            talkative_cooldown_delay_seconds=0,
+        ),
+    )
+    second = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Arvid check Tesla Aktie nochmal",
+            is_group=True,
+            mentioned_bot=True,
+        ),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="test",
+            talkative_cooldown_enabled=True,
+            talkative_cooldown_streak_threshold=2,
+            talkative_cooldown_delay_seconds=0,
+        ),
+    )
+
+    await responder.aclose()
+
+    assert first == "Tesla bleibt volatil."
+    assert second == "Bro, du nervst gerade mit dem gleichen Thema. Kurz Pause."
+    assert provider.calls == 1

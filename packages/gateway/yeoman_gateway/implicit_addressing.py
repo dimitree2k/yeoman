@@ -31,6 +31,17 @@ _REPAIR_FEEDBACK_RE = re.compile(
 _RESEARCH_REQUEST_RE = re.compile(
     r"(?i)\b(deep\s+search|deep\s+research|recherch|quellen?|sources?|such(?:e|st)?|prüf|pruef)\b"
 )
+_SOCIAL_BEAT_CUE_RE = re.compile(
+    r"(?i)(?:\b(lol|haha|lmao|rofl|meme|witz|witzig|funny|joke|roast|banter|unfair|cringe|wild)\b|[😂🤣💀😭])"
+)
+_SOCIAL_IMAGE_CUE_RE = re.compile(
+    r"(?i)\b("
+    r"social\s+media\s+post|"
+    r"screenshot\s+of\s+(?:a\s+)?(?:post|tweet|x\s+post|instagram|tiktok)|"
+    r"tweet|meme|caption|side-by-side\s+photos|featuring\s+side-by-side|"
+    r"text\s+(?:above\s+the\s+images\s+)?(?:reads|says)"
+    r")\b"
+)
 
 
 class SessionManagerLike(Protocol):
@@ -47,6 +58,7 @@ class ConversationState:
     direct_bot_interaction: bool
     name_mentioned: bool = False
     repair_requested: bool = False
+    social_cue: bool = False
 
     def as_metadata(self) -> dict[str, object]:
         return {
@@ -58,6 +70,7 @@ class ConversationState:
             "direct_bot_interaction": self.direct_bot_interaction,
             "name_mentioned": self.name_mentioned,
             "repair_requested": self.repair_requested,
+            "social_cue": self.social_cue,
         }
 
 
@@ -94,6 +107,23 @@ def looks_like_repair_feedback(text: str) -> bool:
     return bool(compact and _REPAIR_FEEDBACK_RE.search(compact))
 
 
+def looks_like_social_reaction_prompt(text: str, metadata: dict[str, Any] | None = None) -> bool:
+    compact = " ".join(str(text or "").strip().split())
+    if not compact:
+        return False
+    if _SOCIAL_BEAT_CUE_RE.search(compact):
+        return True
+
+    metadata = metadata or {}
+    media_kind = str(metadata.get("media_kind") or metadata.get("mediaKind") or "").strip().lower()
+    has_image_context = (
+        media_kind == "image"
+        or "[image]" in compact.lower()
+        or "[image_description]" in compact.lower()
+    )
+    return bool(has_image_context and _SOCIAL_IMAGE_CUE_RE.search(compact))
+
+
 def reaction_for_name_mention(text: str) -> str:
     if _NEGATIVE_REACTION_RE.search(text):
         return "🙄"
@@ -123,6 +153,9 @@ def classify_conversation_state(
     reply_direct = bool(reply_to_bot or metadata.get("reply_to_bot") or metadata.get("replyToBot"))
     from_me = bool(metadata.get("from_me") or metadata.get("fromMe"))
     request_like = looks_like_question_or_request(content)
+    social_reaction = (
+        not request_like and looks_like_social_reaction_prompt(content, metadata)
+    )
     recent_followup = is_recent_assistant_followup(
         session_manager=session_manager,
         channel=channel,
@@ -149,6 +182,8 @@ def classify_conversation_state(
         address_mode = "from_me"
     elif repair_feedback:
         address_mode = "repair_feedback"
+    elif explicit_mention and social_reaction:
+        address_mode = "explicit_social_mention"
     elif explicit_mention:
         address_mode = "explicit_mention"
     elif reply_direct:
@@ -171,6 +206,8 @@ def classify_conversation_state(
 
     if address_mode == "repair_feedback":
         answer_shape = "repair"
+    elif address_mode == "explicit_social_mention":
+        answer_shape = "social_one_liner"
     elif preferred_action != "answer":
         answer_shape = "none"
     elif _RESEARCH_REQUEST_RE.search(content):
@@ -190,6 +227,7 @@ def classify_conversation_state(
         direct_bot_interaction=direct,
         name_mentioned=name_mentioned,
         repair_requested=repair_feedback,
+        social_cue=social_reaction,
     )
 
 

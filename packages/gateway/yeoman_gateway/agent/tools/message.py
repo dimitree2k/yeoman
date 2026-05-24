@@ -3,6 +3,11 @@
 from typing import Any, Awaitable, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.tools.send_voice import (
+    _is_resolvable_whatsapp_chat_id,
+    _normalize_whatsapp_chat_id,
+    _unresolved_whatsapp_target_error,
+)
 from yeoman_gateway.bus.events import OutboundMessage
 
 
@@ -109,6 +114,10 @@ class MessageTool(Tool):
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
+        if channel == "whatsapp":
+            if not _is_resolvable_whatsapp_chat_id(chat_id):
+                return _unresolved_whatsapp_target_error(chat_id)
+            chat_id = _normalize_whatsapp_chat_id(chat_id)
 
         if not self._send_callback:
             return "Error: Message sending not configured"

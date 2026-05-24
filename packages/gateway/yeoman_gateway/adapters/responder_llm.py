@@ -52,6 +52,7 @@ from yeoman_gateway.media.tts import (
     truncate_for_voice,
     write_tts_audio_file,
 )
+from yeoman_gateway.policy.identity import normalize_sender_list
 from yeoman_gateway.providers.base import LLMProvider, ToolCallRequest
 from yeoman_gateway.session.manager import SessionManager
 
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.memory.service import MemoryService
     from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 
 _BACKWARD_REF_RE = re.compile(
@@ -113,11 +115,151 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "youtube_transcript",
     }
 )
+_DELIVERY_TOOLS = frozenset({"message", "send_voice", "send_media"})
+_DELIVERY_TARGET_STOPWORDS = frozenset(
+    {
+        "da",
+        "das",
+        "dem",
+        "den",
+        "der",
+        "die",
+        "dich",
+        "einen",
+        "eine",
+        "euch",
+        "hier",
+        "me",
+        "mich",
+        "mir",
+        "the",
+        "this",
+        "uns",
+    }
+)
+_DELIVERY_TARGET_PREPOSITION_RE = re.compile(
+    r"(?iu)\b(?:an|to|für|fuer|zu)\s+(?:(?:die|den|der|das|dem|the)\s+)?([@\w+][\w.+-]*)"
+)
+_DELIVERY_TARGET_AFTER_VERB_RE = re.compile(
+    r"(?iu)\b(?:schick|schicke|sende|send|schreib|schreibe)\s+([@\w+][\w.+-]*)"
+)
+_PRIVATE_DELIVERY_INTENT_RE = re.compile(
+    r"(?iu)\b(?:privat|private|dm|pn|pm|direktnachricht|direct\s+message|"
+    r"off[-\s]?chat|pers(?:ö|oe)nlich)\b"
+)
+_DELIVERY_SUCCESS_RE = re.compile(
+    r"^(?:Voice message|Message) delivered to (?P<channel>[^:]+):"
+    r"(?P<chat_id>.+?)(?:\. Delivery complete\b.*|\.$)",
+    re.IGNORECASE,
+)
+_PHONE_CHARS_RE = re.compile(r"[\s().-]+")
 
 
 def _has_backward_reference(text: str) -> bool:
     """Return True if the message appears to reference earlier conversation."""
     return bool(_BACKWARD_REF_RE.search(text))
+
+
+def _delivery_args_have_explicit_target(arguments: dict[str, Any]) -> bool:
+    for key in ("chat_id", "group"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _normalize_whatsapp_chat_id_for_delivery(chat_id: str) -> str:
+    token = str(chat_id or "").strip()
+    if not token or "@" in token:
+        return token
+    phone = _PHONE_CHARS_RE.sub("", token.removeprefix("+"))
+    if phone.isdigit():
+        return f"{phone}@s.whatsapp.net"
+    return token
+
+
+def _delivery_arg_chat_id(arguments: dict[str, Any]) -> str:
+    value = arguments.get("chat_id")
+    return str(value or "").strip() if isinstance(value, str) else ""
+
+
+def _delivery_targets_private_chat(
+    *,
+    arguments: dict[str, Any],
+    current_channel: str,
+    current_chat_id: str,
+) -> bool:
+    if current_channel != "whatsapp" or not current_chat_id.endswith("@g.us"):
+        return False
+    if str(arguments.get("group") or "").strip():
+        return False
+    target = _delivery_arg_chat_id(arguments)
+    if not target:
+        return False
+    normalized = _normalize_whatsapp_chat_id_for_delivery(target)
+    if not normalized or normalized == current_chat_id:
+        return False
+    return not normalized.endswith("@g.us")
+
+
+def _private_delivery_intent_present(text: str) -> bool:
+    return bool(_PRIVATE_DELIVERY_INTENT_RE.search(str(text or "")))
+
+
+def _whatsapp_aliases(*values: str) -> set[str]:
+    return set(normalize_sender_list("whatsapp", [v for v in values if str(v or "").strip()]))
+
+
+def _delivery_request_names_target(text: str) -> bool:
+    compact = " ".join(str(text or "").strip().split())
+    if not compact:
+        return False
+
+    for pattern in (_DELIVERY_TARGET_PREPOSITION_RE, _DELIVERY_TARGET_AFTER_VERB_RE):
+        for match in pattern.finditer(compact):
+            token = str(match.group(1) or "").strip(" ,.:;!?()[]{}\"'")
+            if not token:
+                continue
+            if token.lower() in _DELIVERY_TARGET_STOPWORDS:
+                continue
+            return True
+    return False
+
+
+def _delivery_repair_result(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    current_user_message: str,
+    current_channel: str = "",
+    current_chat_id: str = "",
+) -> str | None:
+    if tool_name not in _DELIVERY_TOOLS:
+        return None
+    if (
+        _delivery_targets_private_chat(
+            arguments=arguments,
+            current_channel=current_channel,
+            current_chat_id=current_chat_id,
+        )
+        and not _private_delivery_intent_present(current_user_message)
+    ):
+        return (
+            "Repair required: this group-chat request does not explicitly ask for "
+            "private/off-chat delivery, but the delivery tool targets a personal chat. "
+            "Do not send it privately. Ask one short clarification question or use "
+            "the current group if that is clearly intended."
+        )
+    if _delivery_args_have_explicit_target(arguments):
+        return None
+    if not _delivery_request_names_target(current_user_message):
+        return None
+    return (
+        "Repair required: the user named a recipient or target, but this delivery "
+        "tool call has no explicit `chat_id` or `group`. "
+        "Do not default to the current chat. Ask one short clarification question "
+        "for the missing target and do not ask any engagement question."
+    )
 
 
 def _last_sentence(text: str) -> str:
@@ -204,6 +346,7 @@ class LLMResponder(ResponderPort):
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
         inbound_archive: "InboundArchive | None" = None,
+        private_handoff_store: "PrivateHandoffStore | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
     ) -> None:
@@ -233,9 +376,11 @@ class LLMResponder(ResponderPort):
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._recording_notifier = recording_notifier
         self.inbound_archive = inbound_archive
+        self._private_handoff_store = private_handoff_store
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
+        self._pending_hidden_assistant_messages: list[str] = []
 
         self.effective_restrict_to_workspace = restrict_to_workspace or (
             self.exec_config.isolation.enabled
@@ -594,6 +739,98 @@ class LLMResponder(ResponderPort):
         return f"Voice message delivered to {channel}:{chat_id}."
 
     @staticmethod
+    def _delivery_success_target(result: str) -> tuple[str, str] | None:
+        match = _DELIVERY_SUCCESS_RE.search(str(result or "").strip())
+        if not match:
+            return None
+        return match.group("channel").strip(), match.group("chat_id").strip()
+
+    @staticmethod
+    def _sender_id_from_whatsapp_chat_id(chat_id: str) -> str:
+        token = str(chat_id or "").strip()
+        if "@" in token:
+            token = token.split("@", 1)[0]
+        return token.split(":", 1)[0].removeprefix("+")
+
+    def _record_hidden_assistant_marker(self, content: str) -> None:
+        compact = " ".join(str(content or "").split())
+        if compact:
+            self._pending_hidden_assistant_messages.append(compact)
+
+    def _flush_hidden_assistant_markers(self, session: Any) -> None:
+        if not self._pending_hidden_assistant_messages:
+            return
+        for marker in self._pending_hidden_assistant_messages:
+            session.add_message("assistant", marker, hidden=True, synthetic=True)
+        self._pending_hidden_assistant_messages = []
+
+    def _maybe_open_private_handoff(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: str,
+        current_channel: str,
+        current_chat_id: str,
+        current_sender_id: str,
+        current_is_group: bool,
+        current_user_message: str,
+        origin_label: str,
+    ) -> None:
+        if self._private_handoff_store is None:
+            return
+        if tool_name not in {"message", "send_voice"}:
+            return
+        if not current_is_group or current_channel != "whatsapp" or not current_chat_id.endswith("@g.us"):
+            return
+        if not _private_delivery_intent_present(current_user_message):
+            return
+        target = self._delivery_success_target(result)
+        if target is None:
+            return
+        target_channel, target_chat_id = target
+        if target_channel != "whatsapp" or target_chat_id.endswith("@g.us"):
+            return
+        target_sender = self._sender_id_from_whatsapp_chat_id(target_chat_id) or current_sender_id
+        try:
+            self._private_handoff_store.open(
+                channel=target_channel,
+                target_chat_id=target_chat_id,
+                target_sender_id=target_sender,
+                origin_chat_id=current_chat_id,
+                origin_label=origin_label or current_chat_id,
+            )
+        except Exception as exc:
+            logger.warning("private handoff open failed: {}", exc)
+
+    def _private_delivery_target_is_resolvable(
+        self,
+        *,
+        arguments: dict[str, Any],
+        current_sender_id: str,
+        current_metadata: dict[str, object],
+    ) -> bool:
+        target = _delivery_arg_chat_id(arguments)
+        if not target:
+            return False
+        target_aliases = _whatsapp_aliases(_normalize_whatsapp_chat_id_for_delivery(target))
+        allowed_values = [
+            current_sender_id,
+            str(current_metadata.get("participant") or ""),
+            str(current_metadata.get("reply_to_participant") or ""),
+        ]
+        mentioned = current_metadata.get("mentioned_jids")
+        if isinstance(mentioned, list):
+            allowed_values.extend(str(value) for value in mentioned if str(value or "").strip())
+        if target_aliases.intersection(_whatsapp_aliases(*allowed_values)):
+            return True
+        if self.contacts_service is not None:
+            for jid in self.contacts_service.known_jids:
+                if target_aliases.intersection(_whatsapp_aliases(str(jid))):
+                    return True
+        return False
+
+    @staticmethod
     def _metadata_for_event(event: InboundEvent) -> dict[str, object]:
         metadata = dict(event.raw_metadata)
         metadata.update(
@@ -771,7 +1008,15 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         model: str | None = None,
         provider: LLMProvider | None = None,
+        temperature: float | None = None,
         reasoning: dict[str, object] | None = None,
+        current_user_message: str = "",
+        current_channel: str = "",
+        current_chat_id: str = "",
+        current_sender_id: str = "",
+        current_is_group: bool = False,
+        current_origin_label: str = "",
+        current_metadata: dict[str, object] | None = None,
         trace: Any = None,
     ) -> str | None:
         iteration = 0
@@ -792,6 +1037,7 @@ class LLMResponder(ResponderPort):
                     messages=messages,
                     tools=self._tool_definitions(allowed_tools),
                     model=model or self.model,
+                    temperature=temperature if temperature is not None else 0.7,
                     reasoning=reasoning,
                 )
                 lf.log_generation(
@@ -869,8 +1115,61 @@ class LLMResponder(ResponderPort):
                             parent_span_id=iter_span.span_id if iter_span else None,
                         ) if trace is not None else None
 
-                        # --- dedup guard for send-type tools ---
+                        # --- repair/dedup guards for send-type tools ---
                         if tool_call.name in _send_tools:
+                            metadata_for_delivery = current_metadata or {}
+                            if (
+                                _delivery_targets_private_chat(
+                                    arguments=tool_call.arguments,
+                                    current_channel=current_channel,
+                                    current_chat_id=current_chat_id,
+                                )
+                                and _private_delivery_intent_present(current_user_message)
+                                and not self._private_delivery_target_is_resolvable(
+                                    arguments=tool_call.arguments,
+                                    current_sender_id=current_sender_id,
+                                    current_metadata=metadata_for_delivery,
+                                )
+                            ):
+                                repair_result = (
+                                    "Repair required: the user asked for private delivery, "
+                                    "but the personal target is not the current sender, a "
+                                    "mentioned/replied participant, or a known contact. Ask "
+                                    "one short clarification question and do not guess a phone number."
+                                )
+                                logger.warning(
+                                    "Blocked delivery tool call with unresolved private target: {}",
+                                    tool_call.name,
+                                )
+                                lf.end_span(tool_span, output=repair_result)
+                                messages = self.context.add_tool_result(
+                                    messages,
+                                    tool_call.id,
+                                    tool_call.name,
+                                    repair_result,
+                                )
+                                continue
+                            repair_result = _delivery_repair_result(
+                                tool_name=tool_call.name,
+                                arguments=tool_call.arguments,
+                                current_user_message=current_user_message,
+                                current_channel=current_channel,
+                                current_chat_id=current_chat_id,
+                            )
+                            if repair_result is not None and tool_call.name in allowed_tools:
+                                logger.warning(
+                                    "Blocked delivery tool call missing explicit target: {}",
+                                    tool_call.name,
+                                )
+                                lf.end_span(tool_span, output=repair_result)
+                                messages = self.context.add_tool_result(
+                                    messages,
+                                    tool_call.id,
+                                    tool_call.name,
+                                    repair_result,
+                                )
+                                continue
+
                             call_key = (tool_call.name, args_preview)
                             if call_key in _sent_calls:
                                 result = (
@@ -941,10 +1240,29 @@ class LLMResponder(ResponderPort):
                             tool_call.name,
                             result,
                         )
+                        self._maybe_open_private_handoff(
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                            result=str(result or ""),
+                            current_channel=current_channel,
+                            current_chat_id=current_chat_id,
+                            current_sender_id=current_sender_id,
+                            current_is_group=current_is_group,
+                            current_user_message=current_user_message,
+                            origin_label=current_origin_label,
+                        )
                         if (
                             tool_call.name == "send_voice"
                             and result.startswith("Voice message delivered")
                         ):
+                            target = self._delivery_success_target(str(result or ""))
+                            target_label = (
+                                f"{target[0]}:{target[1]}" if target is not None else "the requested chat"
+                            )
+                            self._record_hidden_assistant_marker(
+                                "Voice message delivered to "
+                                f"{target_label}. Do not send it again for this request."
+                            )
                             return None
                     continue
 
@@ -1181,15 +1499,9 @@ class LLMResponder(ResponderPort):
 
     def _talkative_message_for(self, text: str) -> str:
         if self._is_probably_german(text):
-            return (
-                "Bro, du bist heute extrem gespraechig zum selben Thema. "
-                "Arvid braucht kurz Pause. "
-                "Wenn du 24/7 quatschen willst, goenn dir ein OpenAI/Kimi/Anthropic-Abo."
-            )
+            return "Bro, du nervst gerade mit dem gleichen Thema. Kurz Pause."
         return (
-            "Bro, you are very talkative on the same topic today. "
-            "Arvid needs a short break. "
-            "If you want 24/7 bot chat, get an OpenAI/Kimi/Anthropic subscription."
+            "Bro, this is getting annoying on the same topic. Take a short pause."
         )
 
     async def _generate_talkative_message_llm(self, text: str) -> str | None:
@@ -1200,14 +1512,16 @@ class LLMResponder(ResponderPort):
                 "content": (
                     "You write one short playful cooldown message for a busy group chat. "
                     "No markdown. No threats. No slurs. No factual claims. "
+                    "Set a blunt boundary without customer-support softness. "
+                    "Do not ask a follow-up question. "
                     "Max 2 sentences and max 160 characters."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Write a cheeky message telling one very talkative person to take a short pause, "
-                    "and suggest buying an OpenAI/Kimi/Anthropic subscription for all-day bot chatting. "
+                    "Write a cheeky message telling one very talkative person they are getting annoying "
+                    "with the same topic and should take a short pause. "
                     f"Output language: {language_hint}."
                 ),
             },
@@ -1320,6 +1634,7 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
+        private_handoff_id: str | None = None,
     ) -> str | None:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
@@ -1344,6 +1659,7 @@ class LLMResponder(ResponderPort):
                 is_owner=is_owner,
                 model_profile=model_profile,
                 session_history_limit=session_history_limit,
+                private_handoff_id=private_handoff_id,
             )
 
     async def _generate_locked(
@@ -1367,6 +1683,7 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         model_profile: str | None = None,
         session_history_limit: int | None = None,
+        private_handoff_id: str | None = None,
     ) -> str | None:
         # Handle owner approve/deny commands
         if is_owner and channel == "whatsapp":
@@ -1386,6 +1703,7 @@ class LLMResponder(ResponderPort):
             session_id=session_key,
         )
         self._current_trace = trace
+        self._pending_hidden_assistant_messages = []
 
         session = self.sessions.get_or_create(session_key)
 
@@ -1529,11 +1847,28 @@ class LLMResponder(ResponderPort):
                     is_owner=is_owner,
                     model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
                     provider=self._provider_for_profile(resolved_profile),
+                    temperature=(
+                        float(getattr(resolved_profile, "temperature"))
+                        if getattr(resolved_profile, "temperature", None) is not None
+                        else None
+                    ),
                     reasoning=(
                         getattr(resolved_profile, "reasoning", None)
                         if isinstance(getattr(resolved_profile, "reasoning", None), dict)
                         else None
                     ),
+                    current_user_message=content,
+                    current_channel=channel,
+                    current_chat_id=chat_id,
+                    current_sender_id=sender_id or "",
+                    current_is_group=bool(metadata.get("is_group", False)),
+                    current_origin_label=str(
+                        metadata.get("group_name")
+                        or metadata.get("subject")
+                        or metadata.get("chat_name")
+                        or chat_id
+                    ),
+                    current_metadata=metadata,
                     trace=trace,
                 )
                 self._current_session = None
@@ -1541,6 +1876,7 @@ class LLMResponder(ResponderPort):
         if final_content is None:
             if not _user_message_already_added:
                 session.add_message("user", content, sender_id=sender_id)
+            self._flush_hidden_assistant_markers(session)
             self.sessions.save(session)
             self._current_trace = None
             return None
@@ -1592,6 +1928,11 @@ class LLMResponder(ResponderPort):
             session.add_message("user", content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+        if private_handoff_id and self._private_handoff_store is not None:
+            try:
+                self._private_handoff_store.consume_reply(private_handoff_id)
+            except Exception as exc:
+                logger.warning("private handoff consume failed: {}", exc)
         self._current_trace = None
         return final_content
 
@@ -1611,6 +1952,19 @@ class LLMResponder(ResponderPort):
             )
             metadata["voice_reply_max_chars"] = int(
                 getattr(decision, "voice_output_max_chars", 500) or 500
+            )
+        if decision.private_handoff_active:
+            metadata["private_handoff_active"] = True
+            metadata["private_handoff_origin_chat_id"] = (
+                decision.private_handoff_origin_chat_id or ""
+            )
+            metadata["private_handoff_origin_label"] = (
+                decision.private_handoff_origin_label
+                or decision.private_handoff_origin_chat_id
+                or ""
+            )
+            metadata["private_handoff_remaining_replies"] = (
+                decision.private_handoff_remaining_replies
             )
         # Inject contacts roster for group chats with disclosure enabled
         if (
@@ -1649,6 +2003,7 @@ class LLMResponder(ResponderPort):
             is_owner=decision.is_owner,
             model_profile=decision.model_profile,
             session_history_limit=decision.session_history_limit,
+            private_handoff_id=decision.private_handoff_id,
         )
 
     async def process_direct(

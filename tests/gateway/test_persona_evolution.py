@@ -24,6 +24,7 @@ from yeoman_gateway.persona_evolution import (
     chats_for_persona,
     collect_persona_evolution_evidence,
     deny_persona_evolution_proposal,
+    persona_evolution_result_needs_notification,
     render_persona_evolution_proposal,
     run_persona_evolution_cron,
 )
@@ -181,6 +182,23 @@ def test_chats_for_persona_uses_effective_policy_persona() -> None:
         ("whatsapp", "group-a", "chat"),
         ("whatsapp", "group-b", "chat"),
     ]
+
+
+def test_persona_evolution_notification_detection_handles_auto_apply_prefix() -> None:
+    assert persona_evolution_result_needs_notification(
+        "persona_evolution proposal written: /tmp/proposal.md"
+    )
+    assert persona_evolution_result_needs_notification(
+        "persona_evolution no proposal: pending_proposal proposal_id=abc123"
+    )
+    assert persona_evolution_result_needs_notification(
+        "persona_evolution auto_applied ignored proposals: old123; "
+        "persona_evolution proposal written: /tmp/proposal.md"
+    )
+    assert not persona_evolution_result_needs_notification(
+        "persona_evolution auto_applied ignored proposals: old123; "
+        "persona_evolution no proposal: no_durable_changes messages=50 score=167.50"
+    )
 
 
 @pytest.mark.asyncio

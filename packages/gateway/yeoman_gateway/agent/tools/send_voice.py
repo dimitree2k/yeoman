@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from yeoman_gateway.agent.tools.base import Tool
+
+_PHONE_CHARS_RE = re.compile(r"[\s().-]+")
 
 
 def _normalize_whatsapp_chat_id(chat_id: str) -> str:
@@ -13,9 +16,28 @@ def _normalize_whatsapp_chat_id(chat_id: str) -> str:
     if not token or "@" in token:
         return token
     phone = token.removeprefix("+")
+    phone = _PHONE_CHARS_RE.sub("", phone)
     if phone.isdigit():
         return f"{phone}@s.whatsapp.net"
     return token
+
+
+def _is_resolvable_whatsapp_chat_id(chat_id: str) -> bool:
+    token = str(chat_id or "").strip()
+    if not token:
+        return False
+    if "@" in token:
+        return True
+    phone = _PHONE_CHARS_RE.sub("", token.removeprefix("+"))
+    return phone.isdigit() and len(phone) >= 5
+
+
+def _unresolved_whatsapp_target_error(target: str) -> str:
+    compact = " ".join(str(target or "").strip().split()) or "<empty>"
+    return (
+        f"Error: Cannot resolve WhatsApp target '{compact}'. "
+        "Ask which WhatsApp chat/contact to use; do not guess or default to the current chat."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +194,8 @@ class SendVoiceTool(Tool):
         if not resolved_channel or not resolved_chat_id:
             return "Error: No target channel/chat specified"
         if resolved_channel == "whatsapp":
+            if not _is_resolvable_whatsapp_chat_id(resolved_chat_id):
+                return _unresolved_whatsapp_target_error(resolved_chat_id)
             resolved_chat_id = _normalize_whatsapp_chat_id(resolved_chat_id)
         if not self._send_callback:
             return "Error: Voice sending is not configured"

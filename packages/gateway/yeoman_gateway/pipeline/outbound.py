@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.tts import TTSSynthesizer
 
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
+_INLINE_CODE_REACTION_RE = re.compile(r"^\s*`(\s*::reaction::.+?)`\s*$", re.DOTALL)
 # Matches text followed by a reaction suffix: "some text\n\n::reaction::emoji"
 _REACTION_SUFFIX_RE = re.compile(r"^([\s\S]+?)\n+::reaction::([^\n]+?)\s*$")
 _TRACEBACK_RE = re.compile(r"(?im)^\s*traceback \(most recent call last\):")
@@ -101,6 +102,13 @@ def _is_unsuitable_for_voice(text: str) -> bool:
     return False
 
 
+def _unwrap_inline_code_reaction_marker(text: str) -> str:
+    match = _INLINE_CODE_REACTION_RE.match(text)
+    if not match:
+        return text
+    return match.group(1).strip()
+
+
 class OutboundMiddleware:
     """Assemble final outbound intent from the reply in ``ctx.reply``.
 
@@ -146,6 +154,7 @@ class OutboundMiddleware:
         decision = ctx.decision
 
         # ── Reaction marker ──────────────────────────────────────────
+        reply = _unwrap_inline_code_reaction_marker(reply)
         reaction_match = _REACTION_RE.match(reply)
         if reaction_match and event.message_id:
             full_content = reaction_match.group(1).strip()

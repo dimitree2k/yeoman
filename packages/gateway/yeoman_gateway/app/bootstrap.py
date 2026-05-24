@@ -48,6 +48,7 @@ from yeoman_gateway.memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     build_persona_evolution_approval_message,
+    persona_evolution_result_needs_notification,
     run_persona_evolution_cron,
 )
 from yeoman_gateway.policy.persona import load_persona_text
@@ -56,6 +57,7 @@ from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
 from yeoman_gateway.session.manager import SessionManager
 from yeoman_gateway.storage.inbound_archive import InboundArchive
+from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -362,6 +364,7 @@ def build_gateway_runtime(
 
     cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
+    private_handoffs = PrivateHandoffStore(get_operational_data_path() / "policy" / "private_handoffs.json")
 
     # Create policy adapter first so we can use it for owner_alert_resolver
     policy_adapter = EnginePolicyAdapter(
@@ -369,6 +372,7 @@ def build_gateway_runtime(
         known_tools=set(),  # Will be updated after responder is created
         policy_path=policy_path,
         session_manager=session_manager,
+        private_handoff_store=private_handoffs,
         workspace=workspace,
         memory_state_dir=memory_state_dir,
     )
@@ -436,6 +440,7 @@ def build_gateway_runtime(
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
+        private_handoff_store=private_handoffs,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
@@ -738,10 +743,7 @@ def build_gateway_runtime(
                 proposal_ttl_seconds=max(60, int(config.persona_evolution.proposal_ttl_seconds)),
                 proposal_mode=config.persona_evolution.mode,
             )
-            if result and (
-                result.startswith("persona_evolution proposal written:")
-                or result.startswith("persona_evolution no proposal: pending_proposal")
-            ):
+            if persona_evolution_result_needs_notification(result):
                 ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
                 try:
                     proposal = ledger.pending_proposal(persona_file)

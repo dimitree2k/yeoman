@@ -1397,6 +1397,21 @@ def _with_auto_apply_summary(
     return "; ".join([*prefixes, result])
 
 
+def persona_evolution_result_needs_notification(result: str | None) -> bool:
+    """Return whether a cron result points to a pending owner review."""
+    if not result:
+        return False
+    return any(
+        segment.strip().startswith(
+            (
+                "persona_evolution proposal written:",
+                "persona_evolution no proposal: pending_proposal",
+            )
+        )
+        for segment in str(result).split(";")
+    )
+
+
 def persona_evolution_signal_score(evidence: PersonaEvolutionEvidence) -> float:
     """Score whether evidence is strong enough to deserve a review proposal."""
     score = 0.0

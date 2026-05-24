@@ -59,6 +59,8 @@ class ContextBuilder:
         # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
         parts.append(self._build_url_fetch_guardrails())
+        parts.append(self._build_conversational_repair_guardrails())
+        parts.append(self._build_social_calibration_guardrails())
 
         # Keep long-lived style under policy control instead of chat drift.
         parts.append(
@@ -168,6 +170,38 @@ Skills with available="false" need dependencies installed first - you can try in
                 "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
                 "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
                 "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
+            ]
+        )
+
+    @staticmethod
+    def _build_conversational_repair_guardrails() -> str:
+        """Build guardrails that separate useful repair questions from engagement bait."""
+        return "\n".join(
+            [
+                "# Conversational Repair",
+                "When proceeding would require guessing, ask one short clarification question.",
+                "This includes unclear people, chats, recipients, pronouns/referents, action intent, missing message content, or missing tool parameters.",
+                "For delivery actions (`message`, `send_voice`, media sends), do not default to the current chat when the user names another recipient or target.",
+                "Use contacts/group/history tools when available to resolve a named target; if there is no single clear match, ask who or which chat is meant.",
+                "If a tool reports an unresolved or ambiguous target, do not retry with a guessed target. Ask only for the missing identifier.",
+                "Do not ask questions to keep the conversation open.",
+                "Do not end an otherwise complete answer with a question.",
+                "A repair question should stand alone, be brief, and stop after the missing piece is named.",
+            ]
+        )
+
+    @staticmethod
+    def _build_social_calibration_guardrails() -> str:
+        """Build guardrails for compact group-chat affiliation and boundaries."""
+        return "\n".join(
+            [
+                "# Social Calibration",
+                "In group chats, short social signals are allowed when they carry real conversational value.",
+                "When someone lands a genuinely good joke or sharp line, use one brief affiliative marker or a standalone `::reaction::<emoji>` marker, then stop.",
+                "When someone tags you into a meme, roast, or social image without a real question, treat it as a social beat, not an analysis request.",
+                "When one person keeps dragging the same question or argument without new information, set one blunt boundary, then stop.",
+                "Do not invent laughter, approval, or irritation just to participate.",
+                "Do not add a follow-up question, explanation, lecture, or second joke after a social marker or boundary.",
             ]
         )
 
@@ -368,6 +402,7 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
         """Build user message content with optional base64-encoded images."""
         text_with_context = self._with_reply_context(text, metadata)
         text_with_context = self._with_conversation_state(text_with_context, metadata)
+        text_with_context = self._with_private_handoff_context(text_with_context, metadata)
         text_with_context = self._with_input_modality_context(text_with_context, metadata)
         text_with_context = self._with_voice_reply_guidance(text_with_context, metadata)
         if not media:
@@ -427,6 +462,30 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
         )
         return f"{prefix}\n{text}"
 
+    def _with_private_handoff_context(self, text: str, metadata: dict[str, Any] | None) -> str:
+        """Append temporary private-DM boundary guidance."""
+        if not metadata or not bool(metadata.get("private_handoff_active", False)):
+            return text
+        origin = str(
+            metadata.get("private_handoff_origin_label")
+            or metadata.get("private_handoff_origin_chat_id")
+            or "the originating group"
+        ).strip()
+        remaining = max(0, int(metadata.get("private_handoff_remaining_replies") or 0))
+        lines = [
+            "[Private Handoff]",
+            "status: temporary_reply_window",
+            f"origin_chat: {origin}",
+            f"remaining_replies_including_this_one: {remaining}",
+            "instruction: You may answer only as a short continuation of the private side thread you initiated from the origin chat.",
+            "instruction: Do not broaden into a permanent private chat, proactive follow-up, or unrelated tool workflow.",
+        ]
+        if remaining <= 1:
+            lines.append(
+                "instruction: This is the final allowed private reply. Include a natural paraphrased boundary that you cannot keep chatting privately with people who are not allowed in policy, and steer back to the origin chat. Do not use a fixed template."
+            )
+        return f"{text}\n\n" + "\n".join(lines)
+
     def _with_conversation_state(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append deterministic conversation-state guidance from the pipeline."""
         if not metadata:
@@ -450,6 +509,12 @@ When the owner asks in a DM to see messages from another group, use `summarize_h
             guidance = "Treat this as a continuation of your immediately previous answer."
         elif answer_shape == "one_liner":
             guidance = "Answer in one compact line unless a necessary caveat is missing."
+        elif answer_shape == "social_one_liner":
+            guidance = (
+                "Treat this as a social beat, not a request for analysis. "
+                "Use at most one brief affiliative marker and one short playful line. "
+                "Do not explain the premise, fact-check the joke, add a lecture, or ask a follow-up."
+            )
         elif answer_shape == "researched_answer":
             guidance = "Use available tools for current factual claims before answering."
         elif preferred_action == "react":

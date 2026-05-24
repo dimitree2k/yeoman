@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-from yeoman_gateway.core.intents import SendOutboundIntent
+from yeoman_gateway.core.intents import (
+    PersistSessionIntent,
+    RecordMetricIntent,
+    SendOutboundIntent,
+    SendReactionIntent,
+)
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
@@ -83,6 +88,29 @@ async def _run_outbound(
 
     await middleware(ctx, _noop)
     return ctx
+
+
+def _metric_names(ctx: PipelineContext) -> set[str]:
+    return {i.name for i in ctx.intents if isinstance(i, RecordMetricIntent)}
+
+
+@pytest.mark.asyncio
+async def test_inline_code_reaction_marker_detected(tmp_path):
+    tts = _TTS()
+
+    ctx = await _run_outbound(reply="`::reaction::🤙`", tmp_path=tmp_path, tts=tts)
+
+    reactions = [i for i in ctx.intents if isinstance(i, SendReactionIntent)]
+    assert len(reactions) == 1
+    assert reactions[0].emoji == "🤙"
+    assert reactions[0].message_id == "msg-1"
+    sends = [i for i in ctx.intents if isinstance(i, SendOutboundIntent)]
+    assert sends == []
+    persist = [i for i in ctx.intents if isinstance(i, PersistSessionIntent)]
+    assert len(persist) == 1
+    assert "[reacted with 🤙]" in persist[0].assistant_content
+    assert "reaction_sent" in _metric_names(ctx)
+    assert tts.inputs == []
 
 
 @pytest.mark.asyncio

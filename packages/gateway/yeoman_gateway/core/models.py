@@ -71,6 +71,11 @@ class PolicyDecision:
     contacts_disclosure: bool = False
     session_history_limit: int | None = None
     is_owner: bool = False
+    private_handoff_active: bool = False
+    private_handoff_id: str | None = None
+    private_handoff_origin_chat_id: str | None = None
+    private_handoff_origin_label: str | None = None
+    private_handoff_remaining_replies: int = 0
     source: str = "disabled"
 
 

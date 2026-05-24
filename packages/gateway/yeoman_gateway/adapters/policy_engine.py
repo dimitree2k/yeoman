@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
+from loguru import logger
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
 
@@ -52,6 +53,7 @@ from yeoman_gateway.policy.schema import (
 
 if TYPE_CHECKING:
     from yeoman_gateway.session.manager import SessionManager
+    from yeoman_gateway.storage.private_handoff import PrivateHandoff, PrivateHandoffStore
 
 _POLICY_ADMIN_USAGE = (
     "Policy commands (owner DM only):\n"
@@ -141,6 +143,7 @@ class EnginePolicyAdapter(PolicyPort):
         reload_on_change: bool | None = None,
         reload_check_interval_seconds: float | None = None,
         session_manager: "SessionManager | None" = None,
+        private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
         memory_state_dir: str = "memory/session-state",
     ) -> None:
@@ -148,6 +151,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._known_tools = set(known_tools)
         self._policy_path = policy_path
         self._session_manager = session_manager
+        self._private_handoff_store = private_handoff_store
         if workspace is not None:
             self._workspace = workspace.expanduser().resolve()
         elif self._engine is not None:
@@ -215,6 +219,62 @@ class EnginePolicyAdapter(PolicyPort):
                 on_policy_applied=self._on_policy_applied,
                 group_subject_resolver=lambda ids: self._list_group_subjects_from_bridge(ids),
             )
+
+    def _active_private_handoff(self, event: InboundEvent) -> "PrivateHandoff | None":
+        if self._private_handoff_store is None:
+            return None
+        if event.is_group:
+            return None
+        try:
+            return self._private_handoff_store.find_active(
+                channel=event.channel,
+                chat_id=event.chat_id,
+                sender_id=event.sender_id,
+            )
+        except Exception as exc:
+            logger.warning("private handoff lookup failed: {}", exc)
+            return None
+
+    def _private_handoff_decision(
+        self,
+        *,
+        event: InboundEvent,
+        handoff: "PrivateHandoff",
+        notes: Any,
+        is_owner: bool,
+    ) -> PolicyDecision:
+        persona_file: str | None = None
+        model_profile: str | None = None
+        try:
+            if self._engine is not None and event.channel in self._engine.apply_channels:
+                origin = self._engine.resolve_policy(event.channel, handoff.origin_chat_id)
+                persona_file = origin.persona_file
+                model_profile = origin.model_profile
+        except Exception:
+            pass
+        persona_text = self._engine.persona_text(persona_file) if self._engine is not None else None
+        return PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="private_handoff",
+            when_to_reply_mode="all",
+            persona_file=persona_file,
+            persona_text=persona_text,
+            notes_enabled=notes.enabled,
+            notes_mode=notes.mode,
+            notes_allow_blocked_senders=notes.allow_blocked_senders,
+            notes_batch_interval_seconds=notes.batch_interval_seconds,
+            notes_batch_max_messages=notes.batch_max_messages,
+            model_profile=model_profile,
+            is_owner=is_owner,
+            private_handoff_active=True,
+            private_handoff_id=handoff.id,
+            private_handoff_origin_chat_id=handoff.origin_chat_id,
+            private_handoff_origin_label=handoff.origin_label,
+            private_handoff_remaining_replies=handoff.remaining_replies,
+            source=str(self._policy_path) if self._policy_path else "private_handoff",
+        )
 
     def set_memory_service(self, memory_service: object) -> None:
         """Late-binding setter for MemoryService (avoids circular bootstrap)."""
@@ -550,6 +610,18 @@ class EnginePolicyAdapter(PolicyPort):
         if pause_reason is not None and decision.accept_message:
             should_respond = False
             reason = pause_reason
+        handoff = self._active_private_handoff(event)
+        if (
+            handoff is not None
+            and pause_reason is None
+            and decision.reason != "blocked_sender"
+        ):
+            return self._private_handoff_decision(
+                event=event,
+                handoff=handoff,
+                notes=notes,
+                is_owner=is_owner,
+            )
         return PolicyDecision(
             accept_message=decision.accept_message,
             should_respond=should_respond,

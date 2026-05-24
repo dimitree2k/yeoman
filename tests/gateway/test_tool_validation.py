@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import platform
 import shutil
@@ -8,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.agent.tools.exec_isolation import (
@@ -28,13 +26,6 @@ from yeoman_gateway.agent.tools.web import _validate_url
 from yeoman_gateway.app.bootstrap import _resolve_security_tool_settings
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
-from yeoman_shared.config.loader import (
-    _atomic_write_config,
-    _migrate_config,
-    convert_keys,
-    convert_to_camel,
-)
-from yeoman_shared.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.orchestrator import Orchestrator
@@ -44,6 +35,13 @@ from yeoman_gateway.cron.types import CronSchedule
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.security.engine import SecurityEngine
 from yeoman_gateway.security.normalize import normalize_text
+from yeoman_shared.config.loader import (
+    _atomic_write_config,
+    _migrate_config,
+    convert_keys,
+    convert_to_camel,
+)
+from yeoman_shared.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
 from yeoman_shared.utils.helpers import get_workspace_path
 
 
@@ -151,7 +149,10 @@ async def test_message_tool_resolves_whatsapp_group_reference() -> None:
     )
     result = await tool.execute(content="Ping", group="Finanzgruppe")
 
-    assert result == "Message sent to whatsapp:491786127564-1611913127@g.us"
+    assert result == (
+        "Message delivered to whatsapp:491786127564-1611913127@g.us. "
+        "Delivery complete — now produce your brief text confirmation."
+    )
     assert len(sent) == 1
     assert sent[0].channel == "whatsapp"
     assert sent[0].chat_id == "491786127564-1611913127@g.us"
@@ -580,8 +581,9 @@ class _ToolProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        del tools, model, max_tokens, temperature
+        del tools, model, max_tokens, temperature, reasoning
         self.calls += 1
         if self.calls == 1:
             return LLMResponse(
