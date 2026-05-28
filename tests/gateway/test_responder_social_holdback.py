@@ -173,6 +173,50 @@ async def test_group_trading_exit_question_after_social_line_does_not_hold_back(
 
 
 @pytest.mark.asyncio
+async def test_group_voice_retry_refinement_after_social_line_does_not_hold_back(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _SequenceProvider(
+        [
+            "Voice message delivered to whatsapp:group@g.us. Do not send it again for this request.",
+            "Ich kann eine Sprachnachricht sprechen, aber nicht wirklich singen.",
+        ]
+    )
+    responder = LLMResponder(bus=MessageBus(), provider=provider, workspace=workspace)
+
+    first = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Sing die deutsche Nationalhymne kurz in einer Sprachnachricht",
+            is_group=True,
+            reply_to_bot=True,
+        ),
+        _decision(),
+    )
+    second = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Textsicherheit ist da\nJetzt aber mit Melodie \nDas war nicht gesungen",
+            is_group=True,
+            reply_to_bot=True,
+        ),
+        _decision(),
+    )
+
+    await responder.aclose()
+
+    assert first == "Voice message delivered to whatsapp:group@g.us. Do not send it again for this request."
+    assert second == "Ich kann eine Sprachnachricht sprechen, aber nicht wirklich singen."
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_group_social_reply_ends_rhetorical_question_with_full_stop(
     tmp_path: Path,
 ) -> None:

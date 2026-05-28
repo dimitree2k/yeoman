@@ -23,7 +23,7 @@ class ImplicitBotAddressMiddleware:
         *,
         session_manager: SessionManagerLike | None = None,
         bot_name_aliases: Sequence[str] = ("arvid",),
-        followup_window_seconds: float = 10.0,
+        followup_window_seconds: float = 900.0,
     ) -> None:
         self._session_manager = session_manager
         self._bot_name_aliases = tuple(
@@ -81,6 +81,11 @@ class ImplicitBotAddressMiddleware:
 
         if state_mode == "plain_name_request":
             self._promote_to_reply(ctx, mentioned_bot=True, reason="plain_name_request")
+            await next(ctx)
+            return
+
+        if state_mode == "quoted_context_request":
+            self._promote_to_reply(ctx, mentioned_bot=True, reason="quoted_context_request")
             await next(ctx)
             return
 

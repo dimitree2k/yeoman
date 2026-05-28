@@ -79,6 +79,93 @@ async def test_plain_arvid_request_wakes_mention_only_policy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plain_arvid_mach_mal_request_wakes_mention_only_policy() -> None:
+    ctx = PipelineContext(
+        event=_event(content="Arvid, mach mal Bewertung von dem Portfolio bitte"),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.mentioned_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "plain_name_request"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "plain_name_request"
+    assert state["preferred_action"] == "answer"
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is True
+
+
+@pytest.mark.asyncio
+async def test_arvid_request_with_quoted_image_context_wakes_mention_only_policy() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Arvid, mach mal Bewertung von dem Portfolio bitte",
+            reply_to_message_id="img-1",
+            raw_metadata={
+                "reply_to_message_id": "img-1",
+                "reply_to_text": (
+                    "[Image]\n"
+                    "[image_description] This image shows a digital spreadsheet titled "
+                    '"Dividenden und Zinsen 2026" with companies, share counts, '
+                    "monthly payouts, and annual dividend totals."
+                ),
+                "reply_context_source": "archive",
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.mentioned_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "quoted_context_request"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "quoted_context_request"
+    assert state["preferred_action"] == "answer"
+    assert state["answer_shape"] == "short_take"
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is True
+    assert ctx.decision.reason == "when_to_reply:implicit_quoted_context_request"
+
+
+@pytest.mark.asyncio
+async def test_deictic_arvid_reply_to_quoted_image_wakes_mention_only_policy() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="von dem hier, Arvid",
+            reply_to_message_id="img-1",
+            raw_metadata={
+                "reply_to_message_id": "img-1",
+                "reply_to_text": (
+                    "[Image]\n"
+                    "[image_description] This image shows a digital spreadsheet titled "
+                    '"Dividenden und Zinsen 2026" with companies, share counts, '
+                    "monthly payouts, and annual dividend totals."
+                ),
+                "reply_context_source": "archive",
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.mentioned_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "quoted_context_request"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "quoted_context_request"
+    assert state["preferred_action"] == "answer"
+    assert state["answer_shape"] == "short_take"
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is True
+    assert ctx.decision.reason == "when_to_reply:implicit_quoted_context_request"
+
+
+@pytest.mark.asyncio
 async def test_explicit_mention_gets_conversation_state_without_extra_promotion() -> None:
     ctx = PipelineContext(
         event=_event(content="@203075365150770 check mal eBay", mentioned_bot=True),
@@ -177,6 +264,144 @@ async def test_question_without_question_mark_after_recent_assistant_reply_wakes
 
 
 @pytest.mark.asyncio
+async def test_question_after_recent_assistant_thread_wakes_for_real_group_followup() -> None:
+    event_time = datetime(2026, 5, 25, 8, 52, 34, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                "timestamp": (event_time - timedelta(seconds=52)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content=(
+                "Bei derzeitiger Lage 30 Jahre im voraus rechnen ist anders "
+                "ambitioniert. Welche Technologien gab es vor 30 Jahren so noch nicht? 😅"
+            ),
+            timestamp=event_time,
+            sender_id="frank@s.whatsapp.net",
+            participant="frank@s.whatsapp.net",
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.reply_to_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "recent_assistant_followup"
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is True
+    assert ctx.decision.reason == "when_to_reply:implicit_recent_assistant_followup"
+
+
+@pytest.mark.asyncio
+async def test_question_after_ten_minutes_wakes_when_bot_thread_is_uninterrupted() -> None:
+    event_time = datetime(2026, 5, 25, 9, 10, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                "timestamp": (event_time - timedelta(minutes=10)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content="Welche Technologien gab es vor 30 Jahren noch nicht?",
+            timestamp=event_time,
+            raw_metadata={
+                "ambient_context_rows": [
+                    {
+                        "sender_id": None,
+                        "participant": "203075365150770@lid",
+                        "text": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                    }
+                ]
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.reply_to_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "recent_assistant_followup"
+
+
+@pytest.mark.asyncio
+async def test_question_after_intervening_human_message_stays_silent() -> None:
+    event_time = datetime(2026, 5, 25, 8, 53, 30, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                "timestamp": (event_time - timedelta(seconds=60)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content="Was ist mit dem Depot?",
+            timestamp=event_time,
+            raw_metadata={
+                "ambient_context_rows": [
+                    {
+                        "sender_id": None,
+                        "participant": "203075365150770@lid",
+                        "text": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                    },
+                    {
+                        "sender_id": "4915774497527",
+                        "participant": "4915774497527@s.whatsapp.net",
+                        "text": "Onlyfans",
+                    },
+                ]
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _noop_next)
+
+    assert ctx.reply is None
+    assert ctx.event.reply_to_bot is False
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is False
+
+
+@pytest.mark.asyncio
+async def test_non_question_after_recent_assistant_thread_stays_silent() -> None:
+    event_time = datetime(2026, 5, 25, 8, 52, 48, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": "Das ist eine Generationenbilanz über 30+ Jahre.",
+                "timestamp": (event_time - timedelta(seconds=66)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(content="Onlyfans", timestamp=event_time),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _noop_next)
+
+    assert ctx.reply is None
+    assert ctx.event.reply_to_bot is False
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is False
+
+
+@pytest.mark.asyncio
 async def test_recent_negative_feedback_to_arvid_wakes_repair_turn() -> None:
     event_time = datetime(2026, 5, 2, 18, 0, 16, tzinfo=UTC)
     sessions = _Sessions(
@@ -226,13 +451,13 @@ async def test_plain_arvid_non_request_gets_reaction_only() -> None:
 
 @pytest.mark.asyncio
 async def test_old_assistant_reply_does_not_wake_followup() -> None:
-    event_time = datetime(2026, 5, 2, 18, 1, tzinfo=UTC)
+    event_time = datetime(2026, 5, 2, 18, 20, tzinfo=UTC)
     sessions = _Sessions(
         [
             {
                 "role": "assistant",
                 "content": "GME ist deutlich kleiner als eBay.",
-                "timestamp": (event_time - timedelta(seconds=30)).isoformat(),
+                "timestamp": (event_time - timedelta(minutes=20)).isoformat(),
             }
         ]
     )

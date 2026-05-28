@@ -78,6 +78,8 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "asr.transcribe_audio": "asr_default",
     "tts.speak": "tts_default",
     "whatsapp.vision.describe_image": "vision_whatsapp_cheap",
+    "vision.ocr_image": "vision_whatsapp_cheap",
+    "whatsapp.vision.ocr_image": "vision_whatsapp_cheap",
     "whatsapp.asr.transcribe_audio": "asr_default",
     "whatsapp.tts.speak": "tts_default",
     "vision.describe_video": "vision_whatsapp_cheap",
@@ -110,6 +112,11 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "delete_video_after_description": True,
     "describe_stickers": True,
     "delete_sticker_after_description": True,
+    "persist_incoming_documents": True,
+    "max_document_bytes_mb": 12,
+    "max_document_text_pages": 12,
+    "max_document_prompt_chars": 6000,
+    "ocr_images": True,
 }
 
 DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {

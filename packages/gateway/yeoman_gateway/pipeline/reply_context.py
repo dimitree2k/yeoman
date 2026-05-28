@@ -78,6 +78,7 @@ class ReplyContextMiddleware:
                     raw.setdefault("reply_context_source", "payload")
                 if ambient_lines:
                     raw["ambient_context_window"] = ambient_lines
+                    raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
                 return replace(event, raw_metadata=raw), False, False
             return event, False, False
 
@@ -97,6 +98,7 @@ class ReplyContextMiddleware:
                     raw.setdefault("reply_context_source", "payload")
                 if ambient_lines:
                     raw["ambient_context_window"] = ambient_lines
+                    raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
                 return replace(event, raw_metadata=raw), True, False
             return event, True, False
 
@@ -110,6 +112,7 @@ class ReplyContextMiddleware:
             raw["reply_context_window"] = window_lines
         if ambient_lines:
             raw["ambient_context_window"] = ambient_lines
+            raw["ambient_context_rows"] = self._build_ambient_context_rows(event)
 
         if has_payload_reply_text:
             return replace(event, raw_metadata=raw), True, True
@@ -154,6 +157,32 @@ class ReplyContextMiddleware:
         except Exception:
             return []
         return self._format_lines(before)
+
+    def _build_ambient_context_rows(self, event: InboundEvent) -> list[dict[str, str | None]]:
+        if self._archive is None or self._ambient_limit <= 0 or not event.message_id:
+            return []
+        if not event.is_group:
+            return []
+        try:
+            before = self._archive.lookup_messages_before(
+                event.channel,
+                event.chat_id,
+                event.message_id,
+                limit=self._ambient_limit,
+            )
+        except Exception:
+            return []
+        rows: list[dict[str, str | None]] = []
+        for row in reversed(before):
+            rows.append(
+                {
+                    "sender_id": row.sender_id,
+                    "sender_name": row.sender_name,
+                    "participant": row.participant,
+                    "text": row.text,
+                }
+            )
+        return rows
 
     def _format_lines(self, rows: list[ArchivedMessage]) -> list[str]:
         lines: list[str] = []

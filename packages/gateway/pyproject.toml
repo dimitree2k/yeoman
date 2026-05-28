@@ -25,6 +25,7 @@ dependencies = [
     "youtube-transcript-api>=1.2.4",
     "caldav>=3.0.1",
     "icalendar>=7.0.3",
+    "pypdf>=6.4.0",
 ]
 
 [project.optional-dependencies]

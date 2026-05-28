@@ -41,9 +41,13 @@ from yeoman_gateway.cron.service import CronJobDeferredError, CronJobSkippedErro
 from yeoman_gateway.cron.types import CronJob
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
+from yeoman_gateway.media.document_cache import DocumentCache
+from yeoman_gateway.media.document_processing import DocumentProcessor
+from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
 from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
+from yeoman_gateway.media.vision import VisionDescriber
 from yeoman_gateway.memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
@@ -316,6 +320,26 @@ def build_gateway_runtime(
         outgoing_dir=config.channels.whatsapp.media.outgoing_path,
     )
     provider_factory = ProviderFactory(config=config)
+    document_cache = DocumentCache(get_operational_data_path() / "media" / "document_cache.db")
+    lazy_vision = (
+        VisionDescriber(provider_factory)
+        if config.channels.whatsapp.media.ocr_images
+        else None
+    )
+    document_processor = DocumentProcessor(
+        cache=document_cache,
+        model_router=model_router,
+        vision_describer=lazy_vision,
+        max_document_bytes=config.channels.whatsapp.media.max_document_bytes_mb * 1024 * 1024,
+        max_image_bytes=config.channels.whatsapp.media.max_image_bytes_mb * 1024 * 1024,
+        max_pdf_pages=config.channels.whatsapp.media.max_document_text_pages,
+        max_prompt_chars=config.channels.whatsapp.media.max_document_prompt_chars,
+    )
+    lazy_media_resolver = LazyMediaResolver(
+        cache=document_cache,
+        processor=document_processor,
+        max_prompt_chars=config.channels.whatsapp.media.max_document_prompt_chars,
+    )
 
     assistant_model = config.agents.defaults.model
     try:
@@ -441,6 +465,7 @@ def build_gateway_runtime(
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
         private_handoff_store=private_handoffs,
+        lazy_media_resolver=lazy_media_resolver,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
@@ -482,6 +507,7 @@ def build_gateway_runtime(
         model_router=model_router,
         media_storage=media_storage,
         provider_factory=provider_factory,
+        document_cache=document_cache,
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)

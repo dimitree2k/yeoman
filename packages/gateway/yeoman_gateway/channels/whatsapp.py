@@ -23,6 +23,7 @@ from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.vision import VisionDescriber
 
 if TYPE_CHECKING:
+    from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.providers.factory import ProviderFactory
     from yeoman_gateway.storage.chat_registry import ChatRegistry
@@ -134,6 +135,7 @@ class InboundEvent:
     reply_to_text: str | None
     media_kind: str | None
     media_type: str | None
+    media_file_name: str | None
     media_path: str | None
     media_bytes: int | None
     media_description: str | None
@@ -158,6 +160,7 @@ class WhatsAppChannel(BaseChannel):
         model_router: "ModelRouter | None" = None,
         media_storage: MediaStorage | None = None,
         provider_factory: "ProviderFactory | None" = None,
+        document_cache: "DocumentCache | None" = None,
         groq_api_key: str | None = None,
         openai_api_key: str | None = None,
         openai_api_base: str | None = None,
@@ -171,6 +174,7 @@ class WhatsAppChannel(BaseChannel):
             incoming_dir=self.config.media.incoming_path,
             outgoing_dir=self.config.media.outgoing_path,
         )
+        self._document_cache = document_cache
         self._vision_describer = (
             VisionDescriber(provider_factory) if provider_factory is not None else None
         )
@@ -631,6 +635,11 @@ class WhatsAppChannel(BaseChannel):
             if isinstance(media, dict) and media.get("mimeType")
             else None
         )
+        media_file_name = (
+            str(media.get("fileName")).strip()
+            if isinstance(media, dict) and isinstance(media.get("fileName"), str)
+            else ""
+        )
         media_path = (
             str(media.get("path")).strip()
             if isinstance(media, dict) and isinstance(media.get("path"), str)
@@ -703,6 +712,7 @@ class WhatsAppChannel(BaseChannel):
             reply_to_text=reply_to_text,
             media_kind=media_kind,
             media_type=media_type,
+            media_file_name=media_file_name or None,
             media_path=media_path or None,
             media_bytes=media_bytes,
             media_description=None,
@@ -718,6 +728,7 @@ class WhatsAppChannel(BaseChannel):
             return
 
         event = await self._enrich_media_event(event)
+        self._record_document_cache_item(event)
         self._archive_inbound_event(event)
         self._sync_chat_registry(event)
 
@@ -821,6 +832,7 @@ class WhatsAppChannel(BaseChannel):
             reply_to_text=reply_to_text,
             media_kind=media_source.media_kind,
             media_type=media_source.media_type,
+            media_file_name=media_source.media_file_name,
             media_path=media_source.media_path,
             media_bytes=media_source.media_bytes,
             media_description=media_source.media_description,
@@ -828,6 +840,46 @@ class WhatsAppChannel(BaseChannel):
         )
 
         await self._publish_event(merged)
+
+    def _record_document_cache_item(self, event: InboundEvent) -> None:
+        if self._document_cache is None or not self.config.media.enabled:
+            return
+        if event.media_kind not in {"document", "image"} or not event.media_path:
+            return
+
+        validated_path = self._media_storage.validate_incoming_path(event.media_path)
+        if validated_path is None:
+            logger.warning(
+                "Skipping WhatsApp media cache record due to invalid media path: {}",
+                event.media_path,
+            )
+            return
+        try:
+            size_bytes = validated_path.stat().st_size
+        except OSError:
+            size_bytes = event.media_bytes
+
+        try:
+            self._document_cache.record_media_item(
+                channel=self.name,
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                sender_id=event.sender_phone_jid or event.sender_id,
+                sender_name=event.sender_name,
+                kind=event.media_kind,
+                mime_type=event.media_type,
+                file_name=event.media_file_name,
+                local_path=validated_path,
+                size_bytes=size_bytes,
+                timestamp=event.timestamp,
+                retention_days=self.config.media.retention_days,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to cache WhatsApp media metadata {}: {}",
+                event.message_id,
+                e,
+            )
 
     def _archive_inbound_event(self, event: InboundEvent) -> None:
         if self.inbound_archive is None:
@@ -870,9 +922,28 @@ class WhatsAppChannel(BaseChannel):
                 channel=self.name,
                 chat_id=event.chat_jid,
                 chat_type="group" if event.is_group else "dm",
+                readable_name=(
+                    self._policy_comment_for_chat(event.chat_jid) if event.is_group else None
+                ),
             )
         except Exception as e:
             logger.warning(f"Failed to update chat registry for {event.chat_jid}: {e}")
+
+    def _policy_comment_for_chat(self, chat_id: str) -> str | None:
+        try:
+            from yeoman_gateway.policy.loader import load_policy
+
+            policy = load_policy()
+            channel_policy = policy.channels.get(self.name)
+            if channel_policy is None:
+                return None
+            override = channel_policy.chats.get(str(chat_id))
+            if override is None:
+                return None
+            comment = str(override.comment or "").strip()
+            return comment or None
+        except Exception:
+            return None
 
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
         event = await self._enrich_primary_media_event(event)
@@ -1251,6 +1322,7 @@ class WhatsAppChannel(BaseChannel):
                 "media_path": event.media_path,
                 "media_bytes": event.media_bytes,
                 "media_type": event.media_type,
+                "media_file_name": event.media_file_name,
                 "media_kind": event.media_kind,
                 "media_description": event.media_description,
                 "is_voice": is_voice,

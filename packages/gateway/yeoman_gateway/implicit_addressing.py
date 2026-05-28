@@ -15,7 +15,9 @@ _QUESTION_OR_REQUEST_RE = re.compile(
     r"kannst|kannste|koenntest|könntest|wuerdest|würdest|"
     r"meinst|denkst|findest|haeltst|hältst|"
     r"check(?:st)?|pruef(?:st)?|prüf(?:st)?|such(?:st)?|"
+    r"mach(?:e|st)?(?:\s+mal)?|gib|geb|"
     r"erklaer(?:st)?|erklär(?:st)?|rechne|bewert(?:e|est)?|analysier(?:e|st)?|"
+    r"bewertung|analyse|review|einschaetzung|einschätzung|"
     r"sag\s+mal|hilf"
     r")\b"
 )
@@ -40,6 +42,18 @@ _SOCIAL_IMAGE_CUE_RE = re.compile(
     r"screenshot\s+of\s+(?:a\s+)?(?:post|tweet|x\s+post|instagram|tiktok)|"
     r"tweet|meme|caption|side-by-side\s+photos|featuring\s+side-by-side|"
     r"text\s+(?:above\s+the\s+images\s+)?(?:reads|says)"
+    r")\b"
+)
+_QUOTED_CONTEXT_DEICTIC_RE = re.compile(
+    r"(?i)\b("
+    r"das|dem|den|der|die|dies(?:e[rsn]?|er|es)?|hier|hierzu|dazu|darauf|"
+    r"davon|damit|von\s+dem|zu\s+dem"
+    r")\b"
+)
+_QUOTED_CONTEXT_REQUEST_RE = re.compile(
+    r"(?i)\b("
+    r"mach(?:e|st)?|gib|geb|bewertung|analyse|analys(?:e|ier)|review|"
+    r"einschaetzung|einschätzung|meinung|take|bitte"
     r")\b"
 )
 
@@ -124,6 +138,50 @@ def looks_like_social_reaction_prompt(text: str, metadata: dict[str, Any] | None
     return bool(has_image_context and _SOCIAL_IMAGE_CUE_RE.search(compact))
 
 
+def looks_like_quoted_context_request(
+    text: str,
+    metadata: dict[str, Any] | None = None,
+    *,
+    bot_name_aliases: Sequence[str] = ("arvid",),
+) -> bool:
+    metadata = metadata or {}
+    reply_to_text = str(metadata.get("reply_to_text") or "").strip()
+    reply_to_message_id = str(
+        metadata.get("reply_to_message_id") or metadata.get("reply_to") or ""
+    ).strip()
+    if not reply_to_text and not reply_to_message_id:
+        return False
+
+    compact = " ".join(str(text or "").strip().split())
+    if not compact:
+        return False
+    if not contains_bot_name(compact, bot_name_aliases=bot_name_aliases):
+        return False
+    if looks_like_social_reaction_prompt(compact, metadata):
+        return False
+    if looks_like_question_or_request(compact):
+        return True
+
+    without_name = compact
+    for alias in bot_name_aliases:
+        alias = str(alias).strip()
+        if not alias:
+            continue
+        without_name = re.sub(
+            rf"(?i)(?<![\w@])@?{re.escape(alias)}(?!\w)",
+            " ",
+            without_name,
+        )
+    without_name = " ".join(without_name.split())
+    if not without_name:
+        return False
+
+    return bool(
+        _QUOTED_CONTEXT_DEICTIC_RE.search(without_name)
+        or _QUOTED_CONTEXT_REQUEST_RE.search(without_name)
+    )
+
+
 def reaction_for_name_mention(text: str) -> str:
     if _NEGATIVE_REACTION_RE.search(text):
         return "🙄"
@@ -162,6 +220,7 @@ def classify_conversation_state(
         chat_id=chat_id,
         event_time=event_time,
         content=content,
+        metadata=metadata,
         followup_window_seconds=followup_window_seconds,
     )
     seconds_since_assistant = seconds_since_last_assistant(
@@ -188,6 +247,12 @@ def classify_conversation_state(
         address_mode = "explicit_mention"
     elif reply_direct:
         address_mode = "reply_to_bot"
+    elif name_mentioned and looks_like_quoted_context_request(
+        content,
+        metadata,
+        bot_name_aliases=bot_name_aliases,
+    ):
+        address_mode = "quoted_context_request"
     elif name_mentioned and request_like:
         address_mode = "plain_name_request"
     elif recent_followup:
@@ -264,6 +329,7 @@ def is_recent_assistant_followup(
     chat_id: str,
     event_time: datetime,
     content: str,
+    metadata: dict[str, Any] | None = None,
     followup_window_seconds: float = 10.0,
 ) -> bool:
     if session_manager is None or not looks_like_followup_request(content):
@@ -274,7 +340,47 @@ def is_recent_assistant_followup(
         chat_id=chat_id,
         event_time=event_time,
     )
-    return delta is not None and 0 <= delta <= max(0.0, float(followup_window_seconds))
+    if delta is None or not (0 <= delta <= max(0.0, float(followup_window_seconds))):
+        return False
+    if _ambient_window_has_intervening_human(metadata):
+        return False
+    return _last_session_turn_is_assistant(
+        session_manager=session_manager,
+        channel=channel,
+        chat_id=chat_id,
+    )
+
+
+def _ambient_window_has_intervening_human(metadata: dict[str, Any] | None) -> bool:
+    rows = (metadata or {}).get("ambient_context_rows")
+    if not isinstance(rows, list) or not rows:
+        return False
+    latest = rows[-1]
+    if not isinstance(latest, dict):
+        return False
+    sender_id = str(latest.get("sender_id") or "").strip()
+    sender_name = str(latest.get("sender_name") or "").strip()
+    return bool(sender_id or sender_name)
+
+
+def _last_session_turn_is_assistant(
+    *,
+    session_manager: SessionManagerLike,
+    channel: str,
+    chat_id: str,
+) -> bool:
+    session = session_manager.get_or_create(f"{channel}:{chat_id}")
+    messages = getattr(session, "messages", [])
+    if not isinstance(messages, list):
+        return False
+    for row in reversed(messages):
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "").strip()
+        if role in {"tool_trace", "session_boundary", "system"}:
+            continue
+        return role == "assistant"
+    return False
 
 
 def seconds_since_last_assistant(

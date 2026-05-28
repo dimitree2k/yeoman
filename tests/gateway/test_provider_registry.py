@@ -19,8 +19,11 @@ import os
 from types import SimpleNamespace
 
 import litellm
+import pytest
+from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 from yeoman_gateway.providers.registry import find_by_model
+from yeoman_shared.config.schema import Config
 
 # --------------------------------------------------------------------------
 # find_by_model: prefixed model names resolve by the first /-segment only.
@@ -51,6 +54,12 @@ def test_find_by_model_unprefixed_legacy_match() -> None:
     """Unprefixed names still fall back to substring keyword matching."""
     assert find_by_model("claude-3-opus").name == "anthropic"
     assert find_by_model("gpt-4o-mini").name == "openai"
+
+
+def test_find_by_model_unprefixed_mimo_picks_xiaomi() -> None:
+    spec = find_by_model("mimo-v2.5-pro")
+    assert spec is not None
+    assert spec.name == "xiaomi"
 
 
 def test_find_by_model_unknown_prefix_returns_none() -> None:
@@ -94,6 +103,69 @@ def test_litellm_provider_groq_model_does_not_pollute_openai_env(
     )
     assert os.environ.get("GROQ_API_KEY") == "gsk_classifier_key"
     assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_provider_factory_uses_xiaomi_default_base_url() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "xiaomi": {
+                "api_key": "mimo-test-key",
+            }
+        }
+    })
+
+    provider = ProviderFactory(config=config).create_chat_provider(
+        "mimo-v2.5-pro",
+        "xiaomi",
+    )
+
+    assert isinstance(provider, LiteLLMProvider)
+    assert provider.api_key == "mimo-test-key"
+    assert provider.api_base == "https://api.xiaomimimo.com/v1"
+    assert provider._resolve_model("mimo-v2.5-pro") == "openai/mimo-v2.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_passes_api_key_and_base_per_call(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content="hello from mimo",
+                        reasoning_content=None,
+                        tool_calls=[],
+                    ),
+                )
+            ],
+            usage=None,
+        )
+
+    monkeypatch.setattr(
+        "yeoman_gateway.providers.litellm_provider.acompletion",
+        fake_acompletion,
+    )
+    provider = LiteLLMProvider(
+        api_key="mimo-test-key",
+        api_base="https://api.xiaomimimo.com/v1",
+        default_model="mimo-v2.5",
+    )
+
+    response = await provider.chat(
+        [{"role": "user", "content": "say hi"}],
+        model="mimo-v2.5",
+        max_tokens=32,
+        temperature=1.0,
+    )
+
+    assert response.content == "hello from mimo"
+    assert captured["model"] == "openai/mimo-v2.5"
+    assert captured["api_key"] == "mimo-test-key"
+    assert captured["api_base"] == "https://api.xiaomimimo.com/v1"
 
 
 def test_litellm_provider_preserves_reasoning_content_from_response() -> None:

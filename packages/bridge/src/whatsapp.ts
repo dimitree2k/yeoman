@@ -110,6 +110,7 @@ export interface WhatsAppClientOptions {
   persistInboundAudio?: boolean;
   persistInboundVideo?: boolean;
   persistInboundSticker?: boolean;
+  persistInboundDocument?: boolean;
   acceptFromMe?: boolean;
   readReceipts?: boolean;
   accountId?: string;
@@ -230,11 +231,12 @@ async function ensureDirPrivate(path: string): Promise<void> {
   }
 }
 
-function mediaExtension(kind: InboundMedia['kind'], mimeType: string | undefined, fileName?: string): string {
+export function mediaExtension(kind: InboundMedia['kind'], mimeType: string | undefined, fileName?: string): string {
   const known = extname(String(fileName || '').trim()).toLowerCase();
   if (known) return known;
 
   const mime = String(mimeType || '').toLowerCase();
+  if (mime.includes('pdf')) return '.pdf';
   if (mime.includes('jpeg') || mime.includes('jpg')) return '.jpg';
   if (mime.includes('png')) return '.png';
   if (mime.includes('webp')) return '.webp';
@@ -654,6 +656,46 @@ export class WhatsAppClient {
     } else if (downloadedAny && typeof downloadedAny === 'object' && ArrayBuffer.isView(downloadedAny)) {
       buffer = Buffer.from(downloadedAny as Uint8Array);
     }
+    if (!buffer || buffer.length === 0) return media;
+
+    await fs.writeFile(filePath, buffer);
+    try {
+      await fs.chmod(filePath, 0o600);
+    } catch {
+      // Ignore chmod failures on unsupported environments.
+    }
+    return {
+      ...media,
+      path: filePath,
+      bytes: buffer.length,
+    };
+  }
+
+  private async persistInboundDocument(msg: any, messageId: string, media: InboundMedia): Promise<InboundMedia> {
+    if (!this.sock || media.kind !== 'document') return media;
+    if (this.options.persistInboundDocument === false) return media;
+
+    const now = new Date();
+    const yyyy = String(now.getUTCFullYear());
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const dayDir = join(this.mediaIncomingDir, yyyy, mm, dd);
+    await ensureDirPrivate(dayDir);
+
+    const ext = mediaExtension(media.kind, media.mimeType, media.fileName);
+    const filePath = join(dayDir, `${messageId}${ext}`);
+
+    const downloaded = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: pino({ level: 'silent' }),
+        reuploadRequest: this.sock.updateMediaMessage,
+      },
+    );
+
+    const buffer = decodeDownloadedMedia(downloaded);
     if (!buffer || buffer.length === 0) return media;
 
     await fs.writeFile(filePath, buffer);
@@ -1364,6 +1406,13 @@ export class WhatsAppClient {
         } else if (inboundMedia?.kind === 'sticker') {
           try {
             inboundMedia = await this.persistInboundSticker(msg, messageId, inboundMedia);
+          } catch (err) {
+            this.lastError = safeErrorMessage(err);
+            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+          }
+        } else if (inboundMedia?.kind === 'document') {
+          try {
+            inboundMedia = await this.persistInboundDocument(msg, messageId, inboundMedia);
           } catch (err) {
             this.lastError = safeErrorMessage(err);
             this.options.onError(`inbound_media_save_failed: ${this.lastError}`);

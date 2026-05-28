@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveParticipantJid, shouldIgnoreFromMeInbound } from './whatsapp.js';
+import { mediaExtension, resolveParticipantJid, shouldIgnoreFromMeInbound } from './whatsapp.js';
 
 test('resolveParticipantJid ignores quoted participant metadata in direct chat', () => {
   const msg = {
@@ -46,4 +46,9 @@ test('shouldIgnoreFromMeInbound accepts user self messages when flag enabled', (
 
 test('shouldIgnoreFromMeInbound ignores bridge-sent self messages when flag enabled', () => {
   assert.equal(shouldIgnoreFromMeInbound(true, true, true), true);
+});
+
+test('mediaExtension preserves document file names and maps PDF mime type', () => {
+  assert.equal(mediaExtension('document', 'application/pdf', undefined), '.pdf');
+  assert.equal(mediaExtension('document', undefined, 'Frank Report.PDF'), '.pdf');
 });

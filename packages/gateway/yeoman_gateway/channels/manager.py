@@ -13,6 +13,7 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:
+    from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.storage import MediaStorage
     from yeoman_gateway.providers.factory import ProviderFactory
@@ -39,6 +40,7 @@ class ChannelManager:
         model_router: "ModelRouter | None" = None,
         media_storage: "MediaStorage | None" = None,
         provider_factory: "ProviderFactory | None" = None,
+        document_cache: "DocumentCache | None" = None,
     ):
         self.config = config
         self.bus = bus
@@ -47,6 +49,7 @@ class ChannelManager:
         self.model_router = model_router
         self.media_storage = media_storage
         self.provider_factory = provider_factory
+        self.document_cache = document_cache
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._reaction_dispatch_task: asyncio.Task | None = None
@@ -84,6 +87,7 @@ class ChannelManager:
                     model_router=self.model_router,
                     media_storage=self.media_storage,
                     provider_factory=self.provider_factory,
+                    document_cache=self.document_cache,
                     groq_api_key=self.config.providers.groq.api_key or None,
                     openai_api_key=openai_compat.api_key if openai_compat else None,
                     openai_api_base=openai_compat.api_base if openai_compat else None,

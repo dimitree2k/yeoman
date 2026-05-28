@@ -222,6 +222,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(("kimi-k2.5", {"temperature": 1.0}),),
     ),
+    # Xiaomi MiMo: OpenAI-compatible endpoint with MiMo-specific API keys.
+    ProviderSpec(
+        name="xiaomi",
+        keywords=("mimo", "xiaomi"),
+        env_key="MIMO_API_KEY",
+        display_name="Xiaomi MiMo",
+        litellm_prefix="openai",  # mimo-v2.5-pro → openai/mimo-v2.5-pro
+        skip_prefixes=("openai/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="xiaomimimo",
+        default_api_base="https://api.xiaomimimo.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Local deployment (fallback: unknown api_base → assume local) ======
     # vLLM / any OpenAI-compatible local server.
     # If api_base is set but doesn't match a known gateway, we land here.

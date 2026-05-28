@@ -149,6 +149,14 @@ class TestConversationStateContext:
         assert "set one blunt boundary" in prompt
         assert "Do not add a follow-up question" in prompt
 
+    def test_system_prompt_routes_cross_chat_media_to_media_history(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_path).build_system_prompt()
+
+        assert "use `media_history`" in prompt
+        assert "previously shared images, screenshots, PDFs, or documents" in prompt
+
     def test_current_message_includes_repair_guidance(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
 

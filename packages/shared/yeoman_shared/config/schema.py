@@ -103,6 +103,13 @@ class WhatsAppMediaConfig(BaseModel):
     delete_sticker_after_description: bool = bool(
         DEFAULT_WHATSAPP_MEDIA["delete_sticker_after_description"]
     )
+    persist_incoming_documents: bool = bool(
+        DEFAULT_WHATSAPP_MEDIA["persist_incoming_documents"]
+    )
+    max_document_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_document_bytes_mb"])
+    max_document_text_pages: int = int(DEFAULT_WHATSAPP_MEDIA["max_document_text_pages"])
+    max_document_prompt_chars: int = int(DEFAULT_WHATSAPP_MEDIA["max_document_prompt_chars"])
+    ocr_images: bool = bool(DEFAULT_WHATSAPP_MEDIA["ocr_images"])
 
     @property
     def incoming_path(self) -> Path:

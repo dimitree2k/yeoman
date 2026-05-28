@@ -25,6 +25,13 @@ VIDEO_PROMPT = (
     "Be factual, include key objects/actions, and mention visible text only if readable."
 )
 
+OCR_PROMPT = (
+    "Transcribe the visible text in this image as accurately as possible. "
+    "Preserve line breaks when useful. If the image contains no readable visible text, "
+    "reply with an empty string. Do not describe non-text visual elements unless needed "
+    "to disambiguate the text."
+)
+
 
 class VisionDescriber:
     """Describe local image files using a routed vision-capable model."""
@@ -71,6 +78,47 @@ class VisionDescriber:
         if not text:
             return None
         return " ".join(text.split())
+
+    async def ocr_image(self, image_path: Path, profile: ResolvedProfile) -> str | None:
+        """Extract visible text from a local image using a routed vision/OCR model."""
+        if profile.kind not in {"vision", "ocr"} or not profile.model:
+            return None
+        if not image_path.exists() or not image_path.is_file():
+            return None
+
+        mime, _ = mimetypes.guess_type(str(image_path))
+        if not mime or not mime.startswith("image/"):
+            return None
+
+        b64 = base64.b64encode(image_path.read_bytes()).decode()
+        provider = self._provider_factory.create_chat_provider(profile.model)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            }
+        ]
+
+        timeout_s = (profile.timeout_ms or 12000) / 1000.0
+        try:
+            response = await asyncio.wait_for(
+                provider.chat(
+                    messages=messages,
+                    model=profile.model,
+                    max_tokens=profile.max_tokens or 1200,
+                    temperature=profile.temperature if profile.temperature is not None else 0.0,
+                ),
+                timeout=max(1.0, timeout_s),
+            )
+        except Exception:
+            return None
+        text = (response.content or "").strip()
+        if not text:
+            return None
+        return text
 
     async def describe_video(
         self,

@@ -139,7 +139,10 @@ class ChatRegistry:
                     """
                     UPDATE chats SET
                         chat_type = COALESCE(?, chat_type),
-                        readable_name = COALESCE(?, readable_name),
+                        readable_name = CASE
+                            WHEN ? IS NOT NULL AND ? != '' THEN ?
+                            ELSE readable_name
+                        END,
                         last_seen_at = ?,
                         created_at = COALESCE(?, created_at),
                         description = COALESCE(?, description),
@@ -153,6 +156,8 @@ class ChatRegistry:
                     """,
                     (
                         chat_type_safe,
+                        readable_name,
+                        readable_name,
                         readable_name,
                         now_iso,
                         int(created_at) if created_at else None,

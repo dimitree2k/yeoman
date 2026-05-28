@@ -17,6 +17,7 @@ docs/superpowers/specs/*
 !docs/superpowers/specs/2026-05-02-disclosure-safe-memory-tags-design.md
 !docs/superpowers/specs/2026-05-02-topic-graph-memory-architecture.md
 !docs/superpowers/specs/2026-05-03-profile-gated-mcp-layer-design.md
+!docs/superpowers/specs/2026-05-25-reactive-coalescing-design.md
 *.egg-info/
 *.egg
 *.pyc
@@ -47,6 +48,7 @@ tests/gateway/*
 !tests/gateway/test_memory_disclosure.py
 !tests/gateway/test_control_plane_api_hardening.py
 !tests/gateway/test_outbound_voice_soft_limits.py
+!tests/gateway/test_whatsapp_chat_registry.py
 !tests/gateway/test_responder_social_holdback.py
 !tests/gateway/test_responder_textual_tool_calls.py
 .mypy_cache

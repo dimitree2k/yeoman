@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.service import CronService
+    from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.memory.service import MemoryService
@@ -94,6 +95,20 @@ _NEW_VALUE_REQUEST_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_RETRY_REFINEMENT_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"noch\s*mal|nochmal|erneut|retry|again|try again|versuch\w*|"
+    r"mach\w*|jetzt aber mit|das war nicht|war nicht|not right"
+    r")\b",
+    re.IGNORECASE,
+)
+_VOICE_REFINEMENT_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"sprachnachricht|voice|audio|melodie|melody|sing|singen|gesungen|sung|"
+    r"lied|song|tts|stimme"
+    r")\b",
+    re.IGNORECASE,
+)
 _CLARIFYING_QUESTION_START_RE = re.compile(
     r"^\s*(?:"
     r"was|wer|wie|warum|wieso|weshalb|wo|wann|welch(?:e|er|es|en|em)?|"
@@ -107,6 +122,7 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "browse",
         "deep_research",
         "fact_check",
+        "media_history",
         "ops",
         "recall_conversation",
         "summarize_history",
@@ -347,6 +363,7 @@ class LLMResponder(ResponderPort):
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
         inbound_archive: "InboundArchive | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
+        lazy_media_resolver: "LazyMediaResolver | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
     ) -> None:
@@ -377,6 +394,7 @@ class LLMResponder(ResponderPort):
         self._recording_notifier = recording_notifier
         self.inbound_archive = inbound_archive
         self._private_handoff_store = private_handoff_store
+        self._lazy_media_resolver = lazy_media_resolver
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
         self._talkative_state: dict[str, _TalkativeCooldownState] = {}
@@ -515,6 +533,17 @@ class LLMResponder(ResponderPort):
         self._recall_tool = RecallConversationTool(session_manager=self.sessions)
         self.tools.register(self._recall_tool)
 
+        if self._lazy_media_resolver is not None:
+            from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
+
+            self.tools.register(
+                MediaHistoryTool(
+                    cache=self._lazy_media_resolver.cache,
+                    processor=self._lazy_media_resolver.processor,
+                    group_resolver=self._resolve_group_reference,
+                )
+            )
+
     def _metric(
         self,
         name: str,
@@ -570,6 +599,12 @@ class LLMResponder(ResponderPort):
         recall_tool = self.tools.get("recall_conversation")
         if isinstance(recall_tool, RecallConversationTool):
             recall_tool.set_context(channel, chat_id)
+
+        from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
+
+        media_history_tool = self.tools.get("media_history")
+        if isinstance(media_history_tool, MediaHistoryTool):
+            media_history_tool.set_context(channel, chat_id, is_owner=is_owner)
 
     def _resolve_history_limit(
         self, chat_id: str, session_history_limit: int | None, content: str = "",
@@ -1369,6 +1404,11 @@ class LLMResponder(ResponderPort):
             return False
         if _NEW_VALUE_REQUEST_RE.search(compact):
             return True
+        if (
+            _RETRY_REFINEMENT_REQUEST_RE.search(compact)
+            and _VOICE_REFINEMENT_CONTEXT_RE.search(compact)
+        ):
+            return True
         if compact.endswith("?") and _CLARIFYING_QUESTION_START_RE.search(compact):
             return True
         return False
@@ -1704,6 +1744,7 @@ class LLMResponder(ResponderPort):
         )
         self._current_trace = trace
         self._pending_hidden_assistant_messages = []
+        metadata = dict(metadata)
 
         session = self.sessions.get_or_create(session_key)
 
@@ -1761,6 +1802,23 @@ class LLMResponder(ResponderPort):
         if owner_raw_voice_reply is not None:
             final_content = owner_raw_voice_reply
         else:
+            if self._lazy_media_resolver is not None:
+                try:
+                    retrieval = await self._lazy_media_resolver.resolve(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=content,
+                        metadata=metadata,
+                    )
+                    if retrieval is not None:
+                        metadata["temporary_media_retrieval"] = retrieval
+                        self._metric(
+                            "temporary_media_retrieval_chars",
+                            len(str(retrieval.get("content") or "")),
+                        )
+                except Exception as e:
+                    logger.warning("lazy media retrieval failed: {}", e)
+
             retrieved_memory_text = ""
             retrieved_hits_count = 0
             if self.memory is not None:
