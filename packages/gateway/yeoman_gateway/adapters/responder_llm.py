@@ -131,6 +131,17 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "youtube_transcript",
     }
 )
+_DEFERRED_WORK_PROMISE_RE = re.compile(
+    r"\b(?:"
+    r"ich\s+(?:schau(?:e)?|checke|pr(?:ü|ue)fe|suche|recherchiere|gucke)\b"
+    r"|ich\s+muss\s+(?:erst\s+)?[^.!?]{0,90}\b"
+    r"(?:checken|pr(?:ü|ue)fen|suchen|nachschauen|recherchieren)\b"
+    r"|(?:let me|i(?:'ll| will| need to| have to))\s+[^.!?]{0,90}\b"
+    r"(?:check|look up|search|verify|fetch)\b"
+    r"|(?:einen?\s+moment|moment\s+(?:kurz|bitte)|one moment|give me a moment)"
+    r")\b",
+    re.IGNORECASE,
+)
 _DELIVERY_TOOLS = frozenset({"message", "send_voice", "send_media"})
 _DELIVERY_TARGET_STOPWORDS = frozenset(
     {
@@ -153,6 +164,19 @@ _DELIVERY_TARGET_STOPWORDS = frozenset(
         "uns",
     }
 )
+
+
+def _looks_like_deferred_work_promise(content: str | None) -> bool:
+    if not content:
+        return False
+    compact = " ".join(content.split()).strip()
+    if not compact or len(compact) > 220:
+        return False
+    if "?" in compact:
+        return False
+    return bool(_DEFERRED_WORK_PROMISE_RE.search(compact))
+
+
 _DELIVERY_TARGET_PREPOSITION_RE = re.compile(
     r"(?iu)\b(?:an|to|für|fuer|zu)\s+(?:(?:die|den|der|das|dem|the)\s+)?([@\w+][\w.+-]*)"
 )
@@ -1057,6 +1081,7 @@ class LLMResponder(ResponderPort):
         iteration = 0
         final_content: str | None = None
         chat_provider = provider or self.provider
+        deferred_work_repair_attempted = False
         # Guard against the model looping on the same side-effecting tool call
         _sent_calls: set[tuple[str, str]] = set()
         _send_tools = frozenset({"message", "send_voice", "send_media"})
@@ -1120,6 +1145,35 @@ class LLMResponder(ResponderPort):
                                 }
                             )
                             continue
+
+                if (
+                    not tool_calls
+                    and allowed_tools
+                    and _looks_like_deferred_work_promise(response.content)
+                ):
+                    if deferred_work_repair_attempted:
+                        logger.warning(
+                            "Suppressing repeated deferred work promise before outbound: {!r}",
+                            response.content,
+                        )
+                        return None
+                    deferred_work_repair_attempted = True
+                    logger.warning(
+                        "Rejecting deferred work promise before outbound: {!r}",
+                        response.content,
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Runtime rejected your previous response because it only "
+                                "promised future work. Either call an available tool now, "
+                                "or answer directly if no tool is needed. Do not send a "
+                                "waiting or preamble message to the chat."
+                            ),
+                        }
+                    )
+                    continue
 
                 if tool_calls:
                     tool_call_dicts: list[dict[str, Any]] = [

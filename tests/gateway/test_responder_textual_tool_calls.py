@@ -132,6 +132,57 @@ class _RecordingProvider(LLMProvider):
         return "fallback/model"
 
 
+class _DeferredPromiseThenAnswerProvider(LLMProvider):
+    def __init__(self, *, repeat_promise: bool = False) -> None:
+        super().__init__()
+        self.calls = 0
+        self.repeat_promise = repeat_promise
+        self.second_messages: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del tools, model, max_tokens, temperature, reasoning
+        self.calls += 1
+        if self.calls == 1 or self.repeat_promise:
+            if self.calls == 2:
+                self.second_messages = messages
+            return LLMResponse(content="Ich muss erst aktuelle Marktdaten checken. Einen Moment.")
+        self.second_messages = messages
+        return LLMResponse(content="Heute ist Tech stark, Banken sind schwach, sonst wenig Drama.")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+class _ClarifyingQuestionProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del messages, tools, model, max_tokens, temperature, reasoning
+        self.calls += 1
+        return LLMResponse(content="Welche Aktie meinst du?")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
 def _event() -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
@@ -249,6 +300,73 @@ async def test_reasoning_content_is_replayed_after_tool_call(tmp_path: Path) -> 
     )
     assert provider.second_messages[-2]["tool_calls"][0]["id"] == "call_reasoning_1"
     assert provider.second_messages[-1]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+async def test_deferred_work_promise_is_repaired_before_reply(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _DeferredPromiseThenAnswerProvider()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+
+    out = await responder.generate_reply(_event(), _decision())
+
+    await responder.aclose()
+
+    assert out == "Heute ist Tech stark, Banken sind schwach, sonst wenig Drama."
+    assert provider.calls == 2
+    repair_messages = [
+        message["content"]
+        for message in provider.second_messages
+        if message["role"] == "system"
+    ]
+    assert any("only promised future work" in message for message in repair_messages)
+    assert any("call an available tool now" in message for message in repair_messages)
+
+
+@pytest.mark.asyncio
+async def test_repeated_deferred_work_promise_is_suppressed(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _DeferredPromiseThenAnswerProvider(repeat_promise=True)
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+
+    out = await responder.generate_reply(_event(), _decision())
+
+    await responder.aclose()
+
+    assert out is None
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_clarifying_question_is_not_treated_as_deferred_work(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _ClarifyingQuestionProvider()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+
+    out = await responder.generate_reply(_event(), _decision())
+
+    await responder.aclose()
+
+    assert out == "Welche Aktie meinst du?"
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio
