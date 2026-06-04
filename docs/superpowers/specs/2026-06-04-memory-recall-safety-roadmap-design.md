@@ -176,7 +176,9 @@ raising query count.
 ### Added Value
 
 Trace diagnostics answer why a memory was or was not available to the responder.
-They are the first safety tool needed before any graph work.
+They are the first safety tool needed before graph-assisted recall is allowed to
+affect live prompts. They are not a blocker for graph schema, admin tools, or
+read-only graph navigation.
 
 Trace should answer:
 
@@ -249,15 +251,17 @@ Graph work requires stronger metadata and correction tools than candidate 1:
 ### Design
 
 Keep the existing future graph spec as the architecture direction. This roadmap
-adds the implementation gate:
+adds the live-recall gate:
 
 1. Build candidate 2 trace diagnostics first.
-2. Add graph tables and admin commands only after trace exists.
+2. Add graph tables and admin commands when the graph slice is ready; these may
+   be built before live graph recall because they do not affect prompts.
 3. Import existing plain topic strings as suggestions, not authoritative graph
    nodes.
-4. Run graph expansion in shadow mode.
-5. Compare graph-expanded candidates against normal recall.
-6. Enable one-hop graph-assisted recall only for owner-approved contexts.
+4. Enable read-only graph navigation for operator inspection.
+5. Run one-hop graph expansion in shadow mode with graph trace.
+6. Compare graph-expanded candidates against normal recall.
+7. Enable one-hop graph-assisted recall only for owner-approved contexts.
 
 Graph-assisted recall must default to:
 
@@ -283,9 +287,11 @@ Recommended order:
    Use trace results to identify raw-ish `episodic/utterance` rows that should be
    split, retagged, or ignored.
 5. **Graph overlay administration.**
-   Only after trace and metadata quality improve.
-6. **Graph shadow mode.**
-   Collect evidence without changing live prompts.
+   Add schema, admin commands, and read-only navigation. This can happen before
+   live graph recall, but it must not alter prompt context.
+6. **Graph shadow mode with graph trace.**
+   Collect evidence without changing live prompts. Every one-hop addition or
+   block must be explainable.
 7. **Owner-approved one-hop graph recall.**
    Enable only after safety review.
 
@@ -375,6 +381,6 @@ Candidate 3 is ready for a new implementation plan only when:
 
 - trace diagnostics are in place;
 - owner/admin metadata correction exists;
-- graph expansion can run in shadow mode;
+- graph schema and read-only navigation have a clear operator workflow;
+- graph expansion can run in shadow mode with graph trace;
 - every graph-expanded candidate has an explainable safety decision.
-
