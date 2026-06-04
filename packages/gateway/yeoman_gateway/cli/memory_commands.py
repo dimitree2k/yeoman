@@ -12,6 +12,7 @@ from rich.table import Table
 from yeoman_gateway.memory.disclosure import (
     DISCLOSURE_MODES,
     SENSITIVITIES,
+    disclosure_decision,
     normalize_list,
     normalize_metadata,
 )
@@ -322,6 +323,78 @@ def memory_search(
             sensitivity,
             topics,
             hit.entry.updated_at[:19],
+            content,
+        )
+    console.print(table)
+
+
+@memory_app.command("trace")
+def memory_trace(
+    query: str = typer.Option(..., "--query", "-q", help="Trace query"),
+    channel: str = typer.Option(..., "--channel", help="Channel for scoped trace"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Chat id for scoped trace"),
+    sender_id: str | None = typer.Option(None, "--sender-id", help="Sender id for user scope"),
+    reply_to_text: str | None = typer.Option(
+        None,
+        "--reply-to-text",
+        help="Quoted/reply text included in recall",
+    ),
+    reply_to_jid: str | None = typer.Option(
+        None,
+        "--reply-to-jid",
+        help="Quoted/reply sender jid included in recall",
+    ),
+) -> None:
+    """Trace recall scoring, query origin, quota, and disclosure decision."""
+    with _memory_service_context() as service:
+        hits = service.recall_for_event(
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            query=query,
+            reply_to_text=reply_to_text,
+            reply_to_jid=reply_to_jid,
+        )
+        query_text = service._normalize_content(
+            query + (f"\n{reply_to_text}" if reply_to_text else "")
+        )
+        owner_context = service._is_owner(channel, sender_id)
+
+    if not hits:
+        console.print("No memory hits.")
+        return
+
+    table = Table(title="Memory Trace")
+    table.add_column("Rank", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("query_origin", min_width=12)
+    table.add_column("quota", min_width=7)
+    table.add_column("disclosure", min_width=11)
+    table.add_column("Mode", min_width=10)
+    table.add_column("Kind", min_width=10, no_wrap=True)
+    table.add_column("Sensitivity", min_width=11, no_wrap=True)
+    table.add_column("Topics", min_width=14, no_wrap=True)
+    table.add_column("Content")
+    for index, hit in enumerate(hits, start=1):
+        metadata = normalize_metadata(hit.entry.meta_json)
+        decision = disclosure_decision(
+            metadata,
+            query=query_text,
+            owner_context=owner_context,
+        )
+        content = " ".join(hit.entry.content.split())
+        if len(content) > 120:
+            content = content[:117] + "..."
+        table.add_row(
+            str(index),
+            f"{hit.final_score:.2f}",
+            str(hit.trace.get("query_origin") or "-"),
+            str(hit.trace.get("quota") or "-"),
+            decision,
+            metadata.disclosure_mode,
+            hit.entry.kind,
+            metadata.sensitivity,
+            ",".join(metadata.topics),
             content,
         )
     console.print(table)

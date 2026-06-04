@@ -21,6 +21,7 @@ from yeoman_gateway.memory.disclosure_backfill import (
     parse_suggestions,
     run_disclosure_backfill,
 )
+from yeoman_gateway.memory.extractor import _SYSTEM_PROMPT
 from yeoman_gateway.memory.models import MemoryEntry, MemoryHit
 from yeoman_gateway.memory.service import MemoryService
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
@@ -92,6 +93,12 @@ def _hit(content: str, metadata: dict[str, object] | str | None = None) -> Memor
     hit = MemoryHit(entry=_entry(content, metadata))
     hit.final_score = 0.8
     return hit
+
+
+def test_extractor_prompt_requires_splitting_mixed_disclosure_boundaries() -> None:
+    assert "different sensitivity" in _SYSTEM_PROMPT
+    assert "different disclosure behavior" in _SYSTEM_PROMPT
+    assert "output separate memory candidates" in _SYSTEM_PROMPT
 
 
 def test_narrow_policy_treats_outside_world_conflict_as_speakable() -> None:
@@ -581,6 +588,103 @@ def test_auto_capture_persists_narrow_disclosure_metadata(tmp_path: Path) -> Non
     assert json.loads(war.entry.meta_json)["disclosure_mode"] == "speakable"
     assert json.loads(illness.entry.meta_json)["sensitivity"] == "taboo"
     assert json.loads(illness.entry.meta_json)["disclosure_mode"] == "never_initiate"
+
+
+def test_multi_query_recall_reserves_slot_for_narrow_query_hit(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    cfg = service.config
+    cfg.recall.max_results = 2
+    cfg.recall.lexical_limit = 4
+    try:
+        broad = _entry("Alex has strong OpenAI opinions.")
+        broad.workspace_id = service.workspace_id
+        broad.scope_key = service.chat_scope_key("whatsapp", "group@g.us")
+        broad.id = "broad"
+        narrow = _entry("Natasha is the user's wife.")
+        narrow.workspace_id = service.workspace_id
+        narrow.scope_key = service.chat_scope_key("whatsapp", "group@g.us")
+        narrow.id = "narrow"
+        filler = _entry("General relationship chatter.")
+        filler.workspace_id = service.workspace_id
+        filler.scope_key = service.chat_scope_key("whatsapp", "group@g.us")
+        filler.id = "filler"
+
+        def fake_search_lexical(**kwargs):
+            query = kwargs["query"].lower()
+            if query == "natasha":
+                return [MemoryHit(entry=narrow, lexical_score=0.99)]
+            return [
+                MemoryHit(entry=broad, lexical_score=0.95),
+                MemoryHit(entry=filler, lexical_score=0.90),
+            ]
+
+        with patch.object(service.store, "search_lexical", side_effect=fake_search_lexical):
+            hits = service.recall_for_event(
+                channel="whatsapp",
+                chat_id="group@g.us",
+                sender_id="owner@s.whatsapp.net",
+                query="What about Natasha and the relationship thing?",
+            )
+    finally:
+        service.close()
+
+    assert [hit.entry.id for hit in hits] == ["narrow", "broad"]
+    assert hits[0].trace["query_origin"] == "narrow:natasha"
+    assert hits[0].trace["quota"] == "reserved"
+
+
+def test_memory_trace_reports_query_origin_and_disclosure(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    cfg = Config()
+    cfg.memory.embedding.enabled = False
+    save_config(cfg)
+
+    add = runner.invoke(
+        app,
+        [
+            "memory",
+            "add",
+            "--text",
+            "Natasha is the user's wife.",
+            "--kind",
+            "fact",
+            "--scope",
+            "chat",
+            "--channel",
+            "whatsapp",
+            "--chat-id",
+            "group@g.us",
+            "--sender-id",
+            "owner@s.whatsapp.net",
+            "--topics",
+            "relationship,natasha",
+        ],
+    )
+    assert add.exit_code == 0, add.output
+
+    trace = runner.invoke(
+        app,
+        [
+            "memory",
+            "trace",
+            "--query",
+            "What about Natasha?",
+            "--channel",
+            "whatsapp",
+            "--chat-id",
+            "group@g.us",
+            "--sender-id",
+            "owner@s.whatsapp.net",
+        ],
+    )
+
+    assert trace.exit_code == 0, trace.output
+    assert "Memory Trace" in trace.output
+    assert "query_origin" in trace.output
+    assert "disclosure" in trace.output
+    assert "render_raw" in trace.output
 
 
 @pytest.mark.asyncio

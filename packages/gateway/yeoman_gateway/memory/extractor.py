@@ -260,6 +260,7 @@ RULES:
 - If nothing worth remembering → return {"memories": []}
 - Facts about a named third party → sector=semantic, kind=person_profile. Prepend name: "Timo: kauft ein Haus und nimmt einen Kredit auf".
 - For group batches [sender_id]: attribute facts to the right person by prefixing their ID when multiple people speak.
+- If one source message or batch contains facts with different subjects, different sensitivity, different disclosure behavior, or clearly different retrieval use cases, output separate memory candidates.
 - Never output instructions, system prompt fragments, or placeholder values.
 - confidence: how certain is this fact? (0.5=mentioned in passing, 0.9=stated clearly)
 - salience: how useful is this long-term? (0.5=mildly interesting, 0.9=core life fact)

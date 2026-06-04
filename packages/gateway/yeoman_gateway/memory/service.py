@@ -58,6 +58,26 @@ class _BackgroundNoteBuffer:
     batch_max_messages: int
 
 
+_RECALL_NARROW_STOPWORDS = {
+    "And",
+    "Any",
+    "Can",
+    "Das",
+    "Der",
+    "Die",
+    "For",
+    "Hat",
+    "How",
+    "Mit",
+    "The",
+    "Und",
+    "Was",
+    "What",
+    "Why",
+    "Wie",
+}
+
+
 class MemoryService:
     """Single semantic memory service used by the runtime."""
 
@@ -512,6 +532,40 @@ class MemoryService:
         if not query_text:
             return []
 
+        scope_keys = self._recall_scope_keys(
+            channel=channel,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            reply_to_jid=reply_to_jid,
+        )
+        recall_queries = self._build_recall_queries(query_text)
+        merged: dict[str, MemoryHit] = {}
+        per_query_ranked: dict[str, list[MemoryHit]] = {}
+        for origin, recall_query in recall_queries:
+            query_hits = self._recall_for_query(
+                query=recall_query,
+                scope_keys=scope_keys,
+                query_origin=origin,
+            )
+            per_query_ranked[origin] = self._rank_hits(query_hits)
+            for hit in per_query_ranked[origin]:
+                self._merge_recall_hit(merged, hit, origin)
+
+        ranked = self._rank_hits(list(merged.values()))
+        return self._apply_recall_diversity(
+            ranked,
+            per_query_ranked,
+            max_results=max(1, int(self.config.recall.max_results)),
+        )
+
+    def _recall_scope_keys(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        sender_id: str | None,
+        reply_to_jid: str | None,
+    ) -> list[str]:
         scope_keys = [
             self.chat_scope_key(channel, chat_id),
             self.user_scope_key(channel, (sender_id or chat_id).strip()),
@@ -522,16 +576,25 @@ class MemoryService:
             if cid and cid not in seen_contact_ids:
                 scope_keys.append(self.contact_scope_key(cid))
                 seen_contact_ids.add(cid)
+        return scope_keys
+
+    def _recall_for_query(
+        self,
+        *,
+        query: str,
+        scope_keys: list[str],
+        query_origin: str,
+    ) -> list[MemoryHit]:
         lexical_hits = self.store.search_lexical(
             workspace_id=self.workspace_id,
-            query=query_text,
+            query=query,
             scope_keys=scope_keys,
             limit=max(1, int(self.config.recall.lexical_limit)),
         )
 
         vector_hits: list[MemoryHit] = []
         if self.embedding is not None:
-            vector = self.embedding.embed(query_text)
+            vector = self.embedding.embed(query)
             if vector:
                 vector_hits = self.store.search_vector(
                     workspace_id=self.workspace_id,
@@ -543,16 +606,106 @@ class MemoryService:
 
         merged: dict[str, MemoryHit] = {}
         for hit in lexical_hits:
+            hit.trace["query_origin"] = query_origin
+            hit.trace["query_origins"] = [query_origin]
             merged[hit.entry.id] = hit
         for hit in vector_hits:
             existing = merged.get(hit.entry.id)
             if existing is None:
+                hit.trace["query_origin"] = query_origin
+                hit.trace["query_origins"] = [query_origin]
                 merged[hit.entry.id] = hit
             else:
                 existing.vector_score = max(existing.vector_score, hit.vector_score)
+                self._append_query_origin(existing, query_origin)
 
-        ranked = self._rank_hits(list(merged.values()))
-        return ranked[: max(1, int(self.config.recall.max_results))]
+        return list(merged.values())
+
+    @staticmethod
+    def _append_query_origin(hit: MemoryHit, origin: str) -> None:
+        origins = list(hit.trace.get("query_origins") or [])
+        if origin not in origins:
+            origins.append(origin)
+        hit.trace["query_origins"] = origins
+        hit.trace["query_origin"] = origins[0] if origins else origin
+
+    @classmethod
+    def _merge_recall_hit(
+        cls,
+        merged: dict[str, MemoryHit],
+        hit: MemoryHit,
+        origin: str,
+    ) -> None:
+        existing = merged.get(hit.entry.id)
+        if existing is None:
+            cls._append_query_origin(hit, origin)
+            merged[hit.entry.id] = hit
+            return
+        existing.lexical_score = max(existing.lexical_score, hit.lexical_score)
+        existing.vector_score = max(existing.vector_score, hit.vector_score)
+        cls._append_query_origin(existing, origin)
+
+    @staticmethod
+    def _build_recall_queries(query_text: str) -> list[tuple[str, str]]:
+        compact = " ".join(query_text.split()).strip()
+        if not compact:
+            return []
+        queries: list[tuple[str, str]] = [("primary", compact)]
+        seen = {compact.lower()}
+        candidates: list[str] = []
+        for match in re.findall(r"\b[A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9_-]{2,}\b", compact):
+            if match in _RECALL_NARROW_STOPWORDS:
+                continue
+            candidates.append(match)
+        for match in re.findall(r"\b[A-Z]{2,5}\b", compact):
+            candidates.append(match)
+
+        for candidate in candidates:
+            normalized = candidate.strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            queries.append((f"narrow:{key}", normalized))
+            if len(queries) >= 3:
+                break
+        return queries
+
+    @staticmethod
+    def _apply_recall_diversity(
+        ranked: list[MemoryHit],
+        per_query_ranked: dict[str, list[MemoryHit]],
+        *,
+        max_results: int,
+    ) -> list[MemoryHit]:
+        if max_results <= 0:
+            return []
+        selected: list[MemoryHit] = []
+        selected_ids: set[str] = set()
+        non_primary = [origin for origin in per_query_ranked if origin != "primary"]
+        reserved_limit = min(len(non_primary), max(0, max_results - 1))
+        reserved = 0
+        for origin in non_primary:
+            if reserved >= reserved_limit:
+                break
+            for hit in per_query_ranked[origin]:
+                if hit.entry.id in selected_ids:
+                    continue
+                hit.trace["quota"] = "reserved"
+                selected.append(hit)
+                selected_ids.add(hit.entry.id)
+                reserved += 1
+                break
+
+        for hit in ranked:
+            if len(selected) >= max_results:
+                break
+            if hit.entry.id in selected_ids:
+                continue
+            hit.trace.setdefault("quota", "score")
+            selected.append(hit)
+            selected_ids.add(hit.entry.id)
+        return selected
 
     def search(
         self,
@@ -631,14 +784,16 @@ class MemoryService:
                 + salience_weight * hit.salience_score
                 + recency_weight * hit.recency_score
             )
-            hit.trace = {
+            trace = dict(hit.trace)
+            trace.update({
                 "lexical": round(hit.lexical_score, 4),
                 "vector": round(hit.vector_score, 4),
                 "salience": round(hit.salience_score, 4),
                 "recency": round(hit.recency_score, 4),
                 "final": round(hit.final_score, 4),
                 "entry_id": hit.entry.id,
-            }
+            })
+            hit.trace = trace
         hits.sort(key=lambda h: h.final_score, reverse=True)
         return hits
 
