@@ -1,5 +1,4 @@
 # tests/test_session_tool_traces.py
-import pytest
 from yeoman_gateway.session.manager import Session
 
 
@@ -41,6 +40,6 @@ def test_get_history_skips_legacy_rows_without_content():
 
     history = session.get_history()
     assert history == [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "hi", "timestamp": "2026-03-07T00:00:00"},
+        {"role": "assistant", "content": "hello", "timestamp": "2026-03-07T00:00:02"},
     ]

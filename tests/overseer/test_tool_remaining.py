@@ -51,6 +51,20 @@ def test_check_health_runs_disk_usage_above_end_to_end(tmp_path):
     assert "disk_usage_above" in result
 
 
+def test_check_health_ignores_irrelevant_query_for_disk_usage(tmp_path):
+    result = check_health_execute(
+        {
+            "check": "disk_usage_above",
+            "target": str(tmp_path),
+            "threshold": 0,
+            "query": "",
+        },
+        _ctx(),
+    )
+    assert "ERROR" not in result
+    assert "disk_usage_above" in result
+
+
 def test_check_health_tool_schema_advertises_threshold():
     definition = next(t for t in TOOL_DEFINITIONS if t["name"] == "check_health")
     properties = definition["input_schema"]["properties"]

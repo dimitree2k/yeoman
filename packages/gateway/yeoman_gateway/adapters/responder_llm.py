@@ -28,6 +28,7 @@ from yeoman_gateway.agent.tools.filesystem import (
     ReadFileTool,
     WriteFileTool,
 )
+from yeoman_gateway.agent.tools.market_data import MarketIntelligenceTool, MarketQuoteTool
 from yeoman_gateway.agent.tools.message import MessageTool
 from yeoman_gateway.agent.tools.ops import OpsTool
 from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
@@ -122,6 +123,8 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
         "browse",
         "deep_research",
         "fact_check",
+        "market_intelligence",
+        "market_quote",
         "media_history",
         "ops",
         "recall_conversation",
@@ -499,6 +502,8 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(MarketQuoteTool())
+        self.tools.register(MarketIntelligenceTool())
         self.tools.register(YoutubeTranscriptTool())
 
         from yeoman_gateway.agent.tools.browse import BrowseTool
@@ -906,6 +911,23 @@ class LLMResponder(ResponderPort):
             }
         )
         return metadata
+
+    @staticmethod
+    def _session_user_metadata(sender_id: str | None, metadata: dict[str, object]) -> dict[str, object]:
+        values: dict[str, object] = {
+            "sender_id": sender_id or metadata.get("sender_id"),
+            "sender_name": metadata.get("sender_name"),
+            "message_id": metadata.get("message_id"),
+            "timestamp": metadata.get("timestamp"),
+            "reply_to_message_id": metadata.get("reply_to_message_id"),
+            "reply_to_participant": metadata.get("reply_to_participant"),
+            "reply_to_text": metadata.get("reply_to_text"),
+        }
+        return {
+            key: value
+            for key, value in values.items()
+            if value is not None and str(value).strip()
+        }
 
     @staticmethod
     def _is_inbound_voice(event: InboundEvent) -> bool:
@@ -1804,7 +1826,7 @@ class LLMResponder(ResponderPort):
 
         # Save session immediately on first message (even if no response yet)
         if not session.messages:
-            session.add_message("user", content, sender_id=sender_id)
+            session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self.sessions.save(session)
             # Track that we've already added the user message to avoid duplication
             _user_message_already_added = True
@@ -1835,7 +1857,7 @@ class LLMResponder(ResponderPort):
             sender_id=sender_id,
         ):
             if not _user_message_already_added:
-                session.add_message("user", content, sender_id=sender_id)
+                session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self.sessions.save(session)
             self._metric("social_holdback")
             logger.info(
@@ -1987,7 +2009,7 @@ class LLMResponder(ResponderPort):
 
         if final_content is None:
             if not _user_message_already_added:
-                session.add_message("user", content, sender_id=sender_id)
+                session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self._flush_hidden_assistant_markers(session)
             self.sessions.save(session)
             self._current_trace = None
@@ -2037,7 +2059,7 @@ class LLMResponder(ResponderPort):
 
         # Only add messages if they weren't already added (for new sessions)
         if not _user_message_already_added:
-            session.add_message("user", content)
+            session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         if private_handoff_id and self._private_handoff_store is not None:

@@ -264,7 +264,7 @@ async def test_collect_persona_evolution_evidence_excludes_raw_messages(
         "Proactive speakup taste pattern: compact market numbers land."
     ]
     assert evidence.chats[0].recent_message_count == 1
-    assert "compact market numbers land" in rendered
+    assert "Alpha should lead with compact market numbers before any broader take" in rendered
     assert "Raw speakup text should not appear" not in rendered
     assert "Private raw chat text must not appear" not in rendered
     assert "no persona files were modified" in rendered
@@ -335,7 +335,7 @@ async def test_render_persona_evolution_proposal_dedupes_review_noise(
     assert "## Current Evolution Digest" in rendered
     assert "Current Evolution File" not in rendered
     assert "whatsapp:group-b" not in rendered
-    assert rendered.count("compact market numbers land") == 1
+    assert rendered.count("lead with compact market numbers before any broader take") == 1
     assert "Recent chat preferences:" not in rendered
     assert "Learned proactive taste:" not in rendered
 
@@ -446,6 +446,139 @@ async def test_run_persona_evolution_cron_skips_redundant_durable_lesson(
         scope_type="chat",
         kind="preference",
         text="Proactive speakup taste pattern: Engages most with data-dense observations and error corrections on trading, markets, and finance; resists contrarian views and opinion-heavy shares.",
+        importance=0.75,
+        confidence=0.88,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    archive = InboundArchive(tmp_path / "reply_context.db")
+    output = workspace / "persona-evolution" / "proposal.md"
+    _record_messages(archive, day=1, count=3)
+
+    try:
+        result = await run_persona_evolution_cron(
+            policy=_policy(),
+            workspace=workspace,
+            persona_file="personas/alpha-2.md",
+            memory=memory,
+            speakup_log=log,
+            inbound_archive=archive,
+            window_days=1,
+            limit=10,
+            output_path=output,
+            min_meaningful_messages=1,
+            min_signal_score=0.0,
+            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+        )
+    finally:
+        memory.close()
+        log.close()
+        archive.close()
+
+    assert result == "persona_evolution no proposal: no_durable_changes messages=3 score=5.75"
+    assert not output.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_persona_evolution_cron_converts_chat_taste_to_alpha_behavior(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "personas" / "alpha-2.evolution.md").write_text(
+        "\n".join(
+            [
+                "# Evolution Layer: Alpha",
+                "",
+                "## Consciousness Outcome Lessons",
+                "- 2026-06-03 `whatsapp:group-a` confidence=medium evidence=50 speakups, 50 messages: Analytisch, datengetrieben und haeufig korrigierend oder kontraer; dominiert von finanz- und tech-affinen Faktenchecks mit praezisen Zahlen und Quellenangaben.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    memory = _memory(tmp_path)
+    memory.record_manual(
+        channel="whatsapp",
+        chat_id="group-a",
+        sender_id=None,
+        scope_type="chat",
+        kind="preference",
+        text=(
+            "Proactive speakup taste pattern: Assertive, technically precise discourse "
+            "favored; unsolicited contributions succeed when correcting inaccuracies "
+            "with hard data, offering contrarian takes supported by metrics, or "
+            "sharing sharp observations laced with dry humor. Jargon and "
+            "industry-specific references signal insider fluency. Speculative or "
+            "fluffy remarks without quantitative backing tend to get ignored or "
+            "challenged. Tone is confident, often slightly combative, but "
+            "acknowledged when factually sound."
+        ),
+        importance=0.75,
+        confidence=0.88,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    archive = InboundArchive(tmp_path / "reply_context.db")
+    output = workspace / "persona-evolution" / "proposal.md"
+    _record_messages(archive, day=1, count=3)
+
+    try:
+        result = await run_persona_evolution_cron(
+            policy=_policy(),
+            workspace=workspace,
+            persona_file="personas/alpha-2.md",
+            memory=memory,
+            speakup_log=log,
+            inbound_archive=archive,
+            window_days=1,
+            limit=10,
+            output_path=output,
+            min_meaningful_messages=1,
+            min_signal_score=0.0,
+            now=datetime(2026, 5, 1, 13, 0, tzinfo=UTC),
+        )
+    finally:
+        memory.close()
+        log.close()
+        archive.close()
+
+    assert result == f"persona_evolution proposal written: {output}"
+    rendered = output.read_text(encoding="utf-8")
+    assert "Alpha should" in rendered
+    assert "lead with the hard number or concrete evidence before the opinion" in rendered
+    assert "skip speculative or fluffy remarks unless they are anchored" in rendered
+    assert "Assertive, technically precise discourse favored" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_persona_evolution_cron_skips_repeated_alpha_behavior_delta(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace / "personas" / "alpha-2.evolution.md").write_text(
+        "\n".join(
+            [
+                "# Evolution Layer: Alpha",
+                "",
+                "## Consciousness Outcome Lessons",
+                "- 2026-06-06 `whatsapp:group-a` confidence=medium evidence=50 speakups, 50 messages: Alpha should lead with the hard number or concrete evidence before the opinion; correct inaccuracies directly when the evidence is strong; make contrarian takes only with clear metrics or sources; add dry humor only after the substance lands; skip speculative or fluffy remarks unless they are anchored to quantitative backing; keep the tone confident and technically precise.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    memory = _memory(tmp_path)
+    memory.record_manual(
+        channel="whatsapp",
+        chat_id="group-a",
+        sender_id=None,
+        scope_type="chat",
+        kind="preference",
+        text=(
+            "Proactive speakup taste pattern: Assertive, technically precise discourse "
+            "favored; unsolicited contributions succeed when correcting inaccuracies "
+            "with hard data, offering contrarian takes supported by metrics, or "
+            "sharing sharp observations laced with dry humor. Speculative or fluffy "
+            "remarks without quantitative backing tend to get ignored or challenged."
+        ),
         importance=0.75,
         confidence=0.88,
     )

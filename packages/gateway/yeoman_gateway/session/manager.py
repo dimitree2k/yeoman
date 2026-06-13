@@ -9,6 +9,18 @@ from typing import Any
 from loguru import logger
 from yeoman_shared.utils.helpers import get_sessions_path, safe_filename
 
+_LLM_HISTORY_METADATA_KEYS = frozenset(
+    {
+        "timestamp",
+        "sender_id",
+        "sender_name",
+        "message_id",
+        "reply_to_message_id",
+        "reply_to_participant",
+        "reply_to_text",
+    }
+)
+
 
 @dataclass
 class Session:
@@ -97,7 +109,11 @@ class Session:
                 content = ""
             if not isinstance(content, (str, list, dict)):
                 content = str(content)
-            history.append({"role": role, "content": content})
+            row = {"role": role, "content": content}
+            for key in _LLM_HISTORY_METADATA_KEYS:
+                if key in message and message[key] is not None:
+                    row[key] = message[key]
+            history.append(row)
         return history
 
     def get_full_history(self) -> list[dict[str, Any]]:

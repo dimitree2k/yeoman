@@ -104,6 +104,35 @@ class TestSessionBoundary:
         history = s.get_history(max_messages=50)
         assert len(history) == 0
 
+    def test_preserves_safe_message_metadata_for_prompt_context(self):
+        s = Session(key="test")
+        s.add_message(
+            "user",
+            "Wat fürn Deckel",
+            sender_id="4917632625469",
+            sender_name="Frank Taeger",
+            message_id="3BCC5AB37B9E4F343C7E",
+            reply_to_message_id="3EB019A2845309C24863EF",
+            reply_to_participant="203075365150770@lid",
+            internal_debug="do not expose",
+        )
+
+        history = s.get_history(max_messages=50)
+
+        assert history == [
+            {
+                "role": "user",
+                "content": "Wat fürn Deckel",
+                "timestamp": history[0]["timestamp"],
+                "sender_id": "4917632625469",
+                "sender_name": "Frank Taeger",
+                "message_id": "3BCC5AB37B9E4F343C7E",
+                "reply_to_message_id": "3EB019A2845309C24863EF",
+                "reply_to_participant": "203075365150770@lid",
+            }
+        ]
+        assert "internal_debug" not in history[0]
+
 
 class TestPreflightHeuristic:
     """Preflight heuristic should detect backward references in messages."""
@@ -149,6 +178,17 @@ class TestConversationStateContext:
         assert "set one blunt boundary" in prompt
         assert "Do not add a follow-up question" in prompt
 
+    def test_system_prompt_routes_market_questions_to_market_tools(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_path).build_system_prompt()
+
+        assert "# Market Data" in prompt
+        assert "market_intelligence" in prompt
+        assert "market_quote" in prompt
+        assert "web_search" in prompt
+        assert "do not infer prices from web_search" in prompt
+
     def test_system_prompt_routes_cross_chat_media_to_media_history(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
 
@@ -183,6 +223,52 @@ class TestConversationStateContext:
         assert "preferred_action: answer" in user_text
         assert "answer_shape: repair" in user_text
         assert "Acknowledge the problem briefly, then correct the answer." in user_text
+
+    def test_external_history_preserves_original_sender_context(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[
+                {
+                    "role": "user",
+                    "content": "Ich rede einfach weiter mit dir",
+                    "timestamp": "2026-06-09T22:04:21+02:00",
+                    "sender_id": "4917632625469",
+                    "sender_name": "Frank Taeger",
+                    "message_id": "m1",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Der hat ja auch keinen Deckel mehr draufgekriegt.",
+                    "timestamp": "2026-06-09T22:53:25+02:00",
+                },
+                {
+                    "role": "user",
+                    "content": "Wat fürn Deckel",
+                    "timestamp": "2026-06-09T23:04:45+02:00",
+                    "sender_id": "4917632625469",
+                    "sender_name": "Frank Taeger",
+                    "message_id": "m2",
+                    "reply_to_message_id": "bot1",
+                    "reply_to_participant": "203075365150770@lid",
+                },
+            ],
+            current_message="Der Typ bin ich",
+            current_metadata={"sender_id": "4917632625469"},
+            channel="whatsapp",
+            chat_id="group@g.us",
+        )
+
+        history_texts = [str(message["content"]) for message in messages if message["role"] == "user"]
+
+        assert "sender=history" not in "\n".join(history_texts)
+        assert "sender_name=Frank Taeger" in history_texts[0]
+        assert "sender_id=4917632625469" in history_texts[0]
+        assert "at=2026-06-09T22:04:21+02:00" in history_texts[0]
+        assert "message_id=m1" in history_texts[0]
+        assert "sender_name=Frank Taeger" in history_texts[1]
+        assert "reply_to_message_id=bot1" in history_texts[1]
+        assert "reply_to_participant=203075365150770@lid" in history_texts[1]
 
     def test_current_message_includes_social_one_liner_guidance(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
@@ -281,6 +367,66 @@ class TestDeliveryRepairGate:
 
         assert result == "Voice message delivered."
         assert sent[0].chat_id == "491234567890-123456789@g.us"
+
+    @pytest.mark.asyncio
+    async def test_responder_persists_user_sender_metadata_for_later_context(self, tmp_path):
+        from typing import Any
+
+        from yeoman_gateway.adapters.responder_llm import LLMResponder
+        from yeoman_gateway.bus.queue import MessageBus
+        from yeoman_gateway.core.models import PolicyDecision
+        from yeoman_gateway.providers.base import LLMProvider, LLMResponse
+
+        class _Provider(LLMProvider):
+            async def chat(
+                self,
+                messages: list[dict[str, Any]],
+                tools: list[dict[str, Any]] | None = None,
+                model: str | None = None,
+                max_tokens: int = 4096,
+                temperature: float = 0.7,
+                reasoning: dict[str, Any] | None = None,
+            ) -> LLMResponse:
+                del messages, tools, model, max_tokens, temperature, reasoning
+                return LLMResponse(content="verstanden")
+
+            def get_default_model(self) -> str:
+                return "dummy/model"
+
+        responder = LLMResponder(bus=MessageBus(), provider=_Provider(), workspace=tmp_path)
+
+        out = await responder.generate_reply(
+            InboundEvent(
+                channel="whatsapp",
+                chat_id="group@g.us",
+                sender_id="4915253696948",
+                content="Ich BIN Carschten",
+                message_id="carschten-1",
+                is_group=True,
+                reply_to_bot=True,
+                reply_to_message_id="bot-1",
+                reply_to_participant="203075365150770@lid",
+                reply_to_text="Carschten, 50+ oder nicht...",
+                raw_metadata={"sender_name": "Carschten"},
+            ),
+            PolicyDecision(
+                accept_message=True,
+                should_respond=True,
+                allowed_tools=frozenset(),
+                reason="test",
+            ),
+        )
+
+        history = responder.sessions.get_or_create("whatsapp:group@g.us").get_history()
+        await responder.aclose()
+
+        assert out == "verstanden"
+        assert history[0]["sender_id"] == "4915253696948"
+        assert history[0]["sender_name"] == "Carschten"
+        assert history[0]["message_id"] == "carschten-1"
+        assert history[0]["reply_to_message_id"] == "bot-1"
+        assert history[0]["reply_to_participant"] == "203075365150770@lid"
+        assert history[0]["reply_to_text"] == "Carschten, 50+ oder nicht..."
 
     @pytest.mark.asyncio
     async def test_side_effecting_tool_without_explicit_target_gets_repair_result(

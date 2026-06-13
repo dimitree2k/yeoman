@@ -12,10 +12,33 @@ from yeoman_gateway.agent.skills import SkillsLoader
 _EXTERNAL_CHANNELS = frozenset({"whatsapp", "telegram", "discord", "feishu"})
 
 
-def _wrap_untrusted_message(sender: str, content: str, channel: str) -> str:
+def _format_untrusted_context(sender: str, channel: str, metadata: dict[str, Any] | None) -> str:
+    fields = [f"channel={channel}"]
+    metadata = metadata or {}
+    if metadata.get("sender_name"):
+        fields.append(f"sender_name={metadata['sender_name']}")
+    if metadata.get("sender_id"):
+        fields.append(f"sender_id={metadata['sender_id']}")
+    elif sender:
+        fields.append(f"sender_id={sender}")
+    if metadata.get("timestamp"):
+        fields.append(f"at={metadata['timestamp']}")
+    for key in ("message_id", "reply_to_message_id", "reply_to_participant"):
+        if metadata.get(key):
+            fields.append(f"{key}={metadata[key]}")
+    return "\n".join(str(field) for field in fields)
+
+
+def _wrap_untrusted_message(
+    sender: str,
+    content: str,
+    channel: str,
+    metadata: dict[str, Any] | None = None,
+) -> str:
     """Wrap inbound channel message with trust boundary markers."""
     return (
-        f"--- UNTRUSTED INBOUND MESSAGE (channel={channel}, sender={sender}) ---\n"
+        "--- UNTRUSTED INBOUND MESSAGE ---\n"
+        f"{_format_untrusted_context(sender, channel, metadata)}\n"
         f"{content}\n"
         f"--- END UNTRUSTED INBOUND MESSAGE ---"
     )
@@ -58,6 +81,7 @@ class ContextBuilder:
         # NOTE: temporal grounding is injected as a separate message in build_messages()
         # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
+        parts.append(self._build_market_data_guardrails())
         parts.append(self._build_url_fetch_guardrails())
         parts.append(self._build_conversational_repair_guardrails())
         parts.append(self._build_social_calibration_guardrails())
@@ -170,6 +194,20 @@ Skills with available="false" need dependencies installed first - you can try in
                 "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
                 "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
                 "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
+            ]
+        )
+
+    @staticmethod
+    def _build_market_data_guardrails() -> str:
+        """Build guardrails for current market prices and financial quote data."""
+        return "\n".join(
+            [
+                "# Market Data",
+                "For 'why is this stock/commodity/forex/crypto moving?', 'what is going on with <ticker>?', sector move, market sentiment, or macro/geopolitical market questions, call `market_intelligence` before answering when it is available.",
+                "For simple current price, intraday move, percent change, or previous close lookups, call `market_quote` before answering when it is available.",
+                "`market_intelligence` and `market_quote` are the source of truth for quote values. Use `web_search`, `web_fetch`, news, or macro context only to explain catalysts after quote values are established.",
+                "If quote tools are unavailable, not configured, rate-limited, or return no usable quotes, say current quote data is unavailable and do not infer prices from web_search snippets.",
+                "When citing market values, include the symbol, price or percent move, timeframe/source timestamp if present, and any market-open/delay caveat returned by the tool.",
             ]
         )
 
@@ -361,7 +399,12 @@ When the owner asks in a DM about previously shared images, screenshots, PDFs, o
                 if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                     messages.append({
                         "role": "user",
-                        "content": _wrap_untrusted_message("history", msg["content"], channel),
+                        "content": _wrap_untrusted_message(
+                            str(msg.get("sender_id") or ""),
+                            msg["content"],
+                            channel,
+                            metadata=msg,
+                        ),
                     })
                 else:
                     messages.append(msg)

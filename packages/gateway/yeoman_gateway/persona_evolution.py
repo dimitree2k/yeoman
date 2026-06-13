@@ -35,6 +35,7 @@ _REDUNDANT_NOTE_STOPWORDS = {
     "about",
     "after",
     "again",
+    "alpha",
     "better",
     "chat",
     "confidence",
@@ -51,6 +52,7 @@ _REDUNDANT_NOTE_STOPWORDS = {
     "proposal",
     "recent",
     "share",
+    "should",
     "speakup",
     "speakups",
     "that",
@@ -1072,15 +1074,81 @@ def _proposed_change_notes(evidence: PersonaEvolutionEvidence) -> list[str]:
         if chat_evidence.recent_message_count:
             evidence_parts.append(f"{chat_evidence.recent_message_count} messages")
         evidence_text = ", ".join(evidence_parts) if evidence_parts else "learned taste"
-        notes.append(
-            f"{evidence.collected_at.date()} `{chat.channel}:{chat.chat_id}` "
-            f"confidence=medium evidence={evidence_text}: {patterns[0]}"
-        )
+        for pattern in patterns:
+            behavior_delta = _behavior_delta_from_taste_pattern(pattern)
+            if not behavior_delta:
+                continue
+            notes.append(
+                f"{evidence.collected_at.date()} `{chat.channel}:{chat.chat_id}` "
+                f"confidence=medium evidence={evidence_text}: {behavior_delta}"
+            )
+            break
     return [
         note
         for note in notes
         if not _durable_note_already_covered(note, evidence.current_evolution_text)
     ]
+
+
+def _behavior_delta_from_taste_pattern(pattern: str) -> str | None:
+    cleaned = _ensure_sentence(_clean_taste_pattern(pattern))
+    if not cleaned:
+        return None
+    lowered = cleaned.casefold()
+    if re.search(r"\b(alpha|yeoman)\s+should\b", lowered):
+        return re.sub(r"\byeoman should\b", "Alpha should", cleaned, count=1, flags=re.I)
+
+    clauses: list[str] = []
+    if any(
+        marker in lowered
+        for marker in (
+            "hard data",
+            "hard number",
+            "metric",
+            "quantitative",
+            "data-dense",
+            "precise number",
+            "technically precise",
+        )
+    ):
+        clauses.append("lead with the hard number or concrete evidence before the opinion")
+    if any(marker in lowered for marker in ("correcting inaccuracies", "fact check", "facts check", "faktencheck")):
+        clauses.append("correct inaccuracies directly when the evidence is strong")
+    if any(marker in lowered for marker in ("contrarian", "kontraer")):
+        clauses.append("make contrarian takes only with clear metrics or sources")
+    if "dry humor" in lowered or "humor" in lowered:
+        clauses.append("add dry humor only after the substance lands")
+    if "jargon" in lowered or "industry-specific" in lowered or "insider" in lowered:
+        clauses.append("use insider terminology when it makes the point sharper")
+    if any(marker in lowered for marker in ("speculative", "fluffy", "broad take", "broad proactive")):
+        clauses.append("skip speculative or fluffy remarks unless they are anchored to quantitative backing")
+    if any(marker in lowered for marker in ("confident", "assertive", "combative", "technically precise")):
+        clauses.append("keep the tone confident and technically precise")
+    if "compact market number" in lowered:
+        clauses.append("lead with compact market numbers before any broader take")
+
+    if not clauses:
+        return None
+    return "Alpha should " + "; ".join(_unique_ordered(clauses)) + "."
+
+
+def _ensure_sentence(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    if not cleaned:
+        return ""
+    return cleaned if cleaned[-1] in ".!?" else f"{cleaned}."
+
+
+def _unique_ordered(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return unique
 
 
 def _durable_note_already_covered(note: str, current_evolution_text: str) -> bool:

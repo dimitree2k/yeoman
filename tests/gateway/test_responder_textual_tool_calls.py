@@ -66,6 +66,45 @@ class _RecordingDeepResearchTool(Tool):
         return "research result: eBay marketplace execution has declined"
 
 
+class _RecordingMarketQuoteTool(Tool):
+    name = "market_quote"
+    description = "record market quote calls"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "symbols": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["symbols"],
+    }
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return '{"ok": true, "quotes": [{"symbol": "NVDA", "percent_change": -2.5}]}'
+
+
+class _RecordingMarketIntelligenceTool(Tool):
+    name = "market_intelligence"
+    description = "record market intelligence calls"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "symbols": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["query"],
+    }
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return '{"ok": true, "quotes": [{"symbol": "AMD", "percent_change": 3.2}]}'
+
+
 class _ReasoningToolThenAnswerProvider(LLMProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -214,7 +253,15 @@ def test_responder_registers_extended_tavily_tools(tmp_path: Path) -> None:
     )
 
     try:
-        assert {"web_search", "web_fetch", "web_map", "web_crawl", "deep_research"} <= responder.tool_names
+        assert {
+            "web_search",
+            "web_fetch",
+            "web_map",
+            "web_crawl",
+            "deep_research",
+            "market_quote",
+            "market_intelligence",
+        } <= responder.tool_names
     finally:
         # No async resources were opened in this test.
         pass
@@ -272,6 +319,72 @@ async def test_json_textual_tool_call_is_executed_before_reply(tmp_path: Path) -
     assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
     assert provider.calls == 2
     assert tool.calls == [{"query": "eBay failures", "max_results": 4}]
+
+
+@pytest.mark.asyncio
+async def test_market_quote_textual_tool_call_is_executed_before_reply(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _TextualToolThenAnswerProvider(
+        '{"tool": "market_quote", "arguments": {"symbols": ["NVDA", "AMD"]}}'
+    )
+    tool = _RecordingMarketQuoteTool()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+    responder.tools.register(tool)
+
+    out = await responder.generate_reply(
+        _event(),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"market_quote"}),
+            reason="test",
+        ),
+    )
+
+    await responder.aclose()
+
+    assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
+    assert provider.calls == 2
+    assert tool.calls == [{"symbols": ["NVDA", "AMD"]}]
+
+
+@pytest.mark.asyncio
+async def test_market_intelligence_textual_tool_call_is_executed_before_reply(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _TextualToolThenAnswerProvider(
+        '{"tool": "market_intelligence", "arguments": {"query": "why is AMD moving?", "symbols": ["AMD"]}}'
+    )
+    tool = _RecordingMarketIntelligenceTool()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+    responder.tools.register(tool)
+
+    out = await responder.generate_reply(
+        _event(),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"market_intelligence"}),
+            reason="test",
+        ),
+    )
+
+    await responder.aclose()
+
+    assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
+    assert provider.calls == 2
+    assert tool.calls == [{"query": "why is AMD moving?", "symbols": ["AMD"]}]
 
 
 @pytest.mark.asyncio
