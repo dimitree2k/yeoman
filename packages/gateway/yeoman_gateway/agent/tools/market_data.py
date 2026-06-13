@@ -22,6 +22,7 @@ _DEFAULT_TIMEOUT_SECONDS = 10.0
 _MAX_SYMBOLS = 20
 _TWELVE_DATA_MAX_CREDITS_PER_MINUTE = 8
 _QUOTE_CACHE_TTL_SECONDS = 75.0
+_MAX_MARKET_INTELLIGENCE_CHARS = 1800
 _SECRET_PARAM_RE = re.compile(r"(?i)(apikey|token|api_key|access_key)=([^&'\"\s]+)")
 _SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
 _IGNORE_SYMBOL_WORDS = {
@@ -97,6 +98,22 @@ def _extract_symbols_from_query(query: str) -> list[str]:
         if len(symbols) >= _MAX_SYMBOLS:
             break
     return symbols
+
+
+def _shorten(value: Any, limit: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _round_float(value: Any) -> float | None:
+    number = _as_float(value)
+    if number is None:
+        return None
+    return round(number, 4)
 
 
 def _normalize_quote(raw: dict[str, Any]) -> dict[str, Any]:
@@ -319,23 +336,92 @@ class MarketIntelligenceTool(Tool):
             *await self._fetch_tavily_catalysts(query, symbols),
         ]
         macro_context = await self._fetch_gdelt_macro_context(query) if include_macro else []
-        return json.dumps(
-            {
-                "ok": bool(quotes) or bool(news) or bool(macro_context),
-                "query": query,
-                "symbols": symbols,
-                "quotes": quotes,
-                "quote_errors": quote_errors,
-                "news": news,
-                "macro_context": macro_context,
-                "guidance": (
-                    "Use quote rows as the only source for price and percent move values. "
-                    "Do not use web/news snippets as price values. Use news and macro_context only for catalysts. "
-                    "Label Alpaca free-feed quotes as IEX-only when source is alpaca_iex."
-                ),
-            },
-            ensure_ascii=False,
+        result = self._compact_result(
+            query=query,
+            symbols=symbols,
+            quotes=quotes,
+            quote_errors=quote_errors,
+            news=news,
+            macro_context=macro_context,
         )
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    def _compact_result(
+        self,
+        *,
+        query: str,
+        symbols: list[str],
+        quotes: list[dict[str, Any]],
+        quote_errors: list[dict[str, Any]],
+        news: list[dict[str, Any]],
+        macro_context: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result = {
+            "ok": bool(quotes) or bool(news) or bool(macro_context),
+            "query": _shorten(query, 120),
+            "symbols": symbols,
+            "quotes": [self._compact_quote(quote) for quote in quotes[:8]],
+            "quote_errors": [self._compact_error(error) for error in quote_errors[:4]],
+            "news": [self._compact_news_item(item) for item in news[:4]],
+            "macro_context": [self._compact_macro_item(item) for item in macro_context[:3]],
+            "guidance": "Use quotes for prices. Do not use web/news snippets as price values. News/macro are catalysts only. Label alpaca_iex as IEX-only.",
+        }
+        raw = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        if len(raw) <= _MAX_MARKET_INTELLIGENCE_CHARS:
+            return result
+        result["news"] = [self._compact_news_item(item, summary_limit=0) for item in news[:3]]
+        result["macro_context"] = [self._compact_macro_item(item, title_limit=80) for item in macro_context[:2]]
+        return result
+
+    @staticmethod
+    def _compact_quote(quote: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "symbol": quote.get("symbol"),
+            "price": _round_float(quote.get("price")),
+            "pct": _round_float(quote.get("percent_change")),
+            "prev": _round_float(quote.get("previous_close")),
+            "change": _round_float(quote.get("change")),
+            "time": quote.get("datetime"),
+            "open": quote.get("is_market_open"),
+            "source": quote.get("source"),
+        }
+        feed = quote.get("feed")
+        if feed:
+            compact["feed"] = feed
+        return {key: value for key, value in compact.items() if value is not None}
+
+    @staticmethod
+    def _compact_error(error: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            "provider": error.get("provider"),
+            "symbol": error.get("symbol"),
+            "error": error.get("error") or error.get("code"),
+            "symbols": error.get("symbols"),
+            "message": _shorten(error.get("message"), 120),
+        }
+        return {key: value for key, value in compact.items() if value not in (None, "", [])}
+
+    @staticmethod
+    def _compact_news_item(item: dict[str, Any], summary_limit: int = 120) -> dict[str, Any]:
+        compact = {
+            "source": item.get("source"),
+            "symbol": item.get("symbol"),
+            "headline": _shorten(item.get("headline"), 120),
+            "date": item.get("published_date") or item.get("datetime"),
+        }
+        if summary_limit > 0:
+            compact["summary"] = _shorten(item.get("summary"), summary_limit)
+        return {key: value for key, value in compact.items() if value not in (None, "", [])}
+
+    @staticmethod
+    def _compact_macro_item(item: dict[str, Any], title_limit: int = 120) -> dict[str, Any]:
+        compact = {
+            "source": item.get("source"),
+            "title": _shorten(item.get("title"), title_limit),
+            "domain": item.get("domain"),
+            "seen": item.get("seen_date"),
+        }
+        return {key: value for key, value in compact.items() if value not in (None, "", [])}
 
     async def _fetch_twelve_quotes(
         self,

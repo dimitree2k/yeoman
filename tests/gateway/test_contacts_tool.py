@@ -1,10 +1,12 @@
 """Tests for the contacts LLM tool."""
 
-import pytest
 from pathlib import Path
 
-from yeoman_gateway.contacts.service import ContactsService
+import pytest
 from yeoman_gateway.agent.tools.contacts import ContactsTool
+from yeoman_gateway.agent.tools.resolve_contact import ResolveContactTool
+from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.storage.chat_registry import ChatRegistry
 
 
 @pytest.fixture
@@ -17,6 +19,26 @@ def tool(contacts: ContactsService) -> ContactsTool:
     t = ContactsTool(contacts)
     t.set_context(channel="whatsapp", chat_id="test@g.us")
     return t
+
+
+@pytest.fixture
+def chat_registry(tmp_path: Path) -> ChatRegistry:
+    registry = ChatRegistry(db_path=tmp_path / "chat_registry.db")
+    registry.register_chat(
+        channel="whatsapp",
+        chat_id="finance@g.us",
+        chat_type="group",
+        readable_name="Finanzgruppe",
+        metadata={
+            "participants": [
+                {
+                    "id": "46918273106072@lid",
+                    "phoneNumber": "4917632625469@s.whatsapp.net",
+                }
+            ]
+        },
+    )
+    return registry
 
 
 class TestContactsTool:
@@ -77,3 +99,48 @@ class TestContactsTool:
         schema = tool.to_schema()
         assert schema["function"]["name"] == "contacts"
         assert "action" in schema["function"]["parameters"]["properties"]
+
+
+class TestResolveContactTool:
+    @pytest.mark.asyncio
+    async def test_resolves_partial_name_without_disclosing_fields(
+        self, contacts: ContactsService, chat_registry: ChatRegistry
+    ) -> None:
+        contact_id = contacts.ensure_contact(
+            channel="whatsapp",
+            identifier="4917632625469@s.whatsapp.net",
+            kind="phone_jid",
+            push_name="Frank Taeger",
+        )
+        contacts.store.add_field(
+            contact_id=contact_id,
+            kind="note",
+            value="sensitive personal note",
+        )
+        resolver = ResolveContactTool(contacts=contacts, chat_registry=chat_registry)
+        resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
+
+        result = await resolver.execute(query="Frank")
+
+        assert "Resolved contact: Frank Taeger" in result
+        assert "4917632625469@s.whatsapp.net" in result
+        assert "sensitive personal note" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolves_lid_mention_to_phone_jid_in_current_group(
+        self, contacts: ContactsService, chat_registry: ChatRegistry
+    ) -> None:
+        contacts.ensure_contact(
+            channel="whatsapp",
+            identifier="4917632625469@s.whatsapp.net",
+            kind="phone_jid",
+            push_name="Frank Taeger",
+        )
+        resolver = ResolveContactTool(contacts=contacts, chat_registry=chat_registry)
+        resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
+
+        result = await resolver.execute(query="@46918273106072")
+
+        assert "Resolved contact: Frank Taeger" in result
+        assert "4917632625469@s.whatsapp.net" in result
+        assert "46918273106072@lid" in result

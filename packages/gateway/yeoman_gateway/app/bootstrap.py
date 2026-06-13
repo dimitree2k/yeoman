@@ -242,6 +242,7 @@ class GatewayRuntime:
     responder: LLMResponder
     memory: MemoryService
     contacts: ContactsService
+    chat_registry: object
     bus: MessageBus | None = None
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
@@ -290,6 +291,8 @@ class GatewayRuntime:
             self.inbound_archive.close()
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
                 self.speakup_log.close()
+            if hasattr(self.chat_registry, "close"):
+                self.chat_registry.close()
             self.contacts.close()
             self.memory.close()
             await tracing.shutdown()
@@ -375,6 +378,11 @@ def build_gateway_runtime(
     contacts_service = ContactsService(
         db_path=get_operational_data_path() / "contacts" / "contacts.db",
     )
+    from yeoman_gateway.storage.chat_registry import ChatRegistry
+
+    chat_registry = ChatRegistry(
+        db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
+    )
     contacts_service.mark_owner_from_policy(
         policy_engine.policy.owners if policy_engine else {},
     )
@@ -455,6 +463,7 @@ def build_gateway_runtime(
         security=security,
         cron_service=cron,
         contacts_service=contacts_service,
+        chat_registry=chat_registry,
         caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
         file_access_resolver=file_access_resolver,
@@ -1117,6 +1126,7 @@ def build_gateway_runtime(
         responder=responder,
         memory=memory_service,
         contacts=contacts_service,
+        chat_registry=chat_registry,
         bus=bus,
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,

@@ -33,6 +33,10 @@ from yeoman_gateway.agent.tools.message import MessageTool
 from yeoman_gateway.agent.tools.ops import OpsTool
 from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
 from yeoman_gateway.agent.tools.registry import ToolRegistry
+from yeoman_gateway.agent.tools.resolve_contact import (
+    ResolveContactTool,
+    resolve_contact_reference,
+)
 from yeoman_gateway.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
 from yeoman_gateway.agent.tools.shell import ExecTool
 from yeoman_gateway.agent.tools.spawn import SpawnTool
@@ -67,6 +71,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.storage.chat_registry import ChatRegistry
     from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
 
@@ -190,6 +195,9 @@ _PRIVATE_DELIVERY_INTENT_RE = re.compile(
     r"(?iu)\b(?:privat|private|dm|pn|pm|direktnachricht|direct\s+message|"
     r"off[-\s]?chat|pers(?:ö|oe)nlich)\b"
 )
+_VOICE_DELIVERY_REQUEST_RE = re.compile(
+    r"(?iu)\b(?:sprachnachricht|voice\s*note|voice|sprach(?:e|nachricht)?)\b"
+)
 _DELIVERY_SUCCESS_RE = re.compile(
     r"^(?:Voice message|Message) delivered to (?P<channel>[^:]+):"
     r"(?P<chat_id>.+?)(?:\. Delivery complete\b.*|\.$)",
@@ -254,10 +262,15 @@ def _whatsapp_aliases(*values: str) -> set[str]:
 
 
 def _delivery_request_names_target(text: str) -> bool:
+    return bool(_delivery_named_targets(text))
+
+
+def _delivery_named_targets(text: str) -> list[str]:
     compact = " ".join(str(text or "").strip().split())
     if not compact:
-        return False
+        return []
 
+    targets: list[str] = []
     for pattern in (_DELIVERY_TARGET_PREPOSITION_RE, _DELIVERY_TARGET_AFTER_VERB_RE):
         for match in pattern.finditer(compact):
             token = str(match.group(1) or "").strip(" ,.:;!?()[]{}\"'")
@@ -265,8 +278,8 @@ def _delivery_request_names_target(text: str) -> bool:
                 continue
             if token.lower() in _DELIVERY_TARGET_STOPWORDS:
                 continue
-            return True
-    return False
+            targets.append(token)
+    return targets
 
 
 def _delivery_repair_result(
@@ -373,6 +386,7 @@ class LLMResponder(ResponderPort):
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         contacts_service: "ContactsService | None" = None,
+        chat_registry: "ChatRegistry | None" = None,
         caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -406,6 +420,7 @@ class LLMResponder(ResponderPort):
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.contacts_service = contacts_service
+        self.chat_registry = chat_registry
         self.caldav_service = caldav_service
         self.memory = memory_service
         self.telemetry = telemetry
@@ -538,6 +553,12 @@ class LLMResponder(ResponderPort):
         if self.contacts_service is not None:
             contacts_tool = ContactsTool(self.contacts_service)
             self.tools.register(contacts_tool)
+            self.tools.register(
+                ResolveContactTool(
+                    contacts=self.contacts_service,
+                    chat_registry=self.chat_registry,
+                )
+            )
 
         # Calendar — only if CalDAV credentials are configured
         if self.caldav_service is not None:
@@ -612,6 +633,10 @@ class LLMResponder(ResponderPort):
         contacts_tool = self.tools.get("contacts")
         if isinstance(contacts_tool, ContactsTool):
             contacts_tool.set_context(channel, chat_id)
+
+        resolve_contact_tool = self.tools.get("resolve_contact")
+        if isinstance(resolve_contact_tool, ResolveContactTool):
+            resolve_contact_tool.set_context(channel, chat_id)
 
         ops_manage_tool = self.tools.get("ops_manage")
         if isinstance(ops_manage_tool, OpsManageTool):
@@ -928,6 +953,130 @@ class LLMResponder(ResponderPort):
             for key, value in values.items()
             if value is not None and str(value).strip()
         }
+
+    def _seed_pending_delivery(
+        self,
+        *,
+        session: Any,
+        channel: str,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, object],
+        allowed_tools: set[str],
+    ) -> None:
+        if "send_voice" not in allowed_tools:
+            return
+        if channel != "whatsapp" or not str(chat_id).endswith("@g.us"):
+            return
+        if not _VOICE_DELIVERY_REQUEST_RE.search(content):
+            return
+        target_names = _delivery_named_targets(content)
+        if not target_names:
+            return
+        voice_content = str(metadata.get("reply_to_text") or "").strip()
+        if not voice_content:
+            return
+        session.metadata["pending_delivery"] = {
+            "tool": "send_voice",
+            "channel": channel,
+            "origin_chat_id": chat_id,
+            "target_name": target_names[-1],
+            "content": voice_content,
+            "source_message_id": str(metadata.get("reply_to_message_id") or ""),
+        }
+
+    def _pending_delivery_mentions(
+        self,
+        *,
+        content: str,
+        metadata: dict[str, object],
+    ) -> list[str]:
+        mentions: list[str] = []
+        raw_mentions = metadata.get("mentioned_jids")
+        if isinstance(raw_mentions, list):
+            mentions.extend(str(value) for value in raw_mentions if str(value or "").strip())
+        for match in re.finditer(r"@([0-9]{5,})(?:@(lid|s\.whatsapp\.net))?", content):
+            digits = match.group(1)
+            suffix = match.group(2)
+            if suffix:
+                mentions.append(f"{digits}@{suffix}")
+            else:
+                mentions.append(f"{digits}@lid")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for mention in mentions:
+            if mention not in seen:
+                deduped.append(mention)
+                seen.add(mention)
+        return deduped
+
+    def _resolve_pending_delivery_target(
+        self,
+        *,
+        pending: dict[str, object],
+        content: str,
+        metadata: dict[str, object],
+        channel: str,
+        chat_id: str,
+    ) -> str | None:
+        if self.contacts_service is None:
+            return None
+        for mention in self._pending_delivery_mentions(content=content, metadata=metadata):
+            resolution = resolve_contact_reference(
+                contacts=self.contacts_service,
+                reference=mention,
+                channel=channel,
+                chat_id=chat_id,
+                chat_registry=self.chat_registry,
+            )
+            if resolution is not None:
+                return resolution.jid
+        return None
+
+    async def _maybe_complete_pending_delivery(
+        self,
+        *,
+        session: Any,
+        content: str,
+        metadata: dict[str, object],
+        allowed_tools: set[str],
+        channel: str,
+        chat_id: str,
+    ) -> bool:
+        pending_raw = session.metadata.get("pending_delivery")
+        if not isinstance(pending_raw, dict):
+            return False
+        if pending_raw.get("tool") != "send_voice" or "send_voice" not in allowed_tools:
+            return False
+        target_jid = self._resolve_pending_delivery_target(
+            pending=pending_raw,
+            content=content,
+            metadata=metadata,
+            channel=channel,
+            chat_id=chat_id,
+        )
+        if not target_jid:
+            return False
+        voice_content = str(pending_raw.get("content") or "").strip()
+        if not voice_content:
+            session.metadata.pop("pending_delivery", None)
+            return False
+
+        args = {"content": voice_content, "chat_id": target_jid}
+        result = await self.tools.execute("send_voice", args)
+        session.add_tool_call(
+            tool_name="send_voice",
+            tool_call_id="pending_delivery",
+            arguments=args,
+            result=result,
+        )
+        if not str(result or "").startswith("Voice message delivered"):
+            return False
+        session.metadata.pop("pending_delivery", None)
+        self._record_hidden_assistant_marker(
+            f"{result} Do not send it again for this request."
+        )
+        return True
 
     @staticmethod
     def _is_inbound_voice(event: InboundEvent) -> bool:
@@ -1366,6 +1515,11 @@ class LLMResponder(ResponderPort):
                             tool_call.name == "send_voice"
                             and result.startswith("Voice message delivered")
                         ):
+                            if (
+                                hasattr(self, "_current_session")
+                                and self._current_session is not None
+                            ):
+                                self._current_session.metadata.pop("pending_delivery", None)
                             target = self._delivery_success_target(str(result or ""))
                             target_label = (
                                 f"{target[0]}:{target[1]}" if target is not None else "the requested chat"
@@ -1835,6 +1989,30 @@ class LLMResponder(ResponderPort):
 
         self._set_tool_context(
             channel=channel, chat_id=chat_id, session_key=session_key, is_owner=is_owner,
+        )
+
+        if await self._maybe_complete_pending_delivery(
+            session=session,
+            content=content,
+            metadata=metadata,
+            allowed_tools=allowed_tools,
+            channel=channel,
+            chat_id=chat_id,
+        ):
+            if not _user_message_already_added:
+                session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
+            self._flush_hidden_assistant_markers(session)
+            self.sessions.save(session)
+            self._current_trace = None
+            return None
+
+        self._seed_pending_delivery(
+            session=session,
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+            allowed_tools=allowed_tools,
         )
 
         if self.memory is not None:
