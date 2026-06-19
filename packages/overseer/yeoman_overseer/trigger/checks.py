@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,20 @@ def check_process_alive(*, target: str) -> CheckResult:
         return CheckResult(value=True, detail=f"PID {pid} exists (no permission to signal)")
 
 
+def check_systemd_active(*, target: str) -> CheckResult:
+    """Check a local user systemd unit without touching the managed service."""
+    proc = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return CheckResult(value=True, detail=f"{target} is active")
+    detail = proc.stderr.strip() or f"{target} is inactive (systemctl rc={proc.returncode})"
+    return CheckResult(value=False, detail=detail)
+
+
 def check_file_age_exceeds(*, target: str, threshold: str) -> CheckResult:
     """Check if a file is older than threshold. Missing file = True (infinitely old)."""
     path = Path(target)
@@ -95,6 +110,7 @@ def check_row_count_exceeds(
 
 _CHECK_REGISTRY: dict[str, Any] = {
     "process_alive": check_process_alive,
+    "systemd_active": check_systemd_active,
     "file_age_exceeds": check_file_age_exceeds,
     "disk_usage_above": check_disk_usage_above,
     "row_count_exceeds": check_row_count_exceeds,

@@ -7,10 +7,10 @@ trigger:
   kind: poll
   interval_s: 30
   condition:
-    check: process_alive
-    target: yeoman-bridge
+    check: systemd_active
+    target: yeoman-bridge.service
     operator: "=="
-    value: true
+    value: false
 escalate_to_llm: false
 safety:
   max_actions_per_hour: 10
@@ -23,9 +23,8 @@ safety:
 The WhatsApp bridge connects to WhatsApp servers via Baileys.
 
 ## Actions
-1. Check if bridge process is alive via PID file
-2. If dead: restart via `systemctl --user restart yeoman-bridge`
-3. If restart fails 3 times: alert owner
+- action: restart_service
+  target: yeoman-bridge.service
 
 ## Escalation
 After 3 failed restarts → alert via cascading comms

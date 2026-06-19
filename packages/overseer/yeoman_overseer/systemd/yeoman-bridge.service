@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node %h/.yeoman/var/cache/bridge/dist/server.js
+ExecStart=/usr/bin/node %h/.yeoman/var/cache/bridge/dist/index.js
 Restart=always
 StartLimitBurst=5
 StartLimitIntervalSec=300
@@ -16,10 +16,24 @@ MemoryMax=256M
 
 BindPaths=%h/.yeoman/var/cache/bridge
 BindPaths=%h/.yeoman/secrets/whatsapp-auth
+BindPaths=%h/.yeoman/var/media
 ReadOnlyPaths=%h/.yeoman/var/run
 
 Environment=YEOMAN_HOME=%h/.yeoman
+EnvironmentFile=-%h/.yeoman/.env
+Environment=BRIDGE_HOST=127.0.0.1
+Environment=BRIDGE_PORT=3001
+Environment=AUTH_DIR=%h/.yeoman/secrets/whatsapp-auth
+Environment=MEDIA_DIR=%h/.yeoman/var/media
+Environment=MEDIA_INCOMING_DIR=%h/.yeoman/var/media/incoming/whatsapp
+Environment=MEDIA_OUTGOING_DIR=%h/.yeoman/var/media/outgoing/whatsapp
+Environment=WHATSAPP_READ_RECEIPTS=1
+Environment=WHATSAPP_ACCEPT_FROM_ME=1
+Environment=WHATSAPP_PERSIST_INBOUND_AUDIO=1
+Environment=WHATSAPP_PERSIST_INBOUND_DOCUMENTS=1
 WorkingDirectory=%h/.yeoman/var/cache/bridge
+StandardOutput=append:%h/.yeoman/var/logs/whatsapp-bridge.log
+StandardError=append:%h/.yeoman/var/logs/whatsapp-bridge.log
 
 [Install]
 WantedBy=default.target

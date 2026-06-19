@@ -4,7 +4,7 @@ import os
 import sqlite3
 from pathlib import Path
 import pytest
-from yeoman_overseer.trigger.checks import CheckResult, check_process_alive, check_file_age_exceeds, check_disk_usage_above, check_row_count_exceeds, run_check
+from yeoman_overseer.trigger.checks import CheckResult, check_process_alive, check_file_age_exceeds, check_disk_usage_above, check_row_count_exceeds, check_systemd_active, run_check
 
 def test_process_alive_current_process() -> None:
     result = check_process_alive(target=str(os.getpid()))
@@ -61,6 +61,35 @@ def test_row_count_exceeds(tmp_path: Path) -> None:
 def test_run_check_dispatches() -> None:
     result = run_check("process_alive", target=str(os.getpid()))
     assert result.value is True
+
+def test_systemd_active_uses_local_user_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr("yeoman_overseer.trigger.checks.subprocess.run", fake_run)
+
+    result = check_systemd_active(target="yeoman-bridge.service")
+
+    assert result.value is True
+    assert calls == [["systemctl", "--user", "is-active", "--quiet", "yeoman-bridge.service"]]
+
+def test_systemd_active_false_when_unit_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Result:
+        returncode = 3
+        stderr = ""
+
+    monkeypatch.setattr("yeoman_overseer.trigger.checks.subprocess.run", lambda *args, **kwargs: Result())
+
+    result = run_check("systemd_active", target="yeoman-bridge.service")
+
+    assert result.value is False
 
 def test_run_check_unknown() -> None:
     with pytest.raises(ValueError, match="Unknown check"):

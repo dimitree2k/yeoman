@@ -43,7 +43,11 @@ const MEDIA_OUTGOING_DIR = process.env.MEDIA_OUTGOING_DIR || join(MEDIA_DIR, 'ou
 const PERSIST_INBOUND_AUDIO = parseBoolEnv(process.env.WHATSAPP_PERSIST_INBOUND_AUDIO, false);
 const PERSIST_INBOUND_DOCUMENTS = parseBoolEnv(process.env.WHATSAPP_PERSIST_INBOUND_DOCUMENTS, true);
 const ACCEPT_FROM_ME = parseBoolEnv(process.env.WHATSAPP_ACCEPT_FROM_ME, false);
-const BRIDGE_TOKEN = (process.env.BRIDGE_TOKEN || '').trim();
+const BRIDGE_TOKEN = (
+  process.env.BRIDGE_TOKEN
+  || process.env.WHATSAPP_BRIDGE_TOKEN
+  || ''
+).trim();
 const MANIFEST_PATH = process.env.BRIDGE_MANIFEST_PATH || join(process.cwd(), 'bridge.manifest.json');
 const READ_RECEIPTS = parseBoolEnv(process.env.WHATSAPP_READ_RECEIPTS, true);
 
@@ -60,7 +64,7 @@ function loadManifestIdentity(path: string): { bridgeVersion: string; buildId: s
 }
 
 if (!BRIDGE_TOKEN) {
-  console.error('Missing BRIDGE_TOKEN. Refusing to start insecure bridge.');
+  console.error('Missing BRIDGE_TOKEN or WHATSAPP_BRIDGE_TOKEN. Refusing to start insecure bridge.');
   process.exit(1);
 }
 

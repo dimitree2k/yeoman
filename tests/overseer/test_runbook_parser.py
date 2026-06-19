@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 import pytest
+from yeoman_overseer.executor.deterministic import parse_deterministic_actions
 from yeoman_overseer.runbook.parser import parse_runbook, parse_runbook_dir, Runbook
 
 SAMPLE_RUNBOOK = dedent("""\
@@ -34,6 +35,9 @@ SAMPLE_RUNBOOK = dedent("""\
     ## Escalation
     After 3 failed restarts, alert owner.
 """)
+
+STARTER_RUNBOOKS = Path(__file__).parents[2] / "packages" / "overseer" / "yeoman_overseer" / "starter_runbooks"
+SYSTEMD_UNITS = Path(__file__).parents[2] / "packages" / "overseer" / "yeoman_overseer" / "systemd"
 
 def test_parse_valid_runbook(tmp_path: Path) -> None:
     f = tmp_path / "health-gateway.md"
@@ -69,3 +73,27 @@ def test_parse_runbook_dir(tmp_path: Path) -> None:
 
 def test_parse_runbook_dir_empty(tmp_path: Path) -> None:
     assert parse_runbook_dir(tmp_path) == []
+
+def test_health_bridge_restarts_systemd_unit_when_inactive() -> None:
+    rb = parse_runbook(STARTER_RUNBOOKS / "health-bridge.md")
+
+    assert rb.meta.trigger.condition is not None
+    assert rb.meta.trigger.condition.check == "systemd_active"
+    assert rb.meta.trigger.condition.target == "yeoman-bridge.service"
+    assert rb.meta.trigger.condition.operator == "=="
+    assert rb.meta.trigger.condition.value is False
+
+    actions = parse_deterministic_actions(rb.body)
+
+    assert len(actions) == 1
+    assert actions[0].action == "restart_service"
+    assert actions[0].target == "yeoman-bridge.service"
+
+def test_bridge_systemd_unit_starts_index_with_runtime_env() -> None:
+    unit = (SYSTEMD_UNITS / "yeoman-bridge.service").read_text()
+
+    assert "ExecStart=/usr/bin/node %h/.yeoman/var/cache/bridge/dist/index.js" in unit
+    assert "EnvironmentFile=-%h/.yeoman/.env" in unit
+    assert "Environment=AUTH_DIR=%h/.yeoman/secrets/whatsapp-auth" in unit
+    assert "Environment=MEDIA_INCOMING_DIR=%h/.yeoman/var/media/incoming/whatsapp" in unit
+    assert "BindPaths=%h/.yeoman/var/media" in unit
