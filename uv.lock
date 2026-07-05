@@ -1684,7 +1684,7 @@ wheels = [
 
 [[package]]
 name = "yeoman-gateway"
-version = "0.7.1"
+version = "0.8.0"
 source = { editable = "packages/gateway" }
 dependencies = [
     { name = "caldav" },
@@ -1736,7 +1736,7 @@ provides-extras = ["overseer"]
 
 [[package]]
 name = "yeoman-overseer"
-version = "0.7.1"
+version = "0.8.0"
 source = { editable = "packages/overseer" }
 dependencies = [
     { name = "croniter" },
@@ -1759,7 +1759,7 @@ requires-dist = [
 
 [[package]]
 name = "yeoman-shared"
-version = "0.7.1"
+version = "0.8.0"
 source = { editable = "packages/shared" }
 dependencies = [
     { name = "httpx" },
