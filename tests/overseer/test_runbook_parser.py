@@ -1,10 +1,12 @@
 """Tests for runbook Markdown+YAML parser."""
 from __future__ import annotations
+
 from pathlib import Path
 from textwrap import dedent
+
 import pytest
 from yeoman_overseer.executor.deterministic import parse_deterministic_actions
-from yeoman_overseer.runbook.parser import parse_runbook, parse_runbook_dir, Runbook
+from yeoman_overseer.runbook.parser import parse_runbook, parse_runbook_dir
 
 SAMPLE_RUNBOOK = dedent("""\
     ---
@@ -74,20 +76,22 @@ def test_parse_runbook_dir(tmp_path: Path) -> None:
 def test_parse_runbook_dir_empty(tmp_path: Path) -> None:
     assert parse_runbook_dir(tmp_path) == []
 
-def test_health_bridge_restarts_systemd_unit_when_inactive() -> None:
+def test_health_bridge_alerts_when_whatsapp_protocol_is_disconnected() -> None:
     rb = parse_runbook(STARTER_RUNBOOKS / "health-bridge.md")
 
+    assert rb.meta.version == 2
     assert rb.meta.trigger.condition is not None
-    assert rb.meta.trigger.condition.check == "systemd_active"
-    assert rb.meta.trigger.condition.target == "yeoman-bridge.service"
+    assert rb.meta.trigger.condition.check == "whatsapp_bridge_connected"
+    assert rb.meta.trigger.condition.target == "default"
     assert rb.meta.trigger.condition.operator == "=="
     assert rb.meta.trigger.condition.value is False
 
     actions = parse_deterministic_actions(rb.body)
 
-    assert len(actions) == 1
-    assert actions[0].action == "restart_service"
-    assert actions[0].target == "yeoman-bridge.service"
+    assert [action.action for action in actions] == ["alert", "restart_service"]
+    assert actions[0].target == "owner"
+    assert "WhatsApp bridge is disconnected" in actions[0].kwargs["message"]
+    assert actions[1].target == "yeoman-bridge.service"
 
 def test_bridge_systemd_unit_starts_index_with_runtime_env() -> None:
     unit = (SYSTEMD_UNITS / "yeoman-bridge.service").read_text()

@@ -189,6 +189,16 @@ class TestConversationStateContext:
         assert "web_search" in prompt
         assert "do not infer prices from web_search" in prompt
 
+    def test_system_prompt_discourages_self_justification_loops(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_path).build_system_prompt()
+
+        assert "# Epistemic Posture" in prompt
+        assert "Make claims only when you have enough grounding to defend them" in prompt
+        assert "Do not perform self-critique, self-diagnosis, or self-abasement" in prompt
+        assert "If you are not grounded enough to defend the claim, do not make it" in prompt
+
     def test_system_prompt_routes_cross_chat_media_to_media_history(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
 
@@ -222,7 +232,40 @@ class TestConversationStateContext:
         assert "address_mode: repair_feedback" in user_text
         assert "preferred_action: answer" in user_text
         assert "answer_shape: repair" in user_text
-        assert "Acknowledge the problem briefly, then correct the answer." in user_text
+        assert "Acknowledge the problem briefly, then give the corrected answer." in user_text
+        assert "Do not stop after only apologizing" in user_text
+
+    def test_recent_group_messages_override_stale_session_for_vague_references(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[
+                {
+                    "role": "assistant",
+                    "content": "Timo's 40%-Take-Profit-Logik ist bei dir jetzt durch.",
+                },
+            ],
+            current_message="@203075365150770 vorteile oder Nachteile der Strategie?",
+            current_metadata={
+                "sender_id": "491757070305",
+                "sender_name": "D.",
+                "ambient_context_window": [
+                    "[Genti Halilaj] Wenn ich in Rente gehen will einfach irgend einen in Minecraft erschießen",
+                    "[Genti Halilaj] Dann 15 Jahre lang bezahltes wohnen",
+                    "[D.] Hm. Gar nicht so schlecht die Idee 🤓 am Besten in der Schweiz oder Norwegen oder so",
+                ],
+            },
+            channel="whatsapp",
+            chat_id="491786127564-1611913127@g.us",
+        )
+
+        user_text = str(messages[-1]["content"])
+
+        assert "[Recent Messages]" in user_text
+        assert "fresh_recent_messages_take_precedence=true" in user_text
+        assert "If current and older session context point to different topics" in user_text
+        assert "do not answer from older session history" in user_text
+        assert "bezahlt" in user_text or "bezahltes" in user_text
 
     def test_external_history_preserves_original_sender_context(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
@@ -269,6 +312,27 @@ class TestConversationStateContext:
         assert "sender_name=Frank Taeger" in history_texts[1]
         assert "reply_to_message_id=bot1" in history_texts[1]
         assert "reply_to_participant=203075365150770@lid" in history_texts[1]
+
+    def test_external_current_message_includes_owner_runtime_context(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[],
+            current_message="Schick eine Sprachnachricht in die Ente",
+            current_metadata={
+                "sender_id": "491757070305",
+                "sender_name": "D.",
+                "is_owner": True,
+            },
+            channel="whatsapp",
+            chat_id="491786127564-1611913127@g.us",
+        )
+
+        current_text = str(messages[-1]["content"])
+
+        assert "sender_name=D." in current_text
+        assert "sender_id=491757070305" in current_text
+        assert "runtime_is_owner=true" in current_text
 
     def test_current_message_includes_social_one_liner_guidance(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder

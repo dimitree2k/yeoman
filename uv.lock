@@ -1764,6 +1764,7 @@ dependencies = [
     { name = "openai" },
     { name = "pyyaml" },
     { name = "sdnotify" },
+    { name = "websockets" },
     { name = "yeoman-shared" },
 ]
 
@@ -1774,6 +1775,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.60.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "sdnotify", specifier = ">=0.3.2" },
+    { name = "websockets", specifier = ">=16.0" },
     { name = "yeoman-shared", editable = "packages/shared" },
 ]
 

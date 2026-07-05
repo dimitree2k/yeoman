@@ -251,8 +251,21 @@ def apply_missing_defaults(snake_config: dict[str, Any]) -> None:
             if isinstance(media, dict):
                 for k, v in default_whatsapp_media().items():
                     media.setdefault(k, v)
-            for k, v in default_whatsapp_reply_context().items():
-                whatsapp.setdefault(k, v)
+            reply_context = default_whatsapp_reply_context()
+            whatsapp.setdefault(
+                "reply_context_window_limit",
+                reply_context["window_limit"],
+            )
+            whatsapp.setdefault(
+                "reply_context_line_max_chars",
+                reply_context["line_max_chars"],
+            )
+            for k in (
+                "ambient_window_limit",
+                "session_history_limit",
+                "session_history_limit_group",
+            ):
+                whatsapp.setdefault(k, reply_context[k])
 
     memory = snake_config.setdefault("memory", {})
     if isinstance(memory, dict):

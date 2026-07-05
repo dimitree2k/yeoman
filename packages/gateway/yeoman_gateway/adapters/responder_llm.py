@@ -1975,6 +1975,7 @@ class LLMResponder(ResponderPort):
         self._current_trace = trace
         self._pending_hidden_assistant_messages = []
         metadata = dict(metadata)
+        metadata["is_owner"] = bool(is_owner)
 
         session = self.sessions.get_or_create(session_key)
 

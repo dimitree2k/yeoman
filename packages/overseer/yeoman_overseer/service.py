@@ -22,7 +22,7 @@ from yeoman_overseer.executor.deterministic import (
     parse_deterministic_actions,
 )
 from yeoman_overseer.maintenance import MaintenanceManager
-from yeoman_overseer.runbook.parser import Runbook, parse_runbook_dir
+from yeoman_overseer.runbook.parser import Runbook, parse_runbook, parse_runbook_dir
 from yeoman_overseer.safety.causal import CausalChainDetector
 from yeoman_overseer.safety.circuit_breaker import CircuitBreaker
 from yeoman_overseer.safety.rate_limiter import RateLimiter
@@ -33,6 +33,37 @@ from yeoman_overseer.trigger.evaluator import TriggerEvaluator
 from yeoman_overseer.trigger.lock import LockManager
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_starter_runbooks(
+    starter_dir: Path,
+    runbook_dir: Path,
+    *,
+    copy_missing: bool = False,
+) -> int:
+    """Copy missing starter runbooks and upgrade older generated copies."""
+    if not starter_dir.is_dir():
+        return 0
+
+    synced = 0
+    for src in starter_dir.glob("*.md"):
+        dest = runbook_dir / src.name
+        if not dest.exists():
+            if copy_missing:
+                shutil.copy2(src, dest)
+                synced += 1
+            continue
+
+        try:
+            source_runbook = parse_runbook(src)
+            existing_runbook = parse_runbook(dest)
+        except ValueError:
+            continue
+
+        if source_runbook.meta.version > existing_runbook.meta.version:
+            shutil.copy2(src, dest)
+            synced += 1
+    return synced
 
 
 @dataclass
@@ -68,13 +99,14 @@ class OverseerService:
         runbook_dir = self.data_dir / "runbooks"
         runbook_dir.mkdir(exist_ok=True)
 
-        # Copy starter runbooks if directory is empty
-        if not any(runbook_dir.glob("*.md")):
-            starter_dir = Path(__file__).parent / "starter_runbooks"
-            if starter_dir.is_dir():
-                for src in starter_dir.glob("*.md"):
-                    shutil.copy2(src, runbook_dir / src.name)
-                logger.info("Copied %d starter runbooks", len(list(starter_dir.glob("*.md"))))
+        starter_dir = Path(__file__).parent / "starter_runbooks"
+        synced = _sync_starter_runbooks(
+            starter_dir,
+            runbook_dir,
+            copy_missing=not any(runbook_dir.glob("*.md")),
+        )
+        if synced:
+            logger.info("Synced %d starter runbooks", synced)
 
         self._git = InternalGit(self.data_dir)
         self._git.init()

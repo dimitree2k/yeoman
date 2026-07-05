@@ -124,9 +124,10 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path) as f:
                 raw = json.load(f)
 
-            migrated_raw, changed = _migrate_config_with_change(raw)
+            migrated_raw, _changed = _migrate_config_with_change(raw)
             validated = Config.model_validate(convert_keys(migrated_raw))
-            if changed:
+            persisted = convert_to_camel(validated.model_dump())
+            if raw != persisted:
                 _backup_config(path)
                 _atomic_write_config(path, validated)
             return _apply_env_overrides(validated)
@@ -215,6 +216,16 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
     if not isinstance(snake, dict):
         raise ValueError("Config migration produced invalid root payload")
 
+    channels_cfg = snake.get("channels")
+    whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else None
+    if isinstance(whatsapp_cfg, dict):
+        if "window_limit" in whatsapp_cfg and "reply_context_window_limit" not in whatsapp_cfg:
+            whatsapp_cfg["reply_context_window_limit"] = whatsapp_cfg["window_limit"]
+        if "line_max_chars" in whatsapp_cfg and "reply_context_line_max_chars" not in whatsapp_cfg:
+            whatsapp_cfg["reply_context_line_max_chars"] = whatsapp_cfg["line_max_chars"]
+        whatsapp_cfg.pop("window_limit", None)
+        whatsapp_cfg.pop("line_max_chars", None)
+
     version = snake.get("config_version")
     try:
         version_num = int(version) if version is not None else 1
@@ -231,7 +242,6 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
             wa_runtime = {}
             runtime["whatsapp_bridge"] = wa_runtime
 
-        channels_cfg = snake.get("channels")
         whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else {}
         if not isinstance(whatsapp_cfg, dict):
             whatsapp_cfg = {}

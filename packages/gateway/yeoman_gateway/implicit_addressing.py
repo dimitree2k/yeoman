@@ -33,6 +33,14 @@ _REPAIR_FEEDBACK_RE = re.compile(
 _RESEARCH_REQUEST_RE = re.compile(
     r"(?i)\b(deep\s+search|deep\s+research|recherch|quellen?|sources?|such(?:e|st)?|prüf|pruef)\b"
 )
+_SIDE_EFFECT_FOLLOWUP_RE = re.compile(
+    r"(?i)\b("
+    r"schick(?:e|st|en)?|send(?:e|est)?|sende|"
+    r"weiterleit(?:e|en|est)?|leit(?:e|est)?\s+weiter|"
+    r"poste|post(?:e|est)?|teile|teil(?:e|st)?|"
+    r"ruf(?:e|st)?|call|loesch(?:e|st)?|lösch(?:e|st)?"
+    r")\b"
+)
 _SOCIAL_BEAT_CUE_RE = re.compile(
     r"(?i)(?:\b(lol|haha|lmao|rofl|meme|witz|witzig|funny|joke|roast|banter|unfair|cringe|wild)\b|[😂🤣💀😭])"
 )
@@ -55,6 +63,69 @@ _QUOTED_CONTEXT_REQUEST_RE = re.compile(
     r"mach(?:e|st)?|gib|geb|bewertung|analyse|analys(?:e|ier)|review|"
     r"einschaetzung|einschätzung|meinung|take|bitte"
     r")\b"
+)
+_TOPIC_TOKEN_RE = re.compile(r"(?iu)[a-zäöüß0-9]{4,}")
+_TOPIC_STOPWORDS = frozenset(
+    {
+        "aber",
+        "alle",
+        "alles",
+        "also",
+        "auch",
+        "auf",
+        "aus",
+        "beim",
+        "bist",
+        "dann",
+        "dass",
+        "dein",
+        "deine",
+        "denn",
+        "doch",
+        "dort",
+        "ein",
+        "eine",
+        "einen",
+        "einer",
+        "eines",
+        "gibt",
+        "habt",
+        "hast",
+        "hier",
+        "immer",
+        "kein",
+        "keine",
+        "keinen",
+        "kann",
+        "kannst",
+        "macht",
+        "mehr",
+        "mich",
+        "nicht",
+        "noch",
+        "oder",
+        "sich",
+        "sind",
+        "sonst",
+        "über",
+        "um",
+        "und",
+        "wenn",
+        "wer",
+        "wie",
+        "wieso",
+        "will",
+        "wird",
+        "wirklich",
+        "was",
+        "welche",
+        "welchen",
+        "welcher",
+        "warum",
+        "zeit",
+        "zum",
+        "zur",
+    }
 )
 
 
@@ -334,6 +405,8 @@ def is_recent_assistant_followup(
 ) -> bool:
     if session_manager is None or not looks_like_followup_request(content):
         return False
+    if looks_like_external_side_effect_request(content):
+        return False
     delta = seconds_since_last_assistant(
         session_manager=session_manager,
         channel=channel,
@@ -342,45 +415,102 @@ def is_recent_assistant_followup(
     )
     if delta is None or not (0 <= delta <= max(0.0, float(followup_window_seconds))):
         return False
-    if _ambient_window_has_intervening_human(metadata):
-        return False
-    return _last_session_turn_is_assistant(
+    last_assistant_text = _last_session_assistant_content(
         session_manager=session_manager,
         channel=channel,
         chat_id=chat_id,
     )
+    if last_assistant_text is None:
+        return False
+    if _ambient_window_has_unrelated_intervening_human(
+        metadata,
+        content=content,
+        last_assistant_text=last_assistant_text,
+    ):
+        return False
+    return True
 
 
-def _ambient_window_has_intervening_human(metadata: dict[str, Any] | None) -> bool:
+def looks_like_external_side_effect_request(text: str) -> bool:
+    compact = " ".join(str(text or "").strip().split())
+    if not compact or not _SIDE_EFFECT_FOLLOWUP_RE.search(compact):
+        return False
+    return bool(re.search(r"(?i)\b(an|in|zu|nach)\b", compact))
+
+
+def _ambient_window_has_unrelated_intervening_human(
+    metadata: dict[str, Any] | None,
+    *,
+    content: str,
+    last_assistant_text: str,
+) -> bool:
     rows = (metadata or {}).get("ambient_context_rows")
     if not isinstance(rows, list) or not rows:
         return False
-    latest = rows[-1]
-    if not isinstance(latest, dict):
+
+    human_texts: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sender_id = str(row.get("sender_id") or "").strip()
+        sender_name = str(row.get("sender_name") or "").strip()
+        if not sender_id and not sender_name:
+            continue
+        text = str(row.get("text") or row.get("content") or "").strip()
+        if text:
+            human_texts.append(text)
+
+    if not human_texts:
         return False
-    sender_id = str(latest.get("sender_id") or "").strip()
-    sender_name = str(latest.get("sender_name") or "").strip()
-    return bool(sender_id or sender_name)
+
+    if _has_topic_overlap(content, last_assistant_text):
+        return False
+    return not _has_topic_overlap(content, " ".join(human_texts[-3:]))
 
 
-def _last_session_turn_is_assistant(
+def _has_topic_overlap(left: str, right: str) -> bool:
+    left_tokens = _topic_tokens(left)
+    if not left_tokens:
+        return False
+    return len(left_tokens & _topic_tokens(right)) >= 2
+
+
+def _topic_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in _TOPIC_TOKEN_RE.finditer(str(text or "").lower()):
+        token = _normalize_topic_token(match.group(0))
+        if len(token) >= 4 and token not in _TOPIC_STOPWORDS:
+            tokens.add(token)
+    return tokens
+
+
+def _normalize_topic_token(token: str) -> str:
+    normalized = token.strip().lower()
+    if len(normalized) > 5 and normalized.endswith("s"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def _last_session_assistant_content(
     *,
     session_manager: SessionManagerLike,
     channel: str,
     chat_id: str,
-) -> bool:
+) -> str | None:
     session = session_manager.get_or_create(f"{channel}:{chat_id}")
     messages = getattr(session, "messages", [])
     if not isinstance(messages, list):
-        return False
+        return None
     for row in reversed(messages):
         if not isinstance(row, dict):
             continue
         role = str(row.get("role") or "").strip()
         if role in {"tool_trace", "session_boundary", "system"}:
             continue
-        return role == "assistant"
-    return False
+        if role != "assistant":
+            return None
+        return str(row.get("content") or "")
+    return None
 
 
 def seconds_since_last_assistant(

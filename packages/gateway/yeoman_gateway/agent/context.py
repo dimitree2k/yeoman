@@ -21,6 +21,8 @@ def _format_untrusted_context(sender: str, channel: str, metadata: dict[str, Any
         fields.append(f"sender_id={metadata['sender_id']}")
     elif sender:
         fields.append(f"sender_id={sender}")
+    if metadata.get("is_owner") is True:
+        fields.append("runtime_is_owner=true")
     if metadata.get("timestamp"):
         fields.append(f"at={metadata['timestamp']}")
     for key in ("message_id", "reply_to_message_id", "reply_to_participant"):
@@ -81,6 +83,7 @@ class ContextBuilder:
         # NOTE: temporal grounding is injected as a separate message in build_messages()
         # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
+        parts.append(self._build_epistemic_posture_guardrails())
         parts.append(self._build_market_data_guardrails())
         parts.append(self._build_url_fetch_guardrails())
         parts.append(self._build_conversational_repair_guardrails())
@@ -194,6 +197,21 @@ Skills with available="false" need dependencies installed first - you can try in
                 "Do not invent jobs, investments, affiliations, timelines, or net-worth figures.",
                 "If verification is weak or conflicting, say uncertainty clearly and avoid confident framing.",
                 "Prefer primary or reputable sources over low-credibility blogs and rumor sites.",
+            ]
+        )
+
+    @staticmethod
+    def _build_epistemic_posture_guardrails() -> str:
+        """Build guardrails for confident claims, corrections, and challenges."""
+        return "\n".join(
+            [
+                "# Epistemic Posture",
+                "Make claims only when you have enough grounding to defend them if challenged.",
+                "If challenged and your claim was grounded, state the basis and any caveat briefly; do not collapse into agreement for social comfort.",
+                "If challenged and you were wrong, acknowledge the factual correction once, give the corrected answer, then stop.",
+                "Do not perform self-critique, self-diagnosis, or self-abasement in user-facing replies.",
+                "Do not explain your internal confidence, social behavior, or why you made the mistake unless the user explicitly asks for a debugging explanation.",
+                "If you are not grounded enough to defend the claim, do not make it; say the uncertainty briefly or stay silent when no answer is required.",
             ]
         )
 
@@ -424,11 +442,24 @@ When the owner asks in a DM about previously shared images, screenshots, PDFs, o
         if is_external:
             sender = str((current_metadata or {}).get("sender_id", "unknown"))
             if isinstance(user_content, str):
-                user_content = _wrap_untrusted_message(sender, user_content, channel)
+                user_content = _wrap_untrusted_message(
+                    sender,
+                    user_content,
+                    channel,
+                    metadata=current_metadata,
+                )
             elif isinstance(user_content, list):
                 # Multimodal content: wrap the text part, keep image parts as-is
                 user_content = [
-                    {**part, "text": _wrap_untrusted_message(sender, part["text"], channel)}
+                    {
+                        **part,
+                        "text": _wrap_untrusted_message(
+                            sender,
+                            part["text"],
+                            channel,
+                            metadata=current_metadata,
+                        ),
+                    }
                     if part.get("type") == "text" and isinstance(part.get("text"), str)
                     else part
                     for part in user_content
@@ -589,7 +620,10 @@ When the owner asks in a DM about previously shared images, screenshots, PDFs, o
 
         guidance = "Use normal judgment."
         if answer_shape == "repair":
-            guidance = "Acknowledge the problem briefly, then correct the answer."
+            guidance = (
+                "Acknowledge the problem briefly, then give the corrected answer. "
+                "Do not stop after only apologizing or naming the corrected topic."
+            )
         elif address_mode == "recent_assistant_followup":
             guidance = "Treat this as a continuation of your immediately previous answer."
         elif answer_shape == "one_liner":
@@ -667,6 +701,9 @@ When the owner asks in a DM about previously shared images, screenshots, PDFs, o
             lines = [
                 "[Recent Messages]",
                 "usage: Ambient window of recent chat messages for conversational context.",
+                "fresh_recent_messages_take_precedence=true",
+                "usage: If current and older session context point to different topics, treat recent_messages as the active thread.",
+                "usage: For vague references like 'das', 'die Strategie', 'der Plan', or 'dazu', do not answer from older session history when recent_messages provide a plausible referent; ask one short clarification if still ambiguous.",
             ]
         if reply_context_source:
             lines.append(f"source: {reply_context_source}")

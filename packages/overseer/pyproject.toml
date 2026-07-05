@@ -8,6 +8,7 @@ dependencies = [
     "pyyaml>=6.0.2",
     "croniter>=6.0.0",
     "httpx>=0.28.1",
+    "websockets>=16.0",
     "openai>=1.60.0",
     "sdnotify>=0.3.2",
 ]

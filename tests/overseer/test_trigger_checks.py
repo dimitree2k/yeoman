@@ -1,10 +1,21 @@
 """Tests for built-in trigger check functions."""
 from __future__ import annotations
+
 import os
 import sqlite3
 from pathlib import Path
+
 import pytest
-from yeoman_overseer.trigger.checks import CheckResult, check_process_alive, check_file_age_exceeds, check_disk_usage_above, check_row_count_exceeds, check_systemd_active, run_check
+from yeoman_overseer.trigger.checks import (
+    check_disk_usage_above,
+    check_file_age_exceeds,
+    check_process_alive,
+    check_row_count_exceeds,
+    check_systemd_active,
+    check_whatsapp_bridge_connected,
+    run_check,
+)
+
 
 def test_process_alive_current_process() -> None:
     result = check_process_alive(target=str(os.getpid()))
@@ -90,6 +101,47 @@ def test_systemd_active_false_when_unit_inactive(monkeypatch: pytest.MonkeyPatch
     result = run_check("systemd_active", target="yeoman-bridge.service")
 
     assert result.value is False
+
+def test_whatsapp_bridge_connected_reads_protocol_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_health(target: str, timeout_s: float) -> dict:
+        assert target == "default"
+        assert timeout_s == 3.0
+        return {"whatsapp": {"connected": True, "running": True, "reconnectAttempts": 0}}
+
+    monkeypatch.setattr(
+        "yeoman_overseer.trigger.checks._whatsapp_bridge_health",
+        fake_health,
+    )
+
+    result = check_whatsapp_bridge_connected(target="default")
+
+    assert result.value is True
+    assert "connected=True" in result.detail
+    assert "running=True" in result.detail
+
+def test_whatsapp_bridge_connected_false_when_logged_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_health(target: str, timeout_s: float) -> dict:
+        return {
+            "whatsapp": {
+                "connected": False,
+                "running": False,
+                "reconnectAttempts": 31,
+                "lastDisconnectStatus": 401,
+                "lastError": "Reconnect attempts exhausted (30)",
+            }
+        }
+
+    monkeypatch.setattr(
+        "yeoman_overseer.trigger.checks._whatsapp_bridge_health",
+        fake_health,
+    )
+
+    result = run_check("whatsapp_bridge_connected", target="default")
+
+    assert result.value is False
+    assert "connected=False" in result.detail
+    assert "lastDisconnectStatus=401" in result.detail
+    assert "Reconnect attempts exhausted" in result.detail
 
 def test_run_check_unknown() -> None:
     with pytest.raises(ValueError, match="Unknown check"):

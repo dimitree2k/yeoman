@@ -377,6 +377,71 @@ async def test_question_after_intervening_human_message_stays_silent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_topic_question_after_intervening_humans_still_wakes() -> None:
+    event_time = datetime(2026, 6, 23, 9, 42, 40, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": (
+                    "Vorteile: Miete weg, drei Mahlzeiten am Tag, Struktur, "
+                    "kein Altersarmuts-Risiko. Nachteile: Knast, keine Freiheit, "
+                    "Steak ist eher schwierig und Rente wird dadurch nicht besser."
+                ),
+                "timestamp": (event_time - timedelta(seconds=93)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content=(
+                "Mit Altersarmut gibt's auch kein Steak, musst auch um 6 aufstehen "
+                "um die Pfandflaschen der Partygänger einzusammeln. Bekommt man "
+                "keine Rente wenn man im Knast sitzt?"
+            ),
+            timestamp=event_time,
+            sender_id="genti@s.whatsapp.net",
+            participant="genti@s.whatsapp.net",
+            raw_metadata={
+                "ambient_context_rows": [
+                    {
+                        "sender_id": None,
+                        "participant": "203075365150770@lid",
+                        "text": (
+                            "Vorteile: Miete weg, drei Mahlzeiten am Tag, Struktur, "
+                            "kein Altersarmuts-Risiko. Nachteile: Knast, keine Freiheit, "
+                            "Steak ist eher schwierig und Rente wird dadurch nicht besser."
+                        ),
+                    },
+                    {
+                        "sender_id": "genti@s.whatsapp.net",
+                        "participant": "genti@s.whatsapp.net",
+                        "text": "Kirche auf der sahne",
+                    },
+                    {
+                        "sender_id": "alex@s.whatsapp.net",
+                        "participant": "alex@s.whatsapp.net",
+                        "text": (
+                            "Wenn man Bock hat und möchte, wieso nicht. Wer muss, "
+                            "weil es sonst nicht hinhaut, hat gelitten"
+                        ),
+                    },
+                ]
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.reply_to_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "recent_assistant_followup"
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is True
+
+
+@pytest.mark.asyncio
 async def test_non_question_after_recent_assistant_thread_stays_silent() -> None:
     event_time = datetime(2026, 5, 25, 8, 52, 48, tzinfo=UTC)
     sessions = _Sessions(
@@ -390,6 +455,31 @@ async def test_non_question_after_recent_assistant_thread_stays_silent() -> None
     )
     ctx = PipelineContext(
         event=_event(content="Onlyfans", timestamp=event_time),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _noop_next)
+
+    assert ctx.reply is None
+    assert ctx.event.reply_to_bot is False
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is False
+
+
+@pytest.mark.asyncio
+async def test_side_effect_request_after_recent_assistant_thread_stays_silent() -> None:
+    event_time = datetime(2026, 5, 25, 8, 52, 48, tzinfo=UTC)
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": "Die Zusammenfassung steht.",
+                "timestamp": (event_time - timedelta(seconds=20)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(content="Kannst du das an Ente schicken?", timestamp=event_time),
         decision=_mention_only_decision(),
     )
 

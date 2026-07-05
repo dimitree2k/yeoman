@@ -8,7 +8,7 @@ from textwrap import dedent
 import pytest
 from yeoman_overseer.executor import deterministic
 from yeoman_overseer.executor.stale_agent_sessions import CleanupResult
-from yeoman_overseer.service import OverseerConfig, OverseerService
+from yeoman_overseer.service import OverseerConfig, OverseerService, _sync_starter_runbooks
 from yeoman_overseer.trigger.checks import CheckResult
 
 RUNBOOK = dedent("""\
@@ -65,6 +65,36 @@ def test_config_defaults() -> None:
     assert cfg.actions_per_hour == 30
     assert cfg.llm_calls_per_day == 80
     assert cfg.llm_tokens_per_day == 2_000_000
+
+def test_sync_starter_runbooks_updates_older_runtime_copy(tmp_path: Path) -> None:
+    starter_dir = tmp_path / "starter"
+    runbook_dir = tmp_path / "runtime"
+    starter_dir.mkdir()
+    runbook_dir.mkdir()
+    starter = RUNBOOK.replace("version: 1", "version: 2").replace("# Test", "# Starter v2")
+    runtime = RUNBOOK.replace("# Test", "# Runtime v1")
+    (starter_dir / "health-bridge.md").write_text(starter)
+    (runbook_dir / "health-bridge.md").write_text(runtime)
+
+    synced = _sync_starter_runbooks(starter_dir, runbook_dir)
+
+    assert synced == 1
+    assert "# Starter v2" in (runbook_dir / "health-bridge.md").read_text()
+
+def test_sync_starter_runbooks_keeps_same_or_newer_runtime_copy(tmp_path: Path) -> None:
+    starter_dir = tmp_path / "starter"
+    runbook_dir = tmp_path / "runtime"
+    starter_dir.mkdir()
+    runbook_dir.mkdir()
+    starter = RUNBOOK.replace("# Test", "# Starter")
+    runtime = RUNBOOK.replace("# Test", "# Runtime")
+    (starter_dir / "health-bridge.md").write_text(starter)
+    (runbook_dir / "health-bridge.md").write_text(runtime)
+
+    synced = _sync_starter_runbooks(starter_dir, runbook_dir)
+
+    assert synced == 0
+    assert "# Runtime" in (runbook_dir / "health-bridge.md").read_text()
 
 @pytest.mark.asyncio
 async def test_service_init_and_stop(overseer_dir: Path) -> None:

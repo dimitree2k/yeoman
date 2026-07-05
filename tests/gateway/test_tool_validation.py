@@ -1,8 +1,10 @@
 import asyncio
+import json
 import os
 import platform
 import shutil
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +37,13 @@ from yeoman_gateway.cron.types import CronSchedule
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.security.engine import SecurityEngine
 from yeoman_gateway.security.normalize import normalize_text
+from yeoman_shared.config import loader as config_loader
 from yeoman_shared.config.loader import (
     _atomic_write_config,
     _migrate_config,
     convert_keys,
     convert_to_camel,
+    load_config,
 )
 from yeoman_shared.config.schema import Config, ExecIsolationConfig, ExecToolConfig, SecurityConfig
 from yeoman_shared.utils.helpers import get_workspace_path
@@ -376,6 +380,44 @@ def test_config_migration_for_legacy_isolation_keys() -> None:
     assert isolation["enabled"] is True
     assert isolation["backend"] == "bubblewrap"
     assert isolation["allowlistPath"] == "/tmp/allow.json"
+
+
+def test_config_load_does_not_backup_when_canonical_config_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeDateTime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=UTC):
+            cls.calls += 1
+            return datetime(2026, 1, 1, 0, 0, cls.calls, tzinfo=tz)
+
+    monkeypatch.setattr(config_loader, "datetime", FakeDateTime)
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "whatsapp": {
+                        "enabled": True,
+                        "bridgeUrl": "ws://127.0.0.1:3001",
+                    }
+                },
+                "agents": {"defaults": {"model": "openrouter/openai/gpt-4o-mini"}},
+                "providers": {"openrouter": {"apiKey": "k"}},
+            }
+        )
+    )
+
+    load_config(cfg_path)
+    first_backups = sorted(tmp_path.glob("config.backup.*.json"))
+    assert len(first_backups) == 1
+
+    load_config(cfg_path)
+
+    assert sorted(tmp_path.glob("config.backup.*.json")) == first_backups
 
 
 def test_persona_manipulation_false_positives_are_allowed() -> None:
