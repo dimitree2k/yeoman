@@ -207,6 +207,41 @@ class TestConversationStateContext:
         assert "use `media_history`" in prompt
         assert "previously shared images, screenshots, PDFs, or documents" in prompt
 
+    def test_group_prompt_hides_dm_only_cross_chat_capabilities(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[],
+            current_message="Und in der Ente?",
+            current_metadata={"is_owner": True, "sender_id": "owner@s.whatsapp.net"},
+            channel="whatsapp",
+            chat_id="491786127564-1611913127@g.us",
+        )
+
+        system_prompt = str(messages[0]["content"]).lower()
+
+        assert "owner dm" not in system_prompt
+        assert "another group" not in system_prompt
+        assert "cross-chat" not in system_prompt
+        assert "other chats" not in system_prompt
+
+    def test_owner_dm_prompt_keeps_cross_chat_history_capability(self, tmp_path):
+        from yeoman_gateway.agent.context import ContextBuilder
+
+        messages = ContextBuilder(tmp_path).build_messages(
+            history=[],
+            current_message="Was ging heute in der Ente?",
+            current_metadata={"is_owner": True, "sender_id": "owner@s.whatsapp.net"},
+            channel="whatsapp",
+            chat_id="491757070305@s.whatsapp.net",
+        )
+
+        system_prompt = str(messages[0]["content"])
+
+        assert "owner DM" in system_prompt
+        assert "summarize_history" in system_prompt
+        assert "media_history" in system_prompt
+
     def test_current_message_includes_repair_guidance(self, tmp_path):
         from yeoman_gateway.agent.context import ContextBuilder
 

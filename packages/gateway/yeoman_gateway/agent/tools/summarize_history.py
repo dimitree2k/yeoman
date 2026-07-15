@@ -45,6 +45,13 @@ class SummarizeHistoryTool(Tool):
 
     @property
     def description(self) -> str:
+        if self._can_use_group_parameter:
+            return (
+                "Fetch raw chat message history for summarization. "
+                "Use when users ask to summarize, recap, or catch up on recent conversation. "
+                "Returns timestamped messages, oldest first. In an owner DM, an optional group "
+                "parameter may fetch history from a different chat."
+            )
         return (
             "Fetch raw chat message history for summarization. "
             "Use when users ask to summarize, recap, or catch up on recent conversation. "
@@ -53,28 +60,34 @@ class SummarizeHistoryTool(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
+        properties: dict[str, Any] = {
+            "hours_back": {
+                "type": "integer",
+                "description": (
+                    "Hours of history to fetch. "
+                    "Omit for today (since midnight local time)."
+                ),
+                "minimum": 1,
+                "maximum": 48,
+            },
+        }
+        if self._can_use_group_parameter:
+            properties["group"] = {
+                "type": "string",
+                "description": (
+                    "Optional owner DM only WhatsApp group alias/name/chat id "
+                    "to fetch history from a different chat."
+                ),
+            }
         return {
             "type": "object",
-            "properties": {
-                "hours_back": {
-                    "type": "integer",
-                    "description": (
-                        "Hours of history to fetch. "
-                        "Omit for today (since midnight local time)."
-                    ),
-                    "minimum": 1,
-                    "maximum": 48,
-                },
-                "group": {
-                    "type": "string",
-                    "description": (
-                        "Optional (owner DM only): WhatsApp group alias/name/chat id "
-                        "to fetch history from a different chat."
-                    ),
-                },
-            },
+            "properties": properties,
             "required": [],
         }
+
+    @property
+    def _can_use_group_parameter(self) -> bool:
+        return self._channel == "whatsapp" and self._is_owner and not self._chat_id.endswith("@g.us")
 
     async def execute(self, **kwargs: Any) -> str:
         if not self._channel or not self._chat_id:

@@ -45,6 +45,36 @@ def _write_runbook(tmp_path: Path, name: str = "test-health") -> Path:
     path.write_text(content)
     return path
 
+
+def _write_manual_reset_runbook(tmp_path: Path, name: str = "test-health") -> Path:
+    content = dedent(f"""\
+        ---
+        name: {name}
+        domain: health
+        enabled: true
+        version: 1
+        trigger:
+          kind: poll
+          interval_s: 1
+          condition:
+            check: process_alive
+            target: "1"
+            operator: "=="
+            value: true
+        escalate_to_llm: false
+        safety:
+          max_actions_per_hour: 10
+          cooldown_s: 0
+          manual_reset_after_failures: true
+        ---
+        # Test
+        ## Actions
+        1. noop
+    """)
+    path = tmp_path / f"{name}.md"
+    path.write_text(content)
+    return path
+
 def _write_cron_runbook(tmp_path: Path, name: str = "test-cron", expr: str = "* * * * *") -> Path:
     content = dedent(f"""\
         ---
@@ -102,6 +132,41 @@ async def test_evaluator_respects_circuit_breaker(tmp_path: Path) -> None:
     evaluator = TriggerEvaluator(runbooks=[rb], on_triggered=callback, lock_manager=LockManager(), circuit_breaker=cb, rate_limiter=RateLimiter(), causal_detector=CausalChainDetector(), maintenance=MaintenanceManager(), state=OverseerState())
     await evaluator.tick()
     callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_manual_reset_runbook_stops_after_three_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rb = parse_runbook(_write_manual_reset_runbook(tmp_path))
+    callback = AsyncMock(side_effect=RuntimeError("restart failed"))
+    cb = CircuitBreaker(failure_threshold=3)
+    clock = {"monotonic": 1_000.0, "wall": 1_800_000_000.0}
+    monkeypatch.setattr(evaluator_module.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(evaluator_module.time, "monotonic", lambda: clock["monotonic"])
+    evaluator = TriggerEvaluator(
+        runbooks=[rb],
+        on_triggered=callback,
+        lock_manager=LockManager(),
+        circuit_breaker=cb,
+        rate_limiter=RateLimiter(),
+        causal_detector=CausalChainDetector(),
+        maintenance=MaintenanceManager(),
+        state=OverseerState(),
+    )
+
+    for _ in range(3):
+        await evaluator.tick()
+        clock["monotonic"] += 1.0
+        clock["wall"] += 1.0
+
+    clock["monotonic"] += 4_000.0
+    clock["wall"] += 4_000.0
+    await evaluator.tick()
+
+    assert callback.call_count == 3
+    assert cb.can_execute("test-health") is False
 
 @pytest.mark.asyncio
 async def test_evaluator_respects_maintenance(tmp_path: Path) -> None:

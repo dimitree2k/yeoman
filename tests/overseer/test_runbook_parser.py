@@ -79,7 +79,8 @@ def test_parse_runbook_dir_empty(tmp_path: Path) -> None:
 def test_health_bridge_alerts_when_whatsapp_protocol_is_disconnected() -> None:
     rb = parse_runbook(STARTER_RUNBOOKS / "health-bridge.md")
 
-    assert rb.meta.version == 2
+    assert rb.meta.version == 3
+    assert rb.meta.safety.manual_reset_after_failures is True
     assert rb.meta.trigger.condition is not None
     assert rb.meta.trigger.condition.check == "whatsapp_bridge_connected"
     assert rb.meta.trigger.condition.target == "default"

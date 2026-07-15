@@ -66,6 +66,9 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         persona_text: str | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        is_owner: bool = False,
     ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
@@ -79,7 +82,13 @@ class ContextBuilder:
         parts = []
 
         # Core identity
-        parts.append(self._get_identity())
+        parts.append(
+            self._get_identity(
+                expose_cross_chat_history=self._should_expose_cross_chat_history(
+                    channel, chat_id, is_owner
+                )
+            )
+        )
         # NOTE: temporal grounding is injected as a separate message in build_messages()
         # to keep the system prompt stable across turns for prefix-cache friendliness.
         parts.append(self._build_fact_verification_guardrails())
@@ -310,11 +319,40 @@ Skills with available="false" need dependencies installed first - you can try in
 
         return "\n".join(out)
 
-    def _get_identity(self) -> str:
+    @staticmethod
+    def _should_expose_cross_chat_history(
+        channel: str | None,
+        chat_id: str | None,
+        is_owner: bool,
+    ) -> bool:
+        if channel is None or chat_id is None:
+            return True
+        return channel == "whatsapp" and is_owner and not chat_id.endswith("@g.us")
+
+    def _get_identity(self, *, expose_cross_chat_history: bool = True) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+        delivery_guidance = (
+            "Use 'message' for text delivery to other chats and 'send_voice' for WhatsApp voice notes."
+            if expose_cross_chat_history
+            else "Use only the tools and targets explicitly available for this chat turn."
+        )
+        voice_context_guidance = (
+            "If required context is missing (e.g. user asks to answer \"the last voice message\" from another chat), ask only for the missing content or target chat.\n"
+            "For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step."
+            if expose_cross_chat_history
+            else "If required context is not visible in this chat, say only that you can answer from the visible chat context."
+        )
+        cross_chat_history_guidance = (
+            "\n\n## Cross-chat history (owner DM only)\n"
+            "When the owner asks in a DM to see messages from another group, use `summarize_history` with the `group` parameter (group name, alias, or chat id). This only works in owner DMs — never from groups or for non-owners.\n"
+            "When the owner asks in a DM about previously shared images, screenshots, PDFs, or documents from another group, use `media_history` with the `group` parameter. Set `extract=true` only when the owner asks what the file contains or asks you to analyze it."
+            if expose_cross_chat_history
+            else "\n\n## Visible Chat Boundary\n"
+            "If asked about information unavailable in the visible context for this chat, say only that you can answer from this chat's visible context."
+        )
 
         return f"""# Assistant Identity
 
@@ -336,7 +374,7 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
-Use 'message' for text delivery to other chats and 'send_voice' for WhatsApp voice notes.
+{delivery_guidance}
 For system metrics (temperature, RAM, disk, uptime), use the 'ops' tool with action="system_stats".
 
 ## Self-Diagnosis (MANDATORY)
@@ -357,12 +395,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
 - Keep voice content concise for TTS (1-3 sentences).
 - After calling `send_voice` once, do not send a visible text confirmation. Do NOT call `send_voice` again for the same request.
 - If `send_voice` is not available in your tools, or returns an error, tell the user the specific reason (e.g. "Voice ist gerade nicht verfügbar: <reason>"). Never silently fall back to text when voice was requested.
-If required context is missing (e.g. user asks to answer "the last voice message" from another chat), ask only for the missing content or target chat.
-For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step.
-
-## Cross-chat history (owner DM only)
-When the owner asks in a DM to see messages from another group, use `summarize_history` with the `group` parameter (group name, alias, or chat id). This only works in owner DMs — never from groups or for non-owners.
-When the owner asks in a DM about previously shared images, screenshots, PDFs, or documents from another group, use `media_history` with the `group` parameter. Set `extract=true` only when the owner asks what the file contains or asks you to analyze it."""
+{voice_context_guidance}{cross_chat_history_guidance}"""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -406,7 +439,13 @@ When the owner asks in a DM about previously shared images, screenshots, PDFs, o
         is_external = channel in _EXTERNAL_CHANNELS
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names, persona_text=persona_text)
+        system_prompt = self.build_system_prompt(
+            skill_names,
+            persona_text=persona_text,
+            channel=channel,
+            chat_id=chat_id,
+            is_owner=bool((current_metadata or {}).get("is_owner")),
+        )
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})

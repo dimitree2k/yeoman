@@ -1,6 +1,7 @@
 """Tests for yeoman deploy utilities."""
 
 from pathlib import Path
+import importlib.util
 
 
 def _make_bridge(tmp_path: Path) -> Path:
@@ -131,3 +132,14 @@ def test_deploy_dry_run_exits_zero() -> None:
         env={**os.environ, "YEOMAN_SOURCE_DIR": str(Path.home() / "Documents" / "yeoman")},
     )
     assert result.returncode == 0, f"deploy --dry-run failed:\n{result.stderr}"
+
+
+def test_whatsapp_qr_reconnect_script_resolves_repo_root() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    script = repo / "scripts" / "whatsapp_qr_reconnect.py"
+    spec = importlib.util.spec_from_file_location("whatsapp_qr_reconnect", script)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.repo_root() == repo

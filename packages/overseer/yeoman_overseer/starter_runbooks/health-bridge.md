@@ -2,7 +2,7 @@
 name: health-bridge
 domain: health
 enabled: true
-version: 2
+version: 3
 trigger:
   kind: poll
   interval_s: 30
@@ -16,6 +16,7 @@ safety:
   max_actions_per_hour: 10
   rollback: true
   cooldown_s: 300
+  manual_reset_after_failures: true
 ---
 # Bridge Health
 

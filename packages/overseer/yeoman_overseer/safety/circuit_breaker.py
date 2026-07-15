@@ -19,6 +19,7 @@ class BreakerEntry:
     quarantine_count: int = 0
     state: RunbookState = RunbookState.CLOSED
     quarantined_at: float = 0.0
+    manual_reset_required: bool = False
 
 
 @dataclass
@@ -34,7 +35,7 @@ class CircuitBreaker:
             self._breakers[name] = BreakerEntry()
         return self._breakers[name]
 
-    def record_failure(self, name: str) -> None:
+    def record_failure(self, name: str, *, manual_reset_required: bool = False) -> None:
         entry = self._get(name)
         if entry.state == RunbookState.PERMANENTLY_DISABLED:
             return
@@ -46,11 +47,15 @@ class CircuitBreaker:
             else:
                 entry.state = RunbookState.QUARANTINED
                 entry.quarantined_at = time.monotonic()
+                entry.manual_reset_required = manual_reset_required
             entry.consecutive_failures = 0
 
     def record_success(self, name: str) -> None:
         entry = self._get(name)
         entry.consecutive_failures = 0
+        entry.state = RunbookState.CLOSED
+        entry.quarantined_at = 0.0
+        entry.manual_reset_required = False
 
     def get_state(self, name: str) -> RunbookState:
         return self._get(name).state
@@ -64,6 +69,8 @@ class CircuitBreaker:
     def try_reenable(self, name: str) -> bool:
         entry = self._get(name)
         if entry.state != RunbookState.QUARANTINED:
+            return False
+        if entry.manual_reset_required:
             return False
         backoff = self.backoff_base_s * (2 ** (entry.quarantine_count - 1))
         elapsed = time.monotonic() - entry.quarantined_at
@@ -80,6 +87,7 @@ class CircuitBreaker:
                 "quarantine_count": e.quarantine_count,
                 "state": e.state.value,
                 "quarantined_at": e.quarantined_at,
+                "manual_reset_required": e.manual_reset_required,
             }
             for name, e in self._breakers.items()
         }
@@ -91,5 +99,6 @@ class CircuitBreaker:
                 quarantine_count=raw["quarantine_count"],
                 state=RunbookState(raw["state"]),
                 quarantined_at=raw.get("quarantined_at", 0.0),
+                manual_reset_required=raw.get("manual_reset_required", False),
             )
             self._breakers[name] = entry

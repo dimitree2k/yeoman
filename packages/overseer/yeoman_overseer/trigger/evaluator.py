@@ -48,6 +48,11 @@ class TriggerEvaluator:
             if not rb.meta.enabled:
                 continue
             if not self.circuit_breaker.can_execute(name):
+                if trigger.kind == "poll" and trigger.condition is not None:
+                    check_result = self._evaluate_condition(trigger.condition)
+                    if not self._condition_met(trigger.condition, check_result):
+                        self.circuit_breaker.record_success(name)
+                        continue
                 self.circuit_breaker.try_reenable(name)
                 if not self.circuit_breaker.can_execute(name):
                     continue
@@ -95,7 +100,10 @@ class TriggerEvaluator:
                 self.circuit_breaker.record_success(name)
             except Exception as exc:
                 logger.error("Runbook %s failed: %s", name, exc)
-                self.circuit_breaker.record_failure(name)
+                self.circuit_breaker.record_failure(
+                    name,
+                    manual_reset_required=rb.meta.safety.manual_reset_after_failures,
+                )
             finally:
                 self.lock_manager.release(name, name)
                 self._cooldown_until[name] = now + rb.meta.safety.cooldown_s

@@ -343,6 +343,7 @@ class OverseerService:
             actions = parse_deterministic_actions(runbook.body)
             if actions:
                 executor = DeterministicExecutor(comms=self._comms)
+                failed_results: list[str] = []
                 for action in actions:
                     action_start = time.monotonic()
                     result = await executor.execute(
@@ -352,6 +353,7 @@ class OverseerService:
                     )
                     if not result.success:
                         result_str = result.detail
+                        failed_results.append(result.detail)
                     if self._audit:
                         self._audit.append(AuditEntry(
                             runbook=runbook.meta.name,
@@ -363,6 +365,8 @@ class OverseerService:
                             escalated_to_llm=False,
                             domain=runbook.meta.domain,
                         ))
+                if failed_results:
+                    raise RuntimeError("; ".join(failed_results))
                 return
 
         duration_ms = int((time.monotonic() - start) * 1000)

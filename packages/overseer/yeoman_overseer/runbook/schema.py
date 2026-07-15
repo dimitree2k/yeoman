@@ -47,6 +47,7 @@ class SafetyConfig(BaseModel):
     max_actions_per_hour: int = 10
     rollback: bool = True
     cooldown_s: int = 300
+    manual_reset_after_failures: bool = False
     requires_tests: bool = False
     on_lock_conflict: Literal["queue", "skip"] = "skip"
     shell_timeout_s: int = 60

@@ -49,61 +49,78 @@ class MediaHistoryTool(Tool):
 
     @property
     def description(self) -> str:
+        if self._can_use_group_parameter:
+            return (
+                "Search retained chat media files such as images, screenshots, PDFs, and documents. "
+                "Use when the user asks about a previously shared file or image. In an owner DM, "
+                "an optional group parameter may search another WhatsApp group. Set extract=true "
+                "only when the user asks what the media contains or asks to analyze it; otherwise "
+                "return metadata only."
+            )
         return (
             "Search retained chat media files such as images, screenshots, PDFs, and documents. "
-            "Use when the user asks about a previously shared file or image, including owner DM "
-            "requests about another WhatsApp group. Set extract=true only when the user asks what "
-            "the media contains or asks to analyze it; otherwise return metadata only."
+            "Use when the user asks about a previously shared file or image in the current chat. "
+            "Set extract=true only when the user asks what the media contains or asks to analyze it; "
+            "otherwise return metadata only."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
+        properties: dict[str, Any] = {
+            "message_id": {
+                "type": "string",
+                "description": "Optional exact WhatsApp message id of the media item.",
+            },
+            "sender": {
+                "type": "string",
+                "description": "Optional sender display-name hint, for example Frank or Maurice.",
+            },
+            "file_name": {
+                "type": "string",
+                "description": "Optional file-name hint for documents or PDFs.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["image", "document"],
+                "description": "Optional media kind filter.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum search results to return.",
+                "minimum": 1,
+                "maximum": 12,
+            },
+            "extract": {
+                "type": "boolean",
+                "description": (
+                    "When true, lazily OCR/extract the single matching or most recent result. "
+                    "Leave false for simple file lookup."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": "The user's content question, used only as extraction context.",
+            },
+        }
+        if self._can_use_group_parameter:
+            properties = {
                 "group": {
                     "type": "string",
                     "description": (
-                        "Optional owner-DM only WhatsApp group alias/name/chat id to search."
+                        "Optional owner DM only WhatsApp group alias/name/chat id to search."
                     ),
                 },
-                "message_id": {
-                    "type": "string",
-                    "description": "Optional exact WhatsApp message id of the media item.",
-                },
-                "sender": {
-                    "type": "string",
-                    "description": "Optional sender display-name hint, for example Frank or Maurice.",
-                },
-                "file_name": {
-                    "type": "string",
-                    "description": "Optional file-name hint for documents or PDFs.",
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["image", "document"],
-                    "description": "Optional media kind filter.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum search results to return.",
-                    "minimum": 1,
-                    "maximum": 12,
-                },
-                "extract": {
-                    "type": "boolean",
-                    "description": (
-                        "When true, lazily OCR/extract the single matching or most recent result. "
-                        "Leave false for simple file lookup."
-                    ),
-                },
-                "query": {
-                    "type": "string",
-                    "description": "The user's content question, used only as extraction context.",
-                },
-            },
+                **properties,
+            }
+        return {
+            "type": "object",
+            "properties": properties,
             "required": [],
         }
+
+    @property
+    def _can_use_group_parameter(self) -> bool:
+        return self._channel == "whatsapp" and self._is_owner and not self._chat_id.endswith("@g.us")
 
     async def execute(self, **kwargs: Any) -> str:
         if not self._channel or not self._chat_id:

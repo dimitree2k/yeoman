@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { mediaExtension, resolveParticipantJid, shouldIgnoreFromMeInbound } from './whatsapp.js';
+import {
+  FALLBACK_WHATSAPP_WEB_VERSION,
+  mediaExtension,
+  resolveParticipantJid,
+  resolveWhatsAppWebVersion,
+  shouldIgnoreFromMeInbound,
+} from './whatsapp.js';
 
 test('resolveParticipantJid ignores quoted participant metadata in direct chat', () => {
   const msg = {
@@ -51,4 +57,21 @@ test('shouldIgnoreFromMeInbound ignores bridge-sent self messages when flag enab
 test('mediaExtension preserves document file names and maps PDF mime type', () => {
   assert.equal(mediaExtension('document', 'application/pdf', undefined), '.pdf');
   assert.equal(mediaExtension('document', undefined, 'Frank Report.PDF'), '.pdf');
+});
+
+test('resolveWhatsAppWebVersion uses fetched latest version', async () => {
+  const version = await resolveWhatsAppWebVersion(async () => ({
+    version: [2, 3000, 1035194821],
+    isLatest: true,
+  }));
+
+  assert.deepEqual(version, [2, 3000, 1035194821]);
+});
+
+test('resolveWhatsAppWebVersion falls back when fetch fails', async () => {
+  const version = await resolveWhatsAppWebVersion(async () => {
+    throw new Error('network unavailable');
+  });
+
+  assert.deepEqual(version, FALLBACK_WHATSAPP_WEB_VERSION);
 });

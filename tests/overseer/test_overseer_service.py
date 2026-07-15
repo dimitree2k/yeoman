@@ -7,6 +7,7 @@ from textwrap import dedent
 
 import pytest
 from yeoman_overseer.executor import deterministic
+from yeoman_overseer.executor.deterministic import ActionResult
 from yeoman_overseer.executor.stale_agent_sessions import CleanupResult
 from yeoman_overseer.service import OverseerConfig, OverseerService, _sync_starter_runbooks
 from yeoman_overseer.trigger.checks import CheckResult
@@ -143,3 +144,65 @@ async def test_service_executes_deterministic_runbook_actions(
     assert entries[0]["runbook"] == "ops-stale-agent-session-cleanup"
     assert entries[0]["action"] == "cleanup_stale_agent_sessions"
     assert "killed 1" in entries[0]["result"]
+
+
+@pytest.mark.asyncio
+async def test_service_raises_after_deterministic_action_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d = tmp_path / "overseer"
+    runbooks = d / "runbooks"
+    runbooks.mkdir(parents=True)
+    (runbooks / "health-bridge.md").write_text(dedent("""\
+        ---
+        name: health-bridge
+        domain: health
+        enabled: true
+        version: 1
+        trigger:
+          kind: poll
+          interval_s: 1
+          condition:
+            check: process_alive
+            target: "1"
+            operator: "=="
+            value: true
+        escalate_to_llm: false
+        safety:
+          max_actions_per_hour: 10
+          cooldown_s: 0
+        ---
+        # Bridge Health
+        ## Actions
+        - action: restart_service
+          target: yeoman-bridge.service
+    """))
+
+    async def fake_execute(
+        self: object,
+        action: str,
+        *,
+        target: str,
+        **kwargs: str,
+    ) -> ActionResult:
+        return ActionResult(success=False, detail="restart failed")
+
+    monkeypatch.setattr(
+        deterministic.DeterministicExecutor,
+        "execute",
+        fake_execute,
+    )
+
+    service = OverseerService(
+        data_dir=d,
+        socket_path=d / "test.sock",
+        config=OverseerConfig(),
+    )
+    await service.init()
+
+    with pytest.raises(RuntimeError, match="restart failed"):
+        await service._on_runbook_triggered(
+            service.runbooks[0],
+            check_result=CheckResult(value=True),
+        )

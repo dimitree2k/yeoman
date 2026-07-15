@@ -48,7 +48,23 @@ class DeterministicExecutor:
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode == 0:
-                return ActionResult(success=True, detail=f"Restarted {target}")
+                await asyncio.sleep(2.0)
+                active_proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "--user", "is-active", "--quiet", target,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                active_stdout, active_stderr = await active_proc.communicate()
+                if active_proc.returncode == 0:
+                    return ActionResult(success=True, detail=f"Restarted {target}")
+                detail = (
+                    active_stderr.decode().strip()
+                    or active_stdout.decode().strip()
+                    or f"systemctl is-active exited {active_proc.returncode}"
+                )
+                return ActionResult(
+                    success=False,
+                    detail=f"Restarted {target}, but service is not active: {detail}",
+                )
             return ActionResult(success=False, detail=f"Failed to restart {target}: {stderr.decode().strip()}")
         except Exception as exc:
             return ActionResult(success=False, detail=f"Error restarting {target}: {exc}")
