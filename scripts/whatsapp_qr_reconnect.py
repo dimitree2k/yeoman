@@ -200,6 +200,10 @@ def health() -> dict[str, Any]:
     return WhatsAppRuntimeManager().health_check(timeout_s=10)
 
 
+async def health_async() -> dict[str, Any]:
+    return await WhatsAppRuntimeManager()._health_check_async(timeout_s=10)
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     print(f"repo={DEFAULT_SOURCE_DIR}")
     print(f"units={active_units()}")
@@ -254,7 +258,7 @@ async def start_loop(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout_minutes * 60
     next_qr_at = 0.0
     while time.monotonic() < deadline:
-        current = health()
+        current = await health_async()
         print(json.dumps(current, sort_keys=True))
         if current.get("whatsapp", {}).get("connected"):
             cleanup_qr(svg_path)
