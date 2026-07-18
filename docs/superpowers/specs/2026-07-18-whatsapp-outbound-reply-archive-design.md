@@ -55,7 +55,7 @@ primary key and 30-day retention. A `direction` column defaults existing rows to
    quoted message determines the referent.
 5. If the archive lookup misses, Yeoman uses the quote text supplied by
    WhatsApp without inventing an archive row or timestamp. Recent ambient
-messages must not replace the explicit quote.
+   messages must not replace the explicit quote.
 
 Exact message lookup and reply-context windows include both directions.
 Range-based readers preserve their current inbound-only behavior unless a
