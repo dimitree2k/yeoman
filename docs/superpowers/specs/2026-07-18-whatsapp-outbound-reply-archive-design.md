@@ -12,6 +12,8 @@ thread. Outbound WhatsApp messages must use the same reply archive and the same
   `data/inbound/reply_context.db`.
 - Store the real WhatsApp message ID and original send timestamp returned by the
   bridge.
+- Mark every row as `inbound` or `outbound` so existing inbound-only consumers
+  do not ingest Yeoman's own messages.
 - Use the existing reply-archive retention and cleanup behavior for inbound and
   outbound rows alike.
 - Make an explicit WhatsApp quote authoritative over newer ambient chat topics.
@@ -35,12 +37,12 @@ thread. Outbound WhatsApp messages must use the same reply archive and the same
    timestamp in the successful command response.
 3. The WhatsApp channel records the visible outbound content in the existing
    `InboundArchive` storage, using the returned ID and timestamp and identifying
-   the speaker as Yeoman.
+   the speaker as Yeoman and the direction as `outbound`.
 4. Failed sends are not archived.
 
 The archive continues to use its existing `(channel, chat_id, message_id)`
-primary key and 30-day retention. No direction column or separate lifecycle is
-required for reply lookup.
+primary key and 30-day retention. A `direction` column defaults existing rows to
+`inbound`; no separate table or lifecycle is required.
 
 ### Receiving a Reply
 
@@ -53,7 +55,11 @@ required for reply lookup.
    quoted message determines the referent.
 5. If the archive lookup misses, Yeoman uses the quote text supplied by
    WhatsApp without inventing an archive row or timestamp. Recent ambient
-   messages must not replace the explicit quote.
+messages must not replace the explicit quote.
+
+Exact message lookup and reply-context windows include both directions.
+Range-based readers preserve their current inbound-only behavior unless a
+caller explicitly opts into outbound rows.
 
 ## Removing the Faulty Fallback
 
@@ -86,6 +92,21 @@ This design does not delete or alter:
 - media or document caches;
 - contact data.
 
+## Consumer Isolation
+
+Adding outbound rows must not change existing inbound-only behavior:
+
+- long-term memory capture continues to use the current user/assistant turn and
+  does not read archived outbound rows;
+- `summarize_history`, persona-evolution evidence, consciousness activity
+  windows, outcome classification, and quiet-gate checks continue to receive
+  inbound rows only;
+- exact reply lookup and context-window reconstruction may read both directions
+  because either a human or Yeoman message can be the quoted anchor.
+
+This prevents duplicate memory capture, inflated activity counts, false
+persona evidence, and Yeoman messages being mistaken for human chat input.
+
 ## Failure Handling
 
 - A bridge send without a usable message ID is treated as delivered but cannot
@@ -103,14 +124,18 @@ Add regression coverage for:
 
 1. Bridge text and media responses include the real message ID and timestamp.
 2. A successful outbound send is stored in the existing reply archive.
-3. A failed outbound send creates no archive row.
-4. A reply arriving hours later resolves its original outbound anchor and
+3. Existing rows migrate to `direction=inbound`.
+4. Range lookups remain inbound-only by default while exact and reply-window
+   lookups can return outbound rows.
+5. A failed outbound send creates no archive row.
+6. A reply arriving hours later resolves its original outbound anchor and
    receives the context window from that time, not the newest group topic.
-5. An archive miss uses WhatsApp quote text without seeding a current-time
+7. An archive miss uses WhatsApp quote text without seeding a current-time
    target row.
-6. Prompt construction makes an explicit quote authoritative over unrelated
+8. Prompt construction makes an explicit quote authoritative over unrelated
    recent messages.
-7. Existing inbound retention, session JSONL, and memory behavior remain
+9. Existing inbound retention, session JSONL, long-memory capture, persona
+   evidence, activity windows, and summary behavior remain
    unchanged.
 
 ## Acceptance Criteria
@@ -122,3 +147,5 @@ Add regression coverage for:
 - Both inbound and outbound reply anchors expire under the same existing
   30-day policy.
 - No new database, cleanup service, or retention setting is introduced.
+- Existing archive consumers do not receive outbound rows unless they
+  explicitly request them.
