@@ -89,7 +89,7 @@ Run the exact new test module and confirm failure because the scanner does not e
 
 - [ ] **Step 3: Implement the minimum standard-library scanner**
 
-Stream files as bytes, count fixed secret-category regex matches without retaining matched values, hash each file, and derive the corpus commitment from sorted opaque file identifiers plus file hashes. Emit one JSON object to stdout. Never emit exception data that could contain file content.
+Stream files as bytes, count fixed secret-category regex matches without retaining matched values, hash each file, and derive the corpus commitment from sorted opaque file identifiers plus file hashes. Bound optional ASCII-whitespace gaps at 128 bytes so the streaming overlap has a finite maximum. Open every path component and recursive child relative to held directory descriptors with no-follow checks. Emit one JSON object to stdout. Never emit exception data that could contain file content.
 
 - [ ] **Step 4: Verify GREEN and mutation resistance**
 
