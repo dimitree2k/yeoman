@@ -50,3 +50,11 @@ Request both standing reviews after each accepted milestone task or earlier when
 - The AGENTS-prescribed mypy slice reports 13 errors in the existing large policy/responder adapters. One staged removal of a required boundary ignore was corrected; the remaining current errors are not represented as green and will not be used to justify baseline acceptance.
 - Credential-like added literals are confined to explicit test fixtures such as redaction tests; no private-key marker was found. This heuristic scan is evidence, not a substitute for the signed exhaustive source inventory.
 - No preservation commit/tag or implementation worktree has been created. Owner disposition, signing/recovery material, and Luna worker availability remain open gates.
+
+### 2026-08-16 — Goal blocked at owner-controlled bootstrap gates
+
+- The same three gates remain unresolved for three consecutive goal turns: implementation-subagent model authority, disposition of the audited 50-path staged candidate, and authorization/destinations for offline program-signing and age recovery identities.
+- Current collaboration workers cannot satisfy the explicit Luna requirement: the subagent interface exposes only Sol and Terra. Agent A and Agent B remain idle Luna reviewers and have not been used outside their standing contract.
+- Current source authority is program-log commit `5ebfa0119d9bbd0edc7810b25cdd93e18d974afb`; the staged candidate digest remains `7d94039ee62bd91d6735cbfe4b293db41a6c7be4c6fdedc060273c21f5ddd56c` across 50 paths. No preservation tag or target/toolkit worktree exists.
+- `age`/`rage` remain unavailable and GnuPG has zero local secret keys. No key material was generated and no recovery location was guessed.
+- Runtime and memory remain untouched. Resume Task 1 only after the owner answers the three numbered decisions recorded in the prior handoff.
