@@ -17,7 +17,7 @@ Do not restart a service, open a QR, touch WhatsApp auth, create live evidence, 
 
 ## Exact repository checkpoints
 
-- Source `/home/dm/Documents/yeoman`: clean at `7359cff390c8f60dc1decb0e455803df158b671b` (`docs(incident): bind quarantine receipt gates`).
+- Source `/home/dm/Documents/yeoman`: accepted plan/code baseline `7359cff390c8f60dc1decb0e455803df158b671b` (`docs(incident): bind quarantine receipt gates`); this pause note and ledger are committed on top, and the worktree must remain clean.
 - Migration toolkit `/home/dm/Documents/yeoman-migration-toolkit`: clean at WIP checkpoint `fc86076352e8aaa417b7315688c02872bddf4826` (`wip(incident): checkpoint smoke readiness pause`). This commit is deliberately not accepted for merge or release.
 - Target `/home/dm/Documents/yeoman-rework`: clean at `bdc4c8c9e33602c5c8abd69f054703469d212dab`; release-baseline work remains pending.
 
