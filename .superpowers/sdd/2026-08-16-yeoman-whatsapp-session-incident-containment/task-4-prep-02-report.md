@@ -110,11 +110,12 @@ Status: all four Important findings from the independent Terra rejection, plus t
 ### Source and implementation commits
 
 - Accepted prep-03 typed evidence plan: `417880a84914bcf4fa2e10631a1f23dfb1b38f42`; SHA-256 `8ac9a1cfb047e892c364e5516974e0699531b1ce81101fa1e40ed5c4fcb6e2f5`.
-- Prep-02 contract alignment: `e7c67710067df7eee54756e5b328af7d7834b1be`; current prep-02 plan SHA-256 `327a9b5825dba8fd2a4c97d51215ee22a924673add39eec134abff9e7c00eced`.
+- Prep-02 contract alignment: `e7c67710067df7eee54756e5b328af7d7834b1be`; observer-boundary clarification: `ef4e908`; current prep-02 plan SHA-256 `8ed9fc0b8c7a796399db22700511d75ae16ce7e1b7d29c9a24580f8480865086`.
 - Safe legacy modes, canonical v1 bytes, strict inventories, and held-FD rewind: `f63baeb82483f13ec585199ddd84134cf9eadc28`.
 - Accepted typed observer/smoke DAG: `b196e874491fe47286f5cbabe72182f3e886376d`.
 - Global state-nonce reservation and crash recovery: `168ddcd30b744a1906dd9d8e9898c907dbba69bc`.
 - Prep-03 smoke expectation safety graph and common-verifier layering: `252438c8eff02847cb2170d7112841ee30cfe702`.
+- Quarantine-to-current-auth predecessor authentication: `f17ebe05598bf28c5f8a0f32dbc3b1d9dbb957a1`.
 
 ### Corrected findings and compatibility seams
 
@@ -125,6 +126,7 @@ Status: all four Important findings from the independent Terra rejection, plus t
 - State quiescence reserves `HMAC(key, YEOMAN-ROTATION-STATE-NONCE-V1 || nonce)` directly in `.state-receipts` before record publication. The reservation is incident-global across phase, kind, and record HMAC, contains no raw nonce, recovers both pending crash windows, and refuses completed or concurrently held reuse. This is separate from prep-03's future `.smoke-one-shot` registry.
 - The comparator accepts only the fixed prep-03 protected DAG: ready; raw artifacts; contiguous normalized events; expectation; intent; attempt; Bridge acceptance; optional inbound reply; and final complete close. It authenticates fixed kinds, exact schemas, commitments, predecessors, counts, timestamps, account/channel/destination/message causality, and complete capture. Unknown, capture-failed, retired, plain, disconnected, missing, or fabricated graphs are mismatches. Outbound events remain represented by `observed_outbound`.
 - `smoke-expectation-v2` now binds the exact incident, a 32-lowercase-hex rotation nonce, fixed smoke text, observer ready, fixed-kind current-auth and owner device-inventory commitments, `canonical_auth_tree_v1`, current-auth HMAC, self-identity HMAC, and the deterministic client-message-ID HMAC. The owner inventory must predecessor-link an authenticated `phone-ready-v1` with exact `YEOMAN_ROTATION_PHONE_READY_V1` source content. Its exact canonical `YEOMAN_ROTATION_DEVICE_INVENTORY_V1` JSON source must equal the protected intended/no-unknown/count/unique-sorted-label fields and bind the same current-auth commitment. Swapped, missing, malformed, free-form, or semantically false variants fail closed.
+- `phone-ready-v1` must predecessor-link the authenticated fixed-kind `auth-quarantine-receipt-v1`. That receipt has exactly `phase`, `nonce`, `serialization`, `old_auth_hmac`, and `artifact`; requires `quarantined`, a 32-lowercase-hex nonce, `canonical_auth_tree_v1`, a valid old-auth HMAC, and an `EvidenceCommitment` artifact; and must bind the same quarantine artifact as current-auth. The old and current auth HMACs must differ. Missing/wrong predecessors, failure phases, extra/malformed fields, swapped artifacts, or equal old/current identities fail closed.
 - State no longer invents or requires a private `.rotation-observer-receipts` journal. It uses the common fixed-kind protected-record verifier; prep-03 owns observer/one-shot durability. Recursive exact schema/kind/predecessor/raw checks remain the authenticity boundary, and a valid same-kind protected close is accepted without state-private provenance.
 
 ### RED and GREEN evidence
@@ -133,9 +135,10 @@ Status: all four Important findings from the independent Terra rejection, plus t
 - Canonical/mode/inventory/rewind RED selection: 11 expected failures and 4 passes exposed the ASCII-escaping, normal-mode, inventory-validation, and consuming-FD gaps. After correction the 15 targeted tests passed, then the complete common/state gate passed 148 tests.
 - Typed observer contract RED: 13 tests failed before the accepted prep-03 kinds and graph existed. After plan commit `417880a`, three additional account/time-order tests failed. GREEN passed 19 adversarial observer cases, 81 state tests, and 159 common/state tests.
 - State nonce RED: four replay, cross-phase, crash-window, and concurrent-lock cases failed. GREEN passed all four targeted cases, then 85 state tests and 163 common/state tests.
-- Expectation RED: the first fully bound valid graph failed while 15 tamper cases were already refused; predecessor RED then failed 2 of 17 cases; exact owner-source RED failed 1 of 21 cases; and the common-protected-record layering test failed 1 case while state still required its private journal. After each implementation step, the respective selections passed 16, 18, 21, and 1 tests. The final expectation matrix passes 21 missing, wrong, swapped, malformed, unordered, duplicate, predecessor, and free-form-source variants plus the valid graph.
-- Final gate: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py` passed **239 tests in 11.39 seconds**.
-- Final static gate: `uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` returned `All checks passed!`; `git diff --check` produced no output. The toolkit worktree was clean after commit `252438c8eff02847cb2170d7112841ee30cfe702`.
+- Expectation RED: the first fully bound valid graph failed while 15 tamper cases were already refused; predecessor RED then failed 2 of 17 cases; exact owner-source RED failed 1 of 21 cases; and the common-protected-record layering test failed 1 case while state still required its private journal. After each implementation step, the respective selections passed 16, 18, 21, and 1 tests. That stage covered 21 missing, wrong, swapped, malformed, unordered, duplicate, predecessor, and free-form-source variants plus the valid graph.
+- Final quarantine-graph RED: the five missing/wrong predecessor, failure-phase, swapped-artifact, and same-old/current cases all returned `preserved` (`5 failed, 21 passed`). GREEN then passed those 26 cases plus the valid graph; the expanded exact-schema/value matrix passed all 31 tamper cases.
+- Final gate: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py` passed **249 tests in 12.15 seconds**.
+- Final static gate: `uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` returned `All checks passed!`; `git diff --check` produced no output. The toolkit worktree was clean after commit `f17ebe05598bf28c5f8a0f32dbc3b1d9dbb957a1`.
 
 ### Restored mutation evidence
 
@@ -146,6 +149,7 @@ Status: all four Important findings from the independent Terra rejection, plus t
 - Removed observer account equality: the cross-account event returned `preserved_with_classified_additions` and failed. Restored.
 - Scoped the nonce reservation filename by record HMAC: `test_state_nonce_is_unique_across_phases_and_distinct_common_receipts` did not raise and failed. Restored.
 - Removed exact canonical inventory source validation: the free-form signed owner-content case returned `preserved` and failed. Restored.
+- Removed the old-auth/current-auth inequality check: the equal-identity quarantine graph returned `preserved` and `same-old-current-auth` failed. Restored.
 
 ### Exact no-live attestation for this correction round
 
