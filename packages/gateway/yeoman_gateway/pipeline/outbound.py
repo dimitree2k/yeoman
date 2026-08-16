@@ -38,7 +38,12 @@ _LOG_LINE_RE = re.compile(
     r"(?im)^\s*(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|"
     r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b)"
 )
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _VOICE_HARD_MAX_CHARS = 500
+_SOCIAL_REPLY_CHAR_CAPS = {
+    "social_one_liner": 180,
+    "one_liner": 220,
+}
 
 
 def _normalize_whatsapp_jid(value: str) -> str:
@@ -107,6 +112,40 @@ def _unwrap_inline_code_reaction_marker(text: str) -> str:
     if not match:
         return text
     return match.group(1).strip()
+
+
+def _answer_shape_from_metadata(metadata: dict[str, object]) -> str:
+    raw = metadata.get("conversation_state")
+    if not isinstance(raw, dict):
+        return ""
+    return str(raw.get("answer_shape") or "").strip()
+
+
+def _limit_group_social_reply(reply: str, event: "InboundEvent") -> str:
+    if not event.is_group:
+        return reply
+
+    answer_shape = _answer_shape_from_metadata(event.raw_metadata)
+    max_chars = _SOCIAL_REPLY_CHAR_CAPS.get(answer_shape)
+    if max_chars is None:
+        return reply
+
+    compact = " ".join(str(reply or "").strip().split())
+    if not compact:
+        return compact
+
+    first_sentence = _SENTENCE_SPLIT_RE.split(compact, maxsplit=1)[0].strip()
+    if first_sentence:
+        compact = first_sentence
+    if len(compact) <= max_chars:
+        return compact
+
+    suffix = "..."
+    clipped = compact[: max(1, max_chars - len(suffix))].rstrip()
+    boundary = clipped.rfind(" ")
+    if boundary >= max_chars // 2:
+        clipped = clipped[:boundary].rstrip()
+    return f"{clipped}{suffix}"
 
 
 class OutboundMiddleware:
@@ -189,6 +228,8 @@ class OutboundMiddleware:
             suffix_match = _REACTION_SUFFIX_RE.match(reply)
             if suffix_match:
                 reply = suffix_match.group(1).strip()
+
+        reply = _limit_group_social_reply(reply, event)
 
         # ── Output security ──────────────────────────────────────────
         if self._security is not None:

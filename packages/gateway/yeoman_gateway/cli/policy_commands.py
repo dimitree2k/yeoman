@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 
 import typer
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from .channel_commands import _ensure_whatsapp_bridge_token
 from .core import app, console, make_policy_engine
@@ -152,7 +153,7 @@ def policy_annotate_whatsapp_comments(
     async def _list_groups(url: str, ids: list[str], token: str) -> dict[str, str]:
         request_id = uuid.uuid4().hex
         payload = {
-            "version": 2,
+            "version": PROTOCOL_VERSION,
             "type": "list_groups",
             "token": token,
             "requestId": request_id,
@@ -168,7 +169,7 @@ def policy_annotate_whatsapp_comments(
                     raise TimeoutError("bridge did not reply in time")
                 raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 data = json.loads(raw)
-                if data.get("version") != 2:
+                if data.get("version") != PROTOCOL_VERSION:
                     continue
                 if data.get("type") != "response":
                     continue

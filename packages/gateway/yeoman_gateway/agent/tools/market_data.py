@@ -116,13 +116,35 @@ def _round_float(value: Any) -> float | None:
     return round(number, 4)
 
 
+_QUOTE_GROUNDING_LABELS: dict[str, list[str]] = {
+    "datetime": ["Stand", "Datenstand", "Datum", "date", "as of"],
+    "price": ["Kurs", "Preis", "price"],
+    "open": ["Eröffnung", "opening price", "open"],
+    "high": ["Tageshoch", "high"],
+    "low": ["Tagestief", "low"],
+    "previous_close": [
+        "Vortagesschluss",
+        "Schlusskurs",
+        "previous close",
+    ],
+    "change": ["Veränderung", "Änderung", "change"],
+    "percent_change": [
+        "Veränderung",
+        "prozentuale Änderung",
+        "percent change",
+    ],
+    "volume": ["Volumen", "Handelsvolumen", "volume"],
+}
+
+
 def _normalize_quote(raw: dict[str, Any]) -> dict[str, Any]:
-    return {
+    currency = raw.get("currency")
+    quote = {
         "symbol": str(raw.get("symbol") or "").upper() or None,
         "name": raw.get("name"),
         "exchange": raw.get("exchange"),
         "mic_code": raw.get("mic_code"),
-        "currency": raw.get("currency"),
+        "currency": currency,
         "datetime": raw.get("datetime"),
         "timestamp": _as_int(raw.get("timestamp")),
         "price": _as_float(raw.get("close")),
@@ -136,6 +158,25 @@ def _normalize_quote(raw: dict[str, Any]) -> dict[str, Any]:
         "is_market_open": raw.get("is_market_open"),
         "source": "twelvedata",
     }
+    quote["units"] = {
+        key: unit
+        for key, unit in {
+            "price": currency,
+            "open": currency,
+            "high": currency,
+            "low": currency,
+            "previous_close": currency,
+            "change": currency,
+            "percent_change": "%",
+        }.items()
+        if quote.get(key) is not None and unit
+    }
+    quote["labels"] = {
+        key: labels
+        for key, labels in _QUOTE_GROUNDING_LABELS.items()
+        if quote.get(key) is not None
+    }
+    return quote
 
 
 class MarketQuoteTool(Tool):
@@ -375,8 +416,10 @@ class MarketIntelligenceTool(Tool):
 
     @staticmethod
     def _compact_quote(quote: dict[str, Any]) -> dict[str, Any]:
+        currency = quote.get("currency")
         compact = {
             "symbol": quote.get("symbol"),
+            "currency": currency,
             "price": _round_float(quote.get("price")),
             "pct": _round_float(quote.get("percent_change")),
             "prev": _round_float(quote.get("previous_close")),
@@ -384,6 +427,25 @@ class MarketIntelligenceTool(Tool):
             "time": quote.get("datetime"),
             "open": quote.get("is_market_open"),
             "source": quote.get("source"),
+        }
+        units = {
+            key: unit
+            for key, unit in {
+                "price": currency,
+                "pct": "%",
+                "prev": currency,
+                "change": currency,
+            }.items()
+            if compact.get(key) is not None and unit
+        }
+        if units:
+            compact["units"] = units
+        compact["labels"] = {
+            "price": _QUOTE_GROUNDING_LABELS["price"],
+            "pct": _QUOTE_GROUNDING_LABELS["percent_change"],
+            "prev": _QUOTE_GROUNDING_LABELS["previous_close"],
+            "change": _QUOTE_GROUNDING_LABELS["change"],
+            "time": _QUOTE_GROUNDING_LABELS["datetime"],
         }
         feed = quote.get("feed")
         if feed:
@@ -568,8 +630,9 @@ class MarketIntelligenceTool(Tool):
             return None
         change = price - previous_close if previous_close else None
         percent_change = (change / previous_close * 100.0) if change is not None and previous_close else None
-        return {
+        quote = {
             "symbol": symbol.upper(),
+            "currency": "USD",
             "price": price,
             "open": _as_float(daily_bar.get("o")),
             "high": _as_float(daily_bar.get("h")),
@@ -582,6 +645,20 @@ class MarketIntelligenceTool(Tool):
             "source": f"alpaca_{self.alpaca_data_feed}",
             "feed": self.alpaca_data_feed,
         }
+        quote["units"] = {
+            key: unit
+            for key, unit in {
+                "price": "USD",
+                "open": "USD",
+                "high": "USD",
+                "low": "USD",
+                "previous_close": "USD",
+                "change": "USD",
+                "percent_change": "%",
+            }.items()
+            if quote.get(key) is not None
+        }
+        return quote
 
     async def _fetch_finnhub_news(self, symbols: list[str]) -> list[dict[str, Any]]:
         if not symbols or not self.finnhub_api_key:

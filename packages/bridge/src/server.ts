@@ -272,7 +272,13 @@ export class BridgeServer {
 
     if (type === 'send_text') {
       const parsed = parseSendTextPayload(payload);
-      const sent = await this.wa.sendText(parsed.to, parsed.text, parsed.replyToMessageId, parsed.mentions);
+      const sent = await this.wa.sendText(
+        parsed.to,
+        parsed.text,
+        parsed.replyToMessageId,
+        parsed.mentions,
+        parsed.clientMessageId,
+      );
       return { sent };
     }
 

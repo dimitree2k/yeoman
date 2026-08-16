@@ -1,6 +1,8 @@
 """Session management for conversation history."""
 
 import json
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -89,7 +91,11 @@ class Session:
                 break
 
         start = boundary_idx + 1 if boundary_idx >= 0 else 0
-        candidates = self.messages[start:]
+        candidates = [
+            message
+            for message in self.messages[start:]
+            if message.get("hidden") is not True
+        ]
 
         # Apply max_messages limit.
         if len(candidates) > max_messages:
@@ -99,6 +105,8 @@ class Session:
         history: list[dict[str, Any]] = []
         allowed_roles = {"system", "user", "assistant"}
         for message in candidates:
+            if message.get("hidden") is True:
+                continue
             role = str(message.get("role") or "").strip()
             if role == "tool_trace" or role not in allowed_roles:
                 continue
@@ -206,20 +214,30 @@ class SessionManager:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
         path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
 
-        with open(path, "w") as f:
-            # Write metadata first
-            metadata_line = {
-                "_type": "metadata",
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata
-            }
-            f.write(json.dumps(metadata_line) + "\n")
-
-            # Write messages
-            for msg in session.messages:
-                f.write(json.dumps(msg) + "\n")
+        try:
+            with open(temporary, "x") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata
+                }
+                f.write(json.dumps(metadata_line) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
         self._cache[session.key] = session
 

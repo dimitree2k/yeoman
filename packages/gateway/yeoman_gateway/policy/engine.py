@@ -106,6 +106,7 @@ class EffectivePolicy:
     talkative_cooldown_cooldown_seconds: int
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
+    reply_budget: dict[str, Any]
     spontaneity_enabled: bool
     spontaneity_profile: str
     spontaneity_daily_cap: int | None
@@ -172,6 +173,7 @@ class _CompiledPolicy:
     talkative_cooldown_cooldown_seconds: int
     talkative_cooldown_delay_seconds: float
     talkative_cooldown_use_llm_message: bool
+    reply_budget: dict[str, Any]
     spontaneity_enabled: bool
     spontaneity_profile: str
     spontaneity_daily_cap: int | None
@@ -326,6 +328,7 @@ class PolicyEngine:
             talkative_cooldown_cooldown_seconds=int(resolved.talkative_cooldown.cooldown_seconds),
             talkative_cooldown_delay_seconds=float(resolved.talkative_cooldown.delay_seconds),
             talkative_cooldown_use_llm_message=bool(resolved.talkative_cooldown.use_llm_message),
+            reply_budget=resolved.reply_budget.model_dump(by_alias=False),
             spontaneity_enabled=bool(resolved.spontaneity.enabled),
             spontaneity_profile=str(resolved.spontaneity.profile),
             spontaneity_daily_cap=resolved.spontaneity.daily_cap,
@@ -503,6 +506,7 @@ class PolicyEngine:
             talkative_cooldown_cooldown_seconds=resolved.talkative_cooldown_cooldown_seconds,
             talkative_cooldown_delay_seconds=resolved.talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=resolved.talkative_cooldown_use_llm_message,
+            reply_budget=dict(resolved.reply_budget),
             spontaneity_enabled=resolved.spontaneity_enabled,
             spontaneity_profile=resolved.spontaneity_profile,
             spontaneity_daily_cap=resolved.spontaneity_daily_cap,

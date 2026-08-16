@@ -125,3 +125,10 @@ def test_config_has_consciousness_model_routes() -> None:
     assert cfg.models.routes["consciousness.outcome"] == "consciousness_judgment"
     assert cfg.models.routes["consciousness.taste"] == "consciousness_judgment"
     assert "consciousness_judgment" in cfg.models.profiles
+
+
+def test_config_has_assistant_model_route() -> None:
+    cfg = Config()
+    profile = cfg.models.profiles[cfg.models.routes["assistant.reply"]]
+    assert profile.kind == "chat"
+    assert profile.model is not None

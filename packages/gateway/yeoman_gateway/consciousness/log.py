@@ -523,3 +523,9 @@ class SpeakupLog:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

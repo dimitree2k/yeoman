@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -112,6 +113,9 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -124,6 +128,9 @@ class LiteLLMProvider(LLMProvider):
             temperature: Sampling temperature.
             reasoning: Optional reasoning config for OpenRouter
                        (e.g. {"enabled": true} or {"effort": "high"}).
+            response_format: Optional structured-output contract.
+            timeout_seconds: Optional per-call provider timeout.
+            max_retries: Optional per-call provider retry count.
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -154,6 +161,13 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        if timeout_seconds is not None:
+            kwargs["timeout"] = timeout_seconds
+        if max_retries is not None:
+            kwargs["num_retries"] = max_retries
+
         # Pass reasoning config via extra_body for OpenRouter
         if reasoning:
             extra_body = kwargs.get("extra_body", {})
@@ -161,7 +175,11 @@ class LiteLLMProvider(LLMProvider):
             kwargs["extra_body"] = extra_body
 
         try:
-            response = await acompletion(**kwargs)
+            if timeout_seconds is None:
+                response = await acompletion(**kwargs)
+            else:
+                async with asyncio.timeout(timeout_seconds):
+                    response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
@@ -200,11 +218,18 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
 
+        finish_reason = choice.finish_reason or "stop"
+        if (
+            not str(message.content or "").strip()
+            and not tool_calls
+        ):
+            finish_reason = "error"
+
         return LLMResponse(
             content=message.content,
             reasoning_content=getattr(message, "reasoning_content", None),
             tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
+            finish_reason=finish_reason,
             usage=usage,
         )
 

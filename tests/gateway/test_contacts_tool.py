@@ -1,5 +1,6 @@
 """Tests for the contacts LLM tool."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -122,8 +123,10 @@ class TestResolveContactTool:
 
         result = await resolver.execute(query="Frank")
 
-        assert "Resolved contact: Frank Taeger" in result
-        assert "4917632625469@s.whatsapp.net" in result
+        payload = json.loads(result)
+        assert payload["ok"] is True
+        assert payload["contact"]["display_name"] == "Frank Taeger"
+        assert payload["contact"]["jid"] == "4917632625469@s.whatsapp.net"
         assert "sensitive personal note" not in result
 
     @pytest.mark.asyncio
@@ -141,6 +144,86 @@ class TestResolveContactTool:
 
         result = await resolver.execute(query="@46918273106072")
 
-        assert "Resolved contact: Frank Taeger" in result
-        assert "4917632625469@s.whatsapp.net" in result
-        assert "46918273106072@lid" in result
+        payload = json.loads(result)
+        assert payload["contact"]["display_name"] == "Frank Taeger"
+        assert payload["contact"]["jid"] == "4917632625469@s.whatsapp.net"
+        assert payload["contact"]["matched_identifier"] == "46918273106072@lid"
+
+    @pytest.mark.asyncio
+    async def test_name_resolution_does_not_use_substring_only_match(
+        self,
+        contacts: ContactsService,
+        tmp_path: Path,
+    ) -> None:
+        contacts.ensure_contact(
+            channel="whatsapp",
+            identifier="4917000000000@s.whatsapp.net",
+            kind="phone_jid",
+            push_name="Joanne Miller",
+        )
+        registry = ChatRegistry(db_path=tmp_path / "substring_registry.db")
+        registry.register_chat(
+            channel="whatsapp",
+            chat_id="substring@g.us",
+            chat_type="group",
+            readable_name="Substring",
+            metadata={
+                "participants": [
+                    {
+                        "id": "10000000000000@lid",
+                        "phoneNumber": "4917000000000@s.whatsapp.net",
+                    }
+                ]
+            },
+        )
+        resolver = ResolveContactTool(
+            contacts=contacts,
+            chat_registry=registry,
+        )
+        resolver.set_context(
+            channel="whatsapp",
+            chat_id="substring@g.us",
+        )
+
+        result = await resolver.execute(query="Ann")
+
+        registry.close()
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert payload["error_code"] == "contact_not_resolved"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "x4917632625469y",
+            "Frank4917632625469evil",
+            "4917632625469@evil",
+            "@4917632625469@evil",
+            "4917632625469@s.whatsapp.net.evil",
+            "4917632625469＠evil",
+        ],
+    )
+    async def test_identifier_resolution_requires_token_boundaries(
+        self,
+        contacts: ContactsService,
+        chat_registry: ChatRegistry,
+        query: str,
+    ) -> None:
+        contacts.ensure_contact(
+            channel="whatsapp",
+            identifier="4917632625469@s.whatsapp.net",
+            kind="phone_jid",
+            push_name="Frank Taeger",
+        )
+        resolver = ResolveContactTool(
+            contacts=contacts,
+            chat_registry=chat_registry,
+        )
+        resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
+
+        result = await resolver.execute(query=query)
+
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert payload["error_code"] == "contact_not_resolved"

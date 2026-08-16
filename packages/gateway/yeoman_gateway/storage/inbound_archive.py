@@ -334,6 +334,12 @@ class InboundArchive:
         with self._lock:
             self._conn.close()
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _maybe_purge_locked(self) -> None:
         now = time.monotonic()
         if now - self._last_purge_at < PURGE_INTERVAL_SECONDS:

@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 
 const TOKEN_JSON_RE = /("token"\s*:\s*")[^"]*(")/gi;
 const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
@@ -35,6 +35,7 @@ export interface SendTextPayload {
   text: string;
   replyToMessageId?: string;
   mentions?: string[];
+  clientMessageId?: string;
 }
 
 export interface SendMediaPayload {
@@ -47,6 +48,7 @@ export interface SendMediaPayload {
   caption?: string;
   replyToMessageId?: string;
   mentions?: string[];
+  clientMessageId?: string;
 }
 
 export interface SendPollPayload {
@@ -54,6 +56,7 @@ export interface SendPollPayload {
   question: string;
   options: string[];
   maxSelections?: number;
+  clientMessageId?: string;
 }
 
 export interface ReactPayload {
@@ -62,6 +65,7 @@ export interface ReactPayload {
   emoji: string;
   participantJid?: string;
   fromMe?: boolean;
+  clientMessageId?: string;
 }
 
 export interface PresenceUpdatePayload {
@@ -150,14 +154,25 @@ function asOptionalStringArray(value: unknown): string[] | undefined {
   return out;
 }
 
+const CLIENT_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+function asOptionalClientMessageId(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  const parsed = asString(value);
+  if (!parsed || !CLIENT_MESSAGE_ID_RE.test(parsed)) return null;
+  return parsed;
+}
+
 function parseSendText(payload: Record<string, unknown>): SendTextPayload | null {
   const to = asString(payload.to);
   const text = asString(payload.text);
   const replyToMessageId = asOptionalString(payload.replyToMessageId);
   const mentions = asOptionalStringArray(payload.mentions);
+  const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
   if (!to || !text) return null;
   if (payload.mentions !== undefined && !mentions) return null;
-  return { to, text, replyToMessageId, mentions };
+  if (clientMessageId === null) return null;
+  return { to, text, replyToMessageId, mentions, clientMessageId };
 }
 
 function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | null {
@@ -171,8 +186,10 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
   const caption = asOptionalString(payload.caption);
   const replyToMessageId = asOptionalString(payload.replyToMessageId);
   const mentions = asOptionalStringArray(payload.mentions);
+  const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
   if (!mediaUrl && !mediaBase64 && !mediaPath) return null;
   if (payload.mentions !== undefined && !mentions) return null;
+  if (clientMessageId === null) return null;
   return {
     to,
     mediaUrl,
@@ -183,6 +200,7 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
     caption,
     replyToMessageId,
     mentions,
+    clientMessageId,
   };
 }
 
@@ -191,11 +209,13 @@ function parseSendPoll(payload: Record<string, unknown>): SendPollPayload | null
   const question = asString(payload.question);
   const options = asOptionalStringArray(payload.options);
   const maxSelections = asOptionalNumber(payload.maxSelections);
+  const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
   if (!to || !question || !options || options.length < 2) return null;
   if (maxSelections !== undefined && (!Number.isInteger(maxSelections) || maxSelections < 1)) {
     return null;
   }
-  return { to, question, options, maxSelections };
+  if (clientMessageId === null) return null;
+  return { to, question, options, maxSelections, clientMessageId };
 }
 
 function parseReact(payload: Record<string, unknown>): ReactPayload | null {
@@ -205,7 +225,9 @@ function parseReact(payload: Record<string, unknown>): ReactPayload | null {
   const emoji = typeof payload.emoji === 'string' ? payload.emoji : '';
   const participantJid = asOptionalString(payload.participantJid);
   const fromMe = asOptionalBool(payload.fromMe);
-  return { chatJid, messageId, emoji, participantJid, fromMe };
+  const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
+  if (clientMessageId === null) return null;
+  return { chatJid, messageId, emoji, participantJid, fromMe, clientMessageId };
 }
 
 function parsePresenceUpdate(payload: Record<string, unknown>): PresenceUpdatePayload | null {

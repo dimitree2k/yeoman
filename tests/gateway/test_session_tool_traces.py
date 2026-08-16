@@ -1,5 +1,8 @@
 # tests/test_session_tool_traces.py
-from yeoman_gateway.session.manager import Session
+import os
+
+import pytest
+from yeoman_gateway.session.manager import Session, SessionManager
 
 
 def test_session_stores_tool_call():
@@ -43,3 +46,27 @@ def test_get_history_skips_legacy_rows_without_content():
         {"role": "user", "content": "hi", "timestamp": "2026-03-07T00:00:00"},
         {"role": "assistant", "content": "hello", "timestamp": "2026-03-07T00:00:02"},
     ]
+
+
+def test_session_save_replaces_file_atomically(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(tmp_path, sessions_dir=tmp_path / "sessions")
+    session = manager.get_or_create("whatsapp:finance@g.us")
+    session.add_message("user", "first")
+    manager.save(session)
+    path = manager._get_session_path(session.key)
+    original = path.read_bytes()
+    session.add_message("assistant", "second")
+
+    def fail_replace(source, destination) -> None:
+        del source, destination
+        raise OSError("simulated power loss")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated power loss"):
+        manager.save(session)
+
+    assert path.read_bytes() == original

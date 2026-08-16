@@ -16,6 +16,9 @@ import httpx
 from loguru import logger
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.agent.tools.url_provenance import (
+    provenance_transition_error,
+)
 
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import WebToolsConfig
@@ -28,6 +31,12 @@ _TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 _TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 _TAVILY_MAP_URL = "https://api.tavily.com/map"
 _TAVILY_CRAWL_URL = "https://api.tavily.com/crawl"
+_AUTH_PATH_SEGMENTS = {"login", "signin", "auth", "consent"}
+_AUTH_GATE_PHRASES = {
+    "sign in to continue",
+    "signin to continue",
+    "consent to continue",
+}
 
 
 class _WebRateLimiter:
@@ -68,6 +77,27 @@ def _normalize(text: str) -> str:
     """Normalize whitespace."""
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _has_auth_path(url: str) -> bool:
+    return any(
+        segment.lower() in _AUTH_PATH_SEGMENTS
+        for segment in urlparse(url).path.split("/")
+        if segment
+    )
+
+
+def _auth_gate_body(body_text: str, extracted_text: str) -> bool:
+    if re.search(
+        r"<input\b[^>]*\btype\s*=\s*[\"']?password\b",
+        body_text,
+        flags=re.I,
+    ):
+        return True
+    compact = " ".join(extracted_text.lower().split())
+    return len(compact) <= 2000 and any(
+        phrase in compact for phrase in _AUTH_GATE_PHRASES
+    )
 
 
 def _is_private_ip(host: str) -> bool:
@@ -445,6 +475,12 @@ class WebFetchTool(Tool):
                 "type": "boolean",
                 "description": "Include Tavily usage metadata.",
             },
+            "provenance_required": {
+                "type": "boolean",
+                "description": (
+                    "Require direct fetching with verifiable final-URL provenance."
+                ),
+            },
         },
         "required": ["url"],
     }
@@ -484,6 +520,7 @@ class WebFetchTool(Tool):
         include_images: bool | None = None,
         include_favicon: bool | None = None,
         include_usage: bool | None = None,
+        provenance_required: bool = False,
         **kwargs: Any,
     ) -> str:
         del kwargs
@@ -501,6 +538,17 @@ class WebFetchTool(Tool):
         )
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})
+        if provenance_required:
+            provenance_error = provenance_transition_error(url, url)
+            if provenance_error is not None:
+                return json.dumps(
+                    {
+                        "error": "URL is not valid for provenance-required fetching",
+                        "error_code": provenance_error,
+                        "url": url,
+                        "finalUrl": url,
+                    }
+                )
 
         # YouTube pages don't yield transcripts via web_fetch — redirect to the dedicated tool
         if "youtube.com" in url or "youtu.be" in url:
@@ -512,7 +560,7 @@ class WebFetchTool(Tool):
             )
 
         # Try Tavily Extract first (handles JS-heavy pages and paywall content better)
-        if self.api_key:
+        if self.api_key and not provenance_required:
             try:
                 result = await self._tavily_extract(
                     url,
@@ -640,8 +688,31 @@ class WebFetchTool(Tool):
                                     }
                                 )
                             next_url = str(r.url.join(location))
+                            transition_error = provenance_transition_error(
+                                url,
+                                next_url,
+                            )
+                            if transition_error is not None:
+                                return json.dumps(
+                                    {
+                                        "error": "Redirect is not provenance-safe",
+                                        "error_code": transition_error,
+                                        "url": url,
+                                        "finalUrl": next_url,
+                                    }
+                                )
                             continue
 
+                        if r.status_code in {401, 403, 451}:
+                            return json.dumps(
+                                {
+                                    "error": f"Authentication wall returned HTTP {r.status_code}",
+                                    "error_code": "auth_wall",
+                                    "url": url,
+                                    "finalUrl": str(r.url),
+                                    "status": r.status_code,
+                                }
+                            )
                         r.raise_for_status()
 
                         # Content-type filter
@@ -692,6 +763,16 @@ class WebFetchTool(Tool):
                         final_url = str(r.url)
                         break
 
+            if not body_text.strip():
+                return json.dumps(
+                    {
+                        "error": "Fetched document body is empty",
+                        "error_code": "empty_body",
+                        "url": url,
+                        "finalUrl": final_url,
+                    }
+                )
+
             # Parse based on content type
             if "application/json" in ctype:
                 text, extractor = json.dumps(json.loads(body_text), indent=2), "json"
@@ -706,6 +787,25 @@ class WebFetchTool(Tool):
                 extractor = "readability"
             else:
                 text, extractor = body_text, "raw"
+
+            if _has_auth_path(final_url) or _auth_gate_body(body_text, text):
+                return json.dumps(
+                    {
+                        "error": "Fetched document is an authentication wall",
+                        "error_code": "auth_wall",
+                        "url": url,
+                        "finalUrl": final_url,
+                    }
+                )
+            if not text.strip():
+                return json.dumps(
+                    {
+                        "error": "Fetched document has no extracted text",
+                        "error_code": "empty_body",
+                        "url": url,
+                        "finalUrl": final_url,
+                    }
+                )
 
             truncated = len(text) > max_chars
             if truncated:

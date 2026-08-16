@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
@@ -82,7 +84,7 @@ def _whatsapp_bridge_health(target: str, timeout_s: float) -> dict[str, Any]:
 
     request_id = uuid.uuid4().hex
     envelope = {
-        "version": 2,
+        "version": PROTOCOL_VERSION,
         "type": "health",
         "token": token,
         "requestId": request_id,
@@ -104,6 +106,11 @@ def _whatsapp_bridge_health(target: str, timeout_s: float) -> dict[str, Any]:
             data = json.loads(raw)
             if not isinstance(data, dict):
                 continue
+            if data.get("version") != PROTOCOL_VERSION:
+                raise RuntimeError(
+                    "Bridge health protocol mismatch: "
+                    f"expected {PROTOCOL_VERSION}, got {data.get('version')!r}"
+                )
             if data.get("type") != "response":
                 continue
             if data.get("requestId") != request_id:

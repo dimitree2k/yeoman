@@ -68,6 +68,18 @@ def _voice_event() -> InboundEvent:
     )
 
 
+def _text_group_event(answer_shape: str) -> InboundEvent:
+    return InboundEvent(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        sender_id="456",
+        content="incoming",
+        message_id="msg-1",
+        is_group=True,
+        raw_metadata={"conversation_state": {"answer_shape": answer_shape}},
+    )
+
+
 async def _run_outbound(
     *,
     reply: str,
@@ -111,6 +123,56 @@ async def test_inline_code_reaction_marker_detected(tmp_path):
     assert "[reacted with 🤙]" in persist[0].assistant_content
     assert "reaction_sent" in _metric_names(ctx)
     assert tts.inputs == []
+
+
+@pytest.mark.asyncio
+async def test_group_one_liner_state_limits_outbound_text():
+    ctx = PipelineContext(event=_text_group_event("one_liner"))
+    ctx.decision = PolicyDecision(
+        accept_message=True,
+        should_respond=True,
+        allowed_tools=frozenset(),
+        reason="test",
+    )
+    ctx.reply = (
+        "Das ist der Teil, der als einzelner sozialer Treffer stehen bleiben sollte. "
+        "Diese zweite erklaerende Auswalzung macht den Gruppenchat wieder zur Buehne."
+    )
+    middleware = OutboundMiddleware()
+
+    async def _noop(_ctx: PipelineContext) -> None:
+        return None
+
+    await middleware(ctx, _noop)
+
+    outbound = next(intent for intent in ctx.intents if isinstance(intent, SendOutboundIntent))
+    assert outbound.event.content == (
+        "Das ist der Teil, der als einzelner sozialer Treffer stehen bleiben sollte."
+    )
+    persist = next(intent for intent in ctx.intents if isinstance(intent, PersistSessionIntent))
+    assert persist.assistant_content == outbound.event.content
+
+
+@pytest.mark.asyncio
+async def test_group_social_one_liner_state_has_hard_char_cap():
+    ctx = PipelineContext(event=_text_group_event("social_one_liner"))
+    ctx.decision = PolicyDecision(
+        accept_message=True,
+        should_respond=True,
+        allowed_tools=frozenset(),
+        reason="test",
+    )
+    ctx.reply = " ".join(["vieltext"] * 80)
+    middleware = OutboundMiddleware()
+
+    async def _noop(_ctx: PipelineContext) -> None:
+        return None
+
+    await middleware(ctx, _noop)
+
+    outbound = next(intent for intent in ctx.intents if isinstance(intent, SendOutboundIntent))
+    assert len(outbound.event.content) <= 180
+    assert outbound.event.content.endswith("...")
 
 
 @pytest.mark.asyncio

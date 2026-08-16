@@ -15,6 +15,7 @@ wrong endpoint:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -168,6 +169,85 @@ async def test_litellm_provider_passes_api_key_and_base_per_call(monkeypatch) ->
     assert captured["api_base"] == "https://api.xiaomimimo.com/v1"
 
 
+@pytest.mark.asyncio
+async def test_litellm_provider_passes_structured_output_call_controls(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content='{"intent":"answer"}',
+                        reasoning_content=None,
+                        tool_calls=[],
+                    ),
+                )
+            ],
+            usage=None,
+        )
+
+    monkeypatch.setattr(
+        "yeoman_gateway.providers.litellm_provider.acompletion",
+        fake_acompletion,
+    )
+    provider = LiteLLMProvider(
+        api_key="openrouter-test-key",
+        api_base="https://openrouter.ai/api/v1",
+        default_model="z-ai/glm-5.2",
+    )
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "turn_plan",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"intent": {"type": "string"}},
+                "required": ["intent"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    response = await provider.chat(
+        [{"role": "user", "content": "answer this"}],
+        response_format=response_format,
+        timeout_seconds=12.0,
+        max_retries=0,
+    )
+
+    assert response.content == '{"intent":"answer"}'
+    assert captured["response_format"] == response_format
+    assert captured["timeout"] == 12.0
+    assert captured["num_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_enforces_total_wall_clock_timeout(monkeypatch) -> None:
+    async def slow_acompletion(**kwargs):
+        del kwargs
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(
+        "yeoman_gateway.providers.litellm_provider.acompletion",
+        slow_acompletion,
+    )
+    provider = LiteLLMProvider(default_model="z-ai/glm-5.2")
+
+    response = await asyncio.wait_for(
+        provider.chat(
+            [{"role": "user", "content": "answer this"}],
+            timeout_seconds=0.01,
+        ),
+        timeout=0.1,
+    )
+
+    assert response.finish_reason == "error"
+
+
 def test_litellm_provider_preserves_reasoning_content_from_response() -> None:
     provider = LiteLLMProvider(default_model="deepseek-v4-flash")
     response = SimpleNamespace(
@@ -187,3 +267,31 @@ def test_litellm_provider_preserves_reasoning_content_from_response() -> None:
     parsed = provider._parse_response(response)
 
     assert parsed.reasoning_content == "The user asked for current data, so I need a tool."
+
+
+@pytest.mark.parametrize("content", [None, "", "   \n\t"])
+def test_litellm_provider_marks_empty_non_tool_response_as_error(
+    content: str | None,
+) -> None:
+    provider = LiteLLMProvider(default_model="z-ai/glm-5.2")
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content=content,
+                    reasoning_content=None,
+                    tool_calls=[],
+                ),
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=1176,
+            completion_tokens=31,
+            total_tokens=1207,
+        ),
+    )
+
+    parsed = provider._parse_response(response)
+
+    assert parsed.finish_reason == "error"

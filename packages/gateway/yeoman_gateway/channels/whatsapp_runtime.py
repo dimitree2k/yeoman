@@ -25,8 +25,8 @@ from yeoman_shared.utils.process import (
     read_pid_file,
     signal_process_group,
 )
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
-PROTOCOL_VERSION = 2
 MANIFEST_FILENAME = "bridge.manifest.json"
 DEFAULT_BUILD_ID = "dev"
 STARTUP_HEALTH_RETRIES = 2

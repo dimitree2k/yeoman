@@ -6,6 +6,7 @@ import json
 
 import typer
 from rich.table import Table
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from .core import app, console
 
@@ -138,7 +139,7 @@ def chats_sync(
     async def _fetch_groups(url: str, token: str) -> list[dict]:
         request_id = uuid.uuid4().hex
         payload = {
-            "version": 2,
+            "version": PROTOCOL_VERSION,
             "type": "list_groups",
             "token": token,
             "requestId": request_id,
@@ -154,7 +155,7 @@ def chats_sync(
                     raise TimeoutError("Bridge did not reply in time")
                 raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 data = json.loads(raw)
-                if data.get("version") != 2:
+                if data.get("version") != PROTOCOL_VERSION:
                     continue
                 if data.get("type") != "response":
                     continue

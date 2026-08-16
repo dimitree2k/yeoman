@@ -16,6 +16,7 @@ import websockets
 from loguru import logger
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.core.admin_commands import (
     AdminCommandContext,
@@ -245,11 +246,13 @@ class EnginePolicyAdapter(PolicyPort):
     ) -> PolicyDecision:
         persona_file: str | None = None
         model_profile: str | None = None
+        reply_budget: dict[str, object] = {}
         try:
             if self._engine is not None and event.channel in self._engine.apply_channels:
                 origin = self._engine.resolve_policy(event.channel, handoff.origin_chat_id)
                 persona_file = origin.persona_file
                 model_profile = origin.model_profile
+                reply_budget = dict(origin.reply_budget)
         except Exception:
             pass
         persona_text = self._engine.persona_text(persona_file) if self._engine is not None else None
@@ -266,6 +269,7 @@ class EnginePolicyAdapter(PolicyPort):
             notes_allow_blocked_senders=notes.allow_blocked_senders,
             notes_batch_interval_seconds=notes.batch_interval_seconds,
             notes_batch_max_messages=notes.batch_max_messages,
+            reply_budget=reply_budget,
             model_profile=model_profile,
             is_owner=is_owner,
             private_handoff_active=True,
@@ -297,8 +301,6 @@ class EnginePolicyAdapter(PolicyPort):
         target = str(reference or "").strip()
         if not target:
             return None, "group reference cannot be empty"
-        if " " not in target and target.endswith("@g.us"):
-            return target, None
         if self._policy_admin_service is None:
             return None, "group resolver unavailable: policy admin service is not configured"
 
@@ -549,6 +551,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_cooldown_seconds=900,
                 talkative_cooldown_delay_seconds=2.5,
                 talkative_cooldown_use_llm_message=False,
+                reply_budget={},
                 session_history_limit=None,
                 source="disabled",
             )
@@ -571,6 +574,7 @@ class EnginePolicyAdapter(PolicyPort):
         talkative_cooldown_use_llm_message = False
         contacts_disclosure = False
         session_history_limit: int | None = None
+        reply_budget: dict[str, object] = {}
         model_profile: str | None = None
         when_to_reply_mode: Literal[
             "all", "mention_only", "allowed_senders", "owner_only", "off"
@@ -595,6 +599,7 @@ class EnginePolicyAdapter(PolicyPort):
                 talkative_cooldown_use_llm_message = effective.talkative_cooldown_use_llm_message
                 contacts_disclosure = effective.contacts_disclosure
                 session_history_limit = effective.session_history_limit
+                reply_budget = dict(effective.reply_budget)
                 model_profile = effective.model_profile
             except Exception:
                 # Policy voice output settings are optional and should never break evaluation.
@@ -647,6 +652,7 @@ class EnginePolicyAdapter(PolicyPort):
             talkative_cooldown_cooldown_seconds=talkative_cooldown_cooldown_seconds,
             talkative_cooldown_delay_seconds=talkative_cooldown_delay_seconds,
             talkative_cooldown_use_llm_message=talkative_cooldown_use_llm_message,
+            reply_budget=reply_budget,
             model_profile=model_profile,
             contacts_disclosure=contacts_disclosure,
             session_history_limit=session_history_limit,
@@ -737,6 +743,7 @@ class EnginePolicyAdapter(PolicyPort):
                         "delaySeconds": effective.talkative_cooldown_delay_seconds,
                         "useLlmMessage": effective.talkative_cooldown_use_llm_message,
                     },
+                    "replyBudget": effective.reply_budget,
                 }
                 if effective is not None
                 else None
@@ -2379,7 +2386,7 @@ class EnginePolicyAdapter(PolicyPort):
         async def _fetch(url: str, chat_ids: list[str], bridge_token: str) -> dict[str, str]:
             request_id = uuid.uuid4().hex
             payload = {
-                "version": 2,
+                "version": PROTOCOL_VERSION,
                 "type": "list_groups",
                 "token": bridge_token,
                 "requestId": request_id,
@@ -2395,7 +2402,7 @@ class EnginePolicyAdapter(PolicyPort):
                         raise TimeoutError("bridge did not reply in time")
                     raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                     data = json.loads(raw)
-                    if data.get("version") != 2:
+                    if data.get("version") != PROTOCOL_VERSION:
                         continue
                     if data.get("type") != "response":
                         continue

@@ -80,6 +80,7 @@ export interface SendMediaInput {
   caption?: string;
   replyToMessageId?: string;
   mentions?: string[];
+  clientMessageId?: string;
 }
 
 export async function resolveWhatsAppWebVersion(
@@ -100,6 +101,7 @@ export interface SendPollInput {
   question: string;
   options: string[];
   maxSelections?: number;
+  clientMessageId?: string;
 }
 
 export interface ReactInput {
@@ -108,6 +110,7 @@ export interface ReactInput {
   emoji: string;
   participantJid?: string;
   fromMe?: boolean;
+  clientMessageId?: string;
 }
 
 export type PresenceState = 'available' | 'unavailable' | 'composing' | 'paused' | 'recording';
@@ -1477,7 +1480,8 @@ export class WhatsAppClient {
     text: string,
     replyToMessageId?: string,
     mentions?: string[],
-  ): Promise<{ to: string }> {
+    clientMessageId?: string,
+  ): Promise<{ to: string; messageId?: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1491,17 +1495,18 @@ export class WhatsAppClient {
     if (translatedMentions?.length) {
       message.mentions = translatedMentions;
     }
-    let sent: any;
-    if (quoted) {
-      sent = await this.sock.sendMessage(to, message, { quoted });
-    } else {
-      sent = await this.sock.sendMessage(to, message);
-    }
+    const sent = await this.sock.sendMessage(to, message, {
+      ...(quoted ? { quoted } : {}),
+      ...(clientMessageId ? { messageId: clientMessageId } : {}),
+    });
     this.rememberOutboundSelfMessage(to, sent);
-    return { to };
+    const messageId = String(sent?.key?.id || clientMessageId || '').trim() || undefined;
+    return { to, messageId };
   }
 
-  async sendMedia(input: SendMediaInput): Promise<{ to: string; mimeType: string; bytes: number }> {
+  async sendMedia(
+    input: SendMediaInput,
+  ): Promise<{ to: string; mimeType: string; bytes: number; messageId?: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1514,6 +1519,11 @@ export class WhatsAppClient {
     let caption = input.caption ? limitText(input.caption, 2_000) : undefined;
     const translated = caption ? this.translateMentions(normalizeMentions(input.mentions)) : undefined;
     const mentions = translated?.jids;
+    const sendOptions = {
+      ...(quoted ? { quoted } : {}),
+      ...(input.clientMessageId ? { messageId: input.clientMessageId } : {}),
+    };
+    let sent: any;
     if (caption && translated?.textReplacements.size) {
       for (const [lidToken, phoneToken] of translated.textReplacements) {
         caption = caption.replaceAll(`@${lidToken}`, `@${phoneToken}`);
@@ -1522,30 +1532,15 @@ export class WhatsAppClient {
 
     if (kind === 'image') {
       const payload = { image: media.buffer, caption, mimetype: media.mimeType, mentions };
-      let sent: any;
-      if (quoted) {
-        sent = await this.sock.sendMessage(input.to, payload, { quoted });
-      } else {
-        sent = await this.sock.sendMessage(input.to, payload);
-      }
+      sent = await this.sock.sendMessage(input.to, payload, sendOptions);
       this.rememberOutboundSelfMessage(input.to, sent);
     } else if (kind === 'video') {
       const payload = { video: media.buffer, caption, mimetype: media.mimeType, mentions };
-      let sent: any;
-      if (quoted) {
-        sent = await this.sock.sendMessage(input.to, payload, { quoted });
-      } else {
-        sent = await this.sock.sendMessage(input.to, payload);
-      }
+      sent = await this.sock.sendMessage(input.to, payload, sendOptions);
       this.rememberOutboundSelfMessage(input.to, sent);
     } else if (kind === 'audio') {
       const payload = { audio: media.buffer, ptt: true, mimetype: media.mimeType };
-      let sent: any;
-      if (quoted) {
-        sent = await this.sock.sendMessage(input.to, payload, { quoted });
-      } else {
-        sent = await this.sock.sendMessage(input.to, payload);
-      }
+      sent = await this.sock.sendMessage(input.to, payload, sendOptions);
       this.rememberOutboundSelfMessage(input.to, sent);
     } else {
       const payload = {
@@ -1555,19 +1550,22 @@ export class WhatsAppClient {
         mimetype: media.mimeType,
         mentions,
       };
-      let sent: any;
-      if (quoted) {
-        sent = await this.sock.sendMessage(input.to, payload, { quoted });
-      } else {
-        sent = await this.sock.sendMessage(input.to, payload);
-      }
+      sent = await this.sock.sendMessage(input.to, payload, sendOptions);
       this.rememberOutboundSelfMessage(input.to, sent);
     }
 
-    return { to: input.to, mimeType: media.mimeType, bytes: media.buffer.length };
+    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    return {
+      to: input.to,
+      mimeType: media.mimeType,
+      bytes: media.buffer.length,
+      messageId,
+    };
   }
 
-  async sendPoll(input: SendPollInput): Promise<{ to: string; options: number }> {
+  async sendPoll(
+    input: SendPollInput,
+  ): Promise<{ to: string; options: number; messageId?: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1577,36 +1575,53 @@ export class WhatsAppClient {
       throw new Error('Poll requires at least 2 options');
     }
 
-    const sent = await this.sock.sendMessage(input.to, {
-      poll: {
-        name: limitText(input.question, 512),
-        values: options.slice(0, 12),
-        selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
+    const sent = await this.sock.sendMessage(
+      input.to,
+      {
+        poll: {
+          name: limitText(input.question, 512),
+          values: options.slice(0, 12),
+          selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
+        },
       },
-    });
+      input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
+    );
     this.rememberOutboundSelfMessage(input.to, sent);
 
-    return { to: input.to, options: options.length };
+    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    return { to: input.to, options: options.length, messageId };
   }
 
-  async react(input: ReactInput): Promise<{ chatJid: string; messageId: string }> {
+  async react(
+    input: ReactInput,
+  ): Promise<{ chatJid: string; messageId: string; outboundMessageId?: string }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
 
-    await this.sock.sendMessage(input.chatJid, {
-      react: {
-        text: input.emoji,
-        key: {
-          remoteJid: input.chatJid,
-          id: input.messageId,
-          fromMe: Boolean(input.fromMe),
-          participant: input.participantJid,
+    const sent = await this.sock.sendMessage(
+      input.chatJid,
+      {
+        react: {
+          text: input.emoji,
+          key: {
+            remoteJid: input.chatJid,
+            id: input.messageId,
+            fromMe: Boolean(input.fromMe),
+            participant: input.participantJid,
+          },
         },
       },
-    });
+      input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
+    );
 
-    return { chatJid: input.chatJid, messageId: input.messageId };
+    const outboundMessageId =
+      String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    return {
+      chatJid: input.chatJid,
+      messageId: input.messageId,
+      outboundMessageId,
+    };
   }
 
   async updatePresence(input: PresenceUpdateInput): Promise<{ state: PresenceState; chatJid?: string }> {

@@ -52,6 +52,37 @@ _SOCIAL_IMAGE_CUE_RE = re.compile(
     r"text\s+(?:above\s+the\s+images\s+)?(?:reads|says)"
     r")\b"
 )
+_GROUP_MEMBER_BAIT_RE = re.compile(
+    r"(?is)\b(wer|wen|wem|welche\w*)\b.{0,100}\b(hier|gruppe|chat)\b.{0,100}"
+    r"\b(geht\s+dir|nervt|nerven|hasst|schlimmste|duemmste|dümmste|auf\s+den\s+sack)\b"
+)
+_REPLY_ACK_NORMALIZED = frozenset(
+    {
+        "ok",
+        "okay",
+        "k",
+        "jo",
+        "ja",
+        "yes",
+        "yep",
+        "jup",
+        "hm",
+        "hmm",
+        "ähm",
+        "aehm",
+        "ehm",
+        "uff",
+        "lol",
+        "haha",
+        "hahaha",
+        "juckt",
+        "lass es",
+    }
+)
+_REPLY_ACK_THINKING = frozenset({"hm", "hmm", "ähm", "aehm", "ehm", "uff"})
+_REPLY_ACK_DISMISSIVE = frozenset({"juckt", "lass es"})
+_LOW_CONTENT_REPLY_MAX_CHARS = 80
+_LOW_CONTENT_REPLY_MAX_TOKENS = 8
 _QUOTED_CONTEXT_DEICTIC_RE = re.compile(
     r"(?i)\b("
     r"das|dem|den|der|die|dies(?:e[rsn]?|er|es)?|hier|hierzu|dazu|darauf|"
@@ -209,6 +240,37 @@ def looks_like_social_reaction_prompt(text: str, metadata: dict[str, Any] | None
     return bool(has_image_context and _SOCIAL_IMAGE_CUE_RE.search(compact))
 
 
+def looks_like_reply_ack(text: str) -> bool:
+    compact = " ".join(str(text or "").strip().lower().split())
+    compact = compact.strip(".,!?;: ")
+    if not compact or len(compact) > 24:
+        return False
+    return compact in _REPLY_ACK_NORMALIZED
+
+
+def looks_like_low_content_reply(text: str) -> bool:
+    compact = " ".join(str(text or "").strip().split())
+    if not compact or looks_like_question_or_request(compact):
+        return False
+    if len(compact) > _LOW_CONTENT_REPLY_MAX_CHARS:
+        return False
+    return len(compact.split()) <= _LOW_CONTENT_REPLY_MAX_TOKENS
+
+
+def reaction_for_reply_ack(text: str) -> str:
+    compact = " ".join(str(text or "").strip().lower().split()).strip(".,!?;: ")
+    if compact in _REPLY_ACK_THINKING:
+        return "🤔"
+    if compact in _REPLY_ACK_DISMISSIVE:
+        return "🥱"
+    return "👍"
+
+
+def looks_like_group_member_bait(text: str) -> bool:
+    compact = " ".join(str(text or "").strip().split())
+    return bool(compact and _GROUP_MEMBER_BAIT_RE.search(compact))
+
+
 def looks_like_quoted_context_request(
     text: str,
     metadata: dict[str, Any] | None = None,
@@ -285,6 +347,9 @@ def classify_conversation_state(
     social_reaction = (
         not request_like and looks_like_social_reaction_prompt(content, metadata)
     )
+    reply_ack = reply_direct and looks_like_reply_ack(content)
+    low_content_reply = reply_direct and looks_like_low_content_reply(content)
+    group_member_bait = explicit_mention and looks_like_group_member_bait(content)
     recent_followup = is_recent_assistant_followup(
         session_manager=session_manager,
         channel=channel,
@@ -312,6 +377,12 @@ def classify_conversation_state(
         address_mode = "from_me"
     elif repair_feedback:
         address_mode = "repair_feedback"
+    elif group_member_bait:
+        address_mode = "group_member_bait"
+    elif reply_ack:
+        address_mode = "reply_ack"
+    elif low_content_reply:
+        address_mode = "low_content_reply"
     elif explicit_mention and social_reaction:
         address_mode = "explicit_social_mention"
     elif explicit_mention:
@@ -335,6 +406,8 @@ def classify_conversation_state(
 
     if address_mode == "none":
         preferred_action = "silence"
+    elif address_mode in {"reply_ack", "group_member_bait", "low_content_reply"}:
+        preferred_action = "react"
     elif address_mode == "name_mention":
         preferred_action = "react"
     else:
@@ -447,6 +520,30 @@ def _ambient_window_has_unrelated_intervening_human(
     rows = (metadata or {}).get("ambient_context_rows")
     if not isinstance(rows, list) or not rows:
         return False
+
+    assistant_text = " ".join(last_assistant_text.split())
+    assistant_row_index: int | None = None
+    legacy_unmarked_matches: list[int] = []
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if not isinstance(row, dict):
+            continue
+        row_text = " ".join(
+            str(row.get("text") or row.get("content") or "").split()
+        )
+        if row_text != assistant_text:
+            continue
+        sender_id = str(row.get("sender_id") or "").strip().casefold()
+        sender_name = str(row.get("sender_name") or "").strip()
+        if sender_id == "assistant":
+            assistant_row_index = index
+            break
+        if not sender_id and not sender_name:
+            legacy_unmarked_matches.append(index)
+    if assistant_row_index is None and legacy_unmarked_matches:
+        assistant_row_index = legacy_unmarked_matches[0]
+    if assistant_row_index is not None:
+        rows = rows[assistant_row_index + 1:]
 
     human_texts: list[str] = []
     for row in rows:

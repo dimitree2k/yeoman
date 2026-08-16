@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +11,9 @@ from yeoman_gateway.agent.tools.recall_conversation import RecallConversationToo
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.session.manager import Session, SessionManager
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+_JPEG_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
 
 
 def _make_event(
@@ -132,6 +137,20 @@ class TestSessionBoundary:
             }
         ]
         assert "internal_debug" not in history[0]
+
+    def test_hidden_rows_never_enter_prompt_history(self):
+        s = Session(key="test")
+        s.add_message("user", "visible before")
+        s.add_message("assistant", "internal marker 1", hidden=True)
+        s.add_message("assistant", "internal marker 2", hidden=True)
+        s.add_message("assistant", "visible after")
+
+        history = s.get_history(max_messages=2)
+
+        assert [row["content"] for row in history] == [
+            "visible before",
+            "visible after",
+        ]
 
 
 class TestPreflightHeuristic:
@@ -397,6 +416,106 @@ class TestConversationStateContext:
         assert "answer_shape: social_one_liner" in user_text
         assert "Treat this as a social beat, not a request for analysis." in user_text
         assert "Do not explain the premise" in user_text
+
+
+def test_v1_inline_image_symlink_is_omitted_fail_closed(tmp_path) -> None:
+    from yeoman_gateway.agent.context import ContextBuilder
+
+    target = tmp_path / "target.png"
+    target.write_bytes(_PNG_BYTES)
+    symlink = tmp_path / "chart.png"
+    symlink.symlink_to(target)
+
+    content = ContextBuilder(tmp_path)._build_user_content(
+        "Chart?",
+        [str(symlink)],
+    )
+
+    assert content == "Chart?"
+
+
+def test_v1_inline_image_sniff_and_encoding_share_one_open_descriptor(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from yeoman_gateway.agent.context import ContextBuilder
+
+    image = tmp_path / "racing-image.bin"
+    image.write_bytes(_PNG_BYTES)
+    original_open = os.open
+    image_opens = 0
+
+    def replace_path_after_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal image_opens
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if os.fspath(path) == os.fspath(image):
+            image_opens += 1
+            replacement = image.with_suffix(".replacement")
+            replacement.write_bytes(_JPEG_BYTES)
+            os.replace(replacement, image)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", replace_path_after_open)
+
+    content = ContextBuilder(tmp_path)._build_user_content(
+        "Chart?",
+        [str(image)],
+    )
+
+    assert image_opens == 1
+    assert isinstance(content, list)
+    url = content[1]["image_url"]["url"]
+    mime, encoded = url.split(",", 1)
+    assert mime == "data:image/png;base64"
+    assert base64.b64decode(encoded) == _PNG_BYTES
+
+
+def test_v1_inline_image_growth_after_fstat_is_omitted(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from yeoman_gateway.agent.context import ContextBuilder
+
+    image = tmp_path / "growing.png"
+    image.write_bytes(_PNG_BYTES)
+    builder = ContextBuilder(tmp_path)
+    builder.MAX_INLINE_IMAGE_BYTES = len(_PNG_BYTES) + 1
+    original_fstat = os.fstat
+    grew = False
+
+    def grow_after_fstat(descriptor):
+        nonlocal grew
+        opened_stat = original_fstat(descriptor)
+        if not grew:
+            with image.open("ab") as image_file:
+                image_file.write(b"unsafe-growth")
+            grew = True
+        return opened_stat
+
+    monkeypatch.setattr(os, "fstat", grow_after_fstat)
+
+    content = builder._build_user_content("Chart?", [str(image)])
+
+    assert grew
+    assert content == "Chart?"
+
+
+def test_v1_inline_image_uses_magic_bytes_for_mime_and_encoding(tmp_path) -> None:
+    from yeoman_gateway.agent.context import ContextBuilder
+
+    image = tmp_path / "chart.txt"
+    image.write_bytes(_PNG_BYTES)
+
+    content = ContextBuilder(tmp_path)._build_user_content(
+        "Chart?",
+        [str(image)],
+    )
+
+    assert isinstance(content, list)
+    url = content[1]["image_url"]["url"]
+    mime, encoded = url.split(",", 1)
+    assert mime == "data:image/png;base64"
+    assert base64.b64decode(encoded) == _PNG_BYTES
 
 
 class TestDeliveryRepairGate:

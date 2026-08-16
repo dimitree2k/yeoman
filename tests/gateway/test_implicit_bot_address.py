@@ -335,6 +335,97 @@ async def test_question_after_ten_minutes_wakes_when_bot_thread_is_uninterrupted
 
 
 @pytest.mark.asyncio
+async def test_followup_ignores_humans_before_last_assistant_reply() -> None:
+    event_time = datetime(2026, 7, 28, 0, 3, 47, tzinfo=UTC)
+    assistant_text = "Ich kann das gerade nicht verlässlich beantworten."
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": assistant_text,
+                "timestamp": (event_time - timedelta(minutes=13)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content="Und jetzt?",
+            timestamp=event_time,
+            raw_metadata={
+                "ambient_context_rows": [
+                    {
+                        "sender_id": "owner@s.whatsapp.net",
+                        "participant": "owner@s.whatsapp.net",
+                        "text": "Ok bitte mehr Details zum sell-off",
+                    },
+                    {
+                        "sender_id": "assistant",
+                        "sender_name": "Yeoman",
+                        "participant": None,
+                        "text": assistant_text,
+                    },
+                ]
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _tracking_next)
+
+    assert ctx.reply == "downstream reached"
+    assert ctx.event.reply_to_bot is True
+    assert ctx.event.raw_metadata["implicit_bot_address"] == "recent_assistant_followup"
+
+
+@pytest.mark.asyncio
+async def test_human_copy_of_last_assistant_text_does_not_reset_anchor() -> None:
+    event_time = datetime(2026, 7, 28, 0, 3, 47, tzinfo=UTC)
+    assistant_text = "Ich kann das gerade nicht verlässlich beantworten."
+    sessions = _Sessions(
+        [
+            {
+                "role": "assistant",
+                "content": assistant_text,
+                "timestamp": (event_time - timedelta(minutes=13)).isoformat(),
+            }
+        ]
+    )
+    ctx = PipelineContext(
+        event=_event(
+            content="Und jetzt?",
+            timestamp=event_time,
+            raw_metadata={
+                "ambient_context_rows": [
+                    {
+                        "sender_id": "assistant",
+                        "sender_name": "Yeoman",
+                        "participant": None,
+                        "text": assistant_text,
+                    },
+                    {
+                        "sender_id": "other@s.whatsapp.net",
+                        "participant": "other@s.whatsapp.net",
+                        "text": "Ganz anderes Thema",
+                    },
+                    {
+                        "sender_id": "owner@s.whatsapp.net",
+                        "participant": "owner@s.whatsapp.net",
+                        "text": assistant_text,
+                    },
+                ]
+            },
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware(session_manager=sessions)(ctx, _tracking_next)
+
+    assert ctx.event.reply_to_bot is False
+    assert ctx.decision is not None
+    assert ctx.decision.should_respond is False
+
+
+@pytest.mark.asyncio
 async def test_question_after_intervening_human_message_stays_silent() -> None:
     event_time = datetime(2026, 5, 25, 8, 53, 30, tzinfo=UTC)
     sessions = _Sessions(
@@ -537,6 +628,163 @@ async def test_plain_arvid_non_request_gets_reaction_only() -> None:
     assert len(reactions) == 1
     assert reactions[0].message_id == "msg-1"
     assert reactions[0].emoji in {"🤔", "🙄", "👀"}
+
+
+@pytest.mark.asyncio
+async def test_short_ack_reply_to_bot_gets_reaction_only() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Ok",
+            reply_to_bot=True,
+            reply_to_message_id="bot-msg-1",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert ctx.halted is True
+    assert ctx.reply is None
+    assert len(reactions) == 1
+    assert reactions[0].message_id == "msg-1"
+    assert reactions[0].emoji == "👍"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "reply_ack"
+    assert state["preferred_action"] == "react"
+
+
+@pytest.mark.asyncio
+async def test_hesitation_reply_to_bot_gets_reaction_only() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Ähm",
+            reply_to_bot=True,
+            reply_to_message_id="bot-msg-1",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert ctx.halted is True
+    assert ctx.reply is None
+    assert len(reactions) == 1
+    assert reactions[0].emoji == "🤔"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "reply_ack"
+
+
+@pytest.mark.asyncio
+async def test_ente_replay_meme_reply_to_bot_gets_reaction_only() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            chat_id="1234567890-1234567890@g.us",
+            content="Death by Snu Snu",
+            reply_to_bot=True,
+            reply_to_message_id="bot-msg-ente-1",
+            raw_metadata={"reply_to_text": "Wer hat das Thema eigentlich angefangen?"},
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert ctx.halted is True
+    assert ctx.reply is None
+    assert len(reactions) == 1
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "low_content_reply"
+    assert state["preferred_action"] == "react"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_bot_with_clear_question_still_answers() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Was meinst du konkret mit Proteinshake?",
+            reply_to_bot=True,
+            reply_to_message_id="bot-msg-1",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.halted is False
+    assert ctx.reply == "downstream reached"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "reply_to_bot"
+    assert state["preferred_action"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_repeated_bait_reactions_enter_short_group_cooldown() -> None:
+    middleware = ImplicitBotAddressMiddleware(
+        bait_reaction_streak_threshold=2,
+        bait_reaction_cooldown_seconds=300,
+    )
+    base = datetime(2026, 7, 20, 19, 24, tzinfo=UTC)
+
+    for index, content in enumerate(["Ok", "Ähm"]):
+        ctx = PipelineContext(
+            event=_event(
+                content=content,
+                message_id=f"msg-{index + 1}",
+                timestamp=base + timedelta(seconds=index * 5),
+                reply_to_bot=True,
+                reply_to_message_id="bot-msg-1",
+            ),
+            decision=_mention_only_decision(should_respond=True),
+        )
+
+        await middleware(ctx, _tracking_next)
+
+        assert len([i for i in ctx.intents if isinstance(i, SendReactionIntent)]) == 1
+
+    cooled_ctx = PipelineContext(
+        event=_event(
+            content="Death by Snu Snu",
+            message_id="msg-3",
+            timestamp=base + timedelta(seconds=10),
+            reply_to_bot=True,
+            reply_to_message_id="bot-msg-1",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await middleware(cooled_ctx, _tracking_next)
+
+    assert cooled_ctx.halted is True
+    assert cooled_ctx.reply is None
+    assert [i for i in cooled_ctx.intents if isinstance(i, SendReactionIntent)] == []
+    state = cooled_ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "bait_cooldown"
+    assert state["preferred_action"] == "silence"
+
+
+@pytest.mark.asyncio
+async def test_group_member_ranking_bait_gets_reaction_only() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="@123456789012345 wer hier in der gruppe geht dir am meisten auf den sack",
+            mentioned_bot=True,
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert ctx.halted is True
+    assert ctx.reply is None
+    assert len(reactions) == 1
+    assert reactions[0].emoji == "🙄"
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "group_member_bait"
+    assert state["preferred_action"] == "react"
 
 
 @pytest.mark.asyncio

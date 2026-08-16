@@ -56,6 +56,7 @@ async def test_ingest_event_uses_policy_comment_as_group_registry_name(
         media_type=None,
         media_path=None,
         media_bytes=None,
+        media_file_name=None,
         media_description=None,
         voice_transcript=None,
     )

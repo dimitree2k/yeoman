@@ -51,6 +51,9 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+        max_retries: int | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -63,6 +66,9 @@ class LLMProvider(ABC):
             temperature: Sampling temperature.
             reasoning: Optional reasoning config for OpenRouter
                        (e.g. {"enabled": true} or {"effort": "high"}).
+            response_format: Optional structured-output contract.
+            timeout_seconds: Optional per-call provider timeout.
+            max_retries: Optional per-call provider retry count.
 
         Returns:
             LLMResponse with content and/or tool calls.

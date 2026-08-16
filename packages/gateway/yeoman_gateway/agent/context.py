@@ -1,8 +1,9 @@
 """Context builder for assembling agent prompts."""
 
 import base64
-import mimetypes
+import os
 import platform
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -472,6 +473,10 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         # the (stable) system prompt benefits from provider prefix caching.
         messages.append({"role": "system", "content": self._build_temporal_grounding()})
 
+        reply_budget_context = self._build_reply_budget_context(current_metadata)
+        if reply_budget_context:
+            messages.append({"role": "system", "content": reply_budget_context})
+
         # Retrieved long-term memory (bounded, synthetic system context)
         if retrieved_memory_text:
             messages.append({"role": "system", "content": retrieved_memory_text})
@@ -507,6 +512,34 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
 
         return messages
 
+    @staticmethod
+    def _build_reply_budget_context(metadata: dict[str, Any] | None) -> str | None:
+        """Build trusted runtime guidance for the current turn's reply budget."""
+        if not metadata:
+            return None
+        raw = metadata.get("reply_budget")
+        if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
+            return None
+
+        def clean(value: object) -> str:
+            return " ".join(str(value or "").split())[:500]
+
+        lines = [
+            "[Reply Budget]",
+            f"answer_shape: {clean(raw.get('answer_shape') or 'short_take')}",
+            f"target_chars: {clean(raw.get('target_chars'))}",
+            f"hard_max_chars: {clean(raw.get('hard_max_chars'))}",
+            f"long_form_max_chars: {clean(raw.get('long_form_max_chars'))}",
+            f"long_form_allowed: {'true' if bool(raw.get('long_form_allowed', False)) else 'false'}",
+            f"hard_cap_enabled: {'true' if bool(raw.get('hard_cap_enabled', True)) else 'false'}",
+        ]
+        if raw.get("session_history_limit"):
+            lines.append(f"session_history_limit: {clean(raw.get('session_history_limit'))}")
+        instruction = clean(raw.get("instruction"))
+        if instruction:
+            lines.append(f"instruction: {instruction}")
+        return "\n".join(lines)
+
     def _build_user_content(
         self,
         text: str,
@@ -520,29 +553,115 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         text_with_context = self._with_input_modality_context(text_with_context, metadata)
         text_with_context = self._with_temporary_media_retrieval(text_with_context, metadata)
         text_with_context = self._with_voice_reply_guidance(text_with_context, metadata)
-        if not media:
-            return text_with_context
+        return self._with_image_blocks(text_with_context, tuple(media or ()))
 
-        images = []
+    def _with_image_blocks(
+        self,
+        text: str,
+        media: tuple[str, ...],
+    ) -> str | list[dict[str, Any]]:
+        """Append bounded, magic-byte-validated images after the text block."""
+        images: list[dict[str, Any]] = []
         for path in media[: self.MAX_INLINE_IMAGES]:
-            p = Path(path)
-            mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
+            image_path = Path(path)
+            image_bytes = self._read_regular_image(
+                image_path,
+                max_bytes=self.MAX_INLINE_IMAGE_BYTES,
+            )
+            if image_bytes is None:
                 continue
-            try:
-                if p.stat().st_size > self.MAX_INLINE_IMAGE_BYTES:
-                    continue
-            except OSError:
+            mime = self._sniff_image_bytes(image_bytes)
+            if mime is None:
                 continue
-            try:
-                b64 = base64.b64encode(p.read_bytes()).decode()
-            except OSError:
-                continue
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-
+            encoded = base64.b64encode(image_bytes).decode()
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{encoded}",
+                    },
+                }
+            )
         if not images:
-            return text_with_context
-        return [{"type": "text", "text": text_with_context}, *images]
+            return text
+        return [{"type": "text", "text": text}, *images]
+
+    @staticmethod
+    def _sniff_image_mime(path: Path) -> str | None:
+        """Identify supported inline images by content, never by extension."""
+        header = ContextBuilder._read_regular_image(
+            path,
+            max_bytes=None,
+            read_bytes=12,
+        )
+        if header is None:
+            return None
+        return ContextBuilder._sniff_image_bytes(header)
+
+    @staticmethod
+    def _sniff_image_bytes(content: bytes) -> str | None:
+        header = content[:12]
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if (
+            len(header) >= 12
+            and header.startswith(b"RIFF")
+            and header[8:12] == b"WEBP"
+        ):
+            return "image/webp"
+        return None
+
+    @staticmethod
+    def _read_regular_image(
+        path: Path,
+        *,
+        max_bytes: int | None,
+        read_bytes: int | None = None,
+    ) -> bytes | None:
+        """Read one regular non-symlink file from one descriptor, fail closed."""
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        non_block = getattr(os, "O_NONBLOCK", None)
+        if (
+            not isinstance(no_follow, int)
+            or no_follow == 0
+            or not isinstance(non_block, int)
+            or non_block == 0
+        ):
+            return None
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | no_follow
+                | non_block,
+            )
+            opened_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                return None
+            if max_bytes is not None and opened_stat.st_size > max_bytes:
+                return None
+            limit = (
+                max_bytes + 1
+                if read_bytes is None and max_bytes is not None
+                else read_bytes
+            )
+            with os.fdopen(descriptor, "rb") as image_file:
+                descriptor = -1
+                content = image_file.read(limit)
+        except (OSError, ValueError):
+            return None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if max_bytes is not None and len(content) > max_bytes:
+            return None
+        return content
 
     def _with_input_modality_context(self, text: str, metadata: dict[str, Any] | None) -> str:
         """Append compact modality hint when input originated from voice."""

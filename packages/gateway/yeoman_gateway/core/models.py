@@ -67,6 +67,7 @@ class PolicyDecision:
     talkative_cooldown_cooldown_seconds: int = 900
     talkative_cooldown_delay_seconds: float = 2.5
     talkative_cooldown_use_llm_message: bool = False
+    reply_budget: dict[str, object] = field(default_factory=dict)
     model_profile: str | None = None
     contacts_disclosure: bool = False
     session_history_limit: int | None = None

@@ -1,12 +1,15 @@
 """Tests for built-in trigger check functions."""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from yeoman_overseer.trigger.checks import (
+    _whatsapp_bridge_health,
     check_disk_usage_above,
     check_file_age_exceeds,
     check_process_alive,
@@ -15,6 +18,7 @@ from yeoman_overseer.trigger.checks import (
     check_whatsapp_bridge_connected,
     run_check,
 )
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 
 def test_process_alive_current_process() -> None:
@@ -118,6 +122,55 @@ def test_whatsapp_bridge_connected_reads_protocol_health(monkeypatch: pytest.Mon
     assert result.value is True
     assert "connected=True" in result.detail
     assert "running=True" in result.detail
+
+
+def test_whatsapp_bridge_health_uses_shared_protocol_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[dict[str, object]] = []
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+        def recv(self, *, timeout: float) -> str:
+            assert timeout > 0
+            return json.dumps(
+                {
+                    "version": PROTOCOL_VERSION,
+                    "type": "response",
+                    "requestId": sent[0]["requestId"],
+                    "payload": {
+                        "ok": True,
+                        "result": {"whatsapp": {"connected": True}},
+                    },
+                }
+            )
+
+    wa = SimpleNamespace(
+        bridge_token="secret",
+        resolved_bridge_url="ws://localhost:3001",
+        max_payload_bytes=1024,
+    )
+    monkeypatch.setattr(
+        "yeoman_shared.config.loader.load_config",
+        lambda: SimpleNamespace(channels=SimpleNamespace(whatsapp=wa)),
+    )
+    monkeypatch.setattr(
+        "websockets.sync.client.connect",
+        lambda *args, **kwargs: Socket(),
+    )
+
+    result = _whatsapp_bridge_health(target="default", timeout_s=1.0)
+
+    assert sent[0]["version"] == PROTOCOL_VERSION == 3
+    assert result["whatsapp"]["connected"] is True
 
 def test_whatsapp_bridge_connected_false_when_logged_out(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_health(target: str, timeout_s: float) -> dict:

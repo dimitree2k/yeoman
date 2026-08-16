@@ -202,6 +202,54 @@ class _DeferredPromiseThenAnswerProvider(LLMProvider):
         return "dummy/model"
 
 
+class _GermanMarketPromiseThenAnswerProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.second_messages: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del tools, model, max_tokens, temperature, reasoning
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(content="Ich rufe die aktuellen Marktdaten für NVIDIA ab.")
+        self.second_messages = messages
+        return LLMResponse(content="NVDA ist heute leicht grün; Haupttreiber sind AI-Capex und Analysten-Upgrades.")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+class _MarketPreflightAnswerProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[list[dict[str, Any]]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del tools, model, max_tokens, temperature, reasoning
+        self.calls.append(messages)
+        return LLMResponse(content="NVDA: 212,06 $, +2,3 %. Gründe: AI-Capex bleibt stark; Edge/Jetson-Preisstory stützt Pricing-Power.")
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
 class _ClarifyingQuestionProvider(LLMProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -442,6 +490,81 @@ async def test_deferred_work_promise_is_repaired_before_reply(tmp_path: Path) ->
     ]
     assert any("only promised future work" in message for message in repair_messages)
     assert any("call an available tool now" in message for message in repair_messages)
+
+
+@pytest.mark.asyncio
+async def test_german_market_fetch_promise_is_repaired_before_reply(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _GermanMarketPromiseThenAnswerProvider()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+
+    out = await responder.generate_reply(
+        _event(),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"market_intelligence"}),
+            reason="test",
+        ),
+    )
+
+    await responder.aclose()
+
+    assert out == "NVDA ist heute leicht grün; Haupttreiber sind AI-Capex und Analysten-Upgrades."
+    assert provider.calls == 2
+    repair_messages = [
+        message["content"]
+        for message in provider.second_messages
+        if message["role"] == "system"
+    ]
+    assert any("only promised future work" in message for message in repair_messages)
+
+
+@pytest.mark.asyncio
+async def test_v1_does_not_semantically_prefetch_market_tool_from_company_words(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _MarketPreflightAnswerProvider()
+    tool = _RecordingMarketIntelligenceTool()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=3,
+    )
+    responder.tools.register(tool)
+
+    out = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Arvid, was ist heute bei NVIDIA los? Bitte aktuelle Zahlen und die zwei wichtigsten Gründe, maximal 4 kurze Sätze.",
+            is_group=True,
+            mentioned_bot=True,
+        ),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"market_intelligence"}),
+            reason="test",
+        ),
+    )
+
+    await responder.aclose()
+
+    assert out == "NVDA: 212,06 $, +2,3 %. Gründe: AI-Capex bleibt stark; Edge/Jetson-Preisstory stützt Pricing-Power."
+    assert len(provider.calls) == 1
+    assert tool.calls == []
+    assert all(message["role"] != "tool" for message in provider.calls[0])
 
 
 @pytest.mark.asyncio
@@ -699,9 +822,15 @@ async def test_private_voice_send_records_hidden_marker_and_handoff(tmp_path: Pa
     assert out is None
     assert len(voice_tool.calls) == 1
     session = sessions.get_or_create("whatsapp:group@g.us")
-    history = session.get_history()
+    history = [
+        row
+        for row in session.get_full_history()
+        if row.get("role") in {"user", "assistant"}
+    ]
     assert history[-2]["role"] == "user"
     assert history[-1]["role"] == "assistant"
+    assert history[-1]["hidden"] is True
+    assert history[-1]["synthetic"] is True
     assert "Voice message delivered" in history[-1]["content"]
     assert "Do not send it again" in history[-1]["content"]
 

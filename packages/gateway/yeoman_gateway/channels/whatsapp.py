@@ -1,4 +1,4 @@
-"""WhatsApp channel implementation using strict bridge protocol v2."""
+"""WhatsApp channel implementation using the strict bridge protocol."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -94,7 +95,6 @@ def _whatsapp_jid_user_token(value: str) -> str:
     return normalized.split("@", 1)[0] if normalized else ""
 
 
-PROTOCOL_VERSION = 2
 DEDUPE_TTL_SECONDS = 20 * 60
 DEDUPE_CLEANUP_INTERVAL_SECONDS = 30
 TYPING_LOOP_INTERVAL_SECONDS = 4.0
@@ -102,8 +102,6 @@ TYPING_MAX_DURATION_SECONDS = 45.0
 SEND_CONNECT_WAIT_SECONDS = 8.0
 SEND_MAX_ATTEMPTS = 3
 SEND_RETRY_BASE_DELAY_SECONDS = 0.6
-
-
 class BridgeProtocolMismatchError(RuntimeError):
     """Bridge protocol version mismatch."""
 
@@ -279,7 +277,10 @@ class WhatsAppChannel(BaseChannel):
                     self._connected = True
                     self._repair_attempted = False
                     self._reconnect_attempts = 0
-                    logger.info("Connected to WhatsApp bridge (protocol v2)")
+                    logger.info(
+                        "Connected to WhatsApp bridge (protocol v{})",
+                        PROTOCOL_VERSION,
+                    )
 
                     await self._reader_task
 
@@ -439,7 +440,6 @@ class WhatsAppChannel(BaseChannel):
                     payload["replyToMessageId"] = reply_to
                 if allow_mentions and caption:
                     payload["mentions"] = list(mentions)
-
                 await self._send_command_with_retry(
                     "send_media",
                     payload,
@@ -459,6 +459,10 @@ class WhatsAppChannel(BaseChannel):
 
             if sent_any_media:
                 return
+            if not text:
+                raise RuntimeError(
+                    "WhatsApp outbound had no valid media and no text"
+                )
 
         if not text:
             return
@@ -471,7 +475,6 @@ class WhatsAppChannel(BaseChannel):
             payload["replyToMessageId"] = reply_to
         if allow_mentions:
             payload["mentions"] = list(mentions)
-
         await self._send_command_with_retry(
             "send_text",
             payload,
@@ -509,7 +512,6 @@ class WhatsAppChannel(BaseChannel):
         }
         if msg.participant_jid:
             payload["participantJid"] = msg.participant_jid
-
         await self._send_command_with_retry(
             "react",
             payload,

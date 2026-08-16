@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -13,7 +14,11 @@ if TYPE_CHECKING:
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.storage.chat_registry import ChatRegistry
 
-_MENTION_TOKEN_RE = re.compile(r"@?([0-9]{5,})(?:@(lid|s\.whatsapp\.net))?")
+_MENTION_TOKEN_RE = re.compile(
+    r"(?<![\w@\x80-\U0010ffff])"
+    r"@?([0-9]{5,})(?:@(lid|s\.whatsapp\.net))?"
+    r"(?![\w@.\x80-\U0010ffff])"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +112,24 @@ def _contact_identifiers(
     ]
 
 
+def _reference_matches_labels(
+    reference: str,
+    labels: list[str],
+) -> bool:
+    reference_tokens = re.findall(r"\w+", reference.casefold())
+    if not reference_tokens:
+        return False
+    width = len(reference_tokens)
+    for label in labels:
+        label_tokens = re.findall(r"\w+", str(label).casefold())
+        if any(
+            label_tokens[index:index + width] == reference_tokens
+            for index in range(0, len(label_tokens) - width + 1)
+        ):
+            return True
+    return False
+
+
 def resolve_contact_reference(
     *,
     contacts: "ContactsService",
@@ -145,6 +168,15 @@ def resolve_contact_reference(
 
     candidates: list[ContactResolution] = []
     for contact in matches.values():
+        labels = [
+            contact.display_name,
+            *[
+                alias.alias
+                for alias in contacts.store.get_aliases(contact.id)
+            ],
+        ]
+        if not _reference_matches_labels(ref, labels):
+            continue
         identifiers = _contact_identifiers(contacts, contact, channel=channel)
         if not identifiers:
             continue
@@ -162,6 +194,31 @@ def resolve_contact_reference(
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def contact_resolution_matches_reference(
+    *,
+    contacts: "ContactsService",
+    reference: str,
+    resolution: ContactResolution,
+) -> bool:
+    """Check that an exact mention resolves to one candidate for a name/alias."""
+    contact_id = contacts.known_jids.get(resolution.jid)
+    if not contact_id and resolution.matched_identifier:
+        contact_id = contacts.known_jids.get(resolution.matched_identifier)
+    if not contact_id:
+        return False
+    contact = contacts.store.get_contact(contact_id)
+    if contact is None:
+        return False
+    labels = [
+        contact.display_name,
+        *[
+            alias.alias
+            for alias in contacts.store.get_aliases(contact_id)
+        ],
+    ]
+    return _reference_matches_labels(reference, labels)
 
 
 class ResolveContactTool(Tool):
@@ -217,10 +274,22 @@ class ResolveContactTool(Tool):
             chat_registry=self._chat_registry,
         )
         if result is None:
-            return f"No single contact found matching '{query}'"
-        extra = (
-            f" (matched {result.matched_identifier})"
-            if result.matched_identifier
-            else ""
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error_code": "contact_not_resolved",
+                    "query": query,
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "contact": {
+                    "display_name": result.display_name,
+                    "jid": result.jid,
+                    "matched_identifier": result.matched_identifier,
+                },
+            },
+            ensure_ascii=False,
         )
-        return f"Resolved contact: {result.display_name} -> whatsapp:{result.jid}{extra}"

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from yeoman_gateway.core.admin_commands import AdminCommandResult
 from yeoman_gateway.core.intents import OrchestratorIntent
 from yeoman_gateway.core.models import InboundEvent
-from yeoman_gateway.core.pipeline import Pipeline
+from yeoman_gateway.core.pipeline import Middleware, Pipeline
 from yeoman_gateway.core.ports import PolicyPort, ReplyArchivePort, ResponderPort, SecurityPort
 from yeoman_gateway.pipeline.access import AccessControlMiddleware, NoReplyFilterMiddleware
 from yeoman_gateway.pipeline.admin import AdminCommandMiddleware
@@ -29,6 +29,7 @@ from yeoman_gateway.pipeline.normalize import NormalizationMiddleware
 from yeoman_gateway.pipeline.outbound import OutboundMiddleware
 from yeoman_gateway.pipeline.persona_evolution_approval import PersonaEvolutionApprovalMiddleware
 from yeoman_gateway.pipeline.policy import PolicyMiddleware
+from yeoman_gateway.pipeline.reply_budget import ReplyBudgetMiddleware
 from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
 from yeoman_gateway.pipeline.responder import ResponderMiddleware
 from yeoman_gateway.pipeline.security_input import InputSecurityMiddleware
@@ -87,7 +88,7 @@ class Orchestrator:
         persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
     ) -> None:
-        layers: list = [
+        layers: list[Middleware] = [
             NormalizationMiddleware(),
             DeduplicationMiddleware(ttl_seconds=dedupe_ttl_seconds),
             ArchiveMiddleware(archive=reply_archive),
@@ -105,6 +106,7 @@ class Orchestrator:
             AdminCommandMiddleware(handler=policy_admin_handler),
             PolicyMiddleware(policy=policy),
             ImplicitBotAddressMiddleware(session_manager=session_manager),
+            ReplyBudgetMiddleware(),
         ])
         if bus is not None and speakup_approval_store is not None and speakup_log is not None and security is not None:
             layers.append(

@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import websockets
 from yeoman_shared.config.loader import load_config
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.policy.admin.audit import PolicyAuditEntry, PolicyAuditStore
 from yeoman_gateway.policy.admin.contracts import (
@@ -464,17 +465,6 @@ class PolicyAdminService:
                 except OSError:
                     pass
 
-        log_path = base_dir / "var" / "logs" / "gateway.log"
-        if log_path.exists():
-            try:
-                with open(log_path, encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        for chat_id in re.findall(r"chat=([0-9a-zA-Z-]+@g\.us)", line):
-                            rec = ensure(chat_id)
-                            rec["seen_log"] = True
-            except OSError:
-                pass
-
         for chat_id, subject in self._bridge_subject_cache.items():
             rec = ensure(chat_id)
             rec["seen_bridge"] = True
@@ -600,8 +590,6 @@ class PolicyAdminService:
         target = str(query or "").strip()
         if not target:
             return None, "group reference cannot be empty"
-        if " " not in target and target.endswith("@g.us"):
-            return target, None
 
         try:
             effective_policy = policy or load_policy(self._policy_path)
@@ -1483,7 +1471,7 @@ class PolicyAdminService:
         async def _fetch(url: str, chat_ids: list[str], bridge_token: str) -> dict[str, str]:
             request_id = uuid.uuid4().hex
             payload = {
-                "version": 2,
+                "version": PROTOCOL_VERSION,
                 "type": "list_groups",
                 "token": bridge_token,
                 "requestId": request_id,
@@ -1499,7 +1487,7 @@ class PolicyAdminService:
                         raise TimeoutError("bridge did not reply in time")
                     raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
                     data = json.loads(raw)
-                    if data.get("version") != 2:
+                    if data.get("version") != PROTOCOL_VERSION:
                         continue
                     if data.get("type") != "response":
                         continue

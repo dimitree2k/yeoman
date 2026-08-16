@@ -20,6 +20,7 @@ AllowedToolsMode = Literal["all", "allowlist"]
 ToolAccessMode = Literal["everyone", "allowlist", "owner_only"]
 MemoryNotesMode = Literal["adaptive", "heuristic", "hybrid"]
 VoiceOutputMode = Literal["text", "in_kind", "always", "off"]
+LongFormBypassMode = Literal["off", "owner_only", "always"]
 ActionType = Literal[
     "answer_open_question",
     "surface_memory",
@@ -175,6 +176,38 @@ class TalkativeCooldownPolicyOverride(PolicyModel):
     use_llm_message: bool | None = Field(default=None, alias="useLlmMessage")
 
 
+class ReplyBudgetPolicy(PolicyModel):
+    """Per-chat answer-length budget for group replies."""
+
+    enabled: bool = False
+    targets: dict[str, int] = Field(
+        default_factory=lambda: {
+            "social_one_liner": 180,
+            "one_liner": 220,
+            "short_take": 420,
+            "repair": 700,
+            "researched_answer": 1200,
+        }
+    )
+    hard_max_chars: int = Field(default=600, alias="hardMaxChars", ge=1)
+    long_form_max_chars: int = Field(default=2200, alias="longFormMaxChars", ge=1)
+    long_form_bypass: LongFormBypassMode = Field(default="owner_only", alias="longFormBypass")
+    session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
+    ambient_window_limit: int | None = Field(default=None, alias="ambientWindowLimit", ge=1, le=50)
+
+
+class ReplyBudgetPolicyOverride(PolicyModel):
+    """Partial override for per-chat answer-length budgets."""
+
+    enabled: bool | None = None
+    targets: dict[str, int] | None = None
+    hard_max_chars: int | None = Field(default=None, alias="hardMaxChars", ge=1)
+    long_form_max_chars: int | None = Field(default=None, alias="longFormMaxChars", ge=1)
+    long_form_bypass: LongFormBypassMode | None = Field(default=None, alias="longFormBypass")
+    session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
+    ambient_window_limit: int | None = Field(default=None, alias="ambientWindowLimit", ge=1, le=50)
+
+
 class SpontaneityPolicy(PolicyModel):
     """Per-chat eligibility and safety policy for proactive speakups."""
 
@@ -218,6 +251,7 @@ class ChatPolicy(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicy = Field(
         default_factory=TalkativeCooldownPolicy, alias="talkativeCooldown"
     )
+    reply_budget: ReplyBudgetPolicy = Field(default_factory=ReplyBudgetPolicy, alias="replyBudget")
     spontaneity: SpontaneityPolicy = Field(default_factory=SpontaneityPolicy)
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
@@ -241,6 +275,7 @@ class ChatPolicyOverride(PolicyModel):
     talkative_cooldown: TalkativeCooldownPolicyOverride | None = Field(
         default=None, alias="talkativeCooldown"
     )
+    reply_budget: ReplyBudgetPolicyOverride | None = Field(default=None, alias="replyBudget")
     spontaneity: SpontaneityPolicyOverride | None = None
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)

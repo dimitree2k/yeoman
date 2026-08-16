@@ -1,6 +1,8 @@
+import json
 import time
 from typing import Any
 
+import httpx
 import pytest
 from yeoman_gateway.agent.tools.web import _validate_domain, _WebRateLimiter
 from yeoman_shared.config.schema import WebToolsConfig
@@ -38,6 +40,79 @@ class _RecordingAsyncClient:
     ) -> _FakeResponse:
         self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         return _FakeResponse(self.response_payload)
+
+
+class _DirectResponse:
+    def __init__(
+        self,
+        *,
+        requested_url: str,
+        status_code: int = 200,
+        body: str = "<html><body><article>Article body</article></body></html>",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.url = httpx.URL(requested_url)
+        self.headers = httpx.Headers(
+            headers or {"content-type": "text/html; charset=utf-8"}
+        )
+        self._body = body.encode()
+
+    async def __aenter__(self) -> "_DirectResponse":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        request = httpx.Request("GET", self.url)
+        response = httpx.Response(
+            self.status_code,
+            request=request,
+        )
+        response.raise_for_status()
+
+    async def aiter_bytes(self, _chunk_size: int):
+        yield self._body
+
+
+class _DirectClient:
+    responses: list[_DirectResponse] = []
+
+    def __init__(self, **_kwargs: object) -> None:
+        self._responses = iter(self.responses)
+
+    async def __aenter__(self) -> "_DirectClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def stream(
+        self,
+        _method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+    ) -> _DirectResponse:
+        del headers
+        response = next(self._responses)
+        response.url = httpx.URL(url)
+        return response
+
+
+def _install_direct_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[_DirectResponse],
+) -> None:
+    from yeoman_gateway.agent.tools import web
+
+    async def _allow_dns(_hostname: str) -> None:
+        return None
+
+    _DirectClient.responses = responses
+    monkeypatch.setattr(web.httpx, "AsyncClient", _DirectClient)
+    monkeypatch.setattr(web, "_async_validate_dns", _allow_dns)
 
 
 def test_web_tools_config_defaults():
@@ -248,6 +323,367 @@ async def test_web_fetch_tavily_extract_accepts_query_focused_options(
         "include_favicon": True,
         "include_usage": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_provenance_required_bypasses_tavily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [_DirectResponse(requested_url="https://example.com/article")],
+    )
+    tool = WebFetchTool(
+        api_key="tvly-test",
+        web_config=WebToolsConfig(rate_limit_rpm=100),
+    )
+
+    async def _must_not_call(*args: object, **kwargs: object) -> str:
+        raise AssertionError("Tavily must not run for provenance-required fetches")
+
+    monkeypatch.setattr(tool, "_tavily_extract", _must_not_call)
+
+    result = json.loads(
+        await tool.execute(
+            url="https://example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["finalUrl"] == "https://example.com/article"
+    assert result["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403, 451])
+async def test_web_fetch_auth_wall_status_is_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="https://example.com/article",
+                status_code=status_code,
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="https://example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "auth_wall"
+    assert result["finalUrl"] == "https://example.com/article"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_empty_body_is_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="https://example.com/article",
+                body="",
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="https://example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "empty_body"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_same_host_canonical_redirect_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="http://www.example.com/article",
+                status_code=301,
+                headers={"location": "https://example.com/canonical/article"},
+            ),
+            _DirectResponse(
+                requested_url="https://example.com/canonical/article",
+            ),
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="http://www.example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["finalUrl"] == "https://example.com/canonical/article"
+    assert result["text"]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_cross_host_redirect_is_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="https://example.com/article",
+                status_code=302,
+                headers={"location": "https://login.other.example/signin"},
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="https://example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "cross_host_redirect"
+    assert result["finalUrl"] == "https://login.other.example/signin"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_url", "redirect_url", "error_code", "expected_final_url"),
+    [
+        (
+            "https://example.com/article",
+            "http://example.com/canonical",
+            "scheme_downgrade",
+            "http://example.com/canonical",
+        ),
+        (
+            "http://example.com:8080/article",
+            "https://example.com:8443/canonical",
+            "unsafe_port_redirect",
+            "http://example.com:8080/article",
+        ),
+    ],
+)
+async def test_web_fetch_rejects_unsafe_redirect_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_url: str,
+    redirect_url: str,
+    error_code: str,
+    expected_final_url: str,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url=requested_url,
+                status_code=302,
+                headers={"location": redirect_url},
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url=requested_url,
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == error_code
+    assert result["finalUrl"] == expected_final_url
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_explicit_nondefault_request_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    url = "https://example.com:8443/article"
+    _install_direct_fetch(
+        monkeypatch,
+        [_DirectResponse(requested_url=url)],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url=url,
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "unsafe_port_redirect"
+    assert result["finalUrl"] == url
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_allows_unicode_to_punycode_same_host_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="http://bücher.example/article",
+                status_code=301,
+                headers={
+                    "location": "https://www.xn--bcher-kva.example/canonical"
+                },
+            ),
+            _DirectResponse(
+                requested_url="https://www.xn--bcher-kva.example/canonical",
+            ),
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="http://bücher.example/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["finalUrl"] == (
+        "https://www.xn--bcher-kva.example/canonical"
+    )
+    assert result["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["login", "signin", "consent"])
+async def test_web_fetch_auth_wall_redirect_path_is_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url=f"https://example.com/{path}",
+                body="<html><body>Sign in to continue</body></html>",
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url=f"https://example.com/{path}",
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "auth_wall"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        '<html><body><input type="password"></body></html>',
+        "<html><body>Consent to continue</body></html>",
+    ],
+)
+async def test_web_fetch_nonredirecting_auth_wall_body_is_structured_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+) -> None:
+    from yeoman_gateway.agent.tools.web import WebFetchTool, _rate_limiter
+
+    _rate_limiter._timestamps.clear()
+    _rate_limiter.configure(100)
+    _install_direct_fetch(
+        monkeypatch,
+        [
+            _DirectResponse(
+                requested_url="https://example.com/article",
+                body=body,
+            )
+        ],
+    )
+
+    result = json.loads(
+        await WebFetchTool(
+            api_key="",
+            web_config=WebToolsConfig(rate_limit_rpm=100),
+        ).execute(
+            url="https://example.com/article",
+            provenance_required=True,
+        )
+    )
+
+    assert result["error_code"] == "auth_wall"
 
 
 @pytest.mark.asyncio

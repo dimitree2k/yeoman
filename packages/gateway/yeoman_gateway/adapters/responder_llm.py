@@ -1,4 +1,4 @@
-"""Typed responder that runs LLM + tools without legacy AgentLoop."""
+"""LLM-powered responder adapter."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
 from yeoman_gateway.agent.tools.registry import ToolRegistry
 from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
+    contact_resolution_matches_reference,
     resolve_contact_reference,
 )
 from yeoman_gateway.agent.tools.send_voice import SendVoiceTool, VoiceSendRequest
@@ -59,6 +60,7 @@ from yeoman_gateway.media.tts import (
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
 from yeoman_gateway.providers.base import LLMProvider, ToolCallRequest
+from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
 
 if TYPE_CHECKING:
@@ -142,6 +144,8 @@ _TEXTUAL_TOOL_COERCION_SAFE_TOOLS = frozenset(
 _DEFERRED_WORK_PROMISE_RE = re.compile(
     r"\b(?:"
     r"ich\s+(?:schau(?:e)?|checke|pr(?:ü|ue)fe|suche|recherchiere|gucke)\b"
+    r"|ich\s+rufe\s+[^.!?]{0,90}\b(?:ab|auf)\b"
+    r"|ich\s+hole\s+[^.!?]{0,90}\b(?:daten|zahlen|kurse|quotes?)\b"
     r"|ich\s+muss\s+(?:erst\s+)?[^.!?]{0,90}\b"
     r"(?:checken|pr(?:ü|ue)fen|suchen|nachschauen|recherchieren)\b"
     r"|(?:let me|i(?:'ll| will| need to| have to))\s+[^.!?]{0,90}\b"
@@ -973,6 +977,23 @@ class LLMResponder(ResponderPort):
         target_names = _delivery_named_targets(content)
         if not target_names:
             return
+        target_name = target_names[-1]
+        if self.contacts_service is not None:
+            resolved_targets: dict[str, str] = {}
+            for candidate in target_names:
+                resolution = resolve_contact_reference(
+                    contacts=self.contacts_service,
+                    reference=candidate,
+                    channel=channel,
+                    chat_id=chat_id,
+                    chat_registry=self.chat_registry,
+                )
+                if resolution is not None:
+                    resolved_targets[resolution.jid] = candidate
+            if len(resolved_targets) > 1:
+                return
+            if resolved_targets:
+                target_name = next(iter(resolved_targets.values()))
         voice_content = str(metadata.get("reply_to_text") or "").strip()
         if not voice_content:
             return
@@ -980,9 +1001,18 @@ class LLMResponder(ResponderPort):
             "tool": "send_voice",
             "channel": channel,
             "origin_chat_id": chat_id,
-            "target_name": target_names[-1],
+            "target_name": target_name,
             "content": voice_content,
             "source_message_id": str(metadata.get("reply_to_message_id") or ""),
+            "initiating_sender_aliases": sorted(
+                _whatsapp_aliases(
+                    str(metadata.get("sender_id") or ""),
+                    str(metadata.get("participant") or ""),
+                    str(metadata.get("sender_jid") or ""),
+                    str(metadata.get("sender_phone_jid") or ""),
+                    str(metadata.get("participant_lid") or ""),
+                )
+            ),
         }
 
     def _pending_delivery_mentions(
@@ -1021,6 +1051,16 @@ class LLMResponder(ResponderPort):
     ) -> str | None:
         if self.contacts_service is None:
             return None
+        target_name = str(pending.get("target_name") or "").strip()
+        if not target_name:
+            return None
+        expected = resolve_contact_reference(
+            contacts=self.contacts_service,
+            reference=target_name,
+            channel=channel,
+            chat_id=chat_id,
+            chat_registry=self.chat_registry,
+        )
         for mention in self._pending_delivery_mentions(content=content, metadata=metadata):
             resolution = resolve_contact_reference(
                 contacts=self.contacts_service,
@@ -1029,7 +1069,17 @@ class LLMResponder(ResponderPort):
                 chat_id=chat_id,
                 chat_registry=self.chat_registry,
             )
-            if resolution is not None:
+            if resolution is None:
+                continue
+            if expected is not None and _whatsapp_aliases(expected.jid).intersection(
+                _whatsapp_aliases(resolution.jid)
+            ):
+                return expected.jid
+            if expected is None and contact_resolution_matches_reference(
+                contacts=self.contacts_service,
+                reference=target_name,
+                resolution=resolution,
+            ):
                 return resolution.jid
         return None
 
@@ -1047,6 +1097,24 @@ class LLMResponder(ResponderPort):
         if not isinstance(pending_raw, dict):
             return False
         if pending_raw.get("tool") != "send_voice" or "send_voice" not in allowed_tools:
+            return False
+        stored_aliases = pending_raw.get("initiating_sender_aliases")
+        current_aliases = _whatsapp_aliases(
+            str(metadata.get("sender_id") or ""),
+            str(metadata.get("participant") or ""),
+            str(metadata.get("sender_jid") or ""),
+            str(metadata.get("sender_phone_jid") or ""),
+            str(metadata.get("participant_lid") or ""),
+        )
+        expected_aliases = (
+            _whatsapp_aliases(*[str(value) for value in stored_aliases])
+            if isinstance(stored_aliases, list)
+            else set()
+        )
+        if (
+            not isinstance(stored_aliases, list)
+            or not expected_aliases.intersection(current_aliases)
+        ):
             return False
         target_jid = self._resolve_pending_delivery_target(
             pending=pending_raw,
@@ -1256,7 +1324,6 @@ class LLMResponder(ResponderPort):
         # Guard against the model looping on the same side-effecting tool call
         _sent_calls: set[tuple[str, str]] = set()
         _send_tools = frozenset({"message", "send_voice", "send_media"})
-
         while iteration < self.max_iterations:
             iteration += 1
             iter_span = lf.start_span(
@@ -1347,6 +1414,8 @@ class LLMResponder(ResponderPort):
                     continue
 
                 if tool_calls:
+                    if current_metadata is not None:
+                        current_metadata["reply_budget_tool_used"] = True
                     tool_call_dicts: list[dict[str, Any]] = [
                         {
                             "id": tc.id,
@@ -2195,6 +2264,22 @@ class LLMResponder(ResponderPort):
             return None
 
         final_content = self._normalize_social_question_ending(final_content, metadata)
+        final_content, budget_result = enforce_reply_budget(
+            final_content,
+            metadata.get("reply_budget"),
+            user_content=content,
+            tool_used=bool(metadata.get("reply_budget_tool_used", False)),
+        )
+        if bool(budget_result.get("applied", False)):
+            self._metric("reply_budget_enforced", labels=(("channel", channel),))
+            logger.info(
+                "reply_budget enforced channel={} chat={} before={} after={} reason={}",
+                channel,
+                chat_id,
+                budget_result.get("before_chars"),
+                budget_result.get("after_chars"),
+                budget_result.get("reason"),
+            )
 
         if self.memory is not None:
             try:
@@ -2254,6 +2339,17 @@ class LLMResponder(ResponderPort):
         route_channel, route_chat_id = self._route_for_event(event)
         session_key = f"{route_channel}:{route_chat_id}"
         metadata = self._metadata_for_event(event)
+        if "reply_budget" not in metadata and decision.reply_budget:
+            state_raw = metadata.get("conversation_state")
+            state = state_raw if isinstance(state_raw, dict) else {}
+            budget = derive_reply_budget(
+                policy=decision.reply_budget,
+                answer_shape=str(state.get("answer_shape") or "short_take"),
+                content=event.content,
+                is_owner=bool(decision.is_owner),
+            )
+            if budget is not None:
+                metadata["reply_budget"] = budget.as_metadata()
         if self._voice_reply_expected(
             event=event,
             decision=decision,

@@ -8,7 +8,11 @@ import {
   PROTOCOL_VERSION,
 } from './protocol.js';
 
-test('parseBridgeCommand accepts valid v2 command', () => {
+test('protocol version gates deterministic message ids', () => {
+  assert.equal(PROTOCOL_VERSION, 3);
+});
+
+test('parseBridgeCommand accepts valid v3 command', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,
     type: 'send_text',
@@ -43,6 +47,44 @@ test('parseBridgeCommand accepts send_text with replyToMessageId', () => {
   assert.equal(parsed.ok, true);
   if (parsed.ok) {
     assert.equal(parsed.command.type, 'send_text');
+  }
+});
+
+test('parseBridgeCommand preserves a deterministic clientMessageId', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_text',
+    token: 'secret',
+    requestId: 'req-idempotent',
+    payload: {
+      to: '12345@s.whatsapp.net',
+      text: 'hello',
+      clientMessageId: 'A1B2C3D4E5F60708',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.payload.clientMessageId, 'A1B2C3D4E5F60708');
+  }
+});
+
+test('parseBridgeCommand rejects malformed clientMessageId', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'send_text',
+    token: 'secret',
+    requestId: 'req-bad-idempotent',
+    payload: {
+      to: '12345@s.whatsapp.net',
+      text: 'hello',
+      clientMessageId: 'bad id',
+    },
+  });
+
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.error.code, 'ERR_SCHEMA');
   }
 });
 
@@ -178,7 +220,7 @@ test('parseBridgeCommand rejects invalid presence_update payload', () => {
   }
 });
 
-test('response envelope uses protocol v2', () => {
+test('response envelope uses protocol v3', () => {
   const ok = createOkResponse({ requestId: 'req', accountId: 'default', result: { a: 1 } });
   const err = createErrorResponse({
     requestId: 'req',
