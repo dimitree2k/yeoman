@@ -13,6 +13,8 @@ The owner asked to pause for two or three days and keep Yeoman offline. The acti
 - `yeoman-gateway.service`
 - `yeoman-pinchtab.service`
 
+The startup-policy check found Overseer, Bridge, and Pinchtab enabled; Gateway was already disabled. To preserve the requested multi-day offline state across login/reboot, the pause disabled exactly Overseer, Bridge, and Pinchtab. All four units are now both inactive and disabled. Their pre-pause enablement state is therefore: Overseer enabled, Bridge enabled, Gateway disabled, Pinchtab enabled. Restore those three enablements only when the owner explicitly resumes runtime work; do not enable Gateway merely because the others were enabled.
+
 Do not restart a service, open a QR, touch WhatsApp auth, create live evidence, send a message, or perform an owner turn merely to resume coding.
 
 ## Exact repository checkpoints
@@ -54,7 +56,7 @@ The WIP has not passed final task review. The last active implementation checkpo
 ## Required work on resume
 
 1. Read this note and the three accepted prep plans before editing.
-2. Confirm all Yeoman services are still inactive; do not start them for synthetic implementation.
+2. Confirm all Yeoman services are still inactive and disabled; do not start or enable them for synthetic implementation. When the owner later authorizes live runtime work, restore the recorded pre-pause enablement state deliberately rather than enabling every unit.
 3. Resume from toolkit commit `fc86076352e8aaa417b7315688c02872bddf4826` without resetting or dropping the WIP commit.
 4. Finish held no-follow/current-owner/private-mode `creds.json` and stable canonical-auth production adapters, with the same checks at expectation build and immediately before send.
 5. Finish the successful typed DAG: exact acceptance fields and timestamps, complete `accepted_no_reply`, causal `inbound_reply_observed`, unsolicited-event retention, full close/count/head/order/readiness/completeness rules, and prove the returned close passes `compare_v2`.
