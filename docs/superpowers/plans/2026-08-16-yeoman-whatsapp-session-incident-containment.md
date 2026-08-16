@@ -99,12 +99,43 @@ Run the exact test module, then remove one redaction/count branch locally to pro
 
 Scan only the exact implementer transcript, Bridge log files, shell-history files, Task 1 reports/receipts, and WhatsApp authentication-store metadata authorized by the controller. Store only the JSON summary in the protected incident-evidence directory. Sign and encrypt the result; record ciphertext/signature/manifest commitments in the task report.
 
-### Task 3: Rotate and revalidate the WhatsApp linked session
+### Task 3: Harden the canonical QR reconnect boundary
+
+**Files:**
+- Modify: `scripts/whatsapp_qr_reconnect.py`
+- Create: `tests/gateway/test_whatsapp_qr_reconnect_script.py`
+- Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-3-report.md`
+
+**Interfaces:**
+- Consumes: empty prepared authentication directory, explicit owner-revocation acknowledgement, Bridge health.
+- Produces: owner-only QR SVG plus allowlisted service/health metadata; never raw health/error/QR content and never a Gateway restart.
+
+- [ ] **Step 1: Write failing orchestration and disclosure tests**
+
+Prove that status/poll output is a compact allowlist, exception detail is suppressed, start refuses nonempty auth or absent owner acknowledgement, and neither start nor restore restarts Gateway.
+
+- [ ] **Step 2: Run RED**
+
+Run the new test module against the current helper and record failures for raw health output and Gateway restart behavior.
+
+- [ ] **Step 3: Implement the minimal safe boundary**
+
+Separate auth quarantine from QR startup. Require a prepared empty auth directory and explicit owner-revocation flag, remove automatic auth backup and Gateway-restart options from start, keep Overseer untouched, capture QR-render subprocess output, reduce health to protocol/connected/running fields, and collapse operational exceptions to a generic error marker.
+
+- [ ] **Step 4: Verify GREEN and mutation resistance**
+
+Run the exact test module, Ruff, the complete Gateway suite, and a mutation that restores a Gateway restart or raw `lastError` output.
+
+- [ ] **Step 5: Review before owner interaction**
+
+Obtain independent task review. Do not quarantine auth, revoke devices, start Bridge, or render a QR in this task.
+
+### Task 4: Rotate and revalidate the WhatsApp linked session
 
 **Files:**
 - Use: `scripts/whatsapp_qr_reconnect.py`
 - Update: `session-context/2026-08-16-implementation-program-log.md`
-- Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-3-report.md`
+- Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-4-report.md`
 
 **Interfaces:**
 - Consumes: owner authorization, owner QR scan, current authentication state.
@@ -120,7 +151,7 @@ Hash manifests for raw-message, memory, archive, and receipt stores without read
 
 - [ ] **Step 3: Revoke and relink**
 
-Use the canonical reconnect helper so it creates a timestamped authentication backup and owner-only stable SVG. Keep the QR payload out of chat. Have the owner revoke linked devices and scan the fresh QR.
+Create a timestamped encrypted, non-restorable quarantine of the old authentication state before removing it from the active path. After the owner revokes every linked device, invoke the reviewed canonical reconnect helper against the prepared empty auth directory so it produces the owner-only stable SVG. Keep the QR payload out of chat. Have the owner scan the fresh QR.
 
 - [ ] **Step 4: Verify the new session**
 
