@@ -40,3 +40,15 @@ The original bundle hashes above remain the historical first acceptance. Later i
 - Implementation review aligned the state plan with the accepted smoke contract and closed safe-mode, exact-serialization, global state-nonce, typed observer-DAG, current-auth/inventory, and quarantine-predecessor gaps. The final prep-02 plan SHA-256 is `8ed9fc0b8c7a796399db22700511d75ae16ce7e1b7d29c9a24580f8480865086`; the final Terra code review accepted toolkit `f17ebe05598bf28c5f8a0f32dbc3b1d9dbb957a1` with 249 focused tests and no Critical or Important finding.
 
 A fresh Terra reviewer rejected two intermediate smoke drafts, then accepted this final contract with no remaining Critical or Important plan issue. This is plan-only acceptance; RED/GREEN/mutation evidence, independent implementation review, synthetic integration, and both standing Luna gates remain mandatory. No live runtime, service, authentication, key, evidence artifact, message, memory, archive, or network action was performed for these amendments.
+
+## Gate-bound quarantine receipt amendment
+
+A later implementation stop exposed that `phone-ready-v1` could not safely choose between the authorization turn and the successful quarantine receipt as its predecessor. The final reviewed contract uses the successful receipt as the immediate predecessor while preserving the entire causal chain. The first durable quarantine PREPARED journal, every later transaction state, and the final receipt bind the exact authorization gate head; recursive authentication proves `quiescence -> owner-all-devices-revoked-v1 -> owner-quarantine-authorized-v1 -> auth-quarantine-receipt-v1 -> phone-ready-v1`. Recovery requires exact equality to that journal-bound chain before acting. The fixed-kind opaque-artifact verifier was moved into prep-03 Task 1 before quarantine-receipt verification.
+
+The same Terra reviewer rejected two incomplete amendment drafts, then returned GO with no remaining Critical or Important plan issue. Accepted hashes:
+
+- prep-01 quarantine/identity: SHA-256 `0a668c0a5aea847beca23e62359cc480903f6b18d2c548e39c714160bd8267c6`
+- prep-02 state/evidence: SHA-256 `600396a3ed9510003b48401dcb24cc6acd34f3b96b10afb191dcd71ce57f4e2a`
+- prep-03 smoke/readiness: SHA-256 `6074344d5f1c6e6d6f1a3d40fab82983ee34825002a74fb224bcf415184abe30`
+
+This remains plan-only and synthetic-only. It authorizes no live runtime, service, authentication, QR, key, evidence-artifact, message, memory, archive, or network action.

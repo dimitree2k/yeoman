@@ -25,14 +25,18 @@
 ### Task 1: Implement separate owner turns and post-relink inventory attestation
 
 **Files:**
+- Modify: `scripts/incident_evidence_lib.py`
+- Modify: `scripts/whatsapp_auth_quarantine.py`
 - Create: `scripts/whatsapp_rotation_smoke.py`
+- Modify: `tests/shared/test_incident_evidence_lib.py`
+- Modify: `tests/shared/test_whatsapp_auth_quarantine.py`
 - Create: `tests/shared/test_whatsapp_rotation_smoke.py`
 - Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-4-prep-03-report.md`
 
 **Interfaces:**
 - `record_all_devices_revoked_turn(source: HostUserTurn, predecessor: EvidenceCommitment | None) -> EvidenceCommitment`
 - `record_quarantine_authorized_turn(source: HostUserTurn, predecessor: EvidenceCommitment) -> EvidenceCommitment`
-- `record_phone_ready_turn(source: HostUserTurn, predecessor: EvidenceCommitment) -> EvidenceCommitment`
+- `record_phone_ready_turn(source: HostUserTurn, quarantine_receipt: EvidenceCommitment) -> EvidenceCommitment`
 - `record_device_inventory_turn(source: HostUserTurn, owner_predecessor: EvidenceCommitment, current_auth: EvidenceCommitment) -> EvidenceCommitment`
 
 - [ ] **Step 1: Write RED owner-evidence tests**
@@ -46,6 +50,8 @@ def test_pre_action_gate_refuses_generic_or_combined_approval():
 
 Add tests that phone readiness before quarantine, inventory before relink/fingerprint, altered signatures, wrong predecessor kind, or count/labels/JID disclosure fails. Use fake structured `codex_app__read_thread` tuples; reject missing/reread-mismatched/duplicate/combined/reused host sources. Prove a correctly signed turn with content that does not exactly assert the recorded action fails, inventory fields are derived only from canonical host content, and a swapped current-auth commitment fails. No test infers owner identity.
 
+Before the quarantine receipt verifier, add the minimal common fixed-kind `verify_protected_artifact(kind, commitment)` dependency. It revalidates the commitment, HMAC/framing, dual-recipient decryption equality, ciphertext signature, and artifact byte commitment without returning or parsing raw payload bytes. Test invalid/mismatched/non-artifact commitments, swapped kinds, unequal decryptions, missing/tampered artifacts, public-wrapper fixed configuration/crypto closure, and output leakage. The quarantine receipt tests must include valid receipt/gate data whose referenced old-auth artifact is missing, swapped-kind, or tampered.
+
 - [ ] **Step 2: Implement fixed schemas and ordering**
 
 ```python
@@ -58,36 +64,35 @@ def record_quarantine_authorized_turn(source: HostUserTurn, predecessor: Evidenc
     require_owner_predecessor(predecessor, "owner-all-devices-revoked-v1", {"all_devices_revoked": True})
     return record_owner_turn("owner-quarantine-authorized-v1", {"quarantine_authorized": True}, source, predecessor)
 
-def record_phone_ready_turn(source: HostUserTurn, predecessor: EvidenceCommitment) -> EvidenceCommitment:
-    require_verified_quarantine_receipt()
+def record_phone_ready_turn(source: HostUserTurn, quarantine_receipt: EvidenceCommitment) -> EvidenceCommitment:
+    require_verified_quarantine_receipt(quarantine_receipt)
     require_exact_owner_statement(source, "YEOMAN_ROTATION_PHONE_READY_V1")
-    require_owner_predecessor(predecessor, "owner-quarantine-authorized-v1", {"quarantine_authorized": True})
-    return record_owner_turn("phone-ready-v1", {"phone_ready": True}, source, predecessor)
+    return record_owner_turn("phone-ready-v1", {"phone_ready": True}, source, quarantine_receipt)
 ```
 
-The first three owner records require their exact fixed versioned acknowledgement text. `owner-device-inventory-v1` requires exact canonical JSON under `YEOMAN_ROTATION_DEVICE_INVENTORY_V1`; it is only recorded after relink/current-fingerprint verification and includes `intended_yeoman_present`, `no_unknown_devices`, `observed_count`, and `labels` parsed from that host content inside ciphertext. It binds the verified current-auth fingerprint and contains no self JID. Every record has a unique user-turn source commitment, actual user-turn timestamp, exact predecessor-kind/HMAC, and signature verification; actual user content remains encrypted. Maintain a protected source-commitment uniqueness journal so the same host item cannot authorize two kinds.
+The first three owner records require their exact fixed versioned acknowledgement text. Revocation predecessor-links the accepted quiescence capability required by the quarantine controller; authorization predecessor-links revocation. Before recording phone readiness, call the quarantine module's typed verifier: the successful `auth-quarantine-receipt-v1` must bind the exact authorization gate head, and recursive verification must prove `quiescence -> revocation -> authorization -> quarantine receipt`. Missing, swapped, generic same-kind, or fabricated gate links refuse. Add these links to the quarantine receipt implementation and its tests before making this task GREEN.
+
+`phone-ready-v1` is deliberately a new post-action chain root whose exact predecessor is that recursively verified successful quarantine receipt, not the earlier authorization turn and not an implicit/global lookup. Its public/core interface remains exactly two arguments: source and quarantine receipt. `owner-device-inventory-v1` requires exact canonical JSON under `YEOMAN_ROTATION_DEVICE_INVENTORY_V1`; it is only recorded after relink/current-fingerprint verification and includes `intended_yeoman_present`, `no_unknown_devices`, `observed_count`, and `labels` parsed from that host content inside ciphertext. It binds the verified current-auth fingerprint and contains no self JID. Every record has a unique user-turn source commitment, actual user-turn timestamp, exact predecessor-kind/HMAC, and signature verification; actual user content remains encrypted. Maintain a protected source-commitment uniqueness journal so the same host item cannot authorize two kinds.
 
 - [ ] **Step 3: Verify GREEN, mutate, and commit**
 
 ```bash
-uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_smoke.py
-uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_smoke.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_smoke.py
+uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_smoke.py
+uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_auth_quarantine.py scripts/whatsapp_rotation_smoke.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_smoke.py
 ```
 
 Temporarily accept a generic approval and prove the test fails. Restore it and commit:
 
 ```bash
-git add scripts/whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_smoke.py
+git add scripts/incident_evidence_lib.py scripts/whatsapp_auth_quarantine.py scripts/whatsapp_rotation_smoke.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_smoke.py
 git commit -m "feat(incident): record rotation owner attestations"
 ```
 
 ### Task 2: Implement direct Bridge event observer before QR scan
 
 **Files:**
-- Modify: `scripts/incident_evidence_lib.py`
 - Modify: `scripts/whatsapp_rotation_smoke.py`
 - Modify: `scripts/whatsapp_rotation_state.py`
-- Modify: `tests/shared/test_incident_evidence_lib.py`
 - Modify: `tests/shared/test_whatsapp_rotation_smoke.py`
 - Modify: `tests/shared/test_whatsapp_rotation_state.py`
 
@@ -108,7 +113,7 @@ async def test_observer_captures_every_message_event_and_refuses_drop():
     assert observer.terminal_state == "capture_failed"
 ```
 
-Test readiness before QR, authenticated protocol-v3 event filtering, encrypted full raw-event artifact retention, normalized provenance receipt, disconnect, drop, overflow, and ordering. Every normalized event test covers sender, recipient, channel/account, event/observed timestamp, message ID, reply-to, sorted mentions, direction, new-vs-reply, content/media type, and content commitment. Add a minimal fixed-kind `verify_protected_artifact(kind, commitment)` to the common library: it revalidates the commitment, HMAC/framing, dual-recipient decryption equality, ciphertext signature, and artifact byte commitment without returning or parsing raw payload bytes. Test invalid/mismatched/non-artifact commitments, swapped kinds, unequal decryptions, and output leakage. Assert no raw event/content/JID reaches stdout.
+Test readiness before QR, authenticated protocol-v3 event filtering, encrypted full raw-event artifact retention, normalized provenance receipt, disconnect, drop, overflow, and ordering. Every normalized event test covers sender, recipient, channel/account, event/observed timestamp, message ID, reply-to, sorted mentions, direction, new-vs-reply, content/media type, and content commitment. Reuse the Task 1 common fixed-kind opaque-artifact verifier for every raw-event reference. Assert no raw event/content/JID reaches stdout.
 
 - [ ] **Step 2: Implement the observer inside the smoke module**
 
@@ -128,7 +133,7 @@ Upgrade `compare_v2` to accept only the sealed successful `observer-close-v2` co
 Run focused tests/Ruff, temporarily discard one unsolicited event and prove RED coverage fails, restore, then commit:
 
 ```bash
-git add scripts/incident_evidence_lib.py scripts/whatsapp_rotation_smoke.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_state.py
+git add scripts/whatsapp_rotation_smoke.py scripts/whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_state.py
 git commit -m "feat(incident): capture rotation bridge events"
 ```
 
