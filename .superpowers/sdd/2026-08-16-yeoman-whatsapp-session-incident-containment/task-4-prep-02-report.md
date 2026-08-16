@@ -2,7 +2,7 @@
 
 ## Status
 
-Blocked before Task 1 RED. The implementer accessed no toolkit source beyond read-only contract inspection and made no toolkit edit, test run, or live call. The controller later performed the narrowly recorded evidence-metadata and public signature-envelope lookup below; no evidence content was decrypted and no runtime, key, auth, network, QR, message, service, socket, port, or production adapter was accessed or changed.
+Synthetic implementation and the post-review correction round are complete. Production/live invocation remains NO-GO. The earlier blocked states below are retained as chronology; the final current evidence is in **Terra rejection correction round**.
 
 ## Exact contract conflict
 
@@ -64,3 +64,89 @@ Final re-review returned **ACCEPT** with no remaining Critical or Important issu
 - Toolkit branch: `c/yeoman-migration-toolkit`, clean at inspection; required ancestor `6ba55014242953e72ec7a29e75041f704452b885` is present.
 - Read-only contract inspection: `scripts/incident_evidence_lib.py` and the accepted Task 4 common/quarantine report.
 - No RED/GREEN/mutation command was run because implementation remained paused pending final plan acceptance; the corrected simplified interface is now specified.
+
+## Final exact-byte implementation
+
+Status: complete for synthetic implementation and ready for independent source/security review. No integration or smoke run was started.
+
+### Commits
+
+- `0281c28e20fd75ae9cebc7d93a65ae52e4ad3045 feat(incident): inspect v1 rotation scope`
+- `b5bae26b73100940add0daecea68f0ad9b94512b feat(incident): reconcile v1-derived rotation state`
+- `32a3b27812bdea6e8b406200c377f68e67a1d376 fix(security): revalidate observer chain prefix`
+
+### RED and GREEN evidence
+
+- Task 1 state RED: `uv run pytest -q tests/shared/test_whatsapp_rotation_state.py` failed 26 tests because `scripts/whatsapp_rotation_state.py` did not exist.
+- Task 1 legacy RED: `uv run pytest -q tests/shared/test_incident_evidence_lib.py -k legacy` failed 21 legacy tests because `LegacyV1Descriptor`, `_LegacyV1TestCore`, the frozen legacy constants, and bounded legacy child runner did not exist.
+- Task 1 GREEN/gate: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` passed 105 tests; scoped Ruff passed; `git diff --check` produced no output.
+- Task 2 RED: `uv run pytest -q tests/shared/test_whatsapp_rotation_state.py -k 'comparator or observer_growth or every_v1_file_is_exact'` failed 27 tests because the exact comparator and authenticated observer-chain test seams did not exist.
+- Task 2 GREEN/gate: the focused common/state suite passed 132 tests; scoped Ruff passed; `git diff --check` produced no output.
+- Follow-up security RED: a protected observer prefix containing a keyed-HMAC-valid but unknown historical classification incorrectly returned `preserved`; its dedicated regression failed 1 test. The comparator now revalidates allowed classification and causality over the entire prior/current chain while counting only additions.
+- Final committed-tree verification: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py` passed 188 tests in 7.22 seconds. `uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` returned `All checks passed!`; `git diff --check` and `git status --short` produced no output.
+
+### Required mutation evidence
+
+- Removed the exact legacy plaintext serialization SHA-256 check. `test_inspect_refuses_noncanonical_or_wrong_hash_and_generic_receipt` failed because the valid canonical fixture with a substituted expected hash no longer raised. Restored.
+- Removed complete current-file path-set rejection and explicitly skipped unexpected files. The `added` inventory case failed because a new runtime-root file was accepted. Restored.
+- Omitted the first old exact file from pre/post comparison. The `changed-jsonl` comparator case failed because the changed first entry returned `preserved`. Restored.
+- Changed comparison to require every old file but ignore extra post files. The `new-file` comparator case failed because the added root entry returned `preserved`. Restored.
+
+### Security and preservation invariants
+
+- The new legacy reader is separate from new-format `EvidenceCommitment` crypto. It pins the legacy directory, names, sizes, ciphertext/signature/plaintext hashes, signer, `git` namespace, two identities/recipients, allowed-signers file, and cumulative caps. It hashes held no-follow FDs and consumes those same ciphertext/signature/identity FDs; exact plaintext is copied only to an anonymous memfd/`O_TMPFILE` FD for signature verification. Both distinct identities must derive the pinned distinct recipients, decrypt independently to identical bounded bytes, and pass the exact plaintext hash before signature verification. The adjacent commitments file is ignored. New-format namespace and ciphertext-signature behavior are unchanged.
+- State quiescence stops only Overseer, Bridge, then Gateway through fixed absolute systemctl commands, then reuses the accepted two-sample unit/PID/socket/port validation and dedicated common receipt. Fresh pre/post nonces, fixed protected kinds, exact predecessors, and crash-safe `.state-receipts` / `.state-inventories` journals reject generic records, replay, swapped phases, wrong kinds, and wrong predecessors.
+- The fixed four-root walker opens every component/name descriptor-relatively with no-follow semantics. It requires strict UTF-8/NFC names, private owner-UID directories/files, single-link regular files, unique inodes and normalized paths, the exact v1-derived directory/file sets, exact legacy file facts, stable held-FD hashing, and two identical complete passes. SQLite, WAL/SHM/journal, JSONL, and all opaque files receive only `immutable_exact_v1`; no semantic parser, connection, normalization, checkpoint, rewrite, deletion, restore, retry, or replay exists.
+- Pre/post comparison authenticates fixed kinds and journals, independently verifies phase quiescence receipts/nonces and post-to-pre binding, then requires exact directory/file inventory equality. Only the fixed authenticated observer kind may have ordered-prefix growth; every prior/current item HMAC, predecessor, classification, and expected-reply causality is revalidated. Public results contain only status and aggregate classification counts.
+
+### No-live attestation
+
+All tests used disposable pytest roots, synthetic files, fake crypto, fake service results, and synthetic protected records. No production wrapper or adapter was invoked. No live runtime/evidence/key/auth path, systemd service, socket, port, network, QR, linked device, message, memory, archive, receipt, or operator-evidence artifact was read, created, changed, or deleted. The toolkit worktree is clean. Owner interaction and all live pre/owner/post actions remain NO-GO pending the required independent reviews and Luna gates.
+
+## Terra rejection correction round
+
+Status: all four Important findings from the independent Terra rejection, plus the subsequently identified prep-03 expectation and layering seams, are corrected in the toolkit. This remains synthetic/source-only work and does not authorize an incident transition.
+
+### Source and implementation commits
+
+- Accepted prep-03 typed evidence plan: `417880a84914bcf4fa2e10631a1f23dfb1b38f42`; SHA-256 `8ac9a1cfb047e892c364e5516974e0699531b1ce81101fa1e40ed5c4fcb6e2f5`.
+- Prep-02 contract alignment: `e7c67710067df7eee54756e5b328af7d7834b1be`; current prep-02 plan SHA-256 `327a9b5825dba8fd2a4c97d51215ee22a924673add39eec134abff9e7c00eced`.
+- Safe legacy modes, canonical v1 bytes, strict inventories, and held-FD rewind: `f63baeb82483f13ec585199ddd84134cf9eadc28`.
+- Accepted typed observer/smoke DAG: `b196e874491fe47286f5cbabe72182f3e886376d`.
+- Global state-nonce reservation and crash recovery: `168ddcd30b744a1906dd9d8e9898c907dbba69bc`.
+- Prep-03 smoke expectation safety graph and common-verifier layering: `252438c8eff02847cb2170d7112841ee30cfe702`.
+
+### Corrected findings and compatibility seams
+
+- Legacy v1 canonical parsing now uses Python's original default JSON ASCII escaping. Default-escaped NFC non-ASCII bytes are accepted; a literal-UTF-8 reserialization is not interchangeable.
+- The walker permits owner-controlled normal read/execute modes such as directories `0755` and files `0644`, while rejecting group/world write bits. It preserves and compares the exact original/pre/post modes.
+- The comparator validates each inventory independently before equality: exact file count and byte total, exact four roots and derived directory closure, canonical unique paths, current owner, safe mode, regular single-link files, exact fields/types, and no directory/file collision. Two equally forged inventories cannot establish preservation.
+- The legacy reader rewinds the same held ciphertext FD before each independent recipient decryption; a consuming first decrypt cannot starve the second.
+- State quiescence reserves `HMAC(key, YEOMAN-ROTATION-STATE-NONCE-V1 || nonce)` directly in `.state-receipts` before record publication. The reservation is incident-global across phase, kind, and record HMAC, contains no raw nonce, recovers both pending crash windows, and refuses completed or concurrently held reuse. This is separate from prep-03's future `.smoke-one-shot` registry.
+- The comparator accepts only the fixed prep-03 protected DAG: ready; raw artifacts; contiguous normalized events; expectation; intent; attempt; Bridge acceptance; optional inbound reply; and final complete close. It authenticates fixed kinds, exact schemas, commitments, predecessors, counts, timestamps, account/channel/destination/message causality, and complete capture. Unknown, capture-failed, retired, plain, disconnected, missing, or fabricated graphs are mismatches. Outbound events remain represented by `observed_outbound`.
+- `smoke-expectation-v2` now binds the exact incident, a 32-lowercase-hex rotation nonce, fixed smoke text, observer ready, fixed-kind current-auth and owner device-inventory commitments, `canonical_auth_tree_v1`, current-auth HMAC, self-identity HMAC, and the deterministic client-message-ID HMAC. The owner inventory must predecessor-link an authenticated `phone-ready-v1` with exact `YEOMAN_ROTATION_PHONE_READY_V1` source content. Its exact canonical `YEOMAN_ROTATION_DEVICE_INVENTORY_V1` JSON source must equal the protected intended/no-unknown/count/unique-sorted-label fields and bind the same current-auth commitment. Swapped, missing, malformed, free-form, or semantically false variants fail closed.
+- State no longer invents or requires a private `.rotation-observer-receipts` journal. It uses the common fixed-kind protected-record verifier; prep-03 owns observer/one-shot durability. Recursive exact schema/kind/predecessor/raw checks remain the authenticity boundary, and a valid same-kind protected close is accepted without state-private provenance.
+
+### RED and GREEN evidence
+
+- Correction baseline: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` passed 133 tests.
+- Canonical/mode/inventory/rewind RED selection: 11 expected failures and 4 passes exposed the ASCII-escaping, normal-mode, inventory-validation, and consuming-FD gaps. After correction the 15 targeted tests passed, then the complete common/state gate passed 148 tests.
+- Typed observer contract RED: 13 tests failed before the accepted prep-03 kinds and graph existed. After plan commit `417880a`, three additional account/time-order tests failed. GREEN passed 19 adversarial observer cases, 81 state tests, and 159 common/state tests.
+- State nonce RED: four replay, cross-phase, crash-window, and concurrent-lock cases failed. GREEN passed all four targeted cases, then 85 state tests and 163 common/state tests.
+- Expectation RED: the first fully bound valid graph failed while 15 tamper cases were already refused; predecessor RED then failed 2 of 17 cases; exact owner-source RED failed 1 of 21 cases; and the common-protected-record layering test failed 1 case while state still required its private journal. After each implementation step, the respective selections passed 16, 18, 21, and 1 tests. The final expectation matrix passes 21 missing, wrong, swapped, malformed, unordered, duplicate, predecessor, and free-form-source variants plus the valid graph.
+- Final gate: `uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py` passed **239 tests in 11.39 seconds**.
+- Final static gate: `uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py` returned `All checks passed!`; `git diff --check` produced no output. The toolkit worktree was clean after commit `252438c8eff02847cb2170d7112841ee30cfe702`.
+
+### Restored mutation evidence
+
+- Switched v1 canonicalization to literal UTF-8: the default-escaped non-ASCII fixture failed. Restored.
+- Rejected all group/world bits (`0o077`) instead of only write bits (`0o022`): the `0755` directory / `0644` file acceptance test failed. Restored.
+- Removed the ciphertext-FD rewind: `test_legacy_reader_rewinds_held_ciphertext_before_each_independent_decryption` failed after the first fake decrypt consumed the FD. Restored.
+- Removed required directory closure from independent inventory validation: the first equal-but-invalid inventory case returned `preserved` and failed. Restored.
+- Removed observer account equality: the cross-account event returned `preserved_with_classified_additions` and failed. Restored.
+- Scoped the nonce reservation filename by record HMAC: `test_state_nonce_is_unique_across_phases_and_distinct_common_receipts` did not raise and failed. Restored.
+- Removed exact canonical inventory source validation: the free-form signed owner-content case returned `preserved` and failed. Restored.
+
+### Exact no-live attestation for this correction round
+
+Only toolkit source/tests, accepted source plans, this source report, disposable pytest directories, synthetic files, fake crypto/service results, and synthetic protected records were read or changed. No production wrapper/controller was invoked. No `/home/dm/.yeoman` runtime data, production evidence, production key, WhatsApp auth, service, process, socket, port, network, QR, linked device, message, archive, memory, or operator receipt was accessed, created, changed, deleted, or transmitted. No live command, incident transition, send, restart, or owner action occurred.
