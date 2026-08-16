@@ -4,7 +4,7 @@
 
 **Goal:** Close the Baileys session-material transcript exposure without losing raw messages or memory, then reopen the Milestone 01 Task 2 gate.
 
-**Architecture:** Remove log-body emission from the shared diagnostic helper instead of attempting an incomplete secret denylist. Scan the incident corpus offline with a deterministic metadata-only scanner, then rotate the WhatsApp linked session through the canonical QR helper while preserving a timestamped authentication backup and all memory/archive stores.
+**Architecture:** Remove log-body emission from the shared diagnostic helper instead of attempting an incomplete secret denylist. Scan the incident corpus offline with a deterministic metadata-only scanner, then rotate the WhatsApp linked session through the canonical QR helper while preserving all memory/archive stores and placing compromised authentication only into verified encrypted, non-restorable quarantine.
 
 **Tech Stack:** Bash, Python 3 standard library, `unittest`, SHA-256, systemd user services, repository `whatsapp_qr_reconnect.py`, signed and age-encrypted incident evidence.
 
@@ -13,7 +13,7 @@
 - Never print, copy, summarize, hash as a reversible encoding, or embed any matched secret value in a tool transcript, report, test result, receipt, or Git object.
 - Never invoke `recent_logs.sh` against live log content until Task 1 is reviewed and accepted.
 - Preserve every raw message, memory database, archive, receipt, and provenance record; authentication/session quarantine is the only permitted state replacement.
-- Keep `yeoman-bridge.service` and `yeoman-overseer.service` stopped until the owner-authorized QR relink starts; keep Gateway and storage unchanged.
+- Keep Bridge, Gateway, and Overseer stopped through the first-Luna-authorized quiesced v1/v2 baseline and owner gates. During relink only the pinned Bridge-only helper/direct observer may run; stop Bridge again before post-capture/compare. Keep Gateway stopped and storage unchanged.
 - Task 2 of the release-baseline plan remains NO-GO until Agent A and Agent B approve the incident-close package.
 - Terra is authorized for implementation/task-review workers. Every active standing Agent A/B review prompt must explicitly use `gpt-5.6-luna`.
 
@@ -132,30 +132,32 @@ Obtain independent task review. Do not quarantine auth, revoke devices, start Br
 
 ### Task 4: Rotate and revalidate the WhatsApp linked session
 
+**Pre-owner preparation:** Implement and accept the synthetic-only controller bundle in `docs/superpowers/plans/2026-08-16-whatsapp-rotation-prep-orchestration.md` and its `-01` through `-03` companion plans before requesting any owner confirmation. Its operator evidence is fixed under `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`; only runtime auth remains under `/home/dm/.yeoman`. First Luna GO authorizes only full quiescence and read-only v1 inspection/v2 baseline; mandatory second evidence-bound Luna GO is required before any owner turn. This Task remains owner-interactive; no authentication mutation, device revocation, QR rendering, Bridge start, or smoke send is authorized by the preparation bundle.
+
 **Files:**
 - Use: `scripts/whatsapp_qr_reconnect.py`
 - Update: `session-context/2026-08-16-implementation-program-log.md`
 - Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-4-report.md`
 
 **Interfaces:**
-- Consumes: owner authorization, owner QR scan, current authentication state.
-- Produces: timestamped old-auth quarantine, fresh linked session, protocol-v3 connected health, changed opaque session fingerprint, no unknown linked devices, send/receive receipt, and memory/archive integrity commitments.
+- Consumes: separate protected owner records for all-device revocation, quarantine authorization, then post-quarantine phone readiness; owner QR scan; current authentication state.
+- Produces: verified encrypted non-restorable old-auth quarantine, fresh linked session, protocol-v3 connected health, changed opaque session fingerprint, protected owner-attested device inventory, send/receive causal receipt, and memory/archive integrity commitments.
 
-- [ ] **Step 1: Obtain explicit owner authorization**
+- [ ] **Step 1: Revalidate the accepted v2 baseline and record host-backed owner turns**
 
-State that every existing linked device will be revoked/logged out and a phone QR scan is required. Do not proceed from general architecture approval alone.
+Revalidate the accepted protected v2 baseline under full quiescence; do not create a redundant generic manifest. Only after mandatory second evidence-bound Luna GO, record `owner-all-devices-revoked-v1` from its exact host-backed owner turn, then predecessor-linked `owner-quarantine-authorized-v1` from a distinct host-backed owner turn. After verified quarantine, record third `phone-ready-v1` before observer/helper readiness and QR scan. After relink/fingerprint, record fourth `owner-device-inventory-v1` host-backed attestation. Never treat generic approval, one source turn, or a combined checkbox as these records.
 
-- [ ] **Step 2: Record pre-rotation integrity commitments**
+- [ ] **Step 2: Use the accepted pre-rotation v2 commitments**
 
-Hash manifests for raw-message, memory, archive, and receipt stores without reading content into stdout. Record only commitments and counts.
+Use only the accepted quiesced v2 baseline commitments and encrypted adapter inventory. Do not read Gateway databases or create a generic replacement manifest; direct Bridge observer artifacts carry all relink-window raw message evidence.
 
 - [ ] **Step 3: Revoke and relink**
 
-Create a timestamped encrypted, non-restorable quarantine of the old authentication state before removing it from the active path. After the owner revokes every linked device, invoke the reviewed canonical reconnect helper against the prepared empty auth directory so it produces the owner-only stable SVG. Keep the QR payload out of chat. Have the owner scan the fresh QR.
+Create a crash-safe encrypted non-restorable quarantine of old authentication after the two separate pre-action records. With the owner explicitly told not to scan, invoke the reviewed Bridge-only reconnect helper against prepared empty auth so it starts Bridge and creates the owner-only QR. Then start the direct authenticated observer and prove protocol-v3 readiness; only then may the owner scan. Keep QR payload out of chat and retain every observer event encrypted.
 
 - [ ] **Step 4: Verify the new session**
 
-Confirm no unknown linked device, changed opaque session identity, authenticated protocol-v3 connected health, controlled send/receive receipt, and unchanged memory/archive commitments.
+Confirm host-attested intended/no-unknown device inventory, changed opaque session identity under the same `canonical_auth_tree_v1` serialization, observer-complete capture, authenticated protocol-v3 connected health, and one-shot causal smoke receipt. `capture_failed` is incident-close NO-GO. Stop Bridge before post-v2 capture/compare; Gateway/Overseer remain stopped.
 
 - [ ] **Step 5: Close the incident gate**
 
