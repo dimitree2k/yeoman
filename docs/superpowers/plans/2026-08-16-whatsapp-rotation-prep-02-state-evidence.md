@@ -4,7 +4,7 @@
 
 **Goal:** Build a v1-derived v2 baseline and comparator that covers every preserved entry, retains old logical rows exactly, and classifies only causally supported growth.
 
-**Architecture:** This controller owns `quiesce_and_record()` before any baseline read. Its read-only `inspect-v1` gate requires that receipt, decrypts/verifies the fixed v1 artifact under protected no-output conditions, validates its exact external serialization SHA-256 against `6ae6476466c728bbb423be16182b6341e47e38c0d55073f9831751452346f833`, and derives all v2 scope from v1's only facts: relative path, mode, size, mtime, and SHA-256. A source-defined fixed profile registry keyed by exact v1 path—not v1 metadata—then selects adapters only after each live file proves byte-identical to those v1 facts.
+**Architecture:** This controller owns `quiesce_and_record()` before any baseline read. Its read-only `inspect-v1` gate requires that receipt, decrypts/verifies the fixed legacy v1 artifact under protected no-output conditions, validates its exact external serialization SHA-256 against `6ae6476466c728bbb423be16182b6341e47e38c0d55073f9831751452346f833`, and derives all v2 scope from v1's only facts: relative path, mode, size, mtime, and SHA-256. The legacy v1 artifact predates `EvidenceCommitment`; a narrow common-library compatibility reader authenticates its source-pinned location, ciphertext hash, detached-signature hash, signer/namespace, both age decryptions, identical bounded plaintext, and plaintext hash. It does not fabricate a new-format record HMAC or trust the adjacent commitments file. A source-defined fixed profile registry keyed by exact v1 path—not v1 metadata—then selects adapters only after each live file proves byte-identical to those v1 facts.
 
 **Tech Stack:** Python 3 standard library, `scripts/incident_evidence_lib.py`, `pytest`, Ruff.
 
@@ -15,6 +15,25 @@
 - Reverify v1 signature and both recipient decryptions before capture, despite its exact serialization staying external. V2 stores v1 commitment, verified-v1 status, encrypted adapter inventory, and becomes the live protected pre/post baseline.
 - V1 inspection and SQLite baseline capture run only under full verified quiescence of Bridge/Gateway/Overseer. Every v1 entry remains covered. Changed/missing/reordered/truncated old entries are `mismatch`. Baseline mismatch is NO-GO.
 - Runtime data is expected unchanged because Gateway stays stopped. Expected smoke/unsolicited inbound classifications live only in the separate protected direct-observer evidence chain; expected smoke receipt records are the protected evidence HMAC chain, not a guessed runtime receipt file. No raw event is deleted.
+
+## Fixed Legacy-v1 Descriptor
+
+The implementation must add a narrow, test-injectable legacy reader to `incident_evidence_lib.py`; `_read_protected_record()` is intentionally not used because v1 predates the HMAC-framed protected-record format. Production wiring accepts no caller override and pins all of the following in source:
+
+- private directory: `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16`;
+- ciphertext: `pre-rotation-state-manifest.json.age`, exact size 51,823 bytes, SHA-256 `0f94535433f4d833c1c7e51b512369314b407a5e6c88cf6b1330f98172c4448d`;
+- detached signature: `pre-rotation-state-manifest.json.sig`, exact size 294 bytes, SHA-256 `8f75bb199a977e43861fb7ba5c2a8fc395ba70bbc0f2d8e55224ebf5bdd81621`;
+- plaintext external serialization SHA-256: `6ae6476466c728bbb423be16182b6341e47e38c0d55073f9831751452346f833`;
+- signer identity: `yeoman-preservation-2026-08-16`; SSH signature namespace: `git`; signature target: the exact decrypted plaintext bytes;
+- the two fixed `AGE_IDENTITIES` and fixed `ALLOWED_SIGNERS` already held by the common library.
+
+Freeze all new-format constants, `_ProductionCrypto`, `_read_protected_record()`, and ciphertext-signature behavior unchanged. Add a separate legacy crypto protocol/production implementation with fixed `LEGACY_V1_SIGNATURE_NAMESPACE = "git"`; it verifies the exact plaintext, never ciphertext. The public production legacy reader accepts no root, locator, hash, signer, namespace, identity, crypto, or `EvidenceCommitment` argument; dependency injection exists only behind a clearly named test-only core.
+
+Walk every absolute directory component with held no-follow directory descriptors. Require the evidence directory to be an exact owner-UID `0700` directory and both artifacts to be owner-UID regular `0600` files with the exact sizes above. Hash the held artifact FDs and pass those same FDs—or byte-identical verified anonymous `O_TMPFILE`/memfd copies—to age and SSH; never reopen a name after hashing. Apply cumulative source constants `LEGACY_V1_MAX_CIPHERTEXT_BYTES = 1 << 20`, `LEGACY_V1_MAX_SIGNATURE_BYTES = 4096`, and `LEGACY_V1_MAX_PLAINTEXT_BYTES = 1 << 20`; reject artifact `st_size` before hashing/spawn and stop a child on cumulative output overflow. Open two distinct fixed identity FDs, derive and compare their recipients with the two fixed distinct `AGE_RECIPIENTS`, and reject duplicate/substituted identities before decrypting.
+
+Decrypt independently with both fixed identities, require byte-for-byte equality and the exact plaintext hash, then verify the detached signature over those exact plaintext bytes with the fixed signer and legacy namespace. Bound child time, input/output, stderr, descriptor lifecycle, terminate/kill/reap paths, and never surface plaintext, paths, subprocess output, or exception text. Parse only after every proof succeeds. The adjacent legacy `.commitments` file is informational only and must not authorize or replace any source-pinned fact. Tests inject disposable artifacts/crypto through the test-only core and cover wrong location/name, symlink/type/mode/owner/size, replacement after hash, ciphertext/signature/plaintext hash, one-recipient failure, unequal/duplicate/substituted identities or decryptions, wrong signer/namespace/target, new-format namespace/ciphertext signing, every cumulative cap, timeout/nonzero/child cleanup, FD cleanup, output leakage, and a substituted commitments file. No production wrapper is invoked before the first Luna code GO.
+
+The authenticated plaintext has this exact external schema and no extra keys: top level `{manifest_version: 1, scope: "pre-whatsapp-session-rotation-nonauth-state", file_count: 248, byte_count: 228519348, files: [...]}`. Every file object has exactly `{root, relative_path, mode, size, mtime_ns, sha256}`. `root` is one of `runtime_data`, `workspace_sessions`, `workspace_persona_evolution`, or `policy_audit`; `relative_path` is a normalized nonempty relative POSIX path with no `.`/`..`, absolute, NUL, or escaping form; integer fields reject booleans and invalid ranges; SHA-256 is lowercase hexadecimal; `(root, relative_path)` is unique; `file_count` equals list length; and `byte_count` equals the checked sum of entry sizes. The plaintext hash authenticates the original compact sorted-key JSON plus terminal newline; signature verification is over those original bytes, never parsed/re-serialized JSON. `workspace_persona_evolution` is preserved only as historical inert state; it does not restore persona-evolution behavior to the target architecture.
 
 ## V1-Driven Scope and Adapter Inventory
 
@@ -32,7 +51,9 @@ The source-defined fixed profile registry selects a SQLite profile by exact v1 p
 ### Task 1: Add read-only v1 inspection and v2 capture
 
 **Files:**
+- Modify: `scripts/incident_evidence_lib.py`
 - Create: `scripts/whatsapp_rotation_state.py`
+- Modify: `tests/shared/test_incident_evidence_lib.py`
 - Create: `tests/shared/test_whatsapp_rotation_state.py`
 - Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-4-prep-02-report.md`
 
@@ -46,12 +67,14 @@ The source-defined fixed profile registry selects a SQLite profile by exact v1 p
 ```python
 def test_inspect_v1_derives_exact_scope_and_rejects_guessed_paths(tmp_path):
     scope = inspect_v1_for_test(fixture_v1(tmp_path))
-    assert scope.commitment == V1_COMMITMENT
-    assert scope.allowed_roots == {"runtime_data", "workspace_sessions", "retained_history_proactivity", "policy_audit"}
+    assert scope.legacy_v1_plaintext_sha256 == LEGACY_V1_PLAINTEXT_SHA256
+    assert scope.allowed_roots == {"runtime_data", "workspace_sessions", "workspace_persona_evolution", "policy_audit"}
     assert all(entry.adapter in {"jsonl_prefix", "sqlite_logical", "immutable_exact"} for entry in scope.entries)
 ```
 
 Test synthetic fixed-service stop/state/PID/socket/port checks, bounded fake Overseer-respawn detection, v1 SHA/signature/decrypt failure, incomplete quiescence, auth/path escape/symlink/nonregular entry, unknown mutable file, unprofiled SQLite table, and WAL/SHM absent from a declared snapshot profile. Assert paths/content never reach stdout.
+
+Add common-library RED tests for the complete Fixed Legacy-v1 Descriptor boundary above. The synthetic signature target is the exact decrypted plaintext, never the ciphertext or parsed/re-serialized JSON. Assert the public production wrapper has no path, root, identity, signer, namespace, commitment, or crypto override.
 
 - [ ] **Step 2: Run RED**
 
@@ -65,14 +88,15 @@ Expected: FAIL because the controller is absent.
 def inspect_v1(quiescence: EvidenceCommitment) -> V1Scope:
     verify_full_quiescence(quiescence)
     plain = decrypt_verify_external_v1_without_output()
-    require_exact_serialization_sha256(plain, V1_COMMITMENT)
+    require_exact_serialization_sha256(plain, LEGACY_V1_PLAINTEXT_SHA256)
     return parse_and_validate_v1_scope(plain)
 
 def capture_v2(scope: V1Scope) -> EvidenceCommitment:
     require_every_v1_file_byte_identical(scope)
     inventory = [capture_entry(entry) for entry in scope.entries]
     return write_protected_record("whatsapp-rotation-state-v2", {
-        "prior_v1_commitment": V1_COMMITMENT, "verified_v1": True, "adapter_inventory": inventory,
+        "legacy_v1_plaintext_sha256": LEGACY_V1_PLAINTEXT_SHA256,
+        "legacy_v1_verified": True, "adapter_inventory": inventory,
     })
 ```
 
