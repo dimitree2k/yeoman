@@ -2,9 +2,9 @@
 
 Date: 2026-08-16
 
-Status: Normative candidate. Architecture decisions are approved; this written consolidation awaits final owner review.
+Status: Owner-approved normative architecture.
 
-Upon final owner approval, this document becomes the sole normative architecture design and supersedes:
+This document is the sole normative architecture design and supersedes:
 
 - `session-context/2026-08-15-architecture-audit.md`
 - `session-context/2026-08-15-target-architecture-decisions.md`
