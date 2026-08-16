@@ -154,3 +154,10 @@ Status: all four Important findings from the independent Terra rejection, plus t
 ### Exact no-live attestation for this correction round
 
 Only toolkit source/tests, accepted source plans, this source report, disposable pytest directories, synthetic files, fake crypto/service results, and synthetic protected records were read or changed. No production wrapper/controller was invoked. No `/home/dm/.yeoman` runtime data, production evidence, production key, WhatsApp auth, service, process, socket, port, network, QR, linked device, message, archive, memory, or operator receipt was accessed, created, changed, deleted, or transmitted. No live command, incident transition, send, restart, or owner action occurred.
+
+## Independent final acceptance
+
+- The same independent Terra source/security reviewer re-read the full final tree at toolkit `f17ebe05598bf28c5f8a0f32dbc3b1d9dbb957a1`, the implementation-aligned prep-02 plan SHA-256 `8ed9fc0b8c7a796399db22700511d75ae16ce7e1b7d29c9a24580f8480865086`, and the accepted prep-03 contract SHA-256 `8ac9a1cfb047e892c364e5516974e0699531b1ce81101fa1e40ed5c4fcb6e2f5`.
+- Verdict: **ACCEPT**, with no Critical or Important finding and no proportionate removable-complexity finding. The reviewer explicitly confirmed the safe-mode boundary, original v1 escaping, keyed global nonce reservation, complete quarantine-to-owner-to-auth-to-smoke-to-observer graph, and common protected-record layer seam.
+- Reviewer verification passed 249 focused tests in 12.23 seconds, scoped Ruff, range diff check, and clean status. Controller verification independently passed the same 249 tests in 12.52 seconds, scoped Ruff, diff check, and clean status.
+- This accepts the synthetic state-evidence module only. It authorizes neither full quiescence nor production v1/v2 capture; those remain behind the first standing Luna code GO after the remaining smoke/readiness module, synthetic integration, and scoped task reviews.
