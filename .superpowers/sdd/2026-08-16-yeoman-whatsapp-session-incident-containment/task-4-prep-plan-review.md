@@ -30,3 +30,12 @@ The same reviewer then returned ACCEPT and found no remaining Critical or Import
 ## Runtime boundary
 
 No service, QR, linked device, authentication file, raw message, memory store, archive, receipt, or operator-evidence directory was changed while producing or reviewing this plan bundle. Bridge and Overseer remained inactive; Gateway remained active.
+
+## Accepted contract amendments
+
+The original bundle hashes above remain the historical first acceptance. Later implementation reviews exposed two cross-plan contracts that needed correction before code could continue:
+
+- The final exact-state plan was accepted at SHA-256 `f99b243a757d6448fe873bb37c64a4e082db63e693d4156d5d8f75cabdef7f10`. It replaces logical per-database adapters with stronger complete v1 path/byte/metadata equality, pins the exact legacy-v1 reader, uses fixed roots and full quiescence, and permits growth only through separately authenticated observer evidence.
+- The revised smoke/readiness plan was accepted at SHA-256 `8ac9a1cfb047e892c364e5516974e0699531b1ce81101fa1e40ed5c4fcb6e2f5`. It defines an acyclic typed protected-evidence DAG ending in `observer-close-v2`, exact raw-artifact verification, full sender/recipient/channel/time/message/reply/mention provenance, semantic owner-turn templates, post-relink fingerprint binding, and a crash-burned global one-shot nonce journal. A complete zero-event no-reply window has null heads; nonzero windows require an exact contiguous predecessor chain. Unknown/capture-failed states are terminal NO-GO and never successful closes.
+
+A fresh Terra reviewer rejected two intermediate smoke drafts, then accepted this final contract with no remaining Critical or Important plan issue. This is plan-only acceptance; RED/GREEN/mutation evidence, independent implementation review, synthetic integration, and both standing Luna gates remain mandatory. No live runtime, service, authentication, key, evidence artifact, message, memory, archive, or network action was performed for these amendments.
