@@ -610,7 +610,7 @@ The first focused re-review left two blockers: semantic/effect gates could open 
 - keeps processing, egress, delivery, timers, reminders, workload launches, and semantic/admin mutation fenced until the first non-migration live Edge event, its producer cutoff, and `target_committed` marker commit atomically; and
 - permits only metadata/ciphertext-commitment audit of `legacy_unknown`. Plaintext requires a separately reviewed provenance-resolution operation with independent authority evidence and a new classified object version.
 
-After these corrections, both the software-architecture and security reviewers returned **GO with no remaining architecture, contract, or safety blocker**. The candidate remains non-normative until the owner reviews the written consolidation; after approval it supersedes these session notes and they are excluded from the released documentation set.
+After these corrections, both the software-architecture and security reviewers returned **GO with no remaining architecture, contract, or safety blocker**. The owner approved the consolidation on 2026-08-16; it is the normative architecture until a reviewed successor replaces it. These session notes remain implementation-history evidence only and are excluded from the final released documentation set.
 
 ## Major-step cross-review: Data lifecycle and indefinite retention
 
@@ -645,6 +645,41 @@ Both reviewers returned a **conditional go for indefinite default retention with
 Omit a retention DSL, legal holds, compliance portal, scheduled canonical deletion, generic tombstone/cascade service, backup-rewrite engine, forensic-erasure claim, and non-owner deletion policy. The first release needs truthful suppression, erasure-ready storage/provenance, and capacity safety—not a speculative compliance platform.
 
 The owner approved the normative design on 2026-08-16. It is recorded in `session-context/2026-08-15-target-architecture-decisions.md`.
+
+## Implementation-plan cross-review
+
+Date: 2026-08-16
+
+The approved architecture was decomposed into one orchestration file and seven milestone plans under `docs/superpowers/plans/`. The context rule is deliberate: each implementation task reads the normative sections named by the orchestrator, the current milestone plan, current source/tests, and only the immediately preceding safe handoff plus its transitive accepted-contract registry. Completed plan bodies and conversational history are not architectural authority.
+
+The final plan bundle is identified by the canonical command:
+
+```bash
+sha256sum docs/superpowers/plans/2026-08-16-yeoman-rework-*.md | sort | sha256sum
+```
+
+Final bundle SHA-256: `e614e1b92e1fc7eb9aef33909edbca2e830554f2763347a8f137730614cc0067`
+
+Normative specification SHA-256: `8201c5986e66292147e8682af506bf1978abe5338d56572b0395bf3d42affbfa`
+
+The software architect and security engineer initially returned NO-GO on earlier digests. Their blockers drove executable corrections rather than prose-only waivers:
+
+1. Every source/test/manifest/operator-document change now has a failing test where applicable, an implementation boundary, green verification, and a clean commit before review, signing, activation, deployment, rehearsal, observation, or milestone handoff.
+2. The signed Milestone 01 receipt is imported into inert Evidence before the one-time FIDO2 first-owner enrollment ceremony creates owner authority.
+3. The public-web enforcement service has exact socket/process/package/systemd/Overseer ownership, dedicated identity, lifecycle, status, fence, and typed failure contracts.
+4. Modified migration tooling is rebuilt and re-signed; target compatibility is a separate commit; both final migrations and blank-root restore run against the exact final pre-cutover source commit.
+5. The complete clean release is proved and signed only after release, real-state recovery, and cutover tooling commits are final. Real protected activation remains inert, both independent real recovery-key copies are exercised, and activation-dependent gates are re-signed and rerun.
+6. The stabilization evaluator and inert retirement command are delivered through a reviewed, owner-authorized signed forward release before the 14-day/100-trace Core cohort starts.
+7. Proactivity has Workloads-owned DDL/repository/migration state, a green provisional lane that cannot merge/install/activate before accepted Core stabilization, staged activation, and an exact 14-day/100-decision runtime cohort.
+8. Final documentation cleanup may not invalidate that cohort: runtime-source closure, runtime manifest section, executable artifact, activation, and every behavioral cohort component must remain byte-identical. Only the pre-reviewed documentation inventory may change, and the exhaustive manifest is re-signed.
+9. The terminal protected `m07` receipt body is immutable before post-cleanup review. Separate reviewer receipts and the final signed tag bind the released commit, normative spec, observed runtime/cohort digests, final documentation manifest, accepted-contract digest, and `next_milestone=null` without a circular mutable receipt.
+
+Final independent decisions:
+
+- Software architecture reviewer task `01a00731-aa0d-7591-9382-2c52becddbae`: **GO**, exclusively bound to the final bundle and normative-spec digests above.
+- Security engineering reviewer task `01a00731-aa5c-7232-93c3-d165eabc5d58`: **GO**, independently reproducing both digests and finding no remaining blocking dependency inversion, uncommitted source boundary, authority/invalidation gap, or receipt/cutover inconsistency.
+
+This review authorizes execution of the plan, not mutation of the current live runtime. Runtime cutover remains a later explicit milestone with its own owner step-up and both reviewer gates.
 
 ## Major-step cross-review: Execution Capsules
 
