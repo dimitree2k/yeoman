@@ -2,18 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a v1-derived v2 baseline and comparator that covers every preserved entry, retains old logical rows exactly, and classifies only causally supported growth.
+**Goal:** Build a v1-derived v2 baseline and comparator that covers every preserved entry byte-for-byte and classifies growth only in the separately protected observer-evidence domain.
 
-**Architecture:** This controller owns `quiesce_and_record()` before any baseline read. Its read-only `inspect-v1` gate requires that receipt, decrypts/verifies the fixed legacy v1 artifact under protected no-output conditions, validates its exact external serialization SHA-256 against `6ae6476466c728bbb423be16182b6341e47e38c0d55073f9831751452346f833`, and derives all v2 scope from v1's only facts: relative path, mode, size, mtime, and SHA-256. The legacy v1 artifact predates `EvidenceCommitment`; a narrow common-library compatibility reader authenticates its source-pinned location, ciphertext hash, detached-signature hash, signer/namespace, both age decryptions, identical bounded plaintext, and plaintext hash. It does not fabricate a new-format record HMAC or trust the adjacent commitments file. A source-defined fixed profile registry keyed by exact v1 path—not v1 metadata—then selects adapters only after each live file proves byte-identical to those v1 facts.
+**Architecture:** This controller reuses the accepted common full-quiescence adapter/receipt before any baseline read. Its read-only `inspect-v1` gate requires that receipt, decrypts/verifies the fixed legacy v1 artifact under protected no-output conditions, validates its exact external serialization SHA-256 against `6ae6476466c728bbb423be16182b6341e47e38c0d55073f9831751452346f833`, and derives all v2 scope from v1's only facts: relative path, mode, size, mtime, and SHA-256. The legacy v1 artifact predates `EvidenceCommitment`; a narrow common-library compatibility reader authenticates its source-pinned location, ciphertext hash, detached-signature hash, signer/namespace, both age decryptions, identical bounded plaintext, and plaintext hash. It does not fabricate a new-format record HMAC or trust the adjacent commitments file. Every v1-scoped file—including SQLite databases, WAL/SHM/journal sidecars, JSONL, JSON, Markdown, media, and opaque historical files—uses one immutable exact-byte adapter. Nothing parses or opens SQLite/JSONL semantically. Any path-set or byte/metadata difference is a baseline/post mismatch; only the separately rooted authenticated observer-evidence chain may grow.
 
 **Tech Stack:** Python 3 standard library, `scripts/incident_evidence_lib.py`, `pytest`, Ruff.
 
 ## Global Constraints
 
-- Auth is always excluded. `inspect-v1` rejects auth entries, absolute/escaping paths, symlinks, non-regular files, duplicates, metadata mismatch, and scope outside v1's allowed roots: runtime data, workspace sessions, retained persona/proactivity historical state, and policy audit.
+- Auth is always excluded. `inspect-v1` rejects auth entries, absolute/escaping paths, symlinks, non-regular files, duplicates, metadata mismatch, and scope outside v1's allowed roots: runtime data, workspace sessions, inert historical workspace persona-evolution state, and policy audit.
 - Protected operator evidence, including the separate incident receipt chain, is only `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`. Public output is phase, public HMAC/ciphertext/signature commitments, and aggregate counts only.
-- Reverify v1 signature and both recipient decryptions before capture, despite its exact serialization staying external. V2 stores v1 commitment, verified-v1 status, encrypted adapter inventory, and becomes the live protected pre/post baseline.
-- V1 inspection and SQLite baseline capture run only under full verified quiescence of Bridge/Gateway/Overseer. Every v1 entry remains covered. Changed/missing/reordered/truncated old entries are `mismatch`. Baseline mismatch is NO-GO.
+- Reverify v1 signature and both recipient decryptions before capture, despite its exact serialization staying external. V2 stores the explicitly named legacy plaintext SHA-256, verified-v1 status, encrypted exact inventory, and becomes the live protected pre/post baseline.
+- V1 inspection and both complete state captures run only under full verified quiescence of Bridge/Gateway/Overseer. Every v1 entry and every current entry beneath the four roots is covered. A changed, missing, renamed, reordered, truncated, or added path/file is `mismatch`. Baseline mismatch is NO-GO.
 - Runtime data is expected unchanged because Gateway stays stopped. Expected smoke/unsolicited inbound classifications live only in the separate protected direct-observer evidence chain; expected smoke receipt records are the protected evidence HMAC chain, not a guessed runtime receipt file. No raw event is deleted.
 
 ## Fixed Legacy-v1 Descriptor
@@ -35,16 +35,20 @@ Decrypt independently with both fixed identities, require byte-for-byte equality
 
 The authenticated plaintext has this exact external schema and no extra keys: top level `{manifest_version: 1, scope: "pre-whatsapp-session-rotation-nonauth-state", file_count: 248, byte_count: 228519348, files: [...]}`. Every file object has exactly `{root, relative_path, mode, size, mtime_ns, sha256}`. `root` is one of `runtime_data`, `workspace_sessions`, `workspace_persona_evolution`, or `policy_audit`; `relative_path` is a normalized nonempty relative POSIX path with no `.`/`..`, absolute, NUL, or escaping form; integer fields reject booleans and invalid ranges; SHA-256 is lowercase hexadecimal; `(root, relative_path)` is unique; `file_count` equals list length; and `byte_count` equals the checked sum of entry sizes. The plaintext hash authenticates the original compact sorted-key JSON plus terminal newline; signature verification is over those original bytes, never parsed/re-serialized JSON. `workspace_persona_evolution` is preserved only as historical inert state; it does not restore persona-evolution behavior to the target architecture.
 
-## V1-Driven Scope and Adapter Inventory
+## V1-Driven Exact Scope and Evidence Inventory
 
-| V1-declared entry type | Explicit v2 adapter | Required check |
+| Domain | Explicit v2 adapter | Required check |
 | --- | --- | --- |
-| JSONL regular file | ordered line-digest sequence | exact sequence equality while runtime is quiesced |
-| supported SQLite snapshot profile | logical-table profile with fixed `PRAGMA user_version`, `PRAGMA table_info`, SELECT columns and stable unique key tuple | every old key maps to identical canonical row digest |
-| other regular file | immutable exact-file adapter | mode, size, mtime, and content hash remain exact |
+| every regular file declared by v1 | `immutable_exact_v1` | exact path set, file type, mode, size, `mtime_ns`, and SHA-256 under quiescence |
 | protected incident evidence receipt (separate from v1 scope) | evidence-chain adapter | prior receipt HMAC chain is ordered prefix/classified growth |
 
-The source-defined fixed profile registry selects a SQLite profile by exact v1 path and contains the supported schema version, table, SELECT columns, and stable unique key tuple. V1 itself supplies none of those facts. WAL/SHM are explicit held-file members of that database snapshot profile, with stable pre/post hashes around each logical read; they are not independent mutable exceptions. An unlisted table, duplicate/missing/changed key, changed `user_version`/columns, unstable held-file hash, or file with no adapter fails closed. The protected incident receipt chain is compared separately and is never represented as a v1-declared runtime entry. Adapter inventory is encrypted evidence; public output reports counts by adapter/status only.
+The production walker pins this exact source mapping and exposes no caller override: `runtime_data -> /home/dm/.yeoman/data`, `workspace_sessions -> /home/dm/.yeoman/workspace/sessions`, `workspace_persona_evolution -> /home/dm/.yeoman/workspace/persona-evolution`, and `policy_audit -> /home/dm/.yeoman/policy/audit`. It walks sorted names descriptor-relatively, rejects symlinks and every non-regular/non-directory object, rejects hard-linked files or repeated `(st_dev, st_ino)`, and requires owner-UID private roots/files. Every filename must decode as strict UTF-8 and already equal Unicode NFC; the collision key is `(root_label, NFC(relative_posix_path))`, with NUL, dot segments, absolute/escape forms, and duplicate keys rejected.
+
+The v1 file list derives the exact required directory-prefix set, including each fixed root. Baseline enumeration rejects any missing/renamed directory and any extra directory, including an empty one. It captures root and per-directory type/mode/UID/GID/link/`mtime_ns` facts into v2 and post requires their exact equality. It enumerates the complete current directory and file path sets, not merely v1 file names. For each file it compares held-FD `fstat` before/after streaming SHA-256, then performs a second complete enumeration/hash pass and requires the same directory/file sets and facts before publication. A test-only core injects disposable roots; production never accepts roots/walkers/hashes.
+
+V2 adds current file type, UID, GID, link count, and root/directory security facts to encrypted evidence and requires those v2 facts unchanged post-rotation; the legacy v1 does not retroactively prove metadata it never recorded. SQLite databases and every `-wal`, `-shm`, or `-journal` file are ordinary exact entries. No SQLite/JSONL connection, parser, normalization, checkpoint, backup, or reconstruction is allowed. This deliberately preserves opaque and unversioned historical schemas more strongly than a logical adapter could. If stopping a writer checkpoints, removes, or adds a sidecar, the pre-owner baseline is a mismatch and the incident stops for investigation.
+
+The protected incident observer chain is compared separately and is never represented as a v1-declared runtime entry. Its production comparator accepts only authenticated `EvidenceCommitment` inputs for fixed protected kinds and verifies the ordered HMAC/predecessor chain plus allowed causal classifications; plain decoded records are test-core only. Inventory is encrypted evidence; public output reports fixed phase, status, commitments, and aggregate counts only.
 
 ---
 
@@ -58,9 +62,11 @@ The source-defined fixed profile registry selects a SQLite profile by exact v1 p
 - Create: `.superpowers/sdd/2026-08-16-yeoman-whatsapp-session-incident-containment/task-4-prep-02-report.md`
 
 **Interfaces:**
-- `quiesce_and_record() -> EvidenceCommitment`
-- `inspect_v1(quiescence: EvidenceCommitment) -> V1Scope`
-- `capture_v2(scope: V1Scope) -> EvidenceCommitment`
+- `quiesce_and_record_pre() -> EvidenceCommitment`
+- `inspect_v1(pre_quiescence: EvidenceCommitment) -> V1Scope`
+- `capture_pre_v2(scope: V1Scope, pre_quiescence: EvidenceCommitment) -> EvidenceCommitment`
+- `quiesce_and_record_post(pre: EvidenceCommitment) -> EvidenceCommitment`
+- `capture_post_v2(scope: V1Scope, post_quiescence: EvidenceCommitment, pre: EvidenceCommitment) -> EvidenceCommitment`
 
 - [ ] **Step 1: Write RED fixture-v1 tests**
 
@@ -69,10 +75,10 @@ def test_inspect_v1_derives_exact_scope_and_rejects_guessed_paths(tmp_path):
     scope = inspect_v1_for_test(fixture_v1(tmp_path))
     assert scope.legacy_v1_plaintext_sha256 == LEGACY_V1_PLAINTEXT_SHA256
     assert scope.allowed_roots == {"runtime_data", "workspace_sessions", "workspace_persona_evolution", "policy_audit"}
-    assert all(entry.adapter in {"jsonl_prefix", "sqlite_logical", "immutable_exact"} for entry in scope.entries)
+    assert all(entry.adapter == "immutable_exact_v1" for entry in scope.entries)
 ```
 
-Test synthetic fixed-service stop/state/PID/socket/port checks, bounded fake Overseer-respawn detection, v1 SHA/signature/decrypt failure, incomplete quiescence, auth/path escape/symlink/nonregular entry, unknown mutable file, unprofiled SQLite table, and WAL/SHM absent from a declared snapshot profile. Assert paths/content never reach stdout.
+Test reuse of the common synthetic fixed-service stop/state/PID/socket/port and bounded fake Overseer-respawn receipt, v1 SHA/signature/decrypt failure, incomplete quiescence, auth/path escape/symlink/nonregular/hard-link entry, duplicate inode/path, Unicode/path normalization collision, changed/missing/added file, DB/WAL/SHM/journal as ordinary exact files, full-root second-pass drift, and public-output silence. Assert paths/content never reach stdout.
 
 Add common-library RED tests for the complete Fixed Legacy-v1 Descriptor boundary above. The synthetic signature target is the exact decrypted plaintext, never the ciphertext or parsed/re-serialized JSON. Assert the public production wrapper has no path, root, identity, signer, namespace, commitment, or crypto override.
 
@@ -85,22 +91,25 @@ Expected: FAIL because the controller is absent.
 - [ ] **Step 3: Implement read-only inspection and capture**
 
 ```python
-def inspect_v1(quiescence: EvidenceCommitment) -> V1Scope:
-    verify_full_quiescence(quiescence)
+def inspect_v1(pre_quiescence: EvidenceCommitment) -> V1Scope:
+    verify_state_quiescence_pre(pre_quiescence)
     plain = decrypt_verify_external_v1_without_output()
     require_exact_serialization_sha256(plain, LEGACY_V1_PLAINTEXT_SHA256)
     return parse_and_validate_v1_scope(plain)
 
-def capture_v2(scope: V1Scope) -> EvidenceCommitment:
-    require_every_v1_file_byte_identical(scope)
-    inventory = [capture_entry(entry) for entry in scope.entries]
-    return write_protected_record("whatsapp-rotation-state-v2", {
+def capture_pre_v2(scope: V1Scope, pre_quiescence: EvidenceCommitment) -> EvidenceCommitment:
+    verify_state_quiescence_pre(pre_quiescence)
+    inventory = capture_two_pass_exact_inventory(scope)
+    return write_state_inventory("whatsapp-rotation-state-pre-v2", {
+        "phase": "pre", "quiescence": asdict(pre_quiescence),
         "legacy_v1_plaintext_sha256": LEGACY_V1_PLAINTEXT_SHA256,
-        "legacy_v1_verified": True, "adapter_inventory": inventory,
+        "legacy_v1_verified": True, "exact_inventory": inventory,
     })
 ```
 
-Implement `quiesce_and_record()` with the fixed user service list Bridge/Gateway/Overseer: `systemctl --user stop`, allowlisted state/PID/socket/port checks, and a bounded repeated respawn check proving Overseer did not revive anything. It never enable/disables units and writes a protected receipt. Synthetic tests use fakes until first Luna GO. `inspect_v1` refuses without that receipt. Verify full quiescence before deriving one JSONL or SQLite row digest. Open every declared source descriptor-relatively and prove it byte-identical to v1's path/mode/size/mtime/SHA facts. Any changed v1 file is NO-GO; never infer old SQLite rows from it. Only then does SQLite use the source-defined fixed registry profile/read-only held-FD connection and stable key/digest map; JSONL streams ordered rows; other regular files use immutable exact comparison. For each SQLite snapshot profile, hash every held DB/WAL/SHM member before and after the logical read and require stability.
+Add a state-specific full-quiescence wrapper without changing the accepted quarantine adapter: stop exactly Overseer, Bridge, then Gateway with fixed absolute systemctl commands and bounded terminate/kill/reap behavior, then reuse the accepted two-sample unit/PID/socket/port verifier and dedicated common receipt. `quiesce_and_record_pre()` and `quiesce_and_record_post(pre)` each create a fresh internal random nonce and phase-bound protected record of fixed kind `whatsapp-rotation-state-quiescence-pre-v1` or `...-post-v1`; post also binds the exact pre-inventory predecessor. A dedicated crash-safe `.state-receipts` journal binds phase, nonce, common quiescence commitment, predecessor, and final commitment so a generic protected record cannot substitute. Production exposes no phase/nonce/kind/predecessor override.
+
+`inspect_v1` and each capture refuse without the exact authenticated phase receipt. Open all four fixed roots component-by-component and perform the exhaustive two-pass descriptor-relative inventory above. Require the exact current directory/file path sets to equal v1-derived scope and every held file to match v1 mode/size/`mtime_ns`/SHA before recording additional v2 security facts. Any difference is NO-GO. Never open SQLite, parse JSONL, infer logical rows, or classify changes inside v1 roots. Pre inventory uses fixed kind `whatsapp-rotation-state-pre-v2`; post uses `whatsapp-rotation-state-post-v2`, binds both its fresh post receipt and the exact pre inventory, and is independently journaled. Tests reject cached/same nonces or commitments, replay, swapped phases, wrong kinds, generic records, wrong predecessors, and decoded dictionaries.
 
 - [ ] **Step 4: Verify GREEN, mutate, and commit**
 
@@ -109,10 +118,10 @@ uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_wh
 uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py
 ```
 
-Temporarily omit v1 serialization verification and prove RED coverage fails. Temporarily accept unprofiled WAL and prove RED coverage fails. Restore both and commit:
+Temporarily omit v1 serialization verification and prove RED coverage fails. Temporarily omit unknown-file/path-set rejection and prove RED coverage fails. Restore both and commit:
 
 ```bash
-git add scripts/whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_state.py
+git add scripts/incident_evidence_lib.py scripts/whatsapp_rotation_state.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_rotation_state.py
 git commit -m "feat(incident): inspect v1 rotation scope"
 ```
 
@@ -123,41 +132,27 @@ git commit -m "feat(incident): inspect v1 rotation scope"
 - Modify: `tests/shared/test_whatsapp_rotation_state.py`
 
 **Interfaces:**
-- `compare_v2(pre: ProtectedManifest, post: ProtectedManifest, expected: SmokeExpectation) -> ComparisonResult`
+- `compare_v2(pre: EvidenceCommitment, post: EvidenceCommitment, observer: EvidenceCommitment) -> ComparisonResult`
 - Status is `preserved`, `preserved_with_classified_additions`, or `mismatch`.
 
 - [ ] **Step 1: Write RED preservation tests**
 
 ```python
-def test_old_sqlite_key_digest_map_and_runtime_are_exactly_unchanged():
+def test_every_v1_file_is_exact_and_only_observer_chain_grows():
     result = compare_v2(pre_manifest(), post_manifest(), observer_evidence())
     assert result.status == "preserved"
     assert observer_evidence().classifications == {"expected_inbound_reply": 1, "unsolicited_inbound": 1}
 ```
 
-Test changed/missing/reordered/truncated old JSONL line, duplicate/missing/changed SQLite key/digest, immutable file, receipt HMAC, unprofiled table, unstable WAL/SHM, schema drift, and any runtime key/line growth. Each is `mismatch` and retains encrypted evidence.
+Test changed/missing/reordered/truncated JSONL bytes, changed SQLite/database bytes, missing/added WAL/SHM/journal, any immutable file change, path/type/mode/UID/GID/link/mtime drift, new runtime file, receipt HMAC/predecessor/order/classification drift, and any unclassified observer growth. Each is `mismatch` and retains encrypted evidence.
 
 - [ ] **Step 2: Implement exact comparator**
 
-```python
-def capture_sqlite_rows(rows: Iterable[Row]) -> dict[KeyTuple, str]:
-    result: dict[KeyTuple, str] = {}
-    for row in rows:
-        key, digest = stable_key(row), canonical_row_digest(row)
-        if key in result:
-            raise RuntimeError("operation failed")
-        result[key] = digest
-    return result
-
-def compare_sqlite(old: Mapping[KeyTuple, str], new: Mapping[KeyTuple, str]) -> bool:
-    return set(new) == set(old) and all(new[key] == old[key] for key in old)
-```
-
-First prove every v1 entry is present under the same adapter/profile. Immutable adapters, runtime JSONL, and SQLite profiles require exact equality under quiescence; SQLite rejects duplicates before map construction and requires exact key-set/per-key digest equality. Only the separate protected evidence chain permits ordered-prefix/classified growth. Direct observer evidence, not runtime DBs, classifies expected quote causality by `replyToMessageId == accepted messageId` and unsolicited inbound. Never delete/normalize rows.
+First authenticate and load the exact fixed pre/post protected kinds and their dedicated journals. Require distinct commitments/nonces, correct phase order, fresh independently authenticated quiescence receipts, post-to-pre predecessor binding, the same legacy plaintext SHA and verified-v1 flag, then exact directory/file entry-set and per-entry fact equality. Reject same/swapped commitments, wrong kinds, generic protected records, and plain decoded inputs. Any addition inside a v1 root is mismatch. Only the fixed protected `whatsapp-rotation-observer-chain-v1` kind permits ordered-prefix/classified growth. Direct observer evidence, not runtime DBs, classifies expected quote causality by `replyToMessageId == accepted messageId` and unsolicited inbound. Never delete, normalize, open, rewrite, or replay a v1-root file.
 
 - [ ] **Step 3: Verify, mutate, commit, and report**
 
-Run focused tests and Ruff. Temporarily omit a SQLite old key from exact comparison and prove RED coverage fails; temporarily accept unknown mutable file and prove RED coverage fails. Restore both, rerun GREEN, then commit:
+Run focused tests and Ruff. Temporarily omit one old exact entry from comparison and prove RED coverage fails; temporarily accept one new root file and prove RED coverage fails. Restore both, rerun GREEN, then commit:
 
 ```bash
 git add scripts/whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_state.py
@@ -168,4 +163,4 @@ Record encrypted adapter inventory and public counts only for integration/review
 
 ## Execution Handoff
 
-After implementation/synthetic reviews and first Luna GO, run full `quiesce_and_record`, then read-only `inspect-v1`/`capture-v2`; their commitments require mandatory second Luna evidence-bound GO before any owner turn. Mismatch never authorizes deletion, restoration, or replay.
+After implementation/synthetic reviews and the first Luna code GO, run `quiesce_and_record_pre()` -> read-only `inspect_v1(pre_receipt)` -> `capture_pre_v2(scope, pre_receipt)`. Package the exact pre receipt/inventory commitments for the mandatory second evidence-bound Luna GO before any owner turn. After authorized owner/relink/smoke work, run `quiesce_and_record_post(pre_inventory)` -> `capture_post_v2(scope, post_receipt, pre_inventory)` -> `compare_v2(pre_inventory, post_inventory, observer_chain)`, then obtain the final Luna GO. Any mismatch or wrong/replayed/swapped commitment is terminal for incident close and never authorizes deletion, restoration, retry, or replay.

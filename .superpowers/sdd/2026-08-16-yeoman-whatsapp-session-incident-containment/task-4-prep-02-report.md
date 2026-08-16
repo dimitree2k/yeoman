@@ -35,8 +35,32 @@ Implementation remains paused until the same Terra plan reviewer accepts this co
 - Accepted boundary: fixed legacy descriptor/schema, held-FD hash-to-consumption binding, a separate plaintext/`git` signature verifier, exact sizes and cumulative caps, distinct pinned identities/recipients, test-only injection, cleanup/no-output coverage, and inert historical preservation of `workspace_persona_evolution`; new-format `EvidenceCommitment` behavior stays frozen.
 - State implementation may resume from RED against this exact plan. Production/live invocation remains NO-GO.
 
+## Implementation stop: missing complete SQLite profile registry
+
+The corrected plan resolves the legacy-v1 crypto-reader conflict, but its source-defined profile requirement cannot be implemented without forbidden information. It requires a production registry keyed by the exact v1 manifest paths and, for every supported SQLite snapshot, its exact `PRAGMA user_version`, table name, ordered SELECT columns, and stable unique-key tuple. The plan supplies none of those profile entries.
+
+The permitted source-only inspection identifies multiple possible SQLite stores (`memory.db`, `reply_context.db`, `chat_registry.db`, persona-evolution state, contacts, and others), but source code neither identifies which of them are among the 248 legacy-v1 entries nor fixes their v1-time schemas/versions. Selecting any subset or current-source schema would be speculative; an empty registry would reject every real v1 SQLite entry and violate the required full coverage. Determining the missing facts requires decrypting the legacy manifest or live runtime inspection, both explicitly forbidden for this implementation task.
+
+Per the task instruction, implementation stops before RED rather than shipping an incomplete registry. No toolkit source/test was changed and no production/live action was invoked after the corrected-plan read.
+
+### Required resolution
+
+Add an accepted source-pinned registry table to the plan or another reviewed source artifact. It must enumerate every SQLite entry expected in legacy v1 with its exact root/relative path, `user_version`, table, ordered columns, unique key tuple, and explicit DB/WAL/SHM held-member names. Then synthetic-only RED/GREEN implementation can resume without decrypting v1 or inspecting the runtime.
+
+## Architectural simplification: exact-byte state proof
+
+The controller stepped back from the missing registry. Because the authenticated v1 already pins the complete 248-file path set plus every file's mode, size, `mtime_ns`, and SHA-256; pre-baseline requires exact live equality to all of those facts; Gateway/Overseer remain stopped; Bridge-only smoke may not touch the four roots; and post comparison permits no root growth, per-table logical adapters add no preservation power. They instead risk omitting internal/legacy tables or normalizing unversioned schemas.
+
+Two independent Terra source/architecture reviews returned ACCEPT for one `immutable_exact_v1` adapter for every file. SQLite DB/WAL/SHM/journal, JSONL, and all opaque files remain ordinary exact entries. The controller must enumerate the complete roots twice through no-follow descriptors, reject every unexpected path/type/link, require exact v1 facts at baseline, add current security metadata to protected v2, and require exact pre/post v2 equality. Only the separately rooted authenticated observer chain may grow with verified causal classification.
+
+This proves perfect preservation of the sealed legacy state; semantic import into the new target remains a later migration-coverage/receipt gate. Any sidecar change caused by shutdown is a pre-owner mismatch, never an allowed normalization. No source/runtime/live file was changed during these reviews.
+
+The final plan reviewer rejected the first written simplification until it pinned all four label-to-path mappings, separated and freshly bound pre/post quiescence/inventory kinds, made directory-prefix and empty-directory equality explicit, and defined Unicode NFC collision semantics. The plan now includes those corrections plus dedicated state journals and wrong-kind/replay/swap tests; implementation remains paused for final re-review.
+
+Final re-review returned **ACCEPT** with no remaining Critical or Important issue. Accepted final plan SHA-256: `f99b243a757d6448fe873bb37c64a4e082db63e693d4156d5d8f75cabdef7f10`. The execution handoff now fixes the first code GO, pre capture, mandatory second evidence-bound GO before owner work, post capture/compare, and final Luna GO in order. Synthetic implementation may resume; every production/live action remains NO-GO.
+
 ## Evidence
 
 - Toolkit branch: `c/yeoman-migration-toolkit`, clean at inspection; required ancestor `6ba55014242953e72ec7a29e75041f704452b885` is present.
 - Read-only contract inspection: `scripts/incident_evidence_lib.py` and the accepted Task 4 common/quarantine report.
-- No RED/GREEN/mutation command was run because no valid interface exists to write a behaviorally correct RED test.
+- No RED/GREEN/mutation command was run because implementation remained paused pending final plan acceptance; the corrected simplified interface is now specified.
