@@ -58,3 +58,10 @@ Request both standing reviews after each accepted milestone task or earlier when
 - Current source authority is program-log commit `5ebfa0119d9bbd0edc7810b25cdd93e18d974afb`; the staged candidate digest remains `7d94039ee62bd91d6735cbfe4b293db41a6c7be4c6fdedc060273c21f5ddd56c` across 50 paths. No preservation tag or target/toolkit worktree exists.
 - `age`/`rage` remain unavailable and GnuPG has zero local secret keys. No key material was generated and no recovery location was guessed.
 - Runtime and memory remain untouched. Resume Task 1 only after the owner answers the three numbered decisions recorded in the prior handoff.
+
+### 2026-08-16 — Bootstrap gates resolved; Task 1 resumed
+
+- Owner authorized Terra for implementer/task-review subagents while Agent A and Agent B remain Luna, approved the audited 50-path preservation candidate, and approved local signing/recovery-key setup.
+- `age` 1.2.1 was installed from the Debian package repository. No key material has entered Git, either worktree, or runtime state.
+- The host exposes one physical disk only. Two independent age recovery identities will be created in separate permission-restricted locations outside Git/worktrees/runtime, but they share the disk failure domain. This is an explicit local-only bootstrap limitation; one identity must later move to separate local media and be exercised before claiming separate-media recovery.
+- Task 1 resumes from controller base `a5057e615c1d718b6eba0a4948f68fbc12d03afe`; the candidate diff commitment is unchanged.
