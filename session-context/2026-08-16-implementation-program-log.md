@@ -64,4 +64,20 @@ Request both standing reviews after each accepted milestone task or earlier when
 - Owner authorized Terra for implementer/task-review subagents while Agent A and Agent B remain Luna, approved the audited 50-path preservation candidate, and approved local signing/recovery-key setup.
 - `age` 1.2.1 was installed from the Debian package repository. No key material has entered Git, either worktree, or runtime state.
 - The host exposes one physical disk only. Two independent age recovery identities will be created in separate permission-restricted locations outside Git/worktrees/runtime, but they share the disk failure domain. This is an explicit local-only bootstrap limitation; one identity must later move to separate local media and be exercised before claiming separate-media recovery.
-- Task 1 resumes from controller base `a5057e615c1d718b6eba0a4948f68fbc12d03afe`; the candidate diff commitment is unchanged.
+- Task 1 resumes from controller base `5fb178ba5b37cb3ee2c6df050545134e65c99bda`; the candidate diff commitment is unchanged.
+
+### 2026-08-16 — Milestone 01 Task 1 accepted after fix round 1
+
+- Preservation commit `bdc4c8c9e33602c5c8abd69f054703469d212dab` contains exactly the owner-approved 50-path candidate. Source branch commit subject is `chore(release): preserve pre-rework source baseline`.
+- The accepted annotated SSH-signed tag `yeoman-preservation-2026-08-16` is tag object `eb7dede1fbbb52db3ee6ff098f069a35d95067eb` and peels to the preservation commit. Its signature verifies against the pinned Ed25519 program key.
+- Initial review rejected a deterministic reconstruction as proof of the old running Bridge. Fix round 1 performed an owner-approved coordinated preservation fence: Overseer and Bridge stopped in order, exact preservation artifacts populated the managed cache through the supported runtime manager, a new Bridge started under systemd, authenticated health proved protocol v3/running/connected, Overseer returned, and Gateway remained continuously active.
+- Exact deployed `dist/index.js` SHA-256 is `4b2f95fce746e5728f1090aba26567d89df2a091782f78ac0564fac066da6736`; exact managed-runtime fingerprint is `8d4df04de24190b0b9f512a93d1971731a6176c32b089df118499581f711884d`.
+- The protected deployment receipt remains outside Git/worktrees/runtime. Public commitments are plaintext `dea931ef742dead91fba023dc1489489320c7db2be30e594f7ee7615496132e4`, dual-recipient ciphertext `e961c56654b75d293cdff471581128b9f418616d396028b44adacd2753133eb7`, and detached signature `d13be4a2f3a8b2a50b168d4e41a879da04801a0728175224623c823ad9f23896`. Both age identities decrypt to the same commitment and the signature verifies; plaintext is absent.
+- `/home/dm/Documents/yeoman-rework` on `c/yeoman-architecture-rework` and `/home/dm/Documents/yeoman-migration-toolkit` on `c/yeoman-migration-toolkit` are clean at the preservation commit.
+- Scoped task re-review verdict: all three findings addressed; Task 1 accepted. No Task 2 work has started.
+
+### 2026-08-16 — Security incident requiring standing-review disposition
+
+- During Task 1 diagnostics, the bundled `/home/dm/.codex/skills/yeoman-runtime/scripts/recent_logs.sh bridge` helper unexpectedly emitted historical Baileys session-key material into the implementer tool transcript. The helper had been treated as redaction-safe by its skill contract, but current evidence disproves that guarantee for Bridge logs.
+- The implementer stopped broad-log use immediately. No exposed value was copied into Git, task reports, receipts, session notes, or other retained files. This note intentionally contains no secret, identifier, or raw log excerpt.
+- WhatsApp remains connected, but no credential/session rotation or QR relink was performed because that is a separate destructive authorization boundary. Task 2 is held until Agent B classifies the exposure and recommends exact containment; Agent A must also assess the diagnostic/process correction. The unsafe helper must not be used again in this program unless independently repaired and validated.
