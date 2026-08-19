@@ -81,3 +81,18 @@ The owner explicitly resumed implementation. The controller revalidated all thre
 Fresh checkpoint verification before edits: 264 focused tests passed in 13.02 seconds; scoped Ruff and `git diff --check` were clean. A fresh Terra gap audit found the preserved WIP incomplete, especially fixed production smoke APIs/adapters, held credentials and canonical-auth rechecks, authenticated protocol-v3 observation, causal inbound reply/complete close, durable capture-failure evidence, successful one-shot recovery, actual controller-to-comparator proof, and the full negative/mutation matrix.
 
 The resumed task uses the dedicated ledger and recovery brief under `.superpowers/sdd/2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/`. A fresh Terra implementer owns the combined Tasks 1-3 recovery batch because the pause WIP already crosses their shared files. Standing Luna Agent A/B remain deferred until Terra implementation review and synthetic integration review accept the complete pre-owner package.
+
+## Resumed completion 2026-08-19
+
+The synthetic recovery implementation and integration review are now accepted:
+Tasks 1-3 reached Terra SPEC ACCEPT and QUALITY ACCEPT at toolkit `b788608`,
+and the full synthetic bundle reached SPEC ACCEPT and QUALITY ACCEPT at
+`995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`, both with no findings.  Runtime
+services remain offline: Overseer, Bridge, Gateway, and Pinchtab are inactive
+and disabled; synthetic resumption did not restore any enablement.
+
+The final exact five-file synthetic suite passed `339 passed in 16.98s`; the
+exact scoped Ruff command passed, `git diff --check` was clean, and toolkit
+status was clean at `995c3ac`.  The next step is the standing Luna major-turn
+code review only.  No owner turn, quarantine, QR, relink, observer, or smoke
+operation is authorized before the later evidence-bound Luna gates.

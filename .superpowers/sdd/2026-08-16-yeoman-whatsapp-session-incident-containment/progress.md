@@ -11,5 +11,5 @@ Task 2: complete (commits `bdc4c8c..686a1ee`, scoped re-review clean; restricted
 Task 3: in progress from toolkit base `686a1ee84f060b4bcb5acd35b65887cbafed2df3` — harden canonical QR reconnect boundary
 Task 3: complete (commits `4b39f40..6ba5501`; 32 focused tests, Ruff clean, 629 Gateway tests; scoped Terra re-review ACCEPT)
 Task 3b: complete (installed reconnect skill aligned; wrapper removed; contract/validator green; scoped Terra review ACCEPT)
-Task 4: pending — owner-authorized WhatsApp revocation and QR relink
-Task 4 pre-owner prep-03: in progress — gate-bound quarantine receipt amendment accepted at prep-03 SHA-256 `6074344d5f1c6e6d6f1a3d40fab82983ee34825002a74fb224bcf415184abe30`; synthetic implementation/review still required
+Task 4: pending / NO-GO — owner-authorized WhatsApp revocation and QR relink remain forbidden.
+Task 4 pre-owner prep-03: synthetic bundle complete and accepted at toolkit `995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`; Tasks 1-3 Terra acceptance at `b788608`, integration/task SPEC ACCEPT and QUALITY ACCEPT with no findings.  Standing Luna major-turn code review is pending; its first GO may authorize only quiescence plus read-only inspect-v1/capture-v2.

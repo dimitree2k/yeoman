@@ -108,3 +108,29 @@ read or modified.
   and `git diff --check` from the committed toolkit tree. The toolkit worktree
   was clean and no live runtime, program key, evidence root, service, or
   authentication boundary was accessed.
+
+## Full-bundle synthetic acceptance
+
+The later prep-01, prep-02, and prep-03 work is accepted as one synthetic
+pre-owner bundle.  Accepted plan hashes are prep-01
+`0a668c0a5aea847beca23e62359cc480903f6b18d2c548e39c714160bd8267c6`, prep-02
+`600396a3ed9510003b48401dcb24cc6acd34f3b96b10afb191dcd71ce57f4e2a`, and
+prep-03 `6074344d5f1c6e6d6f1a3d40fab82983ee34825002a74fb224bcf415184abe30`.
+
+Terra accepted common/quarantine at `68839a3`, state evidence at `f17ebe0`,
+and final prep-03 Tasks 1-3 at `b788608` with SPEC ACCEPT and QUALITY ACCEPT,
+no findings.  The integration/task review accepted the full bundle at
+`995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`, again with SPEC ACCEPT and
+QUALITY ACCEPT, no findings.
+
+At that head, the exact five-file synthetic suite passed `339 passed in
+16.98s`; exact scoped Ruff passed; `git diff --check` and toolkit status were
+clean.  Integration and all prep work used disposable synthetic fakes only.
+No production controller/wrapper, runtime service, auth/evidence/key path,
+socket, port, network, QR, JID, message, archive, memory, or owner turn was
+invoked.  Runtime remains offline.
+
+This does not authorize the incident.  The next gate is the standing Luna
+major-turn code review.  Its first GO may authorize only full quiescence and
+real read-only `inspect-v1`/`capture-v2`; a second evidence-bound Luna GO is
+required before every owner, quarantine, QR, relink, observer, or smoke action.

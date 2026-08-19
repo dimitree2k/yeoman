@@ -28,11 +28,11 @@ No separate product spec is referenced by this prep plan. The accepted prep-01, 
 | Tasks 2 → 3 | Task 3 consumes the exact observer and comparator DAG from Task 2 | Compatible; the shared smoke/state files make these tasks tightly coupled in the paused WIP. |
 | Tasks 1-3 → 4 | Task 4 records RED/GREEN/mutation and no-live evidence | Compatible; report is pending and must not infer evidence from green tests alone. |
 
-Task 1-3 recovery batch: in progress from WIP `fc86076`; no implementation acceptance yet.
-Task 4: pending.
-Final Terra task review: pending.
-Synthetic integration/task review set: pending.
-Standing Luna Agent A/B major-turn review: pending; do not contact before pre-owner implementation and integration reviews are accepted.
+Task 1-3 recovery batch: complete from WIP `fc86076`; final code/task acceptance at `b788608` with Terra SPEC ACCEPT and QUALITY ACCEPT, no findings.
+Task 4 report: complete; see `task-4-prep-03-report.md`.
+Combined Terra task review: accepted.
+Synthetic integration/task review set: accepted at `995c3ac` with SPEC ACCEPT and QUALITY ACCEPT, no findings.
+Standing Luna Agent A/B major-turn code review: pending.  It is the next gate; do not perform a live action before its first evidence-limited GO.
 
 ## Recovery gap audit
 
