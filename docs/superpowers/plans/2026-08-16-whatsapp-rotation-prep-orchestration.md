@@ -4,13 +4,13 @@
 
 **Goal:** Build and review the synthetic-only controllers required before the incident Task 4 owner rotation can be requested.
 
-**Architecture:** Work only in `/home/dm/Documents/yeoman-migration-toolkit`, whose branch must start from and retain `6ba55014242953e72ec7a29e75041f704452b885` as a required ancestor, rather than pinning implementation to that forever-exact HEAD. Four incident scripts share a small `incident_evidence_lib`: runtime authentication remains under `/home/dm/.yeoman/secrets/whatsapp-auth`, while all protected operator evidence is rooted at `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`; program keys remain in their existing program-key roots.
+**Architecture:** Work only in `/home/dm/Documents/yeoman-migration-toolkit`, whose branch must start from and retain `6ba55014242953e72ec7a29e75041f704452b885` as a required ancestor, rather than pinning implementation to that forever-exact HEAD. Five incident scripts share a small `incident_evidence_lib`: runtime authentication remains under `/home/dm/.yeoman/secrets/whatsapp-auth`, while all protected operator evidence is rooted at `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`; program keys remain in their existing program-key roots.
 
 **Tech Stack:** Python 3 standard library, `age`, `ssh-keygen -Y`, existing `scripts/whatsapp_qr_reconnect.py`, `pytest`, Ruff.
 
 ## Global Constraints
 
-- Production additions are only `scripts/incident_evidence_lib.py`, `scripts/whatsapp_auth_quarantine.py`, `scripts/whatsapp_rotation_state.py`, and `scripts/whatsapp_rotation_smoke.py`; tests are only under `tests/shared/`.
+- Production additions are only `scripts/incident_evidence_lib.py`, `scripts/whatsapp_auth_quarantine.py`, `scripts/whatsapp_rotation_state.py`, `scripts/whatsapp_rotation_smoke.py`, and `scripts/whatsapp_rotation_first_gate.py`; tests are only under `tests/shared/`.
 - Evidence root, auth root, recipient list, signer, allowed-signers file, and incident HMAC key are fixed constants. Provision the dedicated 32-byte incident HMAC key at fixed mode-`0600` path beneath a fixed `0700` program-key/hmac directory using `O_EXCL`, `getrandom`, and file/directory `fsync`; never derive it from signing or age keys. Synthetic tests inject fakes; production CLIs reject every root/path/key override.
 - `EvidenceCommitment` is public-safe: `schema_version`, `record_hmac_sha256`, `ciphertext_sha256`, and `signature_sha256` only. Never expose a bare plaintext record SHA-256.
 - JSON records may be bounded in memory. Streaming artifacts never create a plaintext file or FD-backed disk inode: they feed canonical bytes/tar-like records through bounded HMAC and `age` pipes; recipient verification streams decrypted bytes through HMAC/byte-count comparison and discards them. Build ciphertext, detached signature, and public metadata—but no plaintext—inside a private staging directory; verify ciphertext, both decryptions, and signature before public visibility, `fsync` it, then atomically rename it to a unique final artifact directory. Collision or any prepublication failure leaves no partial published artifact. Ciphertext staging may use `O_TMPFILE`/direct FD publication; unsupported primitives fail closed.
@@ -26,6 +26,51 @@
 | `scripts/whatsapp_auth_quarantine.py` | Bridge-stop-verified old-auth quarantine, empty active auth, old/current identity HMACs. |
 | `scripts/whatsapp_rotation_state.py` | v1-linked v2 adapters and non-destructive preservation comparator. |
 | `scripts/whatsapp_rotation_smoke.py` | Host-backed inventory attestation, direct Bridge event observer, and one-attempt smoke receipts. |
+| `scripts/whatsapp_rotation_first_gate.py` | Zero-argument, authenticated first-live-gate controller: it runs the fixed preflight and evidence lifecycle below, then stops for the second Luna review. |
+
+## First-live-gate controller contract
+
+This is a deliberately narrow incident controller, not a permanent runtime
+module. Its only production invocation is:
+
+```bash
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC /usr/bin/python3 /home/dm/Documents/yeoman-migration-toolkit/scripts/whatsapp_rotation_first_gate.py
+```
+
+It accepts **no arguments**, configuration overrides, alternate roots, or
+environment-supplied paths. It constructs the same sanitized environment for
+every child process. Before any mutation it authenticates the static
+repository/controller contract and validates that every fixed executable is a
+root-owned regular `0755` file, is not group- or world-writable, has the exact
+size and SHA-256 below, and is invoked only by its fixed absolute path. Any
+mismatch is a protected preflight **NO-GO** before quiescence or other
+mutation.
+
+| Executable | Size (bytes) | SHA-256 |
+| --- | ---: | --- |
+| `/usr/bin/age` | 4162312 | `374f65bfbb3646f15f5b3296507c7860067915da27af187995db7b4fec5fc035` |
+| `/usr/bin/age-keygen` | 2433984 | `859e2e6edbe0f5afe2a6e5c340f1f07969195de272888a303de2746902d46e5a` |
+| `/usr/bin/ssh-keygen` | 592376 | `e80f38fc532ca57dd82879c4dd169ae17bf76cc11c3da9c037c7495234fbb9bd` |
+| `/usr/bin/systemctl` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
+| `/usr/bin/git` | 4081272 | `a0e562e4bd3c4c79379e91d8c07a10104b2cefe8fac966dc6bd4874a57a807f3` |
+| `/usr/bin/python3` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
+
+After successful preflight, the controller writes a durable protected attempt
+record that binds the incident/schema, a fresh burned nonce, source/toolkit
+heads, controller identity, and fixed toolchain identities. Only then may it
+run this single causal chain: `q1` full quiescence, v1 provenance, fresh `q2`,
+pre-v2 capture, final read-only receipt, and protected binding. It retains
+every partial artifact. Any later failure writes protected allowlisted failure
+evidence linked to the attempt and available public commitments; a failure to
+write that evidence is still NO-GO and never permits continuation. On success
+it emits only the allowlisted public commitments and stops for the mandatory
+second, evidence-bound Luna review.
+
+This controller authorizes neither a later rotation nor any owner, revocation,
+quarantine, QR/relink, observer, smoke, message, or other production action.
+Persona-evolution is outside target behavior and historical artifacts remain
+inert. Proactivity, consciousness, and speak-up are postponed but mandatory
+later capabilities; they are not widened by this incident gate.
 
 ---
 

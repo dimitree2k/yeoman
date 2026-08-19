@@ -128,3 +128,13 @@ their strictest decision governs.  Even a later GO may authorize only full
 quiescence plus the fixed first-gate controller/read-only v1 inspect/pre-v2
 capture/protected commitment handoff.  It does not authorize owner work,
 revocation, quarantine, QR/relink, observer startup, or smoke.
+
+## Standing Luna re-review update — 2026-08-20
+
+Agent B returned a narrow GO, but Agent A returned the governing NO-GO at the
+same historical source/toolkit heads. Its blockers are: PATH-resolved crypto
+tools; the orchestration plan omitting the fifth first-gate controller; and no
+exact invocation/toolchain provenance or protected attempt/failure identity.
+The documentation correction is in progress; the required toolkit code and
+tests are not complete or reviewed. Retain all partial evidence on any later
+failure. Services remain offline and no live action is authorized.

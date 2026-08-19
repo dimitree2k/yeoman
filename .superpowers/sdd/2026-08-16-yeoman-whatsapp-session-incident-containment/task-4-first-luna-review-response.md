@@ -39,3 +39,19 @@ Their strictest decision governs.  A subsequent GO can authorize only full
 quiescence plus fixed first-gate controller/read-only v1 inspect/pre-v2 capture
 and protected commitment handoff; it cannot authorize owner, revocation,
 quarantine, QR/relink, observer, or smoke work.
+
+## Standing Luna re-review — governing NO-GO, correction underway
+
+At the same exact source/toolkit heads, Agent B returned a narrow **GO** for
+only the stated first-gate lifecycle. Agent A returned the governing
+**NO-GO**. Its three blockers are: PATH-resolved `age`, `age-keygen`, and
+`ssh-keygen` subprocesses despite sensitive descriptors; the authoritative
+orchestration plan's missing fifth `whatsapp_rotation_first_gate.py` component;
+and the absence of an exact production invocation/toolchain provenance plus a
+protected attempt/run identity and allowlisted failure record.
+
+Documentation now records the intended fixed executable baseline and lifecycle,
+but the toolkit implementation, tests, and fresh reviews for those three
+blockers are pending. The gate remains **CLOSED**. Preserve all historical
+376-test evidence as evidence of the prior synthetic head only; it is not
+evidence that the pending correction is complete. No live action occurred.
