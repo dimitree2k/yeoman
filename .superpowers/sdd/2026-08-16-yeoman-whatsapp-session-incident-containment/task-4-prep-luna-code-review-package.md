@@ -1,88 +1,101 @@
-# Luna code-review package — synthetic WhatsApp rotation preparation
+# Luna re-review package — corrected first WhatsApp rotation gate
 
 ## Decision requested
 
-Review the accepted synthetic pre-owner bundle and return **GO** or **NO-GO**
-for the first major live gate.  A GO authorizes **only** full quiescence and
-real read-only `inspect-v1` followed by `capture-v2`.  It does not authorize
-owner turns, revocation, quarantine, QR/relink, Bridge observer startup, or
-smoke.  Those actions remain forbidden until a later, second evidence-bound
-Luna GO after the real quiesced baseline commitments are available for review.
+Standing Luna Agent A and Agent B must independently review this exact fixed
+range and return **GO** or **NO-GO** for the first live gate.  The gate is
+currently **CLOSED**.  Their strictest decision governs.
 
-## Exact review scope
+A later GO may authorize only full quiescence and the fixed first-gate
+controller's read-only v1 inspection, pre-v2 capture, and protected commitment
+handoff.  It does **not** authorize an owner turn, revocation, quarantine,
+QR/relink, observer startup, smoke, a message, or any production mutation.
+There is no live evidence yet.  A second, evidence-bound Luna decision remains
+required before every such later action.
 
-- Toolkit repository: `/home/dm/Documents/yeoman-migration-toolkit`
-- Toolkit branch: `c/yeoman-migration-toolkit`
-- Exact range: `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`
-- Reviewed toolkit head: `995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`
-- Source handoff repository/branch: `/home/dm/Documents/yeoman`,
-  `c/turn-engine-v2`
-- Source head before this documentation commit:
-  `8c583d8df0dc3f4e095a41dca40b881a79032135`
+## Exact scope and heads
 
-## Binding plans and durable reports
+- Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
+  `c/yeoman-migration-toolkit`.
+- Corrected toolkit range/head:
+  `6ba55014242953e72ec7a29e75041f704452b885..62acf5b73ca9b9abaed79004deed7f93ef2280b3`.
+- Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
+  `c/turn-engine-v2`, `26cd7555ee9715b46afa8e49109f862c6b1b2933` before this
+  documentation-only handoff commit.
+- Initial Luna package range (not the range to approve now):
+  `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
 
-- prep-01 SHA-256: `0a668c0a5aea847beca23e62359cc480903f6b18d2c548e39c714160bd8267c6`
-- prep-02 SHA-256: `600396a3ed9510003b48401dcb24cc6acd34f3b96b10afb191dcd71ce57f4e2a`
-- prep-03 SHA-256: `6074344d5f1c6e6d6f1a3d40fab82983ee34825002a74fb224bcf415184abe30`
-- `task-4-prep-orchestration-report.md`
-- `task-4-prep-01-report.md`
-- `task-4-prep-02-report.md`
-- `task-4-prep-03-report.md`
-- `task-1-3-recovery-report.md`
-- `task-4-prep-integration-review-package.md`
+## Initial decisions and correction closure
 
-## Accepted review history
+- Agent A initially gave a narrow conditional GO limited to quiescence and
+  read-only inspect/capture.  Its Important gaps were a fixed bounded
+  controller and a fresh capture-bound q2/final read-only check.
+- Agent B initially gave **NO-GO**, which governed.  Its Important gaps were
+  trusted-ancestor validation and authenticated `VerifiedV1Scope`/artifact
+  provenance.
+- Both identified the stale local `task-1-3-recovery-report.md` reference.
+  The actual report is
+  `.superpowers/sdd/2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/task-1-3-recovery-report.md`.
+- No live action occurred during either initial review or the correction work.
 
-- Terra accepted common/quarantine preparation at `68839a3`.
-- Terra accepted state evidence at `f17ebe0`.
-- Terra accepted the final prep-03 Tasks 1-3 code/task result at `b788608`
-  with **SPEC ACCEPT** and **QUALITY ACCEPT**, no findings.
-- The final integration/task review accepted `995c3ac` with **SPEC ACCEPT**
-  and **QUALITY ACCEPT**, no findings.
+The correction commits, in order, are:
 
-## Fresh final synthetic verification
+1. `e90402f7fd6132e0df919a9c4b6e5f2c91b03580`
+2. `7a2dad692511b056696aa0fda95327ec4f0bd14e`
+3. `9dc098c67b5c1afc0ba9bfd6439bae64cda54534`
+4. `056c2a10bde8a90a006d7d6ba2cba8d877ad1542`
+5. `c9d5a0c670f9a9cf426a6afbbaaa672d366524ba`
+6. `62acf5b73ca9b9abaed79004deed7f93ef2280b3`
+
+At the final head, every held ancestor FD is checked and closed fail-safe; the
+legacy descriptor commitment is exact and all-field; `VerifiedV1Scope` is
+authenticated; q2/final have dedicated causal receipts; and q1, provenance,
+q2, pre, and final are durably bound.  The verifier is required at the
+controller and second-Luna handoff.  Inventory, pre, post, and comparator have
+exact provenance and semantic-quiescence continuity, and public compare fails
+closed.
+
+## Evidence to reproduce
+
+Run from `/home/dm/Documents/yeoman-migration-toolkit` at the corrected head:
 
 ```text
-uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py
-339 passed in 16.98s
+git rev-parse HEAD
+# 62acf5b73ca9b9abaed79004deed7f93ef2280b3
 
-uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_auth_quarantine.py scripts/whatsapp_rotation_state.py scripts/whatsapp_rotation_smoke.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py
-All checks passed!
+uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py
+# 285 passed
+
+uv run pytest -q tests/shared/test_whatsapp_rotation_first_gate.py
+# 91 passed
+
+uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_auth_quarantine.py scripts/whatsapp_rotation_state.py scripts/whatsapp_rotation_smoke.py scripts/whatsapp_rotation_first_gate.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_first_gate.py tests/shared/test_whatsapp_rotation_integration.py
+# All checks passed!
 
 git diff --check
-(no output)
+# no output
 
 git status --short
-(no output; clean toolkit worktree)
+# no output; clean toolkit worktree
 ```
 
-## Architectural boundaries to verify
+The controller's fresh verification total was 376 passing tests.  The 285 + 91
+split was solely the task-runner time boundary.  Final Terra returned SPEC
+ACCEPT and QUALITY ACCEPT with no Critical, Important, or Minor finding.
+Mutations were run and restored across rounds.
 
-- Evidence is fixed-root, descriptor-relative, encrypted/signed, and exposes
-  only public commitments; no plaintext auth, content, or JID reaches output.
-- Full quiescence of Overseer, Bridge, and Gateway is mandatory before any
-  real baseline read.  A mismatch is NO-GO.
-- The v1-derived v2 baseline is exact-byte/state preservation; it does not
-  semantically import legacy content.  Only a sealed, authenticated observer
-  DAG may classify later additions.
-- Owner evidence is four distinct exact host-backed turns with explicit
-  predecessor checks.  Generic, combined, missing, swapped, or reused sources
-  fail closed.
-- Quarantine is non-restorable and may run only after the second Luna GO.
-- Any smoke reservation is one attempt only. `external_effect_unknown` is
-  terminal and never replayed; `capture_failed` blocks incident close.
+## No-live boundary
 
-## Residual risks and non-claims
+No live/systemctl/socket/key/v1/owner/QR/quarantine/observer/smoke production
+call occurred.  Runtime remains offline and disabled.  Synthetic tests and
+review acceptance do not establish credentials, service behavior, capture
+completeness, QR behavior, or WhatsApp delivery.
 
-All coverage is synthetic.  No production wrapper/controller, live key,
-evidence, auth, service, socket, port, network, QR, JID, message, archive,
-memory, owner turn, or receipt was used.  Runtime Overseer, Bridge, Gateway,
-and Pinchtab remain inactive and disabled.  The review therefore cannot treat
-synthetic passing tests as evidence of current live credentials, service
-behavior, QR behavior, capture completeness, or WhatsApp delivery.
+## Supporting durable records
 
-If GO is granted, retain Gateway/Overseer stopped and execute only the
-specified first-gate quiescence plus read-only inspect/capture sequence.  Stop
-and return for review with the real protected commitments before requesting the
-second, evidence-bound Luna decision.
+- `task-4-first-luna-review-response.md` — initial rulings and correction
+  closure.
+- `task-4-prep-orchestration-report.md` — preparation and re-handoff record.
+- `task-4-prep-03-report.md` — accepted synthetic prep-03 report.
+- `../2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/task-1-3-recovery-report.md`
+  — actual recovery-report location.

@@ -134,3 +134,37 @@ This does not authorize the incident.  The next gate is the standing Luna
 major-turn code review.  Its first GO may authorize only full quiescence and
 real read-only `inspect-v1`/`capture-v2`; a second evidence-bound Luna GO is
 required before every owner, quarantine, QR, relink, observer, or smoke action.
+
+## First Luna review correction and durable re-handoff
+
+The initial Luna package range was
+`6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
+Agent A offered only a narrow conditional GO for quiescence/read-only
+inspect/capture and required a fixed bounded controller plus a fresh
+capture-bound q2/final read-only check.  Agent B returned the governing NO-GO,
+requiring trusted-ancestor validation and authenticated `VerifiedV1Scope` and
+artifact provenance.  Both also found the stale local recovery-report
+reference; the report is actually in the separate prep-03 SDD directory at
+`../2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/task-1-3-recovery-report.md`.
+No live action occurred.
+
+The ordered correction chain ends at toolkit
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3`.  It closes every held-ancestor FD
+fail-safe; commits the exact all-field legacy descriptor; authenticates
+`VerifiedV1Scope`; adds dedicated causal q2/final receipts and durable
+q1-to-provenance-to-q2-to-pre-to-final binding; requires verifier checks at
+controller and second-Luna handoff; preserves inventory/pre/post/comparator
+exact provenance and semantic-quiescence continuity; and makes public compare
+fail closed.  Mutations were run and restored across the correction rounds.
+
+Fresh controller verification at `62acf5b` recorded 376 passing tests (split
+285 + 91 only by the task-runner time boundary), relevant Ruff clean,
+`git diff --check` clean, and a clean toolkit worktree.  Final Terra SPEC
+ACCEPT and QUALITY ACCEPT had no Critical, Important, or Minor finding.  No
+live/systemctl/socket/key/v1/owner/QR/quarantine/observer/smoke production call
+occurred.  Runtime remains offline/disabled and the first live gate is
+**CLOSED** until both same standing Luna sessions re-review corrected range
+`6ba55014242953e72ec7a29e75041f704452b885..62acf5b73ca9b9abaed79004deed7f93ef2280b3`.
+Their strictest decision governs.  See `task-4-prep-luna-code-review-package.md`
+as the sole re-review handoff and `task-4-first-luna-review-response.md` for
+the durable initial-decision/correction record.
