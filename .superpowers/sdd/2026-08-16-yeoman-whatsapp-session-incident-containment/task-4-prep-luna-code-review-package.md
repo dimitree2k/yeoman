@@ -22,6 +22,8 @@ required before every such later action.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
   `c/turn-engine-v2`, `26cd7555ee9715b46afa8e49109f862c6b1b2933` before this
   documentation-only handoff commit.
+- Source documentation handoff head: `726429e742daaa838e5ee5806faeec8f28f701d9`
+  (`docs(incident): record corrected first Luna re-review`).
 - Initial Luna package range (not the range to approve now):
   `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
 
@@ -63,10 +65,10 @@ Run from `/home/dm/Documents/yeoman-migration-toolkit` at the corrected head:
 git rev-parse HEAD
 # 62acf5b73ca9b9abaed79004deed7f93ef2280b3
 
-uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py
+uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py
 # 285 passed
 
-uv run pytest -q tests/shared/test_whatsapp_rotation_first_gate.py
+uv run pytest -q tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py tests/shared/test_whatsapp_rotation_first_gate.py
 # 91 passed
 
 uv run ruff check scripts/incident_evidence_lib.py scripts/whatsapp_auth_quarantine.py scripts/whatsapp_rotation_state.py scripts/whatsapp_rotation_smoke.py scripts/whatsapp_rotation_first_gate.py tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_first_gate.py tests/shared/test_whatsapp_rotation_integration.py
