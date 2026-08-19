@@ -48,6 +48,7 @@ mutation.
 
 | Executable | Size (bytes) | SHA-256 |
 | --- | ---: | --- |
+| `/usr/bin/env` | 68464 | `a1a366aeec990c18d7ff97358e523925e449e2df224029fe048fc3ae35a97720` |
 | `/usr/bin/age` | 4162312 | `374f65bfbb3646f15f5b3296507c7860067915da27af187995db7b4fec5fc035` |
 | `/usr/bin/age-keygen` | 2433984 | `859e2e6edbe0f5afe2a6e5c340f1f07969195de272888a303de2746902d46e5a` |
 | `/usr/bin/ssh-keygen` | 592376 | `e80f38fc532ca57dd82879c4dd169ae17bf76cc11c3da9c037c7495234fbb9bd` |
