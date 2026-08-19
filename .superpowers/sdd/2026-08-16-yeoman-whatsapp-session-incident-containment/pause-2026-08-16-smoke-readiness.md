@@ -73,3 +73,11 @@ The WIP has not passed final task review. The last active implementation checkpo
 - Standing Luna Agent A and Agent B were not contacted during this partial implementation turn.
 
 No owner confirmation or live incident gate has been consumed. The next session begins with synthetic code only.
+
+## Resumed 2026-08-19
+
+The owner explicitly resumed implementation. The controller revalidated all three clean worktrees, the preserved toolkit WIP `fc86076352e8aaa417b7315688c02872bddf4826`, and all four Yeoman services still inactive and disabled. Synthetic implementation does not restore the pre-pause service enablements.
+
+Fresh checkpoint verification before edits: 264 focused tests passed in 13.02 seconds; scoped Ruff and `git diff --check` were clean. A fresh Terra gap audit found the preserved WIP incomplete, especially fixed production smoke APIs/adapters, held credentials and canonical-auth rechecks, authenticated protocol-v3 observation, causal inbound reply/complete close, durable capture-failure evidence, successful one-shot recovery, actual controller-to-comparator proof, and the full negative/mutation matrix.
+
+The resumed task uses the dedicated ledger and recovery brief under `.superpowers/sdd/2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/`. A fresh Terra implementer owns the combined Tasks 1-3 recovery batch because the pause WIP already crosses their shared files. Standing Luna Agent A/B remain deferred until Terra implementation review and synthetic integration review accept the complete pre-owner package.
