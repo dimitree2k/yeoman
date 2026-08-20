@@ -376,3 +376,100 @@ speak-up remain mandatory later. This commit's current source head must be
 bound by standing Luna A/B and any candidate. Only standing Luna A/B exact-head
 review is authorized next; construct no candidate unless both return GO. No
 runtime, candidate, privileged, or live action is authorized.
+
+## Superseding Task 5-8 systemic cleanup acceptance — 2026-08-20
+
+This section supersedes the preceding Task 4 next-step record while preserving
+its evidence. Standing Luna A/B had clarified the earlier exact-head result as
+**CANDIDATE-ONLY**, so no disposable replacement candidate was constructed.
+Task 5 then accepted evidence ownership at `e3f0867`, state ownership at
+`1bca8e7`, and bootstrap ownership at `9188f31`; its first combined review
+nevertheless found raw terminal-close and unbounded/raw child-reap gaps. Task 6
+`af3343b` repaired those local gaps, and Task 7 `31d8361` hardened the
+authenticated process caller graph. Their fresh reviews exposed the architectural
+cause: the controller used a separate state quiescence adapter while evidence
+retained a dead production duplicate, and several acquisitions/streams entered
+cleanup only after validation.
+
+The final accepted toolkit is
+`108db1ce3bd16325691afba7042e8130ae8d52d3`, parent
+`31d8361b89c5fec5126ce3b40f08e96ee1c64a11`. The exact Task 8 range is
+`31d8361b89c5fec5126ce3b40f08e96ee1c64a11..108db1ce3bd16325691afba7042e8130ae8d52d3`;
+the combined cleanup range is
+`aa84928af62d8ebf66ab8b658c5a2a0618772319..108db1ce3bd16325691afba7042e8130ae8d52d3`,
+and required ancestor `6ba550` remains present. Task 8 touches exactly
+bootstrap, evidence, state, and their three tests. Controller, quarantine,
+smoke, and secret-scope scanner bytes are unchanged. The authenticated
+production topology is now one explicit chain: bootstrap loads evidence, then
+state, then controller; the controller reaches only the captured state
+quiescence adapter. Evidence's dead `_live_quiescence_fields` wrapper and its
+direct test are removed. Evidence retains only the pinned spawn/read/reap and
+receipt-sampler primitives; no generic subprocess module, arbitrary runner, or
+wider permit-derived capability was added.
+
+The accepted lifecycle contract is uniform and terminal. An unowned initial
+open failure maps directly to its protected domain with no close attempt.
+Every acquired FD, directory, stream, and child has one owner; handoff detaches
+the former owner before a terminal close/reap, sibling cleanup is attempt-all,
+and an uncertain close is never retried or followed by an acquisition that can
+reuse its number. Missing stdout and every normal process fault enter bounded
+cleanup. Successful readers do not perform a second wait/reap. Age abort closes
+parent stdin, performs bounded child reap, and closes output in one idempotent
+attempt-all pass. State owns each stop child until bounded wait succeeds or
+bounded reap is attempted, and explicitly transfers each show child to the
+evidence reader. Crypto material acquisition rolls back every opened FD and
+returns the uniform protected domain. No reachable production `poll()`,
+`BaseException` catch, unbounded wait, raw normal resource exception, auth
+path change, schema change, or capability expansion remains.
+
+Authoritative evidence at `108db1c`: canonical seven-file suite `598 passed
+in 90.67s`; standalone state `180 passed in 91.58s`; bootstrap `97 passed`;
+evidence `181 passed`; independent reachable four-suite review `479 passed`;
+changed three-suite review `458 passed`; adversarial security review `535
+passed`. Python 3.13 compile for the seven audited production files, scoped
+Ruff, diff/ancestry, exact allowlist, no-new-skip, no-`poll`,
+no-`BaseException`, dead-wrapper-absence, and clean-status checks passed.
+Independent final verdicts are **SPEC PASS / ARCHITECTURE GO / QUALITY
+APPROVED** and security **GO**, with no findings.
+
+Authenticated artifact identities are: bootstrap (27,584 bytes)
+`55f6b93b53b07ff6bcbc94cde21f8acaa9515e58f9b0f76fe6be9ea3a5419200`;
+evidence (96,014 bytes)
+`ca9320c46b10aeeba90f3eb5b2c4853a6d30202d924f8c2e14b438b31f547d31`;
+state (88,428 bytes)
+`6630aaed152cfaa6d5de6ff9fa676a65a550b17c4025e13130475a8806db80b6`;
+controller (7,249 bytes)
+`4e1b841d0a32769dc2f89df0e2d31abb9761701b39ff53fd9dc329ea537c8fcf`;
+quarantine (52,374 bytes)
+`b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`;
+smoke (45,924 bytes)
+`4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5`;
+secret-scope scanner (8,979 bytes)
+`233f31419ef7573b7d391ef6909716acd8b1a6101f0a8767d2aa185b8b8661ea`.
+
+The pre-reconciliation source head is
+`3a44c1437a4621e777b0c7b347fde7e2ce81aa04`; preserved target baseline is
+`bdc4c8c9e33602c5c8abd69f054703469d212dab`. Overseer, Bridge, and Gateway
+remain inactive/disabled at PID 0; Pinchtab is inactive/not-found at PID 0.
+Release authority, installed bootstrap, and fixed candidate paths are absent.
+Obsolete mode-0600 candidate
+`04bbce963ad7070ee6b94426e99973f73900c6b3e394630040df9eb5f3557a79`
+remains unapproved, unsigned, uninstalled, and unusable; no replacement exists.
+No runtime, auth, memory, network, service, QR, quarantine, smoke, observer,
+relink, candidate, signing, install, or live action occurred.
+
+Only this docs reconciliation, its independent review, a separate
+plan/package-hash acceptance successor, and standing Luna A/B exact-head review
+are authorized next. Construct one new unsigned candidate only if both standing
+Luna reviewers return GO. Direct-script quarantine/smoke/QR cleanup debt remains
+bound to those later hard gates. Persona evolution remains omitted; proactivity,
+consciousness, and speak-up remain mandatory later capabilities.
+
+Pre-reconciliation self-hashed artifact values were plan
+`9f1669e5c698fad6682c727b4e52fc8bd92491ded6b5f989414474d745fcc700`
+and Luna package
+`9bf78317cf78506078e35456b9059cf4f53f579172d6ae31a6c2128be39221e8`.
+They identify source head `3a44c143` before this five-document append and are
+historical only. The controller must calculate the new plan/package hashes
+after the reconciliation commit and bind those new values in a separate
+three-document acceptance successor before standing Luna review.
