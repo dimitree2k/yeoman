@@ -432,3 +432,38 @@ Luna A/B exact-head review; construct and verify one new unsigned candidate;
 then request owner approval for that exact new hash. Do not put a plan/package
 self-hash inside either self-hashed file. After commit, the controller will
 calculate them and record them in a separate docs-only successor.
+
+## Exact-head Terra acceptance successor — 2026-08-20
+
+This documentation-only successor binds toolkit
+`d7485311d52de206470b4f61c2c8eb3b613ee2ba`, reviewed source documentation
+head `ad82d10201ae44d2d7f86e46e63b1f5ce4e0b9f6`, plan SHA-256
+`a171fd7af9e10e58b3e8462b77a93054a0f32408f29f1eff08eca552ff34bcef`, and
+Luna-package SHA-256
+`75f6203930561ca0d1071df4cad5f03d7cfbf414850bca9d3cbf85ac2d7b9f9b`.
+
+Fresh Terra specification GO from `/root/terra_cleanup_spec_acceptance` found
+no Critical or Important findings and two Minor documentation clarifications;
+it independently reproduced the focused test, seven-file `449`, and state
+`150` results. Fresh Terra security GO from
+`/root/terra_cleanup_security_acceptance` found no Critical, Important, or
+Minor findings across the first/middle/last `OSError`, re-entrant close, and
+unexpected-exception adversarial matrix; it recorded `107 passed` evidence
+tests. Only OS-level cleanup uncertainty remains, with no retry as the safe
+FD-reuse posture.
+
+The canonical seven-file command is:
+
+```bash
+uv run pytest -q tests/shared/test_incident_evidence_lib.py tests/shared/test_whatsapp_auth_quarantine.py tests/shared/test_whatsapp_rotation_state.py tests/shared/test_whatsapp_rotation_smoke.py tests/shared/test_whatsapp_rotation_integration.py tests/shared/test_first_gate_bootstrap.py tests/shared/test_whatsapp_rotation_first_gate.py
+```
+
+The focused test's “Break caught” docstring names the old retryable-descriptor
+regression; its assertions enforce no retry. The already-reviewed test remains
+unchanged for this editorial clarification.
+
+This successor is documentation-only over accepted source `ad82d10`; the exact
+current source head after this commit must be bound by Luna and the successor
+candidate. The gate remains **CLOSED** and offline, the old candidate remains
+obsolete, QR remains a hard later gate, and only standing Luna exact-head review
+is next.
