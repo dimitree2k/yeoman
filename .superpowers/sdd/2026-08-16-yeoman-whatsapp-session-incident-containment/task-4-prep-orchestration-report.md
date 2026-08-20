@@ -486,6 +486,21 @@ combined Terra security verdict is GO. Controller evidence is `458 passed in
 77.84s`, state evidence is `151 passed in 55.25s`, and six-file Python 3.13
 compile, scoped Ruff, diff, ancestor/range, and clean checks all passed.
 
+Task 4A contract is exact: on any normal `Exception` opening four crypto
+files, attempt all prior FDs once and in order; per-FD `OSError` cannot stop a
+later cleanup. Clear `_owned` and `_material`; normalize an open `OSError` to
+protected `EvidenceError`; preserve other exceptions after best-effort cleanup.
+Never catch `BaseException` or retry a possibly reused FD. Task 4B permits
+cleanup only for the exact verified seven-chain
+attempt/q1/provenance/q2/pre/final/binding. After an inner GO close failure,
+record and verify cleanup failure, then return NO-GO with a seven-plus-verified
+receipt. Record/verify failure returns bare NO-GO; an already-correlated inner
+NO-GO is preserved. Close once: no retry, no secret detail, no variable prefix.
+The old direct-import close test did not cross its captured permit fence. Its
+replacement local loader injects one shared bootstrap-equivalent permit into
+the exact three modules; real state tests verify protected record/verify
+semantics.
+
 Authenticated artifacts now are bootstrap (26,420 bytes)
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
 (92,811 bytes)

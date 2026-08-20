@@ -390,6 +390,22 @@ prior false-positive direct-import test. Terra Task 4A specification and
 quality review were clean; Task 4B specification and quality review were
 clean; combined Terra security review is GO.
 
+Task 4A contract: on any normal `Exception` while opening the four crypto
+files, attempt every previously opened FD once, in order; a per-FD `OSError`
+cannot stop later cleanup. Clear `_owned` and `_material`, normalize an open
+`OSError` to protected `EvidenceError`, and preserve every other exception
+after best-effort cleanup. Never catch `BaseException` and never retry an FD
+that could have been reused. Task 4B contract: allow cleanup only for the
+exact verified seven-chain attempt/q1/provenance/q2/pre/final/binding. After
+an inner GO close failure, record and verify the cleanup failure, then return
+NO-GO with a seven-plus-verified receipt; record/verify failure returns bare
+NO-GO. Preserve an already-correlated inner NO-GO. Close once, do not retry,
+emit no secret detail, and use no variable prefix. The repaired old
+direct-import close test had never crossed its captured permit fence; its
+replacement local loader injects one shared bootstrap-equivalent permit into
+the exact three modules, while real state tests verify protected
+record/verify semantics.
+
 Controller evidence is `458 passed in 77.84s`; state evidence is `151 passed
 in 55.25s`. Six-file Python 3.13 compile, scoped Ruff, diff check,
 required-ancestor/range checks, and clean-status checks passed. The current

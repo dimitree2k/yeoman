@@ -175,6 +175,20 @@ testing produced `458 passed in 77.84s`; state testing produced `151 passed in
 55.25s`; six-file Python 3.13 compile, scoped Ruff, diff, ancestor/range, and
 clean checks also passed.
 
+Task 4A: on any normal `Exception` opening the four crypto files, attempt each
+prior FD once in order; a per-FD `OSError` cannot stop later cleanup. Clear
+`_owned`/`_material`, normalize an open `OSError` to protected `EvidenceError`,
+and preserve any other exception after best-effort cleanup. Never catch
+`BaseException` or retry a possibly reused FD. Task 4B: cleanup is permitted
+only after exact verified seven-chain attempt/q1/provenance/q2/pre/final/binding.
+After an inner GO close failure, record and verify that cleanup failure and
+return NO-GO with a seven-plus-verified receipt; record/verify failure returns
+bare NO-GO; preserve an already-correlated inner NO-GO. Close once, no retry,
+no secret detail, no variable prefix. The old direct-import close test never
+crossed its captured permit fence. Its replacement local test loader injects
+one shared bootstrap-equivalent permit into the exact three modules; real state
+tests verify protected record/verify semantics.
+
 Current values: bootstrap (26,420 bytes)
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
 (92,811 bytes)
