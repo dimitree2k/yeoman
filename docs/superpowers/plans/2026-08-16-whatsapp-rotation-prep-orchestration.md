@@ -4,24 +4,25 @@
 
 **Goal:** Build and review the synthetic-only controllers required before the incident Task 4 owner rotation can be requested.
 
-**Architecture:** Work only in `/home/dm/Documents/yeoman-migration-toolkit`, whose branch must start from and retain `6ba55014242953e72ec7a29e75041f704452b885` as a required ancestor, rather than pinning implementation to that forever-exact HEAD. Five incident scripts share a small `incident_evidence_lib`: runtime authentication remains under `/home/dm/.yeoman/secrets/whatsapp-auth`, while all protected operator evidence is rooted at `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`; program keys remain in their existing program-key roots.
+**Architecture:** Work only in `/home/dm/Documents/yeoman-migration-toolkit`, whose branch must retain `6ba55014242953e72ec7a29e75041f704452b885` as a required ancestor. Six incident sources include a tiny standard-library-only pre-import trust anchor, `bootstrap/first_gate_bootstrap.py`, plus five scripts sharing `incident_evidence_lib`. The bootstrap authenticates a root-owned authority and signed closed release before loading three authenticated modules from held bytes; the worktree controller and runtime Git state are never authorization. Runtime authentication remains under `/home/dm/.yeoman/secrets/whatsapp-auth`, protected operator evidence is rooted at `/home/dm/.local/share/yeoman-program-evidence/whatsapp-session-incident-2026-08-16/rotation`, and release artifacts use `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1`.
 
 **Tech Stack:** Python 3 standard library, `age`, `ssh-keygen -Y`, existing `scripts/whatsapp_qr_reconnect.py`, `pytest`, Ruff.
 
 ## Global Constraints
 
-- Production additions are only `scripts/incident_evidence_lib.py`, `scripts/whatsapp_auth_quarantine.py`, `scripts/whatsapp_rotation_state.py`, `scripts/whatsapp_rotation_smoke.py`, and `scripts/whatsapp_rotation_first_gate.py`; tests are only under `tests/shared/`.
+- Production additions are only `bootstrap/first_gate_bootstrap.py`, `scripts/incident_evidence_lib.py`, `scripts/whatsapp_auth_quarantine.py`, `scripts/whatsapp_rotation_state.py`, `scripts/whatsapp_rotation_smoke.py`, and `scripts/whatsapp_rotation_first_gate.py`; tests are only under `tests/shared/`.
 - Evidence root, auth root, recipient list, signer, allowed-signers file, and incident HMAC key are fixed constants. Provision the dedicated 32-byte incident HMAC key at fixed mode-`0600` path beneath a fixed `0700` program-key/hmac directory using `O_EXCL`, `getrandom`, and file/directory `fsync`; never derive it from signing or age keys. Synthetic tests inject fakes; production CLIs reject every root/path/key override.
 - `EvidenceCommitment` is public-safe: `schema_version`, `record_hmac_sha256`, `ciphertext_sha256`, and `signature_sha256` only. Never expose a bare plaintext record SHA-256.
 - JSON records may be bounded in memory. Streaming artifacts never create a plaintext file or FD-backed disk inode: they feed canonical bytes/tar-like records through bounded HMAC and `age` pipes; recipient verification streams decrypted bytes through HMAC/byte-count comparison and discards them. Build ciphertext, detached signature, and public metadata—but no plaintext—inside a private staging directory; verify ciphertext, both decryptions, and signature before public visibility, `fsync` it, then atomically rename it to a unique final artifact directory. Collision or any prepublication failure leaves no partial published artifact. Ciphertext staging may use `O_TMPFILE`/direct FD publication; unsupported primitives fail closed.
 - These are incident migration tools, not permanent Gateway/Bridge architecture. Add their exact deletion, tests, documentation, and evidence-disposition boundary to the final legacy-free release inventory; delete them before final-release acceptance.
-- Full quiescence is mandatory. First Luna code GO authorizes the controller to stop/verify Bridge, Gateway, and Overseer all `inactive`/`failed`, prove Overseer cannot respawn them, and retain that state through v1 inspection, v2 baseline, and owner gates. Keep Gateway/Overseer stopped throughout; only the pinned Bridge-only QR helper and direct observer may run during relink/smoke, then stop Bridge again before post capture/compare. A baseline mismatch is NO-GO. `external_effect_unknown` is terminal and never retried or replayed; `capture_failed` is terminal and blocks incident close.
-- After the first Luna GO and real quiesced v1/v2 baseline, a mandatory second evidence-bound Luna GO authorizes four distinct host-backed owner turns in this order: `owner-all-devices-revoked-v1`, `owner-quarantine-authorized-v1`, `phone-ready-v1` after quarantine, and `owner-device-inventory-v1` after relink/fingerprint. No destructive transition proceeds without both standing reviewers rereading the exact owner reference and confirming statement/predecessor; this is host-API trust evidence, not cryptographic nonrepudiation.
+- Full quiescence is mandatory. Both standing Luna code-review GO decisions authorize only a separately owner-approved privileged bootstrap installation and offline release-signing/authority-preparation step; they do not themselves authorize installation or the first live gate. Only after that preparation is reviewed may the installed bootstrap stop/verify Bridge, Gateway, and Overseer all `inactive`/`failed`, prove Overseer cannot respawn them, and retain that state through v1 inspection and v2 baseline. The first gate then stops for the mandatory second evidence-bound Luna review. Keep Gateway/Overseer stopped throughout later owner gates; only the pinned Bridge-only QR helper and direct observer may run during relink/smoke, then stop Bridge again before post capture/compare. A baseline mismatch is NO-GO. `external_effect_unknown` is terminal and never retried or replayed; `capture_failed` is terminal and blocks incident close.
+- After the installed first gate produces the real quiesced v1/v2 baseline, a mandatory second evidence-bound Luna GO authorizes four distinct host-backed owner turns in this order: `owner-all-devices-revoked-v1`, `owner-quarantine-authorized-v1`, `phone-ready-v1` after quarantine, and `owner-device-inventory-v1` after relink/fingerprint. No destructive transition proceeds without both standing reviewers rereading the exact owner reference and confirming statement/predecessor; this is host-API trust evidence, not cryptographic nonrepudiation.
 
 ## Component Map
 
 | File | Responsibility |
 | --- | --- |
+| `bootstrap/first_gate_bootstrap.py` | Standard-library-only pre-import trust anchor; authenticates the root authority, signed closed release, fixed toolchain, and held module bytes before loading any toolkit code. |
 | `scripts/incident_evidence_lib.py` | Fixed roots, private FD streaming artifacts, encrypt/sign/verify/publish, public HMAC commitments, protected owner-turn records. |
 | `scripts/whatsapp_auth_quarantine.py` | Bridge-stop-verified old-auth quarantine, empty active auth, old/current identity HMACs. |
 | `scripts/whatsapp_rotation_state.py` | v1-linked v2 adapters and non-destructive preservation comparator. |
@@ -31,20 +32,37 @@
 ## First-live-gate controller contract
 
 This is a deliberately narrow incident controller, not a permanent runtime
-module. Its only production invocation is:
+module. Its only production invocation, byte/order exact, is:
 
 ```bash
-/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC /usr/bin/python3 /home/dm/Documents/yeoman-migration-toolkit/scripts/whatsapp_rotation_first_gate.py
+/usr/bin/env -i LANG=C LC_ALL=C TZ=UTC PATH=/usr/bin:/bin /usr/bin/python3.13 -I -S -E -B /usr/local/libexec/yeoman/first_gate_bootstrap.py
 ```
 
-It accepts **no arguments**, configuration overrides, alternate roots, or
-environment-supplied paths. It constructs the same sanitized environment for
-every child process. Before any mutation it authenticates the static
-repository/controller contract and validates that every fixed executable is a
-root-owned regular `0755` file, is not group- or world-writable, has the exact
-size and SHA-256 below, and is invoked only by its fixed absolute path. Any
-mismatch is a protected preflight **NO-GO** before quiescence or other
-mutation.
+The installed bootstrap must be root-owned regular mode `0755` at
+`/usr/local/libexec/yeoman/first_gate_bootstrap.py`, non-writable by group and
+world, with candidate source SHA-256 submitted for re-review
+`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`.
+The root-owned non-writable authority is fixed at
+`/etc/yeoman/first-gate-release-authority.json`; it pins signer identity and
+namespace, allowed-signers content and hash, bootstrap path and hash, and the
+fixed release paths
+`/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1/release.json`
+and `release.sig`.
+
+No installed bootstrap, authority descriptor, release key, manifest, or
+signature was created during synthetic correction. After both standing Luna
+reviewers return GO, privileged installation and offline signing/key/authority
+preparation still require separate explicit owner approval. The installed
+bytes and authority must then be verified before any first-gate attempt, and
+the installed artifacts require re-review if they differ from the approved
+release.
+
+The bootstrap accepts no arguments or overrides and requires the exact sterile
+environment and interpreter flags above. It validates that every fixed
+executable is a root-owned regular `0755` file, is not group- or world-writable,
+has the exact size and SHA-256 below, and is executed only through a held-FD
+pinned path under the sterile environment. `/usr/bin/python3` is a symlink and
+is not the authenticated launcher. Any mismatch is **NO-GO before mutation**.
 
 | Executable | Size (bytes) | SHA-256 |
 | --- | ---: | --- |
@@ -53,19 +71,45 @@ mutation.
 | `/usr/bin/age-keygen` | 2433984 | `859e2e6edbe0f5afe2a6e5c340f1f07969195de272888a303de2746902d46e5a` |
 | `/usr/bin/ssh-keygen` | 592376 | `e80f38fc532ca57dd82879c4dd169ae17bf76cc11c3da9c037c7495234fbb9bd` |
 | `/usr/bin/systemctl` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
-| `/usr/bin/git` | 4081272 | `a0e562e4bd3c4c79379e91d8c07a10104b2cefe8fac966dc6bd4874a57a807f3` |
-| `/usr/bin/python3` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
+| `/usr/bin/python3.13` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
 
-After successful preflight, the controller writes a durable protected attempt
-record that binds the incident/schema, a fresh burned nonce, source/toolkit
-heads, controller identity, and fixed toolchain identities. Only then may it
-run this single causal chain: `q1` full quiescence, v1 provenance, fresh `q2`,
-pre-v2 capture, final read-only receipt, and protected binding. It retains
-every partial artifact. Any later failure writes protected allowlisted failure
-evidence linked to the attempt and available public commitments; a failure to
-write that evidence is still NO-GO and never permits continuation. On success
-it emits only the allowlisted public commitments and stops for the mandatory
-second, evidence-bound Luna review.
+The proposed signed-release schema must bind the incident, a single-use
+`authorization_id`, exact final source and toolkit commits, authoritative-plan
+and Luna-package hashes, required ancestor, installed bootstrap, exact
+invocation, the exact closed module names/paths/sizes/hashes, fixed toolchain,
+and both standing reviewer session IDs plus their GO-review hashes:
+
+- Agent A: `01a009b3-e740-7972-992b-5d63d6066b8c`
+- Agent B: `01a009b3-f495-7a90-8e50-8a22d4d306d2`
+
+The bootstrap loads no toolkit code before authentication. It enforces strict
+environment, flags, arguments, and standard-library roots; performs bounded,
+no-follow authority, manifest, signature, module, and tool reads; verifies the
+SSH signature from held descriptors; and authenticates held executable
+identities. Only `incident_evidence_lib`, `whatsapp_rotation_state`, and
+`whatsapp_rotation_first_gate` are loaded, from authenticated held bytes via an
+in-memory finder. Direct execution of the worktree controller is always
+NO-GO. Neither Git nor a dynamically discovered current head participates in
+runtime authorization.
+
+The release candidate must bind these candidate module hashes:
+
+| Closed module | SHA-256 |
+| --- | --- |
+| `incident_evidence_lib` | `41247af07fc1709ff139af259b27f813ee1883f7baa0654a946711bbfe6a2eeb` |
+| `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
+| `whatsapp_rotation_first_gate` | `edc08386ecf761276eeff22b0d346ae2dbbe63f1173b4e7cb4048c59e936ac4e` |
+
+After authenticating the signed release, the controller durably reserves its
+single-use `authorization_id` in a protected attempt before mutation. The only
+causal chain is: signed release -> attempt -> attempt-linked `q1` -> provenance
+-> `q2` -> pre-v2 -> final read-only receipt -> protected binding. Actual
+`q1`/`q2`/final service inspection uses the held-FD pinned `systemctl` executor
+under the sterile environment. Each phase has an exact allowlisted failure
+prefix and a verified attempt-linked failure record; failure publication is
+best effort, never erases the durable attempt or partial evidence, and never
+permits continuation. Output contains safe commitments only. Success stops for
+the mandatory second evidence-bound Luna review.
 
 This controller authorizes neither a later rotation nor any owner, revocation,
 quarantine, QR/relink, observer, smoke, message, or other production action.
@@ -179,8 +223,8 @@ git commit -m "test(incident): cover rotation preparation integration"
 
 - [ ] **Step 4: Review in the required order**
 
-First run the synthetic-fake integration dry run above. Then package each companion task report, commits, diffs, tests, and mutation evidence for three scoped task reviews. Only after those accept, request the first Agent A/B code review with explicit `gpt-5.6-luna`, exact commit range, reports/review packages, and program log; its GO authorizes only full quiescence and real read-only `inspect-v1`/`capture-v2`. Package real quiescence/baseline commitments for a mandatory second evidence-bound Agent A/B `gpt-5.6-luna` review. Its GO authorizes revocation turn, authorization turn, quarantine, phone-ready turn, pinned helper Bridge/owner-only-QR start while owner does not scan, direct observer readiness, then QR scan, fingerprint/inventory fourth turn, and one-shot smoke. Stop Bridge, post-capture/compare, then obtain a final Luna review. The strictest NO-GO governs every gate; append only accepted commitments and residual risk to the log.
+First run the synthetic-fake integration dry run above. Then package each companion task report, commits, diffs, tests, and mutation evidence for three scoped task reviews. Only after those accept, request the first Agent A/B code review with explicit `gpt-5.6-luna`, exact commit range, reports/review packages, and program log. Both GO decisions authorize only requesting separate explicit owner approval for privileged bootstrap installation and offline signing/key/authority preparation. Verify and, if necessary, re-review the resulting installed artifacts before the byte-exact first-gate invocation. That gate performs only full quiescence and real read-only `inspect-v1`/`capture-v2`, then stops. Package its protected commitments for a mandatory second evidence-bound Agent A/B `gpt-5.6-luna` review. Its GO authorizes revocation turn, authorization turn, quarantine, phone-ready turn, pinned helper Bridge/owner-only-QR start while owner does not scan, direct observer readiness, then QR scan, fingerprint/inventory fourth turn, and one-shot smoke. Stop Bridge, post-capture/compare, then obtain a final Luna review. The strictest NO-GO governs every gate; append only accepted commitments and residual risk to the log.
 
 ## Execution Handoff
 
-The next live sequence after first Luna code GO is full quiescence then read-only `inspect-v1`/`capture-v2`; owner turns begin only after the mandatory second evidence-bound Luna GO.
+The next sequence after both first Luna code-review GO decisions is a separate owner decision on privileged install and offline release preparation—not a live first gate. After approved installation, verification, and any required artifact re-review, the byte-exact bootstrap invocation may perform only full quiescence and read-only `inspect-v1`/`capture-v2`, then must stop. Owner turns begin only after the mandatory second evidence-bound Luna GO.

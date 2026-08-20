@@ -53,5 +53,35 @@ protected attempt/run identity and allowlisted failure record.
 Documentation now records the intended fixed executable baseline and lifecycle,
 but the toolkit implementation, tests, and fresh reviews for those three
 blockers are pending. The gate remains **CLOSED**. Preserve all historical
-376-test evidence as evidence of the prior synthetic head only; it is not
-evidence that the pending correction is complete. No live action occurred.
+376-test evidence as evidence of the prior synthetic head only; it does not
+establish the later correction. No live action occurred.
+
+## Authenticated-bootstrap correction — pending fresh review
+
+Toolkit correction range
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`
+now uses a sixth production source, the standard-library-only pre-import trust
+anchor `bootstrap/first_gate_bootstrap.py` (SHA-256
+`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`).
+The exact seven-file suite passed `407 passed in 55.12s`; the engineer recorded
+three 407-pass runs, Ruff passed, and the toolkit was clean. Earlier 376/388
+runs remain historical.
+
+Terra rejected `4c0f819` for mutable pre-import trust, dynamic heads,
+incorrectly documented `-I`, direct `systemctl`, and noncausal `q1`/failure
+prefixes. `b07023d` and `9c6c9f` implement the signed closed release,
+root-authority, installed bootstrap, held-FD executor, exact failure prefixes,
+and single-use attempt chain. Fresh Terra and both standing Luna reviews remain
+pending; this is not acceptance.
+
+The only intended invocation is byte/order exact:
+
+```bash
+/usr/bin/env -i LANG=C LC_ALL=C TZ=UTC PATH=/usr/bin:/bin /usr/bin/python3.13 -I -S -E -B /usr/local/libexec/yeoman/first_gate_bootstrap.py
+```
+
+Runtime Git and the `/usr/bin/python3` symlink are not authorization. No bootstrap, authority,
+release key, manifest, or signature was installed or created. After both Luna
+GO decisions, privileged installation and offline release preparation still
+require separate explicit owner approval and installed-artifact verification.
+No live action occurred; the first gate remains CLOSED.

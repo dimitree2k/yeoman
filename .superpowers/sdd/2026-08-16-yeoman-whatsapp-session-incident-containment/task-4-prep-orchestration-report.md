@@ -168,3 +168,29 @@ occurred.  Runtime remains offline/disabled and the first live gate is
 Their strictest decision governs.  See `task-4-prep-luna-code-review-package.md`
 as the sole re-review handoff and `task-4-first-luna-review-response.md` for
 the durable initial-decision/correction record.
+
+## Authenticated-bootstrap correction and fresh handoff
+
+The next toolkit correction range is
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`.
+Terra rejected intermediate head `4c0f819` for mutable pre-import trust,
+dynamic-head authorization, documentation/`-I` inconsistency, direct
+`systemctl`, and noncausal `q1`/failure prefixes. Commits `b07023d` and
+`9c6c9f` correct those findings with a root-authorized, signed-release bootstrap
+and attempt-linked held-FD execution chain. Fresh Terra and both standing Luna
+reviews are pending; the correction is not yet accepted.
+
+The exact seven-file suite passed `407 passed in 55.12s`; three engineer runs
+also passed 407, scoped Ruff passed, and toolkit status was clean. Historical
+376/388 runs remain historical evidence only. The bootstrap source hash is
+`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`.
+No bootstrap, root authority, release key, signed manifest, or signature was
+installed or created. No live/runtime/systemctl/key/owner/QR/message operation
+occurred.
+
+Even after both standing Luna GO decisions, privileged installation and
+offline release-signing/key/authority preparation require separate explicit
+owner approval. Installed bootstrap/authority bytes must be verified and any
+deviation re-reviewed before the exact first-gate invocation. The first gate
+remains limited to q1/provenance/q2/pre/final/binding and must stop for the
+second Luna evidence review.

@@ -1,18 +1,21 @@
-# Luna re-review package — corrected first WhatsApp rotation gate
+# Luna re-review package — authenticated-bootstrap first WhatsApp rotation gate
 
-## Re-review status — correction underway
+## Re-review status — corrected code pending acceptance
 
-The first standing Luna re-review reached split outcomes at the exact heads
-below. Agent B returned a narrow **GO**. Agent A returned the governing
-**NO-GO**, so this gate remains **CLOSED**. No pending toolkit correction has
-been implemented, verified, or accepted by this document.
+The architecture correction is implemented at toolkit head
+`9c6c9f733bdaab018c20997f621449c03c764002`, but it is not yet Terra- or
+Luna-accepted. The first live gate remains **CLOSED**. This package requests
+fresh review of the exact authenticated-bootstrap design and does not authorize
+installation, signing, authority preparation, runtime access, or any live
+operation.
 
-Agent A's required corrections are: (1) replace PATH-resolved crypto
-subprocesses with fixed, authenticated toolchain identities under a sanitized
-environment; (2) correct the authoritative plan's missing fifth first-gate
-controller; and (3) bind each run to an exact invocation/preflight plus a
-protected attempt identifier and durable allowlisted failure record. Agent B's
-narrow GO is not authority to bypass those governing requirements.
+Toolkit head `4c0f819` was SPEC/SECURITY **REJECT** because pre-import trust was
+mutable, commits were discovered dynamically, documentation incorrectly used
+`-I`, service calls bypassed the pinned executor, and `q1`/failure evidence was
+not causal or exactly prefixed. Commits `b07023d` and `9c6c9f` correct those
+findings with a separately installed trust anchor, signed closed release,
+held-FD execution, and a single-use causal evidence chain. That correction is
+pending fresh Terra and both standing Luna reviews.
 
 ## Decision requested after the correction
 
@@ -20,25 +23,31 @@ Standing Luna Agent A and Agent B must independently review this exact fixed
 range and return **GO** or **NO-GO** for the first live gate.  The gate is
 currently **CLOSED**.  Their strictest decision governs.
 
-A later GO may authorize only full quiescence and the fixed first-gate
-controller's read-only v1 inspection, pre-v2 capture, and protected commitment
-handoff.  It does **not** authorize an owner turn, revocation, quarantine,
-QR/relink, observer startup, smoke, a message, or any production mutation.
-There is no live evidence yet.  A second, evidence-bound Luna decision remains
-required before every such later action.
+Both later GO decisions authorize only requesting separate explicit owner
+approval for privileged installation and offline release preparation. After
+that approval, verified installation, and any required installed-artifact
+re-review, the first gate may perform only quiescence, read-only v1 inspection,
+pre-v2 capture, and protected commitment handoff. It does **not** authorize an
+owner turn, revocation, quarantine, QR/relink, observer startup, smoke, a
+message, or any later production action. There is no live evidence yet. A
+second, evidence-bound Luna decision remains required before every such later
+action.
 
 ## Exact scope and heads
 
 - Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
   `c/yeoman-migration-toolkit`.
-- Corrected toolkit range/head:
-  `6ba55014242953e72ec7a29e75041f704452b885..62acf5b73ca9b9abaed79004deed7f93ef2280b3`.
+- Current correction range/head:
+  `62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`.
+- Required toolkit ancestor:
+  `6ba55014242953e72ec7a29e75041f704452b885`.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
   `c/turn-engine-v2`, prior documentation heads
   `726429e742daaa838e5ee5806faeec8f28f701d9` and
-  `b74207c10940f9c13335ebe25b0d6e53af63f83e`. The next review package must
-  name the exact successor source and toolkit heads after the pending toolkit
-  correction; neither is asserted as complete here.
+  `b74207c10940f9c13335ebe25b0d6e53af63f83e`, followed by documentation-only
+  commits `5da50485a125c5adbc50318a24385ea017353ae1` and
+  `4551d46b22d81ad01014d8862271b02b60a030c6`. The final review must bind the
+  exact successor source documentation commit that carries this package.
 - Initial Luna package range (not the range to approve now):
   `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
 
@@ -101,25 +110,35 @@ split was solely the task-runner time boundary.  Final Terra returned SPEC
 ACCEPT and QUALITY ACCEPT with no Critical, Important, or Minor finding.
 Mutations were run and restored across rounds.
 
-## Required next Luna evidence
+## Current synthetic correction evidence
 
-The next package must contain, and both standing Luna reviewers must bind their
-decision to, all of the following:
+At `9c6c9f733bdaab018c20997f621449c03c764002`, the parent controller's exact
+seven-file suite passed `407 passed in 55.12s`; the engineer also recorded
+three separate 407-pass runs. Scoped Ruff passed and the toolkit worktree was
+clean. Earlier 376-pass and intermediate 388-pass runs remain historical only;
+neither a passing count nor the rejected `4c0f819` state is current review
+acceptance. No production artifact or live boundary was used.
 
-- exact corrected source and toolkit heads, clean-worktree proof, and corrected
-  orchestration-plan and this-package SHA-256 values;
-- fixed tool paths, root-owned `0755` non-writable metadata, sizes, SHA-256
-  values, and proof that the controller and children used the sanitized
-  environment rather than caller `PATH` or loader/Python overrides;
-- the zero-argument controller invocation, exit status, and only allowlisted
-  public JSON output;
-- protected attempt, `q1`, provenance, `q2`, pre-v2, final, binding, and—if a
-  failure occurred—allowlisted protected failure commitments with their causal
-  predecessors;
-- identical quiescence across all required receipts, exact capture
-  counts/bytes, and proof of no prohibited effect.
+The candidate bootstrap source submitted for re-review is
+`bootstrap/first_gate_bootstrap.py`, SHA-256
+`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`.
+Its intended installed path is
+`/usr/local/libexec/yeoman/first_gate_bootstrap.py`, root-owned regular `0755`
+and non-writable by group/world. The root-owned non-writable authority is
+`/etc/yeoman/first-gate-release-authority.json`; the fixed signed release paths
+are `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1/release.json`
+and `release.sig`. None of those installed/release artifacts or their key,
+authority, manifest, or signature exists or was created by this phase.
 
-The fixed executable baseline to be implemented and proven is:
+The only production invocation is byte/order exact:
+
+```bash
+/usr/bin/env -i LANG=C LC_ALL=C TZ=UTC PATH=/usr/bin:/bin /usr/bin/python3.13 -I -S -E -B /usr/local/libexec/yeoman/first_gate_bootstrap.py
+```
+
+`/usr/bin/python3` is a symlink and is not the authenticated launcher. Runtime
+Git/current-head discovery is not part of authorization. The fixed executable
+baseline is:
 
 | Path | Mode / owner | Size | SHA-256 |
 | --- | --- | ---: | --- |
@@ -128,14 +147,60 @@ The fixed executable baseline to be implemented and proven is:
 | `/usr/bin/age-keygen` | root / `0755` | 2433984 | `859e2e6edbe0f5afe2a6e5c340f1f07969195de272888a303de2746902d46e5a` |
 | `/usr/bin/ssh-keygen` | root / `0755` | 592376 | `e80f38fc532ca57dd82879c4dd169ae17bf76cc11c3da9c037c7495234fbb9bd` |
 | `/usr/bin/systemctl` | root / `0755` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
-| `/usr/bin/git` | root / `0755` | 4081272 | `a0e562e4bd3c4c79379e91d8c07a10104b2cefe8fac966dc6bd4874a57a807f3` |
-| `/usr/bin/python3` | root / `0755` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
+| `/usr/bin/python3.13` | root / `0755` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
 
-The production invocation is fixed to `/usr/bin/env -i PATH=/usr/bin:/bin
-LANG=C LC_ALL=C TZ=UTC /usr/bin/python3
-/home/dm/Documents/yeoman-migration-toolkit/scripts/whatsapp_rotation_first_gate.py`.
-Any metadata, hash, path, environment, controller, or repository mismatch is
-NO-GO before mutation.
+The proposed signed-release schema must bind incident, single-use
+`authorization_id`, exact final
+source/toolkit commits, plan/package hashes, required ancestor, bootstrap,
+exact invocation, exact closed module names/paths/sizes/hashes, exact toolchain,
+and reviewer session IDs plus GO-review hashes. The root authority pins signer
+identity/namespace, allowed-signers content/hash, bootstrap path/hash, and the
+fixed release paths. Reviewer identities are Agent A
+`01a009b3-e740-7972-992b-5d63d6066b8c` and Agent B
+`01a009b3-f495-7a90-8e50-8a22d4d306d2`.
+
+Only three authenticated held-byte modules may be loaded:
+
+| Closed module | SHA-256 |
+| --- | --- |
+| `incident_evidence_lib` | `41247af07fc1709ff139af259b27f813ee1883f7baa0654a946711bbfe6a2eeb` |
+| `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
+| `whatsapp_rotation_first_gate` | `edc08386ecf761276eeff22b0d346ae2dbbe63f1173b4e7cb4048c59e936ac4e` |
+
+The bootstrap authenticates strict environment/flags/no-args/stdlib roots,
+bounded no-follow authority/release/signature/module reads, held-FD SSH
+signature verification, and held-FD tool identities before loading toolkit
+code through an in-memory finder. Direct worktree execution is always NO-GO.
+The causal chain is signed release -> single-use attempt reservation ->
+attempt-linked `q1` -> provenance -> `q2` -> pre-v2 -> final -> binding.
+`q1`/`q2`/final use held-FD pinned `systemctl` under a sterile environment;
+every phase has an exact failure prefix and verified failure record. Failure
+publication is best effort, the durable attempt and partial evidence remain,
+and only safe commitments may be emitted.
+
+## Required next review and owner gate
+
+Fresh Terra and both standing Luna reviewers must bind their decisions to:
+
+- exact corrected source documentation head and toolkit head/range, clean-tree
+  proof, required ancestor, and exact plan/package/bootstrap/module hashes;
+- the exact seven-file 407-pass suite, Ruff result, and the historical
+  `4c0f819` rejection with `b07023d`/`9c6c9f` closure;
+- root-authority and signed-release schemas, fixed signer/namespace,
+  allowed-signers content/hash, exact reviewer sessions/GO hashes, closed
+  modules, toolchain, invocation, and single-use authorization lifecycle;
+- the proposed privileged installation and offline signing/key/authority
+  preparation procedure, including verification of installed bootstrap and
+  authority plus re-review of any differing installed artifact;
+- proof that no install, authority, release key, manifest, signature, runtime,
+  service, key, owner, QR, observer, smoke, or message operation occurred.
+
+Even after both Luna GO decisions, installation and offline release preparation
+remain blocked on separate explicit owner approval. The eventual first-gate
+evidence package must include exact invocation/exit/allowlisted JSON, signed
+release and attempt/q1/provenance/q2/pre/final/binding/failure commitments as
+applicable, identical quiescence, exact counts/bytes, and no prohibited effect.
+The gate then stops for the mandatory second Luna evidence review.
 
 ## No-live boundary
 

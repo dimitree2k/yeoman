@@ -138,3 +138,22 @@ exact invocation/toolchain provenance or protected attempt/failure identity.
 The documentation correction is in progress; the required toolkit code and
 tests are not complete or reviewed. Retain all partial evidence on any later
 failure. Services remain offline and no live action is authorized.
+
+## Authenticated-bootstrap correction update — 2026-08-20
+
+Synthetic correction now ends at toolkit
+`9c6c9f733bdaab018c20997f621449c03c764002` after the SPEC/SECURITY rejection
+at `4c0f819` and fixes in `b07023d`/`9c6c9f`. The exact seven-file suite passed
+`407 passed in 55.12s`; three engineer runs also reached 407, Ruff passed, and
+the toolkit was clean. Prior 376/388 runs and all prior review outcomes remain
+historical, not current acceptance. Fresh Terra and standing Luna re-reviews
+are pending.
+
+The corrected gate requires an authenticated root-owned installed bootstrap
+and signed closed release; neither it nor any authority, release key, manifest,
+or signature exists or was created in this phase. Both standing Luna GO
+decisions must precede a separate explicit owner decision on privileged install
+and offline release preparation. No runtime, service, owner, revocation,
+quarantine, QR, observer, smoke, or message action is authorized. Persona
+evolution remains omitted from target behavior with historical artifacts inert;
+proactivity, consciousness, and speak-up remain deferred but mandatory later.
