@@ -1,13 +1,13 @@
 # Luna re-review package — authenticated-bootstrap first WhatsApp rotation gate
 
-## Re-review status — corrected code pending acceptance
+## Re-review status — current successor pending acceptance
 
-The production-capability correction is implemented at toolkit head
-`bb37b577fc191084be74dff72a87b84ac9cf08ab`, but it is not yet Terra- or
-Luna-accepted. The first live gate remains **CLOSED**. This package requests
-fresh review of the exact authenticated-bootstrap design and does not authorize
-installation, signing, authority preparation, runtime access, or any live
-operation.
+The current production-capability successor is toolkit
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83`; bb37 is a historical **REJECT**,
+not an accepted current head. The first live gate remains **CLOSED**. This
+package requests fresh review of the exact authenticated-bootstrap design and
+does not authorize installation, signing, authority preparation, runtime
+access, or any live operation.
 
 Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
 and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` returned **REJECT**.
@@ -20,9 +20,11 @@ evidence/state/quarantine/smoke helpers still exposed production-capable
 effects without the bootstrap permit. Toolkit a950 deleted those adapters, but
 exact-head Terra review rejected its fixed legacy-descriptor/test-crypto FD
 escape, raw evidence/key open helpers, and evidence/state descendant aliases.
-Toolkit `bb37b57` permit-gates those raw fixed-root and descendant paths and
-propagates the permit through authenticated legacy/inventory operations. Fresh
-Terra and both standing Luna reviews of this strict correction remain pending.
+bb37 attempted to permit-gate those paths, but review found ancestor `_Dir`
+path/permit loss, a composable state raw parent FD, journal permit loss before
+q1, quarantine overlap admission, and overclaiming documentation. Its result
+is historical **REJECT**. Fresh Terra and both standing Luna reviews of the
+current successor remain pending.
 
 ## Decision requested after the correction
 
@@ -48,15 +50,15 @@ later production action. There is no live evidence yet.
 
 - Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
   `c/yeoman-migration-toolkit`.
-- Current correction range/head:
-  `a9504c233a14f92a12b4807855e94e621e8aa4ce..bb37b577fc191084be74dff72a87b84ac9cf08ab`.
+- Current successor range/head:
+  `bb37b577fc191084be74dff72a87b84ac9cf08ab..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
 - Full authenticated-bootstrap correction range:
-  `f55a5e28cfabc5010aa84031bd699aa8e4054645..bb37b577fc191084be74dff72a87b84ac9cf08ab`.
+  `f55a5e28cfabc5010aa84031bd699aa8e4054645..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
 - Required toolkit ancestor:
   `6ba55014242953e72ec7a29e75041f704452b885`.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
   `c/turn-engine-v2`, documentation baseline
-  `58dcd831b10842d5beb23e053ed4441fc18439c1`. The final review must bind the
+  `5e89c59e473496f6f5cdee8d33c26a4c755d28b0`. The final review must bind the
   exact successor source documentation commit that carries this package.
 - Initial Luna package range (not the range to approve now):
   `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
@@ -164,39 +166,46 @@ synthetic verification; later production phases require a future authenticated
 controller capability. These adapter-removal facts remain valid, but a950 is
 historical and not accepted.
 
-## Current bb37 raw-root and descendant capability contract
+## Historical bb37 rejection and current opaque-capability successor
 
-Toolkit `276105f8d2145ea8facab1692f49ad220cfc2783` added exact-permit gates to
-fixed evidence, legacy, HMAC, age-identity, signing, and allowed-signers roots
-and descendants at `_TestConfig`, raw directory/file helpers, and
-`_LegacyV1TestCore`. It propagates the permit through authenticated config,
-crypto, legacy, state raw-root, and inventory operations. Fixed state roots and
-descendants refuse in both `_TestRuntime` and `_open_root` before `os.open`.
-Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` keeps the same boundary while
-making lexical containment exact, normalized, separator-safe, and bounded; it
-rejects sibling-prefix aliases without the fourfold test slowdown of the first
-implementation.
+bb37 is historical **REJECT**. Its direct-path checks did not preserve `_Dir`
+path/permit provenance: an ordinary importer could compose an ancestor handle
+into legacy/key/age/signing reads. State returned a composable raw parent FD;
+authenticated journal opens lost `config.permit` before q1; quarantine admitted
+fixed ancestors/descendants; and the documentation overclaimed safety.
 
-Independent parent verification at clean bb37 passed state `148 passed in
-45.70s` and the exact seven-file suite `440 passed in 65.41s`. Python 3.13
-compiled all six production files; scoped Ruff, `git diff --check`, clean
-status, required-ancestor, and zero skipped/retired scans passed. New direct
-helper tests monkeypatch `os.open` and prove refusal before effects for exact
-fixed roots, descendants, legacy descriptor composition, identities/signing,
-and state roots.
+The current clean toolkit head is `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
+The review range is `bb37b577fc191084be74dff72a87b84ac9cf08ab..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`; the full correction range is
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
+Symmetric normalized separator-safe overlap rejects both protected ancestors
+and descendants, while sibling-prefix fixtures remain valid. `_Dir` carries
+path/permit provenance, exposes no `.fd`, and authorizes effect-specific
+transitions before filesystem effects. Only `_authenticated_fd` with the exact
+captured permit supports production crypto. State uses an opaque path+permit
+`_RootHandle`; journal helpers propagate `config.permit`; quarantine rejects
+any fixed-target overlap. No stale production adapters remain. Same-process
+introspection and a malicious owner remain outside this private stale-entry
+boundary.
 
-Exact production source identities at bb37 are:
+Parent verification at the current head passed state `150 passed in 55.10s`
+and the exact seven-file suite `445 passed in 77.47s`; six-file Python 3.13
+compile, full scoped Ruff, diff/status, required-ancestor, no newly added
+skips/retired coverage, and adapter scans passed. Two conditional bootstrap
+`pytest.skip` cases for unavailable system `ssh-keygen -Y` support pre-exist;
+this package makes no global zero-skip claim.
+
+Exact production source identities at the current head are:
 
 | Production source | SHA-256 |
 | --- | --- |
 | `bootstrap/first_gate_bootstrap.py` | `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd` |
-| `scripts/incident_evidence_lib.py` | `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e` |
-| `scripts/whatsapp_auth_quarantine.py` | `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618` |
-| `scripts/whatsapp_rotation_state.py` | `2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071` |
-| `scripts/whatsapp_rotation_smoke.py` | `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030` |
+| `scripts/incident_evidence_lib.py` | `8be29004648eac2fe58841635c45414d1483102a2d2e7d00e1f1f5cb73d2a2b9` |
+| `scripts/whatsapp_auth_quarantine.py` | `14df959da264d7580f3bc78a5bce693284e917bb799fddb35bd506e787297dcb` |
+| `scripts/whatsapp_rotation_state.py` | `5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16` |
+| `scripts/whatsapp_rotation_smoke.py` | `4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5` |
 | `scripts/whatsapp_rotation_first_gate.py` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
-The f55, eb272, and a950 evidence/hashes above are historical only. The current candidate bootstrap source submitted for re-review is
+The f55, eb272, a950, and bb37 evidence/hashes above are historical only. The current candidate bootstrap source submitted for re-review is
 `bootstrap/first_gate_bootstrap.py`, SHA-256
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`.
 Its intended installed path is
@@ -256,8 +265,8 @@ Only three authenticated held-byte modules may be loaded:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e` |
-| `whatsapp_rotation_state` | `2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071` |
+| `incident_evidence_lib` | `8be29004648eac2fe58841635c45414d1483102a2d2e7d00e1f1f5cb73d2a2b9` |
+| `whatsapp_rotation_state` | `5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16` |
 | `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 The bootstrap authenticates strict environment/flags/no-args/stdlib roots,
@@ -289,10 +298,11 @@ Fresh Terra and both standing Luna reviewers must bind their decisions to:
 
 - exact corrected source documentation head and toolkit head/range, clean-tree
   proof, required ancestor, and exact plan/package/bootstrap/module hashes;
-- state `148 passed in 45.70s`, the exact seven-file `440 passed in 65.41s`
-  suite, and Python 3.13/Ruff/diff/status, zero-skip/retired, and
-  required-ancestor results; the f55 `459 passed`, eb272 `472 passed`, and a950
-  `433 passed` evidence remains historical only;
+- state `150 passed in 55.10s`, the exact seven-file `445 passed in 77.47s`
+  suite, six-file Python 3.13 compile, full scoped Ruff/diff/status,
+  required-ancestor, no-new-skip/retired, and adapter-scan results; the f55,
+  eb272, a950, and bb37 evidence remains historical only. Bootstrap retains
+  two pre-existing conditional system-`ssh-keygen` skips;
 - authority schema v4, candidate, owner-approval, decision, and release schemas; fixed paths,
   release/owner signer allowed-signers content/hash and distinct decoded key blobs,
   distinct namespaces, exact reviewer

@@ -79,7 +79,7 @@ could pair the fixed legacy descriptor with attacker-controlled test crypto and
 receive fixed key/data FDs; raw evidence/key open helpers were ungated; and
 exact-path checks missed evidence/state descendants. a950 is historical only.
 
-The strict correction now ends at toolkit
+The historical strict correction ended at toolkit
 `bb37b577fc191084be74dff72a87b84ac9cf08ab`. Fixed evidence, legacy, HMAC,
 age identity, signing, allowed-signers, and state roots plus descendants require
 the exact bootstrap permit at config, raw directory/file/root helper, legacy
@@ -87,10 +87,10 @@ core, and inventory boundaries. Direct tests monkeypatch `os.open` and prove
 refusal before effects. Separator-safe lexical containment rejects sibling
 prefix aliases and preserves bounded performance.
 
-Independent parent verification passed state `148 passed in 45.70s` and the
+Historical independent parent verification passed state `148 passed in 45.70s` and the
 exact seven-file suite `440 passed in 65.41s`. Python 3.13 compiled all six
-production files; scoped Ruff, diff/status, required-ancestor, and zero
-skipped/retired-test scans passed. Production SHA-256 values are bootstrap
+production files; scoped Ruff, diff/status, required-ancestor, and historical
+no-new-skipped/retired-test scans passed. Production SHA-256 values are bootstrap
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`, evidence
 `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e`, quarantine
 `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`, state
@@ -119,3 +119,40 @@ owner prompt naming its hash and authorizing two-key privileged preparation
 and signing. No live action occurred; the first gate remains **CLOSED**.
 Persona evolution is omitted; proactivity, consciousness, and speak-up remain
 mandatory later capabilities.
+
+## Current successor correction — review still required
+
+bb37 is historical **REJECT**, not an accepted head. Fresh review found its
+Critical ancestor `_Dir` path/permit loss permitted legacy/key/age/signing
+reads; state returned a composable raw parent FD. Important findings were the
+authenticated journal permit drop that prevented q1, quarantine fixed-target
+ancestor/descendant admission, and documentation that overclaimed safety.
+
+The clean current toolkit head is `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
+Review `bb37b577fc191084be74dff72a87b84ac9cf08ab..2967e451d10d83c0a07ff4ed54dad7a556b6bf83` (full
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`).
+The successor uses symmetric normalized separator-safe overlap; provenance
+carrying opaque `_Dir` and `_RootHandle` handles; effect-specific authorization
+before filesystem effects; exact-permit production crypto; journal permit
+propagation; and quarantine overlap refusal with sibling-prefix fixtures
+allowed. No stale production adapters remain. Same-process introspection and a
+malicious owner remain out of scope.
+
+Current production hashes: bootstrap
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+`8be29004648eac2fe58841635c45414d1483102a2d2e7d00e1f1f5cb73d2a2b9`;
+quarantine `14df959da264d7580f3bc78a5bce693284e917bb799fddb35bd506e787297dcb`;
+state `5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16`;
+smoke `4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5`;
+controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
+
+Parent exact evidence: state `150 passed in 55.10s`; seven-file suite `445
+passed in 77.47s`; six-file Python 3.13 compile, full scoped Ruff, clean
+diff/status, required ancestor, no newly added skips/retired coverage, and
+adapter scans pass. Two bootstrap conditional system-`ssh-keygen` skips
+pre-exist; this is not a global zero-skip result. The gate remains **CLOSED**:
+no privileged action, install, key, authority, candidate, approval, decision,
+release, signature, runtime, auth, message, or artifact action occurred;
+services are offline. Fresh Terra then standing Luna A/B exact-head mechanism
+reviews remain pending. Persona evolution is omitted; proactivity,
+consciousness, and speak-up remain mandatory later capabilities.

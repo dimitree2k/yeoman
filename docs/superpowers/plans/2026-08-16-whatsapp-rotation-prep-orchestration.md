@@ -148,8 +148,8 @@ The release candidate must bind these candidate module hashes:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e` |
-| `whatsapp_rotation_state` | `2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071` |
+| `incident_evidence_lib` | `8be29004648eac2fe58841635c45414d1483102a2d2e7d00e1f1f5cb73d2a2b9` |
+| `whatsapp_rotation_state` | `5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16` |
 | `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 After authenticating the signed candidate, signed owner approval, both signed
@@ -282,6 +282,10 @@ First run the synthetic-fake integration dry run above. Then package each compan
 
 ## Execution Handoff
 
-Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed production actions. eb272 corrected the authority/two-signer contract but fresh Terra rejected its underscored production adapters. a950 removed those adapters, but exact-head Terra review rejected a fixed legacy-descriptor/test-crypto FD escape, ungated raw evidence/key opens, and evidence/state descendant aliases. Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` guards exact fixed roots and descendants at configs, raw directory/file/root helpers, legacy core composition, and authenticated inventory propagation while preserving pure/test-injected later-phase cores. Parent verification passed state `148 passed in 45.70s` and the exact seven-file suite `440 passed in 65.41s`; Python 3.13 compile, scoped Ruff, diff/status, zero-skip/retired scans, required-ancestor check, and offline runtime checks passed. All f55/eb272/a950 claims are historical only. No production artifact or action exists.
+Historical record: bb37 was **REJECTED**, not accepted. Its descendant-only capability design lost `_Dir` path/permit provenance across ancestor composition, exposed legacy/key/age/signing reads, returned a composable raw state parent FD, dropped the authenticated journal permit before q1, admitted fixed auth/evidence/key overlaps in quarantine, and overclaimed the resulting boundary. Its tests and hashes are historical evidence only.
+
+The current clean toolkit head is `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`, reviewing `bb37b577fc191084be74dff72a87b84ac9cf08ab..2967e451d10d83c0a07ff4ed54dad7a556b6bf83` (full correction range `f55a5e28cfabc5010aa84031bd699aa8e4054645..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`). Symmetric normalized separator-safe overlap refuses both ancestors and descendants. Evidence `_Dir` carries path/permit, exposes no `.fd`, and authorizes every effect-specific transition before it touches the filesystem; only `_authenticated_fd` with the exact captured permit supports production crypto. State uses an opaque path+permit `_RootHandle`; journal helpers carry `config.permit`; quarantine refuses every fixed-target overlap while sibling-prefix fixtures remain allowed. Same-process introspection and a malicious owner remain outside this stale-entry boundary. No stale production adapters remain.
+
+Parent evidence at this head: state `150 passed in 55.10s`; exact seven-file suite `445 passed in 77.47s`; six-file Python 3.13 compile, full scoped Ruff, clean diff/status, required-ancestor, no newly added skips/retired coverage, and adapter scans all pass. Bootstrap retains two pre-existing conditional `pytest.skip` cases for unavailable system `ssh-keygen -Y` support; this is not a global zero-skip claim. No production artifact or action exists; services remain offline.
 
 The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.

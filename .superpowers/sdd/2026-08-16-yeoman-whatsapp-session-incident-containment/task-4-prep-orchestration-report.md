@@ -253,19 +253,19 @@ descriptor plus attacker test crypto exposed key/data FDs, raw evidence/key
 open helpers were ungated, and exact-only checks missed evidence/state
 descendants. a950 is historical only. No production artifact or action exists.
 
-## Current bb37 raw-root and descendant correction and handoff
+## Historical bb37 raw-root and descendant rejection
 
 Toolkit `276105f8d2145ea8facab1692f49ad220cfc2783` permit-gates fixed evidence,
 legacy, HMAC, age-identity, signing, allowed-signers, and state roots plus
 descendants at config, raw directory/file/root helper, legacy-core, and
 inventory boundaries. Authenticated operations propagate the same captured
 permit. Direct tests monkeypatch `os.open` and prove refusal before effects.
-Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` makes containment normalized,
+Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` made containment normalized,
 separator-safe, and sibling-prefix resistant while restoring bounded runtime.
 
-Parent state verification passed `148 passed in 45.70s`; the exact seven-file
+Historical parent state verification passed `148 passed in 45.70s`; the exact seven-file
 suite passed `440 passed in 65.41s`. Python 3.13 compile, scoped Ruff,
-`git diff --check`, clean status, required-ancestor, and zero skipped/retired
+`git diff --check`, clean status, required-ancestor, and historical no-new skipped/retired
 scans passed. Production hashes: bootstrap
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
 `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e`;
@@ -275,17 +275,59 @@ smoke `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`;
 controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
 No production artifact or action exists.
 
-Required next order: fresh Terra -> standing Luna mechanism review -> exact
+Historical next-order proposal: fresh Terra -> standing Luna mechanism review -> exact
 unsigned draft -> explicit owner prompt naming its hash and authorizing two-key
 privileged preparation/signing -> signed candidate/owner approval -> exact
 signed-candidate Luna reviews -> decisions/release -> reverify -> invoke.
 Persona evolution is omitted; proactivity, consciousness, and speak-up remain
-mandatory later capabilities. Final review must bind bb37 and the successor
-source documentation commit.
+mandatory later capabilities. Final review must bind the current toolkit
+successor and the successor source documentation commit.
 
-The authoritative orchestration-plan SHA-256 is
-`bc33f8e4d9969deea8ccfc66de5e79511a9af36d7de7928febcb32ad17b51721` and the
-Luna-package SHA-256 is
-`7fe470d3466191c840f9243f81d5cde2fc5d5328a9df1ad344815f21bee511ef`.
-They are recorded outside the documents they hash. Final review must bind the
-successor source documentation commit containing this report.
+## Current successor handoff
+
+bb37 is a historical **REJECT**, not the current capability boundary. The
+review proved Critical ancestor `_Dir` path/permit loss that enabled
+legacy/key/age/signing reads; state exposed a composable raw parent FD; and
+Important authenticated journal opens dropped the permit and deadlocked q1.
+Quarantine accepted fixed descendants and ancestors, and the documents
+overclaimed the boundary.
+
+The current clean toolkit is `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`, with
+review range `bb37b577fc191084be74dff72a87b84ac9cf08ab..2967e451d10d83c0a07ff4ed54dad7a556b6bf83` and full range
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..2967e451d10d83c0a07ff4ed54dad7a556b6bf83`.
+Symmetric normalized separator-safe overlap rejects protected ancestors and
+descendants. `_Dir` carries path/permit provenance, exposes no `.fd`, and
+authorizes effect-specific transitions before effects; only
+`_authenticated_fd(exact captured permit)` supports production crypto. State
+uses opaque path+permit `_RootHandle`, all journal opens propagate
+`config.permit`, and quarantine rejects any fixed-target overlap while sibling
+prefix fixtures remain allowed. Same-process introspection and a malicious
+owner remain out of scope. No stale production adapters remain.
+
+| Current production source | SHA-256 |
+| --- | --- |
+| `bootstrap/first_gate_bootstrap.py` | `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd` |
+| `scripts/incident_evidence_lib.py` | `8be29004648eac2fe58841635c45414d1483102a2d2e7d00e1f1f5cb73d2a2b9` |
+| `scripts/whatsapp_auth_quarantine.py` | `14df959da264d7580f3bc78a5bce693284e917bb799fddb35bd506e787297dcb` |
+| `scripts/whatsapp_rotation_state.py` | `5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16` |
+| `scripts/whatsapp_rotation_smoke.py` | `4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5` |
+| `scripts/whatsapp_rotation_first_gate.py` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
+
+Parent verification at the exact current head: state `150 passed in 55.10s`;
+exact seven-file suite `445 passed in 77.47s`; six-file Python 3.13 compile,
+full scoped Ruff, clean diff/status, required ancestor, no newly added
+skips/retired coverage, and adapter scans all pass. Bootstrap retains two
+pre-existing conditional `pytest.skip` cases for unavailable system
+`ssh-keygen -Y` support; do not describe this as globally zero skips.
+
+Current authoritative document hashes, recorded here rather than in the
+self-hashed plan/package: orchestration plan
+`21c864f97b599b9a0dfd0660521d198d82c791bd60aca851ae02caf7947fe63c`; Luna
+package `fa0c154d6c14f125c681c75c6994d49552f2a3e132778316d123fb12ce27fb7c`.
+The final review binds the successor source documentation commit.
+
+The gate remains **CLOSED**. No installation, key, authority, candidate, owner
+approval, decision, release, signature, runtime, auth, message, or artifact
+action occurred; services remain offline. Fresh Terra and standing Luna A/B
+exact-head mechanism reviews remain pending. Persona evolution is omitted;
+proactivity, consciousness, and speak-up remain mandatory later capabilities.
