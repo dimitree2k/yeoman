@@ -15,7 +15,7 @@
 - `EvidenceCommitment` is public-safe: `schema_version`, `record_hmac_sha256`, `ciphertext_sha256`, and `signature_sha256` only. Never expose a bare plaintext record SHA-256.
 - JSON records may be bounded in memory. Streaming artifacts never create a plaintext file or FD-backed disk inode: they feed canonical bytes/tar-like records through bounded HMAC and `age` pipes; recipient verification streams decrypted bytes through HMAC/byte-count comparison and discards them. Build ciphertext, detached signature, and public metadata—but no plaintext—inside a private staging directory; verify ciphertext, both decryptions, and signature before public visibility, `fsync` it, then atomically rename it to a unique final artifact directory. Collision or any prepublication failure leaves no partial published artifact. Ciphertext staging may use `O_TMPFILE`/direct FD publication; unsupported primitives fail closed.
 - These are incident migration tools, not permanent Gateway/Bridge architecture. Add their exact deletion, tests, documentation, and evidence-disposition boundary to the final legacy-free release inventory; delete them before final-release acceptance.
-- Full quiescence is mandatory. Both standing Luna code-review GO decisions authorize only a separately owner-approved privileged bootstrap installation and offline release-signing/authority-preparation step; they do not themselves authorize installation or the first live gate. Only after that preparation is reviewed may the installed bootstrap stop/verify Bridge, Gateway, and Overseer all `inactive`/`failed`, prove Overseer cannot respawn them, and retain that state through v1 inspection and v2 baseline. The first gate then stops for the mandatory second evidence-bound Luna review. Keep Gateway/Overseer stopped throughout later owner gates; only the pinned Bridge-only QR helper and direct observer may run during relink/smoke, then stop Bridge again before post capture/compare. A baseline mismatch is NO-GO. `external_effect_unknown` is terminal and never retried or replayed; `capture_failed` is terminal and blocks incident close.
+- Full quiescence is mandatory. The first standing Luna mechanism/procedure GO decisions authorize only preparation of an exact unsigned candidate draft for a separate owner prompt; they do not authorize installation, signing, or the live gate. The owner prompt must identify that draft's exact canonical SHA-256 and explicitly authorize privileged bootstrap/authority/key preparation plus signing exactly that candidate. Only after the owner approval is captured in the fixed signed approval envelope, the candidate is signed, both standing Luna sessions approve the exact signed candidate, decision envelopes and release are signed, and installed/artifact bytes are verified may the bootstrap stop/verify Bridge, Gateway, and Overseer all `inactive`/`failed`, prove Overseer cannot respawn them, and retain that state through v1 inspection and v2 baseline. The first gate then stops for the mandatory second evidence-bound Luna review. Keep Gateway/Overseer stopped throughout later owner gates; only the pinned Bridge-only QR helper and direct observer may run during relink/smoke, then stop Bridge again before post capture/compare. A baseline mismatch is NO-GO. `external_effect_unknown` is terminal and never retried or replayed; `capture_failed` is terminal and blocks incident close.
 - After the installed first gate produces the real quiesced v1/v2 baseline, a mandatory second evidence-bound Luna GO authorizes four distinct host-backed owner turns in this order: `owner-all-devices-revoked-v1`, `owner-quarantine-authorized-v1`, `phone-ready-v1` after quarantine, and `owner-device-inventory-v1` after relink/fingerprint. No destructive transition proceeds without both standing reviewers rereading the exact owner reference and confirming statement/predecessor; this is host-API trust evidence, not cryptographic nonrepudiation.
 
 ## Component Map
@@ -41,27 +41,31 @@ module. Its only production invocation, byte/order exact, is:
 The installed bootstrap must be root-owned regular mode `0755` at
 `/usr/local/libexec/yeoman/first_gate_bootstrap.py`, non-writable by group and
 world, with candidate source SHA-256 submitted for re-review
-`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`.
+`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`.
 The root-owned non-writable authority is fixed at
 `/etc/yeoman/first-gate-release-authority.json`; it pins signer identity,
 allowed-signers content and hash, bootstrap path and hash, and all fixed
-candidate, decision, and release paths. The release root is
+candidate, owner-approval, decision, and release paths. Both authority and
+installed bootstrap must be root-owned regular files with exact mode `0755`;
+looser and stricter modes both refuse. The release root is
 `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` and
 contains only the fixed names `candidate.json`/`candidate.sig`,
 `agent_a-decision.json`/`agent_a-decision.sig`,
 `agent_b-decision.json`/`agent_b-decision.sig`, and
-`release.json`/`release.sig`.
+`owner-approval.json`/`owner-approval.sig`, and `release.json`/`release.sig`.
 
-No installed bootstrap, authority descriptor, release-signing key, signed
-candidate, signed decision, signed release, or signature was created during
-synthetic correction. The approval order is strict: first fresh Terra
-acceptance and standing Luna mechanism/procedure review of the exact code and
-documentation; then stop and obtain separate explicit owner approval for the
-privileged bootstrap/authority/key preparation and signed-candidate creation;
-then both standing Luna sessions review the exact signed candidate bytes and
-hash and return GO; capture their exact outputs in signed, time-bounded
-decision envelopes; create the final signed release; re-review any differing
-installed or artifact bytes; only then may the byte-exact invocation run.
+No installed bootstrap, authority descriptor, release-signing key, candidate,
+owner approval, decision, release, or signature was created during synthetic
+correction. The approval order is strict: first fresh Terra acceptance and
+standing Luna mechanism/procedure review of exact code/docs; prepare the exact
+unsigned canonical candidate draft; then stop and ask the owner to approve the
+draft's exact SHA-256 plus privileged bootstrap/authority/key preparation and
+signing that exact candidate; only after approval perform that preparation and
+sign the candidate and owner-approval envelopes; then both standing Luna
+sessions review the exact signed candidate bytes/hash and return GO; capture
+their exact outputs in signed, time-bounded decision envelopes; create the
+final signed release; re-review any differing installed or artifact bytes;
+only then may the byte-exact invocation run.
 
 The bootstrap accepts no arguments or overrides and requires the exact sterile
 environment and interpreter flags above. It validates that every fixed
@@ -83,15 +87,20 @@ The authorization is deliberately not one monolithic manifest. The signed
 immutable candidate v1 binds all static executable and provenance facts: the
 incident; exact source and toolkit commits; plan/package hashes; required
 ancestor; installed bootstrap; invocation; closed module names, paths, sizes,
-and hashes; and fixed toolchain. Each signed decision v1 binds that exact
-candidate hash, one standing role/session, the fixed scope, `GO`, exact review
-text and hash, and an inclusive `issued_at <= now <= not_after` validity
-window. The signed release v2 binds the candidate hash, exact hashes of both
-decision envelopes, and a single-use `authorization_id`.
+and hashes; and fixed toolchain. The distinct owner-approval v1 envelope binds
+the incident, exact unsigned canonical candidate hash, fixed owner identity and
+scope, `APPROVED`, exact approval text/hash, and an inclusive validity window
+of at most 24 hours. Each signed decision v1 binds that exact candidate hash,
+one standing role/session, fixed scope, `GO`, exact review text/hash, and the
+same bounded inclusive validity rule. The signed release v3 binds exact hashes
+of candidate, owner approval, and both decision envelopes plus a single-use
+`authorization_id`. Candidate, owner approval, decisions, and release must all
+be their exact canonical bytes; alternate JSON encodings refuse.
 
-The three artifact classes use distinct SSH signature namespaces. The owner
-signature attests exact transcript capture in the decision envelope; Luna
-session IDs are trace/process evidence, not cryptographic nonrepudiation.
+The four artifact classes use distinct SSH signature namespaces. Owner and
+review signatures attest exact transcript capture in their respective
+envelopes; Luna session IDs are trace/process evidence, not cryptographic
+nonrepudiation.
 The standing reviewer identities are:
 
 - Agent A: `01a009b3-e740-7972-992b-5d63d6066b8c`
@@ -110,18 +119,27 @@ verified after startup. Only later `ssh-keygen`, `age`, `age-keygen`, and
 an in-memory finder. Direct execution of the worktree controller is always
 NO-GO. Neither Git nor a dynamically discovered current head participates in
 runtime authorization; strict schema checks also refuse booleans where integer
-fields are required.
+fields are required. The global execution permit and reusable loader are
+absent: `main()` constructs one local permit and one local in-memory loader only
+after exact argv/environment/process, authority, signature, module, and tool
+authentication. The authenticated evidence and controller modules capture that
+same per-execution permit during import; normal/direct imports cannot mint a
+release or reach `_production_runtime`. This is an accidental/stale-entry
+boundary, explicitly not a Python sandbox against same-process introspection or
+a malicious owner, both outside the trusted-launcher threat model.
 
 The release candidate must bind these candidate module hashes:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `6914cebaf9410b09991c03435777edec1f3ac75db01e11a31bf008639c575979` |
+| `incident_evidence_lib` | `fddc847bd34fb87d6e68837fb9af62196e2039706402fbf96e8412aa322cd721` |
 | `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
-| `whatsapp_rotation_first_gate` | `edc08386ecf761276eeff22b0d346ae2dbbe63f1173b4e7cb4048c59e936ac4e` |
+| `whatsapp_rotation_first_gate` | `ab80783d4ad4f648525f38a424d5ae455d1ba483838a8dc78cbd772d5d8b3883` |
 
-After authenticating the signed candidate, both signed decisions, and signed
-release, the controller durably reserves its single-use `authorization_id` in
+After authenticating the signed candidate, signed owner approval, both signed
+decisions, and signed release, the preflight v5 reconstructs exact candidate and
+release hashes, carries bootstrap/owner/decision hashes and owner metadata, and
+the controller durably reserves its single-use `authorization_id` in
 a protected attempt before mutation. The only causal chain is: signed release
 -> attempt -> attempt-linked `q1` -> provenance -> `q2` -> pre-v2 -> final
 read-only receipt -> protected binding. Actual
@@ -244,8 +262,8 @@ git commit -m "test(incident): cover rotation preparation integration"
 
 - [ ] **Step 4: Review in the required order**
 
-First run the synthetic-fake integration dry run above. Then package each companion task report, commits, diffs, tests, and mutation evidence for three scoped task reviews. Only after those accept, request the first Agent A/B mechanism/procedure review with explicit `gpt-5.6-luna`, exact commit range, reports/review packages, and program log. That first pair of GO decisions authorizes only a request for separate explicit owner approval of privileged bootstrap/authority/key preparation and signed-candidate creation. After the owner approves and the signed candidate is created, both standing Luna sessions must review its exact bytes/hash and independently return GO; only then capture their exact review outputs in signed decision envelopes and create the signed final release. Verify and, if necessary, re-review resulting installed/artifact bytes before the byte-exact first-gate invocation. That gate performs only full quiescence and real read-only `inspect-v1`/`capture-v2`, then stops. Package its protected commitments for a mandatory second evidence-bound Agent A/B `gpt-5.6-luna` review. Its GO authorizes revocation turn, authorization turn, quarantine, phone-ready turn, pinned helper Bridge/owner-only-QR start while owner does not scan, direct observer readiness, then QR scan, fingerprint/inventory fourth turn, and one-shot smoke. Stop Bridge, post-capture/compare, then obtain a final Luna review. The strictest NO-GO governs every gate; append only accepted commitments and residual risk to the log.
+First run the synthetic-fake integration dry run above. Then package each companion task report, commits, diffs, tests, and mutation evidence for three scoped task reviews. Only after those accept, request the first Agent A/B mechanism/procedure review with explicit `gpt-5.6-luna`, exact commit range, reports/review packages, and program log. That first pair of GO decisions authorizes only preparation of the exact unsigned canonical candidate draft and an owner prompt naming its SHA-256. The owner must explicitly approve privileged bootstrap/authority/key preparation plus signing exactly that candidate. Capture that approval in the fixed signed owner-approval v1 envelope, perform only the approved preparation, sign the candidate, and have both standing Luna sessions review its exact signed bytes/hash. Only after both return GO may their exact outputs be signed as decision envelopes and release v3 be created. Verify and, if necessary, re-review resulting installed/artifact bytes before the byte-exact first-gate invocation. That gate performs only full quiescence and real read-only `inspect-v1`/`capture-v2`, then stops. Package its protected commitments for a mandatory second evidence-bound Agent A/B `gpt-5.6-luna` review. Its GO authorizes revocation turn, authorization turn, quarantine, phone-ready turn, pinned helper Bridge/owner-only-QR start while owner does not scan, direct observer readiness, then QR scan, fingerprint/inventory fourth turn, and one-shot smoke. Stop Bridge, post-capture/compare, then obtain a final Luna review. The strictest NO-GO governs every gate; append only accepted commitments and residual risk to the log.
 
 ## Execution Handoff
 
-The next sequence after fresh Terra acceptance and both first Luna mechanism/procedure GO decisions is a separate owner decision on privileged bootstrap/authority/key preparation and signed-candidate creation—not a live first gate. After both Luna sessions have separately approved the exact signed candidate bytes/hash, signed decisions and final release may be created. After approved installation, verification, and any required artifact re-review, the byte-exact bootstrap invocation may perform only full quiescence and read-only `inspect-v1`/`capture-v2`, then must stop. Owner turns begin only after the mandatory second evidence-bound Luna GO.
+The next sequence after fresh Terra acceptance and both first Luna mechanism/procedure GO decisions is an exact unsigned candidate draft followed by a separate owner decision naming that draft hash and authorizing privileged bootstrap/authority/key preparation plus signing it—not a live first gate. After approved preparation and signed owner/candidate envelopes, both Luna sessions separately approve exact signed candidate bytes/hash; only then may signed decisions and release v3 be created. After verification and any required artifact re-review, the byte-exact bootstrap invocation may perform only full quiescence and read-only `inspect-v1`/`capture-v2`, then must stop. Owner turns begin only after the mandatory second evidence-bound Luna GO.

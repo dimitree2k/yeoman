@@ -59,30 +59,31 @@ establish the later correction. No live action occurred.
 ## Authenticated-bootstrap correction — pending fresh review
 
 Toolkit correction range
-`62acf5b73ca9b9abaed79004deed7f93ef2280b3..c4bc00a77ade352c24610d152cdeede67da9ec53`
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`
 uses a sixth production source, the standard-library-only pre-import trust
 anchor `bootstrap/first_gate_bootstrap.py` (SHA-256
-`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`).
-The stable exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
-`py_compile`, scoped Ruff, and clean status passed. The final head only removes
-unused legacy bootstrap aliases after that suite; its focused bootstrap suite
-passed 35 tests and Python 3.13/Ruff were clean. The parent must rerun the exact
-suite on the final head before acceptance. Earlier 376/388/407 runs remain
-historical.
+`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`).
+Parent verification at final clean head passed the exact suite: `459 passed in
+60.93s`; Python 3.13 `py_compile`, scoped Ruff, diff check, and status were
+clean. The initial aggregate claim at production correction `960168a` was
+false: parent reproduced 450 passing and nine stale-fixture failures. Test-only
+`f55a5e2` centralizes the canonical preflight-v5 builder and closes all nine.
 
-Fresh Terra reviews rejected `9c6c9f`: SPEC required an immutable reviewed
-candidate, exhaustive all-phase failure-prefix tests, and correct launcher
-wording; SECURITY required a signed candidate, authenticated decision envelopes,
-final-release binding, exact preflight binding, real signature/mutation tests,
-and boolean refusal. The closure at `c4bc00a` is a root authority that pins
-fixed candidate/decision/release paths and signer; signed candidate v1 for all
-static executable/provenance facts; signed per-role decision v1 for candidate
-hash, standing role/session, scope, GO, exact review text/hash, and inclusive
-time bounds; signed release v2 for candidate hash, exact decision-envelope
-hashes, and single-use `authorization_id`; distinct namespaces; and preflight
-v3. The owner signature attests exact transcript capture; Luna session IDs are
-trace/process evidence, not cryptographic nonrepudiation. Fresh Terra and both
-standing Luna reviews remain pending; this is not acceptance.
+Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
+and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected exact-authority mode,
+public release/direct-import runtime reachability, and procedural-only owner
+approval. Closure requires exact root-owned regular `0755` authority/bootstrap;
+removes global permit/loader state; constructs permit and loader only inside
+`main()` after process/signature/module authentication; captures the same
+per-execution permit inside evidence/controller imports so normal imports fail
+before runtime; and explicitly excludes malicious-owner/same-process sandboxing
+from the threat model. Owner approval v1 binds the unsigned canonical candidate
+hash, fixed owner/scope/APPROVED/text hash, a distinct namespace, and at most 24
+hours of inclusive validity. Exact canonical candidate/approval/decision/release
+bytes are required. Release v3 binds candidate, approval, and two decision
+hashes plus authorization; preflight v5 carries bootstrap/decision/approval
+hashes and owner metadata and reconstructs candidate/release hashes. Fresh
+Terra and both standing Luna reviews remain pending; this is not acceptance.
 
 The only intended invocation is byte/order exact:
 
@@ -95,9 +96,11 @@ Runtime Git and the `/usr/bin/python3` symlink are not authorization.
 trust boundaries verified after startup; only later `ssh-keygen`, `age`,
 `age-keygen`, and `systemctl` subprocesses use held FDs. No bootstrap,
 authority, release key, candidate, decision, release, or signature was
-installed or created. First obtain fresh Terra acceptance and standing-Luna
-mechanism/procedure reviews; then stop for a separate owner approval of
-privileged bootstrap/authority/key preparation and signed-candidate creation;
-then obtain both Luna GOs on the exact candidate bytes/hash, create signed
-decision envelopes and final release, and re-review differing installed/artifact
-bytes. No live action occurred; the first gate remains CLOSED.
+installed or created; nor does an owner-approval artifact exist. First obtain
+fresh Terra acceptance and standing-Luna mechanism/procedure reviews; prepare
+the exact unsigned candidate draft; then stop for an owner prompt naming its
+hash and authorizing privileged bootstrap/authority/key preparation plus signing
+that exact candidate. Only after signed owner/candidate envelopes may both Luna
+sessions review exact signed bytes/hash, followed by signed decisions/release
+and differing-byte re-review. No live action occurred; the first gate remains
+CLOSED.

@@ -142,32 +142,32 @@ failure. Services remain offline and no live action is authorized.
 ## Authenticated-bootstrap correction update — 2026-08-20
 
 Synthetic correction now ends at toolkit
-`c4bc00a77ade352c24610d152cdeede67da9ec53`. Fresh Terra rejected `9c6c9f`:
-SPEC required immutable reviewed candidate material, exhaustive all-phase
-failure-prefix tests, and launcher wording; SECURITY required a signed
-candidate, authenticated decisions, final-release and exact-preflight binding,
-real signature/mutation tests, and boolean refusal. The closure is root
-authority plus separate signed candidate v1, per-role signed decision v1, and
-signed release v2—not a monolithic manifest. The authority pins fixed paths and
-signer; decisions bind candidate hash, role/session/scope/GO, exact review
-text/hash, and inclusive time validity; release binds candidate and decision
-hashes plus single-use `authorization_id`; namespaces are distinct. The owner
-signature attests transcript capture and Luna session IDs remain process/trace,
-not cryptographic nonrepudiation.
+`f55a5e28cfabc5010aa84031bd699aa8e4054645`. Fresh Terra review of prior
+source `48ca1a9` and toolkit `c4bc00a` rejected missing exact authority mode
+`0755`, public release/direct-import runtime reachability, and procedural-only
+owner approval. Production `960168a` requires exact root regular `0755`
+bootstrap/authority, moves permit+loader inside authenticated `main()`, binds
+evidence/controller imports to one per-execution permit, and makes normal
+imports fail before runtime. It explicitly does not claim a Python sandbox
+against same-process introspection or a malicious owner.
 
-The stable exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
-`py_compile`, scoped Ruff, `git diff --check`, and clean status passed. Final
-head `c4bc00a` removes only unused legacy bootstrap aliases after that run; its
-focused bootstrap suite passed 35 tests and Python 3.13/Ruff were clean. Parent
-must rerun the exact suite at final head before acceptance. Bootstrap SHA-256 is
-`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`.
+Owner approval v1 has fixed paths/distinct namespace and binds the exact
+unsigned canonical candidate hash, fixed owner/scope/APPROVED/text hash, and no
+more than 24 hours inclusive validity. All signed artifact bytes are canonical.
+Release v3 binds candidate, owner approval, two decisions, and authorization;
+preflight v5 carries bootstrap/decision/owner facts and reconstructs candidate
+and release hashes. The initial `960168a` aggregate claim was false: parent saw
+450 pass and nine stale-fixture failures. Test-only `f55a5e2` centralizes the v5
+fixture builder; final parent verification passed `459 passed in 60.93s`, plus
+Python 3.13 compile, Ruff, diff, and clean status. Bootstrap SHA-256 is
+`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`.
 
-No bootstrap, authority, release key, candidate, decision, release, or
-signature exists or was created. First fresh Terra acceptance and standing-Luna
-mechanism/procedure review; then separate explicit owner approval for privileged
-bootstrap/authority/key preparation and signed-candidate creation; then both
-Luna reviews of exact candidate bytes/hash; then signed decisions and release;
-then re-review of differing installed/artifact bytes; only then invocation. No
+No bootstrap, authority, release key, candidate, owner approval, decision,
+release, or signature exists or was created. First fresh Terra acceptance and
+standing-Luna mechanism/procedure review; then an exact unsigned draft and
+owner prompt naming its hash/authorizing privileged prep plus its signing; then
+signed owner/candidate envelopes; then both Luna signed-candidate reviews;
+then signed decisions/release and differing-byte re-review; only then invocation. No
 runtime, service, owner, revocation, quarantine, QR, observer, smoke, or message
 action is authorized. `/usr/bin/env` and `/usr/bin/python3.13` are root-owned
 pathname launcher trust boundaries checked after startup; only later crypto and

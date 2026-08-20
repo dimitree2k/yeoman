@@ -172,42 +172,49 @@ the durable initial-decision/correction record.
 ## Authenticated-bootstrap correction and fresh handoff
 
 The corrected toolkit range is
-`62acf5b73ca9b9abaed79004deed7f93ef2280b3..c4bc00a77ade352c24610d152cdeede67da9ec53`.
-Fresh Terra reviews rejected `9c6c9f`: SPEC required immutable reviewed
-candidate material, exhaustive all-phase failure-prefix tests, and launcher
-wording; SECURITY required signed candidate/decision/final-release binding,
-exact preflight binding, real signature/mutation tests, and boolean refusal.
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`.
+Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
+and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected two remaining
+boundaries: SPEC required exact installed authority mode `0755`; SECURITY found
+public release/direct-import runtime reachability and procedural-only owner
+approval.
 
-Closure is candidate/decision/release, not a monolithic manifest: root authority
-pins fixed paths and signer; candidate v1 binds static executable/provenance
-facts; each decision v1 binds candidate hash, role/session, scope, GO, exact
-review transcript/hash, and inclusive validity; release v2 binds candidate hash,
-decision-envelope hashes, and single-use `authorization_id`; namespaces differ.
-Preflight is v3. The owner signature attests transcript capture; Luna IDs are
-trace/process evidence rather than cryptographic nonrepudiation.
+Production correction `960168a` requires both bootstrap and authority to be
+root-owned regular exact `0755`; deletes global permit/loader state; creates
+both locally inside `main()` only after exact process/signature/module/tool
+authentication; and makes evidence/controller imports capture the same
+per-execution permit so normal imports fail before production runtime. This is
+an accidental/stale-entry fence, not a same-process or malicious-owner sandbox.
 
-The exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
-`py_compile`, scoped Ruff, `git diff --check`, and clean status passed. Final
-head `c4bc00a` only removes unused legacy bootstrap aliases; the focused
-bootstrap suite passed 35 tests and Python 3.13/Ruff were clean. The parent must
-rerun the exact suite at that head before acceptance. The bootstrap source hash
-is `0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`; the
-three module hashes are unchanged. `/usr/bin/env` and `/usr/bin/python3.13` are
-root-owned pathname launcher trust boundaries verified after startup; only later
-`ssh-keygen`/`age`/`age-keygen`/`systemctl` subprocesses use held FDs.
+Owner approval v1 has fixed paths and its own namespace. It binds incident,
+exact unsigned canonical candidate hash, fixed owner/scope, `APPROVED`, exact
+text/hash, and inclusive validity no longer than 24 hours. Candidate, owner
+approval, decisions, and release must be exact canonical bytes. Release v3
+binds candidate, owner-approval, and both decision hashes plus single-use
+authorization. Preflight v5 carries bootstrap/decision/owner hashes and owner
+metadata and reconstructs canonical candidate/release hashes.
 
-No bootstrap, root authority, release key, signed candidate, signed decision,
-signed release, or signature was installed or created. First fresh Terra and
-standing-Luna mechanism/procedure review; then separate explicit owner approval
-for privileged bootstrap/authority/key preparation and signed-candidate
-creation; then both Luna sessions review exact candidate bytes/hash and GO;
-then signed decisions and final release; then differing-byte re-review; only
-then exact invocation. No live/runtime/systemctl/key/owner/QR/message operation
-occurred.
+An initial aggregate claim at `960168a` missed nine stale test fixtures. Parent
+verification exposed `450 passed, 9 failed`; test-only `f55a5e2` centralizes the
+canonical v5 builder. Final parent verification at clean `f55a5e28` passed the
+exact seven-file suite: `459 passed in 60.93s`; Python 3.13 `py_compile`, scoped
+Ruff, `git diff --check`, and status passed/clean. Bootstrap SHA-256 is
+`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`;
+module hashes are `fddc847bd34fb87d6e68837fb9af62196e2039706402fbf96e8412aa322cd721`,
+`285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1`,
+and `ab80783d4ad4f648525f38a424d5ae455d1ba483838a8dc78cbd772d5d8b3883`.
+
+No bootstrap, authority, release key, candidate, owner approval, decision,
+release, or signature was installed or created. Required order: fresh Terra and
+standing-Luna mechanism review; exact unsigned candidate draft; owner prompt
+naming its hash and approving privileged prep plus signing that candidate;
+signed owner/candidate envelopes; both Luna reviews of exact signed candidate;
+signed decisions/release; differing-byte verification/re-review; invocation.
+No live/runtime/systemctl/key/owner/QR/message operation occurred.
 
 The authoritative orchestration-plan SHA-256 is
-`d45da945b01c0423d62860beb00b1765ea3b082c30aa5945b51b30bd2b0a88e6` and the
+`e90dcf8883017ad97a3fc5cc0388e71be860caa8e2c6fc3c259db0c147330d45` and the
 Luna-package SHA-256 is
-`2e50d06de434c0d780b52671f7ebed676120a899fa6e97609c00b29bd2aa8093`. They
-are recorded here rather than in either self-hashed document. The final review
-must bind the successor source documentation commit that contains this report.
+`6808531775fde99170eb98d2a2a24fc9e6ebd9f3a14bed75078ae41f49897cec`.
+They are recorded outside the documents they hash. Final review must bind the
+successor source documentation commit containing this report.
