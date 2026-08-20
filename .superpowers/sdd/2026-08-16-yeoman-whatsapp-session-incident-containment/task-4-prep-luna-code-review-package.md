@@ -422,3 +422,40 @@ Luna A/B exact-head review; construct and verify one new unsigned candidate;
 then request owner approval for that exact new hash. Do not put a plan/package
 self-hash inside either self-hashed file. After commit, the controller will
 calculate them and record them in a separate docs-only successor.
+
+## Superseding Task 4 cleanup hard-gate reconciliation
+
+The exact-head standing Luna A/B disposition for toolkit
+`d7485311d52de206470b4f61c2c8eb3b613ee2ba` and source
+`cd80a1feb34c16bb88fc294707a6492570e2ee90` was initial GO, then clarified as
+**CANDIDATE-ONLY**. The old
+`04bbce963ad7070ee6b94426e99973f73900c6b3e394630040df9eb5f3557a79` candidate
+was consequently not reused: it is obsolete, unapproved, unsigned, and
+uninstalled, and no new candidate exists.
+
+Review target is Task 4A `ffdcd2f` (parent `d748531`) plus Task 4B `aa84928`
+(parent `ffdcd2f`), combined range `d748..aa`. Contracts include the repair
+of the prior false-positive direct-import test. Terra Task 4A spec/quality and
+Task 4B spec/quality reviews were clean; combined Terra security is GO.
+Controller tests: `458 passed in 77.84s`; state tests: `151 passed in 55.25s`.
+Six-file Python 3.13 compile, scoped Ruff, diff, required-ancestor/range, and
+clean checks passed.
+
+Artifact identity: bootstrap (26,420 bytes)
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+(92,811 bytes)
+`f48de368d22399d8ac0c1e5f90c0a0f3b2f1fe0eb1c1df417e0e459e5d835277`;
+quarantine `b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`;
+state (85,635 bytes)
+`8124da1ed0c9046f08234cebf8ae09e32603fa36dadae767c9564dd5da291caa`; smoke
+`4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5`; controller
+(7,249 bytes) `4e1b841d0a32769dc2f89df0e2d31abb9761701b39ff53fd9dc329ea537c8fcf`.
+
+Gate state remains **CLOSED** and offline: four user services are
+inactive/dead/disabled at PID 0, and fixed privileged paths are absent. QR,
+quarantine, smoke, observer, and relink are later hard gates. Persona evolution
+is omitted; proactivity, consciousness, and speak-up are mandatory later.
+Next: commit docs; compute plan/package hashes outside their self-hashed files;
+make a docs-only acceptance successor; standing Luna A/B reviews that exact
+head; one candidate only if both GO. No runtime, auth, memory, service, network,
+or privileged action is authorized.

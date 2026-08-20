@@ -371,3 +371,45 @@ Luna A/B exact-head review; construct and verify one new unsigned candidate;
 then request owner approval for that exact new hash. Do not put a plan/package
 self-hash inside either self-hashed file. After commit, the controller will
 calculate them and record them in a separate docs-only successor.
+
+## Superseding Task 4 cleanup hard-gate reconciliation
+
+This section supersedes the immediately preceding cleanup-successor next-step
+record. Standing Luna A/B gave an initial exact-head GO for toolkit
+`d7485311d52de206470b4f61c2c8eb3b613ee2ba` and source
+`cd80a1feb34c16bb88fc294707a6492570e2ee90`, then clarified that GO as
+**CANDIDATE-ONLY**. The knowingly disposable candidate was therefore skipped:
+the old `04bbce963ad7070ee6b94426e99973f73900c6b3e394630040df9eb5f3557a79`
+candidate remains obsolete, unapproved, unsigned, and uninstalled; no new
+candidate exists.
+
+Task 4 now consists of toolkit Task 4A `ffdcd2f` (parent `d748531`) and
+Task 4B `aa84928` (parent `ffdcd2f`), reviewed as the combined range
+`d748..aa`. It includes the exact cleanup contracts and the repair of the
+prior false-positive direct-import test. Terra Task 4A specification and
+quality review were clean; Task 4B specification and quality review were
+clean; combined Terra security review is GO.
+
+Controller evidence is `458 passed in 77.84s`; state evidence is `151 passed
+in 55.25s`. Six-file Python 3.13 compile, scoped Ruff, diff check,
+required-ancestor/range checks, and clean-status checks passed. The current
+authenticated values are bootstrap (26,420 bytes)
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`;
+evidence (92,811 bytes)
+`f48de368d22399d8ac0c1e5f90c0a0f3b2f1fe0eb1c1df417e0e459e5d835277`;
+quarantine `b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`;
+state (85,635 bytes)
+`8124da1ed0c9046f08234cebf8ae09e32603fa36dadae767c9564dd5da291caa`;
+smoke `4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5`;
+and controller (7,249 bytes)
+`4e1b841d0a32769dc2f89df0e2d31abb9761701b39ff53fd9dc329ea537c8fcf`.
+
+The gate remains **CLOSED** and offline. All four user services are
+inactive/dead/disabled with PID 0, and no fixed privileged path exists. QR,
+quarantine, smoke, observer, and relink remain later hard gates. Persona
+evolution remains omitted; proactivity, consciousness, and speak-up remain
+mandatory later capabilities. Next order only: commit these docs; compute
+plan/package hashes outside their self-hashed files; make a docs-only
+acceptance successor; have standing Luna A/B review that exact head; construct
+one candidate only if both GO. No runtime, auth, memory, service, network, or
+privileged action is authorized.
