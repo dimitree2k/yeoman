@@ -519,3 +519,36 @@ mandatory later. Next, and only next: commit docs; compute plan/package hashes
 outside their self-hashed files; form a docs-only acceptance successor; conduct
 standing Luna A/B exact-head review; construct one candidate only if both GO.
 No runtime, auth, memory, service, network, or privileged action is authorized.
+
+## Task 4 acceptance successor
+
+This documentation-only successor is over accepted source docs head
+`c947b020d4dd151320aa64fd9fe426386a659585` and binds toolkit
+`aa84928af62d8ebf66ab8b658c5a2a0618772319`, plan SHA-256
+`9f1669e5c698fad6682c727b4e52fc8bd92491ded6b5f989414474d745fcc700`, and
+package SHA-256
+`9bf78317cf78506078e35456b9059cf4f53f579172d6ae31a6c2128be39221e8`.
+Task 4A independent review is SPEC PASS / QUALITY APPROVED with no findings;
+Task 4B independent review is SPEC PASS / QUALITY APPROVED with no findings;
+the combined Terra security verdict is GO with no findings. The earlier docs
+initial Important finding was resolved by `c947`, then re-reviewed as SPEC PASS
+/ QUALITY APPROVED. Controller verification was `458 passed in 77.84s`; state
+verification was `151 passed in 55.25s`; Python 3.13 compile, scoped Ruff,
+diff, ancestor, range, and clean checks passed. Current candidate material is
+bootstrap 26,420 bytes
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+92,811 bytes
+`f48de368d22399d8ac0c1e5f90c0a0f3b2f1fe0eb1c1df417e0e459e5d835277`; state
+85,635 bytes
+`8124da1ed0c9046f08234cebf8ae09e32603fa36dadae767c9564dd5da291caa`; and
+controller 7,249 bytes
+`4e1b841d0a32769dc2f89df0e2d31abb9761701b39ff53fd9dc329ea537c8fcf`.
+
+The gate remains **CLOSED** and offline. Old candidate
+`04bbce963ad7070ee6b94426e99973f73900c6b3e394630040df9eb5f3557a79` remains
+obsolete; no replacement candidate exists. QR and later hard gates remain
+closed; persona evolution is omitted; proactivity, consciousness, and
+speak-up remain mandatory later. This commit's current source head must be
+bound by standing Luna A/B and any candidate. Only standing Luna A/B exact-head
+review is authorized next; construct no candidate unless both return GO. No
+runtime, candidate, privileged, or live action is authorized.
