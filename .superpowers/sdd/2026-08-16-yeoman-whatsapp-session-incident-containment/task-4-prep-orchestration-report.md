@@ -366,3 +366,23 @@ proactivity, consciousness, and speak-up remain mandatory later. The current
 external document hashes are plan
 `3b7889c005c99d7ad33986585d670b514945794f72ff4e044f3e5e813eb134af` and Luna
 package `88216620ecbdc9d2ef6d65947b5176e6edb117de67ca23043c1ab8dd8c7f1d97`.
+
+## Fresh Terra acceptance of 027
+
+At exact clean toolkit `02720889cd4088dfae16f991fe19da460e5effb1`
+and source `966ec4555bca1430f812390c522455f59a3ba8b8`, fresh independent
+specification task `/root/terra_spec_acceptance_027` returned **GO** with no
+findings. It rebound the exact heads/parents, required ancestor, all six
+production identities, the plan/package hashes, and passed the 63-test focused
+quarantine suite. Fresh adversarial security task
+`/root/terra_security_acceptance_027` also returned **GO** with no findings;
+448 tests collected and 14 targeted adversarial tests passed.
+
+That acceptance is narrowly bound to the authenticated three-module first-gate
+graph. It does not authorize or accept QR, quarantine, relink, observer, smoke,
+delivery, or any live operation. The security review recorded
+`whatsapp_qr_reconnect.py` as a later-phase capability-hardening residual outside
+the gate graph. Standing Luna A/B exact-head mechanism review is now the next
+required step, with the strictest decision governing. The gate remains
+**CLOSED**, services remain offline, and no key/install/signing/authority/
+candidate/approval/release/runtime/auth/message/artifact/live action occurred.
