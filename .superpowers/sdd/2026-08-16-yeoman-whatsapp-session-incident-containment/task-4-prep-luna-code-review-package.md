@@ -3,7 +3,7 @@
 ## Re-review status — corrected code pending acceptance
 
 The production-capability correction is implemented at toolkit head
-`eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`, but it is not yet Terra- or
+`a9504c233a14f92a12b4807855e94e621e8aa4ce`, but it is not yet Terra- or
 Luna-accepted. The first live gate remains **CLOSED**. This package requests
 fresh review of the exact authenticated-bootstrap design and does not authorize
 installation, signing, authority preparation, runtime access, or any live
@@ -13,8 +13,14 @@ Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
 and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` returned **REJECT**.
 It found that the implementation accepted an executable authority and that
 ordinary imports still exposed state, evidence, and owner-turn production
-actions. Toolkit `eb272c5` closes that boundary. Fresh Terra and both standing
-Luna reviews remain pending.
+actions. Toolkit `eb272c5` corrected the executable-authority/two-signer
+contract, but fresh Terra review of source `41b2915684311010a6c96061afeb2bef1ab86dd3`
+and toolkit eb272 returned **REJECT** because normally imported underscored
+evidence/state/quarantine/smoke helpers still exposed production-capable
+effects without the bootstrap permit. Toolkit `a9504c2` deletes the dormant
+quarantine/smoke production adapters and permit-gates the remaining
+evidence/state fixed-root paths. Fresh Terra and both standing Luna reviews of
+this strict correction remain pending.
 
 ## Decision requested after the correction
 
@@ -41,12 +47,14 @@ later production action. There is no live evidence yet.
 - Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
   `c/yeoman-migration-toolkit`.
 - Current correction range/head:
-  `f55a5e28cfabc5010aa84031bd699aa8e4054645..eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`.
+  `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a..a9504c233a14f92a12b4807855e94e621e8aa4ce`.
+- Full authenticated-bootstrap correction range:
+  `f55a5e28cfabc5010aa84031bd699aa8e4054645..a9504c233a14f92a12b4807855e94e621e8aa4ce`.
 - Required toolkit ancestor:
   `6ba55014242953e72ec7a29e75041f704452b885`.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
-  `c/turn-engine-v2`, documentation head
-  `1b18fba1b427e0069d80c8e0a583500d90e1cea0`. The final review must bind the
+  `c/turn-engine-v2`, documentation baseline
+  `41b2915684311010a6c96061afeb2bef1ab86dd3`. The final review must bind the
   exact successor source documentation commit that carries this package.
 - Initial Luna package range (not the range to approve now):
   `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
@@ -121,14 +129,47 @@ then passed the exact seven-file suite: `459 passed in 60.93s`. Python 3.13
 false aggregate claim is withdrawn; earlier current-head counts are stale. No
 production artifact or live boundary was used.
 
-## Current eb272 bootstrap contract
+## Historical eb272 verification and fresh rejection
 
 At clean toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`, the parent exact
 seven-file suite passed `472 passed in 61.11s`; `/usr/bin/python3.13`
-`py_compile`, scoped Ruff, `git diff --check`, and status were clean. This is
-the current synthetic verification; it created no production artifact or action.
+`py_compile`, scoped Ruff, `git diff --check`, and status were clean. Fresh
+Terra nevertheless rejected the normally callable private production paths;
+the passing count did not prove the capability boundary. This evidence is
+historical only and created no production artifact or action.
 
-The f55 evidence and hashes above are historical only. The current candidate bootstrap source submitted for re-review is
+## Current a950 strict capability contract
+
+At clean toolkit `a9504c233a14f92a12b4807855e94e621e8aa4ce`, independent parent
+verification passed the exact seven-file suite: `433 passed in 56.67s`.
+`/usr/bin/python3.13` compiled all six production files; the scoped Ruff set,
+`git diff --check`, clean status, required-ancestor check, and scan for skipped
+or hidden retired tests all passed. The lower count is deliberate deletion of
+obsolete tests for removed production adapters, not skipped coverage.
+
+The strict correction removes quarantine's fixed-root production runtime and
+smoke's production Bridge client, observer transport/launcher, credential
+readers, expectation/send paths, and lease registry. Evidence fixed-root
+configuration, pinned tool execution, production crypto, and legacy reads now
+require the exact bootstrap-injected permit; arbitrary subprocess capture
+helpers are absent. State fixed-root runtime construction and service
+quiescence require the same permit. Exact fixed live auth cannot be opened via
+the quarantine test seam. Pure/test-injected cores remain available for
+synthetic verification; later production phases require a future authenticated
+controller capability.
+
+Exact production source identities at a950 are:
+
+| Production source | SHA-256 |
+| --- | --- |
+| `bootstrap/first_gate_bootstrap.py` | `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd` |
+| `scripts/incident_evidence_lib.py` | `15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016` |
+| `scripts/whatsapp_auth_quarantine.py` | `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618` |
+| `scripts/whatsapp_rotation_state.py` | `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed` |
+| `scripts/whatsapp_rotation_smoke.py` | `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030` |
+| `scripts/whatsapp_rotation_first_gate.py` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
+
+The f55 and eb272 evidence and hashes above are historical only. The current candidate bootstrap source submitted for re-review is
 `bootstrap/first_gate_bootstrap.py`, SHA-256
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`.
 Its intended installed path is
@@ -188,8 +229,8 @@ Only three authenticated held-byte modules may be loaded:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203` |
-| `whatsapp_rotation_state` | `6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59` |
+| `incident_evidence_lib` | `15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016` |
+| `whatsapp_rotation_state` | `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed` |
 | `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 The bootstrap authenticates strict environment/flags/no-args/stdlib roots,
@@ -199,10 +240,11 @@ toolkit code through an in-memory finder. Strict schema checks refuse booleans
 in integer fields. There is no global permit or reusable loader: `main()` makes
 both locally only after the exact process contract plus every signature, module,
 and tool is authenticated. Evidence, state, and controller imports capture the
-same per-execution permit. State production runtime, service quiescence, and
-legacy-manifest reading require it. Public production actions in evidence,
-state, quarantine, and smoke now refuse or are absent; later phases require a
-future authenticated controller capability. This is not a
+same per-execution permit. Evidence fixed-root configuration, tool/crypto
+effects, state fixed-root runtime, service quiescence, and legacy-manifest
+reading require it. Quarantine/smoke production adapters are absent and their
+legacy public wrappers refuse before effect; later phases require a future
+authenticated controller capability. This is not a
 same-process or malicious-owner sandbox; those are outside the threat model.
 Preflight v5 carries bootstrap, decision, and owner hashes/metadata and
 reconstructs exact canonical candidate/release hashes. The causal chain
@@ -219,8 +261,9 @@ Fresh Terra and both standing Luna reviewers must bind their decisions to:
 
 - exact corrected source documentation head and toolkit head/range, clean-tree
   proof, required ancestor, and exact plan/package/bootstrap/module hashes;
-- the exact seven-file `472 passed in 61.11s` suite and Python 3.13/Ruff/diff/status
-  results; the f55 `459 passed`/`f55a5e2` evidence remains historical only;
+- the exact seven-file `433 passed in 56.67s` suite and Python 3.13/Ruff/diff/status,
+  zero-skip/retired, and required-ancestor results; the f55 `459 passed` and
+  eb272 `472 passed` evidence remains historical only;
 - authority schema v4, candidate, owner-approval, decision, and release schemas; fixed paths,
   release/owner signer allowed-signers content/hash and distinct decoded key blobs,
   distinct namespaces, exact reviewer

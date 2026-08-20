@@ -24,9 +24,9 @@
 | --- | --- |
 | `bootstrap/first_gate_bootstrap.py` | Standard-library-only pre-import trust anchor; authenticates the root authority, signed candidate, both signed Luna decision envelopes, signed final release, fixed toolchain, and held module bytes before loading any toolkit code. |
 | `scripts/incident_evidence_lib.py` | Fixed roots, private FD streaming artifacts, encrypt/sign/verify/publish, public HMAC commitments, protected owner-turn records. |
-| `scripts/whatsapp_auth_quarantine.py` | Bridge-stop-verified old-auth quarantine, empty active auth, old/current identity HMACs. |
+| `scripts/whatsapp_auth_quarantine.py` | Pure/test-injected old-auth quarantine core, empty active auth, and old/current identity HMACs; no ordinary-import fixed-root production runtime. |
 | `scripts/whatsapp_rotation_state.py` | v1-linked v2 adapters and non-destructive preservation comparator. |
-| `scripts/whatsapp_rotation_smoke.py` | Host-backed inventory attestation, direct Bridge event observer, and one-attempt smoke receipts. |
+| `scripts/whatsapp_rotation_smoke.py` | Pure/test-injected inventory, observer, and one-attempt smoke state machine; no ordinary-import production transport, credential reader, or sender. |
 | `scripts/whatsapp_rotation_first_gate.py` | Zero-argument, authenticated first-live-gate controller: it runs the fixed preflight and evidence lifecycle below, then stops for the second Luna review. |
 
 ## First-live-gate controller contract
@@ -129,9 +129,15 @@ absent: `main()` constructs one local permit and one local in-memory loader only
 after exact argv/environment/process, authority, signature, module, and tool
 authentication. The authenticated evidence, state, and controller modules
 capture that same per-execution permit during import; state production runtime,
-service quiescence, and legacy-manifest reading require it. Public production
-actions in evidence, state, quarantine, and smoke now refuse or are absent, so
-later phases require a future authenticated controller capability. This is an
+service quiescence, and legacy-manifest reading require it. Evidence fixed-root
+configuration, pinned tool execution, and production crypto require that exact
+permit at every constructor/operation; a test config cannot select either fixed
+production evidence path without it. A state test runtime cannot select the
+fixed production roots without it. Quarantine and smoke contain no dormant
+fixed-root runtime, production transport, credential reader, observer launcher,
+or Bridge sender. Their legacy public production wrappers refuse before any
+effect. Later phases therefore require a future authenticated controller
+capability. This is an
 accidental/stale-entry boundary, explicitly not a Python sandbox against
 same-process introspection or a malicious owner, both outside the
 trusted-launcher threat model.
@@ -140,8 +146,8 @@ The release candidate must bind these candidate module hashes:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203` |
-| `whatsapp_rotation_state` | `6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59` |
+| `incident_evidence_lib` | `15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016` |
+| `whatsapp_rotation_state` | `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed` |
 | `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 After authenticating the signed candidate, signed owner approval, both signed
@@ -274,6 +280,6 @@ First run the synthetic-fake integration dry run above. Then package each compan
 
 ## Execution Handoff
 
-Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrects that boundary; all f55 hashes and acceptance evidence above are historical only. No production artifact or action exists.
+Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrected the authority/two-signer contract but a second fresh Terra review rejected its remaining underscored, normally callable production adapters. Toolkit `a9504c233a14f92a12b4807855e94e621e8aa4ce` removes the quarantine/smoke production adapters and stale tests, permit-gates every remaining evidence/state fixed-root effect path, and leaves only pure/test-injected later-phase cores. Parent verification passed the exact seven-file suite with `433 passed in 56.67s`; Python 3.13 compile, scoped Ruff, diff/status, zero-skip/retired scans, required-ancestor check, and offline runtime checks passed. All f55/eb272 claims are historical only. No production artifact or action exists.
 
 The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.

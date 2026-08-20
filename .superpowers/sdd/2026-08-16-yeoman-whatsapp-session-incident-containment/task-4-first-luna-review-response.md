@@ -56,58 +56,59 @@ blockers are pending. The gate remains **CLOSED**. Preserve all historical
 376-test evidence as evidence of the prior synthetic head only; it does not
 establish the later correction. No live action occurred.
 
-## Production-capability correction — pending fresh review
+## Strict production-capability correction — pending fresh review
 
-Toolkit correction range
-`f55a5e28cfabc5010aa84031bd699aa8e4054645..eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`
-uses the standard-library-only pre-import trust anchor
-`bootstrap/first_gate_bootstrap.py` (SHA-256
-`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`). Parent
-verification at clean eb272 passed the exact seven-file suite: `472 passed in
-61.11s`; `/usr/bin/python3.13` `py_compile`, scoped Ruff, diff check, and
-status were clean. The f55 `459 passed` and `f55a5e2` fixture evidence is
-historical only.
+Fresh Terra first rejected source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
+and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645`: the implementation
+accepted an executable authority and ordinary imports exposed production
+actions. Toolkit eb272 corrected the authority/two-signer contract, and parent
+verification passed `472 passed in 61.11s`. Fresh Terra then rejected source
+`41b2915684311010a6c96061afeb2bef1ab86dd3` and toolkit
+`eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`: underscored evidence/state
+helpers and quarantine/smoke production adapters were still ordinary callable
+module attributes. Both earlier counts and claims are historical only.
 
-Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
-and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` found that the
-implementation accepted an executable authority and that ordinary imports
-exposed state, evidence, and owner-turn production actions. eb272 closes that
-boundary: authority schema v4
-requires root-owned regular exact `0644`; bootstrap remains root-owned regular
-exact `0755`; authority pins a canonical Ed25519 release signer and an owner
-signer with separately hashed allowed-signers content and distinct decoded
-public-key blobs. Candidate, decisions, and release use the release signer;
-owner approval uses the owner signer and its own namespace. One per-execution
-permit is injected into all three authenticated modules; evidence, state, and
-controller capture the exact identity; state production runtime, service
-quiescence, and legacy manifest reader require it. Public production actions in
-evidence, state, quarantine, and smoke now refuse or are absent, so later
-phases need a future authenticated controller capability. Same-process
-malicious introspection remains outside the threat model. Fresh Terra and both
-standing Luna reviews remain pending; this is not acceptance.
+The strict correction now ends at toolkit
+`a9504c233a14f92a12b4807855e94e621e8aa4ce`. Quarantine's fixed-root
+production runtime and smoke's production sender, transport, credential,
+observer, lease, and run paths are deleted. Evidence fixed-root configuration,
+pinned tool execution, production crypto, and legacy reads require the exact
+bootstrap-injected permit; arbitrary capture subprocess helpers are absent.
+State fixed-root runtime construction and service quiescence require the same
+permit. The fixed live auth root is refused by the quarantine test seam. Pure
+and test-injected later-phase cores remain, so later production phases require
+a future authenticated controller capability.
 
-Current production module hashes are evidence
-`fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203`, state
-`6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59`, and
+Independent parent verification at clean a950 passed the exact seven-file
+suite: `433 passed in 56.67s`. Python 3.13 compiled all six production files;
+scoped Ruff, diff/status, required-ancestor, and zero skipped/retired-test scans
+passed. The reduced count comes from physical deletion of obsolete production
+adapter tests, not skips. Production SHA-256 values are bootstrap
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`, evidence
+`15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016`, quarantine
+`01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`, state
+`0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed`, smoke
+`74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`, and
 controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
 
-The only intended invocation is byte/order exact:
+Authority schema v4 remains root-owned regular exact `0644`; bootstrap remains
+root-owned regular exact `0755`. Authority pins distinct canonical Ed25519
+release and owner signers. Candidate/decisions/release use the release signer;
+owner approval uses the owner signer and a distinct namespace. Same-process
+malicious introspection and a malicious owner remain outside this stale-entry
+threat boundary.
+
+The only intended invocation remains byte/order exact:
 
 ```bash
 /usr/bin/env -i LANG=C LC_ALL=C TZ=UTC PATH=/usr/bin:/bin /usr/bin/python3.13 -I -S -E -B /usr/local/libexec/yeoman/first_gate_bootstrap.py
 ```
 
-Runtime Git and the `/usr/bin/python3` symlink are not authorization.
-`/usr/bin/env` and `/usr/bin/python3.13` are root-owned pathname launcher
-trust boundaries verified after startup; only later `ssh-keygen`, `age`,
-`age-keygen`, and `systemctl` subprocesses use held FDs. No bootstrap,
-authority, release key, candidate, decision, release, or signature was
-installed or created; nor does an owner-approval artifact exist. First obtain
-fresh Terra acceptance and standing-Luna mechanism/procedure reviews; prepare
-the exact unsigned candidate draft; then stop for an owner prompt naming its
-hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing
-that exact candidate. Only after signed owner/candidate envelopes may both Luna
-sessions review exact signed bytes/hash, followed by signed decisions/release
-and differing-byte re-review. No live action occurred; the first gate remains
-CLOSED. Persona evolution is omitted; proactivity, consciousness, and speak-up
-remain mandatory later capabilities.
+No bootstrap, authority, release key, candidate, owner approval, decision,
+release, or signature was installed or created. Fresh Terra and both standing
+Luna mechanism/procedure reviews remain pending. Only after their acceptance
+may an exact unsigned candidate draft be prepared, followed by an explicit
+owner prompt naming its hash and authorizing two-key privileged preparation
+and signing. No live action occurred; the first gate remains **CLOSED**.
+Persona evolution is omitted; proactivity, consciousness, and speak-up remain
+mandatory later capabilities.

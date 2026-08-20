@@ -215,46 +215,55 @@ signed decisions/release; differing-byte verification/re-review; invocation.
 No live/runtime/systemctl/key/owner/QR/message operation occurred. This f55
 record and its hashes are historical only.
 
-## Current eb272 production-capability correction and handoff
+## Historical eb272 production-capability correction
 
 Fresh Terra rejected source `1b18fba1b427e0069d80c8e0a583500d90e1cea0` with
 toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645`: executable authority was
-accepted, but ordinary imports still exposed state, evidence, and owner-turn
-production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`
-corrects that boundary. Authority schema v4 requires root-owned regular exact
-`0644`; bootstrap requires root-owned regular exact `0755`. Authority pins one
-canonical Ed25519 release signer and one owner signer, with separately hashed
-allowed-signers content and distinct decoded public-key blobs. Candidate,
-decisions, and release use the release signer; owner approval uses the owner
-signer and its own namespace.
+accepted, but ordinary imports still exposed production actions. Toolkit
+`eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrected the authority/two-signer
+contract and parent verification passed `472 passed in 61.11s`. Fresh Terra
+then rejected source `41b2915684311010a6c96061afeb2bef1ab86dd3` with toolkit
+eb272 because normally callable underscored evidence/state helpers and
+quarantine/smoke production adapters remained. A leading underscore is not a
+capability boundary. The eb272 count and hashes are historical only.
 
-Bootstrap injects one per-execution permit into all three authenticated modules;
-evidence, state, and controller capture that exact identity. State production
-runtime, service quiescence, and legacy manifest reading require it. Public
-production actions in evidence, state, quarantine, and smoke now refuse or are
-absent, so later phases require a future authenticated controller capability.
-Same-process malicious introspection is explicitly outside the threat model.
+## Current a950 strict capability correction and handoff
 
-Parent exact seven-file verification at clean eb272 passed `472 passed in
-61.11s`; `/usr/bin/python3.13` `py_compile`, scoped Ruff, `git diff --check`,
-and status were clean. Production hashes: bootstrap
+Toolkit `a9504c233a14f92a12b4807855e94e621e8aa4ce` physically removes the
+quarantine fixed-root production runtime and smoke production Bridge client,
+observer transport/launcher, credential readers, expectation/send paths, and
+lease registry. Evidence fixed-root config, pinned tool execution, production
+crypto, and legacy reads require the exact bootstrap permit; arbitrary
+subprocess capture helpers are absent. State fixed-root runtime construction
+and service quiescence require the same permit. The quarantine test seam
+refuses the exact fixed live auth root. Pure/test-injected later-phase cores
+remain; future production phases need a new authenticated controller
+capability.
+
+Parent exact seven-file verification at clean a950 passed `433 passed in
+56.67s`. `/usr/bin/python3.13` compiled all six production files; scoped Ruff,
+`git diff --check`, clean status, required-ancestor, and zero skipped/retired
+test scans passed. The count reduction is physical deletion of obsolete
+adapter tests, not skipped coverage. Production hashes: bootstrap
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
-`fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203`; state
-`6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59`; controller
-`b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`. No
-production artifact or action exists.
+`15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016`;
+quarantine `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`;
+state `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed`;
+smoke `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`;
+controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
+No production artifact or action exists.
 
 Required next order: fresh Terra -> standing Luna mechanism review -> exact
 unsigned draft -> explicit owner prompt naming its hash and authorizing two-key
 privileged preparation/signing -> signed candidate/owner approval -> exact
 signed-candidate Luna reviews -> decisions/release -> reverify -> invoke.
 Persona evolution is omitted; proactivity, consciousness, and speak-up remain
-mandatory later capabilities. Final review must bind eb272 and the successor
+mandatory later capabilities. Final review must bind a950 and the successor
 source documentation commit.
 
 The authoritative orchestration-plan SHA-256 is
-`7ef2956d8fd84b4c5cdf9d7dbcbeec820fced1bfc763acfb82dea244c040858e` and the
+`d4cfad7aa1f72fadecedf4f1c98a029919f7946c53834d49efa9ad71ef7c7567` and the
 Luna-package SHA-256 is
-`b471be23da9d95fb6e7d55b9796a43678b12bfb7caed61b8eca1dcf89df7a3bc`.
+`628e2a3deef3c18798008e15b3539be130032f253055fc2b686c6f0bc189eac2`.
 They are recorded outside the documents they hash. Final review must bind the
 successor source documentation commit containing this report.
