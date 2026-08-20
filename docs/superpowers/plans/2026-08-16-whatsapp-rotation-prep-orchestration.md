@@ -274,6 +274,6 @@ First run the synthetic-fake integration dry run above. Then package each compan
 
 ## Execution Handoff
 
-Fresh Terra rejected the f55-era source/toolkit package because executable authority was accepted while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrects that boundary; all f55 hashes and acceptance evidence above are historical only. No production artifact or action exists.
+Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrects that boundary; all f55 hashes and acceptance evidence above are historical only. No production artifact or action exists.
 
 The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.

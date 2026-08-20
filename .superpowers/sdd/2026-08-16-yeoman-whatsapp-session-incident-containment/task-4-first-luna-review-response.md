@@ -69,9 +69,10 @@ status were clean. The f55 `459 passed` and `f55a5e2` fixture evidence is
 historical only.
 
 Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
-and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` accepted executable
-authority but rejected ordinary imports that exposed state, evidence, and
-owner-turn production actions. eb272 closes that boundary: authority schema v4
+and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` found that the
+implementation accepted an executable authority and that ordinary imports
+exposed state, evidence, and owner-turn production actions. eb272 closes that
+boundary: authority schema v4
 requires root-owned regular exact `0644`; bootstrap remains root-owned regular
 exact `0755`; authority pins a canonical Ed25519 release signer and an owner
 signer with separately hashed allowed-signers content and distinct decoded

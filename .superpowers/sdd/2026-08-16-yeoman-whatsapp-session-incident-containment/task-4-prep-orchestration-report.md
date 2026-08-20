@@ -253,8 +253,8 @@ mandatory later capabilities. Final review must bind eb272 and the successor
 source documentation commit.
 
 The authoritative orchestration-plan SHA-256 is
-`2f90a7fc79de246164d0d0fd29b801ec3ea64256b7116cc9b1ae532f8690738a` and the
+`7ef2956d8fd84b4c5cdf9d7dbcbeec820fced1bfc763acfb82dea244c040858e` and the
 Luna-package SHA-256 is
-`af114c454a3959cc8568bd837d9991eb4ec717da5a5fc087dbf0f3f3ecc86ef5`.
+`b471be23da9d95fb6e7d55b9796a43678b12bfb7caed61b8eca1dcf89df7a3bc`.
 They are recorded outside the documents they hash. Final review must bind the
 successor source documentation commit containing this report.

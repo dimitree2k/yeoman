@@ -11,9 +11,10 @@ operation.
 
 Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
 and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` returned **REJECT**.
-It accepted executable authority, but found ordinary imports still exposed
-state, evidence, and owner-turn production actions. Toolkit `eb272c5` closes
-that boundary. Fresh Terra and both standing Luna reviews remain pending.
+It found that the implementation accepted an executable authority and that
+ordinary imports still exposed state, evidence, and owner-turn production
+actions. Toolkit `eb272c5` closes that boundary. Fresh Terra and both standing
+Luna reviews remain pending.
 
 ## Decision requested after the correction
 
