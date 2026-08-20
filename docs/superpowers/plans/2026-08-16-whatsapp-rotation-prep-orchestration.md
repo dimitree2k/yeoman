@@ -46,8 +46,9 @@ The root-owned non-writable authority is fixed at
 `/etc/yeoman/first-gate-release-authority.json`; it pins signer identity,
 allowed-signers content and hash, bootstrap path and hash, and all fixed
 candidate, owner-approval, decision, and release paths. Both authority and
-installed bootstrap must be root-owned regular files with exact mode `0755`;
-looser and stricter modes both refuse. The release root is
+installed bootstrap must be root-owned regular files and non-writable by group
+or world. The executable bootstrap additionally requires exact mode `0755`;
+looser and stricter bootstrap modes both refuse. The release root is
 `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` and
 contains only the fixed names `candidate.json`/`candidate.sig`,
 `agent_a-decision.json`/`agent_a-decision.sig`,

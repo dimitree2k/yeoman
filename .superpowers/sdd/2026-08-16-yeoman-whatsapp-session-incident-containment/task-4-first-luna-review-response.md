@@ -70,20 +70,23 @@ false: parent reproduced 450 passing and nine stale-fixture failures. Test-only
 `f55a5e2` centralizes the canonical preflight-v5 builder and closes all nine.
 
 Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
-and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected exact-authority mode,
-public release/direct-import runtime reachability, and procedural-only owner
-approval. Closure requires exact root-owned regular `0755` authority/bootstrap;
-removes global permit/loader state; constructs permit and loader only inside
-`main()` after process/signature/module authentication; captures the same
-per-execution permit inside evidence/controller imports so normal imports fail
-before runtime; and explicitly excludes malicious-owner/same-process sandboxing
-from the threat model. Owner approval v1 binds the unsigned canonical candidate
-hash, fixed owner/scope/APPROVED/text hash, a distinct namespace, and at most 24
-hours of inclusive validity. Exact canonical candidate/approval/decision/release
-bytes are required. Release v3 binds candidate, approval, and two decision
-hashes plus authorization; preflight v5 carries bootstrap/decision/approval
-hashes and owner metadata and reconstructs candidate/release hashes. Fresh
-Terra and both standing Luna reviews remain pending; this is not acceptance.
+and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected the lack of
+exact `0755` enforcement for the installed executable bootstrap, public
+release/direct-import runtime reachability, and procedural-only owner approval.
+Closure requires the executable bootstrap to be root-owned regular exact
+`0755` and the non-executable JSON authority to be root-owned regular and
+non-writable by group or world; removes global permit/loader state; constructs
+permit and loader only inside `main()` after process/signature/module
+authentication; captures the same per-execution permit inside
+evidence/controller imports so normal imports fail before runtime; and
+explicitly excludes malicious-owner/same-process sandboxing from the threat
+model. Owner approval v1 binds the unsigned canonical candidate hash, fixed
+owner/scope/APPROVED/text hash, a distinct namespace, and at most 24 hours of
+inclusive validity. Exact canonical candidate/approval/decision/release bytes
+are required. Release v3 binds candidate, approval, and two decision hashes
+plus authorization; preflight v5 carries bootstrap/decision/approval hashes
+and owner metadata and reconstructs candidate/release hashes. Fresh Terra and
+both standing Luna reviews remain pending; this is not acceptance.
 
 The only intended invocation is byte/order exact:
 

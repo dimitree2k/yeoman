@@ -175,16 +175,18 @@ The corrected toolkit range is
 `62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`.
 Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
 and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected two remaining
-boundaries: SPEC required exact installed authority mode `0755`; SECURITY found
+boundaries: SPEC required exact installed-bootstrap mode `0755`; SECURITY found
 public release/direct-import runtime reachability and procedural-only owner
 approval.
 
-Production correction `960168a` requires both bootstrap and authority to be
-root-owned regular exact `0755`; deletes global permit/loader state; creates
-both locally inside `main()` only after exact process/signature/module/tool
-authentication; and makes evidence/controller imports capture the same
-per-execution permit so normal imports fail before production runtime. This is
-an accidental/stale-entry fence, not a same-process or malicious-owner sandbox.
+Production correction `960168a` requires the executable bootstrap to be
+root-owned regular exact `0755` and the non-executable JSON authority to be a
+root-owned regular file non-writable by group or world; deletes global
+permit/loader state; creates both locally inside `main()` only after exact
+process/signature/module/tool authentication; and makes evidence/controller
+imports capture the same per-execution permit so normal imports fail before
+production runtime. This is an accidental/stale-entry fence, not a same-process
+or malicious-owner sandbox.
 
 Owner approval v1 has fixed paths and its own namespace. It binds incident,
 exact unsigned canonical candidate hash, fixed owner/scope, `APPROVED`, exact
@@ -213,8 +215,8 @@ signed decisions/release; differing-byte verification/re-review; invocation.
 No live/runtime/systemctl/key/owner/QR/message operation occurred.
 
 The authoritative orchestration-plan SHA-256 is
-`e90dcf8883017ad97a3fc5cc0388e71be860caa8e2c6fc3c259db0c147330d45` and the
+`9871fefbeb6ee163760ea72380c2827b10c57fb997a33e1f9a3ab41150bd6853` and the
 Luna-package SHA-256 is
-`6808531775fde99170eb98d2a2a24fc9e6ebd9f3a14bed75078ae41f49897cec`.
+`b3c9d7dd2805b55a315e3129edb167f9f07a4aee386b8533c1b0e0ee79815c6f`.
 They are recorded outside the documents they hash. Final review must bind the
 successor source documentation commit containing this report.

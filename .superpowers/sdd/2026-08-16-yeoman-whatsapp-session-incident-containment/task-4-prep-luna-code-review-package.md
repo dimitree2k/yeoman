@@ -11,7 +11,7 @@ operation.
 
 Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
 and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` returned **REJECT**.
-SPEC found that the bootstrap authority was not required to be exact mode
+SPEC found that the installed bootstrap was not required to be exact mode
 `0755`; SECURITY found that public `VerifiedRelease` construction/direct import
 could reach production runtime and that owner approval remained procedural
 rather than an authenticated, candidate-bound input. Production correction
@@ -128,8 +128,9 @@ The candidate bootstrap source submitted for re-review is
 `95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`.
 Its intended installed path is
 `/usr/local/libexec/yeoman/first_gate_bootstrap.py`, root-owned regular `0755`
-and non-writable by group/world. The root-owned regular authority must also be
-exact mode `0755` at `/etc/yeoman/first-gate-release-authority.json`; it pins
+and non-writable by group/world. The authority at
+`/etc/yeoman/first-gate-release-authority.json` must be root-owned, regular, and
+non-writable by group/world; as a JSON descriptor it is not executable. It pins
 the fixed candidate, owner-approval, both decision, and final-release paths beneath
 `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` as well
 as the signer and allowed-signers content/hash. None of those installed/release
