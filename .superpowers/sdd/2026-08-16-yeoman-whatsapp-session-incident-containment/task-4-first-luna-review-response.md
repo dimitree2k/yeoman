@@ -68,26 +68,33 @@ verification passed `472 passed in 61.11s`. Fresh Terra then rejected source
 helpers and quarantine/smoke production adapters were still ordinary callable
 module attributes. Both earlier counts and claims are historical only.
 
-The strict correction now ends at toolkit
-`a9504c233a14f92a12b4807855e94e621e8aa4ce`. Quarantine's fixed-root
-production runtime and smoke's production sender, transport, credential,
-observer, lease, and run paths are deleted. Evidence fixed-root configuration,
-pinned tool execution, production crypto, and legacy reads require the exact
-bootstrap-injected permit; arbitrary capture subprocess helpers are absent.
-State fixed-root runtime construction and service quiescence require the same
-permit. The fixed live auth root is refused by the quarantine test seam. Pure
-and test-injected later-phase cores remain, so later production phases require
-a future authenticated controller capability.
+Toolkit a950 then removed quarantine's fixed-root production runtime and
+smoke's production sender, transport, credential, observer, lease, and run
+paths. It guarded the advertised production config/tool/crypto and exact state
+runtime paths and removed arbitrary capture subprocess helpers, while keeping
+pure/test-injected later-phase cores for a future authenticated controller.
+Parent verification passed `433
+passed in 56.67s`, but exact-head Terra returned **REJECT**: a normal import
+could pair the fixed legacy descriptor with attacker-controlled test crypto and
+receive fixed key/data FDs; raw evidence/key open helpers were ungated; and
+exact-path checks missed evidence/state descendants. a950 is historical only.
 
-Independent parent verification at clean a950 passed the exact seven-file
-suite: `433 passed in 56.67s`. Python 3.13 compiled all six production files;
-scoped Ruff, diff/status, required-ancestor, and zero skipped/retired-test scans
-passed. The reduced count comes from physical deletion of obsolete production
-adapter tests, not skips. Production SHA-256 values are bootstrap
+The strict correction now ends at toolkit
+`bb37b577fc191084be74dff72a87b84ac9cf08ab`. Fixed evidence, legacy, HMAC,
+age identity, signing, allowed-signers, and state roots plus descendants require
+the exact bootstrap permit at config, raw directory/file/root helper, legacy
+core, and inventory boundaries. Direct tests monkeypatch `os.open` and prove
+refusal before effects. Separator-safe lexical containment rejects sibling
+prefix aliases and preserves bounded performance.
+
+Independent parent verification passed state `148 passed in 45.70s` and the
+exact seven-file suite `440 passed in 65.41s`. Python 3.13 compiled all six
+production files; scoped Ruff, diff/status, required-ancestor, and zero
+skipped/retired-test scans passed. Production SHA-256 values are bootstrap
 `ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`, evidence
-`15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016`, quarantine
+`7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e`, quarantine
 `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`, state
-`0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed`, smoke
+`2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071`, smoke
 `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`, and
 controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
 

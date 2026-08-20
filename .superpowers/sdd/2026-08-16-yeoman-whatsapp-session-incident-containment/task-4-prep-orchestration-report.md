@@ -227,18 +227,15 @@ eb272 because normally callable underscored evidence/state helpers and
 quarantine/smoke production adapters remained. A leading underscore is not a
 capability boundary. The eb272 count and hashes are historical only.
 
-## Current a950 strict capability correction and handoff
+## Historical a950 strict capability correction
 
 Toolkit `a9504c233a14f92a12b4807855e94e621e8aa4ce` physically removes the
 quarantine fixed-root production runtime and smoke production Bridge client,
 observer transport/launcher, credential readers, expectation/send paths, and
-lease registry. Evidence fixed-root config, pinned tool execution, production
-crypto, and legacy reads require the exact bootstrap permit; arbitrary
-subprocess capture helpers are absent. State fixed-root runtime construction
-and service quiescence require the same permit. The quarantine test seam
-refuses the exact fixed live auth root. Pure/test-injected later-phase cores
-remain; future production phases need a new authenticated controller
-capability.
+lease registry. It guards the advertised production config/tool/crypto and
+exact state runtime paths and removes arbitrary subprocess capture helpers.
+Pure/test-injected later-phase cores remain for a future authenticated
+controller capability.
 
 Parent exact seven-file verification at clean a950 passed `433 passed in
 56.67s`. `/usr/bin/python3.13` compiled all six production files; scoped Ruff,
@@ -251,6 +248,31 @@ quarantine `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`;
 state `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed`;
 smoke `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`;
 controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
+Exact-head Terra returned **REJECT** despite the green suite: fixed legacy
+descriptor plus attacker test crypto exposed key/data FDs, raw evidence/key
+open helpers were ungated, and exact-only checks missed evidence/state
+descendants. a950 is historical only. No production artifact or action exists.
+
+## Current bb37 raw-root and descendant correction and handoff
+
+Toolkit `276105f8d2145ea8facab1692f49ad220cfc2783` permit-gates fixed evidence,
+legacy, HMAC, age-identity, signing, allowed-signers, and state roots plus
+descendants at config, raw directory/file/root helper, legacy-core, and
+inventory boundaries. Authenticated operations propagate the same captured
+permit. Direct tests monkeypatch `os.open` and prove refusal before effects.
+Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` makes containment normalized,
+separator-safe, and sibling-prefix resistant while restoring bounded runtime.
+
+Parent state verification passed `148 passed in 45.70s`; the exact seven-file
+suite passed `440 passed in 65.41s`. Python 3.13 compile, scoped Ruff,
+`git diff --check`, clean status, required-ancestor, and zero skipped/retired
+scans passed. Production hashes: bootstrap
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+`7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e`;
+quarantine `01306f100e86864748206c65672309dab89e2d215ce6fa058fdca916d6688618`;
+state `2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071`;
+smoke `74652a00b5ace59f0b36d3c47a2f5fb630727e5462503ec3f7e2136a96794030`;
+controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
 No production artifact or action exists.
 
 Required next order: fresh Terra -> standing Luna mechanism review -> exact
@@ -258,12 +280,12 @@ unsigned draft -> explicit owner prompt naming its hash and authorizing two-key
 privileged preparation/signing -> signed candidate/owner approval -> exact
 signed-candidate Luna reviews -> decisions/release -> reverify -> invoke.
 Persona evolution is omitted; proactivity, consciousness, and speak-up remain
-mandatory later capabilities. Final review must bind a950 and the successor
+mandatory later capabilities. Final review must bind bb37 and the successor
 source documentation commit.
 
 The authoritative orchestration-plan SHA-256 is
-`d4cfad7aa1f72fadecedf4f1c98a029919f7946c53834d49efa9ad71ef7c7567` and the
+`bc33f8e4d9969deea8ccfc66de5e79511a9af36d7de7928febcb32ad17b51721` and the
 Luna-package SHA-256 is
-`628e2a3deef3c18798008e15b3539be130032f253055fc2b686c6f0bc189eac2`.
+`7fe470d3466191c840f9243f81d5cde2fc5d5328a9df1ad344815f21bee511ef`.
 They are recorded outside the documents they hash. Final review must bind the
 successor source documentation commit containing this report.

@@ -130,10 +130,12 @@ after exact argv/environment/process, authority, signature, module, and tool
 authentication. The authenticated evidence, state, and controller modules
 capture that same per-execution permit during import; state production runtime,
 service quiescence, and legacy-manifest reading require it. Evidence fixed-root
-configuration, pinned tool execution, and production crypto require that exact
+configuration and descendants, raw directory/file helpers, legacy test-core
+composition, pinned tool execution, and production crypto require that exact
 permit at every constructor/operation; a test config cannot select either fixed
-production evidence path without it. A state test runtime cannot select the
-fixed production roots without it. Quarantine and smoke contain no dormant
+production evidence path or descendant without it. State test runtime and raw
+root helpers cannot select fixed production roots or descendants without it.
+Quarantine and smoke contain no dormant
 fixed-root runtime, production transport, credential reader, observer launcher,
 or Bridge sender. Their legacy public production wrappers refuse before any
 effect. Later phases therefore require a future authenticated controller
@@ -146,8 +148,8 @@ The release candidate must bind these candidate module hashes:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `15069931dc07771a45435b9490ea06e4d5db30798dc62bfe1b61a8786d29b016` |
-| `whatsapp_rotation_state` | `0a5573ed619689450fd9b6116ea4097f8ec6ecfe5ed30f697747bc04c87c13ed` |
+| `incident_evidence_lib` | `7ff18521a8af2de78382d1d233a3ef707438727f9e6a26d63b4501fbaba0513e` |
+| `whatsapp_rotation_state` | `2a6beab7699da11caf327a5cd332d98b0a28c84f8d887394b2856f67379d9071` |
 | `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 After authenticating the signed candidate, signed owner approval, both signed
@@ -280,6 +282,6 @@ First run the synthetic-fake integration dry run above. Then package each compan
 
 ## Execution Handoff
 
-Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrected the authority/two-signer contract but a second fresh Terra review rejected its remaining underscored, normally callable production adapters. Toolkit `a9504c233a14f92a12b4807855e94e621e8aa4ce` removes the quarantine/smoke production adapters and stale tests, permit-gates every remaining evidence/state fixed-root effect path, and leaves only pure/test-injected later-phase cores. Parent verification passed the exact seven-file suite with `433 passed in 56.67s`; Python 3.13 compile, scoped Ruff, diff/status, zero-skip/retired scans, required-ancestor check, and offline runtime checks passed. All f55/eb272 claims are historical only. No production artifact or action exists.
+Fresh Terra rejected the f55-era source/toolkit package because the implementation accepted an executable authority while ordinary imports still exposed production actions. eb272 corrected the authority/two-signer contract but fresh Terra rejected its underscored production adapters. a950 removed those adapters, but exact-head Terra review rejected a fixed legacy-descriptor/test-crypto FD escape, ungated raw evidence/key opens, and evidence/state descendant aliases. Toolkit `bb37b577fc191084be74dff72a87b84ac9cf08ab` guards exact fixed roots and descendants at configs, raw directory/file/root helpers, legacy core composition, and authenticated inventory propagation while preserving pure/test-injected later-phase cores. Parent verification passed state `148 passed in 45.70s` and the exact seven-file suite `440 passed in 65.41s`; Python 3.13 compile, scoped Ruff, diff/status, zero-skip/retired scans, required-ancestor check, and offline runtime checks passed. All f55/eb272/a950 claims are historical only. No production artifact or action exists.
 
 The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.
