@@ -337,3 +337,29 @@ They identify source head `3a44c143` before this five-document append and are
 historical only. The controller must calculate the new plan/package hashes
 after the reconciliation commit and bind those new values in a separate
 three-document acceptance successor before standing Luna review.
+
+
+## Task 8 documentation hash acceptance — 2026-08-20
+
+Independent review returns **SPEC PASS / QUALITY APPROVED** with no finding for
+the exact five-document reconciliation at source commit
+`3500b6f03acbad918457c7c084298964e5227424` (parent
+`3a44c1437a4621e777b0c7b347fde7e2ce81aa04`). That commit binds accepted
+toolkit `108db1ce3bd16325691afba7042e8130ae8d52d3` and preserved target
+`bdc4c8c9e33602c5c8abd69f054703469d212dab`. Its exact current orchestration
+plan SHA-256 is
+`783016d712a8bfd96ee353c8bdcf7996f8138099c413483dc7fae8aa1b743531`;
+its exact current standing-Luna package SHA-256 is
+`8b5eb8176585e9de4c3c9260124012e1b110caf824345be7f4acead779126941`.
+The plan and package do not contain either self-hash; these values are recorded
+only in the three non-self acceptance records.
+
+The docs review verified exact heads/ancestry, five Markdown files with
+additions only, all Task 5-8 hashes/sizes/tests/verdicts, offline/candidate/QR
+boundaries, the single state production quiescence wrapper, later direct-script
+debt, and the required persona/proactivity/consciousness/speak-up disposition.
+This three-document successor changes no plan/package/code bytes. Its resulting
+source head must be bound by standing Luna A/B. Only their exact-head review is
+authorized next. No candidate, approval, decision, release, signature, install,
+runtime, auth, memory, network, service, QR, quarantine, smoke, observer,
+relink, or live action is authorized.
