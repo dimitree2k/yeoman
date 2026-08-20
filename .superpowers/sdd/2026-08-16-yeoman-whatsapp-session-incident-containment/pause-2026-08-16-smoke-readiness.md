@@ -142,18 +142,35 @@ failure. Services remain offline and no live action is authorized.
 ## Authenticated-bootstrap correction update — 2026-08-20
 
 Synthetic correction now ends at toolkit
-`9c6c9f733bdaab018c20997f621449c03c764002` after the SPEC/SECURITY rejection
-at `4c0f819` and fixes in `b07023d`/`9c6c9f`. The exact seven-file suite passed
-`407 passed in 55.12s`; three engineer runs also reached 407, Ruff passed, and
-the toolkit was clean. Prior 376/388 runs and all prior review outcomes remain
-historical, not current acceptance. Fresh Terra and standing Luna re-reviews
-are pending.
+`c4bc00a77ade352c24610d152cdeede67da9ec53`. Fresh Terra rejected `9c6c9f`:
+SPEC required immutable reviewed candidate material, exhaustive all-phase
+failure-prefix tests, and launcher wording; SECURITY required a signed
+candidate, authenticated decisions, final-release and exact-preflight binding,
+real signature/mutation tests, and boolean refusal. The closure is root
+authority plus separate signed candidate v1, per-role signed decision v1, and
+signed release v2—not a monolithic manifest. The authority pins fixed paths and
+signer; decisions bind candidate hash, role/session/scope/GO, exact review
+text/hash, and inclusive time validity; release binds candidate and decision
+hashes plus single-use `authorization_id`; namespaces are distinct. The owner
+signature attests transcript capture and Luna session IDs remain process/trace,
+not cryptographic nonrepudiation.
 
-The corrected gate requires an authenticated root-owned installed bootstrap
-and signed closed release; neither it nor any authority, release key, manifest,
-or signature exists or was created in this phase. Both standing Luna GO
-decisions must precede a separate explicit owner decision on privileged install
-and offline release preparation. No runtime, service, owner, revocation,
-quarantine, QR, observer, smoke, or message action is authorized. Persona
-evolution remains omitted from target behavior with historical artifacts inert;
-proactivity, consciousness, and speak-up remain deferred but mandatory later.
+The stable exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
+`py_compile`, scoped Ruff, `git diff --check`, and clean status passed. Final
+head `c4bc00a` removes only unused legacy bootstrap aliases after that run; its
+focused bootstrap suite passed 35 tests and Python 3.13/Ruff were clean. Parent
+must rerun the exact suite at final head before acceptance. Bootstrap SHA-256 is
+`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`.
+
+No bootstrap, authority, release key, candidate, decision, release, or
+signature exists or was created. First fresh Terra acceptance and standing-Luna
+mechanism/procedure review; then separate explicit owner approval for privileged
+bootstrap/authority/key preparation and signed-candidate creation; then both
+Luna reviews of exact candidate bytes/hash; then signed decisions and release;
+then re-review of differing installed/artifact bytes; only then invocation. No
+runtime, service, owner, revocation, quarantine, QR, observer, smoke, or message
+action is authorized. `/usr/bin/env` and `/usr/bin/python3.13` are root-owned
+pathname launcher trust boundaries checked after startup; only later crypto and
+`systemctl` subprocesses use held FDs. Persona evolution remains omitted from
+target behavior with historical artifacts inert; proactivity, consciousness,
+and speak-up remain deferred but mandatory later.

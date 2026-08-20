@@ -3,19 +3,21 @@
 ## Re-review status — corrected code pending acceptance
 
 The architecture correction is implemented at toolkit head
-`9c6c9f733bdaab018c20997f621449c03c764002`, but it is not yet Terra- or
+`c4bc00a77ade352c24610d152cdeede67da9ec53`, but it is not yet Terra- or
 Luna-accepted. The first live gate remains **CLOSED**. This package requests
 fresh review of the exact authenticated-bootstrap design and does not authorize
 installation, signing, authority preparation, runtime access, or any live
 operation.
 
-Toolkit head `4c0f819` was SPEC/SECURITY **REJECT** because pre-import trust was
-mutable, commits were discovered dynamically, documentation incorrectly used
-`-I`, service calls bypassed the pinned executor, and `q1`/failure evidence was
-not causal or exactly prefixed. Commits `b07023d` and `9c6c9f` correct those
-findings with a separately installed trust anchor, signed closed release,
-held-FD execution, and a single-use causal evidence chain. That correction is
-pending fresh Terra and both standing Luna reviews.
+Fresh Terra reviews rejected `9c6c9f`: SPEC required an immutable reviewed
+candidate, exhaustive all-phase failure-prefix tests, and corrected launcher
+wording; SECURITY required a signed candidate, authenticated decision envelopes,
+final-release binding, exact preflight binding, real signature/mutation tests,
+and boolean refusal. The corrected chain ends at `c4bc00a77ade352c24610d152cdeede67da9ec53`.
+It replaces the old single-release description with a separately installed
+trust anchor, signed candidate, signed reviewer decisions, signed final release,
+held-FD execution, and a single-use causal evidence chain. Fresh Terra and both
+standing Luna reviews remain pending.
 
 ## Decision requested after the correction
 
@@ -23,22 +25,24 @@ Standing Luna Agent A and Agent B must independently review this exact fixed
 range and return **GO** or **NO-GO** for the first live gate.  The gate is
 currently **CLOSED**.  Their strictest decision governs.
 
-Both later GO decisions authorize only requesting separate explicit owner
-approval for privileged installation and offline release preparation. After
-that approval, verified installation, and any required installed-artifact
-re-review, the first gate may perform only quiescence, read-only v1 inspection,
-pre-v2 capture, and protected commitment handoff. It does **not** authorize an
-owner turn, revocation, quarantine, QR/relink, observer startup, smoke, a
-message, or any later production action. There is no live evidence yet. A
-second, evidence-bound Luna decision remains required before every such later
-action.
+The initial fresh Terra acceptance and these standing Luna reviews are only a
+mechanism/procedure gate. Then stop for separate explicit owner approval of
+privileged bootstrap/authority/key preparation and signed-candidate creation.
+Only after that approval may both standing Luna sessions review the exact
+signed candidate bytes/hash and return GO. Their exact outputs are then captured
+in signed time-bounded decision envelopes, followed by the signed final release
+and any required re-review of differing installed/artifact bytes. Only then may
+the first gate perform quiescence, read-only v1 inspection, pre-v2 capture, and
+protected commitment handoff. It does **not** authorize an owner turn,
+revocation, quarantine, QR/relink, observer startup, smoke, a message, or any
+later production action. There is no live evidence yet.
 
 ## Exact scope and heads
 
 - Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
   `c/yeoman-migration-toolkit`.
 - Current correction range/head:
-  `62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`.
+  `62acf5b73ca9b9abaed79004deed7f93ef2280b3..c4bc00a77ade352c24610d152cdeede67da9ec53`.
 - Required toolkit ancestor:
   `6ba55014242953e72ec7a29e75041f704452b885`.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
@@ -112,23 +116,27 @@ Mutations were run and restored across rounds.
 
 ## Current synthetic correction evidence
 
-At `9c6c9f733bdaab018c20997f621449c03c764002`, the parent controller's exact
-seven-file suite passed `407 passed in 55.12s`; the engineer also recorded
-three separate 407-pass runs. Scoped Ruff passed and the toolkit worktree was
-clean. Earlier 376-pass and intermediate 388-pass runs remain historical only;
-neither a passing count nor the rejected `4c0f819` state is current review
-acceptance. No production artifact or live boundary was used.
+At `c4bc00a77ade352c24610d152cdeede67da9ec53`, the stable exact seven-file
+suite passed `441 passed in 57.42s`; Python 3.13 `py_compile` and scoped Ruff
+passed, and the toolkit worktree was clean. The final head differs from that
+441-pass head only by removing unused legacy bootstrap aliases; its focused
+bootstrap suite passed 35 tests, Python 3.13/Ruff were clean, and the parent
+reruns the exact suite before acceptance. Earlier 376/388/407 evidence
+and every prior verdict are historical only. No production artifact or live
+boundary was used.
 
 The candidate bootstrap source submitted for re-review is
 `bootstrap/first_gate_bootstrap.py`, SHA-256
-`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`.
+`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`.
 Its intended installed path is
 `/usr/local/libexec/yeoman/first_gate_bootstrap.py`, root-owned regular `0755`
 and non-writable by group/world. The root-owned non-writable authority is
-`/etc/yeoman/first-gate-release-authority.json`; the fixed signed release paths
-are `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1/release.json`
-and `release.sig`. None of those installed/release artifacts or their key,
-authority, manifest, or signature exists or was created by this phase.
+`/etc/yeoman/first-gate-release-authority.json`; it pins the fixed candidate,
+both decision, and final-release paths beneath
+`/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` as well
+as the signer and allowed-signers content/hash. None of those installed/release
+artifacts or their key, authority, candidate, decisions, release, or signatures
+exists or was created by this phase.
 
 The only production invocation is byte/order exact:
 
@@ -137,8 +145,10 @@ The only production invocation is byte/order exact:
 ```
 
 `/usr/bin/python3` is a symlink and is not the authenticated launcher. Runtime
-Git/current-head discovery is not part of authorization. The fixed executable
-baseline is:
+Git/current-head discovery is not part of authorization. `/usr/bin/env` and
+`/usr/bin/python3.13` are root-owned pathname launcher trust boundaries checked
+after startup; only later `ssh-keygen`, `age`, `age-keygen`, and `systemctl`
+subprocesses execute by held FD. The fixed executable baseline is:
 
 | Path | Mode / owner | Size | SHA-256 |
 | --- | --- | ---: | --- |
@@ -149,13 +159,17 @@ baseline is:
 | `/usr/bin/systemctl` | root / `0755` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
 | `/usr/bin/python3.13` | root / `0755` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
 
-The proposed signed-release schema must bind incident, single-use
-`authorization_id`, exact final
-source/toolkit commits, plan/package hashes, required ancestor, bootstrap,
-exact invocation, exact closed module names/paths/sizes/hashes, exact toolchain,
-and reviewer session IDs plus GO-review hashes. The root authority pins signer
-identity/namespace, allowed-signers content/hash, bootstrap path/hash, and the
-fixed release paths. Reviewer identities are Agent A
+There is no monolithic manifest. The signed candidate v1 binds all static
+executable/provenance facts: incident; exact source/toolkit commits;
+plan/package hashes; required ancestor; bootstrap; invocation; exact module
+names/paths/sizes/hashes; and toolchain. Each signed decision v1 binds the
+candidate hash, standing role/session, fixed scope, `GO`, exact review text/hash,
+and inclusive `issued_at <= now <= not_after`. The signed release v2 binds the
+candidate hash, exact decision-envelope hashes, and a single-use
+`authorization_id`. Candidate, decision, and release use distinct signature
+namespaces. The owner signature attests exact transcript capture; the Luna
+session IDs are trace/process evidence, not cryptographic nonrepudiation.
+Reviewer identities are Agent A
 `01a009b3-e740-7972-992b-5d63d6066b8c` and Agent B
 `01a009b3-f495-7a90-8e50-8a22d4d306d2`.
 
@@ -163,15 +177,16 @@ Only three authenticated held-byte modules may be loaded:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `41247af07fc1709ff139af259b27f813ee1883f7baa0654a946711bbfe6a2eeb` |
+| `incident_evidence_lib` | `6914cebaf9410b09991c03435777edec1f3ac75db01e11a31bf008639c575979` |
 | `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
 | `whatsapp_rotation_first_gate` | `edc08386ecf761276eeff22b0d346ae2dbbe63f1173b4e7cb4048c59e936ac4e` |
 
 The bootstrap authenticates strict environment/flags/no-args/stdlib roots,
-bounded no-follow authority/release/signature/module reads, held-FD SSH
-signature verification, and held-FD tool identities before loading toolkit
-code through an in-memory finder. Direct worktree execution is always NO-GO.
-The causal chain is signed release -> single-use attempt reservation ->
+bounded no-follow authority/candidate/decision/release/signature/module reads,
+held-FD SSH signature verification, and held-FD tool identities before loading
+toolkit code through an in-memory finder. Strict schema checks refuse booleans
+in integer fields. Direct worktree execution is always NO-GO. The causal chain
+is signed release -> single-use attempt reservation ->
 attempt-linked `q1` -> provenance -> `q2` -> pre-v2 -> final -> binding.
 `q1`/`q2`/final use held-FD pinned `systemctl` under a sterile environment;
 every phase has an exact failure prefix and verified failure record. Failure
@@ -184,23 +199,27 @@ Fresh Terra and both standing Luna reviewers must bind their decisions to:
 
 - exact corrected source documentation head and toolkit head/range, clean-tree
   proof, required ancestor, and exact plan/package/bootstrap/module hashes;
-- the exact seven-file 407-pass suite, Ruff result, and the historical
-  `4c0f819` rejection with `b07023d`/`9c6c9f` closure;
-- root-authority and signed-release schemas, fixed signer/namespace,
-  allowed-signers content/hash, exact reviewer sessions/GO hashes, closed
-  modules, toolchain, invocation, and single-use authorization lifecycle;
+- the exact seven-file 441-pass suite, Python 3.13/Ruff result, focused
+  35-pass cleanup check, and both `9c6c9f` Terra rejection/closure sets;
+- root-authority, candidate, decision, and release schemas; fixed paths,
+  signer/allowed-signers content/hash, distinct namespaces, exact reviewer
+  sessions/review hashes, closed modules, toolchain, invocation, boolean
+  refusal, and single-use authorization lifecycle;
 - the proposed privileged installation and offline signing/key/authority
   preparation procedure, including verification of installed bootstrap and
   authority plus re-review of any differing installed artifact;
-- proof that no install, authority, release key, manifest, signature, runtime,
-  service, key, owner, QR, observer, smoke, or message operation occurred.
+- proof that no install, authority, release key, candidate, decision, release,
+  signature, runtime, service, key, owner, QR, observer, smoke, or message
+  operation occurred.
 
-Even after both Luna GO decisions, installation and offline release preparation
-remain blocked on separate explicit owner approval. The eventual first-gate
-evidence package must include exact invocation/exit/allowlisted JSON, signed
-release and attempt/q1/provenance/q2/pre/final/binding/failure commitments as
-applicable, identical quiescence, exact counts/bytes, and no prohibited effect.
-The gate then stops for the mandatory second Luna evidence review.
+Do not create any artifact during these reviews. The signed candidate comes
+only after separate owner approval; only its exact hash/bytes can receive the
+later two Luna GOs; only then may signed decisions and final release be created.
+The eventual first-gate package must include exact invocation/exit/allowlisted
+JSON, signed candidate/decisions/release and
+attempt/q1/provenance/q2/pre/final/binding/failure commitments as applicable,
+identical quiescence, exact counts/bytes, and no prohibited effect. The gate
+then stops for the mandatory second Luna evidence review.
 
 ## No-live boundary
 

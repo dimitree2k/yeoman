@@ -171,26 +171,43 @@ the durable initial-decision/correction record.
 
 ## Authenticated-bootstrap correction and fresh handoff
 
-The next toolkit correction range is
-`62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`.
-Terra rejected intermediate head `4c0f819` for mutable pre-import trust,
-dynamic-head authorization, documentation/`-I` inconsistency, direct
-`systemctl`, and noncausal `q1`/failure prefixes. Commits `b07023d` and
-`9c6c9f` correct those findings with a root-authorized, signed-release bootstrap
-and attempt-linked held-FD execution chain. Fresh Terra and both standing Luna
-reviews are pending; the correction is not yet accepted.
+The corrected toolkit range is
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..c4bc00a77ade352c24610d152cdeede67da9ec53`.
+Fresh Terra reviews rejected `9c6c9f`: SPEC required immutable reviewed
+candidate material, exhaustive all-phase failure-prefix tests, and launcher
+wording; SECURITY required signed candidate/decision/final-release binding,
+exact preflight binding, real signature/mutation tests, and boolean refusal.
 
-The exact seven-file suite passed `407 passed in 55.12s`; three engineer runs
-also passed 407, scoped Ruff passed, and toolkit status was clean. Historical
-376/388 runs remain historical evidence only. The bootstrap source hash is
-`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`.
-No bootstrap, root authority, release key, signed manifest, or signature was
-installed or created. No live/runtime/systemctl/key/owner/QR/message operation
+Closure is candidate/decision/release, not a monolithic manifest: root authority
+pins fixed paths and signer; candidate v1 binds static executable/provenance
+facts; each decision v1 binds candidate hash, role/session, scope, GO, exact
+review transcript/hash, and inclusive validity; release v2 binds candidate hash,
+decision-envelope hashes, and single-use `authorization_id`; namespaces differ.
+Preflight is v3. The owner signature attests transcript capture; Luna IDs are
+trace/process evidence rather than cryptographic nonrepudiation.
+
+The exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
+`py_compile`, scoped Ruff, `git diff --check`, and clean status passed. Final
+head `c4bc00a` only removes unused legacy bootstrap aliases; the focused
+bootstrap suite passed 35 tests and Python 3.13/Ruff were clean. The parent must
+rerun the exact suite at that head before acceptance. The bootstrap source hash
+is `0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`; the
+three module hashes are unchanged. `/usr/bin/env` and `/usr/bin/python3.13` are
+root-owned pathname launcher trust boundaries verified after startup; only later
+`ssh-keygen`/`age`/`age-keygen`/`systemctl` subprocesses use held FDs.
+
+No bootstrap, root authority, release key, signed candidate, signed decision,
+signed release, or signature was installed or created. First fresh Terra and
+standing-Luna mechanism/procedure review; then separate explicit owner approval
+for privileged bootstrap/authority/key preparation and signed-candidate
+creation; then both Luna sessions review exact candidate bytes/hash and GO;
+then signed decisions and final release; then differing-byte re-review; only
+then exact invocation. No live/runtime/systemctl/key/owner/QR/message operation
 occurred.
 
-Even after both standing Luna GO decisions, privileged installation and
-offline release-signing/key/authority preparation require separate explicit
-owner approval. Installed bootstrap/authority bytes must be verified and any
-deviation re-reviewed before the exact first-gate invocation. The first gate
-remains limited to q1/provenance/q2/pre/final/binding and must stop for the
-second Luna evidence review.
+The authoritative orchestration-plan SHA-256 is
+`d45da945b01c0423d62860beb00b1765ea3b082c30aa5945b51b30bd2b0a88e6` and the
+Luna-package SHA-256 is
+`2e50d06de434c0d780b52671f7ebed676120a899fa6e97609c00b29bd2aa8093`. They
+are recorded here rather than in either self-hashed document. The final review
+must bind the successor source documentation commit that contains this report.

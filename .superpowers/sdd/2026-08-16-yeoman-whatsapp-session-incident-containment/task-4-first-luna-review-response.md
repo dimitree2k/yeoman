@@ -59,20 +59,30 @@ establish the later correction. No live action occurred.
 ## Authenticated-bootstrap correction — pending fresh review
 
 Toolkit correction range
-`62acf5b73ca9b9abaed79004deed7f93ef2280b3..9c6c9f733bdaab018c20997f621449c03c764002`
-now uses a sixth production source, the standard-library-only pre-import trust
+`62acf5b73ca9b9abaed79004deed7f93ef2280b3..c4bc00a77ade352c24610d152cdeede67da9ec53`
+uses a sixth production source, the standard-library-only pre-import trust
 anchor `bootstrap/first_gate_bootstrap.py` (SHA-256
-`2fd537e27ba6a5241724435dbec15369fbe92ec707d8ae24d4b98f16943f37fc`).
-The exact seven-file suite passed `407 passed in 55.12s`; the engineer recorded
-three 407-pass runs, Ruff passed, and the toolkit was clean. Earlier 376/388
-runs remain historical.
+`0ad5fda7cdcf738ec692269aab6eaa42458bdd73afeb9f9307af61c5778f2613`).
+The stable exact seven-file suite passed `441 passed in 57.42s`; Python 3.13
+`py_compile`, scoped Ruff, and clean status passed. The final head only removes
+unused legacy bootstrap aliases after that suite; its focused bootstrap suite
+passed 35 tests and Python 3.13/Ruff were clean. The parent must rerun the exact
+suite on the final head before acceptance. Earlier 376/388/407 runs remain
+historical.
 
-Terra rejected `4c0f819` for mutable pre-import trust, dynamic heads,
-incorrectly documented `-I`, direct `systemctl`, and noncausal `q1`/failure
-prefixes. `b07023d` and `9c6c9f` implement the signed closed release,
-root-authority, installed bootstrap, held-FD executor, exact failure prefixes,
-and single-use attempt chain. Fresh Terra and both standing Luna reviews remain
-pending; this is not acceptance.
+Fresh Terra reviews rejected `9c6c9f`: SPEC required an immutable reviewed
+candidate, exhaustive all-phase failure-prefix tests, and correct launcher
+wording; SECURITY required a signed candidate, authenticated decision envelopes,
+final-release binding, exact preflight binding, real signature/mutation tests,
+and boolean refusal. The closure at `c4bc00a` is a root authority that pins
+fixed candidate/decision/release paths and signer; signed candidate v1 for all
+static executable/provenance facts; signed per-role decision v1 for candidate
+hash, standing role/session, scope, GO, exact review text/hash, and inclusive
+time bounds; signed release v2 for candidate hash, exact decision-envelope
+hashes, and single-use `authorization_id`; distinct namespaces; and preflight
+v3. The owner signature attests exact transcript capture; Luna session IDs are
+trace/process evidence, not cryptographic nonrepudiation. Fresh Terra and both
+standing Luna reviews remain pending; this is not acceptance.
 
 The only intended invocation is byte/order exact:
 
@@ -80,8 +90,14 @@ The only intended invocation is byte/order exact:
 /usr/bin/env -i LANG=C LC_ALL=C TZ=UTC PATH=/usr/bin:/bin /usr/bin/python3.13 -I -S -E -B /usr/local/libexec/yeoman/first_gate_bootstrap.py
 ```
 
-Runtime Git and the `/usr/bin/python3` symlink are not authorization. No bootstrap, authority,
-release key, manifest, or signature was installed or created. After both Luna
-GO decisions, privileged installation and offline release preparation still
-require separate explicit owner approval and installed-artifact verification.
-No live action occurred; the first gate remains CLOSED.
+Runtime Git and the `/usr/bin/python3` symlink are not authorization.
+`/usr/bin/env` and `/usr/bin/python3.13` are root-owned pathname launcher
+trust boundaries verified after startup; only later `ssh-keygen`, `age`,
+`age-keygen`, and `systemctl` subprocesses use held FDs. No bootstrap,
+authority, release key, candidate, decision, release, or signature was
+installed or created. First obtain fresh Terra acceptance and standing-Luna
+mechanism/procedure reviews; then stop for a separate owner approval of
+privileged bootstrap/authority/key preparation and signed-candidate creation;
+then obtain both Luna GOs on the exact candidate bytes/hash, create signed
+decision envelopes and final release, and re-review differing installed/artifact
+bytes. No live action occurred; the first gate remains CLOSED.
