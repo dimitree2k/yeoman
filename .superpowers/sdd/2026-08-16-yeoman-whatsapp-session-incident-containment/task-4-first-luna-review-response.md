@@ -211,3 +211,49 @@ future-phase capability-hardening residual outside this graph. The same standing
 Luna Agent A/B sessions must now review the exact accepted mechanism and this
 source handoff; the strictest result governs. The first gate stays **CLOSED**,
 services remain offline, and no privileged or live artifact/action exists.
+
+## Superseding exact-head cleanup reconciliation — 2026-08-20
+
+This section supersedes each preceding current-successor handoff while
+preserving it as historical evidence. The clean toolkit successor is
+`d7485311d52de206470b4f61c2c8eb3b613ee2ba`, parent
+`02720889cd4088dfae16f991fe19da460e5effb1`; the exact focused range is
+`02720889cd4088dfae16f991fe19da460e5effb1..d7485311d52de206470b4f61c2c8eb3b613ee2ba`
+and the full ancestor range is
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..d7485311d52de206470b4f61c2c8eb3b613ee2ba`.
+
+The total/idempotent cleanup contract is that `_ProductionCrypto.close()`
+detaches `_owned`, clears `_material`, attempts every detached descriptor in
+order, catches only a per-descriptor `OSError`, and makes a later `close()`
+attempt no descriptor again. The focused RED was `1 failed, 106 deselected in
+0.73s`; focused GREEN was `1 passed, 106 deselected in 0.28s`. Implementer
+commit `d7485311d52de206470b4f61c2c8eb3b613ee2ba` is
+`fix(evidence): make crypto cleanup idempotent`. Independent Terra review is
+spec PASS and quality APPROVED, with no Critical or Important finding.
+
+Controller evidence at the successor is root seven-file `449 passed in
+78.06s` and state `150 passed in 54.81s`; six-file Python 3.13 compile, full
+scoped Ruff, range-diff, required-ancestor, no-new-skip, clean-status, and
+`git diff --check` all passed. Current production hashes are: bootstrap
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+`45bfb8953f2174b52d109a833a38e7709f382872e83ac0281735e7086a6fd741`;
+quarantine
+`b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`; state
+`5f041e361fbff68809cbe77477749495991488ebc4000f59d87969f22fcd7e16`; smoke
+`4f7a58867164c475dd6a647962258e5ff9292968a82c4eb7dbfce82452eb17e5`; controller
+`b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
+
+Unsigned checkpoint candidate
+`04bbce963ad7070ee6b94426e99973f73900c6b3e394630040df9eb5f3557a79` is obsolete
+and was never approved, signed, or installed because the mandatory
+authenticated-module repair changed its bytes. The gate remains **CLOSED** and
+offline: no live action occurred; QR residual remains a hard gate; persona
+evolution remains omitted; proactivity, consciousness, and speak-up remain
+mandatory later capabilities.
+
+Next, in exact order: fresh Terra specification/security review of the clean
+code/docs successors; record their result in a docs-only successor; standing
+Luna A/B exact-head review; construct and verify one new unsigned candidate;
+then request owner approval for that exact new hash. Do not put a plan/package
+self-hash inside either self-hashed file. After commit, the controller will
+calculate them and record them in a separate docs-only successor.
