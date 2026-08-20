@@ -169,7 +169,7 @@ Their strictest decision governs.  See `task-4-prep-luna-code-review-package.md`
 as the sole re-review handoff and `task-4-first-luna-review-response.md` for
 the durable initial-decision/correction record.
 
-## Authenticated-bootstrap correction and fresh handoff
+## Historical f55 authenticated-bootstrap correction
 
 The corrected toolkit range is
 `62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`.
@@ -212,11 +212,49 @@ standing-Luna mechanism review; exact unsigned candidate draft; owner prompt
 naming its hash and approving privileged prep plus signing that candidate;
 signed owner/candidate envelopes; both Luna reviews of exact signed candidate;
 signed decisions/release; differing-byte verification/re-review; invocation.
-No live/runtime/systemctl/key/owner/QR/message operation occurred.
+No live/runtime/systemctl/key/owner/QR/message operation occurred. This f55
+record and its hashes are historical only.
+
+## Current eb272 production-capability correction and handoff
+
+Fresh Terra rejected source `1b18fba1b427e0069d80c8e0a583500d90e1cea0` with
+toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645`: executable authority was
+accepted, but ordinary imports still exposed state, evidence, and owner-turn
+production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`
+corrects that boundary. Authority schema v4 requires root-owned regular exact
+`0644`; bootstrap requires root-owned regular exact `0755`. Authority pins one
+canonical Ed25519 release signer and one owner signer, with separately hashed
+allowed-signers content and distinct decoded public-key blobs. Candidate,
+decisions, and release use the release signer; owner approval uses the owner
+signer and its own namespace.
+
+Bootstrap injects one per-execution permit into all three authenticated modules;
+evidence, state, and controller capture that exact identity. State production
+runtime, service quiescence, and legacy manifest reading require it. Public
+production actions in evidence, state, quarantine, and smoke now refuse or are
+absent, so later phases require a future authenticated controller capability.
+Same-process malicious introspection is explicitly outside the threat model.
+
+Parent exact seven-file verification at clean eb272 passed `472 passed in
+61.11s`; `/usr/bin/python3.13` `py_compile`, scoped Ruff, `git diff --check`,
+and status were clean. Production hashes: bootstrap
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`; evidence
+`fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203`; state
+`6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59`; controller
+`b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`. No
+production artifact or action exists.
+
+Required next order: fresh Terra -> standing Luna mechanism review -> exact
+unsigned draft -> explicit owner prompt naming its hash and authorizing two-key
+privileged preparation/signing -> signed candidate/owner approval -> exact
+signed-candidate Luna reviews -> decisions/release -> reverify -> invoke.
+Persona evolution is omitted; proactivity, consciousness, and speak-up remain
+mandatory later capabilities. Final review must bind eb272 and the successor
+source documentation commit.
 
 The authoritative orchestration-plan SHA-256 is
-`9871fefbeb6ee163760ea72380c2827b10c57fb997a33e1f9a3ab41150bd6853` and the
+`2f90a7fc79de246164d0d0fd29b801ec3ea64256b7116cc9b1ae532f8690738a` and the
 Luna-package SHA-256 is
-`b3c9d7dd2805b55a315e3129edb167f9f07a4aee386b8533c1b0e0ee79815c6f`.
+`af114c454a3959cc8568bd837d9991eb4ec717da5a5fc087dbf0f3f3ecc86ef5`.
 They are recorded outside the documents they hash. Final review must bind the
 successor source documentation commit containing this report.

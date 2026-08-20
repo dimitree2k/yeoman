@@ -56,37 +56,39 @@ blockers are pending. The gate remains **CLOSED**. Preserve all historical
 376-test evidence as evidence of the prior synthetic head only; it does not
 establish the later correction. No live action occurred.
 
-## Authenticated-bootstrap correction — pending fresh review
+## Production-capability correction — pending fresh review
 
 Toolkit correction range
-`62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`
-uses a sixth production source, the standard-library-only pre-import trust
-anchor `bootstrap/first_gate_bootstrap.py` (SHA-256
-`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`).
-Parent verification at final clean head passed the exact suite: `459 passed in
-60.93s`; Python 3.13 `py_compile`, scoped Ruff, diff check, and status were
-clean. The initial aggregate claim at production correction `960168a` was
-false: parent reproduced 450 passing and nine stale-fixture failures. Test-only
-`f55a5e2` centralizes the canonical preflight-v5 builder and closes all nine.
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`
+uses the standard-library-only pre-import trust anchor
+`bootstrap/first_gate_bootstrap.py` (SHA-256
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`). Parent
+verification at clean eb272 passed the exact seven-file suite: `472 passed in
+61.11s`; `/usr/bin/python3.13` `py_compile`, scoped Ruff, diff check, and
+status were clean. The f55 `459 passed` and `f55a5e2` fixture evidence is
+historical only.
 
-Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
-and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` rejected the lack of
-exact `0755` enforcement for the installed executable bootstrap, public
-release/direct-import runtime reachability, and procedural-only owner approval.
-Closure requires the executable bootstrap to be root-owned regular exact
-`0755` and the non-executable JSON authority to be root-owned regular and
-non-writable by group or world; removes global permit/loader state; constructs
-permit and loader only inside `main()` after process/signature/module
-authentication; captures the same per-execution permit inside
-evidence/controller imports so normal imports fail before runtime; and
-explicitly excludes malicious-owner/same-process sandboxing from the threat
-model. Owner approval v1 binds the unsigned canonical candidate hash, fixed
-owner/scope/APPROVED/text hash, a distinct namespace, and at most 24 hours of
-inclusive validity. Exact canonical candidate/approval/decision/release bytes
-are required. Release v3 binds candidate, approval, and two decision hashes
-plus authorization; preflight v5 carries bootstrap/decision/approval hashes
-and owner metadata and reconstructs candidate/release hashes. Fresh Terra and
-both standing Luna reviews remain pending; this is not acceptance.
+Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
+and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` accepted executable
+authority but rejected ordinary imports that exposed state, evidence, and
+owner-turn production actions. eb272 closes that boundary: authority schema v4
+requires root-owned regular exact `0644`; bootstrap remains root-owned regular
+exact `0755`; authority pins a canonical Ed25519 release signer and an owner
+signer with separately hashed allowed-signers content and distinct decoded
+public-key blobs. Candidate, decisions, and release use the release signer;
+owner approval uses the owner signer and its own namespace. One per-execution
+permit is injected into all three authenticated modules; evidence, state, and
+controller capture the exact identity; state production runtime, service
+quiescence, and legacy manifest reader require it. Public production actions in
+evidence, state, quarantine, and smoke now refuse or are absent, so later
+phases need a future authenticated controller capability. Same-process
+malicious introspection remains outside the threat model. Fresh Terra and both
+standing Luna reviews remain pending; this is not acceptance.
+
+Current production module hashes are evidence
+`fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203`, state
+`6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59`, and
+controller `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e`.
 
 The only intended invocation is byte/order exact:
 
@@ -102,8 +104,9 @@ authority, release key, candidate, decision, release, or signature was
 installed or created; nor does an owner-approval artifact exist. First obtain
 fresh Terra acceptance and standing-Luna mechanism/procedure reviews; prepare
 the exact unsigned candidate draft; then stop for an owner prompt naming its
-hash and authorizing privileged bootstrap/authority/key preparation plus signing
+hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing
 that exact candidate. Only after signed owner/candidate envelopes may both Luna
 sessions review exact signed bytes/hash, followed by signed decisions/release
 and differing-byte re-review. No live action occurred; the first gate remains
-CLOSED.
+CLOSED. Persona evolution is omitted; proactivity, consciousness, and speak-up
+remain mandatory later capabilities.

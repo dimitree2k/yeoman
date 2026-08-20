@@ -41,14 +41,15 @@ module. Its only production invocation, byte/order exact, is:
 The installed bootstrap must be root-owned regular mode `0755` at
 `/usr/local/libexec/yeoman/first_gate_bootstrap.py`, non-writable by group and
 world, with candidate source SHA-256 submitted for re-review
-`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`.
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`.
 The root-owned non-writable authority is fixed at
-`/etc/yeoman/first-gate-release-authority.json`; it pins signer identity,
-allowed-signers content and hash, bootstrap path and hash, and all fixed
-candidate, owner-approval, decision, and release paths. Both authority and
-installed bootstrap must be root-owned regular files and non-writable by group
-or world. The executable bootstrap additionally requires exact mode `0755`;
-looser and stricter bootstrap modes both refuse. The release root is
+`/etc/yeoman/first-gate-release-authority.json`. Authority schema v4 requires
+it to be root-owned regular exact mode `0644`; it pins one canonical Ed25519
+release signer and one owner signer, each with separately hashed
+allowed-signers content and a distinct decoded public-key blob. Candidate,
+decisions, and release use the release signer; owner approval uses the owner
+signer and its own namespace. The installed bootstrap is root-owned regular
+exact mode `0755`; looser and stricter bootstrap modes both refuse. The release root is
 `/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` and
 contains only the fixed names `candidate.json`/`candidate.sig`,
 `agent_a-decision.json`/`agent_a-decision.sig`,
@@ -84,7 +85,9 @@ is not the authenticated launcher. Any mismatch is **NO-GO before mutation**.
 | `/usr/bin/systemctl` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
 | `/usr/bin/python3.13` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
 
-The authorization is deliberately not one monolithic manifest. The signed
+The authorization is deliberately not one monolithic manifest. Authority v4 is
+the root descriptor for the two signer records, fixed paths, and bootstrap
+identity. The signed
 immutable candidate v1 binds all static executable and provenance facts: the
 incident; exact source and toolkit commits; plan/package hashes; required
 ancestor; installed bootstrap; invocation; closed module names, paths, sizes,
@@ -98,8 +101,9 @@ of candidate, owner approval, and both decision envelopes plus a single-use
 `authorization_id`. Candidate, owner approval, decisions, and release must all
 be their exact canonical bytes; alternate JSON encodings refuse.
 
-The four artifact classes use distinct SSH signature namespaces. Owner and
-review signatures attest exact transcript capture in their respective
+The four artifact classes use distinct SSH signature namespaces. The release
+signer signs candidate, both decisions, and release; the owner signer signs
+owner approval. Owner and review signatures attest exact transcript capture in their respective
 envelopes; Luna session IDs are trace/process evidence, not cryptographic
 nonrepudiation.
 The standing reviewer identities are:
@@ -123,19 +127,22 @@ runtime authorization; strict schema checks also refuse booleans where integer
 fields are required. The global execution permit and reusable loader are
 absent: `main()` constructs one local permit and one local in-memory loader only
 after exact argv/environment/process, authority, signature, module, and tool
-authentication. The authenticated evidence and controller modules capture that
-same per-execution permit during import; normal/direct imports cannot mint a
-release or reach `_production_runtime`. This is an accidental/stale-entry
-boundary, explicitly not a Python sandbox against same-process introspection or
-a malicious owner, both outside the trusted-launcher threat model.
+authentication. The authenticated evidence, state, and controller modules
+capture that same per-execution permit during import; state production runtime,
+service quiescence, and legacy-manifest reading require it. Public production
+actions in evidence, state, quarantine, and smoke now refuse or are absent, so
+later phases require a future authenticated controller capability. This is an
+accidental/stale-entry boundary, explicitly not a Python sandbox against
+same-process introspection or a malicious owner, both outside the
+trusted-launcher threat model.
 
 The release candidate must bind these candidate module hashes:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `fddc847bd34fb87d6e68837fb9af62196e2039706402fbf96e8412aa322cd721` |
-| `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
-| `whatsapp_rotation_first_gate` | `ab80783d4ad4f648525f38a424d5ae455d1ba483838a8dc78cbd772d5d8b3883` |
+| `incident_evidence_lib` | `fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203` |
+| `whatsapp_rotation_state` | `6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59` |
+| `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 After authenticating the signed candidate, signed owner approval, both signed
 decisions, and signed release, the preflight v5 reconstructs exact candidate and
@@ -267,4 +274,6 @@ First run the synthetic-fake integration dry run above. Then package each compan
 
 ## Execution Handoff
 
-The next sequence after fresh Terra acceptance and both first Luna mechanism/procedure GO decisions is an exact unsigned candidate draft followed by a separate owner decision naming that draft hash and authorizing privileged bootstrap/authority/key preparation plus signing it—not a live first gate. After approved preparation and signed owner/candidate envelopes, both Luna sessions separately approve exact signed candidate bytes/hash; only then may signed decisions and release v3 be created. After verification and any required artifact re-review, the byte-exact bootstrap invocation may perform only full quiescence and read-only `inspect-v1`/`capture-v2`, then must stop. Owner turns begin only after the mandatory second evidence-bound Luna GO.
+Fresh Terra rejected the f55-era source/toolkit package because executable authority was accepted while ordinary imports still exposed state, evidence, and owner-turn production actions. Toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a` corrects that boundary; all f55 hashes and acceptance evidence above are historical only. No production artifact or action exists.
+
+The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.

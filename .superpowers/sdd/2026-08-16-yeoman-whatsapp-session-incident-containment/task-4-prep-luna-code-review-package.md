@@ -2,21 +2,18 @@
 
 ## Re-review status — corrected code pending acceptance
 
-The architecture correction is implemented at toolkit head
-`f55a5e28cfabc5010aa84031bd699aa8e4054645`, but it is not yet Terra- or
+The production-capability correction is implemented at toolkit head
+`eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`, but it is not yet Terra- or
 Luna-accepted. The first live gate remains **CLOSED**. This package requests
 fresh review of the exact authenticated-bootstrap design and does not authorize
 installation, signing, authority preparation, runtime access, or any live
 operation.
 
-Fresh Terra review of source `48ca1a93957c85385ea2bfd995b9f3491fe9799f`
-and toolkit `c4bc00a77ade352c24610d152cdeede67da9ec53` returned **REJECT**.
-SPEC found that the installed bootstrap was not required to be exact mode
-`0755`; SECURITY found that public `VerifiedRelease` construction/direct import
-could reach production runtime and that owner approval remained procedural
-rather than an authenticated, candidate-bound input. Production correction
-`960168a` and test-only canonical-fixture correction `f55a5e2` close those
-findings. Fresh Terra and both standing Luna reviews remain pending.
+Fresh Terra review of source `1b18fba1b427e0069d80c8e0a583500d90e1cea0`
+and toolkit `f55a5e28cfabc5010aa84031bd699aa8e4054645` returned **REJECT**.
+It accepted executable authority, but found ordinary imports still exposed
+state, evidence, and owner-turn production actions. Toolkit `eb272c5` closes
+that boundary. Fresh Terra and both standing Luna reviews remain pending.
 
 ## Decision requested after the correction
 
@@ -43,12 +40,12 @@ later production action. There is no live evidence yet.
 - Toolkit repository/branch: `/home/dm/Documents/yeoman-migration-toolkit`,
   `c/yeoman-migration-toolkit`.
 - Current correction range/head:
-  `62acf5b73ca9b9abaed79004deed7f93ef2280b3..f55a5e28cfabc5010aa84031bd699aa8e4054645`.
+  `f55a5e28cfabc5010aa84031bd699aa8e4054645..eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`.
 - Required toolkit ancestor:
   `6ba55014242953e72ec7a29e75041f704452b885`.
 - Source handoff repository/branch baseline: `/home/dm/Documents/yeoman`,
-  `c/turn-engine-v2`, prior documentation head
-  `48ca1a93957c85385ea2bfd995b9f3491fe9799f`. The final review must bind the
+  `c/turn-engine-v2`, documentation head
+  `1b18fba1b427e0069d80c8e0a583500d90e1cea0`. The final review must bind the
   exact successor source documentation commit that carries this package.
 - Initial Luna package range (not the range to approve now):
   `6ba55014242953e72ec7a29e75041f704452b885..995c3ac76ed04a77ed55dd21fbc7d80bffd4e24e`.
@@ -112,7 +109,7 @@ split was solely the task-runner time boundary.  Final Terra returned SPEC
 ACCEPT and QUALITY ACCEPT with no Critical, Important, or Minor finding.
 Mutations were run and restored across rounds.
 
-## Current synthetic correction evidence
+## Historical f55 correction evidence
 
 At `960168a`, an aggregate claim initially missed nine stale fixtures: parent
 verification exposed `450 passed, 9 failed`. Test-only `f55a5e2` centralizes the
@@ -123,17 +120,25 @@ then passed the exact seven-file suite: `459 passed in 60.93s`. Python 3.13
 false aggregate claim is withdrawn; earlier current-head counts are stale. No
 production artifact or live boundary was used.
 
-The candidate bootstrap source submitted for re-review is
+## Current eb272 bootstrap contract
+
+At clean toolkit `eb272c52965a7d2dd1a4c66eaa40c8e499079f7a`, the parent exact
+seven-file suite passed `472 passed in 61.11s`; `/usr/bin/python3.13`
+`py_compile`, scoped Ruff, `git diff --check`, and status were clean. This is
+the current synthetic verification; it created no production artifact or action.
+
+The f55 evidence and hashes above are historical only. The current candidate bootstrap source submitted for re-review is
 `bootstrap/first_gate_bootstrap.py`, SHA-256
-`95f5d30c71ee3607c97d884a965b6897450521dbfcba647531f6505e30894ae6`.
+`ec6530570357921a4955d6a39d130db7153e67bc726ab1b61a98232d236370bd`.
 Its intended installed path is
 `/usr/local/libexec/yeoman/first_gate_bootstrap.py`, root-owned regular `0755`
 and non-writable by group/world. The authority at
-`/etc/yeoman/first-gate-release-authority.json` must be root-owned, regular, and
-non-writable by group/world; as a JSON descriptor it is not executable. It pins
+`/etc/yeoman/first-gate-release-authority.json` must be root-owned regular exact
+mode `0644`; as a JSON descriptor it is not executable. Authority schema v4 pins
 the fixed candidate, owner-approval, both decision, and final-release paths beneath
-`/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1` as well
-as the signer and allowed-signers content/hash. None of those installed/release
+`/home/dm/.local/share/yeoman-program-release/whatsapp-first-gate-v1`, one canonical
+Ed25519 release signer, and one owner signer. Each has separately hashed
+allowed-signers content and a distinct decoded public-key blob. None of those installed/release
 artifacts or their key, authority, candidate, owner approval, decisions,
 release, or signatures exists or was created by this phase.
 
@@ -158,15 +163,17 @@ subprocesses execute by held FD. The fixed executable baseline is:
 | `/usr/bin/systemctl` | root / `0755` | 331504 | `c418667a6fce4553f5faa61fd62f887787e7fc3d5ad5c2c4afff9d44ad09d475` |
 | `/usr/bin/python3.13` | root / `0755` | 6673720 | `5a8d634b3cf42fa618c2a39c7e674206cefc3b0be3d2f7023d5b1f8ebb51a013` |
 
-There is no monolithic manifest. The signed candidate v1 binds all static
+There is no monolithic manifest. Authority v4 is the root descriptor for two
+signers, fixed paths, and bootstrap identity. The signed candidate v1 binds all static
 executable/provenance facts: incident; exact source/toolkit commits;
 plan/package hashes; required ancestor; bootstrap; invocation; exact module
-names/paths/sizes/hashes; and toolchain. Owner approval v1 uses a fixed path and
-distinct namespace and binds the exact unsigned canonical candidate hash,
+names/paths/sizes/hashes; and toolchain. Owner approval v1 uses a fixed path,
+the owner signer, and a distinct namespace and binds the exact unsigned canonical candidate hash,
 fixed owner/scope, `APPROVED`, exact approval text/hash, and an inclusive window
 no longer than 24 hours. Each signed decision v1 binds the
 candidate hash, standing role/session, fixed scope, `GO`, exact review text/hash,
-and the same bounded inclusive validity. Signed release v3 binds exact hashes of
+and the same bounded inclusive validity. The release signer signs candidate,
+both decisions, and release. Signed release v3 binds exact hashes of
 candidate, owner approval, and both decision envelopes plus a single-use
 `authorization_id`. Candidate, owner approval, decisions, and release are exact
 canonical bytes and use distinct signature namespaces. Signatures attest exact
@@ -180,9 +187,9 @@ Only three authenticated held-byte modules may be loaded:
 
 | Closed module | SHA-256 |
 | --- | --- |
-| `incident_evidence_lib` | `fddc847bd34fb87d6e68837fb9af62196e2039706402fbf96e8412aa322cd721` |
-| `whatsapp_rotation_state` | `285a49cf5a99cce38d64a06a9419a8c6a08ee0f37ef767ca6f26b9c709d345c1` |
-| `whatsapp_rotation_first_gate` | `ab80783d4ad4f648525f38a424d5ae455d1ba483838a8dc78cbd772d5d8b3883` |
+| `incident_evidence_lib` | `fc6ae7b178711b4847c0c1b2a091bb8802221c9ac4c7297105f29b9eb90ba203` |
+| `whatsapp_rotation_state` | `6e75b07ee171ffa0a78a3001a114ec405c4ecd739385fe89a6b5608528058b59` |
+| `whatsapp_rotation_first_gate` | `b0e157bf8c356491091accdd21d58cdac6adfafbc006c9d6c5d8d6d228c8b58e` |
 
 The bootstrap authenticates strict environment/flags/no-args/stdlib roots,
 bounded no-follow authority/candidate/decision/release/signature/module reads,
@@ -190,8 +197,11 @@ held-FD SSH signature verification, and held-FD tool identities before loading
 toolkit code through an in-memory finder. Strict schema checks refuse booleans
 in integer fields. There is no global permit or reusable loader: `main()` makes
 both locally only after the exact process contract plus every signature, module,
-and tool is authenticated. Evidence/controller imports capture the same
-per-execution permit, and normal imports fail before runtime. This is not a
+and tool is authenticated. Evidence, state, and controller imports capture the
+same per-execution permit. State production runtime, service quiescence, and
+legacy-manifest reading require it. Public production actions in evidence,
+state, quarantine, and smoke now refuse or are absent; later phases require a
+future authenticated controller capability. This is not a
 same-process or malicious-owner sandbox; those are outside the threat model.
 Preflight v5 carries bootstrap, decision, and owner hashes/metadata and
 reconstructs exact canonical candidate/release hashes. The causal chain
@@ -208,11 +218,11 @@ Fresh Terra and both standing Luna reviewers must bind their decisions to:
 
 - exact corrected source documentation head and toolkit head/range, clean-tree
   proof, required ancestor, and exact plan/package/bootstrap/module hashes;
-- the exact seven-file 459-pass suite, Python 3.13/Ruff/diff/status results,
-  the withdrawn 960 aggregate claim, its 450-pass/9-fail reproduction, and the
-  test-only `f55a5e2` fixture closure;
-- root-authority, candidate, owner-approval, decision, and release schemas; fixed paths,
-  signer/allowed-signers content/hash, distinct namespaces, exact reviewer
+- the exact seven-file `472 passed in 61.11s` suite and Python 3.13/Ruff/diff/status
+  results; the f55 `459 passed`/`f55a5e2` evidence remains historical only;
+- authority schema v4, candidate, owner-approval, decision, and release schemas; fixed paths,
+  release/owner signer allowed-signers content/hash and distinct decoded key blobs,
+  distinct namespaces, exact reviewer
   sessions/review hashes, closed modules, toolchain, invocation, boolean
   refusal, and single-use authorization lifecycle;
 - the proposed privileged installation and offline signing/key/authority
