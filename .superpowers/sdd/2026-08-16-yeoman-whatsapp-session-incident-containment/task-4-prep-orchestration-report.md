@@ -331,3 +331,38 @@ approval, decision, release, signature, runtime, auth, message, or artifact
 action occurred; services remain offline. Fresh Terra and standing Luna A/B
 exact-head mechanism reviews remain pending. Persona evolution is omitted;
 proactivity, consciousness, and speak-up remain mandatory later capabilities.
+
+## Superseding current handoff — 2026-08-20
+
+Toolkit `2967e451d10d83c0a07ff4ed54dad7a556b6bf83` is now historical
+**REJECT**. Fresh Terra security session `01a01dfa-4f0f-7f61-bb31-f52e6daa5046`
+found `_HeldAuth.parent_fd`/`.fd` ordinary-import composition from an allowed
+sibling into fixed WhatsApp auth. Parallel Terra specification session
+`01a01dfa-4f22-7500-b1e3-2df4834d1af7` returned GO, but the strictest security
+REJECT governs. The former `445` seven-file and `150` state results and their
+hashes are historical.
+
+The current clean successor is `02720889cd4088dfae16f991fe19da460e5effb1`,
+parent `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`; review
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83..02720889cd4088dfae16f991fe19da460e5effb1`
+and full `f55a5e28cfabc5010aa84031bd699aa8e4054645..02720889cd4088dfae16f991fe19da460e5effb1`.
+`_HeldAuth` descriptors and target name are name-mangled/opaque, with no global
+FD registry, getter, or raw directory-descriptor API. Bounded effects require
+exact `.auth-quarantine-<32hex>` siblings, same-parent exchange/internal name
+swap, and owned recursive-child parent FDs with `dup`/`fstat` cleanup
+regressions. Quarantine SHA-256 is
+`b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`; other
+production hashes are unchanged.
+
+Root evidence is seven-file `448 passed in 83.62s`, state `150 passed in
+63.78s`, six-file Python 3.13 compile, full scoped Ruff, diff, required
+ancestor, and no-new-skip checks; two pre-existing conditional system
+`ssh-keygen` skips remain. Design re-review gave GO/no findings, but fresh
+exact-head independent Terra specification/security acceptance remains pending.
+Luna is blocked and the gate is **CLOSED**. No key, install, signing,
+authority, candidate, approval, release, runtime, auth, message, artifact, or
+live action occurred; services remain offline. Persona evolution is omitted;
+proactivity, consciousness, and speak-up remain mandatory later. The current
+external document hashes are plan
+`3b7889c005c99d7ad33986585d670b514945794f72ff4e044f3e5e813eb134af` and Luna
+package `88216620ecbdc9d2ef6d65947b5176e6edb117de67ca23043c1ab8dd8c7f1d97`.

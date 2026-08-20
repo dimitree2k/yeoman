@@ -29,3 +29,31 @@ Parent evidence: state `150 passed in 55.10s`; exact seven-file suite `445 passe
 Current authoritative document hashes (recorded outside their self-hashed documents): orchestration plan `21c864f97b599b9a0dfd0660521d198d82c791bd60aca851ae02caf7947fe63c`; Luna package `fa0c154d6c14f125c681c75c6994d49552f2a3e132778316d123fb12ce27fb7c`. Final review must bind the successor source documentation commit.
 
 Gate remains **CLOSED**: no install/key/authority/candidate/owner approval/decision/release/signature/runtime/auth/message artifact/action; services offline. Fresh Terra then standing Luna A/B exact-head mechanism review remain pending. Persona evolution omitted; proactivity, consciousness, and speak-up mandatory later.
+
+Current reconciliation: toolkit `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`
+is historical **REJECT** after fresh Terra security session
+`01a01dfa-4f0f-7f61-bb31-f52e6daa5046` found ordinary-import composition from
+an allowed sibling into fixed WhatsApp auth through `_HeldAuth.parent_fd`/`.fd`.
+Parallel Terra specification session `01a01dfa-4f22-7500-b1e3-2df4834d1af7`
+returned GO, but the strictest security REJECT governs. Its `445` seven-file
+and `150` state results and old hashes are historical. Current clean successor
+`02720889cd4088dfae16f991fe19da460e5effb1` (parent `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`)
+must be reviewed over `2967e451d10d83c0a07ff4ed54dad7a556b6bf83..02720889cd4088dfae16f991fe19da460e5effb1`
+and full `f55a5e28cfabc5010aa84031bd699aa8e4054645..02720889cd4088dfae16f991fe19da460e5effb1`.
+`_HeldAuth` FDs/target name are name-mangled opaque; no global FD registry,
+getter, or raw directory-descriptor API remains. Effects validate exact
+`.auth-quarantine-<32hex>` names, exchange only same-parent handles with an
+internal swap, and recursive children own/clean up FDs across `dup`/`fstat`
+failure. Quarantine SHA-256 is `b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`;
+other production hashes are unchanged. Root evidence: seven-file `448 passed
+in 83.62s`; state `150 passed in 63.78s`; six-file Python 3.13 compile, full
+scoped Ruff, diff, required ancestor, and no-new-skip checks pass. Two
+pre-existing conditional system-`ssh-keygen` skips remain. Design re-review
+gave GO/no findings, but fresh exact-head Terra specification/security
+acceptance is pending; Luna is blocked and the gate remains **CLOSED**. No
+key/install/signing/authority/candidate/approval/release/runtime/auth/message/
+artifact/live action occurred; services offline. Persona evolution is omitted;
+proactivity, consciousness, and speak-up remain mandatory later. Current
+authoritative hashes, recorded outside self-hashed documents: orchestration
+plan `3b7889c005c99d7ad33986585d670b514945794f72ff4e044f3e5e813eb134af`; Luna
+package `88216620ecbdc9d2ef6d65947b5176e6edb117de67ca23043c1ab8dd8c7f1d97`.

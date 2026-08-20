@@ -289,3 +289,39 @@ The current clean toolkit head is `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`, re
 Parent evidence at this head: state `150 passed in 55.10s`; exact seven-file suite `445 passed in 77.47s`; six-file Python 3.13 compile, full scoped Ruff, clean diff/status, required-ancestor, no newly added skips/retired coverage, and adapter scans all pass. Bootstrap retains two pre-existing conditional `pytest.skip` cases for unavailable system `ssh-keygen -Y` support; this is not a global zero-skip claim. No production artifact or action exists; services remain offline.
 
 The required next sequence is fresh Terra review, standing Luna mechanism review, an exact unsigned candidate draft, and an explicit owner prompt naming that hash and authorizing two-key privileged bootstrap/authority/key preparation plus signing exactly that candidate—not a live first gate. Then capture signed candidate and owner approval; obtain both Luna reviews of the exact signed candidate; create decisions/release; reverify differing bytes; and invoke only if every gate remains GO. Owner turns begin only after the mandatory second evidence-bound Luna GO. Persona evolution is omitted; proactivity, consciousness, and speak-up remain mandatory later capabilities.
+
+## Execution Handoff Reconciliation — 2026-08-20
+
+This section supersedes the prior `2967e451d10d83c0a07ff4ed54dad7a556b6bf83`
+current-successor handoff. That head is historical **REJECT**: fresh Terra
+security session `01a01dfa-4f0f-7f61-bb31-f52e6daa5046` found that
+`_HeldAuth.parent_fd` and `.fd` enabled ordinary-import composition from an
+allowed sibling into fixed WhatsApp auth. Parallel Terra specification session
+`01a01dfa-4f22-7500-b1e3-2df4834d1af7` returned GO, but the strictest security
+REJECT governs. Its `445` seven-file and `150` state results, plus the earlier
+production hashes, are historical evidence only.
+
+The current clean toolkit successor is
+`02720889cd4088dfae16f991fe19da460e5effb1`, parent
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83`. Review
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83..02720889cd4088dfae16f991fe19da460e5effb1`
+and full range
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..02720889cd4088dfae16f991fe19da460e5effb1`.
+`_HeldAuth` descriptors and target name are name-mangled/opaque; there is no
+global FD registry, getter, or raw directory-descriptor API. Its bounded
+effects validate exact `.auth-quarantine-<32hex>` sibling names, require
+same-parent exchange with internal name swap, and give recursive children owned
+parent descriptors with guarded `dup`/`fstat` cleanup. The current quarantine
+SHA-256 is `b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`;
+the other production hashes are unchanged from the historical table.
+
+Implementation design re-review returned GO with no findings, but fresh
+exact-head independent Terra specification/security acceptance remains pending.
+Luna is therefore blocked and the gate is **CLOSED**. Root verification at the
+successor recorded `448 passed in 83.62s` for the seven-file suite and `150
+passed in 63.78s` for state; six-file Python 3.13 compile, full scoped Ruff,
+diff, required-ancestor, and no-new-skip checks passed. Two pre-existing
+conditional system-`ssh-keygen` skips remain. No key, install, signing,
+authority, candidate, approval, release, runtime, auth, message, artifact, or
+live action occurred; services remain offline. Persona evolution remains
+omitted, while proactivity, consciousness, and speak-up remain mandatory later.

@@ -340,3 +340,39 @@ completeness, QR behavior, or WhatsApp delivery.
 - `task-4-prep-03-report.md` — accepted synthetic prep-03 report.
 - `../2026-08-16-whatsapp-rotation-prep-03-smoke-readiness/task-1-3-recovery-report.md`
   — actual recovery-report location.
+
+## Current exact-head reconciliation — Luna remains blocked
+
+This package's former `2967e451d10d83c0a07ff4ed54dad7a556b6bf83` scope is
+historical **REJECT**, not a reviewable current head. Fresh Terra security
+session `01a01dfa-4f0f-7f61-bb31-f52e6daa5046` found ordinary-import
+composition through `_HeldAuth.parent_fd`/`.fd` from an allowed sibling into
+fixed WhatsApp auth. Parallel Terra specification session
+`01a01dfa-4f22-7500-b1e3-2df4834d1af7` returned GO, but the strictest security
+REJECT governs. The former `445` seven-file and `150` state results and their
+production hashes are historical only.
+
+The pending exact-head review target is clean toolkit
+`02720889cd4088dfae16f991fe19da460e5effb1`, parent
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83`: review
+`2967e451d10d83c0a07ff4ed54dad7a556b6bf83..02720889cd4088dfae16f991fe19da460e5effb1`
+and full range
+`f55a5e28cfabc5010aa84031bd699aa8e4054645..02720889cd4088dfae16f991fe19da460e5effb1`.
+`_HeldAuth` FDs and target names are name-mangled/opaque, with no global FD
+registry/getter/raw directory-descriptor API. Effects are bounded to exact
+`.auth-quarantine-<32hex>` siblings; exchange requires the same parent and
+swaps private names internally; recursive children own duplicated parent FDs
+and close acquired FDs on `dup`/`fstat` failure. Quarantine SHA-256 is now
+`b20c9f586421af7bf3d45cfa5b4c581b6666e7f4af05fba8b01fef174199e019`; other
+production hashes are unchanged.
+
+Root evidence is `448 passed in 83.62s` for the seven-file suite and `150
+passed in 63.78s` for state, plus six-file Python 3.13 compile, full scoped
+Ruff, diff, required-ancestor, and no-new-skip checks. Two pre-existing
+conditional system-`ssh-keygen` skips remain. Implementation design re-review
+gave GO/no findings, but fresh exact-head independent Terra
+specification/security acceptance is still pending. Luna is blocked and the
+gate is **CLOSED**: no key, install, signing, authority, candidate, approval,
+release, runtime, auth, message, artifact, or live action occurred; services
+remain offline. Persona evolution is omitted; proactivity, consciousness, and
+speak-up remain mandatory later.
