@@ -1,5 +1,10 @@
 """Utility functions for yeoman."""
 
-from yeoman_shared.utils.helpers import ensure_dir, get_data_path, get_workspace_path
+from yeoman_shared.utils.helpers import (
+    ensure_dir,
+    get_data_path,
+    get_session_state_path,
+    get_workspace_path,
+)
 
-__all__ = ["ensure_dir", "get_workspace_path", "get_data_path"]
+__all__ = ["ensure_dir", "get_workspace_path", "get_data_path", "get_session_state_path"]

@@ -6,9 +6,36 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
-from yeoman_gateway.agent.tools.ops import OpsTool, _parse_loguru_line, _parse_time_spec
+from yeoman_gateway.agent.tools.ops import (
+    _BRIDGE_PID,
+    _GATEWAY_PID,
+    _RUN_DIR,
+    OpsTool,
+    _parse_loguru_line,
+    _parse_time_spec,
+)
 from yeoman_gateway.agent.tools.ops_manage import OpsManageTool
+
+
+def test_ops_pid_paths_use_canonical_run_root() -> None:
+    assert _RUN_DIR.name == "run"
+    assert _RUN_DIR.name != "var"
+    assert _GATEWAY_PID.parent == _RUN_DIR
+    assert _BRIDGE_PID.parent == _RUN_DIR
+
+
+@pytest.mark.asyncio
+async def test_ops_manage_reads_pid_from_canonical_run_root(tmp_path, monkeypatch) -> None:
+    runtime = tmp_path / "yeoman"
+    monkeypatch.setenv("YEOMAN_HOME", str(runtime))
+    tool = OpsManageTool()
+    tool.set_context("cli", "test")
+
+    with patch("yeoman_gateway.agent.tools.ops_manage.read_pid_file", return_value=None) as read_pid:
+        result = await tool.execute(action="restart", service="gateway")
+
+    assert "not running" in result.lower()
+    read_pid.assert_called_once_with(runtime / "run/gateway.pid")
 
 
 @pytest.mark.asyncio

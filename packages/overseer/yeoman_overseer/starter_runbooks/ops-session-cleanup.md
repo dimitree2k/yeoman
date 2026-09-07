@@ -15,7 +15,7 @@ safety:
 # Session Cleanup
 
 ## Context
-Session state files accumulate in workspace/memory/session-state/. Remove stale ones weekly.
+Session state files accumulate in data/memory/session-state/. Remove stale ones weekly.
 
 ## Actions
 1. Prune session-state WAL files older than 30 days

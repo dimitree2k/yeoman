@@ -5,15 +5,25 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from yeoman_shared.utils.helpers import ensure_dir, safe_filename
+from yeoman_shared.config.defaults import DEFAULT_SESSION_STATE_DIR
+from yeoman_shared.utils.helpers import ensure_dir, get_session_state_path, safe_filename
+
+
+def resolve_session_state_dir(workspace: Path, state_dir: str = DEFAULT_SESSION_STATE_DIR) -> Path:
+    """Resolve the configured session-state directory with one canonical default."""
+    relative = Path(state_dir).expanduser()
+    if state_dir == DEFAULT_SESSION_STATE_DIR:
+        return get_session_state_path()
+    if relative.is_absolute():
+        return ensure_dir(relative)
+    return ensure_dir(workspace / relative)
 
 
 class SessionStateStore:
     """Append-only markdown WAL for per-session state."""
 
-    def __init__(self, workspace: Path, state_dir: str = "memory/session-state") -> None:
-        relative = Path(state_dir)
-        self._base = ensure_dir(workspace / relative)
+    def __init__(self, workspace: Path, state_dir: str = DEFAULT_SESSION_STATE_DIR) -> None:
+        self._base = resolve_session_state_dir(workspace, state_dir)
 
     def _path_for_session(self, session_key: str) -> Path:
         safe_key = safe_filename(session_key.replace(":", "_"))

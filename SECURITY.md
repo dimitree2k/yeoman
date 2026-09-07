@@ -135,7 +135,7 @@ Recommended for production:
 
 - External provider calls use HTTPS endpoints.
 - WhatsApp bridge defaults to local binding (`127.0.0.1:3001`) with token authentication.
-- Keep bridge auth state protected in `~/.yeoman/whatsapp-auth` (mode `0700`).
+- Keep bridge auth state protected in `~/.yeoman/secrets/whatsapp-auth` (mode `0700`).
 
 If you expose bridge or gateway outside localhost:
 
@@ -149,10 +149,10 @@ Sensitive local data may exist in:
 
 - `~/.yeoman/config.json` (API keys/tokens)
 - `~/.yeoman/policy.json` (owner IDs, ACLs)
-- `~/.yeoman/sessions/*.jsonl` (conversation history)
-- `~/.yeoman/memory/memory.db` (long-term memory)
-- `~/.yeoman/inbound/reply_context.db` (message archive)
-- `~/.yeoman/logs/*` (runtime logs)
+- `~/.yeoman/data/inbound/*.jsonl` (conversation history)
+- `~/.yeoman/data/memory/memory.db` (long-term memory)
+- `~/.yeoman/data/inbound/reply_context.db` (message archive)
+- `~/.yeoman/var/logs/*` (runtime logs)
 
 Operational guidance:
 

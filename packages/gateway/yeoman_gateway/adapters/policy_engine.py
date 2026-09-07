@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
 from loguru import logger
+from yeoman_shared.config.defaults import DEFAULT_SESSION_STATE_DIR
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
@@ -27,6 +28,7 @@ from yeoman_gateway.core.admin_commands import (
 )
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import PolicyPort
+from yeoman_gateway.memory.session_state import resolve_session_state_dir
 from yeoman_gateway.policy.admin.contracts import (
     PolicyActorContext,
     PolicyCommand,
@@ -146,7 +148,7 @@ class EnginePolicyAdapter(PolicyPort):
         session_manager: "SessionManager | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
-        memory_state_dir: str = "memory/session-state",
+        memory_state_dir: str = DEFAULT_SESSION_STATE_DIR,
     ) -> None:
         self._engine = engine
         self._known_tools = set(known_tools)
@@ -159,7 +161,7 @@ class EnginePolicyAdapter(PolicyPort):
             self._workspace = self._engine.workspace
         else:
             self._workspace = (Path.home() / ".yeoman" / "workspace").resolve()
-        self._memory_state_dir = str(memory_state_dir or "memory/session-state")
+        self._memory_state_dir = str(memory_state_dir or DEFAULT_SESSION_STATE_DIR)
         self._policy_admin_service: PolicyAdminService | None = None
         self._memory_service: object | None = None
         self._admin_router = AdminCommandRouter(
@@ -1908,9 +1910,7 @@ class EnginePolicyAdapter(PolicyPort):
         return policy
 
     def _session_wal_path(self, session_key: str) -> Path:
-        state_dir = Path(self._memory_state_dir).expanduser()
-        if not state_dir.is_absolute():
-            state_dir = self._workspace / state_dir
+        state_dir = resolve_session_state_dir(self._workspace, self._memory_state_dir)
         safe_key = safe_filename(session_key.replace(":", "_"))
         return state_dir / f"{safe_key}.md"
 

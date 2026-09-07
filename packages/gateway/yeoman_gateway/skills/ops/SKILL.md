@@ -82,11 +82,11 @@ yeoman config                                # manage configuration
 
 These are facts about how you run. NEVER contradict or fabricate alternatives.
 
-- **Gateway**: Python process, managed via PID file (`~/.yeoman/var/run/gateway.pid`).
+- **Gateway**: Python process, managed via PID file (`~/.yeoman/run/gateway.pid`).
 - **Bridge**: Node.js process (`node dist/index.js`), holds a live WebSocket to `web.whatsapp.com`.
-  Managed via PID file (`~/.yeoman/var/run/whatsapp-bridge.pid`).
-- **Gateway ↔ Bridge**: connected via `ws://localhost:3001` (protocol v2).
-- **No systemd/systemctl units exist.** Do not suggest `systemctl restart yeoman-*`.
+  Managed via PID file (`~/.yeoman/run/whatsapp-bridge.pid`).
+- **Gateway ↔ Bridge**: connected via `ws://localhost:3001` (protocol v3).
+- **User-level systemd units manage the live Gateway and Bridge.** For controlled operations use the documented `yeoman deploy` workflow or `systemctl --user` only when the runbook explicitly requires it.
 - **No webhooks, no cached relay, no inbound proxy.** Messages flow:
   `WhatsApp servers → Bridge (WebSocket) → Gateway (local WS) → Orchestrator pipeline → LLM → reply back`.
 - **DNS errors** (`getaddrinfo EAI_AGAIN`) = transient network issue on the host, not a code bug.

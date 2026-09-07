@@ -48,8 +48,13 @@ def get_logs_path() -> Path:
 
 
 def get_run_path() -> Path:
-    """Get the PID/socket run directory (~/.yeoman/var/run)."""
-    return ensure_dir(get_var_path() / "run")
+    """Get the canonical PID/socket run directory (~/.yeoman/run)."""
+    return ensure_dir(get_data_path() / "run")
+
+
+def get_session_state_path() -> Path:
+    """Get the canonical durable session-state directory (~/.yeoman/data/memory/session-state)."""
+    return ensure_dir(get_operational_data_path() / "memory" / "session-state")
 
 
 def get_cache_path() -> Path:

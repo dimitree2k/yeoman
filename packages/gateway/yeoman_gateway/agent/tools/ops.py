@@ -9,14 +9,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.utils.helpers import get_logs_path, get_run_path
 from yeoman_shared.utils.process import pid_alive, read_pid_file
 
 from yeoman_gateway.agent.tools.base import Tool
 
-_LOGS_DIR = Path("~/.yeoman/var/logs").expanduser()
+_LOGS_DIR = get_logs_path()
 _GATEWAY_LOG = _LOGS_DIR / "gateway.log"
 _BRIDGE_LOG = _LOGS_DIR / "whatsapp-bridge.log"
-_RUN_DIR = Path("~/.yeoman/var/run").expanduser()
+_RUN_DIR = get_run_path()
 _GATEWAY_PID = _RUN_DIR / "gateway.pid"
 _BRIDGE_PID = _RUN_DIR / "whatsapp-bridge.pid"
 

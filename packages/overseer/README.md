@@ -230,8 +230,8 @@ Requires `ANTHROPIC_API_KEY` in `~/.yeoman/.env` for LLM-escalated runbooks.
 
 ```bash
 # Force kill
-cat ~/.yeoman/var/run/overseer.pid | xargs kill -9
-rm ~/.yeoman/var/run/overseer.pid
+cat ~/.yeoman/run/overseer.pid | xargs kill -9
+rm ~/.yeoman/run/overseer.pid
 
 # Reset daily budget
 python3 -c "

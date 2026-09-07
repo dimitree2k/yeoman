@@ -501,7 +501,7 @@ else
     elif [ "$resolved_config_loaded" = "true" ] && [ "$memory_wal_enabled" = "true" ]; then
         add_issue "memory" "WARNING" "MEM-004" "session-state WAL files are missing" \
             "wal_enabled is true but wal_files=${mem_wal_files:-0}" \
-            "Verify workspace/memory/session-state and memory.wal.state_dir."
+            "Verify data/memory/session-state and memory.wal.state_dir."
     fi
 
     if command -v sqlite3 >/dev/null 2>&1 && [ -n "${mem_db_path:-}" ] && [ -f "${mem_db_path:-}" ]; then

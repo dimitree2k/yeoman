@@ -146,7 +146,7 @@ class InboundEvent:
 
 
 class WhatsAppChannel(BaseChannel):
-    """WhatsApp channel backed by the Node.js bridge protocol v2."""
+    """WhatsApp channel backed by the Node.js bridge protocol v3."""
 
     name = "whatsapp"
 
@@ -216,7 +216,7 @@ class WhatsAppChannel(BaseChannel):
     def _require_token(self) -> str:
         token = (self.config.bridge_token or "").strip()
         if not token:
-            raise RuntimeError("channels.whatsapp.bridgeToken is required for protocol v2")
+            raise RuntimeError("channels.whatsapp.bridgeToken is required for protocol v3")
         return token
 
     async def start(self) -> None:

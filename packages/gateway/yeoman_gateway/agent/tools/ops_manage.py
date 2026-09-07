@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import secrets
 import time
-from pathlib import Path
 from typing import Any, NamedTuple
 
+from yeoman_shared.utils.helpers import get_run_path
 from yeoman_shared.utils.process import pid_alive, read_pid_file
 
 from yeoman_gateway.agent.tools.base import Tool
@@ -85,7 +85,7 @@ class OpsManageTool(Tool):
             return "Error: 'service' must be 'gateway' or 'bridge'."
 
         # Pre-action state validation
-        pid_path = Path("~/.yeoman/var/run").expanduser() / (
+        pid_path = get_run_path() / (
             "gateway.pid" if service == "gateway" else "whatsapp-bridge.pid"
         )
         pid = read_pid_file(pid_path)

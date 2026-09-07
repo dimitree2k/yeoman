@@ -17,7 +17,7 @@ MemoryMax=256M
 BindPaths=%h/.yeoman/var/cache/bridge
 BindPaths=%h/.yeoman/secrets/whatsapp-auth
 BindPaths=%h/.yeoman/var/media
-ReadOnlyPaths=%h/.yeoman/var/run
+ReadOnlyPaths=%h/.yeoman/run
 
 Environment=YEOMAN_HOME=%h/.yeoman
 EnvironmentFile=-%h/.yeoman/.env

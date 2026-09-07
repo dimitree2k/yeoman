@@ -33,7 +33,7 @@ This project spans two directories that must be kept in sync:
 | `~/.yeoman/` | Runtime state: config, policy, memory, logs, workspace | separate private runtime repo |
 
 **When working on a task**, consider which directory is relevant:
-- Code changes → `~/Documents/yeoman/`, then restart the gateway
+- Code changes → `~/Documents/yeoman/`, then run `yeoman deploy` so the uv-installed Gateway and source-controlled Bridge are refreshed
 - Config/policy/persona/skill changes → `~/.yeoman/`
 - Debugging a live issue → check `~/.yeoman/var/logs/` and `~/.yeoman/data/`
 
@@ -101,9 +101,9 @@ ruff format .                       # Format all packages
 mypy packages/gateway/yeoman_gateway/core packages/gateway/yeoman_gateway/adapters  # Type check strict modules
 ```
 
-After any gateway source code change, restart the gateway to pick it up:
+After gateway, dependency, or Bridge source changes, deploy from the source checkout; the deploy command restarts services that were active:
 ```bash
-yeoman gateway restart
+cd ~/Documents/yeoman && yeoman deploy
 ```
 
 
@@ -224,8 +224,10 @@ See `docs/ambient-context-window.md` for the full design (local only, gitignored
 ## Deployment Rules
 
 **Source of truth**: `~/Documents/yeoman/` — ALL code changes happen here.
-Python changes are live immediately (editable install). Bridge or dependency
-changes require `yeoman deploy`.
+The active Gateway runs from the uv-managed installation at
+`~/.local/share/uv/tools/yeoman-gateway/`; the source checkout is the only
+place to edit. Run `yeoman deploy` after Python, Bridge, or dependency changes
+so the installed Gateway and generated Bridge runtime are updated together.
 
 **NEVER modify files in these derived locations:**
 - `~/.local/share/uv/tools/yeoman-gateway/` — managed by `uv tool install`

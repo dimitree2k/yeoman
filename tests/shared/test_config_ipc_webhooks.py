@@ -9,6 +9,7 @@ from yeoman_shared.config.schema import (
     WebhooksConfig,
     WebhookSourceConfig,
 )
+from yeoman_shared.utils.helpers import get_run_path
 
 
 def test_ipc_config_defaults() -> None:
@@ -132,3 +133,15 @@ def test_config_has_assistant_model_route() -> None:
     profile = cfg.models.profiles[cfg.models.routes["assistant.reply"]]
     assert profile.kind == "chat"
     assert profile.model is not None
+
+
+def test_run_path_uses_canonical_runtime_root(tmp_path, monkeypatch) -> None:
+    runtime = tmp_path / "yeoman"
+    monkeypatch.setenv("YEOMAN_HOME", str(runtime))
+
+    assert get_run_path() == runtime / "run"
+    assert (runtime / "run").is_dir()
+
+
+def test_memory_session_state_default_is_runtime_owned() -> None:
+    assert Config().memory.wal.state_dir == "data/memory/session-state"

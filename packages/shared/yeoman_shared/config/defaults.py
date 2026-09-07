@@ -10,6 +10,7 @@ DEFAULT_SUBAGENT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_ASR_MODEL = "whisper-large-v3"
 DEFAULT_TTS_MODEL = "tts-1"
+DEFAULT_SESSION_STATE_DIR = "data/memory/session-state"
 
 DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
     "assistant_default": {
@@ -165,7 +166,7 @@ DEFAULT_MEMORY: dict[str, Any] = {
     },
     "wal": {
         "enabled": True,
-        "state_dir": "memory/session-state",
+        "state_dir": DEFAULT_SESSION_STATE_DIR,
     },
 }
 
