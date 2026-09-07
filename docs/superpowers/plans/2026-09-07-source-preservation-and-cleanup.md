@@ -57,12 +57,12 @@
 
 **Files:**
 - Delete: \`packages/gateway/yeoman_gateway/core/message.py\`
-- Delete: the 19 legacy \`tests/test_*.py\` files that import the removed \`yeoman\` package and currently fail collection.
-- Modify: only documentation references proven to point exclusively to those deleted files.
+- Archive outside the repository: the 19 ignored legacy \`tests/test_*.py\` files that import the removed \`yeoman\` package and currently fail collection.
+- Modify: only documentation references proven to point exclusively to those deleted or archived files.
 
-- [ ] Reconfirm \`core/message.py\` has no production callers and the listed root tests are obsolete rather than the maintained gateway test surface.
-- [ ] Delete the verified files in the isolated worktree.
-- [ ] Run the focused tests and commit as \`chore: remove obsolete gateway source and legacy tests\`.
+- [ ] Reconfirm \`core/message.py\` has no production callers and confirm the 19 root tests are ignored files outside Git, not the maintained gateway test surface.
+- [ ] Delete \`core/message.py\` in the isolated worktree and move only the verified ignored legacy tests to \`/home/dm/Documents/yeoman-cleanup-archive-20260907/legacy-root-tests\`.
+- [ ] Run the focused tests and commit the tracked source cleanup as \`chore: remove obsolete gateway source\`; report the external archive separately.
 
 Do not remove A2A, owner-turn, observability, reply-budget, WhatsApp, consciousness, memory, dormant API/webhooks, Discord/Feishu, or dependency paths in this pass without new evidence.
 
@@ -82,7 +82,7 @@ Do not remove A2A, owner-turn, observability, reply-budget, WhatsApp, consciousn
 - Inspect: source, refs/worktrees, systemd/runtime state
 - Document: final task response and this committed plan
 
-- [ ] Run focused A2A/owner-turn/API tests, full collection, Ruff on changed Python files, and diff checks from \`c/source-cleanup\`; report any pre-existing full-repository lint findings separately.
+- [ ] Run focused A2A/owner-turn/API tests, full collection, Ruff on changed Python files, and diff checks from \`c/source-cleanup\`; run a second collection check from the live source after archiving the 19 ignored tests.
 - [ ] Verify the live gateway/bridge services and editable package resolution were not changed by isolated cleanup.
 - [ ] Reconcile remaining branches and deliberate non-deletions.
 - [ ] Do not deploy the cleanup worktree until policy compatibility is revalidated and the cleaned source is intentionally selected as live.
