@@ -13,6 +13,7 @@ from yeoman_gateway.bus.events import (
     OverseerCommand,
     ReactionMessage,
 )
+from yeoman_gateway.observability import private_log_identifier, safe_log_token
 
 
 class MessageBus:
@@ -112,6 +113,13 @@ class MessageBus:
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
+        logger.info(
+            "MessageBus inbound channel={} chat={} message_id={} chars={}",
+            safe_log_token(msg.channel, max_length=40),
+            private_log_identifier(msg.chat_id),
+            private_log_identifier(self._metadata_message_id(msg.metadata)),
+            len(msg.content or ""),
+        )
         await self._put_bounded(self.inbound, msg, "inbound")
         self._put_event_best_effort(
             InboundObservedEvent(
@@ -132,6 +140,13 @@ class MessageBus:
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
+        logger.info(
+            "MessageBus outbound channel={} chat={} message_id={} chars={}",
+            safe_log_token(msg.channel, max_length=40),
+            private_log_identifier(msg.chat_id),
+            private_log_identifier(self._metadata_message_id(msg.metadata)),
+            len(msg.content or ""),
+        )
         await self._put_bounded(self.outbound, msg, "outbound")
 
     async def consume_outbound(self) -> OutboundMessage:

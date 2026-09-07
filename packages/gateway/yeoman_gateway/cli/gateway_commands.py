@@ -245,9 +245,35 @@ def _start_gateway_daemon(port: int, verbose: bool, ensure_whatsapp: bool = True
     console.print(f"Log: {log_path}")
 
 
+def _should_setup_daemon_logging() -> bool:
+    """Use the gateway file sink for daemon and systemd-managed runs."""
+    import os
+
+    return os.environ.get("Yeoman_GATEWAY_DAEMON") == "1" or bool(
+        os.environ.get("INVOCATION_ID")
+    )
+
+
+def _prepare_private_log_path(log_path: Path) -> None:
+    """Create a gateway log path with user-only permissions."""
+    import os
+
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(log_path.parent, 0o700)
+    log_path.touch(mode=0o600, exist_ok=True)
+    os.chmod(log_path, 0o600)
+
+
 def _setup_daemon_logging(log_path: Path) -> None:
-    """Replace Loguru's default stderr sink with a rotating file sink."""
+    """Replace Loguru's default stderr sink with a private rotating file sink."""
+    import os
+
     from loguru import logger
+
+    _prepare_private_log_path(log_path)
+
+    def _private_opener(path: str, flags: int) -> int:
+        return os.open(path, flags, 0o600)
 
     logger.remove()
     logger.add(
@@ -258,13 +284,12 @@ def _setup_daemon_logging(log_path: Path) -> None:
         enqueue=True,
         backtrace=True,
         diagnose=False,
+        opener=_private_opener,
     )
 
 
 def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = True) -> None:
     """Start the yeoman gateway in foreground."""
-    import os
-
     from loguru import logger
     from yeoman_shared.config.loader import load_config
 
@@ -272,7 +297,7 @@ def _run_gateway_foreground(port: int, verbose: bool, ensure_whatsapp: bool = Tr
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 
-    if os.environ.get("Yeoman_GATEWAY_DAEMON") == "1":
+    if _should_setup_daemon_logging():
         _setup_daemon_logging(_gateway_log_path())
 
     if verbose:

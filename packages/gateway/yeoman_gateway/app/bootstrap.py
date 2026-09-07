@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, assert_never
 from loguru import logger
 from yeoman_shared.telemetry import InMemoryTelemetry, tracing
 
+from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
 from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman_gateway.adapters.responder_llm import LLMResponder
@@ -414,6 +415,9 @@ def build_gateway_runtime(
         workspace=workspace,
         policy=policy_engine.policy if policy_engine is not None else None,
     )
+    a2a_registry = A2AWorkerRegistry.from_config(config.tools.a2a)
+    if a2a_registry is not None:
+        logger.info("A2A worker tools enabled: {}", ", ".join(a2a_registry.names))
 
     openai_compat = resolve_openai_compatible_credentials(config)
     elevenlabs = config.providers.elevenlabs
@@ -474,6 +478,7 @@ def build_gateway_runtime(
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
         private_handoff_store=private_handoffs,
+        a2a_registry=a2a_registry,
         lazy_media_resolver=lazy_media_resolver,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
@@ -1006,6 +1011,24 @@ def build_gateway_runtime(
         )
         return {"response": response}
 
+    async def ipc_owner_turn(
+        prompt: str,
+        session_key: str | None,
+        chat_id: str,
+        post_to_whatsapp: bool,
+    ) -> dict:
+        from yeoman_gateway.ipc.owner_turn import process_owner_turn
+
+        return await process_owner_turn(
+            prompt=prompt,
+            chat_id=chat_id,
+            session_key=session_key,
+            post_to_whatsapp=post_to_whatsapp,
+            policy_adapter=policy_adapter,
+            responder=responder,
+            bus=bus,
+        )
+
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
         from yeoman_gateway.bus.events import SystemEvent
 
@@ -1016,6 +1039,7 @@ def build_gateway_runtime(
         path=socket_path,
         send_message_handler=ipc_send_message,
         trigger_agent_turn_handler=ipc_trigger_agent_turn,
+        owner_turn_handler=ipc_owner_turn,
         publish_event_handler=ipc_publish_event,
         rate_limit=ipc_config.command_rate_limit,
     )

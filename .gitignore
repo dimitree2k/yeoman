@@ -51,6 +51,8 @@ tests/gateway/*
 !tests/gateway/test_memory_disclosure.py
 !tests/gateway/test_control_plane_api_hardening.py
 !tests/gateway/test_outbound_voice_soft_limits.py
+!tests/gateway/test_a2a_observability.py
+!tests/gateway/test_owner_turn.py
 !tests/gateway/test_whatsapp_chat_registry.py
 !tests/gateway/test_responder_social_holdback.py
 !tests/gateway/test_responder_textual_tool_calls.py

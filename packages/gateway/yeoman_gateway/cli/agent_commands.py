@@ -20,6 +20,7 @@ def agent(
     from yeoman_shared.config.loader import load_config
     from yeoman_shared.telemetry import InMemoryTelemetry
 
+    from yeoman_gateway.a2a.registry import A2AWorkerRegistry
     from yeoman_gateway.adapters.responder_llm import LLMResponder
     from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
     from yeoman_gateway.bus.queue import MessageBus
@@ -49,6 +50,7 @@ def agent(
         workspace=config.workspace_path,
         policy=policy,
     )
+    a2a_registry = A2AWorkerRegistry.from_config(config.tools.a2a)
 
     responder = LLMResponder(
         bus=bus,
@@ -64,6 +66,7 @@ def agent(
         telemetry=telemetry,
         security=security,
         file_access_resolver=file_access_resolver,
+        a2a_registry=a2a_registry,
     )
 
     if message:

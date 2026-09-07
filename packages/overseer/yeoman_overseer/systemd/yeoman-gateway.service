@@ -18,6 +18,7 @@ BindPaths=%h/.yeoman
 ReadOnlyPaths=%h/Documents/yeoman
 
 Environment=YEOMAN_HOME=%h/.yeoman
+Environment=Yeoman_GATEWAY_DAEMON=1
 
 [Install]
 WantedBy=default.target

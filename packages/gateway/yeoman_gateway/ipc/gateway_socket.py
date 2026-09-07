@@ -24,6 +24,7 @@ class GatewaySocket:
     path: Path
     send_message_handler: Callable[..., Awaitable[dict]] | None = None
     trigger_agent_turn_handler: Callable[..., Awaitable[dict]] | None = None
+    owner_turn_handler: Callable[..., Awaitable[dict]] | None = None
     publish_event_handler: Callable[..., Awaitable[dict]] | None = None
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
     rate_limit: int = 10  # commands per second
@@ -104,6 +105,18 @@ class GatewaySocket:
                     channel=args.get("channel", "cli"),
                     chat_id=args.get("chat_id", "direct"),
                     model_profile=args.get("model_profile"),
+                )
+                return {"status": "ok", "response": result}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        if cmd == "owner_turn" and self.owner_turn_handler:
+            try:
+                result = await self.owner_turn_handler(
+                    prompt=args.get("prompt", ""),
+                    session_key=args.get("session_key"),
+                    chat_id=args.get("chat_id", ""),
+                    post_to_whatsapp=args.get("post_to_whatsapp") is True,
                 )
                 return {"status": "ok", "response": result}
             except Exception as e:

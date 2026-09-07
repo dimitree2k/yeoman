@@ -66,6 +66,7 @@ from yeoman_gateway.session.manager import SessionManager
 if TYPE_CHECKING:
     from yeoman_shared.config.schema import ExecToolConfig, WebToolsConfig
 
+    from yeoman_gateway.a2a.registry import A2AWorkerRegistry
     from yeoman_gateway.caldav.service import CalDAVService
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.service import CronService
@@ -365,6 +366,23 @@ def _literal_tool_args_from_ast(call: ast.Call) -> dict[str, Any] | None:
     return args
 
 
+_SENSITIVE_TOOL_NAMES = frozenset({"a2a_delegate"})
+
+
+def _tool_observability_arguments(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Keep delegated task content out of generic logs and traces."""
+    if tool_name in _SENSITIVE_TOOL_NAMES:
+        return "[redacted]"
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _tool_observability_output(tool_name: str, result: str | None) -> str:
+    """Keep delegated worker output out of generic trace spans."""
+    if tool_name in _SENSITIVE_TOOL_NAMES:
+        return "[redacted]"
+    return (result or "")[:500]
+
+
 @dataclass
 class _TalkativeCooldownState:
     sender_id: str = ""
@@ -408,6 +426,7 @@ class LLMResponder(ResponderPort):
         recording_notifier: "Callable[[str, str], Awaitable[None]] | None" = None,
         inbound_archive: "InboundArchive | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
+        a2a_registry: "A2AWorkerRegistry | None" = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -440,6 +459,7 @@ class LLMResponder(ResponderPort):
         self._recording_notifier = recording_notifier
         self.inbound_archive = inbound_archive
         self._private_handoff_store = private_handoff_store
+        self._a2a_registry = a2a_registry
         self._lazy_media_resolver = lazy_media_resolver
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
@@ -581,6 +601,11 @@ class LLMResponder(ResponderPort):
                 )
             )
 
+        if self._a2a_registry is not None:
+            from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
+
+            self.tools.register(A2ADelegateTool(self._a2a_registry))
+
         # Recall conversation — search session history on demand
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
 
@@ -645,6 +670,12 @@ class LLMResponder(ResponderPort):
         ops_manage_tool = self.tools.get("ops_manage")
         if isinstance(ops_manage_tool, OpsManageTool):
             ops_manage_tool.set_context(channel, chat_id)
+
+        from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
+
+        a2a_tool = self.tools.get("a2a_delegate")
+        if isinstance(a2a_tool, A2ADelegateTool):
+            a2a_tool.set_context(channel, chat_id)
 
         from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
 
@@ -1436,11 +1467,15 @@ class LLMResponder(ResponderPort):
 
                     for tool_call in tool_calls:
                         args_preview = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.info("Tool call: {}({})", tool_call.name, args_preview[:200])
+                        observability_args = _tool_observability_arguments(
+                            tool_call.name,
+                            tool_call.arguments,
+                        )
+                        logger.info("Tool call: {}({})", tool_call.name, observability_args[:200])
                         tool_span = lf.start_span(
                             trace=trace,
                             name=f"tool/{tool_call.name}",
-                            metadata={"arguments": args_preview[:500]},
+                            metadata={"arguments": observability_args[:500]},
                             parent_span_id=iter_span.span_id if iter_span else None,
                         ) if trace is not None else None
 
@@ -1470,7 +1505,13 @@ class LLMResponder(ResponderPort):
                                     "Blocked delivery tool call with unresolved private target: {}",
                                     tool_call.name,
                                 )
-                                lf.end_span(tool_span, output=repair_result)
+                                lf.end_span(
+                                    tool_span,
+                                    output=_tool_observability_output(
+                                        tool_call.name,
+                                        repair_result,
+                                    ),
+                                )
                                 messages = self.context.add_tool_result(
                                     messages,
                                     tool_call.id,
@@ -1490,7 +1531,13 @@ class LLMResponder(ResponderPort):
                                     "Blocked delivery tool call missing explicit target: {}",
                                     tool_call.name,
                                 )
-                                lf.end_span(tool_span, output=repair_result)
+                                lf.end_span(
+                                    tool_span,
+                                    output=_tool_observability_output(
+                                        tool_call.name,
+                                        repair_result,
+                                    ),
+                                )
                                 messages = self.context.add_tool_result(
                                     messages,
                                     tool_call.id,
@@ -1508,7 +1555,10 @@ class LLMResponder(ResponderPort):
                                     "Tell the user it was already sent."
                                 )
                                 logger.warning("Blocked duplicate tool call: {}", tool_call.name)
-                                lf.end_span(tool_span, output=result)
+                                lf.end_span(
+                                    tool_span,
+                                    output=_tool_observability_output(tool_call.name, result),
+                                )
                                 messages = self.context.add_tool_result(
                                     messages, tool_call.id, tool_call.name, result,
                                 )
@@ -1519,7 +1569,10 @@ class LLMResponder(ResponderPort):
                             result = (
                                 f"Error: Tool '{tool_call.name}' is blocked by policy for this chat."
                             )
-                            lf.end_span(tool_span, output=result)
+                            lf.end_span(
+                                tool_span,
+                                output=_tool_observability_output(tool_call.name, result),
+                            )
                         else:
                             if self.security is not None:
                                 tool_security = self.security.check_tool(
@@ -1536,7 +1589,10 @@ class LLMResponder(ResponderPort):
                                         "Error: Tool call blocked by security middleware "
                                         f"({tool_security.decision.reason})."
                                     )
-                                    lf.end_span(tool_span, output=result)
+                                    lf.end_span(
+                                        tool_span,
+                                        output=_tool_observability_output(tool_call.name, result),
+                                    )
                                 else:
                                     if tool_security.decision.action == "warn":
                                         self._metric(
@@ -1548,14 +1604,20 @@ class LLMResponder(ResponderPort):
                                         tool_call.arguments,
                                         is_owner=is_owner,
                                     )
-                                    lf.end_span(tool_span, output=result[:500] if result else "")
+                                    lf.end_span(
+                                        tool_span,
+                                        output=_tool_observability_output(tool_call.name, result),
+                                    )
                             else:
                                 result = await self._execute_tool(
                                     tool_call.name,
                                     tool_call.arguments,
                                     is_owner=is_owner,
                                 )
-                                lf.end_span(tool_span, output=result[:500] if result else "")
+                                lf.end_span(
+                                    tool_span,
+                                    output=_tool_observability_output(tool_call.name, result),
+                                )
                         if hasattr(self, '_current_session') and self._current_session is not None:
                             self._current_session.add_tool_call(
                                 tool_name=tool_call.name,

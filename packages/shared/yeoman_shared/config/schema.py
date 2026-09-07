@@ -442,11 +442,34 @@ class ExecToolConfig(BaseModel):
     isolation: ExecIsolationConfig = Field(default_factory=ExecIsolationConfig)
 
 
+class A2AWorkerConfig(BaseModel):
+    """One named A2A worker reachable by Yeoman tools."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    url: str = Field(min_length=1)
+    timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    # Store only the environment-variable name; never persist a bearer token here.
+    auth_token_env: str | None = Field(default=None, alias="authTokenEnv")
+    # Remote peers require an explicit per-worker opt-in; local workers are the default.
+    allow_remote: bool = Field(default=False, alias="allowRemote")
+
+
+class A2AConfig(BaseModel):
+    """Opt-in generic A2A worker registry configuration."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    enabled: bool = False
+    workers: dict[str, A2AWorkerConfig] = Field(default_factory=dict)
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    a2a: A2AConfig = Field(default_factory=A2AConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
