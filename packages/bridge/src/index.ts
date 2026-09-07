@@ -5,6 +5,7 @@ import { readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
+import { defaultMediaDir } from './media_paths.js';
 import { BridgeServer } from './server.js';
 
 if (!globalThis.crypto) {
@@ -37,7 +38,7 @@ try {
   process.exit(1);
 }
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.yeoman', 'whatsapp-auth');
-const MEDIA_DIR = process.env.MEDIA_DIR || join(homedir(), '.yeoman', 'media');
+const MEDIA_DIR = process.env.MEDIA_DIR || defaultMediaDir();
 const MEDIA_INCOMING_DIR = process.env.MEDIA_INCOMING_DIR || join(MEDIA_DIR, 'incoming', 'whatsapp');
 const MEDIA_OUTGOING_DIR = process.env.MEDIA_OUTGOING_DIR || join(MEDIA_DIR, 'outgoing', 'whatsapp');
 const PERSIST_INBOUND_AUDIO = parseBoolEnv(process.env.WHATSAPP_PERSIST_INBOUND_AUDIO, false);
