@@ -199,6 +199,53 @@ async def test_registry_dispatches_named_workers_and_tool_returns_worker_result(
     assert calls == [("inspect this", "hermes", "ctx-3")]
 
 
+@pytest.mark.asyncio
+async def test_bound_delegate_does_not_forward_model_context_id() -> None:
+    forwarded_contexts: list[str | None] = []
+
+    class FakeClient:
+        async def send_message(
+            self,
+            message: str,
+            *,
+            context_id: str | None = None,
+        ) -> A2AWorkerResult:
+            assert message == "inspect this"
+            forwarded_contexts.append(context_id)
+            return A2AWorkerResult(
+                worker="hermes",
+                task_id="task-bound-1",
+                context_id=context_id or "remote-generated-context",
+                state="TASK_STATE_COMPLETED",
+                text="done",
+            )
+
+    registry = A2AWorkerRegistry(
+        [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+        client_factory=lambda worker: FakeClient(),
+    )
+    tool = A2ADelegateTool(registry)
+    tool.set_context("whatsapp", "owner@s.whatsapp.net", session_key="whatsapp:owner")
+
+    result = await tool.execute(
+        worker="hermes",
+        message="inspect this",
+        context_id="model-selected-foreign-context",
+    )
+
+    assert result == "[hermes | TASK_STATE_COMPLETED | task-bound-1]\ndone"
+    assert forwarded_contexts == [None]
+    assert "context_id" not in tool.parameters["properties"]
+
+
+def test_unbound_delegate_keeps_explicit_context_for_internal_callers() -> None:
+    tool = A2ADelegateTool(A2AWorkerRegistry([]))
+
+    # The public model schema hides context_id; this only documents the
+    # compatibility path for trusted non-chat callers and existing tests.
+    assert "context_id" not in tool.parameters["properties"]
+
+
 def test_a2a_config_is_disabled_and_secret_is_referenced_by_env_name() -> None:
     config = Config.model_validate(
         {
@@ -226,3 +273,9 @@ async def test_registry_rejects_unknown_worker() -> None:
 
     with pytest.raises(KeyError, match="unknown A2A worker 'missing'"):
         await registry.call("missing", "work")
+
+
+def test_policy_diagnostics_include_a2a_delegate() -> None:
+    from yeoman_gateway.cli.policy_commands import _policy_known_tools
+
+    assert "a2a_delegate" in _policy_known_tools()

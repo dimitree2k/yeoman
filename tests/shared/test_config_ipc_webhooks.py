@@ -1,7 +1,10 @@
-"""Tests for IPC and webhook config schema."""
+"""Tests for shared configuration schema and loading."""
+
+import json
 
 import pytest
 from pydantic import ValidationError
+from yeoman_shared.config.loader import _migrate_config, load_config
 from yeoman_shared.config.schema import (
     Config,
     ConsciousnessConfig,
@@ -38,6 +41,53 @@ def test_config_has_ipc_and_webhooks() -> None:
     cfg = Config()
     assert isinstance(cfg.ipc, IpcConfig)
     assert isinstance(cfg.webhooks, WebhooksConfig)
+
+
+def test_legacy_bridge_runtime_is_folded_into_channel_config() -> None:
+    migrated = _migrate_config(
+        {
+            "configVersion": 2,
+            "channels": {"whatsapp": {"bridgeHost": "channel-host"}},
+            "runtime": {
+                "whatsappBridge": {
+                    "host": "legacy-host",
+                    "port": 3999,
+                    "token": "legacy-token",
+                    "autoRepair": False,
+                    "startupTimeoutMs": 22000,
+                    "maxPayloadBytes": 131072,
+                }
+            },
+        }
+    )
+
+    whatsapp = migrated["channels"]["whatsapp"]
+    assert "runtime" not in migrated
+    assert whatsapp["bridgeHost"] == "channel-host"
+    assert whatsapp["bridgePort"] == 3999
+    assert whatsapp["bridgeToken"] == "legacy-token"
+    assert whatsapp["bridgeAutoRepair"] is False
+    assert whatsapp["bridgeStartupTimeoutMs"] == 22000
+    assert whatsapp["maxPayloadBytes"] == 131072
+
+
+def test_loading_config_drops_legacy_bridge_runtime_block(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "configVersion": 2,
+                "channels": {"whatsapp": {"enabled": True}},
+                "runtime": {"whatsappBridge": {"port": 3999}},
+            }
+        )
+    )
+
+    loaded = load_config(config_path)
+
+    persisted = json.loads(config_path.read_text())
+    assert loaded.channels.whatsapp.bridge_port == 3999
+    assert "runtime" not in persisted
 
 
 def test_consciousness_config_defaults_disabled() -> None:

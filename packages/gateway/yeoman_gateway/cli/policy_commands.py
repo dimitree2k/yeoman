@@ -37,6 +37,7 @@ def _policy_known_tools() -> set[str]:
         "summarize_history",
         "spawn",
         "cron",
+        "a2a_delegate",
     }
 
 

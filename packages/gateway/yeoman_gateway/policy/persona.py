@@ -6,6 +6,13 @@ from pathlib import Path
 
 from loguru import logger
 
+COMPACT_PROMPT_MARKER = "<!-- prompt-chain: compact -->"
+
+
+def uses_compact_prompt(persona_text: str | None) -> bool:
+    """Opt in through trusted persona files, never inbound message metadata."""
+    return bool(persona_text and persona_text.startswith(COMPACT_PROMPT_MARKER))
+
 
 def resolve_persona_path(persona_file: str, workspace: Path) -> Path:
     """Resolve a persona path and ensure it stays inside workspace."""
@@ -36,6 +43,8 @@ def load_persona_text(persona_file: str | None, workspace: Path) -> str | None:
         logger.warning(f"persona path is not a file: {path}")
         return None
     text = path.read_text(encoding="utf-8")
+    if uses_compact_prompt(text):
+        return text
 
     # Load evolution layer by convention: alpha-2.md → alpha-2.evolution.md
     evolution_path = path.parent / f"{path.stem}.evolution{path.suffix}"

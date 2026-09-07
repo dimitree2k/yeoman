@@ -179,12 +179,6 @@ tools_exec_isolation = (
     tools_exec.get("isolation", {}) if isinstance(tools_exec.get("isolation"), dict) else {}
 )
 security = data.get("security", {}) if isinstance(data.get("security"), dict) else {}
-runtime = data.get("runtime", {}) if isinstance(data.get("runtime"), dict) else {}
-runtime_whatsapp = (
-    runtime.get("whatsapp_bridge", {})
-    if isinstance(runtime.get("whatsapp_bridge"), dict)
-    else {}
-)
 providers = data.get("providers", {}) if isinstance(data.get("providers"), dict) else {}
 agents = data.get("agents", {}) if isinstance(data.get("agents"), dict) else {}
 agent_defaults = (
@@ -234,7 +228,6 @@ for env_name in provider_env_keys:
 telegram_token_present = bool(str(telegram.get("token", "")).strip() or env_or_file("TELEGRAM_BOT_TOKEN"))
 whatsapp_token_present = bool(
     str(pick(whatsapp, "bridgeToken", "bridge_token", default="")).strip()
-    or str(pick(runtime_whatsapp, "token", default="")).strip()
     or env_or_file("WHATSAPP_BRIDGE_TOKEN")
 )
 
@@ -303,12 +296,6 @@ if isinstance(channels, dict):
         or str(whatsapp.get("bridge_token", "")).strip()
     ):
         secret_fields.append("channels.whatsapp.bridgeToken")
-
-runtime = data.get("runtime", {})
-if isinstance(runtime, dict):
-    wa_runtime = runtime.get("whatsappBridge", runtime.get("whatsapp_bridge", {}))
-    if isinstance(wa_runtime, dict) and str(wa_runtime.get("token", "")).strip():
-        secret_fields.append("runtime.whatsappBridge.token")
 
 values = {
     "raw_secret_count": str(len(secret_fields)),

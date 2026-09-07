@@ -291,29 +291,6 @@ class GatewayConfig(BaseModel):
     port: int = 18790
 
 
-class WhatsAppBridgeRuntimeConfig(BaseModel):
-    """Runtime supervision config for the WhatsApp bridge process."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    host: str = "127.0.0.1"
-    port: int = 3001
-    token: str = ""
-    auto_repair: bool = True
-    startup_timeout_ms: int = 15000
-    max_payload_bytes: int = 262144
-
-
-class RuntimeConfig(BaseModel):
-    """Out-of-process runtime subsystem configuration."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    whatsapp_bridge: WhatsAppBridgeRuntimeConfig = Field(
-        default_factory=WhatsAppBridgeRuntimeConfig
-    )
-
-
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
 
@@ -592,7 +569,6 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
-    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)

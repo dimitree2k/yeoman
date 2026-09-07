@@ -226,38 +226,29 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
         whatsapp_cfg.pop("window_limit", None)
         whatsapp_cfg.pop("line_max_chars", None)
 
-    version = snake.get("config_version")
-    try:
-        version_num = int(version) if version is not None else 1
-    except (TypeError, ValueError):
-        version_num = 1
-
-    if version_num < 2:
-        runtime = snake.get("runtime")
-        if not isinstance(runtime, dict):
-            runtime = {}
-            snake["runtime"] = runtime
-        wa_runtime = runtime.get("whatsapp_bridge")
-        if not isinstance(wa_runtime, dict):
-            wa_runtime = {}
-            runtime["whatsapp_bridge"] = wa_runtime
-
-        whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else {}
+    # `runtime.whatsappBridge` was an unused second copy of the operational
+    # Bridge settings. Fold it into the channel config once, with the channel
+    # value winning when both files contain a value, then drop the legacy copy.
+    runtime_cfg = snake.pop("runtime", None)
+    legacy_bridge = runtime_cfg.get("whatsapp_bridge") if isinstance(runtime_cfg, dict) else None
+    if isinstance(legacy_bridge, dict):
+        if not isinstance(channels_cfg, dict):
+            channels_cfg = {}
+            snake["channels"] = channels_cfg
         if not isinstance(whatsapp_cfg, dict):
             whatsapp_cfg = {}
+            channels_cfg["whatsapp"] = whatsapp_cfg
 
-        wa_runtime.setdefault("host", whatsapp_cfg.get("bridge_host", "127.0.0.1"))
-        wa_runtime.setdefault("port", whatsapp_cfg.get("bridge_port", 3001))
-        wa_runtime.setdefault("token", whatsapp_cfg.get("bridge_token", ""))
-        wa_runtime.setdefault("auto_repair", whatsapp_cfg.get("bridge_auto_repair", True))
-        wa_runtime.setdefault(
-            "startup_timeout_ms",
-            whatsapp_cfg.get("bridge_startup_timeout_ms", 15000),
-        )
-        wa_runtime.setdefault(
-            "max_payload_bytes",
-            whatsapp_cfg.get("max_payload_bytes", 262144),
-        )
+        for channel_key, legacy_key in (
+            ("bridge_host", "host"),
+            ("bridge_port", "port"),
+            ("bridge_token", "token"),
+            ("bridge_auto_repair", "auto_repair"),
+            ("bridge_startup_timeout_ms", "startup_timeout_ms"),
+            ("max_payload_bytes", "max_payload_bytes"),
+        ):
+            if channel_key not in whatsapp_cfg and legacy_key in legacy_bridge:
+                whatsapp_cfg[channel_key] = legacy_bridge[legacy_key]
 
     # Collapse deprecated memory2 config into single memory config.
     memory_cfg = snake.get("memory")

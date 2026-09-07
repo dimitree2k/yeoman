@@ -18,11 +18,13 @@ class A2ADelegateTool(Tool):
         self._registry = registry
         self._channel = ""
         self._chat_id = ""
+        self._session_key = ""
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        """Attach the current Yeoman chat to observability records."""
+    def set_context(self, channel: str, chat_id: str, *, session_key: str = "") -> None:
+        """Attach the current Yeoman chat to observability and boundary controls."""
         self._channel = str(channel or "")
         self._chat_id = str(chat_id or "")
+        self._session_key = str(session_key or "")
 
     @property
     def name(self) -> str:
@@ -53,21 +55,27 @@ class A2ADelegateTool(Tool):
                     "maxLength": 12000,
                     "description": "The self-contained task to send to the worker.",
                 },
-                "context_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 200,
-                    "description": "Optional A2A context ID for a follow-up task.",
-                },
             },
             "required": ["worker", "message"],
             "additionalProperties": False,
         }
 
+    def _effective_context_id(self, requested: Any) -> str | None:
+        """Keep model-supplied context handles out of channel-bound calls.
+
+        A bound Yeoman turn is deliberately stateless at the A2A boundary until
+        an internal session store can namespace and authorize follow-ups. The
+        client generates a fresh context when this returns ``None``. Unbound
+        callers retain the old explicit-context compatibility path.
+        """
+        if self._channel or self._chat_id or self._session_key:
+            return None
+        return requested
+
     async def execute(self, **kwargs: Any) -> str:
         worker = str(kwargs.get("worker") or "")
         message = str(kwargs.get("message") or "")
-        context_id = kwargs.get("context_id")
+        context_id = self._effective_context_id(kwargs.get("context_id"))
         logger.info(
             "A2A delegation started channel={} chat={} worker={} context_id={} message_chars={}",
             safe_log_token(self._channel, max_length=40),

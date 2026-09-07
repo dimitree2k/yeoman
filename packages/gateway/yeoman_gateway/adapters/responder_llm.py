@@ -59,6 +59,7 @@ from yeoman_gateway.media.tts import (
     write_tts_audio_file,
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
+from yeoman_gateway.policy.persona import uses_compact_prompt
 from yeoman_gateway.providers.base import LLMProvider, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
@@ -675,7 +676,7 @@ class LLMResponder(ResponderPort):
 
         a2a_tool = self.tools.get("a2a_delegate")
         if isinstance(a2a_tool, A2ADelegateTool):
-            a2a_tool.set_context(channel, chat_id)
+            a2a_tool.set_context(channel, chat_id, session_key=session_key)
 
         from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
 
@@ -2275,6 +2276,7 @@ class LLMResponder(ResponderPort):
                     media=list(media),
                     channel=channel,
                     chat_id=chat_id,
+                    allowed_tools=allowed_tools,
                 )
 
                 self._current_session = session
@@ -2328,7 +2330,7 @@ class LLMResponder(ResponderPort):
         final_content = self._normalize_social_question_ending(final_content, metadata)
         final_content, budget_result = enforce_reply_budget(
             final_content,
-            metadata.get("reply_budget"),
+            None if uses_compact_prompt(persona_text) else metadata.get("reply_budget"),
             user_content=content,
             tool_used=bool(metadata.get("reply_budget_tool_used", False)),
         )

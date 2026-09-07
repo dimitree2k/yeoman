@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import time
@@ -70,6 +71,25 @@ def check_systemd_active(*, target: str) -> CheckResult:
         return CheckResult(value=True, detail=f"{target} is active")
     detail = proc.stderr.strip() or f"{target} is inactive (systemctl rc={proc.returncode})"
     return CheckResult(value=False, detail=detail)
+
+
+def check_gateway_healthy(*, target: str) -> CheckResult:
+    """Require both an active user unit and a responsive gateway event loop."""
+    active = check_systemd_active(target=target)
+    if not active.value:
+        return active
+    home = Path(os.environ.get("YEOMAN_HOME") or Path.home() / ".yeoman")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5.0)
+            client.connect(str(home / "run" / "gateway.sock"))
+            client.sendall(b'{"cmd":"ping","args":{}}\n')
+            with client.makefile("rb") as stream:
+                response = json.loads(stream.readline(4096))
+        healthy = isinstance(response, dict) and response.get("status") == "ok" and response.get("response") == "pong"
+        return CheckResult(value=healthy, detail="Gateway pong" if healthy else "Invalid gateway ping response")
+    except (OSError, ValueError) as exc:
+        return CheckResult(value=False, detail=f"Gateway ping failed: {exc}")
 
 
 def _whatsapp_bridge_health(target: str, timeout_s: float) -> dict[str, Any]:
@@ -195,6 +215,7 @@ def check_row_count_exceeds(
 
 
 _CHECK_REGISTRY: dict[str, Any] = {
+    "gateway_healthy": check_gateway_healthy,
     "process_alive": check_process_alive,
     "systemd_active": check_systemd_active,
     "whatsapp_bridge_connected": check_whatsapp_bridge_connected,

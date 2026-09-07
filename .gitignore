@@ -12,6 +12,7 @@ docs/superpowers/plans/*
 !docs/superpowers/plans/2026-05-02-disclosure-safe-memory-tags.md
 !docs/superpowers/plans/2026-03-09-langfuse-tracing.md
 !docs/superpowers/plans/2026-09-07-runtime-source-structure-normalization.md
+!docs/superpowers/plans/2026-09-07-tradingagents-hermes-yeoman-plan.md
 !docs/superpowers/specs/
 docs/superpowers/specs/*
 !docs/superpowers/specs/2026-04-25-consciousness-layer-design.md
@@ -21,6 +22,7 @@ docs/superpowers/specs/*
 !docs/superpowers/specs/2026-05-03-profile-gated-mcp-layer-design.md
 !docs/superpowers/specs/2026-05-25-reactive-coalescing-design.md
 !docs/superpowers/specs/2026-03-09-langfuse-tracing-design.md
+!docs/superpowers/specs/2026-09-07-tradingagents-hermes-yeoman-design.md
 .superpowers/*
 *.egg-info/
 *.egg

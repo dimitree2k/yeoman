@@ -158,7 +158,14 @@ def test_reply_budget_prompt_is_trusted_system_context(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("compact", [False, True])
+async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path, compact: bool) -> None:
+    persona_text = None
+    if compact:
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts/RUNTIME.md").write_text("Runtime rules")
+        (tmp_path / "prompts/AGENTS.md").write_text("Evidence rules")
+        persona_text = "<!-- prompt-chain: compact -->\nPersona"
     responder = LLMResponder(
         bus=MessageBus(),
         provider=_LongReplyProvider(),
@@ -190,10 +197,12 @@ async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path) -> N
             should_respond=True,
             allowed_tools=frozenset(),
             reason="test",
+            persona_text=persona_text,
         ),
     )
 
     session = responder.sessions.get_or_create("whatsapp:group@g.us")
     assistant_rows = [row for row in session.messages if row.get("role") == "assistant"]
-    assert reply == "Das ist ein kompakter erster Satz, der fuer den Chat reicht."
+    expected = (await _LongReplyProvider().chat([])).content if compact else "Das ist ein kompakter erster Satz, der fuer den Chat reicht."
+    assert reply == expected
     assert assistant_rows[-1]["content"] == reply
