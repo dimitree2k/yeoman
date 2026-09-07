@@ -72,4 +72,3 @@ def test_memory_cli_commands_end_to_end(tmp_path: Path, monkeypatch) -> None:
     reindex = runner.invoke(app, ["memory", "reindex"])
     assert reindex.exit_code == 0, reindex.output
     assert "rebuilt" in reindex.output.lower()
-
