@@ -21,6 +21,7 @@ docs/superpowers/specs/*
 !docs/superpowers/specs/2026-05-03-profile-gated-mcp-layer-design.md
 !docs/superpowers/specs/2026-05-25-reactive-coalescing-design.md
 !docs/superpowers/specs/2026-03-09-langfuse-tracing-design.md
+.superpowers/*
 *.egg-info/
 *.egg
 *.pyc
@@ -61,6 +62,7 @@ tests/gateway/*
 !tests/gateway/test_responder_textual_tool_calls.py
 !tests/gateway/test_memory_cli.py
 !tests/gateway/test_memory_session_state.py
+!tests/gateway/test_whatsapp_runtime.py
 !tests/gateway/test_responder_memory_recall.py
 !tests/gateway/test_a2a.py
 !tests/gateway/test_cron_voice_quiet_window.py

@@ -182,7 +182,7 @@ Ausführung in getrennten Etappen: Tasks 1–4 legen Baseline, Dokumentation und
 - [x] Confirm both destination names are free and inspect Git history before moving the files.
 - [x] Use a tracked move where source files are tracked; these two Langfuse files were ignored/untracked, so they were moved with `mv`, inbound links were scanned, and explicit `.gitignore` exceptions make the intended files trackable.
 - [x] Adopt `docs/superpowers/plans/` and `docs/superpowers/specs/` as the current canonical plan/spec locations; do not create a second parallel hierarchy during this cleanup.
-- [x] Keep generated `.superpowers/` scratch output out of durable documentation; archive only reviewed, meaningful results into `docs/` or `session-context/`.
+- [x] Ignore `.superpowers/*` and `docs/superpowers/*` by default; track only explicitly listed durable exceptions (`docs/superpowers/plans/2026-04-25-consciousness-layer.md`, `docs/superpowers/plans/2026-05-02-disclosure-safe-memory-tags.md`, `docs/superpowers/plans/2026-03-09-langfuse-tracing.md`, this plan, the listed design specs, and the migration tests). Keep generated `.superpowers/` scratch output out of durable documentation; archive only reviewed, meaningful results into `docs/` or `session-context/`.
 - [x] Define a future decision point for a tool-agnostic `docs/{plans,specs,decisions,operations}` layout rather than mixing it into this migration.
 
 **Acceptance:** There is one active location for plans and one for specs, historical evidence remains distinguishable, and all moved documents retain any available Git history and working links.

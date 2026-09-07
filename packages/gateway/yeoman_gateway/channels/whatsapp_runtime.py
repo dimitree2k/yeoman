@@ -112,6 +112,50 @@ class WhatsAppRuntimeManager:
         port = self._resolve_bridge_port()
         return f"ws://{host}:{port}"
 
+    @staticmethod
+    def _systemd_bridge_active() -> bool:
+        """Return whether the user-level Bridge unit owns lifecycle management."""
+        if not shutil.which("systemctl"):
+            return False
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", "yeoman-bridge.service"],
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    @staticmethod
+    def _bridge_port_open(port: int) -> bool:
+        """Check listener reachability when sandboxing hides peer PIDs."""
+        import socket
+
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    def _wait_for_systemd_bridge(self, port: int) -> BridgeStatus:
+        timeout_ms = getattr(self.config.channels.whatsapp, "bridge_startup_timeout_ms", 30_000)
+        deadline = time.monotonic() + max(1.0, float(timeout_ms) / 1000.0)
+        status = self.status_bridge(port)
+        port_open = self._bridge_port_open(port)
+        while not status.running and not port_open and time.monotonic() < deadline:
+            time.sleep(0.1)
+            status = self.status_bridge(port)
+            port_open = self._bridge_port_open(port)
+        if not status.running and port_open:
+            return BridgeStatus(
+                running=True,
+                port=port,
+                pids=status.pids,
+                log_path=status.log_path,
+            )
+        return status
+
     def _resolve_source_bridge_dir(self) -> Path:
         if self._source_bridge_dir:
             return self._source_bridge_dir
@@ -286,8 +330,11 @@ class WhatsAppRuntimeManager:
         pids: set[int] = set(listener_pids_for_port(port))
 
         stored = read_pid_file(self.bridge_pid_path)
-        if stored is not None and pid_alive(stored) and (stored in pids or is_bridge_process(stored)):
-            pids.add(stored)
+        if stored is not None:
+            if pid_alive(stored) and (stored in pids or is_bridge_process(stored)):
+                pids.add(stored)
+            else:
+                self.bridge_pid_path.unlink(missing_ok=True)
         return sorted(p for p in pids if pid_alive(p))
 
     def status_bridge(self, port: int | None = None) -> BridgeStatus:
@@ -333,10 +380,16 @@ class WhatsAppRuntimeManager:
         if not shutil.which("node"):
             raise RuntimeError("node not found. Install Node.js >= 20.")
 
+        resolved_port = self._resolve_bridge_port() if port is None else port
+        if self._systemd_bridge_active():
+            status = self._wait_for_systemd_bridge(resolved_port)
+            if status.running:
+                return status
+            raise RuntimeError("systemd Bridge is active but did not open its listener")
+
         bridge_dir = self.ensure_runtime()
         token = self.ensure_bridge_token(quiet=True)
         wa = self.config.channels.whatsapp
-        resolved_port = self._resolve_bridge_port() if port is None else port
         status = self.status_bridge(resolved_port)
         if status.running:
             return status
