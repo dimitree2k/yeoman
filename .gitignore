@@ -56,6 +56,16 @@ tests/gateway/*
 !tests/gateway/test_whatsapp_chat_registry.py
 !tests/gateway/test_responder_social_holdback.py
 !tests/gateway/test_responder_textual_tool_calls.py
+!tests/gateway/test_memory_cli.py
+!tests/gateway/test_responder_memory_recall.py
+!tests/gateway/test_a2a.py
+!tests/gateway/test_cron_voice_quiet_window.py
+!tests/gateway/test_market_intelligence_tool.py
+!tests/gateway/test_reply_budget.py
+!tests/overseer/
+tests/overseer/*
+!tests/overseer/test_alert_formatting.py
+!tests/overseer/test_stale_agent_sessions.py
 .mypy_cache
 .ruff_cache
 node_modules/
