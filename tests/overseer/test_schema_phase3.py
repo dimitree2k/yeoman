@@ -1,5 +1,5 @@
 # tests/overseer/test_schema_phase3.py
-from yeoman_overseer.runbook.schema import SafetyConfig, RunbookFrontmatter, TriggerConfig
+from yeoman_overseer.runbook.schema import SafetyConfig, RunbookFrontmatter
 
 
 def test_safety_config_shell_timeout_default():

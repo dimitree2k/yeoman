@@ -1,7 +1,6 @@
 """Tests for ContactsMiddleware."""
 
 import pytest
-from dataclasses import replace
 from pathlib import Path
 
 from yeoman_gateway.contacts.service import ContactsService

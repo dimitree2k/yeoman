@@ -1,6 +1,5 @@
 """Tests for JSONL audit logger and tombstones."""
 from __future__ import annotations
-import json
 from pathlib import Path
 from yeoman_overseer.audit.logger import AuditLogger, AuditEntry, TombstoneEntry
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
-import pytest
 from yeoman_overseer.agent.tools.write_file import write_file, _is_allowed
 
 

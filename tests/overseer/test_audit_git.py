@@ -37,7 +37,7 @@ def test_revert(tmp_path: Path) -> None:
     git.init()
     f = repo / "config.txt"
     f.write_text("original")
-    sha1 = git.commit(files=["config.txt"], message="original")
+    git.commit(files=["config.txt"], message="original")
     f.write_text("modified")
     sha2 = git.commit(files=["config.txt"], message="modified")
     git.revert(sha2)

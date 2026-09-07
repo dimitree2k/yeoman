@@ -1,7 +1,6 @@
 """Tests for LLM agent context assembly."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -59,7 +58,7 @@ def test_audit_log_filtered_by_domain() -> None:
         {"domain": "memory", "runbook": "x", "action": "prune"},
         {"domain": "health", "runbook": "y", "action": "restart"},
     ])
-    ctx = build_context(_runbook(domain="memory"), {}, audit)
+    build_context(_runbook(domain="memory"), {}, audit)
     audit.read_recent.assert_called_once_with(limit=20, domain="memory")
 
 

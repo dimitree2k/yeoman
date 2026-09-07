@@ -2,8 +2,7 @@
 from __future__ import annotations
 import subprocess
 from pathlib import Path
-import pytest
-from yeoman_overseer.agent.patcher import Patcher, PatchContext
+from yeoman_overseer.agent.patcher import Patcher
 
 
 def _init_git_repo(path: Path) -> None:

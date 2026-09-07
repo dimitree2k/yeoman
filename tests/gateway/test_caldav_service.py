@@ -6,7 +6,6 @@ import icalendar
 import pytest
 
 from yeoman_gateway.caldav.service import CalDAVService
-from yeoman_gateway.caldav.types import CalendarInfo
 
 
 SAMPLE_ICAL = """BEGIN:VCALENDAR

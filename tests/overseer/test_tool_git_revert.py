@@ -2,7 +2,6 @@
 from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
-import pytest
 from yeoman_overseer.agent.tools.git_revert import git_revert
 
 
@@ -27,7 +26,7 @@ def test_revert_calls_internal_git(tmp_path):
 
 def test_revert_audit_logged(tmp_path):
     ctx = _ctx(tmp_path)
-    result = git_revert("abc123", ctx=ctx)
+    git_revert("abc123", ctx=ctx)
     ctx.audit.append.assert_called_once()
     entry = ctx.audit.append.call_args[0][0]
     assert entry.action == "git_revert"

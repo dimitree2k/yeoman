@@ -1,10 +1,8 @@
 # tests/overseer/test_tool_prune_memory.py
 from __future__ import annotations
 import sqlite3
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
-import pytest
 from yeoman_overseer.agent.tools.prune_memory import prune_memory
 
 

@@ -1,5 +1,4 @@
 """Tests for AuditEntry LLM fields and query_tombstones domain filter."""
-import json
 import tempfile
 from pathlib import Path
 

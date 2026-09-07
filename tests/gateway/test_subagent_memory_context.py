@@ -1,6 +1,6 @@
 # tests/test_subagent_memory_context.py
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 from dataclasses import dataclass
 from yeoman_gateway.agent.subagent import SubagentManager
 

@@ -1,8 +1,6 @@
 # tests/overseer/test_tool_dry_run_runbook.py
 from __future__ import annotations
-from pathlib import Path
 from unittest.mock import MagicMock
-import pytest
 from yeoman_overseer.agent.tools.dry_run_runbook import dry_run_runbook
 
 _VALID_RUNBOOK = """\
