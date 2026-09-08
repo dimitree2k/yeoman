@@ -27,6 +27,7 @@ class LiteLLMProvider(LLMProvider):
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
+        provider_name: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -34,6 +35,8 @@ class LiteLLMProvider(LLMProvider):
 
         # Detect gateway / local deployment from api_key and api_base
         self._gateway = find_gateway(api_key, api_base, default_model)
+        spec = self._gateway or find_by_model(default_model)
+        self.provider_name = provider_name or (spec.name if spec else "unknown")
 
         # Backwards-compatible flags (used by tests and possibly external code)
         self.is_openrouter = bool(self._gateway and self._gateway.name == "openrouter")
@@ -168,13 +171,14 @@ class LiteLLMProvider(LLMProvider):
         if max_retries is not None:
             kwargs["num_retries"] = max_retries
 
-        # Pass reasoning config via extra_body for OpenRouter
-        if reasoning:
-            extra_body = kwargs.get("extra_body", {})
-            extra_body["reasoning"] = reasoning
-            kwargs["extra_body"] = extra_body
-
         try:
+            from yeoman_gateway.model_catalog import direct_card, reasoning_kwargs
+
+            kwargs.update(reasoning_kwargs(self.provider_name, reasoning))
+            card = direct_card(self.provider_name, model.removeprefix("openai/"))
+            enabled = (reasoning or {}).get("enabled", card.default_enabled)
+            if enabled and card.temperature_with_reasoning is False:
+                kwargs.pop("temperature", None)
             if timeout_seconds is None:
                 response = await acompletion(**kwargs)
             else:

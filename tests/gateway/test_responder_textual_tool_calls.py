@@ -620,6 +620,7 @@ async def test_responder_applies_resolved_profile_temperature(tmp_path: Path) ->
                     model="deepseek-v4-flash",
                     provider="deepseek",
                     temperature=0.42,
+                    max_tokens=1234,
                 )
             },
             routes={"assistant.reply": "assistant_default"},
@@ -650,6 +651,7 @@ async def test_responder_applies_resolved_profile_temperature(tmp_path: Path) ->
     assert out == "kurz."
     assert provider.calls[0]["model"] == "deepseek-v4-flash"
     assert provider.calls[0]["temperature"] == 0.42
+    assert provider.calls[0]["max_tokens"] == 1234
 
 
 class _HandoffSendVoiceProvider(LLMProvider):

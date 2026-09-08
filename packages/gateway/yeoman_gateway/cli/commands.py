@@ -12,6 +12,7 @@ from . import deploy_commands as _deploy_commands  # noqa: F401
 from . import doctor_commands as _doctor_commands  # noqa: F401
 from . import env_commands as _env_commands  # noqa: F401
 from . import memory_commands as _memory_commands  # noqa: F401
+from . import model_commands as _model_commands  # noqa: F401
 from . import overseer_commands as _overseer_commands  # noqa: F401
 from . import persona_evolution_commands as _persona_evolution_commands  # noqa: F401
 from . import policy_commands as _policy_commands  # noqa: F401

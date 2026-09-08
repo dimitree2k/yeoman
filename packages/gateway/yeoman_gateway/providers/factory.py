@@ -31,9 +31,14 @@ class ProviderFactory:
         if not api_base and provider_spec and provider_spec.default_api_base:
             api_base = provider_spec.default_api_base
         extra_headers = provider_cfg.extra_headers if provider_cfg else None
+        effective_provider = provider_name or next(
+            (name for name, value in self.config.providers if value is provider_cfg),
+            None,
+        )
         return LiteLLMProvider(
             api_key=api_key,
             api_base=api_base,
             default_model=model,
             extra_headers=extra_headers,
+            provider_name=effective_provider,
         )

@@ -1340,6 +1340,7 @@ class LLMResponder(ResponderPort):
         provider: LLMProvider | None = None,
         temperature: float | None = None,
         reasoning: dict[str, object] | None = None,
+        max_tokens: int = 4096,
         current_user_message: str = "",
         current_channel: str = "",
         current_chat_id: str = "",
@@ -1369,6 +1370,7 @@ class LLMResponder(ResponderPort):
                     model=model or self.model,
                     temperature=temperature if temperature is not None else 0.7,
                     reasoning=reasoning,
+                    max_tokens=max_tokens,
                 )
                 lf.log_generation(
                     parent=iter_span or trace,
@@ -2293,6 +2295,7 @@ class LLMResponder(ResponderPort):
                     is_owner=is_owner,
                     model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
                     provider=self._provider_for_profile(resolved_profile),
+                    max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
                     temperature=(
                         float(getattr(resolved_profile, "temperature"))
                         if getattr(resolved_profile, "temperature", None) is not None
