@@ -2065,6 +2065,46 @@ class ProcessingStore:
 
     # -- retention ---------------------------------------------------------------------
 
+    def count_waiting_effects(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        states: tuple[str, ...] = ("queued", "executing"),
+    ) -> int:
+        """Waiting, actionable effects of *this* chat only.
+
+        Counting every effect in the database against a per-chat limit let one chat's
+        backlog block another chat forever, and terminal ``blocked`` rows occupied
+        capacity indefinitely.
+        """
+        placeholders = ",".join(["?"] * len(states))
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT COUNT(*) AS c FROM effects
+                 WHERE state IN ({placeholders})
+                   AND json_extract(target_json, '$.channel') = ?
+                   AND json_extract(target_json, '$.chat_id') = ?
+                """,
+                (*[str(item) for item in states], str(channel), str(chat_id)),
+            ).fetchone()
+        return int(row["c"])
+
+    def effect_meta(self, effect_id: str) -> Any:
+        """Lineage projection of one effect, looked up directly by id."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM effects WHERE effect_id = ? LIMIT 1", (str(effect_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        return _effect_meta_from_row(
+            row,
+            attempts=self._attempts_for(str(effect_id)),
+            evidence=self._evidence_for(str(effect_id)),
+        )
+
     def reserve_send_budget(
         self,
         *,

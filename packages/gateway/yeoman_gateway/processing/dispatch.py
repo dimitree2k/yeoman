@@ -793,10 +793,8 @@ class IntentEffectRouter:
         if self._budget is None:
             return None
         now = self._clock()
-        waiting = len(
-            self._gateway.store.list_effects(
-                states=("queued", "blocked", "executing"), limit=500
-            )
+        waiting = self._gateway.store.count_waiting_effects(
+            channel=channel, chat_id=chat_id
         )
         units = payload_units(payload)
         if waiting > self._budget.waiting_cap:

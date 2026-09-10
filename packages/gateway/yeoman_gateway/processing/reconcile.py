@@ -155,10 +155,12 @@ class ReconciliationResult:
 
 
 def _effect_meta(store: Any, effect_id: str) -> RetainedEffectMeta | None:
-    for effect in store.list_effects(states=None, limit=500):
-        if effect.effect_id == effect_id:
-            return effect
-    return None
+    """Direct lookup by id.
+
+    Scanning ``list_effects(limit=500)`` missed every effect past the first 500 rows, so a
+    new ``unknown`` effect was never probed and never escalated.
+    """
+    return store.effect_meta(effect_id)
 
 
 async def reconcile_effect(
@@ -470,7 +472,18 @@ class ReconciliationService:
             if probe_record is None:
                 return None
 
-        if not force and (probe_record.due_ms > now or now >= deadline_ms):
+        if now >= deadline_ms:
+            # A plan that is still open when the deadline passes must be closed and
+            # escalated - returning here left the same plan open on every later tick.
+            self._store.finish_probe(
+                probe_record.probe_id,
+                outcome=ProbeOutcome.INCONCLUSIVE.value,
+                now_ms=now,
+                worker_id=self._worker_id,
+                detail="deadline_passed",
+            )
+            return self._escalate(effect_id, now, reason="probe_deadline")
+        if not force and probe_record.due_ms > now:
             return None
 
         lease_ms = int(getattr(self._config, "claim_lease_seconds", 30)) * 1000
@@ -556,10 +569,7 @@ class ReconciliationService:
         )
 
     def _effect_meta(self, effect_id: str) -> RetainedEffectMeta | None:
-        for effect in self._store.list_effects(states=None, limit=500):
-            if effect.effect_id == effect_id:
-                return effect
-        return None
+        return self._store.effect_meta(effect_id)
 
 
 @dataclass(frozen=True, slots=True)

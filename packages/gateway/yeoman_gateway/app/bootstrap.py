@@ -470,29 +470,9 @@ def _shared_fact_members(chat_registry: object | None):
         return None
 
     def _lookup(channel: str, chat_id: str) -> frozenset[str] | None:
-        try:
-            record = chat_registry.get_chat(channel, chat_id)  # type: ignore[attr-defined]
-        except Exception:
-            return None
-        if not isinstance(record, dict):
-            return None
-        metadata = record.get("metadata")
-        participants = None
-        if isinstance(metadata, dict):
-            participants = metadata.get("participants")
-        if not isinstance(participants, list) or not participants:
-            return None
-        members: set[str] = set()
-        for item in participants:
-            if isinstance(item, str):
-                members.add(item)
-                continue
-            if isinstance(item, dict):
-                for key in ("id", "jid", "lid", "phoneNumber", "user_id"):
-                    value = item.get(key)
-                    if value:
-                        members.add(str(value))
-                        break
+        from yeoman_gateway.memory.read_gate import registry_members
+
+        members = registry_members(chat_registry, channel=channel, chat_id=chat_id)
         return frozenset(members) if members else None
 
     return _lookup

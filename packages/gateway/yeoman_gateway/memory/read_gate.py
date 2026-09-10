@@ -186,7 +186,7 @@ def build_read_context(
             candidates.add(str(counterpart))
         members = frozenset(candidates)
     elif chat_registry is not None:
-        raw = _registry_members(chat_registry, channel=channel, chat_id=chat_id)
+        raw = registry_members(chat_registry, channel=channel, chat_id=chat_id)
         if raw:
             members = frozenset(str(item) for item in raw)
 
@@ -201,25 +201,25 @@ def build_read_context(
     )
 
 
-def _registry_members(chat_registry: Any, *, channel: str, chat_id: str) -> set[str]:
-    """Read the proven participant list, tolerating both registry shapes."""
-    for name in ("participants", "members_for", "known_members"):
-        method = getattr(chat_registry, name, None)
-        if method is None:
-            continue
-        try:
-            raw = method(channel=channel, chat_id=chat_id) if name != "participants" else method(
-                channel, chat_id
-            )
-        except TypeError:
-            try:
-                raw = method(chat_id)
-            except Exception:  # pragma: no cover - defensive
-                continue
-        except Exception:  # pragma: no cover - defensive
-            continue
-        return _as_principal_set(raw)
-    return set()
+def registry_members(chat_registry: Any, *, channel: str, chat_id: str) -> set[str]:
+    """Proven participants from the real registry API (``get_chat`` + metadata).
+
+    The registry has no ``participants``/``members_for``/``known_members`` method; looking
+    for those made every group look like unknown membership, which silently suppressed
+    shared memory in groups.
+    """
+    get_chat = getattr(chat_registry, "get_chat", None)
+    if get_chat is None:
+        return set()
+    try:
+        record = get_chat(channel, chat_id)
+    except Exception:  # pragma: no cover - defensive
+        return set()
+    if not isinstance(record, Mapping):
+        return set()
+    metadata = record.get("metadata")
+    participants = metadata.get("participants") if isinstance(metadata, Mapping) else None
+    return _as_principal_set(participants)
 
 
 def _as_principal_set(raw: Any) -> set[str]:
