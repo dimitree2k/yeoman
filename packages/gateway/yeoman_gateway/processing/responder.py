@@ -73,7 +73,16 @@ class ThreadActorResponder:
             # The running generation answers with the wider snapshot: no second answer path.
             return None
 
-        return await self._run_loop(actor, event, decision)
+        try:
+            return await self._run_loop(actor, event, decision)
+        except Exception as exc:
+            # The actor must never cost a reply: degrade to the plain path and say so.
+            logger.warning(
+                "threads_degraded thread_id={} error_type={}",
+                thread_id,
+                type(exc).__name__,
+            )
+            return await self._inner.generate_reply(event, decision)
 
     # -- loop --------------------------------------------------------------------------
 
@@ -113,15 +122,26 @@ class ThreadActorResponder:
             return None
         try:
             assignment = self._store.event_assignment(event_id)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "assignment_unavailable event_id={} error_type={}", event_id, type(exc).__name__
+            )
             return None
         if assignment is None:
             return None
         thread_id = assignment[0]
         if not thread_id:
+            logger.debug("assignment_unavailable event_id={} reason=no_thread", event_id)
             return None
         thread = self._store.get_thread(thread_id)
-        return thread_id if thread is not None else None
+        if thread is None:
+            logger.warning(
+                "assignment_unavailable event_id={} thread_id={} reason=unknown_thread",
+                event_id,
+                thread_id,
+            )
+            return None
+        return thread_id
 
     def session_key_for(self, event: Any, *, thread_id: str) -> str:
         """Thread-scoped session key; the chat key stays for legacy callers.

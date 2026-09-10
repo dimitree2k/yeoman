@@ -662,7 +662,10 @@ class IntentEffectRouter:
     ) -> EffectReceipt:
         now = self._clock()
         processing = self._config.processing
-        deadline_ms = int(getattr(processing.deadlines, deadline_key))
+        deadlines = getattr(processing, "deadlines", None) or getattr(
+            processing, "Deadlines", None
+        )
+        deadline_ms = int(getattr(deadlines, deadline_key))
 
         binding = CURRENT_TURN.get()
         turn = getattr(binding, "turn", None)

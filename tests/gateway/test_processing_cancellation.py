@@ -850,3 +850,98 @@ async def test_two_threads_do_not_mix_state_or_effects(tmp_path: Path) -> None:
     assert turn_a.principal == "a@s.whatsapp.net"
     assert turn_b.principal == "b@s.whatsapp.net"
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_actor_failure_never_loses_the_reply(tmp_path: Path) -> None:
+    """A broken actor degrades to the plain path instead of answering nothing."""
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    _turn(store, registry)
+    inner = _InnerResponder(["fallback answer"])
+    wrapper = _wrapper(store, inner, registry)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("actor exploded")
+
+    wrapper._run_loop = _boom  # type: ignore[method-assign]
+
+    reply = await wrapper.generate_reply(_event_model(message_id="m1"), object())
+
+    assert reply == "fallback answer"
+    assert inner.calls == 1
+    store.close()
+
+
+def test_broken_assignment_keeps_the_message_flowing(tmp_path: Path) -> None:
+    """The gate degrades the assignment, it does not drop the message (marker: threads_degraded)."""
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+    from yeoman_gateway.processing.policy import IngestGate
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("registry unavailable")
+
+    registry.assign = _boom  # type: ignore[method-assign]
+    gate = IngestGate(
+        config=_EnabledConfig(),
+        store=store,
+        snapshots=_Snapshots(),
+        evaluate=lambda request: PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"message"}),
+            reason="allow",
+        ),
+        threads=registry,
+        clock=_Clock(),
+    )
+    request_event = InboundEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="orderer@s.whatsapp.net",
+        content="hi",
+        message_id="m1",
+        is_group=True,
+        mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+    from yeoman_gateway.processing.policy import IngestRequest
+
+    result = gate.admit(IngestRequest(event_key="wa:m1", event_id="m1", trace_id="tr1", event=request_event))
+
+    assert result is not None
+    assert result.assignment is None  # degraded, not fatal
+    assert result.proceed is True  # the message still flows
+    assert store.count_events() == 1
+    store.close()
+
+
+class _EnabledConfig:
+    """Minimal enabled processing config for the gate tests."""
+
+    enabled = True
+    chats = [f"whatsapp:{CHAT}"]
+    shadow_chats: list[str] = []
+    deadline_key = "reactive_ms"
+
+    class Threads:
+        followup_window_seconds = 15
+        idle_seconds = 1800
+        reopen_window_seconds = 604800
+        pending_inputs_per_thread = 32
+
+    class Deadlines:
+        reactive_ms = 120_000
+        semantic_reaction_ms = 30_000
+        proactive_ms = 60_000
+
+    def is_chat_enabled(self, channel: str, chat_id: str) -> bool:
+        return f"{channel}:{chat_id}" in self.chats
+
+    def is_chat_shadowed(self, channel: str, chat_id: str) -> bool:
+        return False

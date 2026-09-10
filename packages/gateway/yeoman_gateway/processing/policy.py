@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from loguru import logger
+
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.processing.models import (
     CanonicalEvent,
@@ -254,12 +256,26 @@ class IngestGate:
     # -- internals ---------------------------------------------------------------------
 
     def _assign(self, request: IngestRequest, *, now: int, allow_turn: bool) -> Any:
-        """Attach the canonical event to its thread; never runs for a denied event."""
+        """Attach the canonical event to its thread; never runs for a denied event.
+
+        A failing assignment degrades this event to the chat-scoped path and logs
+        ``threads_degraded``. It deliberately does not drop the message: answering without
+        a thread is better for a live chat than silence, and no effect is created here.
+        """
         if self._threads is None or self._store is None:
             return None
-        return self._threads.assign(
-            self._canonical_event(request), now_ms=now, allow_turn=allow_turn
-        )
+        try:
+            return self._threads.assign(
+                self._canonical_event(request), now_ms=now, allow_turn=allow_turn
+            )
+        except Exception as exc:
+            logger.warning(
+                "threads_degraded event_id={} chat={} error_type={}",
+                request.event_id,
+                request.event.chat_id,
+                type(exc).__name__,
+            )
+            return None
 
     def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
         event = request.event
