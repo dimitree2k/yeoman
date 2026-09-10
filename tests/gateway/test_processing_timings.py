@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from yeoman_gateway.processing.timings import (
     PHASES,
     PhaseTimings,
@@ -112,3 +113,49 @@ def test_compare_reports_skips_unmeasured_phases() -> None:
     assert "model: legacy median=10.0ms p95=20.0ms | managed median=12.0ms p95=25.0ms" in lines
     assert "deferred[budget_exhausted]: legacy=0 managed=2" in lines
     assert not any(line.startswith("ingest") for line in lines)  # never sampled, not zero
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_records_its_phase_and_counts_a_blocked_effect() -> None:
+    import types
+
+    from yeoman_gateway.bus.events import OutboundMessage
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ManagedOutboundDispatcher,
+    )
+
+    class _Router:
+        def __init__(self, state: str, detail: str | None = None) -> None:
+            self._state = state
+            self._detail = detail
+
+        def manages(self, channel: str, chat_id: str) -> bool:
+            return True
+
+        async def submit_message(self, message, *, principal, capability, payload):
+            return types.SimpleNamespace(
+                state=self._state, detail=self._detail, effect_id="fx1"
+            )
+
+    class _Bus:
+        async def publish_outbound(self, message) -> None:  # pragma: no cover - unused
+            raise AssertionError("managed chat must not use the legacy publish")
+
+    message = OutboundMessage(channel="whatsapp", chat_id="chat-1", content="hi")
+
+    sent = PhaseTimings()
+    await ManagedOutboundDispatcher(router=_Router("sent"), bus=_Bus(), timings=sent)(message)
+    assert sent.sample_count("effect_queue") == 1
+
+    blocked = PhaseTimings()
+    with pytest.raises(EffectNotDeliveredError):
+        await ManagedOutboundDispatcher(
+            router=_Router("blocked", "queue_capacity"), bus=_Bus(), timings=blocked
+        )(message)
+    assert blocked.report().deferred == {"queue_capacity": 1}
+    assert blocked.sample_count("effect_queue") == 1  # the attempt is still measured
+
+    # Without instrumentation the dispatcher behaves exactly as before.
+    plain = ManagedOutboundDispatcher(router=_Router("sent"), bus=_Bus())
+    await plain(message)

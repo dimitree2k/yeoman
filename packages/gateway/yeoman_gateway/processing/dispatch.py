@@ -16,8 +16,9 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Iterator, Protocol, runtime_checkable
 
 from loguru import logger
 
@@ -41,6 +42,7 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
+from yeoman_gateway.processing.timings import PhaseTimings
 
 #: Provenance marker set by the effect transport. The managed-chat guard only lets
 #: outbound messages carrying it through.
@@ -308,23 +310,37 @@ class ManagedOutboundDispatcher:
         router: "IntentEffectRouter",
         bus: EffectTransport,
         principal: Callable[[], str] | None = None,
+        timings: "PhaseTimings | None" = None,
     ) -> None:
         self._router = router
         self._bus = bus
         self._principal = principal or CURRENT_PRINCIPAL.get
+        self._timings = timings
 
     async def __call__(self, message: OutboundMessage) -> None:
         if not self._router.manages(message.channel, message.chat_id):
             await self._bus.publish_outbound(message)
             return
         capability, payload = classify_outbound(message)
-        receipt = await self._router.submit_message(
-            message, principal=self._principal(), capability=capability, payload=payload
-        )
+        with self._phase("effect_queue"):
+            receipt = await self._router.submit_message(
+                message, principal=self._principal(), capability=capability, payload=payload
+            )
         if receipt.state != "sent":
+            if self._timings is not None:
+                self._timings.note_deferral(str(receipt.detail or receipt.state))
             raise EffectNotDeliveredError(
                 f"effect not delivered (state={receipt.state}, detail={receipt.detail or '-'})"
             )
+
+    @contextmanager
+    def _phase(self, name: str) -> Iterator[None]:
+        """Time a phase when instrumentation is attached, otherwise do nothing."""
+        if self._timings is None:
+            yield
+            return
+        with self._timings.phase(name):
+            yield
 
 
 #: Capabilities that must not run in the new mode: they write outside the chat
