@@ -31,6 +31,44 @@ test('parseBridgeCommand accepts valid v3 command', () => {
   }
 });
 
+test('parseBridgeCommand accepts delete_message with an exact target', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'delete_message',
+    token: 'secret',
+    requestId: 'req-delete-1',
+    payload: {
+      chatJid: '12345@s.whatsapp.net',
+      messageId: 'BAE5EXACTMESSAGEID',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'delete_message');
+    assert.deepEqual(parsed.command.payload, {
+      chatJid: '12345@s.whatsapp.net',
+      messageId: 'BAE5EXACTMESSAGEID',
+    });
+  }
+});
+
+test('parseBridgeCommand rejects delete_message without a message id', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'delete_message',
+    token: 'secret',
+    payload: {
+      chatJid: '12345@s.whatsapp.net',
+    },
+  });
+
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.error.code, 'ERR_SCHEMA');
+  }
+});
+
 test('parseBridgeCommand accepts send_text with replyToMessageId', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,

@@ -9,6 +9,7 @@ import {
   createOkResponse,
   isLoopbackAddress,
   parseBridgeCommand,
+  parseDeleteMessagePayload,
   parseListGroupsPayload,
   parseLoginStartPayload,
   parseLoginWaitPayload,
@@ -292,6 +293,12 @@ export class BridgeServer {
       const parsed = parseSendPollPayload(payload);
       const sent = await this.wa.sendPoll(parsed);
       return { sent };
+    }
+
+    if (type === 'delete_message') {
+      const parsed = parseDeleteMessagePayload(payload);
+      const deleted = await this.wa.deleteMessage(parsed);
+      return { deleted };
     }
 
     if (type === 'react') {

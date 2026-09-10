@@ -369,6 +369,21 @@ class WhatsAppChannel(BaseChannel):
 
         await self._stop_typing(msg.chat_id)
 
+        delete_request = (
+            msg.metadata.get("delete_message") if isinstance(msg.metadata, dict) else None
+        )
+        if isinstance(delete_request, dict):
+            message_id = str(delete_request.get("message_id") or "").strip()
+            if not message_id:
+                raise RuntimeError("WhatsApp delete request missing message_id")
+            await self._send_command_with_retry(
+                "delete_message",
+                {"chatJid": msg.chat_id, "messageId": message_id},
+                timeout_seconds=20.0,
+                max_attempts=SEND_MAX_ATTEMPTS,
+            )
+            return
+
         reaction = msg.metadata.get("reaction") if isinstance(msg.metadata, dict) else None
         if isinstance(reaction, dict):
             reaction_message_id = str(reaction.get("message_id") or "").strip()
@@ -1498,6 +1513,10 @@ class WhatsAppChannel(BaseChannel):
             summary["chat_jid"] = payload.get("chatJid")
             summary["message_id"] = payload.get("messageId")
             summary["emoji"] = payload.get("emoji")
+            return summary
+        if command_type == "delete_message":
+            summary["chat_jid"] = payload.get("chatJid")
+            summary["message_id"] = payload.get("messageId")
             return summary
         return summary
 

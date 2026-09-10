@@ -33,6 +33,7 @@ def _policy_known_tools() -> set[str]:
         "market_quote",
         "market_intelligence",
         "message",
+        "delete_message",
         "send_voice",
         "summarize_history",
         "spawn",

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   FALLBACK_WHATSAPP_WEB_VERSION,
+  WhatsAppClient,
   mediaExtension,
   resolveParticipantJid,
   resolveWhatsAppWebVersion,
@@ -74,4 +75,45 @@ test('resolveWhatsAppWebVersion falls back when fetch fails', async () => {
   });
 
   assert.deepEqual(version, FALLBACK_WHATSAPP_WEB_VERSION);
+});
+
+test('deleteMessage sends a fromMe delete key for the exact target', async () => {
+  const sent: Array<{ jid: string; payload: unknown }> = [];
+  const client = new WhatsAppClient({
+    authDir: '/tmp/yeoman-delete-message-test',
+    onMessage: () => {},
+    onQR: () => {},
+    onStatus: () => {},
+    onError: () => {},
+  });
+
+  (client as any).sock = {
+    sendMessage: async (jid: string, payload: unknown) => {
+      sent.push({ jid, payload });
+      return { key: { id: 'delete-ack' } };
+    },
+  };
+  (client as any).connected = true;
+
+  const result = await client.deleteMessage({
+    chatJid: '12345@s.whatsapp.net',
+    messageId: 'BAE5EXACTMESSAGEID',
+  });
+
+  assert.deepEqual(result, {
+    chatJid: '12345@s.whatsapp.net',
+    messageId: 'BAE5EXACTMESSAGEID',
+  });
+  assert.deepEqual(sent, [
+    {
+      jid: '12345@s.whatsapp.net',
+      payload: {
+        delete: {
+          remoteJid: '12345@s.whatsapp.net',
+          fromMe: true,
+          id: 'BAE5EXACTMESSAGEID',
+        },
+      },
+    },
+  ]);
 });

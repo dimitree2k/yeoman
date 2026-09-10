@@ -311,6 +311,7 @@ def test_responder_registers_extended_tavily_tools(tmp_path: Path) -> None:
             "deep_research",
             "market_quote",
             "market_intelligence",
+            "delete_message",
         } <= responder.tool_names
     finally:
         # No async resources were opened in this test.

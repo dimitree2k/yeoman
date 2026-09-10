@@ -20,6 +20,7 @@ from yeoman_gateway.agent.context import ContextBuilder
 from yeoman_gateway.agent.subagent import SubagentManager
 from yeoman_gateway.agent.tools.contacts import ContactsTool
 from yeoman_gateway.agent.tools.cron import CronTool
+from yeoman_gateway.agent.tools.delete_message import DeleteMessageTool
 from yeoman_gateway.agent.tools.exec_isolation import SandboxMount
 from yeoman_gateway.agent.tools.file_access import FileAccessResolver, enable_grants
 from yeoman_gateway.agent.tools.filesystem import (
@@ -156,7 +157,7 @@ _DEFERRED_WORK_PROMISE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_DELIVERY_TOOLS = frozenset({"message", "send_voice", "send_media"})
+_DELIVERY_TOOLS = frozenset({"message", "send_voice", "send_media", "delete_message"})
 _DELIVERY_TARGET_STOPWORDS = frozenset(
     {
         "da",
@@ -556,6 +557,12 @@ class LLMResponder(ResponderPort):
         )
         self.tools.register(message_tool)
         self.tools.register(
+            DeleteMessageTool(
+                send_callback=self.bus.publish_outbound,
+                group_resolver=self._resolve_group_reference,
+            )
+        )
+        self.tools.register(
             SendVoiceTool(
                 send_callback=self._send_voice_message,
                 group_resolver=self._resolve_group_reference,
@@ -638,11 +645,26 @@ class LLMResponder(ResponderPort):
             logger.debug("telemetry incr failed {}={}: {}", name, value, exc)
 
     def _set_tool_context(
-        self, *, channel: str, chat_id: str, session_key: str, is_owner: bool = False,
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        session_key: str,
+        is_owner: bool = False,
+        reply_to_message_id: str | None = None,
     ) -> None:
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(channel, chat_id)
+
+        delete_message_tool = self.tools.get("delete_message")
+        if isinstance(delete_message_tool, DeleteMessageTool):
+            delete_message_tool.set_context(
+                channel,
+                chat_id,
+                reply_to_message_id=reply_to_message_id,
+                is_owner=is_owner,
+            )
 
         send_voice_tool = self.tools.get("send_voice")
         if isinstance(send_voice_tool, SendVoiceTool):
@@ -1356,7 +1378,7 @@ class LLMResponder(ResponderPort):
         deferred_work_repair_attempted = False
         # Guard against the model looping on the same side-effecting tool call
         _sent_calls: set[tuple[str, str]] = set()
-        _send_tools = frozenset({"message", "send_voice", "send_media"})
+        _send_tools = frozenset({"message", "send_voice", "send_media", "delete_message"})
         while iteration < self.max_iterations:
             iteration += 1
             iter_span = lf.start_span(
@@ -1551,11 +1573,20 @@ class LLMResponder(ResponderPort):
 
                             call_key = (tool_call.name, args_preview)
                             if call_key in _sent_calls:
+                                if tool_call.name == "delete_message":
+                                    already_handled = (
+                                        "The deletion request was already handled. "
+                                        "Tell the user it was already deleted or queued."
+                                    )
+                                else:
+                                    already_handled = (
+                                        "The message was already delivered. "
+                                        "Tell the user it was already sent."
+                                    )
                                 result = (
                                     f"Blocked: you already called {tool_call.name} "
                                     "with these exact arguments earlier in this turn. "
-                                    "The message was already delivered. "
-                                    "Tell the user it was already sent."
+                                    f"{already_handled}"
                                 )
                                 logger.warning("Blocked duplicate tool call: {}", tool_call.name)
                                 lf.end_span(
@@ -2123,7 +2154,13 @@ class LLMResponder(ResponderPort):
             _user_message_already_added = False
 
         self._set_tool_context(
-            channel=channel, chat_id=chat_id, session_key=session_key, is_owner=is_owner,
+            channel=channel,
+            chat_id=chat_id,
+            session_key=session_key,
+            is_owner=is_owner,
+            reply_to_message_id=(
+                str(metadata.get("reply_to_message_id") or "").strip() or None
+            ),
         )
 
         if await self._maybe_complete_pending_delivery(

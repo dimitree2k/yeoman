@@ -7,6 +7,7 @@ export type BridgeCommandType =
   | 'send_text'
   | 'send_media'
   | 'send_poll'
+  | 'delete_message'
   | 'react'
   | 'presence_update'
   | 'list_groups'
@@ -66,6 +67,11 @@ export interface ReactPayload {
   participantJid?: string;
   fromMe?: boolean;
   clientMessageId?: string;
+}
+
+export interface DeleteMessagePayload {
+  chatJid: string;
+  messageId: string;
 }
 
 export interface PresenceUpdatePayload {
@@ -230,6 +236,13 @@ function parseReact(payload: Record<string, unknown>): ReactPayload | null {
   return { chatJid, messageId, emoji, participantJid, fromMe, clientMessageId };
 }
 
+function parseDeleteMessage(payload: Record<string, unknown>): DeleteMessagePayload | null {
+  const chatJid = asString(payload.chatJid);
+  const messageId = asString(payload.messageId);
+  if (!chatJid || !messageId) return null;
+  return { chatJid, messageId };
+}
+
 function parsePresenceUpdate(payload: Record<string, unknown>): PresenceUpdatePayload | null {
   const stateRaw = asString(payload.state);
   const chatJid = asOptionalString(payload.chatJid);
@@ -310,6 +323,7 @@ export function parseBridgeCommand(
   if (typed === 'send_text') validPayload = Boolean(parseSendText(payload));
   else if (typed === 'send_media') validPayload = Boolean(parseSendMedia(payload));
   else if (typed === 'send_poll') validPayload = Boolean(parseSendPoll(payload));
+  else if (typed === 'delete_message') validPayload = Boolean(parseDeleteMessage(payload));
   else if (typed === 'react') validPayload = Boolean(parseReact(payload));
   else if (typed === 'presence_update') validPayload = Boolean(parsePresenceUpdate(payload));
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
@@ -356,6 +370,12 @@ export function parseSendPollPayload(payload: Record<string, unknown>): SendPoll
 export function parseReactPayload(payload: Record<string, unknown>): ReactPayload {
   const parsed = parseReact(payload);
   if (!parsed) throw new Error('Invalid react payload');
+  return parsed;
+}
+
+export function parseDeleteMessagePayload(payload: Record<string, unknown>): DeleteMessagePayload {
+  const parsed = parseDeleteMessage(payload);
+  if (!parsed) throw new Error('Invalid delete_message payload');
   return parsed;
 }
 

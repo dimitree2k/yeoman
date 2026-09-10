@@ -354,6 +354,10 @@ Skills with available="false" need dependencies installed first - you can try in
             if expose_cross_chat_history
             else "Use only the tools and targets explicitly available for this chat turn."
         )
+        delete_guidance = (
+            "When available, use 'delete_message' only with an exact WhatsApp message ID. "
+            "For a quoted/replied-to message, omit message_id; never delete a message authored by another person."
+        )
         voice_context_guidance = (
             "If required context is missing (e.g. user asks to answer \"the last voice message\" from another chat), ask only for the missing content or target chat.\n"
             "For cross-chat voice requests, state only the real blocker (missing source message content or target chat identity), then continue with the best actionable next step."
@@ -377,6 +381,7 @@ You have access to tools that allow you to:
 - Execute shell commands
 - Search the web and fetch web pages
 - Send messages to users on chat channels
+- Delete the assistant's own WhatsApp messages for everyone when policy/runtime allows
 - Spawn subagents for complex background tasks
 - On WhatsApp, send voice replies when policy/runtime enables voice output
 - Fetch and present raw chat history when asked to summarize or recap conversations
@@ -390,6 +395,7 @@ Your workspace is at: {workspace_path}
 
 IMPORTANT: For the current chat turn, normally reply with assistant text.
 {delivery_guidance}
+{delete_guidance}
 For system metrics (temperature, RAM, disk, uptime), use the 'ops' tool with action="system_stats".
 
 ## Self-Diagnosis (MANDATORY)
@@ -895,7 +901,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
                     compact = compact[:220] + "..."
                 ambient_lines.append(compact)
 
-        if not reply_to_text and not ambient_lines:
+        if not reply_to_message_id and not reply_to_text and not ambient_lines:
             return text
 
         if reply_to_text:

@@ -113,6 +113,11 @@ export interface ReactInput {
   clientMessageId?: string;
 }
 
+export interface DeleteMessageInput {
+  chatJid: string;
+  messageId: string;
+}
+
 export type PresenceState = 'available' | 'unavailable' | 'composing' | 'paused' | 'recording';
 
 export interface PresenceUpdateInput {
@@ -1622,6 +1627,30 @@ export class WhatsAppClient {
       messageId: input.messageId,
       outboundMessageId,
     };
+  }
+
+  async deleteMessage(
+    input: DeleteMessageInput,
+  ): Promise<{ chatJid: string; messageId: string }> {
+    if (!this.sock || !this.connected) {
+      throw new Error('Not connected');
+    }
+
+    const chatJid = normalizeJid(input.chatJid);
+    const messageId = String(input.messageId || '').trim();
+    if (!chatJid || !messageId) {
+      throw new Error('Delete message requires chatJid and messageId');
+    }
+
+    await this.sock.sendMessage(chatJid, {
+      delete: {
+        remoteJid: chatJid,
+        fromMe: true,
+        id: messageId,
+      },
+    });
+
+    return { chatJid, messageId };
   }
 
   async updatePresence(input: PresenceUpdateInput): Promise<{ state: PresenceState; chatJid?: string }> {
