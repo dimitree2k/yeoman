@@ -126,3 +126,15 @@ def test_zero_retention_means_keep_everything(tmp_path) -> None:
 
     assert archive.retention_days is None
     archive.close()
+
+
+def test_default_path_is_the_operational_data_directory(tmp_path, monkeypatch) -> None:
+    """A wrong default silently creates a second, empty archive - guard against it."""
+    from yeoman_shared.utils.helpers import get_operational_data_path
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    tmp_path.mkdir(exist_ok=True)
+    archive = InboundArchive(retention_days=None)
+
+    assert archive.db_path == get_operational_data_path() / "inbound" / "reply_context.db"
+    archive.close()

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from yeoman_shared.utils.helpers import ensure_dir, get_data_path
+from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path
 
 DEFAULT_RETENTION_DAYS = 30
 PURGE_INTERVAL_SECONDS = 3600
@@ -30,7 +30,9 @@ class InboundArchive:
         keep-forever mode and no longer purges on start; the timed mode stays available
         for callers that want it.
         """
-        self.db_path = db_path or (get_data_path() / "inbound" / "reply_context.db")
+        # The canonical location is the operational data directory; deriving it from the
+        # home path instead silently creates a second, empty archive.
+        self.db_path = db_path or (get_operational_data_path() / "inbound" / "reply_context.db")
         self.retention_days = (
             None if retention_days is None or int(retention_days) <= 0
             else max(1, int(retention_days))
