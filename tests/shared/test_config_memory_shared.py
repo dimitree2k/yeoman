@@ -23,11 +23,12 @@ def test_shared_defaults_are_off() -> None:
     assert shared.enabled is False
     assert shared.extraction_enabled is False
     assert shared.extractor_version == "shared-facts-v1"
-    assert shared.max_candidates_per_job == 4
     assert shared.max_jobs_waiting == 64
-    assert shared.max_audience_size == 64
     assert shared.require_known_membership is True
-    assert shared.allow_author_only_facts is False
+    # The three knobs that were declared but never enforced are gone again, so no
+    # operator can trust a control that does not exist.
+    for dropped in ("max_candidates_per_job", "max_audience_size", "allow_author_only_facts"):
+        assert not hasattr(shared, dropped)
 
 
 def test_extraction_requires_the_shared_switch() -> None:
