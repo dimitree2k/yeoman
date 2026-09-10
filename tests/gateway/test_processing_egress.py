@@ -1116,3 +1116,45 @@ async def test_generic_transport_error_never_becomes_a_chat_error(
     effects = store.list_effects()
     assert effects and effects[0].state == "unknown", producer_name
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_typing_stays_ephemeral_presence_without_an_effect(tmp_path: Path) -> None:
+    """Typing must never become a durable, replayable outbox effect (spec R08)."""
+    from yeoman_gateway.app.bootstrap import OrchestratorService
+    from yeoman_gateway.core.intents import SetTypingIntent
+    from yeoman_gateway.providers.base import LLMProvider, LLMResponse
+
+    class _Provider(LLMProvider):
+        async def chat(self, messages, tools=None, model=None, max_tokens=4096,
+                       temperature=0.7, reasoning=None) -> LLMResponse:
+            return LLMResponse(content="")
+
+        def get_default_model(self) -> str:
+            return "test/model"
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    typing_calls: list[tuple[str, str, bool]] = []
+
+    async def _typing(channel: str, chat_id: str, enabled: bool) -> None:
+        typing_calls.append((channel, chat_id, enabled))
+
+
+    service = OrchestratorService(
+        bus=_RecordingBus(),
+        orchestrator=None,  # type: ignore[arg-type]
+        typing_adapter=_typing,
+        telemetry=None,  # type: ignore[arg-type]
+        memory=None,  # type: ignore[arg-type]
+        effect_router=router,
+    )
+    await service._dispatch_intents(
+        [SetTypingIntent(channel="whatsapp", chat_id=CHAT, enabled=True)], principal="owner"
+    )
+
+    assert typing_calls == [("whatsapp", CHAT, True)]
+    assert executor.calls == []
+    assert store.count_effects() == 0
+    store.close()

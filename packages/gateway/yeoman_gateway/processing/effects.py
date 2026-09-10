@@ -186,7 +186,13 @@ class EffectGateway:
                 effect_id, target, stored.operation_key, detail=decision.reason
             )
 
-        if not self._store.claim_effect(effect_id, self._worker_id, now, self._lease_ms):
+        if not self._store.claim_effect(
+            effect_id,
+            self._worker_id,
+            now,
+            self._lease_ms,
+            policy_version=decision.policy_version,
+        ):
             current = self._store.effect_state(effect_id) or stored.state
             return self._receipt(
                 effect_id, current, stored.operation_key, detail="claim not acquired"

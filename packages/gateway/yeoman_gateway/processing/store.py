@@ -691,9 +691,19 @@ class ProcessingStore:
         return str(row["attempt_id"]) if row is not None else None
 
     def claim_effect(
-        self, effect_id: str, worker_id: str, now_ms: int, lease_ms: int
+        self,
+        effect_id: str,
+        worker_id: str,
+        now_ms: int,
+        lease_ms: int,
+        *,
+        policy_version: str | None = None,
     ) -> bool:
-        """Atomically claim an executable effect. Only one worker can win."""
+        """Atomically claim an executable effect. Only one worker can win.
+
+        ``policy_version`` records which policy version the attempt was authorized
+        under; a policy change after dispatch starts cannot undo an effect in flight.
+        """
         if not worker_id:
             raise ValueError("worker_id is required")
         if lease_ms <= 0:
@@ -728,7 +738,7 @@ class ProcessingStore:
                     effect_id,
                     worker_id,
                     now_ms,
-                    row["policy_version"],
+                    policy_version or row["policy_version"],
                 ),
             )
             self._append_evidence(

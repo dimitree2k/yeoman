@@ -419,3 +419,22 @@ async def test_unknown_effect_is_never_silently_executed(tmp_path):
     assert "reconciliation" in (receipt.detail or "")
     assert executor.calls == []
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_records_the_authorizing_policy_version(tmp_path):
+    """A policy change after dispatch starts cannot undo an effect in flight."""
+    db = ProcessingStore(tmp_path / "p.db")
+    gateway = EffectGateway(
+        db,
+        authorizer=_Authorizer(),
+        executor=_Executor("sent"),
+        worker_id="worker-a",
+        clock=_Clock(0),
+    )
+    gateway.submit(_envelope())
+    await gateway.execute_ready("fx1")
+
+    effects = db.list_effects()
+    assert effects[0].attempts[0].policy_version == "policy-v1"
+    db.close()
