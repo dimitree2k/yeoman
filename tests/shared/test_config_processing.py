@@ -139,3 +139,22 @@ def test_two_global_generations_are_allowed_but_not_default() -> None:
 
     with pytest.raises(ValidationError):
         ProcessingConfig.model_validate({"threads": {"max_generations_global": 3}})
+
+
+def test_reconciliation_probe_settings() -> None:
+    """Plan 04 defaults: two probes at a time, no provider lookup, no client id echo."""
+    cfg = Config().processing.reconciliation
+    assert cfg.probe_concurrency == 2
+    assert cfg.provider_lookup_enabled is False
+    assert cfg.client_message_id is False
+
+    wider = ProcessingConfig.model_validate(
+        {"reconciliation": {"probe_concurrency": 8, "provider_lookup_enabled": True}}
+    )
+    assert wider.reconciliation.probe_concurrency == 8
+    assert wider.reconciliation.provider_lookup_enabled is True
+
+    with pytest.raises(ValidationError):
+        ProcessingConfig.model_validate({"reconciliation": {"probe_concurrency": 0}})
+    with pytest.raises(ValidationError):
+        ProcessingConfig.model_validate({"reconciliation": {"probe_concurrency": 9}})

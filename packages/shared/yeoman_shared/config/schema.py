@@ -603,6 +603,12 @@ class ProcessingReconciliationConfig(BaseModel):
     deadline_seconds: int = Field(default=600, ge=1)
     claim_lease_seconds: int = Field(default=30, ge=1)
     probe_timeout_ms: int = Field(default=10_000, ge=1)
+    #: Simultaneous probes per reconciliation tick.
+    probe_concurrency: int = Field(default=2, ge=1, le=8)
+    #: Provider lookups stay off by default: the reconciler works locally unless enabled.
+    provider_lookup_enabled: bool = False
+    #: Echo a client message id to the provider (off until the bridge proves idempotency).
+    client_message_id: bool = False
 
     @model_validator(mode="after")
     def _validate_probe_within_lease(self) -> "ProcessingReconciliationConfig":

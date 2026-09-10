@@ -262,6 +262,7 @@ class GatewayRuntime:
     speakup_log: object | None = None
     lull_observer: object | None = None
     processing: "ProcessingStore | None" = None
+    reconciliation: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def run(self) -> None:
@@ -308,6 +309,8 @@ class GatewayRuntime:
                 self.speakup_log.close()
             if hasattr(self.chat_registry, "close"):
                 self.chat_registry.close()
+            if self.reconciliation is not None:
+                await self.reconciliation.stop()
             self.contacts.close()
             self.memory.close()
             if self.processing is not None:
@@ -344,6 +347,29 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
     except Exception:
         logger.exception("processing store unavailable; new processing mode stays offline")
         return None
+
+
+def build_reconciliation_service(
+    config: "Config",
+    store: "ProcessingStore | None",
+    *,
+    probe: object | None = None,
+):
+    """Reconciler for the new mode; ``None`` while processing is off or no store is open.
+
+    Disabled mode stays inert: no store, no database and no background task.
+    """
+    if store is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.reconcile import LocalEvidenceProbe, ReconciliationService
+
+    reconciliation = config.processing.reconciliation
+    evidence = probe or LocalEvidenceProbe(
+        store,
+        provider_lookup_enabled=bool(reconciliation.provider_lookup_enabled),
+    )
+    return ReconciliationService(store, probe=evidence, config=reconciliation)
 
 
 def build_thread_registry(config: "Config", store: "ProcessingStore | None"):
@@ -1474,5 +1500,6 @@ def build_gateway_runtime(
         speakup_log=speakup_log,
         lull_observer=lull_observer,
         processing=processing_store,
+        reconciliation=build_reconciliation_service(config, processing_store),
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

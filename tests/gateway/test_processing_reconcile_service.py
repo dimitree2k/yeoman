@@ -239,3 +239,49 @@ async def test_deadline_escalates_without_further_probes(tmp_path: Path) -> None
     assert store.effect_state(effect_id) == "unknown_nonrepeatable"
     assert probe.calls == 0  # past the deadline no probe is planned
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_factory_is_inert_when_processing_is_disabled(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    from yeoman_gateway.app.bootstrap import (
+        build_processing_store,
+        build_reconciliation_service,
+    )
+    from yeoman_shared.config.schema import Config
+
+    disabled = Config()
+    assert build_reconciliation_service(disabled, None) is None  # no store, no DB, no task
+
+    enabled = Config.model_validate({"processing": {"enabled": True}})
+    with patch.dict("os.environ", {"YEOMAN_HOME": str(tmp_path)}):
+        store = build_processing_store(enabled)
+        assert store is not None
+        service = build_reconciliation_service(enabled, store)
+    assert service is not None
+    assert service.running is False  # built, not started
+    await service.stop()  # a stop without a start is a no-op
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_starts_before_channels_and_stops_before_the_store(tmp_path: Path) -> None:
+    """Start order matters: recovery must run before the first message is processed."""
+    store = ProcessingStore(tmp_path / "p.db")
+    effect_id = _unknown_effect(store)
+    store.claim_effect(effect_id, "dead-worker", T0, 30_000)
+    probe = _CountingProbe(ProbeOutcome.CONFIRMED)
+    service = ReconciliationService(
+        store, probe=probe, config=_Config(), clock=_Clock(T0 + 30_001), tick_seconds=0.05
+    )
+
+    await service.start()
+    await asyncio.sleep(0.15)
+    await service.stop()
+
+    # The recovery happened in the first tick, before anything else could dispatch.
+    assert store.effect_state(effect_id) == "sent"
+    assert probe.calls == 1
+    assert service.running is False
+    store.close()
