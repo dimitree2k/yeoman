@@ -105,6 +105,46 @@ async def test_transport_receipt_confirms_an_unknown_effect(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_late_confirmation_corrects_a_nonrepeatable_effect(tmp_path: Path) -> None:
+    """An escalated effect is never shortened to failed, and late proof still wins."""
+    from yeoman_gateway.processing.models import InvalidTransitionError
+    from yeoman_gateway.processing.signals import attach_receipt_evidence
+
+    store = ProcessingStore(tmp_path / "p.db")
+    effect_id = await _make_unknown(store)
+    assert store.transition(
+        effect_id,
+        expected="unknown",
+        target="unknown_nonrepeatable",
+        now_ms=T0 + 1,
+        evidence={"reason": "probe_deadline"},
+    )
+    assert store.effect_state(effect_id) == "unknown_nonrepeatable"
+
+    # The escalation is not a failure verdict: the state machine refuses `failed`.
+    with pytest.raises(InvalidTransitionError):
+        store.transition(
+            effect_id, expected="unknown_nonrepeatable", target="failed", now_ms=T0 + 2
+        )
+    assert store.effect_state(effect_id) == "unknown_nonrepeatable"
+
+    # A late transport proof still corrects it, and the evidence stays visible.
+    store.record_transport_receipt(
+        effect_id, channel="whatsapp", chat_id=CHAT, provider_message_id="3EB0", now_ms=T0 + 3
+    )
+    attach_receipt_evidence(store, effect_id, now_ms=T0 + 4)
+    result = await reconcile_effect(
+        store, effect_id, probe=LocalEvidenceProbe(store), now_ms=T0 + 5
+    )
+
+    assert result.outcome is ProbeOutcome.CONFIRMED
+    assert store.effect_state(effect_id) == "sent"
+    lineage = store.get_lineage("")
+    assert lineage.effects[0].state == "sent"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_delivery_signal_confirms_without_a_receipt(tmp_path: Path) -> None:
     from yeoman_gateway.processing.signals import WhatsAppSignalMapper
 
