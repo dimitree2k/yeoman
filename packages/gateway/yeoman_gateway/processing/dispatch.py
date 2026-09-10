@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from typing import Any, Protocol, runtime_checkable
 
 from loguru import logger
@@ -36,6 +37,10 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
+
+#: Provenance marker set by the effect transport. The managed-chat guard only lets
+#: outbound messages carrying it through.
+EFFECT_PROVENANCE_KEY = "processing_effect"
 
 #: Capability per payload kind. Enforced again by the authorizer before dispatch.
 CAPABILITY_BY_KIND: Mapping[str, str] = {
@@ -98,8 +103,10 @@ class BusEffectExecutor:
         confirm: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         delete_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         external_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
+        mark_provenance: bool = False,
     ) -> None:
         self._bus = bus
+        self._mark_provenance = mark_provenance
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
@@ -109,6 +116,8 @@ class BusEffectExecutor:
         payload = envelope.payload
         target = envelope.target
 
+        provenance = {EFFECT_PROVENANCE_KEY: envelope.effect_id} if self._mark_provenance else {}
+
         if isinstance(payload, TextPayload):
             await self._bus.publish_outbound(
                 OutboundMessage(
@@ -116,6 +125,7 @@ class BusEffectExecutor:
                     chat_id=target.chat_id,
                     content=payload.text,
                     reply_to=payload.reply_to,
+                    metadata=dict(provenance),
                 )
             )
         elif isinstance(payload, MediaPayload):
@@ -125,6 +135,7 @@ class BusEffectExecutor:
                     chat_id=target.chat_id,
                     content=payload.caption or "",
                     media=list(payload.media),
+                    metadata=dict(provenance),
                 )
             )
         elif isinstance(payload, ReactionPayload):
@@ -179,6 +190,90 @@ class BusEffectExecutor:
         )
 
 
+class EffectNotDeliveredError(ProcessingError):
+    """A managed effect did not reach a proven delivered state.
+
+    Producers must surface this instead of claiming delivery: an accepted queue entry is
+    not a sent message (spec R05).
+    """
+
+
+#: Principal that caused the tool call currently running. Set by the responder, never
+#: read from model arguments.
+CURRENT_PRINCIPAL: ContextVar[str] = ContextVar("yeoman_effect_principal", default="")
+
+
+def classify_outbound(message: OutboundMessage) -> tuple[str, Any]:
+    """Map one outbound message to its capability and typed payload."""
+    metadata = dict(message.metadata or {})
+    delete = metadata.get("delete_message")
+    if isinstance(delete, Mapping) and delete.get("message_id"):
+        return "delete_message", DeletePayload(message_id=str(delete["message_id"]))
+    if message.media:
+        return "send_media", MediaPayload(
+            media=tuple(str(item) for item in message.media),
+            caption=message.content or None,
+        )
+    return "send_text", TextPayload(text=message.content, reply_to=message.reply_to)
+
+
+class ManagedOutboundDispatcher:
+    """Drop-in replacement for ``bus.publish_outbound`` on managed chats.
+
+    Unmanaged chats keep the legacy publish byte-for-byte. Managed chats go through the
+    effect gateway, and an unproven outcome raises instead of pretending success.
+    """
+
+    def __init__(
+        self,
+        *,
+        router: "IntentEffectRouter",
+        bus: EffectTransport,
+        principal: Callable[[], str] | None = None,
+    ) -> None:
+        self._router = router
+        self._bus = bus
+        self._principal = principal or CURRENT_PRINCIPAL.get
+
+    async def __call__(self, message: OutboundMessage) -> None:
+        if not self._router.manages(message.channel, message.chat_id):
+            await self._bus.publish_outbound(message)
+            return
+        capability, payload = classify_outbound(message)
+        receipt = await self._router.submit_message(
+            message, principal=self._principal(), capability=capability, payload=payload
+        )
+        if receipt.state != "sent":
+            raise EffectNotDeliveredError(
+                f"effect not delivered (state={receipt.state}, detail={receipt.detail or '-'})"
+            )
+
+
+def managed_outbound_guard(
+    router: "IntentEffectRouter",
+) -> Callable[[OutboundMessage], tuple[bool, str]]:
+    """Refuse legacy outbound for managed chats unless it carries effect provenance.
+
+    This is the runtime half of "one producer per chat and turn": a producer that was not
+    migrated cannot silently keep sending for an activated chat.
+    """
+
+    def _guard(message: OutboundMessage) -> tuple[bool, str]:
+        if not router.manages(message.channel, message.chat_id):
+            return True, "unmanaged"
+        metadata = dict(message.metadata or {})
+        effect_id = str(metadata.get(EFFECT_PROVENANCE_KEY) or "")
+        if effect_id and router.effect_covers(
+            effect_id, channel=message.channel, chat_id=message.chat_id
+        ):
+            return True, "effect"
+        if effect_id:
+            return False, "forged_effect_provenance"
+        return False, "legacy_outbound_without_effect"
+
+    return _guard
+
+
 class IntentEffectRouter:
     """Turns orchestrator intents into planned effects for managed chats.
 
@@ -199,6 +294,17 @@ class IntentEffectRouter:
         self._config = config
         self._clock = clock or _now_ms
         self._worker_id = worker_id
+
+    def effect_covers(self, effect_id: str, channel: str, chat_id: str) -> bool:
+        """True only for a real persisted effect whose target is this chat."""
+        stored = self._gateway.store.get_effect(effect_id)
+        target = getattr(stored, "target", None)
+        return bool(
+            stored is not None
+            and target is not None
+            and target.channel == channel
+            and target.chat_id == chat_id
+        )
 
     def manages(self, channel: str, chat_id: str) -> bool:
         processing = getattr(self._config, "processing", None)
@@ -250,6 +356,32 @@ class IntentEffectRouter:
             deadline_key="semantic_reaction_ms",
         )
         return True
+
+    async def submit_message(
+        self,
+        message: OutboundMessage,
+        *,
+        principal: str,
+        capability: str,
+        payload: Any,
+    ) -> EffectReceipt:
+        """One entry point for tool/turn producers that used to publish directly."""
+        metadata = dict(message.metadata or {})
+        source = str(metadata.get("message_id") or "turn")
+        return await self._run(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            principal=principal,
+            payload=payload,
+            operation_key=(
+                f"{capability}:{message.channel}:{message.chat_id}:{source}:"
+                f"{canonical_hash(payload_to_mapping(payload))[:12]}"
+            ),
+            trace_id=str(metadata.get("trace_id") or source),
+            deadline_key=(
+                "semantic_reaction_ms" if capability == "send_reaction" else "reactive_ms"
+            ),
+        )
 
     async def _run(
         self,

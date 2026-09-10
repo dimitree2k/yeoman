@@ -414,6 +414,7 @@ class LLMResponder(ResponderPort):
         caldav_service: "CalDAVService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        effect_router: object | None = None,
         memory_service: "MemoryService | None" = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
@@ -456,6 +457,7 @@ class LLMResponder(ResponderPort):
         self._model_router = model_router
         self._routed_provider_factory = routed_provider_factory
         self._tts = tts
+        self._effect_router = effect_router
         self._whatsapp_tts_outgoing_dir = whatsapp_tts_outgoing_dir
         self._whatsapp_tts_max_raw_bytes = max(1, int(whatsapp_tts_max_raw_bytes))
         self._recording_notifier = recording_notifier
@@ -552,13 +554,13 @@ class LLMResponder(ResponderPort):
         self.tools.register(BrowseTool())
 
         message_tool = MessageTool(
-            send_callback=self.bus.publish_outbound,
+            send_callback=self._outbound_dispatch_callback,
             group_resolver=self._resolve_group_reference,
         )
         self.tools.register(message_tool)
         self.tools.register(
             DeleteMessageTool(
-                send_callback=self.bus.publish_outbound,
+                send_callback=self._outbound_dispatch_callback,
                 group_resolver=self._resolve_group_reference,
             )
         )
@@ -819,6 +821,31 @@ class LLMResponder(ResponderPort):
             return self._model_router.resolve(task_key)
         return self._model_router.resolve(task_key, channel=channel)
 
+    async def _outbound_dispatch_callback(self, message: OutboundMessage) -> None:
+        """Single outbound entry point for tool producers.
+
+        Managed chats run through the effect gateway; every other chat keeps the legacy
+        direct publish. The principal comes from the turn context, never from tool
+        arguments.
+        """
+        dispatcher = self._managed_outbound_dispatcher()
+        if dispatcher is None:
+            await self.bus.publish_outbound(message)
+            return
+        await dispatcher(message)
+
+    def _managed_outbound_dispatcher(self):
+        router = self._effect_router
+        if router is None:
+            return None
+        from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+        return ManagedOutboundDispatcher(router=router, bus=self.bus)
+
+    def set_effect_router(self, router: object | None) -> None:
+        """Attach (or detach) the new-mode effect router for tool producers."""
+        self._effect_router = router
+
     async def _send_voice_message(self, request: VoiceSendRequest) -> str:
         channel = str(request.channel or "").strip()
         chat_id = str(request.chat_id or "").strip()
@@ -874,15 +901,18 @@ class LLMResponder(ResponderPort):
 
         out_dir = self._whatsapp_tts_outgoing_dir / "tts"
         path = write_tts_audio_file(out_dir, audio, ext=".ogg")
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content="",
-                reply_to=str(request.reply_to or "").strip() or None,
-                media=[str(path)],
+        try:
+            await self._outbound_dispatch_callback(
+                OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content="",
+                    reply_to=str(request.reply_to or "").strip() or None,
+                    media=[str(path)],
+                )
             )
-        )
+        except Exception as exc:
+            return f"Error: voice message not delivered ({exc})"
         return f"Voice message delivered to {channel}:{chat_id}."
 
     @staticmethod
@@ -2159,6 +2189,9 @@ class LLMResponder(ResponderPort):
         else:
             _user_message_already_added = False
 
+        from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
+
+        CURRENT_PRINCIPAL.set(str(sender_id or ""))
         self._set_tool_context(
             channel=channel,
             chat_id=chat_id,

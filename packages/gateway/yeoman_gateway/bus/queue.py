@@ -50,6 +50,12 @@ class MessageBus:
         )
         self._ipc_queue: asyncio.Queue[OverseerCommand] = asyncio.Queue()  # unbounded
         self._event_handlers: dict[str, list[Callable[[GatewayEvent], Awaitable[None]]]] = {}
+        # Optional guard for the new processing mode: when set, outbound messages for a
+        # managed chat must carry an effect provenance or they are refused and logged
+        # (spec R05: per chat/turn either the legacy or the new producer, never both).
+        self._managed_outbound_guard: (
+            Callable[[OutboundMessage], tuple[bool, str]] | None
+        ) = None
         self._running = False
         self._inbound_dropped = 0
         self._outbound_dropped = 0
@@ -138,8 +144,24 @@ class MessageBus:
         """Consume the next inbound message (blocks until available)."""
         return await self.inbound.get()
 
+    def set_managed_outbound_guard(
+        self, guard: Callable[[OutboundMessage], tuple[bool, str]] | None
+    ) -> None:
+        """Install the managed-chat guard for the new processing mode."""
+        self._managed_outbound_guard = guard
+
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
+        if self._managed_outbound_guard is not None:
+            allowed, reason = self._managed_outbound_guard(msg)
+            if not allowed:
+                logger.warning(
+                    "refusing legacy outbound for a managed chat channel={} chat={} reason={}",
+                    safe_log_token(msg.channel, max_length=40),
+                    private_log_identifier(msg.chat_id),
+                    reason,
+                )
+                return
         logger.info(
             "MessageBus outbound channel={} chat={} message_id={} chars={}",
             safe_log_token(msg.channel, max_length=40),

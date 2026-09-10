@@ -412,3 +412,230 @@ def test_decision_records_keep_policy_identity(tmp_path: Path) -> None:
     assert record.policy_version == "policy-v1"
     assert record.policy_hash == "hash-v1"
     assert record.created_ms == 5
+
+
+# --------------------------------------------------------------------------------------
+# tool producers (Plan 02, Aufgabe 2)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_message_tool_goes_through_the_gateway_for_managed_chats(tmp_path: Path) -> None:
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+    tool = MessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=bus))
+
+    result = await tool.execute(content="hi", channel="whatsapp", chat_id=CHAT)
+
+    assert len(executor.calls) == 1
+    assert executor.calls[0].capability == "send_text"
+    assert bus.sent == []
+    assert "delivered" in result.lower()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_message_tool_keeps_legacy_publish_for_unmanaged_chats(tmp_path: Path) -> None:
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(
+        gateway=gateway, config=_config(chats=("whatsapp:elsewhere@g.us",)), clock=_Clock(0)
+    )
+    bus = _RecordingBus()
+    tool = MessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=bus))
+
+    result = await tool.execute(content="hi", channel="whatsapp", chat_id=CHAT)
+
+    assert [message.content for message in bus.sent] == ["hi"]
+    assert executor.calls == []
+    assert "delivered" in result.lower()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unproven_effect_is_never_reported_as_delivered(tmp_path: Path) -> None:
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(bus=bus),
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0))
+    tool = MessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=bus))
+
+    result = await tool.execute(content="hi", channel="whatsapp", chat_id=CHAT)
+
+    assert [message.content for message in bus.sent] == ["hi"]
+    assert result.startswith("Error")
+    assert "delivery complete" not in result.lower()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_delete_is_disabled_until_a_contract_exists(tmp_path: Path) -> None:
+    from yeoman_gateway.agent.tools.delete_message import DeleteMessageTool
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(bus=bus),
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0))
+    tool = DeleteMessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=bus))
+    tool.set_context("whatsapp", CHAT, is_owner=True)
+
+    result = await tool.execute(message_id="m1")
+
+    assert bus.sent == []
+    assert result.startswith("Error")
+    effects = store.get_lineage("turn").effects
+    assert effects and effects[0].state == "unknown"
+    assert effects[0].capability == "delete_message"
+    store.close()
+
+
+def test_outbound_classification_is_explicit() -> None:
+    from yeoman_gateway.processing.dispatch import classify_outbound
+
+    capability, payload = classify_outbound(
+        OutboundMessage(channel="whatsapp", chat_id=CHAT, content="hi")
+    )
+    assert capability == "send_text"
+    assert isinstance(payload, TextPayload)
+
+    capability, _ = classify_outbound(
+        OutboundMessage(channel="whatsapp", chat_id=CHAT, content="", media=["/tmp/a.ogg"])
+    )
+    assert capability == "send_media"
+
+    capability, payload = classify_outbound(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="",
+            metadata={"delete_message": {"message_id": "m9"}},
+        )
+    )
+    assert capability == "delete_message"
+    assert payload.message_id == "m9"
+
+
+@pytest.mark.asyncio
+async def test_legacy_publish_is_refused_for_managed_chats(tmp_path: Path) -> None:
+    """Runtime half of "one producer per chat and turn"."""
+    from yeoman_gateway.processing.dispatch import (
+        EFFECT_PROVENANCE_KEY,
+        BusEffectExecutor,
+        managed_outbound_guard,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = MessageBus()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(bus=bus, mark_provenance=True),
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0))
+    bus.set_managed_outbound_guard(managed_outbound_guard(router))
+
+    # A legacy producer without provenance is dropped, not delivered.
+    await bus.publish_outbound(OutboundMessage(channel="whatsapp", chat_id=CHAT, content="legacy"))
+    assert bus.outbound.empty()
+
+    # An unmanaged chat keeps the legacy path.
+    await bus.publish_outbound(
+        OutboundMessage(channel="whatsapp", chat_id="free@g.us", content="legacy")
+    )
+    assert (await bus.consume_outbound()).content == "legacy"
+
+    # The effect transport carries provenance and passes.
+    await router.submit_outbound(_outbound("managed"), principal="owner@s.whatsapp.net")
+    delivered = await bus.consume_outbound()
+    assert delivered.content == "managed"
+    assert delivered.metadata.get(EFFECT_PROVENANCE_KEY)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_provenance_cannot_be_forged_by_a_producer(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EFFECT_PROVENANCE_KEY,
+        managed_outbound_guard,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    guard = managed_outbound_guard(router)
+
+    allowed, reason = guard(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="forged",
+            metadata={EFFECT_PROVENANCE_KEY: "fx-not-real"},
+        )
+    )
+    # The marker alone proves nothing: it must name a persisted effect for this chat.
+    assert allowed is False
+    assert reason == "forged_effect_provenance"
+
+    # A real effect for a different chat does not authorize this target either.
+    receipt_gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=_Executor("sent"),
+        clock=_Clock(0),
+    )
+    envelope = EffectEnvelope(
+        effect_id="fx-other",
+        operation_key="k-other",
+        payload=TextPayload(text="x"),
+        target=EffectTarget(channel="whatsapp", chat_id="other-chat@g.us"),
+    )
+    receipt_gateway.submit(envelope)
+    allowed, reason = guard(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="forged",
+            metadata={EFFECT_PROVENANCE_KEY: "fx-other"},
+        )
+    )
+    assert allowed is False and reason == "forged_effect_provenance"
+    store.close()

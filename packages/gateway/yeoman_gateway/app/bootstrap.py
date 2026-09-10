@@ -392,7 +392,7 @@ def build_effect_router(
                 known_tools=lambda: set(policy_adapter.known_tools),
             ),
         ),
-        executor=BusEffectExecutor(bus=bus),
+        executor=BusEffectExecutor(bus=bus, mark_provenance=True),
     )
     return IntentEffectRouter(gateway=gateway, config=config)
 
@@ -550,6 +550,12 @@ def build_gateway_runtime(
         _caldav_service = CalDAVService(_caldav_user, _caldav_pass)
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
+    effect_router = build_effect_router(config, policy_adapter, processing_store, bus)
+    if effect_router is not None:
+        from yeoman_gateway.processing.dispatch import managed_outbound_guard
+
+        bus.set_managed_outbound_guard(managed_outbound_guard(effect_router))
+
     responder = LLMResponder(
         provider=provider,
         workspace=workspace,
@@ -562,6 +568,7 @@ def build_gateway_runtime(
         exec_config=exec_config,
         restrict_to_workspace=restrict_to_workspace,
         session_manager=session_manager,
+        effect_router=effect_router,
         memory_service=memory_service,
         telemetry=telemetry,
         security=security,
@@ -1082,7 +1089,7 @@ def build_gateway_runtime(
         typing_adapter=typing_adapter,
         telemetry=telemetry,
         memory=memory_service,
-        effect_router=build_effect_router(config, policy_adapter, processing_store, bus),
+        effect_router=effect_router,
     )
 
     # IPC socket for overseer commands
