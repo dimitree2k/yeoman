@@ -23,6 +23,8 @@
 |---|---|
 | **Policy engine** | Deterministic per-channel, per-chat access control with hot-reload — no ad-hoc ACLs |
 | **Multi-channel** | Telegram, WhatsApp (Baileys bridge), Discord, Feishu — unified pipeline |
+| **Durable processing** | Journal → threads/turns → effect outbox → transport receipts → reconciliation: every send is either provable or explicitly unresolved, never guessed |
+| **Shared memory** | Source-bound facts with an audience, permission decided *before* retrieval, revocation that bumps a permission epoch |
 | **Memory** | SQLite-backed semantic + FTS recall with session context and background notes |
 | **Voice** | STT via Groq Whisper, TTS via ElevenLabs / OpenRouter — bidirectional voice in WhatsApp |
 | **Tools & skills** | Sandboxed execution (bubblewrap), extensible skill system (OpenClaw-compatible) |
@@ -40,9 +42,163 @@ Intent dispatch → Bus (outbound/reaction) → Channel → User
 
 Hexagonal / ports-and-adapters. `core/ports.py` defines interfaces (`PolicyPort`, `ResponderPort`, `ReplyArchivePort`, `SecurityPort`, `TelemetryPort`); adapters implement them. The pipeline emits typed `OrchestratorIntent` objects; channels react asynchronously. Media (ASR/TTS/vision) is cross-cutting — channels enrich inbound, the responder synthesizes outbound.
 
+On top of that pipeline sits the **stateful processing line** added by the phase work
+(01–06). It is opt-in per chat and inert by default:
+
+```
+inbound event
+   │
+   ├─ fast gate ── deny ──▶ archived, journaled, dropped (no model call)
+   │                 │
+   │              allow / shadow
+   ▼                 ▼
+canonical journal ─▶ join rules ─▶ thread + turn (revision, authority)
+ (event_id,           (bundle,          │
+  event_key,           follow-up,       ▼
+  payload_hash,        new thread)   actor: freeze snapshot ▶ generate ▶ commit
+  revision)                              │
+                                         ▼
+                                   effect outbox (CAS state machine)
+                                         │
+                  budget gate ───────────┤ (hard chat budget, waiting-outbox cap)
+                                         ▼
+                                   managed dispatch ─▶ transport
+                                         │                 │
+                                         ▼                 ▼
+                                 transport receipt   provider message id
+                                         │
+                                         ▼
+                          reconciler: probe, escalate, or confirm
+```
+
 <p align="center">
   <img src="yeoman_arch.svg" alt="architecture" width="900">
 </p>
+
+## Stateful message processing (Phases 01–06)
+
+Everything below is disabled unless a chat is explicitly activated
+(`processing.enabled` + `processing.chats`); `memory.shared.*` is a second, separate opt-in.
+Non-activated chats keep the legacy path byte-for-byte.
+
+### 01 · Journal and lineage
+
+Every inbound event is canonicalised before any expensive work: `event_id`, deterministic
+`event_key`, `trace_id`, `payload_hash`, channel/chat/principal, and its relation to the
+parent event. Payloads are hashed, so dedup and lineage survive payload removal. The journal
+is the single source of truth for *what happened*; effects and facts point back into it.
+
+### 02 · Migration and egress control
+
+Every mutating path is classified as **migrated** (routes through the effect gateway for a
+managed chat), **blocked** (refused at runtime), or **legacy** (untouched, therefore refused
+for a managed chat). Capabilities without an idempotency contract (`a2a_delegate`, `exec`,
+`browse`, `calendar`) are disabled for activated chats, and a legacy producer cannot publish
+into a managed chat unless it carries valid effect provenance.
+
+### 03 · Threads, turns and cancellation
+
+A join rule decides whether an event **starts a thread**, **bundles** into the open turn, or
+**continues** a thread as a follow-up. Each turn carries a principal, a revision and a
+context version; the actor freezes a snapshot before generation, so an effect always belongs
+to the turn and revision that produced it. A correction during a provider call bumps the
+revision and cancels the stale effects instead of letting a later turn silently authorise
+them.
+
+### 04 · Effect outbox, receipts and reconciliation
+
+Effects move through a compare-and-set state machine:
+
+| State | Meaning |
+|---|---|
+| `planned` · `queued` · `executing` | admitted, waiting, claimed by a worker |
+| `sent` | **proven**: the transport returned, or a probe/receipt confirmed it |
+| `blocked` · `expired` · `cancelled` · `failed` | refused with a reason, timed out, superseded, or provably not executed |
+| `unknown` | dispatched but unproven — *not* a failure verdict |
+| `unknown_nonrepeatable` | deadline passed; never silently downgraded to `failed` |
+
+`sent` waits for nothing but the transport: read and delivery receipts are additional
+evidence and can never downgrade a state. A claimed effect lost to a crash recovers to
+`unknown` with a scheduled probe — never back to `queued`. The reconciler probes with
+backoff (5 s → 600 s, six probes, 600 s deadline by default) and never re-executes the
+original effect; a late receipt still corrects `unknown_nonrepeatable` to `sent`.
+
+The WhatsApp bridge speaks **protocol v4**: edit, delete, reaction and receipt signals plus
+`lookup_message` are journaled as first-class events.
+
+### 05 · Shared memory: facts with an author and an audience
+
+A shared fact is a memory node with provenance (`memory2_facts`, `memory2_fact_sources`), an
+audience (`memory2_fact_principals`) and a lifecycle. Two rules define it:
+
+- **Permission is a candidate filter, not a post-filter.** The reader is bound into the SQL
+  `WHERE` clause, so a forbidden fact is never retrieved, ranked, embedded or rendered. A
+  recheck against the current rows runs again immediately before output, and every rights
+  change bumps `acl_epoch`, so no cached decision outlives it.
+- **Facts fail closed.** The audience is the *intersection* of the sources' proven
+  participants — never a union — and unknown membership means no injection. New group
+  members inherit nothing; assistant text, summaries and private-handoff content are never
+  sources.
+
+Extraction is a bounded, source-versioned background job (one model call per settled turn,
+at most four candidates, bounded queue) triggered by turn quiescence (60 s idle, 300 s cap).
+The model only *proposes*: a deterministic screen refuses opinions, speculation, inferences,
+delivery claims, meta-statements ("the author says …") and unresolved relative time. Facts
+are stored with an embedding so they are findable by meaning, and a failing embedding
+provider never loses the fact. Corrections and deletions invalidate derived facts
+idempotently and redact text, FTS rows and vectors — while naming the copies they do *not*
+purge.
+
+Facts can be backfilled from archived history; the command is dry-run by default (one model
+call per batch) and marks historical sources `archive:<message_id>` so they stay
+distinguishable from live-turn facts:
+
+```bash
+yeoman memory facts backfill --chat <chat-id> --since 2026-08-11 --batch-size 20
+yeoman memory facts backfill --chat <chat-id> --since 2026-08-11 --apply
+```
+
+### 06 · Budgets, integration and staged rollout
+
+Sends are budgeted per chat with a **sliding, persisted, attempt-idempotent** reservation:
+capacity returns 60 s after each individual send rather than at a minute boundary, the same
+attempt never spends twice, a genuinely new attempt counts again, and a restart does not hand
+capacity back. A soft per-thread limit is measured by default and enforced only when
+`processing.budgets.threadSoftEnforce` is set — without a re-queue worker a refusal would
+drop a reply instead of delaying it.
+
+The rollout order is in the runbook: introduce the mode **disabled**, then **shadowed**
+(journal and decide, but never send), then activate one chat, then consider shared memory.
+Rollback is a configuration change: it stops new admissions, leaves claims and unresolved
+effects intact, and deletes neither a database nor an archive.
+
+### Data, schemas and retention — as they actually are
+
+| Store | Schema | Notes |
+|---|---|---|
+| `data/processing/processing.db` | **5** | events, relations, threads, turns, generations, effects, attempts, evidence, receipts, probes, budget reservations |
+| `data/memory/memory.db` | **2** | legacy nodes and embeddings, plus facts, sources, principals and extraction jobs |
+| `data/inbound/reply_context.db` | — | inbound archive, **kept complete**: nothing is purged, and messages refused by the fast gate are recorded too |
+
+Two honest limits: **journal payload retention is implemented but not scheduled**, so event
+and effect payloads currently persist despite the configured windows; and a revocation cannot
+reach SQLite backups, the archive, session-state files, or anything a model provider already
+received. Both are stated in the runbook rather than implied away.
+
+### Operating it
+
+```bash
+yeoman status                                 # config, policy, workspace, providers
+yeoman channels whatsapp bridge status
+systemctl --user show yeoman-gateway -p MainPID -p NRestarts -p ActiveState
+yeoman logs | grep -E "protocol v|processing mode|thread_assigned|effect blocked"
+yeoman memory facts list --limit 20           # shared facts: metadata only
+yeoman memory facts jobs --state queued       # extraction backlog
+```
+
+See [`docs/architecture/processing-rollout-runbook.md`](docs/architecture/processing-rollout-runbook.md)
+for the full procedure: current state, disabled introduction, admission stop, status query,
+**WAL-safe backup** (never `cp` a live SQLite file), restart, bridge/IPC checks and rollback.
 
 ## Install
 
@@ -162,7 +318,7 @@ yeoman gateway           # start
 { "channels": { "whatsapp": { "enabled": true } } }
 ```
 
-Supports voice (STT + TTS), bridge lifecycle management (`yeoman channels bridge start|stop|restart|status`), and media persistence.
+Supports voice (STT + TTS), bridge lifecycle management (`yeoman channels bridge start|stop|restart|status`), and media persistence. The bridge speaks **protocol v4**: besides messages it reports edits, deletions, reactions and receipts, and answers `lookup_message` from its cache. A gateway that expects a different protocol refuses to start rather than talking past the bridge (`bridge.manifest.json` is validated against `PROTOCOL_VERSION`).
 
 ### Feishu
 
@@ -307,6 +463,18 @@ Exit codes:
 
 The doctor does not auto-fix anything; it reports findings and proposed fixes first.
 
+For the stateful processing line, check these directly:
+
+```bash
+systemctl --user show yeoman-gateway -p ActiveState -p NRestarts -p MainPID
+yeoman logs | grep -E "protocol v|processing mode|thread_assigned|assignment_unavailable|effect blocked"
+yeoman memory facts jobs --state queued     # extraction backlog
+```
+
+A gateway start that exits with status 0 is the single-instance guard, not a crash; a start
+that exits 1 with "Bridge manifest protocol mismatch" means bridge and gateway disagree about
+the protocol version.
+
 ## CLI Reference
 
 | Command | Description |
@@ -335,6 +503,13 @@ The doctor does not auto-fix anything; it reports findings and proposed fixes fi
 | `yeoman memory prune` | Retention cleanup |
 | `yeoman memory reindex` | Rebuild FTS index |
 | `yeoman memory notes status\|set` | Per-chat background notes config |
+| **Shared facts** (admin) | |
+| `yeoman memory facts list` | List facts as metadata only — no raw text of other principals |
+| `yeoman memory facts show <id> [--content]` | One fact: status, audience, sources |
+| `yeoman memory facts revoke <id>…` | Tombstone, redact text/FTS/vector, bump the permission epoch |
+| `yeoman memory facts supersede <id> --by <ref>` | Mark a fact superseded by a replacement |
+| `yeoman memory facts jobs [--state queued]` | Extraction backlog and skip reasons |
+| `yeoman memory facts backfill --chat <id> --since <date>` | Extract facts from history — **dry-run** unless `--apply` |
 | **Config** | |
 | `yeoman config migrate-to-env` | Move secrets from config.json to .env |
 | **Overseer** | |
@@ -346,6 +521,66 @@ The doctor does not auto-fix anything; it reports findings and proposed fixes fi
 | **Cron** | |
 | `yeoman cron list\|add\|remove\|enable\|run` | Manage scheduled tasks |
 | `yeoman cron add-voice` | Schedule voice broadcast jobs |
+
+## Configuration Reference
+
+### `processing.*` — the stateful mode
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | master switch; `false` keeps the chat on the legacy path |
+| `chats` | `[]` | activated chats, `whatsapp:<chat-id>` |
+| `shadowChats` | `[]` | journal and decide, never send |
+| `dbPath` | `data/processing/processing.db` | journal, threads, effects, receipts, probes |
+| `budgets.chatHardUnits` / `chatHardWindowSeconds` | `6` / `60` | hard per-chat send budget (sliding) |
+| `budgets.threadSoftUnits` / `threadSoftWindowSeconds` | `2` / `10` | soft per-thread limit |
+| `budgets.threadSoftEnforce` | `false` | enforce the soft limit as a refusal (needs the re-queue worker) |
+| `budgets.outboxWaitingPerChat` | `20` | waiting-outbox cap; overflow blocks visibly |
+| `extraction.idleSeconds` / `maxDelaySeconds` | `60` / `300` | when a turn counts as settled |
+| `reconciliation.backoffSeconds` | `[5,15,45,120,300,600]` | probe schedule for `unknown` effects |
+| `reconciliation.maxProbes` / `deadlineSeconds` | `6` / `600` | escalation to `unknown_nonrepeatable` |
+| `reconciliation.claimLeaseSeconds` | `30` | a crashed claim recovers as `unknown` after this |
+| `reconciliation.providerLookupEnabled` | `false` | provider lookups stay off (no proven contract) |
+| `reconciliation.clientMessageId` | `false` | echo a client message id (off until the bridge proves idempotency) |
+| `retention.journalPayloadDays` / `lineageMetadataDays` / `unresolvedDays` / `sharedFactDays` | `7` / `30` / `90` / `90` | configured windows — see the retention caveat above |
+
+### `memory.shared.*` — shared facts
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | read path plus runtime; needs `memory.enabled` and `processing.enabled` |
+| `extractionEnabled` | `false` | the extraction worker; without it no fact is ever created |
+| `extractorVersion` | `shared-facts-v1` | stamped on every fact and part of the job key |
+| `maxJobsWaiting` | `64` | queue cap; overflow is `skipped/queue_full`, never silent |
+| `requireKnownMembership` | `true` | unknown membership injects nothing |
+
+Config keys are camelCase in `config.json` and snake_case in the Pydantic schema; the loader
+converts. `Config` keeps `extra="ignore"`, so an existing config file keeps loading.
+
+## Testing & Quality
+
+```bash
+uv run pytest -q                    # full Python suite
+uv run ruff check .                 # lint
+git diff --check                    # whitespace / conflict markers
+cd packages/bridge && npm run build && npm test   # bridge (TypeScript, node --test)
+```
+
+The suite isolates itself from live state: `tests/conftest.py` points `YEOMAN_HOME` at a
+throwaway directory, so a test that forgets to pin a database path cannot open the runtime
+tree. Tests live in `tests/gateway`, `tests/shared` and `tests/overseer`; new files under the
+ignored `tests/gateway/*` need a matching `!tests/gateway/<file>` entry in `.gitignore`.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/architecture/processing-rollout-runbook.md`](docs/architecture/processing-rollout-runbook.md) | staged rollout, admission stop, WAL-safe backup, rollback, deletion limits |
+| [`packages/overseer/README.md`](packages/overseer/README.md) | overseer runbooks, triggers, safety rails |
+| [`CHANGELOG.md`](CHANGELOG.md) | release history |
+
+The phased design notes and their evidence lists (plans 01–06, per-task acceptance records)
+are kept as private working documents outside this repository.
 
 ## Docker
 
@@ -366,7 +601,10 @@ packages/
 │       ├── channels/     Telegram, WhatsApp, Discord, Feishu
 │       ├── providers/    LLM registry, LiteLLM wrapper, transcription
 │       ├── policy/       Engine, schema, identity normalization, personas
-│       ├── memory/       SQLite store, embeddings, extractor, sessions
+│       ├── processing/   Journal, threads/turns, actor, effect outbox, dispatch,
+│       │                 budgets, receipts, reconciliation, timings
+│       ├── memory/       SQLite store, embeddings, extractor, sessions,
+│       │                 shared facts, read gate, extraction jobs, archive backfill
 │       ├── media/        ASR, TTS, vision, routing
 │       ├── security/     Rule engine, bubblewrap isolation
 │       ├── skills/       Bundled skills (github, weather, cron, tmux...)
