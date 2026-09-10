@@ -824,3 +824,111 @@ def memory_facts_jobs(
     console.print(table)
     console.print(f"queued: {waiting}")
 
+
+@facts_app.command("backfill")
+def memory_facts_backfill(
+    chat: str = typer.Option(..., "--chat", help="Chat id to backfill"),
+    channel: str = typer.Option("whatsapp", "--channel"),
+    since: str = typer.Option(
+        ..., "--since", help="ISO date/time, e.g. 2026-08-11 or 2026-08-11T09:00:00"
+    ),
+    batch_size: int = typer.Option(20, "--batch-size", min=1, max=100),
+    max_batches: int = typer.Option(20, "--max-batches", min=1),
+    max_messages: int = typer.Option(300, "--max-messages", min=1),
+    apply: bool = typer.Option(
+        False, "--apply/--dry-run", help="Dry run by default: it plans and estimates only"
+    ),
+) -> None:
+    """Extract shared facts from archived history. One model call per batch.
+
+    Facts from history reference ``archive:<message_id>`` as their source, so they stay
+    distinguishable from facts derived from live turns.
+    """
+    import time
+    from datetime import UTC, datetime
+
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.memory.archive_backfill import (
+        ArchiveEventSource,
+        run_archive_backfill,
+    )
+    from yeoman_gateway.memory.extraction_jobs import SharedFactExtractionQueue
+    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+    from yeoman_gateway.storage.chat_registry import ChatRegistry
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    config = load_config()
+    try:
+        parsed = datetime.fromisoformat(since)
+    except ValueError:
+        console.print(f"[red]invalid --since value:[/red] {since}")
+        raise typer.Exit(code=2) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    since_ms = int(parsed.timestamp() * 1000)
+
+    registry = ChatRegistry()
+    archive = InboundArchive(retention_days=None)
+    with _memory_service_context() as service:
+        try:
+            extractor = SharedFactExtractor(
+                config=config,
+                route_key=config.memory.capture.extract_route,
+                member_provider=_registry_member_lookup(registry),
+            )
+        except Exception as exc:
+            console.print(f"[red]extractor unavailable:[/red] {exc}")
+            raise typer.Exit(code=1) from None
+        source = ArchiveEventSource(archive)
+        queue = SharedFactExtractionQueue(
+            store=service.store,
+            journal=source,
+            extractor=extractor,
+            embedder=service.embedding,
+            clock=lambda: int(time.time() * 1000),
+        )
+        report = run_archive_backfill(
+            archive=archive,
+            queue=queue,
+            channel=channel,
+            chat_id=chat,
+            workspace_id=service.workspace_id,
+            since_ms=since_ms,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            max_messages=max_messages,
+            dry_run=not apply,
+        )
+    archive.close()
+    registry.close()
+
+    console.print("[bold]Shared fact backfill[/bold]")
+    for line in report.as_lines():
+        console.print(line)
+    if report.dry_run:
+        console.print("re-run with --apply to execute")
+
+
+def _registry_member_lookup(registry):
+    """Proven participants from the chat registry, or ``None`` when unproven."""
+    def _lookup(channel: str, chat_id: str):
+        record = registry.get_chat(channel, chat_id)
+        if not isinstance(record, dict):
+            return None
+        meta = record.get("metadata")
+        participants = meta.get("participants") if isinstance(meta, dict) else None
+        if not isinstance(participants, list) or not participants:
+            return None
+        members = set()
+        for item in participants:
+            if isinstance(item, str):
+                members.add(item)
+            elif isinstance(item, dict):
+                for key in ("id", "jid", "lid", "phoneNumber", "user_id"):
+                    if item.get(key):
+                        members.add(str(item[key]))
+                        break
+        return frozenset(members) if members else None
+
+    return _lookup

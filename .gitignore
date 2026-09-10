@@ -101,6 +101,7 @@ tests/gateway/*
 !tests/gateway/test_processing_timings.py
 !tests/gateway/test_inbound_archive_range.py
 !tests/gateway/test_memory_fact_extractor.py
+!tests/gateway/test_memory_archive_backfill.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py
