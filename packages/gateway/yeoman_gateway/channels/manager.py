@@ -285,7 +285,7 @@ class ChannelManager:
                 e,
             )
 
-    async def send_now(self, message: OutboundMessage) -> None:
+    async def send_now(self, message: OutboundMessage) -> dict[str, Any] | None:
         """Send one already-authorized message directly through its channel.
 
         This is the transport adapter for approved effects: the call returns only after
@@ -296,9 +296,9 @@ class ChannelManager:
         channel = self.channels.get(message.channel)
         if channel is None:
             raise RuntimeError(f"channel not available: {message.channel}")
-        await channel.send(message)
+        return await channel.send(message)
 
-    async def send_reaction_now(self, message: ReactionMessage) -> None:
+    async def send_reaction_now(self, message: ReactionMessage) -> dict[str, Any] | None:
         """Transport adapter for approved reaction effects."""
         channel = self.channels.get(message.channel)
         if channel is None:
@@ -306,7 +306,7 @@ class ChannelManager:
         sender = getattr(channel, "send_reaction", None)
         if sender is None:
             raise RuntimeError(f"channel does not support reactions: {message.channel}")
-        await sender(message)
+        return await sender(message)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

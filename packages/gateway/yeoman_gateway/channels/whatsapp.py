@@ -390,13 +390,13 @@ class WhatsAppChannel(BaseChannel):
             message_id = str(delete_request.get("message_id") or "").strip()
             if not message_id:
                 raise RuntimeError("WhatsApp delete request missing message_id")
-            await self._send_command_with_retry(
+            result = await self._send_command_with_retry(
                 "delete_message",
                 {"chatJid": msg.chat_id, "messageId": message_id},
                 timeout_seconds=20.0,
                 max_attempts=self._send_attempts(msg.metadata),
             )
-            return
+            return _receipt_from_bridge(result, target_message_id=message_id)
 
         reaction = msg.metadata.get("reaction") if isinstance(msg.metadata, dict) else None
         if isinstance(reaction, dict):
@@ -413,12 +413,13 @@ class WhatsAppChannel(BaseChannel):
                     payload["participantJid"] = participant
                 if "from_me" in reaction:
                     payload["fromMe"] = bool(reaction.get("from_me"))
-                await self._send_command_with_retry(
+                result = await self._send_command_with_retry(
                     "react",
                     payload,
                     timeout_seconds=12.0,
                     max_attempts=self._send_attempts(msg.metadata),
                 )
+                return _receipt_from_bridge(result, target_message_id=reaction_message_id)
                 if bool(msg.metadata.get("reaction_only", False)):
                     return
 
@@ -432,6 +433,7 @@ class WhatsAppChannel(BaseChannel):
         if msg.media:
             caption_used = False
             sent_any_media = False
+            media_receipt: dict[str, Any] | None = None
             for media_path in msg.media:
                 validated = self._media_storage.validate_outgoing_path(media_path)
                 if validated is None or not validated.exists() or not validated.is_file():
@@ -469,12 +471,13 @@ class WhatsAppChannel(BaseChannel):
                     payload["replyToMessageId"] = reply_to
                 if allow_mentions and caption:
                     payload["mentions"] = list(mentions)
-                await self._send_command_with_retry(
+                media_result = await self._send_command_with_retry(
                     "send_media",
                     payload,
                     timeout_seconds=30.0,
                     max_attempts=self._send_attempts(msg.metadata),
                 )
+                media_receipt = _receipt_from_bridge(media_result)
                 sent_any_media = True
 
                 # Best-effort cleanup for generated TTS voice notes.
@@ -487,7 +490,7 @@ class WhatsAppChannel(BaseChannel):
                         validated.unlink()
 
             if sent_any_media:
-                return
+                return media_receipt
             if not text:
                 raise RuntimeError(
                     "WhatsApp outbound had no valid media and no text"
@@ -504,12 +507,13 @@ class WhatsAppChannel(BaseChannel):
             payload["replyToMessageId"] = reply_to
         if allow_mentions:
             payload["mentions"] = list(mentions)
-        await self._send_command_with_retry(
+        text_result = await self._send_command_with_retry(
             "send_text",
             payload,
             timeout_seconds=20.0,
             max_attempts=self._send_attempts(msg.metadata),
         )
+        return _receipt_from_bridge(text_result)
 
     async def start_typing(self, chat_id: str) -> None:
         """Public typing API used by policy-aware orchestration."""
@@ -541,12 +545,13 @@ class WhatsAppChannel(BaseChannel):
         }
         if msg.participant_jid:
             payload["participantJid"] = msg.participant_jid
-        await self._send_command_with_retry(
+        result = await self._send_command_with_retry(
             "react",
             payload,
             timeout_seconds=20.0,
             max_attempts=self._send_attempts(msg.metadata),
         )
+        return _receipt_from_bridge(result, target_message_id=msg.message_id)
 
     async def _verify_bridge_health(self, token: str, timeout_seconds: float) -> None:
         response = await self._send_command(
@@ -1795,3 +1800,25 @@ class WhatsAppChannel(BaseChannel):
         low = max(100.0, capped - jitter)
         high = capped + jitter
         return int(random.uniform(low, high))
+
+
+def _receipt_from_bridge(
+    result: Any, *, target_message_id: str | None = None
+) -> dict[str, Any] | None:
+    """Normalise a bridge reply into the receipt the effect layer persists.
+
+    ``send_text``/``send_media`` report ``messageId``; ``react`` reports the reaction's own
+    id plus the message it was applied to. Anything unrecognised yields ``None`` so the
+    effect stays locally accepted without a provider reference.
+    """
+    if not isinstance(result, dict):
+        return None
+    provider_message_id = result.get("messageId") or result.get("outboundMessageId")
+    if target_message_id and not provider_message_id:
+        provider_message_id = result.get("messageId")
+    payload: dict[str, Any] = {}
+    if provider_message_id:
+        payload["provider_message_id"] = str(provider_message_id)
+    if target_message_id:
+        payload["target_message_id"] = str(target_message_id)
+    return payload or None

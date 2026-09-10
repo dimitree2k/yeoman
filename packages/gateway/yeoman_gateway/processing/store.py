@@ -52,6 +52,7 @@ from yeoman_gateway.processing.models import (
     StoredEffect,
     StoredThread,
     StoredTurn,
+    TransportReceipt,
     TurnRef,
     TurnStateError,
     canonical_hash,
@@ -64,7 +65,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = (
     """
@@ -297,6 +298,25 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
           PRIMARY KEY (generation_id, event_id)
         )
         """,
+    ),
+    2: (
+        """
+        CREATE TABLE IF NOT EXISTS transport_receipts (
+          receipt_id TEXT PRIMARY KEY,
+          effect_id TEXT NOT NULL REFERENCES effects(effect_id) ON DELETE CASCADE,
+          attempt_id TEXT,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          provider_message_id TEXT,
+          client_message_id TEXT,
+          confirmed_ms INTEGER NOT NULL,
+          detail TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_receipts_effect "
+        "ON transport_receipts(effect_id, confirmed_ms)",
+        "CREATE INDEX IF NOT EXISTS idx_receipts_provider "
+        "ON transport_receipts(channel, chat_id, provider_message_id)",
     ),
 }
 
@@ -1655,6 +1675,72 @@ class ProcessingStore:
                 )
         return tuple(str(row["event_id"]) for row in rows)
 
+    # -- transport receipts (Plan 04) --------------------------------------------------
+
+    def record_transport_receipt(
+        self,
+        effect_id: str,
+        *,
+        channel: str,
+        chat_id: str,
+        now_ms: int,
+        attempt_id: str | None = None,
+        provider_message_id: str | None = None,
+        client_message_id: str | None = None,
+        detail: str | None = None,
+    ) -> str:
+        """Store what the transport reported. An unknown effect is a programming error."""
+        if self.get_effect(effect_id) is None:
+            raise ProcessingError(f"unknown effect: {effect_id}")
+        receipt_id = f"rc_{canonical_hash([effect_id, provider_message_id, client_message_id, now_ms])[:20]}"
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO transport_receipts (receipt_id, effect_id, attempt_id,
+                    channel, chat_id, provider_message_id, client_message_id, confirmed_ms, detail)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    receipt_id,
+                    effect_id,
+                    attempt_id,
+                    channel,
+                    chat_id,
+                    provider_message_id,
+                    client_message_id,
+                    now_ms,
+                    detail,
+                ),
+            )
+        return receipt_id
+
+    def transport_receipts(self, effect_id: str) -> tuple[TransportReceipt, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM transport_receipts WHERE effect_id = ? "
+                "ORDER BY confirmed_ms, receipt_id",
+                (effect_id,),
+            ).fetchall()
+        return tuple(_transport_receipt_from_row(row) for row in rows)
+
+    def effect_transport_receipt(self, effect_id: str) -> TransportReceipt | None:
+        """Newest receipt of an effect (by confirmed_ms, then receipt id)."""
+        receipts = self.transport_receipts(effect_id)
+        return receipts[-1] if receipts else None
+
+    def effects_by_provider_message(
+        self, channel: str, chat_id: str, provider_message_id: str
+    ) -> tuple[str, ...]:
+        """Effects whose transport reported this provider message id."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT effect_id FROM transport_receipts "
+                "WHERE channel = ? AND chat_id = ? AND provider_message_id = ? "
+                "ORDER BY effect_id",
+                (channel, chat_id, provider_message_id),
+            ).fetchall()
+        return tuple(str(row["effect_id"]) for row in rows)
+
     # -- generations -------------------------------------------------------------------
 
     def record_generation(self, snapshot: GenerationSnapshot) -> str:
@@ -1925,6 +2011,23 @@ class ProcessingStore:
                 int(row["payload_purged_ms"]) if row["payload_purged_ms"] is not None else None
             ),
         )
+
+
+def _transport_receipt_from_row(row: sqlite3.Row) -> TransportReceipt:
+    return TransportReceipt(
+        receipt_id=str(row["receipt_id"]),
+        channel=str(row["channel"]),
+        chat_id=str(row["chat_id"]),
+        provider_message_id=(
+            str(row["provider_message_id"]) if row["provider_message_id"] is not None else None
+        ),
+        client_message_id=(
+            str(row["client_message_id"]) if row["client_message_id"] is not None else None
+        ),
+        attempt_id=str(row["attempt_id"]) if row["attempt_id"] is not None else None,
+        confirmed_ms=int(row["confirmed_ms"]),
+        detail=str(row["detail"]) if row["detail"] is not None else None,
+    )
 
 
 def _pending_from_row(row: sqlite3.Row) -> PendingInput:

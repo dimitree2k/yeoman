@@ -267,6 +267,20 @@ class EffectGateway:
         detail = result.detail if result is not None else None
         match reported:
             case "sent":
+                transport_receipt = getattr(result, "transport_receipt", None)
+                if transport_receipt is not None:
+                    # Receipt first, then the state: "sent" always has its provider
+                    # evidence recorded before it becomes visible.
+                    self._store.record_transport_receipt(
+                        effect_id,
+                        attempt_id=attempt_id,
+                        channel=transport_receipt.channel,
+                        chat_id=transport_receipt.chat_id,
+                        provider_message_id=transport_receipt.provider_message_id,
+                        client_message_id=transport_receipt.client_message_id,
+                        detail=transport_receipt.detail,
+                        now_ms=self._clock(),
+                    )
                 self._store.transition(
                     effect_id,
                     expected="executing",

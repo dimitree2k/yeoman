@@ -33,6 +33,7 @@ from yeoman_gateway.processing.models import (
     ProcessingError,
     ReactionPayload,
     TextPayload,
+    TransportReceipt,
     canonical_hash,
     payload_to_mapping,
 )
@@ -130,21 +131,26 @@ class BusEffectExecutor:
         self._direct_sender = outbound
         self._direct_reaction_sender = reaction
 
-    async def _deliver(self, message: OutboundMessage) -> bool:
-        """Hand one message to the transport. True when a confirming adapter accepted it."""
-        if self._direct_sender is not None:
-            await self._direct_sender(message)
-            return True
-        await self._bus.publish_outbound(message)
-        return False
+    async def _deliver(self, message: OutboundMessage) -> "TransportReceipt | None":
+        """Hand one message to the transport; return the provider receipt if it reported one.
 
-    async def _deliver_reaction(self, message: ReactionMessage) -> bool:
+        ``None`` means either the bus path (no confirmation possible) or an adapter that
+        reported no provider id - in both cases the effect stays unproven beyond local
+        acceptance.
+        """
+        if self._direct_sender is not None:
+            reported = await self._direct_sender(message)
+            return _receipt_from_report(reported, message)
+        await self._bus.publish_outbound(message)
+        return None
+
+    async def _deliver_reaction(self, message: ReactionMessage) -> "TransportReceipt | None":
         """Reaction counterpart of :meth:`_deliver`."""
         if self._direct_reaction_sender is not None:
-            await self._direct_reaction_sender(message)
-            return True
+            reported = await self._direct_reaction_sender(message)
+            return _receipt_from_report(reported, message)
         await self._bus.publish_reaction(message)
-        return False
+        return None
 
     def _guard_text(self, envelope: EffectEnvelope, text: str) -> str:
         """Shared outbound control for text-bearing effects.
@@ -175,10 +181,10 @@ class BusEffectExecutor:
         target = envelope.target
 
         provenance = {EFFECT_PROVENANCE_KEY: envelope.effect_id} if self._mark_provenance else {}
-        used_direct = False
+        receipt: TransportReceipt | None = None
 
         if isinstance(payload, TextPayload):
-            used_direct = await self._deliver(
+            receipt = await self._deliver(
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -188,7 +194,7 @@ class BusEffectExecutor:
                 )
             )
         elif isinstance(payload, MediaPayload):
-            used_direct = await self._deliver(
+            receipt = await self._deliver(
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -198,7 +204,7 @@ class BusEffectExecutor:
                 )
             )
         elif isinstance(payload, ReactionPayload):
-            used_direct = await self._deliver_reaction(
+            receipt = await self._deliver_reaction(
                 ReactionMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -243,11 +249,12 @@ class BusEffectExecutor:
                     else "queued to transport; delivery unconfirmed"
                 ),
             )
-        if used_direct:
+        if self._direct_sender is not None or self._direct_reaction_sender is not None:
             return EffectReceipt(
                 effect_id=envelope.effect_id,
                 state="sent",
                 detail="accepted by the channel transport adapter",
+                transport_receipt=receipt,
             )
         return EffectReceipt(
             effect_id=envelope.effect_id,
@@ -758,3 +765,25 @@ class IntentEffectRouter:
                 chat_id,
             )
         return result
+
+
+def _receipt_from_report(
+    reported: Any, message: Any
+) -> "TransportReceipt | None":
+    """Normalise what a channel reported into a transport receipt."""
+    if not isinstance(reported, Mapping):
+        return None
+    provider_message_id = reported.get("provider_message_id")
+    client_message_id = reported.get("client_message_id")
+    if not provider_message_id and not client_message_id:
+        return None
+    return TransportReceipt(
+        channel=str(getattr(message, "channel", "") or ""),
+        chat_id=str(getattr(message, "chat_id", "") or ""),
+        provider_message_id=(
+            str(provider_message_id) if provider_message_id else None
+        ),
+        client_message_id=str(client_message_id) if client_message_id else None,
+        confirmed_ms=0,
+        detail=str(reported.get("detail") or "") or None,
+    )

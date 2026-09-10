@@ -582,6 +582,7 @@ class EffectReceipt:
     detail: str | None = None
     accepted: bool = False
     updated_ms: int | None = None
+    transport_receipt: "TransportReceipt | None" = None
 
     @property
     def sent(self) -> bool:
@@ -590,6 +591,20 @@ class EffectReceipt:
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL_EFFECT_STATES
+
+
+@dataclass(frozen=True, slots=True)
+class TransportReceipt:
+    """Provider receipt reported by the transport adapter. No payload, no secret."""
+
+    channel: str
+    chat_id: str
+    provider_message_id: str | None
+    confirmed_ms: int
+    attempt_id: str | None = None
+    client_message_id: str | None = None
+    receipt_id: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

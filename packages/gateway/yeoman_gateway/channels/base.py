@@ -47,7 +47,7 @@ class BaseChannel(ABC):
         pass
 
     @abstractmethod
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> dict[str, Any] | None:
         """
         Send a message through this channel.
 
@@ -56,7 +56,7 @@ class BaseChannel(ABC):
         """
         pass
 
-    async def send_reaction(self, msg: ReactionMessage) -> None:
+    async def send_reaction(self, msg: ReactionMessage) -> dict[str, Any] | None:
         """
         Send a reaction emoji to a specific message.
 
