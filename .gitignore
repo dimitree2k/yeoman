@@ -96,6 +96,7 @@ tests/gateway/*
 !tests/gateway/test_responder_shared_facts.py
 !tests/gateway/test_processing_budget.py
 !tests/gateway/test_processing_end_to_end.py
+!tests/gateway/test_processing_cutover.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py
