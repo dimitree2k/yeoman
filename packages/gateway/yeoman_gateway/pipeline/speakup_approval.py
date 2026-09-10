@@ -22,11 +22,13 @@ class SpeakupApprovalMiddleware:
         bus: MessageBus,
         log: SpeakupLog,
         security: SecurityPort,
+        service_effects: object | None = None,
     ) -> None:
         self._store = approval_store
         self._bus = bus
         self._log = log
         self._security = security
+        self._service_effects = service_effects
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         if not getattr(ctx.decision, "is_owner", False):
@@ -107,6 +109,20 @@ class SpeakupApprovalMiddleware:
                 approval.proposal_id,
                 approval.target_chat_id,
             )
+            if self._service_effects is not None:
+                await self._service_effects.send(
+                    source="speakup",
+                    operation_ref=(
+                        f"speakup-approval:{approval.proposal_id}:{approval.target_chat_id}"
+                    ),
+                    channel=approval.target_channel,
+                    chat_id=approval.target_chat_id,
+                    content=content,
+                    reply_to=approval.reply_to_message_id,
+                )
+                await self._log.mark_sent(approval.proposal_id)
+                ctx.halt()
+                return
             await self._bus.publish_outbound(
                 OutboundMessage(
                     channel=approval.target_channel,

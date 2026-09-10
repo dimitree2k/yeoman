@@ -778,6 +778,7 @@ def build_gateway_runtime(
         persona_evolution_workspace=Path(workspace),
         persona_evolution_state_db_path=persona_evolution_state_db_path,
         session_manager=session_manager,
+        service_effects=service_effects,
     )
 
     def _choose_voice_phrase(job: CronJob, phrases: list[str]) -> str:
@@ -1307,6 +1308,7 @@ def build_gateway_runtime(
             memory=memory_service,
             security=security,
             approval_store=speakup_approval_store,
+            service_effects=service_effects,
         )
 
         async def _consciousness_route_call(route: str, prompt: str) -> str:

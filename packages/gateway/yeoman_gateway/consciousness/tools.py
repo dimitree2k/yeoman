@@ -76,11 +76,13 @@ class ConsciousnessTools:
         memory: object | None,
         security: object,
         approval_store: SpeakupApprovalStore | None = None,
+        service_effects: object | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.policy_engine = policy_engine
         self.bus = bus
+        self._service_effects = service_effects
         self.log = log
         self.inbound_archive = inbound_archive
         self.memory = memory
@@ -451,11 +453,24 @@ class ConsciousnessTools:
                         f"Deny: {approval.deny_code}",
                     ]
                 )
+                preview_content = "\n".join(preview_lines)
+                if self._service_effects is not None:
+                    await self._service_effects.send(
+                        source="speakup",
+                        operation_ref=f"speakup-preview:{proposal.proposal_id}",
+                        channel=approval.owner_channel,
+                        chat_id=approval.owner_chat_id,
+                        content=preview_content,
+                    )
+                    await self.log.mark_sent(
+                        proposal.proposal_id, now=self._now().timestamp()
+                    )
+                    return {"status": "sent", "proposal_id": proposal.proposal_id}
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=approval.owner_channel,
                         chat_id=approval.owner_chat_id,
-                        content="\n".join(preview_lines),
+                        content=preview_content,
                         metadata={
                             "spontaneous": True,
                             "preview": True,
@@ -490,6 +505,18 @@ class ConsciousnessTools:
                 if output.decision.action == "sanitize" and output.sanitized_text
                 else proposal.message
             )
+            if self._service_effects is not None:
+                await self._service_effects.send(
+                    source="speakup",
+                    operation_ref=f"speakup:{proposal.proposal_id}",
+                    channel=proposal.channel,
+                    chat_id=proposal.chat_id,
+                    content=content,
+                    reply_to=proposal.reply_to_message_id,
+                )
+                await self.log.mark_sent(proposal.proposal_id, now=self._now().timestamp())
+                self._proposals.pop(proposal.proposal_id, None)
+                return {"status": "sent", "proposal_id": proposal.proposal_id}
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=proposal.channel,

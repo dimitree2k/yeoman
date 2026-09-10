@@ -31,11 +31,13 @@ class PersonaEvolutionApprovalMiddleware:
         workspace: Path,
         state_db_path: Path,
         bus: MessageBus,
+        service_effects: object | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._workspace = workspace
         self._state_db_path = state_db_path
         self._bus = bus
+        self._service_effects = service_effects
         self._now = now or (lambda: datetime.now(UTC))
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
@@ -81,11 +83,26 @@ class PersonaEvolutionApprovalMiddleware:
             result.status,
         )
         if result.status in {"applied", "denied", "blocked", "not_proposed"}:
+            confirmation = self._confirmation_text(
+                result.status, result.message, result.persona_file
+            )
+            if self._service_effects is not None:
+                await self._service_effects.send(
+                    source="admin",
+                    operation_ref=(
+                        f"persona-evolution-confirmation:{proposal_id}:{result.status}"
+                    ),
+                    channel=ctx.event.channel,
+                    chat_id=ctx.event.chat_id,
+                    content=confirmation,
+                )
+                ctx.halt()
+                return
             await self._bus.publish_outbound(
                 OutboundMessage(
                     channel=ctx.event.channel,
                     chat_id=ctx.event.chat_id,
-                    content=self._confirmation_text(result.status, result.message, result.persona_file),
+                    content=confirmation,
                 )
             )
         ctx.halt()

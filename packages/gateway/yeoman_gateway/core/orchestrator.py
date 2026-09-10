@@ -87,6 +87,7 @@ class Orchestrator:
         persona_evolution_workspace: Path | None = None,
         persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
+        service_effects: object | None = None,
     ) -> None:
         layers: list[Middleware] = [
             NormalizationMiddleware(),
@@ -115,6 +116,7 @@ class Orchestrator:
                     bus=bus,
                     log=speakup_log,
                     security=security,
+                    service_effects=service_effects,
                 )
             )
         if (
@@ -127,6 +129,7 @@ class Orchestrator:
                     workspace=persona_evolution_workspace,
                     state_db_path=persona_evolution_state_db_path,
                     bus=bus,
+                    service_effects=service_effects,
                 )
             )
         if workflow_state and approval_trigger:
