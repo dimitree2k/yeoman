@@ -57,6 +57,16 @@ BREAKING CHANGE: config key renamed; update ~/.yeoman/config.json manually.
 - Keep PRs focused — one logical change per commit where practical.
 - Run `python -m pytest tests/` and `ruff check .` before pushing.
 
+## Two-Repository Model
+
+This source checkout has a private runtime companion at `/home/dm/.yeoman`.
+
+- `/home/dm/Documents/yeoman/` owns source code, tests, packaging, and deployment.
+- `/home/dm/.yeoman/` owns runtime config and policy, personas and skills, memory, logs, live state, and private work notes.
+- Deploy source changes with `yeoman deploy` from this checkout. Never manually copy code or edit installed/generated artifacts.
+- Put new private specs, design notes, implementation plans, and dated handoffs in `/home/dm/.yeoman/docs/superpowers/{specs,plans}/` or `/home/dm/.yeoman/session-context/`.
+- Keep this repository's `docs/` for documentation intentionally safe and useful to keep with the source checkout. Read `/home/dm/.yeoman/AGENTS.md` for runtime-specific guidance.
+
 ## Project Navigation
 
 Yeoman is a `uv` workspace monorepo. The source checkout is the only place to
@@ -109,9 +119,9 @@ Use these locations so findings survive session compaction or context loss:
 |--------------|-------------|
 | Cross-agent rules, navigation, safety constraints | `AGENTS.md` |
 | Detailed source architecture and module map | `CLAUDE.md` |
-| Runtime-only layout and private operational notes | `~/.yeoman/CLAUDE.md` (sanitize before copying elsewhere) |
-| Dated session findings and handoff notes | `session-context/YYYY-MM-DD-short-description.md` |
-| Feature designs, tradeoffs, implementation plans | `docs/superpowers/specs/` and `docs/superpowers/plans/` |
+| Runtime-only layout and private operational notes | `~/.yeoman/CLAUDE.md` and `~/.yeoman/AGENTS.md` |
+| Dated session findings and handoff notes | `~/.yeoman/session-context/YYYY-MM-DD-short-description.md` |
+| Feature designs, tradeoffs, implementation plans | `~/.yeoman/docs/superpowers/specs/` and `~/.yeoman/docs/superpowers/plans/` |
 | Shipped user-facing behavior changes | `CHANGELOG.md` |
 | One-off temporary notes | Avoid if possible; convert to one of the above before ending work |
 
@@ -123,12 +133,13 @@ will be tracked.
 
 This project contains Claude Code Superpowers-style specs and plans in
 `docs/superpowers/`. Codex may not have the Superpowers plugin installed, but
-the documents are still useful project context.
+the documents are still useful project context. New private specs and plans go
+in `/home/dm/.yeoman/docs/superpowers/` so they stay out of the source checkout.
 
 Before large feature work or architectural refactors:
 
-- Check `docs/superpowers/specs/` for the relevant design.
-- Check `docs/superpowers/plans/` for implementation steps and completed intent.
+- Check `/home/dm/.yeoman/docs/superpowers/specs/` and `docs/superpowers/specs/` for relevant private or historical designs.
+- Check `/home/dm/.yeoman/docs/superpowers/plans/` and `docs/superpowers/plans/` for implementation steps and completed intent.
 - Treat those docs as historical/architectural context, not guaranteed current code.
 - Reconcile against source and tests before editing.
 
