@@ -1461,3 +1461,42 @@ def test_effect_router_builds_with_a_real_config(tmp_path: Path) -> None:
     router.set_direct_transport(manager.send_now, manager.send_reaction_now)
 
     store.close()
+
+
+def test_thread_responder_is_built_only_with_an_open_store(tmp_path: Path) -> None:
+    """The wrapper exists only for the new mode; a disabled config keeps the legacy path."""
+    from unittest.mock import patch
+
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.app.bootstrap import (
+        build_processing_store,
+        build_thread_registry,
+        build_thread_responder,
+    )
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.policy.loader import save_policy
+    from yeoman_gateway.policy.schema import PolicyConfig
+
+    policy_path = tmp_path / "policy.json"
+    policy = PolicyConfig.model_validate({"owners": {"whatsapp": ["owner@s.whatsapp.net"]}})
+    save_policy(policy, policy_path)
+    adapter = EnginePolicyAdapter(
+        engine=PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"}),
+        known_tools={"message"},
+        policy_path=policy_path,
+        workspace=tmp_path,
+    )
+    disabled = Config()
+    assert build_thread_registry(disabled, None) is None
+    assert build_thread_responder(disabled, None, None, object(), adapter) is None
+
+    enabled = Config.model_validate({"processing": {"enabled": True}})
+    with patch.dict(os.environ, {"YEOMAN_HOME": str(tmp_path)}):
+        store = build_processing_store(enabled)
+        assert store is not None
+        registry = build_thread_registry(enabled, store)
+        wrapper = build_thread_responder(enabled, store, registry, object(), adapter)
+    assert registry is not None
+    assert wrapper is not None
+    assert hasattr(wrapper, "_run_loop")
+    store.close()

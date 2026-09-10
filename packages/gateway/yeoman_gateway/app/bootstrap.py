@@ -378,6 +378,34 @@ def build_processing_gate(
     )
 
 
+def build_thread_responder(
+    config: "Config",
+    store: "ProcessingStore | None",
+    threads: object | None,
+    responder: object,
+    policy_adapter: "EnginePolicyAdapter | None" = None,
+):
+    """Responder wrapper that drives the thread actor. ``None`` keeps the legacy path."""
+    if store is None or threads is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.policy import operator_check
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+    from yeoman_gateway.processing.threads import TurnAuthority
+
+    actor_registry = ThreadActorRegistry(
+        store=store,
+        config=config.processing,
+        authority=TurnAuthority(
+            is_operator=operator_check(
+                (lambda: policy_adapter.policy_engine()) if policy_adapter is not None else (lambda: None)
+            )
+        ),
+    )
+    return ThreadActorResponder(inner=responder, actors=actor_registry, store=store)
+
+
 def build_effect_router(
     config: "Config",
     policy_adapter: "EnginePolicyAdapter | None",
@@ -782,9 +810,13 @@ def build_gateway_runtime(
         )
 
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
+    thread_responder = build_thread_responder(
+        config, processing_store, thread_registry, responder, policy_adapter
+    )
+
     orchestrator = Orchestrator(
         policy=policy_adapter,
-        responder=responder,
+        responder=thread_responder or responder,
         reply_archive=archive_adapter,
         contacts=contacts_service,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
