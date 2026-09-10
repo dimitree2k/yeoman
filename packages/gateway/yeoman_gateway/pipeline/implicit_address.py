@@ -47,6 +47,9 @@ class ImplicitBotAddressMiddleware:
         if decision is None:
             await next(ctx)
             return
+        if not decision.accept_message:
+            await next(ctx)
+            return
         if event.is_group:
             state = classify_conversation_state(
                 session_manager=self._session_manager,

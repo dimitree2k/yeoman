@@ -6,7 +6,6 @@ import asyncio
 import os
 import random
 import time
-import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,21 +144,13 @@ class OrchestratorService:
                 intents = await self._orchestrator.handle(event)
                 await self._dispatch_intents(intents)
             except Exception as e:
-                tb = traceback.format_exc()
                 logger.error(
-                    "vnext orchestrator failure channel={} chat={}: {} (type={})\n{}",
+                    "vnext orchestrator failure stage=handle_dispatch channel={} chat={} "
+                    "message_id={} error_type={}",
                     event.channel,
                     event.chat_id,
-                    e,
+                    event.message_id,
                     type(e).__name__,
-                    tb,
-                )
-                await self._bus.publish_outbound(
-                    OutboundMessage(
-                        channel=event.channel,
-                        chat_id=event.chat_id,
-                        content=f"Sorry, I encountered an error: {e}",
-                    )
                 )
 
     def stop(self) -> None:

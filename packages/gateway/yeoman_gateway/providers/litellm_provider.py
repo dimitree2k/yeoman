@@ -7,6 +7,7 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.providers.registry import find_by_model, find_gateway
@@ -186,11 +187,14 @@ class LiteLLMProvider(LLMProvider):
                     response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
+            logger.error(
+                "LLM provider request failed provider={} model={} error_type={} error={}",
+                self.provider_name,
+                model,
+                type(e).__name__,
+                str(e)[:500],
             )
+            return LLMResponse(content=None, finish_reason="error")
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

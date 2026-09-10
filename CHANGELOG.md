@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Gateway Safety
+- Internal orchestrator and provider failures are now kept out of chat replies, reactions, assistant session entries, and memory capture; failed provider turns clean up their active turn state.
+- Policy reload failures now fail closed for reactive processing until a valid policy is recovered, while repeated diagnostics for one file version are deduplicated.
+- Policy admin dry-runs perform the same semantic validation as applies, and commit-boundary failures report whether the previous or new policy bytes are on disk.
+
 ### Overseer
 - Added deterministic stale agent-session cleanup for old `mosh-server -> bash -> codex/claude` trees, with a 1-hour current-session guard and a daily 04:00 starter runbook.
 - Fixed cron trigger initialization so overseer restarts do not replay missed daily runbooks immediately on startup.

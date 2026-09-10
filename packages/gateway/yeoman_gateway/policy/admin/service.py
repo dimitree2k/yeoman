@@ -93,6 +93,7 @@ class PolicyAdminService:
         command: PolicyCommand,
         actor: PolicyActorContext,
         options: PolicyExecutionOptions | None = None,
+        policy_override: PolicyConfig | None = None,
     ) -> PolicyExecutionResult:
         exec_opts = options or PolicyExecutionOptions()
         if command.namespace.strip().lower() != "policy":
@@ -127,16 +128,19 @@ class PolicyAdminService:
                 dry_run=exec_opts.dry_run,
             )
 
-        try:
-            policy = load_policy(self._policy_path)
-        except Exception as e:
-            return self._result(
-                outcome="error",
-                actor=actor,
-                command_name=subcommand,
-                message=f"Failed to load policy: {e}",
-                dry_run=exec_opts.dry_run,
-            )
+        if policy_override is None:
+            try:
+                policy = load_policy(self._policy_path)
+            except Exception as e:
+                return self._result(
+                    outcome="error",
+                    actor=actor,
+                    command_name=subcommand,
+                    message=f"Failed to load policy: {e}",
+                    dry_run=exec_opts.dry_run,
+                )
+        else:
+            policy = policy_override
 
         rate_error = self._rate_limit_message(actor=actor, policy=policy)
         if rate_error is not None:
@@ -202,6 +206,14 @@ class PolicyAdminService:
         )
         engine.validate(self._known_tools)
 
+    def _read_disk_policy_hash(self) -> str | None:
+        try:
+            if not self._policy_path.exists():
+                return None
+            return self._audit.policy_hash(load_policy(self._policy_path))
+        except Exception:
+            return None
+
     def _commit_policy(
         self,
         *,
@@ -231,19 +243,6 @@ class PolicyAdminService:
                 is_rollback=is_rollback,
             )
 
-        if dry_run:
-            return self._result(
-                outcome="applied",
-                actor=actor,
-                command_name=command_name,
-                message=f"Dry-run: changes validated for {command_name}.",
-                mutated=True,
-                before_hash=before_hash,
-                after_hash=after_hash,
-                dry_run=True,
-                is_rollback=is_rollback,
-            )
-
         try:
             self._validate_policy(after)
         except Exception as e:
@@ -256,6 +255,19 @@ class PolicyAdminService:
                 before_hash=before_hash,
                 after_hash=after_hash,
                 dry_run=dry_run,
+                is_rollback=is_rollback,
+            )
+
+        if dry_run:
+            return self._result(
+                outcome="applied",
+                actor=actor,
+                command_name=command_name,
+                message=f"Dry-run: changes validated for {command_name}.",
+                mutated=True,
+                before_hash=before_hash,
+                after_hash=after_hash,
+                dry_run=True,
                 is_rollback=is_rollback,
             )
 
@@ -280,18 +292,33 @@ class PolicyAdminService:
             if self._on_policy_applied is not None:
                 self._on_policy_applied(after)
         except Exception as e:
+            disk_hash = self._read_disk_policy_hash()
+            if disk_hash == after_hash:
+                disk_state = "new"
+                mutated = True
+                state_message = "The new policy is on disk, but active policy application failed."
+            elif disk_hash == before_hash:
+                disk_state = "before"
+                mutated = False
+                state_message = "The policy file remains unchanged."
+            else:
+                disk_state = "unknown"
+                mutated = False
+                state_message = "The policy file commit state is unknown."
+            error_detail = str(e).strip() or type(e).__name__
             return self._result(
                 outcome="error",
                 actor=actor,
                 command_name=command_name,
-                message=f"Failed to write policy: {e}",
-                mutated=False,
+                message=f"Failed to write policy: {error_detail}. {state_message}",
+                mutated=mutated,
                 before_hash=before_hash,
                 after_hash=after_hash,
                 backup_ref=backup_ref,
                 audit_id=change_id,
                 dry_run=dry_run,
                 is_rollback=is_rollback,
+                meta={"disk_state": disk_state},
             )
 
         audit_error = extra_error

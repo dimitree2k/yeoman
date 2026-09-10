@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from yeoman_gateway.core.intents import SendReactionIntent
+from yeoman_gateway.core.intents import QueueMemoryNotesCaptureIntent, SendReactionIntent
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
+from yeoman_gateway.pipeline.access import AccessControlMiddleware
 from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
 
 
@@ -718,6 +719,55 @@ async def test_reply_to_bot_with_clear_question_still_answers() -> None:
     state = ctx.event.raw_metadata["conversation_state"]
     assert state["address_mode"] == "reply_to_bot"
     assert state["preferred_action"] == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "event_overrides"),
+    [
+        (
+            "Ok",
+            {"reply_to_bot": True, "reply_to_message_id": "bot-msg-1"},
+        ),
+        (
+            "@123456789012345 wer hier in der gruppe geht dir am meisten auf den sack",
+            {"mentioned_bot": True},
+        ),
+        (
+            "Death by Snu Snu",
+            {
+                "reply_to_bot": True,
+                "reply_to_message_id": "bot-msg-1",
+                "raw_metadata": {"reply_to_text": "Wer hat das Thema angefangen?"},
+            },
+        ),
+    ],
+)
+async def test_denied_early_bait_reaches_access_control(
+    content: str,
+    event_overrides: dict[str, object],
+) -> None:
+    ctx = PipelineContext(
+        event=_event(content=content, **event_overrides),
+        decision=_mention_only_decision(
+            accept_message=False,
+            should_respond=False,
+            notes_enabled=True,
+            notes_allow_blocked_senders=True,
+        ),
+    )
+
+    async def access_control_next(current: PipelineContext) -> None:
+        await AccessControlMiddleware()(current, _tracking_next)
+
+    await ImplicitBotAddressMiddleware()(ctx, access_control_next)
+
+    assert ctx.halted is True
+    assert ctx.reply is None
+    assert not [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert [
+        intent for intent in ctx.intents if isinstance(intent, QueueMemoryNotesCaptureIntent)
+    ]
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class LLMProviderError(RuntimeError):
+    """Provider failure without exposing provider response text to callers."""
+
+    def __init__(self) -> None:
+        super().__init__("LLM provider request failed")
+
+
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""

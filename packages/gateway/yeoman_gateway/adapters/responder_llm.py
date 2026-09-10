@@ -61,7 +61,7 @@ from yeoman_gateway.media.tts import (
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
 from yeoman_gateway.policy.persona import uses_compact_prompt
-from yeoman_gateway.providers.base import LLMProvider, ToolCallRequest
+from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
 
@@ -1394,6 +1394,12 @@ class LLMResponder(ResponderPort):
                     reasoning=reasoning,
                     max_tokens=max_tokens,
                 )
+                if response.finish_reason == "error":
+                    logger.warning(
+                        "Dropping provider-error turn before content/tool handling model={}",
+                        model or self.model,
+                    )
+                    raise LLMProviderError()
                 lf.log_generation(
                     parent=iter_span or trace,
                     name="llm",
@@ -2320,44 +2326,49 @@ class LLMResponder(ResponderPort):
 
                 self._current_session = session
                 resolved_profile = self._profile_for_name(model_profile)
-                final_content = await self._chat_loop(
-                    messages=messages,
-                    allowed_tools=allowed_tools,
-                    security_context={
-                        "channel": channel,
-                        "chat_id": chat_id,
-                        "sender_id": sender_id or "",
-                        "session_key": session_key,
-                    },
-                    is_owner=is_owner,
-                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
-                    provider=self._provider_for_profile(resolved_profile),
-                    max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
-                    temperature=(
-                        float(getattr(resolved_profile, "temperature"))
-                        if getattr(resolved_profile, "temperature", None) is not None
-                        else None
-                    ),
-                    reasoning=(
-                        getattr(resolved_profile, "reasoning", None)
-                        if isinstance(getattr(resolved_profile, "reasoning", None), dict)
-                        else None
-                    ),
-                    current_user_message=content,
-                    current_channel=channel,
-                    current_chat_id=chat_id,
-                    current_sender_id=sender_id or "",
-                    current_is_group=bool(metadata.get("is_group", False)),
-                    current_origin_label=str(
-                        metadata.get("group_name")
-                        or metadata.get("subject")
-                        or metadata.get("chat_name")
-                        or chat_id
-                    ),
-                    current_metadata=metadata,
-                    trace=trace,
-                )
-                self._current_session = None
+                try:
+                    final_content = await self._chat_loop(
+                        messages=messages,
+                        allowed_tools=allowed_tools,
+                        security_context={
+                            "channel": channel,
+                            "chat_id": chat_id,
+                            "sender_id": sender_id or "",
+                            "session_key": session_key,
+                        },
+                        is_owner=is_owner,
+                        model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
+                        provider=self._provider_for_profile(resolved_profile),
+                        max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
+                        temperature=(
+                            float(getattr(resolved_profile, "temperature"))
+                            if getattr(resolved_profile, "temperature", None) is not None
+                            else None
+                        ),
+                        reasoning=(
+                            getattr(resolved_profile, "reasoning", None)
+                            if isinstance(getattr(resolved_profile, "reasoning", None), dict)
+                            else None
+                        ),
+                        current_user_message=content,
+                        current_channel=channel,
+                        current_chat_id=chat_id,
+                        current_sender_id=sender_id or "",
+                        current_is_group=bool(metadata.get("is_group", False)),
+                        current_origin_label=str(
+                            metadata.get("group_name")
+                            or metadata.get("subject")
+                            or metadata.get("chat_name")
+                            or chat_id
+                        ),
+                        current_metadata=metadata,
+                        trace=trace,
+                    )
+                except LLMProviderError:
+                    logger.warning("Provider-error turn dropped channel={} chat={}", channel, chat_id)
+                    final_content = None
+                finally:
+                    self._current_session = None
 
         if final_content is None:
             if not _user_message_already_added:

@@ -189,6 +189,8 @@ class EnginePolicyAdapter(PolicyPort):
         self._load_pause_state()
         self._last_reload_check = 0.0
         self._last_mtime_ns = self._stat_mtime_ns()
+        self._policy_file_was_present = self._last_mtime_ns is not None
+        self._policy_reload_error: tuple[int | None, str] | None = None
 
         if engine is None:
             self._reload_on_change = False
@@ -316,8 +318,22 @@ class EnginePolicyAdapter(PolicyPort):
             return None
         try:
             return self._policy_path.stat().st_mtime_ns
-        except FileNotFoundError:
+        except OSError:
             return None
+
+    def _record_policy_reload_error(self, current_mtime: int | None, exc: Exception) -> None:
+        error_state = (current_mtime, type(exc).__name__)
+        previous_error_version = (
+            self._policy_reload_error[0] if self._policy_reload_error is not None else None
+        )
+        if self._policy_reload_error is None or current_mtime != previous_error_version:
+            logger.error(
+                "policy reload failed version={} error_type={} error={}",
+                current_mtime,
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+        self._policy_reload_error = error_state
 
     def _resolve_pause_state_path(self) -> Path:
         if self._policy_path is not None:
@@ -501,18 +517,38 @@ class EnginePolicyAdapter(PolicyPort):
         self._last_reload_check = now
 
         current_mtime = self._stat_mtime_ns()
-        if current_mtime == self._last_mtime_ns:
+        if (
+            current_mtime is None
+            and not self._policy_file_was_present
+            and self._policy_reload_error is None
+        ):
+            return
+        if self._policy_reload_error is None and current_mtime == self._last_mtime_ns:
             return
 
-        new_policy = load_policy(self._policy_path)
-        new_engine = PolicyEngine(
-            policy=new_policy,
-            workspace=self._engine.workspace,
-            apply_channels=self._engine.apply_channels,
-        )
-        new_engine.validate(self._known_tools)
+        try:
+            if current_mtime is None and self._policy_file_was_present:
+                raise FileNotFoundError(f"policy file missing: {self._policy_path}")
+            new_policy = load_policy(self._policy_path)
+            if self._stat_mtime_ns() is None:
+                raise FileNotFoundError(f"policy file missing: {self._policy_path}")
+            new_engine = PolicyEngine(
+                policy=new_policy,
+                workspace=self._engine.workspace,
+                apply_channels=self._engine.apply_channels,
+            )
+            new_engine.validate(self._known_tools)
+        except Exception as exc:
+            self._record_policy_reload_error(current_mtime, exc)
+            return
+
+        had_error = self._policy_reload_error is not None
         self._engine = new_engine
         self._last_mtime_ns = current_mtime
+        self._policy_file_was_present = True
+        self._policy_reload_error = None
+        if had_error:
+            logger.info("policy reload recovered version={}", current_mtime)
 
     def _on_policy_applied(self, policy: PolicyConfig) -> None:
         if self._engine is None:
@@ -525,7 +561,9 @@ class EnginePolicyAdapter(PolicyPort):
         new_engine.validate(self._known_tools)
         self._engine = new_engine
         self._last_mtime_ns = self._stat_mtime_ns()
+        self._policy_file_was_present = True
         self._last_reload_check = time.monotonic()
+        self._policy_reload_error = None
 
     @override
     def evaluate(self, event: InboundEvent) -> PolicyDecision:
@@ -559,6 +597,15 @@ class EnginePolicyAdapter(PolicyPort):
             )
 
         self._maybe_reload()
+        if self._policy_reload_error is not None:
+            return PolicyDecision(
+                accept_message=False,
+                should_respond=False,
+                allowed_tools=frozenset(),
+                reason="policy_reload_failed",
+                when_to_reply_mode="off",
+                source=str(self._policy_path) if self._policy_path else "policy_reload_failed",
+            )
         actor = _to_actor(event)
         decision = self._engine.evaluate(actor, self._known_tools)
         is_owner = self._engine.is_owner(actor)
@@ -1888,15 +1935,20 @@ class EnginePolicyAdapter(PolicyPort):
                 is_owner=True,
             ),
             options=PolicyExecutionOptions(),
+            policy_override=policy if self._policy_reload_error is not None else None,
         )
         return self._execution_to_admin_result(execution)
 
     def _load_policy_for_admin(self) -> PolicyConfig | None:
         if self._engine is None or self._policy_path is None:
             return None
+        self._maybe_reload()
         try:
             return load_policy(self._policy_path)
-        except Exception:
+        except Exception as exc:
+            if self._policy_file_was_present or self._policy_reload_error is not None:
+                self._record_policy_reload_error(self._stat_mtime_ns(), exc)
+                return self._engine.policy
             return None
 
     def _owner_policy_for_context(self, ctx: AdminCommandContext) -> PolicyConfig | None:
@@ -2060,10 +2112,16 @@ class EnginePolicyAdapter(PolicyPort):
             apply_channels=self._engine.apply_channels,
         )
         new_engine.validate(self._known_tools)
-        save_policy(policy, self._policy_path)
+        try:
+            save_policy(policy, self._policy_path)
+        except Exception as exc:
+            self._record_policy_reload_error(self._stat_mtime_ns(), exc)
+            raise
         self._engine = new_engine
         self._last_mtime_ns = self._stat_mtime_ns()
+        self._policy_file_was_present = True
         self._last_reload_check = time.monotonic()
+        self._policy_reload_error = None
 
     def _cmd_allow_group(self, tokens: list[str], policy: PolicyConfig) -> str:
         if len(tokens) != 3:
