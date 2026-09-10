@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from yeoman_gateway.bus.events import OutboundMessage
@@ -34,6 +35,7 @@ async def process_owner_turn(
     policy_adapter: _PolicyAdapter,
     responder: _Responder,
     bus: _Bus,
+    outbound_dispatch: "Callable[[OutboundMessage], Awaitable[Any]] | None" = None,
 ) -> dict[str, object]:
     """Run one owner turn in the canonical WhatsApp session.
 
@@ -91,9 +93,13 @@ async def process_owner_turn(
 
     posted = False
     if post_to_whatsapp:
-        await bus.publish_outbound(
-            OutboundMessage(channel="whatsapp", chat_id=chat_id, content=response)
-        )
+        message = OutboundMessage(channel="whatsapp", chat_id=chat_id, content=response)
+        # An owner turn posts as the verified owner principal; for a chat that the new
+        # processing mode owns this goes through the effect gateway instead of the raw bus.
+        if outbound_dispatch is not None:
+            await outbound_dispatch(message)
+        else:
+            await bus.publish_outbound(message)
         posted = True
 
     return {

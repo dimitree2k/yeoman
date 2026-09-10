@@ -1263,6 +1263,15 @@ def build_gateway_runtime(
     ) -> dict:
         from yeoman_gateway.ipc.owner_turn import process_owner_turn
 
+        async def _owner_outbound(message: OutboundMessage) -> None:
+            from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
+
+            CURRENT_PRINCIPAL.set(str(chat_id))
+            try:
+                await responder.send_outbound(message)
+            finally:
+                CURRENT_PRINCIPAL.set("")
+
         return await process_owner_turn(
             prompt=prompt,
             chat_id=chat_id,
@@ -1271,6 +1280,7 @@ def build_gateway_runtime(
             policy_adapter=policy_adapter,
             responder=responder,
             bus=bus,
+            outbound_dispatch=_owner_outbound,
         )
 
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
