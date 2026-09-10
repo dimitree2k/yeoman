@@ -416,9 +416,29 @@ def build_shared_fact_runtime(
     fact_ttl_ms = (
         int(retention_cfg.shared_fact_days) * 24 * 3600 * 1000 if retention_cfg else None
     )
+    extractor = None
+    if bool(getattr(shared, "extraction_enabled", False)):
+        from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+
+        try:
+            extractor = SharedFactExtractor(
+                config=config,
+                route_key=str(
+                    getattr(
+                        getattr(config.memory, "capture", None),
+                        "extract_route",
+                        "memory.capture.extract",
+                    )
+                ),
+                member_provider=_shared_fact_members(chat_registry),
+            )
+        except Exception:
+            logger.exception("shared fact extractor unavailable; extraction stays off")
+            extractor = None
     queue = SharedFactExtractionQueue(
         store=memory.store,
         journal=store,
+        extractor=extractor,
         idle_ms=int(getattr(extraction_cfg, "idle_seconds", 60)) * 1000,
         max_delay_ms=int(getattr(extraction_cfg, "max_delay_seconds", 300)) * 1000,
         max_waiting=int(getattr(shared, "max_jobs_waiting", 64)),
@@ -436,6 +456,45 @@ def build_shared_fact_runtime(
     )
     memory.extraction = runtime.extraction
     return runtime
+
+
+def _shared_fact_members(chat_registry: object | None):
+    """Proven chat participants, or ``None`` when nothing is proven.
+
+    The audience of a fact must come from a recorded participant list - never from the
+    model and never from a guess. Unknown membership therefore yields no audience, and
+    the fact degrades to ``author_only``.
+    """
+    if chat_registry is None:
+        return None
+
+    def _lookup(channel: str, chat_id: str) -> frozenset[str] | None:
+        try:
+            record = chat_registry.get_chat(channel, chat_id)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        if not isinstance(record, dict):
+            return None
+        metadata = record.get("metadata")
+        participants = None
+        if isinstance(metadata, dict):
+            participants = metadata.get("participants")
+        if not isinstance(participants, list) or not participants:
+            return None
+        members: set[str] = set()
+        for item in participants:
+            if isinstance(item, str):
+                members.add(item)
+                continue
+            if isinstance(item, dict):
+                for key in ("id", "jid", "lid", "phoneNumber", "user_id"):
+                    value = item.get(key)
+                    if value:
+                        members.add(str(value))
+                        break
+        return frozenset(members) if members else None
+
+    return _lookup
 
 
 def build_reconciliation_service(

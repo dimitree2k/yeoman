@@ -124,6 +124,7 @@ class SharedFactCandidate:
     valid_until_ms: int | None = None
     source_refs: tuple[tuple[str, int], ...] = ()
     source_scopes: tuple[str, ...] = ()
+    audience: frozenset[str] = frozenset()
     private_handoff: bool = False
     confidence: float = 0.0
 
@@ -452,13 +453,17 @@ class SharedFactExtractionQueue:
             author_principal=candidate.author_principal,
             assertion_status=initial_assertion_status(candidate),  # type: ignore[arg-type]
             visibility_scope=(candidate.visibility_scope or "author_only"),  # type: ignore[arg-type]
-            group_rule="chat_members_at_source",  # type: ignore[arg-type]
+            group_rule=(
+                "chat_members_at_source"
+                if candidate.visibility_scope == "chat_shared"
+                else "explicit_principals"
+            ),  # type: ignore[arg-type]
             valid_from_ms=int(now_ms),
             valid_until_ms=valid_until,
             extractor_version=self._extractor_version,
             sources=tuple(_fact_sources(refs, candidate)),
             allowed_principals=frozenset(),
-            audience=frozenset(),
+            audience=frozenset(candidate.audience),
             created_ms=int(now_ms),
             updated_ms=int(now_ms),
         )

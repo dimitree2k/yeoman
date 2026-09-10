@@ -542,11 +542,15 @@ class MemoryService:
             limit=effective_limit,
             acl=predicate,
         )
-        vector_hits = self._vector_candidates(
-            query=query,
-            scope_keys=scope_keys,
-            limit=effective_limit,
-            acl=predicate,
+        vector_hits = (
+            self._vector_candidates(
+                query=query,
+                scope_keys=scope_keys,
+                limit=effective_limit,
+                acl=predicate,
+            )
+            if self.store.has_fact_embeddings()
+            else []
         )
         candidates = self._merge_candidates(candidates, vector_hits)
 

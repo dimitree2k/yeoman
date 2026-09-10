@@ -423,6 +423,19 @@ class MemoryStore:
                 ).fetchone()
         return int(row["c"])
 
+    def has_fact_embeddings(self) -> bool:
+        """True when at least one shared fact carries a vector.
+
+        Facts are written without embeddings today, so the semantic half of a shared-fact
+        retrieval would otherwise pay for a query embedding and match nothing.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM memory2_embeddings e"
+                " JOIN memory2_facts f ON f.fact_id = e.entry_id LIMIT 1"
+            ).fetchone()
+        return row is not None
+
     def acl_epoch(self) -> int:
         raw = self.get_meta("acl_epoch")
         try:
