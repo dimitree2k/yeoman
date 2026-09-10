@@ -315,11 +315,13 @@ class EffectGateway:
     # -- helpers -----------------------------------------------------------------------
 
     def _state_for_reason(self, reason: str) -> str:
-        if reason in _CANCELLING_REASONS:
+        """Map a guard reason to a state. The reason may carry a ``:detail`` suffix."""
+        head = reason.split(":", 1)[0]
+        if head in _CANCELLING_REASONS:
             return "cancelled"
-        if reason in _EXPIRING_REASONS:
+        if head in _EXPIRING_REASONS:
             return "expired"
-        if reason in _BLOCKING_REASONS:
+        if head in _BLOCKING_REASONS:
             return "blocked"
         return "blocked"
 

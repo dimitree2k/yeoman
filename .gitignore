@@ -75,6 +75,7 @@ tests/gateway/*
 !tests/gateway/test_processing_policy.py
 !tests/gateway/test_processing_egress.py
 !tests/gateway/test_processing_threads.py
+!tests/gateway/test_processing_cancellation.py
 !tests/gateway/test_a2a.py
 !tests/gateway/test_cron_voice_quiet_window.py
 !tests/gateway/test_market_intelligence_tool.py

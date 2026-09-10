@@ -50,6 +50,7 @@ from yeoman_gateway.processing.models import (
     StoredEffect,
     StoredThread,
     StoredTurn,
+    TurnRef,
     TurnStateError,
     canonical_hash,
     canonical_json,
@@ -1242,6 +1243,91 @@ class ProcessingStore:
             )
         return cursor.rowcount == 1
 
+    def bump_turn_revision(
+        self,
+        turn_id: str,
+        *,
+        expected_revision: int,
+        now_ms: int,
+        reason: str = "",
+    ) -> TurnRef:
+        """Monotonic compare-and-set on the turn revision.
+
+        A closed turn cannot be revised, and a stale expectation is refused instead of
+        silently overwriting a newer revision.
+        """
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT t.*, th.channel AS channel, th.chat_id AS chat_id "
+                "FROM turns t JOIN threads th ON th.thread_id = t.thread_id "
+                "WHERE t.turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise TurnStateError(f"unknown turn: {turn_id}")
+            current = _turn_from_row(row)
+            if current.state in ("closed", "superseded"):
+                raise TurnStateError(f"turn {turn_id} is {current.state} and cannot be revised")
+            if current.revision != int(expected_revision):
+                raise TurnStateError(
+                    f"turn {turn_id} is at revision {current.revision}, expected "
+                    f"{expected_revision}"
+                )
+            conn.execute(
+                "UPDATE turns SET revision = revision + 1, context_version = context_version + 1,"
+                " updated_ms = ? WHERE turn_id = ? AND revision = ?",
+                (now_ms, turn_id, int(expected_revision)),
+            )
+            store_ref = conn.execute(
+                "SELECT t.*, th.channel AS channel, th.chat_id AS chat_id "
+                "FROM turns t JOIN threads th ON th.thread_id = t.thread_id "
+                "WHERE t.turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+        return _turn_from_row(store_ref).to_ref(
+            channel=str(row["channel"]), chat_id=str(row["chat_id"])
+        )
+
+    def bump_context_version(self, turn_id: str, *, now_ms: int) -> int:
+        """New context without invalidating the turn: revision stays untouched."""
+        with self._write() as conn:
+            row = conn.execute(
+                "UPDATE turns SET context_version = context_version + 1, updated_ms = ? "
+                "WHERE turn_id = ? RETURNING context_version",
+                (now_ms, turn_id),
+            ).fetchone()
+        if row is None:
+            raise TurnStateError(f"unknown turn: {turn_id}")
+        return int(row["context_version"])
+
+    def cancel_stale_effects(
+        self,
+        turn_id: str,
+        *,
+        current_revision: int,
+        now_ms: int,
+        reason: str = "superseded",
+    ) -> tuple[str, ...]:
+        """Cancel queued effects of an outdated revision. Nothing in flight is touched."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT effect_id FROM effects WHERE turn_id = ? AND turn_revision < ? "
+                "AND state = 'queued' ORDER BY created_ms, effect_id",
+                (turn_id, int(current_revision)),
+            ).fetchall()
+        cancelled: list[str] = []
+        for row in rows:
+            effect_id = str(row["effect_id"])
+            if self.transition(
+                effect_id,
+                expected="queued",
+                target="cancelled",
+                now_ms=now_ms,
+                evidence={"kind": "superseded", "detail": reason},
+            ):
+                cancelled.append(effect_id)
+        return tuple(cancelled)
+
     def add_turn_source(
         self,
         *,
@@ -1262,6 +1348,16 @@ class ProcessingStore:
                 """,
                 (turn_id, event_id, source_message_id, role, revision_at_join, now_ms),
             )
+
+    def mark_turn_source_removed(self, *, turn_id: str, event_id: str, now_ms: int) -> bool:
+        """Mark one source as removed; the snapshot stays provable with its timestamp."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE turn_sources SET removed_ms = ? "
+                "WHERE turn_id = ? AND event_id = ? AND removed_ms IS NULL",
+                (now_ms, turn_id, event_id),
+            )
+        return cursor.rowcount == 1
 
     def turn_sources(self, turn_id: str) -> tuple[SourceRef, ...]:
         with self._lock:

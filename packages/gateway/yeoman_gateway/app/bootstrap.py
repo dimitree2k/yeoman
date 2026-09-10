@@ -384,6 +384,7 @@ def build_effect_router(
     store: "ProcessingStore | None",
     bus: MessageBus,
     security: object | None = None,
+    threads: object | None = None,
 ):
     """Effect gateway plus transport executor for the new mode.
 
@@ -410,6 +411,7 @@ def build_effect_router(
                 engine_provider=policy_adapter.policy_engine,
                 known_tools=lambda: set(policy_adapter.known_tools),
             ),
+            turn_lookup=getattr(threads, "turn_lookup", None),
         ),
         executor=BusEffectExecutor(
             bus=bus,
@@ -418,7 +420,11 @@ def build_effect_router(
             security_block_message=config.security.block_user_message,
         ),
     )
-    return IntentEffectRouter(gateway=gateway, config=config)
+    return IntentEffectRouter(
+        gateway=gateway,
+        config=config,
+        turn_provider=getattr(threads, "active_turn", None),
+    )
 
 
 def build_gateway_runtime(
@@ -574,8 +580,14 @@ def build_gateway_runtime(
         _caldav_service = CalDAVService(_caldav_user, _caldav_pass)
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
+    thread_registry = build_thread_registry(config, processing_store)
     effect_router = build_effect_router(
-        config, policy_adapter, processing_store, bus, security=security
+        config,
+        policy_adapter,
+        processing_store,
+        bus,
+        security=security,
+        threads=thread_registry,
     )
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard

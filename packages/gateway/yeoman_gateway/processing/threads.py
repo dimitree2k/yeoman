@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.processing.models import (
     CanonicalEvent,
+    StoredTurn,
     TurnRef,
     UpdateEffect,
 )
@@ -131,7 +132,8 @@ class ThreadPolicy:
 
     @classmethod
     def from_config(cls, config: Any) -> ThreadPolicy:
-        threads = getattr(config, "threads", None) or getattr(config, "processing", None)
+        threads = getattr(config, "threads", None) or getattr(config, "Threads", None)
+        threads = threads or getattr(config, "processing", None)
         threads = getattr(threads, "threads", threads)
         if threads is None:
             return cls()
@@ -242,6 +244,36 @@ _RULES: Mapping[JoinRule, Callable[[JoinInput, JoinView, ThreadPolicy], JoinDeci
     JoinRule.DM_LAST_ACTIVE: _rule_dm_last_active,
     JoinRule.AMBIENT: _rule_ambient,
 }
+
+
+class TurnAuthority:
+    """Who may stop or correct a turn.
+
+    The orderer always may. An explicitly authorised operator (an owner in the loaded
+    policy) may as well. Everybody else may only observe: a hint from another participant
+    is additional context, never a cancellation (spec R04).
+    """
+
+    def __init__(self, *, is_operator: Callable[..., bool] | None = None) -> None:
+        self._is_operator = is_operator
+
+    def may_modify(
+        self,
+        turn: StoredTurn,
+        principal: str,
+        *,
+        channel: str = "",
+        chat_id: str = "",
+    ) -> tuple[bool, str]:
+        if principal and principal == turn.principal:
+            return True, "orderer"
+        if self._is_operator is not None and principal:
+            try:
+                if self._is_operator(principal=principal, channel=channel, chat_id=chat_id):
+                    return True, "authorized_operator"
+            except Exception:  # a broken policy lookup must never grant rights
+                return False, "foreign_principal_observe"
+        return False, "foreign_principal_observe"
 
 
 class ThreadRegistry:
@@ -525,6 +557,7 @@ __all__ = [
     "JoinInput",
     "JoinRule",
     "JoinView",
+    "TurnAuthority",
     "ThreadPolicy",
     "ThreadRegistry",
     "classify_update",

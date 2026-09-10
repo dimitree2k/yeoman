@@ -268,6 +268,10 @@ class EffectNotDeliveredError(ProcessingError):
 #: read from model arguments.
 CURRENT_PRINCIPAL: ContextVar[str] = ContextVar("yeoman_effect_principal", default="")
 
+#: Turn a producer is currently working for. Set by the turn pipeline; producers never
+#: invent a turn, and a turn-bound producer refuses to queue an effect without one.
+CURRENT_TURN: ContextVar[Any] = ContextVar("yeoman_current_turn", default=None)
+
 
 def classify_outbound(message: OutboundMessage) -> tuple[str, Any]:
     """Map one outbound message to its capability and typed payload."""
@@ -534,11 +538,13 @@ class IntentEffectRouter:
         clock: Callable[[], int] | None = None,
         worker_id: str = "effect-gateway",
         budget: SendBudget | None = None,
+        turn_provider: Callable[[str, str], Any] | None = None,
     ) -> None:
         self._gateway = gateway
         self._config = config
         self._clock = clock or _now_ms
         self._worker_id = worker_id
+        self._turn_provider = turn_provider
         processing = getattr(config, "processing", None)
         budgets = getattr(processing, "budgets", None)
         self._budget = budget or (
@@ -657,14 +663,35 @@ class IntentEffectRouter:
         now = self._clock()
         processing = self._config.processing
         deadline_ms = int(getattr(processing.deadlines, deadline_key))
+
+        binding = CURRENT_TURN.get()
+        turn = getattr(binding, "turn", None)
+        if turn is None and self._turn_provider is not None:
+            turn = self._turn_provider(channel, chat_id)
+        if binding is not None and getattr(binding, "trace_id", ""):
+            trace_id = binding.trace_id
+        turn_id = getattr(turn, "turn_id", "") or ""
+        turn_revision = int(getattr(turn, "revision", 1) or 1)
+
+        if (
+            not turn_id
+            and self._turn_provider is not None
+            and principal not in SERVICE_PRINCIPALS.values()
+        ):
+            # A turn-bound producer without a turn must not queue anything: autorisation
+            # would otherwise be checked without any revision to compare against.
+            raise EffectNotDeliveredError(
+                "no turn bound to this producer; refusing to queue an effect"
+            )
+
         envelope = EffectEnvelope(
             effect_id=uuid.uuid4().hex,
-            operation_key=operation_key,
+            operation_key=f"{operation_key}:{turn_id}:{turn_revision}",
             payload=payload,
             target=EffectTarget(channel=channel, chat_id=chat_id),
             trace_id=trace_id,
-            turn_id="",
-            turn_revision=1,
+            turn_id=turn_id,
+            turn_revision=turn_revision,
             principal=principal,
             capability=CAPABILITY_BY_KIND[payload.kind],
             expires_at_ms=now + deadline_ms,

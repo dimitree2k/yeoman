@@ -421,6 +421,23 @@ class PolicyCapabilityResolver:
         )
 
 
+def operator_check(
+    engine_provider: Callable[[], "PolicyEngine | None"],
+) -> Callable[..., bool]:
+    """Owner check for turn authority, sharing the actor construction with the resolver."""
+
+    def _is_operator(*, principal: str, channel: str, chat_id: str) -> bool:
+        engine = engine_provider()
+        if engine is None or not principal:
+            return False
+        actor = PolicyCapabilityResolver._actor(
+            principal, EffectTarget(channel=channel, chat_id=chat_id)
+        )
+        return bool(engine.is_owner(actor))
+
+    return _is_operator
+
+
 class SnapshotEffectAuthorizer:
     """Final synchronous policy check bound to one loaded snapshot.
 
