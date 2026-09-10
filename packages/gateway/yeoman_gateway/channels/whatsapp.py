@@ -151,6 +151,7 @@ class InboundEvent:
     media_description: str | None
     voice_transcript: str | None
     sender_name: str | None = None
+    thread_assignment: "dict[str, Any] | None" = None
     reply_to_media_kind: str | None = None
     reply_to_media_type: str | None = None
     reply_to_media_path: str | None = None
@@ -814,6 +815,17 @@ class WhatsAppChannel(BaseChannel):
 
         if self._processing_gate is not None:
             verdict = self._processing_gate.admit(self._processing_request(event))
+            if verdict is not None and not verdict.denied:
+                assignment = getattr(verdict, "assignment", None)
+                if assignment is not None and assignment.thread_id:
+                    event = replace(
+                        event,
+                        thread_assignment={
+                            "thread_id": assignment.thread_id,
+                            "turn_id": assignment.turn_id,
+                            "source_message_ids": list(assignment.source_message_ids),
+                        },
+                    )
             if verdict is not None and verdict.denied:
                 logger.debug(
                     "processing fast gate denied channel=whatsapp chat={} message_id={} "
@@ -1425,6 +1437,10 @@ class WhatsAppChannel(BaseChannel):
                 "media_description": event.media_description,
                 "is_voice": is_voice,
                 "voice_transcript": event.voice_transcript,
+                **(event.thread_assignment or {}),
+                "thread_source_message_ids": list(
+                    (event.thread_assignment or {}).get("source_message_ids") or []
+                ),
             },
         )
 

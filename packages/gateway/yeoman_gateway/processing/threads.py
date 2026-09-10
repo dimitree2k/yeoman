@@ -119,6 +119,7 @@ class JoinDecision:
     ambiguous_targets: tuple[str, ...] = ()
     quote_ref: str | None = None
     quote_allowed: bool = False
+    source_message_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,11 +416,17 @@ class ThreadRegistry:
         self._store.attach_event_assignment(
             event_id=event.event_id, thread_id=thread_id, turn_id=turn_id, now_ms=now_ms
         )
+        sources = self._store.turn_sources(turn_id)
         return replace(
             decision,
             thread_id=thread_id,
             turn_id=None if decision.observes_only else turn_id,
             new_thread=opened,
+            source_message_ids=tuple(
+                source.source_message_id
+                for source in sources
+                if source.source_message_id and source.removed_ms is None
+            ),
         )
 
     # -- view helpers ------------------------------------------------------------------

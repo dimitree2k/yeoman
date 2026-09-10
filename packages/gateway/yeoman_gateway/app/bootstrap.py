@@ -101,6 +101,8 @@ def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolCo
 
 def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
     meta = msg.metadata
+    # Thread assignment from the fast gate travels with the event so the pipeline can
+    # keep the own thread out of the ambient block.
     return InboundEvent(
         channel=msg.channel,
         chat_id=msg.chat_id,

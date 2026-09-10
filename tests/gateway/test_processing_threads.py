@@ -411,3 +411,73 @@ def test_schema_newer_than_code_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ProcessingError):
         ProcessingStore(path)
+
+
+def test_assignment_exposes_the_thread_sources(tmp_path: Path) -> None:
+    """The decision carries the thread's source message ids for ambient dedup."""
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+    first = registry.assign(
+        _event(event_id="m1", source_message_id="m1", mentioned_bot=True), now_ms=T0
+    )
+    assert first.source_message_ids == ("m1",)
+
+    followup = registry.assign(
+        _event(event_id="m2", source_message_id="m2", reply_to_message_id="m1"), now_ms=T0 + 1
+    )
+    assert set(followup.source_message_ids) >= {"m1", "m2"}
+    store.close()
+
+
+def test_ambient_window_never_repeats_the_own_thread() -> None:
+    """Spec R03: ambient is background for other threads, not a copy of this one."""
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
+    from yeoman_gateway.pipeline.reply_context import ReplyContextMiddleware
+
+    class _Archive:
+        def lookup_messages_before(self, channel, chat_id, message_id, limit):
+            del channel, chat_id, message_id, limit
+            return [
+                ArchivedMessage(
+                    channel="whatsapp",
+                    chat_id="chat@g.us",
+                    message_id="own-1",
+                    participant="p",
+                    sender_id="s",
+                    text="own thread message",
+                    timestamp=None,
+                    created_at="",
+                ),
+                ArchivedMessage(
+                    channel="whatsapp",
+                    chat_id="chat@g.us",
+                    message_id="other-1",
+                    participant="p",
+                    sender_id="s",
+                    text="other thread message",
+                    timestamp=None,
+                    created_at="",
+                ),
+            ]
+
+    middleware = ReplyContextMiddleware(
+        archive=_Archive(), reply_context_window_limit=5, reply_context_line_max_chars=200,
+        ambient_window_limit=5,
+    )
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        sender_id="owner@s.whatsapp.net",
+        content="hi",
+        message_id="m3",
+        is_group=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+        raw_metadata={"thread_source_message_ids": ["own-1"]},
+    )
+
+    lines = middleware._build_ambient_window(event)
+
+    assert any("other thread message" in line for line in lines)
+    assert not any("own thread message" in line for line in lines)

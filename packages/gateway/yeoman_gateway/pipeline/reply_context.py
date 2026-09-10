@@ -156,7 +156,7 @@ class ReplyContextMiddleware:
             )
         except Exception:
             return []
-        return self._format_lines(before)
+        return self._format_lines(_without_own_thread(before, event))
 
     def _build_ambient_context_rows(self, event: InboundEvent) -> list[dict[str, str | None]]:
         if self._archive is None or self._ambient_limit <= 0 or not event.message_id:
@@ -173,7 +173,7 @@ class ReplyContextMiddleware:
         except Exception:
             return []
         rows: list[dict[str, str | None]] = []
-        for row in reversed(before):
+        for row in reversed(_without_own_thread(before, event)):
             rows.append(
                 {
                     "sender_id": row.sender_id,
@@ -204,3 +204,23 @@ class ReplyContextMiddleware:
         return (
             row.sender_name or row.sender_id or row.participant or "unknown"
         ).strip() or "unknown"
+
+
+def _own_thread_message_ids(event: InboundEvent) -> frozenset[str]:
+    """Message ids of the thread this event belongs to (spec R03: no own duplicates)."""
+    raw = dict(getattr(event, "raw_metadata", {}) or {})
+    values = raw.get("thread_source_message_ids") or ()
+    if isinstance(values, str):
+        values = (values,)
+    try:
+        return frozenset(str(value) for value in values if value)
+    except TypeError:
+        return frozenset()
+
+
+def _without_own_thread(rows: list[ArchivedMessage], event: InboundEvent) -> list[ArchivedMessage]:
+    """Ambient is background for *other* threads; the own thread is already in context."""
+    own = _own_thread_message_ids(event)
+    if not own:
+        return rows
+    return [row for row in rows if not row.message_id or row.message_id not in own]
