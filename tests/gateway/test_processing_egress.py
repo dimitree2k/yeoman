@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
@@ -1406,3 +1408,56 @@ def test_media_counts_as_several_transport_units() -> None:
 
     assert payload_units(TextPayload(text="hi")) == 1
     assert payload_units(MediaPayload(media=("a", "b", "c"))) == 3
+
+
+def test_effect_router_builds_with_a_real_config(tmp_path: Path) -> None:
+    """The enabled path is only executed at gateway startup: build it in a test too.
+
+    A wrong config attribute name here used to take the whole gateway down on startup
+    while every unit test stayed green, because nothing built the real wiring.
+    """
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.app.bootstrap import (
+        build_effect_router,
+        build_processing_gate,
+        build_processing_store,
+    )
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.channels.manager import ChannelManager
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.policy.loader import save_policy
+    from yeoman_gateway.policy.schema import PolicyConfig
+    from yeoman_gateway.security import SecurityEngine
+
+    policy_path = tmp_path / "policy.json"
+    policy = PolicyConfig.model_validate(
+        {"owners": {"whatsapp": ["owner@s.whatsapp.net"]}}
+    )
+    save_policy(policy, policy_path)
+    engine = PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"})
+    adapter = EnginePolicyAdapter(
+        engine=engine, known_tools={"message"}, policy_path=policy_path, workspace=tmp_path
+    )
+
+    config = Config.model_validate(
+        {
+            "processing": {"enabled": True, "chats": ["whatsapp:chat@g.us"]},
+            "security": {"enabled": True, "stages": {"output": True}},
+        }
+    )
+    with patch.dict(os.environ, {"YEOMAN_HOME": str(tmp_path)}):
+        store = build_processing_store(config)
+    assert store is not None
+    bus = MessageBus()
+    security = SecurityEngine(config.security)
+
+    router = build_effect_router(config, adapter, store, bus, security=security)
+    assert router is not None
+    gate = build_processing_gate(config, adapter, store)
+    assert gate is not None
+    assert router.manages("whatsapp", "chat@g.us") is True
+
+    manager = ChannelManager(config, bus)
+    router.set_direct_transport(manager.send_now, manager.send_reaction_now)
+
+    store.close()

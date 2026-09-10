@@ -403,7 +403,7 @@ def build_effect_router(
             bus=bus,
             mark_provenance=True,
             security=security,
-            security_block_message=config.security.block_message,
+            security_block_message=config.security.block_user_message,
         ),
     )
     return IntentEffectRouter(gateway=gateway, config=config)
