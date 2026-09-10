@@ -639,3 +639,193 @@ async def test_provenance_cannot_be_forged_by_a_producer(tmp_path: Path) -> None
     )
     assert allowed is False and reason == "forged_effect_provenance"
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# system producers and shared output control (Plan 02, Aufgabe 2)
+# --------------------------------------------------------------------------------------
+
+
+class _SanitizingSecurity:
+    def __init__(self, action: str = "sanitize") -> None:
+        self.action = action
+        self.calls: list[dict[str, Any]] = []
+
+    def check_output(self, text: str, context: dict[str, Any] | None = None):
+        from yeoman_gateway.core.models import SecurityDecision, SecurityResult
+
+        self.calls.append({"text": text, "context": dict(context or {})})
+        return SecurityResult(
+            stage="output",
+            decision=SecurityDecision(action=self.action, reason="test"),
+            sanitized_text="[redacted]",
+        )
+
+
+@pytest.mark.asyncio
+async def test_text_effects_pass_the_shared_output_control(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    security = _SanitizingSecurity("sanitize")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(bus=bus, security=security),
+        clock=_Clock(0),
+    )
+    gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="secret token"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            capability="send_text",
+        )
+    )
+    await gateway.execute_ready("fx1")
+
+    assert [message.content for message in bus.sent] == ["[redacted]"]
+    assert security.calls and security.calls[0]["context"]["capability"] == "send_text"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_text_effect_falls_back_to_the_block_message(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(
+            bus=bus, security=_SanitizingSecurity("block"), security_block_message="[blocked]"
+        ),
+        clock=_Clock(0),
+    )
+    gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="danger"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+        )
+    )
+    await gateway.execute_ready("fx1")
+
+    assert [message.content for message in bus.sent] == ["[redacted]"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_producer_uses_a_service_principal(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+    producer = ServiceEffectProducer(router=router, bus=bus)
+
+    receipt = await producer.send(
+        source="cron",
+        operation_ref="cron:job-1:run-1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="reminder",
+    )
+
+    assert receipt is not None
+    assert len(executor.calls) == 1
+    assert executor.calls[0].principal == "service:cron"
+    assert bus.sent == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_producer_keeps_legacy_for_unmanaged_chats(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(
+        gateway=gateway, config=_config(chats=("whatsapp:elsewhere@g.us",)), clock=_Clock(0)
+    )
+    bus = _RecordingBus()
+    producer = ServiceEffectProducer(router=router, bus=bus)
+
+    assert (
+        await producer.send(
+            source="cron",
+            operation_ref="cron:job-1:run-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="reminder",
+        )
+        is None
+    )
+    assert [message.content for message in bus.sent] == ["reminder"]
+    assert executor.calls == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_system_source_is_refused(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ServiceEffectProducer,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+    producer = ServiceEffectProducer(router=router, bus=bus)
+
+    with pytest.raises(EffectNotDeliveredError):
+        await producer.send(
+            source="mystery-box",
+            operation_ref="x",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="hello",
+        )
+    assert executor.calls == []
+    assert bus.sent == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_principal_without_policy_rights_is_blocked(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor, capabilities=_DenyAll())
+    producer = ServiceEffectProducer(router=router, bus=_RecordingBus())
+
+    receipt = await producer.send(
+        source="speakup",
+        operation_ref="speakup:1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="hi",
+    )
+
+    assert receipt is not None and receipt.state == "blocked"
+    assert executor.calls == []
+    store.close()

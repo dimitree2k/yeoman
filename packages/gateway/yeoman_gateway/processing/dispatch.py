@@ -104,12 +104,39 @@ class BusEffectExecutor:
         delete_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         external_handler: Callable[[EffectEnvelope], Awaitable[bool]] | None = None,
         mark_provenance: bool = False,
+        security: Any | None = None,
+        security_block_message: str = "\U0001f602",
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
+        self._security = security
+        self._security_block_message = security_block_message
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
+
+    def _guard_text(self, envelope: EffectEnvelope, text: str) -> str:
+        """Shared outbound control for text-bearing effects.
+
+        Respects the existing security settings (enabled/stages) and mirrors the legacy
+        outbound stage: sanitize replaces the text, block falls back to the configured
+        block message. Media, reaction and delete payloads have their own validators.
+        """
+        if self._security is None:
+            return text
+        result = self._security.check_output(
+            text,
+            context={
+                "channel": envelope.target.channel,
+                "chat_id": envelope.target.chat_id,
+                "effect_id": envelope.effect_id,
+                "capability": envelope.capability,
+            },
+        )
+        action = result.decision.action
+        if action in ("sanitize", "block"):
+            return result.sanitized_text or self._security_block_message
+        return text
 
     async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
         validate_payload(envelope)
@@ -123,7 +150,7 @@ class BusEffectExecutor:
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
-                    content=payload.text,
+                    content=self._guard_text(envelope, payload.text),
                     reply_to=payload.reply_to,
                     metadata=dict(provenance),
                 )
@@ -133,7 +160,7 @@ class BusEffectExecutor:
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
-                    content=payload.caption or "",
+                    content=self._guard_text(envelope, payload.caption or ""),
                     media=list(payload.media),
                     metadata=dict(provenance),
                 )
@@ -247,6 +274,80 @@ class ManagedOutboundDispatcher:
             raise EffectNotDeliveredError(
                 f"effect not delivered (state={receipt.state}, detail={receipt.detail or '-'})"
             )
+
+
+#: Explicit service principals for system producers. A source that is not listed here
+#: must not produce effects in the new mode - no fictional owner (spec R02).
+SERVICE_PRINCIPALS: Mapping[str, str] = {
+    "cron": "service:cron",
+    "admin": "service:admin",
+    "ipc": "service:ipc",
+    "speakup": "service:speakup",
+    "heartbeat": "service:heartbeat",
+}
+
+
+class ServiceEffectProducer:
+    """Effect entry point for system producers without a chat participant.
+
+    Cron runs, admin notices, IPC commands and speakups all use it. An unknown source is
+    refused loudly; a service principal whose policy rights do not cover the target is
+    blocked by the authorizer, exactly like any other principal.
+    """
+
+    def __init__(
+        self,
+        *,
+        router: "IntentEffectRouter",
+        bus: EffectTransport,
+        deadline_key: str = "proactive_ms",
+    ) -> None:
+        self._router = router
+        self._bus = bus
+        self._deadline_key = deadline_key
+
+    async def send(
+        self,
+        *,
+        source: str,
+        operation_ref: str,
+        channel: str,
+        chat_id: str,
+        content: str,
+        capability: str = "send_text",
+        reply_to: str | None = None,
+    ) -> EffectReceipt | None:
+        """Submit one system-produced effect. ``None`` means the legacy path was used."""
+        if not self._router.manages(channel, chat_id):
+            await self._bus.publish_outbound(
+                OutboundMessage(
+                    channel=channel, chat_id=chat_id, content=content, reply_to=reply_to
+                )
+            )
+            return None
+        principal = SERVICE_PRINCIPALS.get(source)
+        if not principal:
+            logger.error(
+                "refusing system producer without a service principal source={} chat={}",
+                source,
+                chat_id,
+            )
+            raise EffectNotDeliveredError(
+                f"system source {source!r} has no registered service principal"
+            )
+        payload = TextPayload(text=content, reply_to=reply_to)
+        return await self._router.submit_message(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata={"message_id": operation_ref, "service_source": source},
+            ),
+            principal=principal,
+            capability=capability,
+            payload=payload,
+        )
 
 
 def managed_outbound_guard(

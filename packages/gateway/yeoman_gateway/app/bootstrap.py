@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, assert_never
+from uuid import uuid4 as _uuid4
 
 from loguru import logger
 from yeoman_shared.telemetry import InMemoryTelemetry, tracing
@@ -56,6 +57,8 @@ from yeoman_gateway.persona_evolution import (
     run_persona_evolution_cron,
 )
 from yeoman_gateway.policy.persona import load_persona_text
+from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+from yeoman_gateway.processing.models import canonical_hash
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
@@ -365,6 +368,7 @@ def build_effect_router(
     policy_adapter: "EnginePolicyAdapter | None",
     store: "ProcessingStore | None",
     bus: MessageBus,
+    security: object | None = None,
 ):
     """Effect gateway plus transport executor for the new mode.
 
@@ -392,7 +396,12 @@ def build_effect_router(
                 known_tools=lambda: set(policy_adapter.known_tools),
             ),
         ),
-        executor=BusEffectExecutor(bus=bus, mark_provenance=True),
+        executor=BusEffectExecutor(
+            bus=bus,
+            mark_provenance=True,
+            security=security,
+            security_block_message=config.security.block_message,
+        ),
     )
     return IntentEffectRouter(gateway=gateway, config=config)
 
@@ -550,11 +559,18 @@ def build_gateway_runtime(
         _caldav_service = CalDAVService(_caldav_user, _caldav_pass)
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
-    effect_router = build_effect_router(config, policy_adapter, processing_store, bus)
+    effect_router = build_effect_router(
+        config, policy_adapter, processing_store, bus, security=security
+    )
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard
 
         bus.set_managed_outbound_guard(managed_outbound_guard(effect_router))
+    service_effects = (
+        ServiceEffectProducer(router=effect_router, bus=bus)
+        if effect_router is not None
+        else None
+    )
 
     responder = LLMResponder(
         provider=provider,
@@ -610,6 +626,16 @@ def build_gateway_runtime(
 
     # Wire admin notify callback: sends text to a given channel+chat.
     async def _admin_notify(channel: str, chat_id: str, text: str) -> None:
+        if service_effects is not None:
+            await service_effects.send(
+                source="admin",
+                operation_ref=f"admin:{channel}:{chat_id}:{canonical_hash(text)[:12]}",
+                channel=channel,
+                chat_id=chat_id,
+                content=text,
+                capability="send_text",
+            )
+            return
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=text))
 
     policy_adapter.set_admin_notify_callback(_admin_notify)
@@ -649,10 +675,23 @@ def build_gateway_runtime(
     persona_evolution_state_db_path = Path(workspace) / "persona-evolution" / "persona-evolution.db"
 
     async def _on_approval_expired(approval: PendingApproval) -> None:
+        content = (
+            f"Workflow approval expired: {approval.approval_id}. "
+            "Use /cron workflow_list to review."
+        )
+        if service_effects is not None:
+            await service_effects.send(
+                source="cron",
+                operation_ref=f"approval-expired:{approval.approval_id}",
+                channel=approval.channel,
+                chat_id=approval.chat_id,
+                content=content,
+            )
+            return
         await bus.publish_outbound(OutboundMessage(
             channel=approval.channel,
             chat_id=approval.chat_id,
-            content=f"Workflow approval expired: {approval.approval_id}. Use /cron workflow_list to review.",
+            content=content,
         ))
 
     cron._workflow_state = workflow_state
@@ -677,10 +716,20 @@ def build_gateway_runtime(
             model_profile=next_job.payload.model_profile,
         )
         if next_job.payload.deliver and next_job.payload.to:
-            await bus.publish_outbound(OutboundMessage(
-                channel=next_job.payload.channel or "cli",
-                chat_id=next_job.payload.to, content=response or "",
-            ))
+            delivery_channel = next_job.payload.channel or "cli"
+            if service_effects is not None:
+                await service_effects.send(
+                    source="cron",
+                    operation_ref=f"cron:{next_job.id}:{run_id}",
+                    channel=delivery_channel,
+                    chat_id=next_job.payload.to,
+                    content=response or "",
+                )
+            else:
+                await bus.publish_outbound(OutboundMessage(
+                    channel=delivery_channel,
+                    chat_id=next_job.payload.to, content=response or "",
+                ))
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
 
@@ -979,13 +1028,26 @@ def build_gateway_runtime(
             model_profile=job.payload.model_profile,
         )
         if job.payload.deliver and job.payload.to:
-            await bus.publish_outbound(
-                OutboundMessage(
-                    channel=job.payload.channel or "cli",
+            delivery_channel = job.payload.channel or "cli"
+            if service_effects is not None:
+                await service_effects.send(
+                    source="cron",
+                    operation_ref=(
+                        f"cron:{job.id}:"
+                        f"{job.state.last_run_at_ms or job.state.next_run_at_ms or ''}"
+                    ),
+                    channel=delivery_channel,
                     chat_id=job.payload.to,
                     content=response or "",
                 )
-            )
+            else:
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=delivery_channel,
+                        chat_id=job.payload.to,
+                        content=response or "",
+                    )
+                )
 
         # Workflow chaining
         if job.payload.next_job_id and response is not None:
@@ -1099,6 +1161,15 @@ def build_gateway_runtime(
     socket_path = Path(ipc_config.gateway_socket_path).expanduser()
 
     async def ipc_send_message(channel: str, chat_id: str, content: str) -> dict:
+        if service_effects is not None:
+            await service_effects.send(
+                source="ipc",
+                operation_ref=f"ipc:{_uuid4().hex}",
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+            )
+            return {"queued": True}
         await bus.publish_outbound(
             OutboundMessage(channel=channel, chat_id=chat_id, content=content)
         )
