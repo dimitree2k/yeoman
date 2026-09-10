@@ -8,6 +8,7 @@ dependencies = [
     "pydantic-settings>=2.13.1",
     "loguru>=0.7.3",
     "httpx>=0.28.1",
+    "langfuse>=4.15.2,<5.0.0",
 ]
 
 [build-system]

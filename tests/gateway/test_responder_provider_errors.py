@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from yeoman_gateway.adapters import responder_llm as responder_module
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.bus.queue import MessageBus
@@ -144,6 +145,82 @@ async def test_normal_error_word_text_and_tool_loop_remain_functional(tmp_path: 
     responder, result = await _run(tmp_path, provider, _decision())
     try:
         assert result == "Error is a normal technical word"
+    finally:
+        await responder.aclose()
+
+
+@pytest.mark.asyncio
+async def test_langfuse_v4_records_generation_and_closes_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, Any]] = []
+
+    class _Handle:
+        def __init__(self, span_id: str) -> None:
+            self.span_id = span_id
+
+    trace = object()
+    iteration = _Handle("iteration-1")
+    generation = _Handle("generation-1")
+
+    def _start_trace(**kwargs: Any) -> object:
+        events.append(("start_trace", kwargs))
+        return trace
+
+    def _start_span(**kwargs: Any) -> _Handle:
+        events.append(("start_span", kwargs))
+        return iteration
+
+    def _start_generation(**kwargs: Any) -> _Handle:
+        events.append(("start_generation", kwargs))
+        return generation
+
+    def _end_generation(handle: _Handle | None, **kwargs: Any) -> None:
+        events.append(("end_generation", {"handle": handle, **kwargs}))
+
+    def _end_span(handle: object | None, **kwargs: Any) -> None:
+        events.append(("end_span", {"handle": handle, **kwargs}))
+
+    def _legacy_log_generation(**kwargs: Any) -> None:
+        del kwargs
+        raise AssertionError("responder must use the v4 generation lifecycle directly")
+
+    monkeypatch.setattr(responder_module.lf, "start_trace", _start_trace)
+    monkeypatch.setattr(responder_module.lf, "start_span", _start_span)
+    monkeypatch.setattr(responder_module.lf, "start_generation", _start_generation)
+    monkeypatch.setattr(responder_module.lf, "end_generation", _end_generation)
+    monkeypatch.setattr(responder_module.lf, "end_span", _end_span)
+    monkeypatch.setattr(responder_module.lf, "log_generation", _legacy_log_generation)
+
+    provider = _Provider(
+        [
+            LLMResponse(
+                content="answer",
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            )
+        ]
+    )
+
+    responder, result = await _run(tmp_path, provider, _decision())
+    try:
+        assert result == "answer"
+        generation_start = next(item for item in events if item[0] == "start_generation")
+        assert generation_start[1]["parent"] is iteration
+        assert generation_start[1]["input"]["message_count"] > 0
+        assert generation_start[1]["input"]["has_tools"] is False
+
+        generation_end = next(item for item in events if item[0] == "end_generation")
+        assert generation_end[1]["handle"] is generation
+        assert generation_end[1]["output"] == "answer"
+        assert generation_end[1]["usage"] == {
+            "prompt_tokens": 4,
+            "completion_tokens": 2,
+            "total_tokens": 6,
+        }
+
+        root_end = [item for item in events if item[0] == "end_span"][-1]
+        assert root_end[1]["handle"] is trace
+        assert root_end[1]["output"] == {"outcome": "completed", "content_chars": 6}
     finally:
         await responder.aclose()
 

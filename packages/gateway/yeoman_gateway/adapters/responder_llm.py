@@ -1429,6 +1429,20 @@ class LLMResponder(ResponderPort):
                 trace=trace,
                 name=f"iteration-{iteration}",
             ) if trace is not None else None
+            generation = lf.start_generation(
+                parent=iter_span or trace,
+                name="llm",
+                model=model or self.model,
+                input={
+                    "message_count": len(messages),
+                    "has_tools": bool(self._tool_definitions(allowed_tools)),
+                },
+                model_parameters={
+                    "temperature": temperature if temperature is not None else 0.7,
+                    "max_tokens": max_tokens,
+                    "reasoning": reasoning,
+                },
+            )
             try:
                 response = await chat_provider.chat(
                     messages=messages,
@@ -1444,17 +1458,19 @@ class LLMResponder(ResponderPort):
                         model or self.model,
                     )
                     raise LLMProviderError()
-                lf.log_generation(
-                    parent=iter_span or trace,
-                    name="llm",
-                    model=model or self.model,
-                    input={"message_count": len(messages), "has_tools": bool(self._tool_definitions(allowed_tools))},
+            except Exception:
+                lf.end_generation(
+                    generation,
+                    metadata={"outcome": "error"},
+                    level="ERROR",
+                    status_message="provider_error",
+                )
+                raise
+            else:
+                lf.end_generation(
+                    generation,
                     output=response.content,
-                    usage={
-                        "input": response.usage.get("prompt_tokens", 0),
-                        "output": response.usage.get("completion_tokens", 0),
-                        "total": response.usage.get("total_tokens", 0),
-                    },
+                    usage=response.usage,
                 )
 
                 tool_calls = response.tool_calls
@@ -2186,6 +2202,11 @@ class LLMResponder(ResponderPort):
             },
             tags=[channel],
             session_id=session_key,
+            input={
+                "content_present": bool(content),
+                "content_chars": len(content),
+                "media_count": len(media),
+            },
         )
         self._current_trace = trace
         self._pending_hidden_assistant_messages = []
@@ -2228,6 +2249,7 @@ class LLMResponder(ResponderPort):
                 session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self._flush_hidden_assistant_markers(session)
             self.sessions.save(session)
+            lf.end_span(trace, output={"outcome": "pending_delivery_completed"})
             self._current_trace = None
             return None
 
@@ -2270,6 +2292,7 @@ class LLMResponder(ResponderPort):
                 sender_id,
                 content[:80],
             )
+            lf.end_span(trace, output={"outcome": "social_holdback"})
             self._current_trace = None
             return None
 
@@ -2433,6 +2456,7 @@ class LLMResponder(ResponderPort):
                 session.add_message("user", content, **self._session_user_metadata(sender_id, metadata))
             self._flush_hidden_assistant_markers(session)
             self.sessions.save(session)
+            lf.end_span(trace, output={"outcome": "no_response"})
             self._current_trace = None
             return None
 
@@ -2511,6 +2535,10 @@ class LLMResponder(ResponderPort):
                 self._private_handoff_store.consume_reply(private_handoff_id)
             except Exception as exc:
                 logger.warning("private handoff consume failed: {}", exc)
+        lf.end_span(
+            trace,
+            output={"outcome": "completed", "content_chars": len(final_content)},
+        )
         self._current_trace = None
         return final_content
 

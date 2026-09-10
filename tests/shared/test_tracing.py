@@ -1,56 +1,144 @@
-"""Unit tests for Langfuse tracing module."""
+"""Unit tests for the Langfuse v4 tracing boundary."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from dataclasses import dataclass, field
+from typing import Any, ClassVar
 
-import httpx
 import pytest
-
 from yeoman_shared.telemetry import tracing
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+@dataclass
+class FakeObservation:
+    """Small SDK-shaped observation used without network access."""
+
+    trace_id: str
+    id: str
+    name: str
+    as_type: str
+    parent: FakeObservation | None = None
+    input: Any = None
+    metadata: Any = None
+    updates: list[dict[str, Any]] = field(default_factory=list)
+    end_count: int = 0
+    _next_id: ClassVar[int] = 0
+
+    def start_observation(self, *, name: str, as_type: str = "span", **kwargs: Any) -> FakeObservation:
+        FakeObservation._next_id += 1
+        return FakeObservation(
+            trace_id=self.trace_id,
+            id=f"obs-{FakeObservation._next_id}",
+            name=name,
+            as_type=as_type,
+            parent=self,
+            input=kwargs.get("input"),
+            metadata=kwargs.get("metadata"),
+        )
+
+    def update(self, **kwargs: Any) -> FakeObservation:
+        self.updates.append(kwargs)
+        if "input" in kwargs:
+            self.input = kwargs["input"]
+        if "metadata" in kwargs:
+            self.metadata = kwargs["metadata"]
+        return self
+
+    def end(self) -> FakeObservation:
+        self.end_count += 1
+        return self
+
+
+class FakeRootContext:
+    def __init__(self, observation: FakeObservation) -> None:
+        self.observation = observation
+
+    def __enter__(self) -> FakeObservation:
+        return self.observation
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.observation.end()
+
+
+class FakePropagationContext:
+    def __init__(self, calls: list[dict[str, Any]], kwargs: dict[str, Any]) -> None:
+        self.calls = calls
+        self.kwargs = kwargs
+
+    def __enter__(self) -> FakePropagationContext:
+        self.calls.append(self.kwargs)
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+
+class FakeLangfuse:
+    instances: list[FakeLangfuse] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.init_kwargs = kwargs
+        self.propagation_calls: list[dict[str, Any]] = []
+        self.root: FakeObservation | None = None
+        self.flush_count = 0
+        self.shutdown_count = 0
+        FakeLangfuse.instances.append(self)
+
+    def start_as_current_observation(self, **kwargs: Any) -> FakeRootContext:
+        FakeObservation._next_id += 1
+        self.root = FakeObservation(
+            trace_id=f"trace-{FakeObservation._next_id}",
+            id=f"obs-{FakeObservation._next_id}",
+            name=kwargs["name"],
+            as_type=kwargs.get("as_type", "span"),
+            input=kwargs.get("input"),
+            metadata=kwargs.get("metadata"),
+        )
+        return FakeRootContext(self.root)
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+
+
+def fake_propagate_attributes(**kwargs: Any) -> FakePropagationContext:
+    client = FakeLangfuse.instances[-1]
+    return FakePropagationContext(client.propagation_calls, kwargs)
 
 
 @pytest.fixture(autouse=True)
-def _clean_module_state():
-    """Reset module-level state before and after every test."""
+def _clean_module_state(monkeypatch: pytest.MonkeyPatch):
     tracing.reset()
+    FakeLangfuse.instances.clear()
+    FakeObservation._next_id = 0
+    monkeypatch.setattr(tracing, "_load_sdk", lambda: (FakeLangfuse, fake_propagate_attributes))
     yield
     tracing.reset()
+    FakeLangfuse.instances.clear()
 
 
-def _init_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set the required env vars and call ``init()``."""
+def _init_tracing(monkeypatch: pytest.MonkeyPatch) -> FakeLangfuse:
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test-secret")
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test-public")
-    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://langfuse.test")
-    tracing.init()
-
-
-# ── Tests ─────────────────────────────────────────────────────────────
+    assert tracing.init() is True
+    client = FakeLangfuse.instances[-1]
+    assert client.init_kwargs["additional_headers"] == {"x-langfuse-ingestion-version": "4"}
+    return client
 
 
 class TestNoOpWhenDisabled:
-    """Verify every public function is a safe no-op when tracing is not configured."""
-
-    def test_init_returns_false_without_secret_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_init_returns_false_without_project_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+        monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+
         assert tracing.init() is False
         assert tracing._client is None
 
-    def test_start_trace_returns_none(self) -> None:
+    def test_observation_helpers_are_safe_noops(self) -> None:
         assert tracing.start_trace(name="test") is None
-
-    def test_start_span_returns_none(self) -> None:
-        fake_trace = tracing.TraceContext(trace_id="abc", name="t", start_time="x")
-        assert tracing.start_span(trace=fake_trace, name="s") is None
-
-    def test_end_span_does_not_raise(self) -> None:
-        tracing.end_span(None)  # should be a silent no-op
-
-    def test_log_generation_does_not_raise(self) -> None:
+        tracing.end_span(None)
         tracing.log_generation(
             parent=None,
             name="gen",
@@ -59,287 +147,107 @@ class TestNoOpWhenDisabled:
             output="bye",
             usage={"input": 1, "output": 2, "total": 3},
         )
-        assert len(tracing._batch) == 0
 
 
-class TestInitialisation:
-    """Verify init() wires up the async client correctly."""
+class TestV4Observations:
+    def test_start_trace_creates_agent_root_and_propagates_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _init_tracing(monkeypatch)
 
-    def test_init_returns_true_with_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
-        assert tracing.init() is True
-        assert tracing._client is not None
+        trace = tracing.start_trace(
+            name="generate",
+            metadata={"channel": "whatsapp", "attempt": 1},
+            tags=["whatsapp"],
+            input="hello",
+            session_id="session-1",
+            user_id="user-1",
+        )
 
-    def test_init_uses_default_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
-        monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
-        tracing.init()
-        assert tracing._base_url == "https://cloud.langfuse.com"
-
-    def test_init_respects_custom_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
-        monkeypatch.setenv("LANGFUSE_BASE_URL", "https://custom.host/")
-        tracing.init()
-        assert tracing._base_url == "https://custom.host"
-
-    def test_init_configures_flush_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
-        tracing.init(flush_interval=10.0, batch_size=100)
-        assert tracing._flush_interval == 10.0
-        assert tracing._batch_size == 100
-
-
-class TestContextCreation:
-    """Verify TraceContext / SpanContext are created with correct IDs."""
-
-    def test_start_trace_returns_trace_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        ctx = tracing.start_trace(name="my-trace", metadata={"k": "v"})
-
-        assert ctx is not None
-        assert isinstance(ctx, tracing.TraceContext)
-        assert len(ctx.trace_id) == 32  # uuid4().hex
-        assert ctx.name == "my-trace"
-        assert ctx.start_time  # non-empty ISO string
-
-    def test_start_span_returns_span_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
         assert trace is not None
-        span = tracing.start_span(trace=trace, name="my-span")
+        assert client.root is not None
+        assert trace.observation is client.root
+        assert client.root.as_type == "agent"
+        assert client.root.input == "hello"
+        assert client.propagation_calls == [
+            {
+                "trace_name": "generate",
+                "user_id": "user-1",
+                "session_id": "session-1",
+                "metadata": {"channel": "whatsapp", "attempt": "1"},
+                "tags": ["whatsapp"],
+            }
+        ]
 
-        assert span is not None
-        assert isinstance(span, tracing.SpanContext)
-        assert len(span.span_id) == 32
-        assert span.trace_id == trace.trace_id
-        assert span.name == "my-span"
-
-
-class TestEventQueuing:
-    """Verify events are queued with the correct structure."""
-
-    def test_start_trace_queues_trace_create_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        tracing.start_trace(name="t1", tags=["tag1"], input="hello", session_id="sess1")
-
-        assert len(tracing._batch) == 1
-        evt = tracing._batch[0]
-        assert evt["type"] == "trace-create"
-        assert evt["body"]["name"] == "t1"
-        assert evt["body"]["tags"] == ["tag1"]
-        assert evt["body"]["input"] == "hello"
-        assert evt["body"]["sessionId"] == "sess1"
-
-    def test_start_span_queues_span_create_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
-        assert trace is not None
-        tracing.start_span(trace=trace, name="s1", metadata={"x": 1})
-
-        assert len(tracing._batch) == 2
-        evt = tracing._batch[1]
-        assert evt["type"] == "span-create"
-        assert evt["body"]["traceId"] == trace.trace_id
-        assert evt["body"]["name"] == "s1"
-        assert evt["body"]["metadata"] == {"x": 1}
-        assert "startTime" in evt["body"]
-
-    def test_start_span_with_parent_span_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
-        assert trace is not None
-        parent = tracing.start_span(trace=trace, name="parent")
-        assert parent is not None
-        child = tracing.start_span(trace=trace, name="child", parent_span_id=parent.span_id)
-        assert child is not None
-
-        evt = tracing._batch[2]
-        assert evt["body"]["parentObservationId"] == parent.span_id
-
-    def test_end_span_queues_span_update_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
-        assert trace is not None
-        span = tracing.start_span(trace=trace, name="s")
-        assert span is not None
-        tracing.end_span(span, output={"result": "ok"}, metadata={"dur_ms": 42})
-
-        assert len(tracing._batch) == 3
-        evt = tracing._batch[2]
-        assert evt["type"] == "span-update"
-        assert evt["body"]["id"] == span.span_id
-        assert evt["body"]["traceId"] == span.trace_id
-        assert "endTime" in evt["body"]
-        assert evt["body"]["output"] == {"result": "ok"}
-        assert evt["body"]["metadata"] == {"dur_ms": 42}
-
-    def test_log_generation_queues_generation_create_event(
+    def test_children_use_v4_observation_types_and_parentage(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
+        trace = tracing.start_trace(name="generate")
+        assert trace is not None
+
+        iteration = tracing.start_span(trace=trace, name="iteration-1")
+        assert iteration is not None
+        tool = tracing.start_span(
+            trace=trace,
+            name="tool/web_search",
+            metadata={"arguments": "{}"},
+            parent_span_id=iteration.span_id,
+        )
+
+        assert tool is not None
+        assert iteration.observation.as_type == "span"
+        assert tool.observation.as_type == "tool"
+        assert tool.observation.parent is iteration.observation
+
+        tracing.end_span(tool, output={"result": "ok"})
+        tracing.end_span(iteration)
+        tracing.end_span(trace, output="answer")
+
+        assert tool.observation.end_count == 1
+        assert iteration.observation.end_count == 1
+        assert trace.observation.end_count == 1
+
+    def test_log_generation_creates_completed_generation_with_v4_usage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _init_tracing(monkeypatch)
+        trace = tracing.start_trace(name="generate")
         assert trace is not None
 
         tracing.log_generation(
             parent=trace,
-            name="chat-completion",
-            model="claude-3-opus",
-            input=[{"role": "user", "content": "hi"}],
-            output={"role": "assistant", "content": "hello"},
+            name="llm",
+            model="openai/gpt-5",
+            input={"message_count": 2},
+            output="hello",
             usage={"input": 10, "output": 20, "total": 30},
             metadata={"channel": "whatsapp"},
-            model_parameters={"temperature": 0.6},
+            model_parameters={"temperature": 0.7},
         )
 
-        assert len(tracing._batch) == 2
-        evt = tracing._batch[1]
-        assert evt["type"] == "generation-create"
-        body = evt["body"]
-        assert body["traceId"] == trace.trace_id
-        assert body["name"] == "chat-completion"
-        assert body["model"] == "claude-3-opus"
-        assert body["input"] == [{"role": "user", "content": "hi"}]
-        assert body["output"] == {"role": "assistant", "content": "hello"}
-        assert body["usageDetails"] == {"input": 10, "output": 20, "total": 30}
-        assert body["metadata"] == {"channel": "whatsapp"}
-        assert body["modelParameters"] == {"temperature": 0.6}
-        assert "parentObservationId" not in body  # parent is a trace, not a span
-
-    def test_log_generation_with_span_parent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        trace = tracing.start_trace(name="t")
-        assert trace is not None
-        span = tracing.start_span(trace=trace, name="s")
-        assert span is not None
-
-        tracing.log_generation(
-            parent=span,
-            name="gen",
-            model="gpt-4",
-            input="q",
-            output="a",
-            usage={"input": 5, "output": 10, "total": 15},
-        )
-
-        evt = tracing._batch[2]
-        assert evt["body"]["parentObservationId"] == span.span_id
-        assert evt["body"]["traceId"] == trace.trace_id
+        generation = trace.children[-1]
+        assert generation.observation.as_type == "generation"
+        assert generation.observation.end_count == 1
+        update = generation.observation.updates[-1]
+        assert update["output"] == "hello"
+        assert update["usage_details"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+        }
 
 
-class TestFlush:
-    """Verify flush sends the batch via HTTP POST with correct auth."""
-
+class TestLifecycle:
     @pytest.mark.asyncio
-    async def test_flush_sends_post_and_clears_queue(
+    async def test_flush_and_shutdown_delegate_to_sdk(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _init_tracing(monkeypatch)
-        tracing.start_trace(name="t")
-        assert len(tracing._batch) == 1
+        client = _init_tracing(monkeypatch)
 
-        mock_response = MagicMock()
-        mock_response.status_code = 207
-        mock_response.json.return_value = {"successes": [{}], "errors": []}
+        await tracing.flush()
+        await tracing.shutdown()
 
-        assert tracing._client is not None
-        with patch.object(tracing._client, "post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
-            await tracing.flush()
-
-            mock_post.assert_called_once()
-            call_kwargs = mock_post.call_args
-            assert call_kwargs[0][0] == "/api/public/ingestion"
-            payload = call_kwargs[1]["json"]
-            assert len(payload["batch"]) == 1
-            assert payload["batch"][0]["type"] == "trace-create"
-
-        # Queue should be empty now.
-        assert len(tracing._batch) == 0
-
-    @pytest.mark.asyncio
-    async def test_flush_noop_when_batch_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        assert tracing._client is not None
-        with patch.object(tracing._client, "post", new_callable=AsyncMock) as mock_post:
-            await tracing.flush()
-            mock_post.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_logs_warning_on_non_207(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _init_tracing(monkeypatch)
-        tracing.start_trace(name="t")
-
-        mock_response = MagicMock()
-        mock_response.status_code = 500
-        mock_response.text = "Internal Server Error"
-
-        assert tracing._client is not None
-        with (
-            patch.object(tracing._client, "post", new_callable=AsyncMock, return_value=mock_response),
-            patch("yeoman_shared.telemetry.tracing.logger") as mock_logger,
-        ):
-            await tracing.flush()
-            mock_logger.warning.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_logs_warning_on_exception(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _init_tracing(monkeypatch)
-        tracing.start_trace(name="t")
-
-        assert tracing._client is not None
-        with (
-            patch.object(
-                tracing._client,
-                "post",
-                new_callable=AsyncMock,
-                side_effect=httpx.ConnectError("connection refused"),
-            ),
-            patch("yeoman_shared.telemetry.tracing.logger") as mock_logger,
-        ):
-            # Must not raise.
-            await tracing.flush()
-            mock_logger.opt.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_auth_uses_public_and_secret_keys(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _init_tracing(monkeypatch)
-
-        # Verify the httpx client was created with the correct auth.
-        assert tracing._client is not None
-        auth = tracing._client._auth  # type: ignore[attr-defined]
-        # httpx BasicAuth stores (username, password) internally
-        assert auth._auth_header  # just verify auth is wired up
-
-
-class TestShutdown:
-    """Verify shutdown flushes and closes the client."""
-
-    @pytest.mark.asyncio
-    async def test_shutdown_flushes_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _init_tracing(monkeypatch)
-        tracing.start_trace(name="t")
-
-        mock_response = MagicMock()
-        mock_response.status_code = 207
-        mock_response.json.return_value = {"successes": [{}], "errors": []}
-
-        assert tracing._client is not None
-        with (
-            patch.object(tracing._client, "post", new_callable=AsyncMock, return_value=mock_response) as mock_post,
-            patch.object(tracing._client, "aclose", new_callable=AsyncMock) as mock_close,
-        ):
-            await tracing.shutdown()
-            mock_post.assert_called_once()
-            mock_close.assert_called_once()
-
+        assert client.flush_count == 1
+        assert client.shutdown_count == 1
         assert tracing._client is None
-        assert len(tracing._batch) == 0
