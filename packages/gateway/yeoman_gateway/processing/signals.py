@@ -269,6 +269,37 @@ __all__ = [
     "CHANNEL",
     "SIGNAL_KINDS",
     "JournalSignal",
+    "SignalJournalSink",
     "WhatsAppSignalMapper",
     "signal_event_id",
 ]
+
+
+class SignalJournalSink:
+    """Journals provider signals. It runs no policy, opens no turn and creates no effect."""
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        mapper: WhatsAppSignalMapper | None = None,
+        clock: Any = None,
+    ) -> None:
+        self._store = store
+        self._mapper = mapper or WhatsAppSignalMapper()
+        self._clock = clock
+
+    def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
+        if self._store is None:
+            return None
+        signal = self._mapper.map(payload, kind=kind)
+        if signal is None:
+            return None
+        now = int(self._clock()) if self._clock is not None else None
+        return self._store.append_event(
+            event_key=signal.event_key,
+            event_id=signal.event_id,
+            trace_id=signal.trace_id,
+            payload=signal.to_event_payload(),
+            now_ms=now,
+        )

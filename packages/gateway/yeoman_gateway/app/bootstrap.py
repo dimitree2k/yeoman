@@ -62,6 +62,7 @@ from yeoman_gateway.processing.dispatch import (
     disable_non_migrated_tools,
 )
 from yeoman_gateway.processing.models import canonical_hash
+from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 from yeoman_gateway.security import NoopSecurity, SecurityEngine
@@ -743,6 +744,9 @@ def build_gateway_runtime(
         provider_factory=provider_factory,
         document_cache=document_cache,
         processing_gate=build_processing_gate(config, policy_adapter, processing_store),
+        processing_signals=(
+            SignalJournalSink(processing_store) if processing_store is not None else None
+        ),
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)

@@ -158,6 +158,10 @@ class InboundEvent:
     reply_to_media_bytes: int | None = None
 
 
+#: Bridge frame types that only carry journal evidence (never a chat turn).
+_PROCESSING_SIGNAL_TYPES = frozenset({"edit", "delete", "reaction", "receipt"})
+
+
 class WhatsAppChannel(BaseChannel):
     """WhatsApp channel backed by the Node.js bridge protocol v3."""
 
@@ -201,6 +205,7 @@ class WhatsAppChannel(BaseChannel):
         self._reader_task: asyncio.Task[None] | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
         self._processing_gate: Any | None = None
+        self._processing_signals: Any | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
@@ -615,6 +620,13 @@ class WhatsAppChannel(BaseChannel):
                 self._resolve_pending(request_id, payload)
             return
 
+        if msg_type in _PROCESSING_SIGNAL_TYPES:
+            # Provider signals are journal evidence, not orders: the hook touches neither
+            # dedupe, debounce, archive nor publishing, and a failure here must never cost
+            # the legacy ingest path.
+            self._dispatch_processing_signal(str(msg_type), payload)
+            return
+
         if msg_type == "message":
             event = self._parse_inbound_event(payload)
             if not event:
@@ -758,6 +770,22 @@ class WhatsAppChannel(BaseChannel):
             reply_to_media_path=reply_to_media_path,
             reply_to_media_bytes=reply_to_media_bytes,
         )
+
+    def set_processing_signals(self, sink: Any | None) -> None:
+        """Attach the journal sink for provider signals (edit/delete/reaction/receipt)."""
+        self._processing_signals = sink
+
+    def _dispatch_processing_signal(self, kind: str, payload: dict[str, Any]) -> None:
+        sink = self._processing_signals
+        if sink is None:
+            return
+        try:
+            sink(kind, payload)
+        except Exception as exc:
+            # Fail-open for the journal only: an unreadable signal must not break ingest.
+            logger.warning(
+                "processing signal rejected kind={} error_type={}", kind, type(exc).__name__
+            )
 
     def set_processing_gate(self, gate: Any | None) -> None:
         """Attach the fast gate of the new processing mode (``None`` keeps legacy)."""
