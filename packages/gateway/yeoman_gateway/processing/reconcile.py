@@ -479,6 +479,14 @@ class ReconciliationService:
 
         timeout_s = max(0.1, int(getattr(self._config, "probe_timeout_ms", 10_000)) / 1000)
         transport = self._store.effect_transport_receipt(effect_id)
+        if transport is not None and transport.provider_message_id:
+            # Late delivery/read evidence is attached before probing, so a probe sees the
+            # full picture and no evidence is lost to the correlation gap.
+            from yeoman_gateway.processing.signals import attach_receipt_evidence
+
+            self._counters["evidence_attached"] = self._counters.get("evidence_attached", 0) + len(
+                attach_receipt_evidence(self._store, effect_id, now_ms=now)
+            )
         signals = ()
         if transport is not None and transport.provider_message_id:
             signals = self._store.delivery_signals(

@@ -902,3 +902,7 @@ class PendingInput:
     relevance: str = "unknown"
     state: str = "waiting"
     enqueued_ms: int | None = None
+
+
+#: Provider statuses that prove a message reached the recipient (Plan 04, task 8).
+DELIVERED_STATUSES_TUPLE: tuple[str, ...] = ("delivered", "read", "played", "read-self")

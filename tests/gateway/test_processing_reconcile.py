@@ -243,3 +243,101 @@ def test_probe_schedule_follows_the_backoff() -> None:
     assert probe_due_ms(T0, attempt_number=2, backoff_seconds=backoff) == T0 + 20_000
     assert probe_due_ms(T0, attempt_number=3, backoff_seconds=backoff) == T0 + 65_000
     assert probe_due_ms(T0, attempt_number=4, backoff_seconds=backoff) == T0 + 185_000
+
+
+# --------------------------------------------------------------------------------------
+# Plan 04 task 8: late delivery/read evidence, never a state downgrade
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_never_moves_an_effect_to_sent(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.signals import (
+        WhatsAppSignalMapper,
+        attach_receipt_evidence,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    effect_id = await _make_unknown(store)
+    store.record_transport_receipt(
+        effect_id, channel="whatsapp", chat_id=CHAT, provider_message_id="3EB0", now_ms=T0
+    )
+    # The receipt signal arrived before the transport receipt was correlated.
+    signal = WhatsAppSignalMapper().map(
+        {"chatJid": CHAT, "messageId": "3EB0", "recipientJid": "4915@s.whatsapp.net",
+         "status": "read"},
+        kind="receipt",
+    )
+    store.append_event(
+        event_key=signal.event_key, event_id=signal.event_id, trace_id=signal.trace_id,
+        payload=signal.to_event_payload(), now_ms=T0,
+    )
+
+    attached = attach_receipt_evidence(store, effect_id, now_ms=T0 + 1)
+
+    assert [item.kind for item in attached] == ["read"]
+    assert store.effect_state(effect_id) == "unknown"  # a read is not transport acceptance
+    details = [item.detail for item in store.list_effects()[0].evidence]
+    assert any("recipient=" in (detail or "") for detail in details)
+    # Idempotent: attaching twice does not grow the evidence.
+    assert attach_receipt_evidence(store, effect_id, now_ms=T0 + 2) == ()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_late_evidence_never_downgrades_a_sent_effect(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.signals import (
+        WhatsAppSignalMapper,
+        attach_receipt_evidence,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(snapshots=_Snapshots(), capabilities=_AllowAll()),
+        executor=_SentExecutor(),
+        clock=_Clock(),
+    )
+    _unknown_effect(store)
+    await gateway.execute_ready("fx1")
+    assert store.effect_state("fx1") == "sent"
+
+    # A late delete signal and a late read must change nothing.
+    delete_signal = WhatsAppSignalMapper().map(
+        {"chatJid": CHAT, "messageId": "3EB0"}, kind="delete"
+    )
+    store.append_event(
+        event_key=delete_signal.event_key, event_id=delete_signal.event_id,
+        trace_id=delete_signal.trace_id, payload=delete_signal.to_event_payload(), now_ms=T0 + 5,
+    )
+    store.record_transport_receipt(
+        "fx1", channel="whatsapp", chat_id=CHAT, provider_message_id="3EB0", now_ms=T0 + 6
+    )
+    attach_receipt_evidence(store, "fx1", now_ms=T0 + 7)
+
+    assert store.effect_state("fx1") == "sent"
+    lineage = store.get_lineage("")
+    assert lineage.effects[0].state == "sent"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_lineage_exposes_evidence_without_raw_content(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    effect_id = await _make_unknown(store)
+    store.record_transport_receipt(
+        effect_id, channel="whatsapp", chat_id=CHAT, provider_message_id="3EB0", now_ms=T0
+    )
+
+    view = store.get_lineage("")
+    rendered = repr(view)
+
+    assert "hi" not in rendered  # no payload text
+    assert "4915" not in rendered  # no raw JID
+    assert view.effects[0].payload_available is True
+    store.close()
+
+
+class _SentExecutor:
+    async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
+        return EffectReceipt(effect_id=envelope.effect_id, state="sent")

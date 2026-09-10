@@ -16,16 +16,40 @@ Determinism rules:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from yeoman_gateway.processing.models import canonical_hash
+from yeoman_gateway.processing.models import (
+    DELIVERED_STATUSES_TUPLE as _DELIVERED,
+)
+from yeoman_gateway.processing.models import (
+    TransportReceipt,
+    canonical_hash,
+)
 
 CHANNEL = "whatsapp"
 
 #: Signal kinds the bridge can report (the canonical event kinds of spec R01).
 SIGNAL_KINDS: tuple[str, ...] = ("message", "edit", "reaction", "delete", "receipt")
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptEvidence:
+    """A delivery/read/played fact about one provider message.
+
+    It is *additional* evidence: it never proves that the transport accepted the message
+    and therefore never moves an effect to ``sent``.
+    """
+
+    kind: str  # delivered | read | played
+    provider_message_id: str
+    recipient_token: str
+    occurred_ms: int | None = None
+
+    @property
+    def detail(self) -> str:
+        return f"recipient={self.recipient_token}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +258,47 @@ class WhatsAppSignalMapper:
             target_message_id=message_id,
         )
 
+    # -- receipt evidence --------------------------------------------------------------
+
+    def receipt_evidence(
+        self, receipt: TransportReceipt | None, signals: Iterable[Any]
+    ) -> tuple[ReceiptEvidence, ...]:
+        """Delivery/read/played facts for one provider message.
+
+        A receipt that arrived *before* the transport receipt is not lost: it is already in
+        the journal and is picked up here by provider id once the mapping exists.
+        """
+        if receipt is None or not receipt.provider_message_id:
+            return ()
+        found: list[ReceiptEvidence] = []
+        for signal in signals:
+            payload = dict(getattr(signal, "payload", None) or {})
+            status = str(payload.get("status") or "").lower()
+            if status not in _DELIVERED:
+                continue
+            if str(payload.get("recipient_token") or "") == "" and not payload.get("recipient_token"):
+                token = "unknown"
+            else:
+                token = str(payload.get("recipient_token"))
+            found.append(
+                ReceiptEvidence(
+                    kind="delivered" if status == "delivered" else status,
+                    provider_message_id=receipt.provider_message_id,
+                    recipient_token=token,
+                    occurred_ms=getattr(signal, "occurred_ms", None),
+                )
+            )
+        # Deduplicate so the same recipient and status does not grow the evidence forever.
+        seen: set[tuple[str, str]] = set()
+        unique: list[ReceiptEvidence] = []
+        for item in found:
+            key = (item.kind, item.recipient_token)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return tuple(unique)
+
     # -- shared ------------------------------------------------------------------------
 
     def _signal(
@@ -269,7 +334,9 @@ __all__ = [
     "CHANNEL",
     "SIGNAL_KINDS",
     "JournalSignal",
+    "ReceiptEvidence",
     "SignalJournalSink",
+    "attach_receipt_evidence",
     "WhatsAppSignalMapper",
     "signal_event_id",
 ]
@@ -303,3 +370,44 @@ class SignalJournalSink:
             payload=signal.to_event_payload(),
             now_ms=now,
         )
+
+
+def attach_receipt_evidence(
+    store: Any,
+    effect_id: str,
+    *,
+    now_ms: int,
+    mapper: WhatsAppSignalMapper | None = None,
+) -> tuple[ReceiptEvidence, ...]:
+    """Attach late delivery/read evidence to an effect; the state never changes here.
+
+    A receipt that arrived before the transport receipt was correlated is picked up now by
+    provider message id, so no evidence is lost and none is invented. ``record_evidence``
+    is the only writer, and it never moves an effect to ``sent`` - that stays with the
+    transport or a probe.
+    """
+    receipt = store.effect_transport_receipt(effect_id)
+    if receipt is None or not receipt.provider_message_id:
+        return ()
+    signals = store.delivery_signals(
+        chat_id=receipt.chat_id, message_id=receipt.provider_message_id
+    )
+    evidence = (mapper or WhatsAppSignalMapper()).receipt_evidence(receipt, signals)
+    attached: list[ReceiptEvidence] = []
+    for item in evidence:
+        existing = {
+            str(entry.detail or "")
+            for entry in (store.list_effects(states=None, limit=500) or ())
+            if entry.effect_id == effect_id
+            for entry in entry.evidence
+        }
+        if f"{item.kind}:{item.detail}" in existing:
+            continue
+        store.record_evidence(
+            effect_id,
+            kind=item.kind,
+            now_ms=now_ms,
+            detail=f"{item.kind}:{item.detail}",
+        )
+        attached.append(item)
+    return tuple(attached)
