@@ -325,6 +325,28 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
         return None
 
 
+def build_processing_gate(
+    config: "Config",
+    policy_adapter: "EnginePolicyAdapter | None",
+    store: "ProcessingStore | None",
+):
+    """Fast gate for canonical ingest -> journal -> policy, before expensive work.
+
+    Returns ``None`` when the new mode is off, so the legacy path is untouched.
+    """
+    if store is None or policy_adapter is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.policy import AdapterSnapshotProvider, IngestGate
+
+    return IngestGate(
+        config=config.processing,
+        store=store,
+        snapshots=AdapterSnapshotProvider(policy_adapter),
+        evaluate=lambda request: policy_adapter.evaluate(request.event),
+    )
+
+
 def build_gateway_runtime(
     *,
     config: "Config",
@@ -337,6 +359,8 @@ def build_gateway_runtime(
     """Compose full gateway runtime around vNext orchestrator."""
 
     from yeoman_shared.utils.helpers import get_operational_data_path
+
+    processing_store = build_processing_store(config)
 
     session_manager = SessionManager(workspace)
     inbound_archive = InboundArchive(
@@ -548,6 +572,7 @@ def build_gateway_runtime(
         media_storage=media_storage,
         provider_factory=provider_factory,
         document_cache=document_cache,
+        processing_gate=build_processing_gate(config, policy_adapter, processing_store),
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
@@ -1181,6 +1206,6 @@ def build_gateway_runtime(
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
         lull_observer=lull_observer,
-        processing=build_processing_store(config),
+        processing=processing_store,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

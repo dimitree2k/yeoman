@@ -55,6 +55,7 @@ from yeoman_gateway.policy.schema import (
 )
 
 if TYPE_CHECKING:
+    from yeoman_gateway.processing.models import PolicySnapshot
     from yeoman_gateway.session.manager import SessionManager
     from yeoman_gateway.storage.private_handoff import PrivateHandoff, PrivateHandoffStore
 
@@ -191,6 +192,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._last_mtime_ns = self._stat_mtime_ns()
         self._policy_file_was_present = self._last_mtime_ns is not None
         self._policy_reload_error: tuple[int | None, str] | None = None
+        self._policy_loaded_ms: int = self._now_ms()
 
         if engine is None:
             self._reload_on_change = False
@@ -547,6 +549,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._last_mtime_ns = current_mtime
         self._policy_file_was_present = True
         self._policy_reload_error = None
+        self._policy_loaded_ms = self._now_ms()
         if had_error:
             logger.info("policy reload recovered version={}", current_mtime)
 
@@ -564,6 +567,48 @@ class EnginePolicyAdapter(PolicyPort):
         self._policy_file_was_present = True
         self._last_reload_check = time.monotonic()
         self._policy_reload_error = None
+        self._policy_loaded_ms = self._now_ms()
+
+    def policy_engine(self) -> "PolicyEngine | None":
+        """Currently loaded engine. Callers must treat it as read-only."""
+        return self._engine
+
+    def policy_snapshot(self) -> "PolicySnapshot":
+        """Immutable snapshot of the loaded policy plus the identity it was loaded as.
+
+        Version and content hash are derived from the engine that decides - not from the
+        file on disk, which may already be a newer, not-yet-reloaded version (spec R02).
+        A known reload failure is reported as unhealthy so new effect paths block.
+        """
+        from yeoman_gateway.processing.models import PolicySnapshot, canonical_hash
+
+        source = str(self._policy_path) if self._policy_path is not None else "in-memory"
+        error = self._policy_reload_error[1] if self._policy_reload_error is not None else None
+        if self._engine is None:
+            return PolicySnapshot(
+                version="unloaded",
+                policy_hash="",
+                policy=None,
+                loaded_ms=self._policy_loaded_ms,
+                healthy=False,
+                source=source,
+                error=error or "policy engine not loaded",
+            )
+        policy = self._engine.policy
+        policy_hash = canonical_hash(policy.model_dump(mode="json"))
+        if self._policy_path is not None and self._last_mtime_ns is not None:
+            version = f"{self._policy_path.name}@{self._last_mtime_ns}"
+        else:
+            version = f"memory:{policy_hash[:16]}"
+        return PolicySnapshot(
+            version=version,
+            policy_hash=policy_hash,
+            policy=policy.model_copy(deep=True),
+            loaded_ms=self._policy_loaded_ms,
+            healthy=self._policy_reload_error is None,
+            source=source,
+            error=error,
+        )
 
     @override
     def evaluate(self, event: InboundEvent) -> PolicyDecision:

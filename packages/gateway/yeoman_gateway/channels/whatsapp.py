@@ -9,6 +9,7 @@ import random
 import re
 import uuid
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -19,6 +20,7 @@ from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
+from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
 from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.vision import VisionDescriber
@@ -93,6 +95,16 @@ def _whatsapp_jid_user_token(value: str) -> str:
     """Extract the user token portion from a WhatsApp JID."""
     normalized = _normalize_whatsapp_jid(value)
     return normalized.split("@", 1)[0] if normalized else ""
+
+
+def _timestamp_to_datetime(value: int) -> datetime:
+    """Bridge timestamps are epoch seconds; tolerate millisecond values."""
+    seconds = float(value or 0)
+    if seconds > 1e11:
+        seconds /= 1000.0
+    if seconds <= 0:
+        return datetime.now(UTC)
+    return datetime.fromtimestamp(seconds, tz=UTC)
 
 
 DEDUPE_TTL_SECONDS = 20 * 60
@@ -187,6 +199,7 @@ class WhatsAppChannel(BaseChannel):
         self._connected = False
         self._reader_task: asyncio.Task[None] | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
+        self._processing_gate: Any | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
@@ -740,9 +753,77 @@ class WhatsAppChannel(BaseChannel):
             reply_to_media_bytes=reply_to_media_bytes,
         )
 
+    def set_processing_gate(self, gate: Any | None) -> None:
+        """Attach the fast gate of the new processing mode (``None`` keeps legacy)."""
+        self._processing_gate = gate
+
+    def _processing_request(self, event: InboundEvent) -> Any:
+        """Canonical base data for the pre-enrichment journal and policy check."""
+        from yeoman_gateway.processing.policy import IngestRequest
+
+        message_id = event.message_id or uuid.uuid4().hex
+        return IngestRequest(
+            event_key=f"whatsapp:{event.chat_jid}:{message_id}",
+            event_id=message_id,
+            trace_id=f"whatsapp:{event.chat_jid}:{message_id}",
+            event=self._to_core_event(event, message_id),
+            payload_extra={
+                "media_kind": event.media_kind,
+                "media_type": event.media_type,
+                "origin": "whatsapp_bridge",
+            },
+        )
+
+    def _to_core_event(self, event: InboundEvent, message_id: str) -> CoreInboundEvent:
+        """Local identity normalization, done before any vision/transcription call.
+
+        A permission decision must never depend on enriched content, so this conversion
+        carries only canonical base data.
+        """
+        effective_participant = event.sender_phone_jid or event.participant_jid
+        effective_sender = (
+            _whatsapp_jid_user_token(event.sender_phone_jid)
+            if event.sender_phone_jid
+            else event.sender_id
+        )
+        return CoreInboundEvent(
+            channel=self.name,
+            chat_id=event.chat_jid,
+            sender_id=effective_sender or event.sender_id,
+            content=event.text,
+            message_id=message_id,
+            timestamp=_timestamp_to_datetime(event.timestamp),
+            participant=effective_participant,
+            is_group=event.is_group,
+            mentioned_bot=event.mentioned_bot,
+            reply_to_bot=event.reply_to_bot,
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_participant=event.reply_to_participant,
+            reply_to_text=event.reply_to_text,
+            raw_metadata={
+                "message_id": message_id,
+                "is_group": event.is_group,
+                "media_kind": event.media_kind,
+                "is_voice": event.media_kind == "audio",
+            },
+        )
+
     async def _ingest_inbound_event(self, event: InboundEvent) -> None:
         if self._is_duplicate(event.chat_jid, event.message_id):
             return
+
+        if self._processing_gate is not None:
+            verdict = self._processing_gate.admit(self._processing_request(event))
+            if verdict is not None and verdict.denied:
+                logger.debug(
+                    "processing fast gate denied channel=whatsapp chat={} message_id={} "
+                    "reason={} decision_id={}",
+                    event.chat_jid,
+                    event.message_id,
+                    verdict.reason,
+                    verdict.decision.decision_id if verdict.decision else "-",
+                )
+                return
 
         event = await self._enrich_media_event(event)
         self._record_document_cache_item(event)

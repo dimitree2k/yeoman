@@ -41,6 +41,7 @@ class ChannelManager:
         media_storage: "MediaStorage | None" = None,
         provider_factory: "ProviderFactory | None" = None,
         document_cache: "DocumentCache | None" = None,
+        processing_gate: Any | None = None,
     ):
         self.config = config
         self.bus = bus
@@ -50,6 +51,7 @@ class ChannelManager:
         self.media_storage = media_storage
         self.provider_factory = provider_factory
         self.document_cache = document_cache
+        self.processing_gate = processing_gate
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._reaction_dispatch_task: asyncio.Task | None = None
@@ -93,6 +95,10 @@ class ChannelManager:
                     openai_api_base=openai_compat.api_base if openai_compat else None,
                     openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
                 )
+                if self.processing_gate is not None:
+                    setter = getattr(self.channels["whatsapp"], "set_processing_gate", None)
+                    if setter is not None:
+                        setter(self.processing_gate)
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:
                 logger.warning(f"WhatsApp channel not available: {e}")
