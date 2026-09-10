@@ -137,6 +137,8 @@ export interface WhatsAppClientOptions {
   readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void;
+  /** Journal evidence from the provider: edit, delete, reaction or receipt. */
+  onSignal?: (kind: 'edit' | 'delete' | 'reaction' | 'receipt', payload: Record<string, unknown>) => void;
   onQR: (qr: string) => void;
   onStatus: (status: string, detail?: Record<string, unknown>) => void;
   onError: (error: string) => void;
@@ -906,6 +908,50 @@ export class WhatsAppClient {
     }
   }
 
+  /**
+   * Emit one journal signal. The same dedupe discipline as inbound messages: a repeated
+   * provider event is dropped instead of journaled twice.
+   */
+  private emitSignal(
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt',
+    identity: string,
+    payload: Record<string, unknown>,
+  ): void {
+    const emit = this.options.onSignal;
+    if (!emit) return;
+    const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
+    if (this.seenInbound(dedupeKey)) return;
+    try {
+      emit(kind, payload);
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.options.onError(`signal_emit_failed: ${this.lastError}`);
+    }
+  }
+
+  /**
+   * Answer a lookup from proven local sources only: the inbound quote cache and the
+   * outbound self-message map. Anything else is ``unsupported`` - the bridge has no
+   * authority over server-side truth and never claims a message is absent.
+   */
+  lookupMessage(input: { chatJid: string; messageId: string }): {
+    status: 'found' | 'absent' | 'unsupported';
+    messageId?: string;
+  } {
+    const chatJid = normalizeJid(input.chatJid);
+    const messageId = String(input.messageId || '').trim();
+    if (!chatJid || !messageId) return { status: 'unsupported' };
+    this.cleanupQuoteCache();
+    if (this.quoteCache.has(`${chatJid}:${messageId}`)) {
+      return { status: 'found', messageId };
+    }
+    const outboundKey = this.outboundSelfKey(chatJid, messageId);
+    if (outboundKey && this.recentOutboundSelf.has(outboundKey)) {
+      return { status: 'found', messageId };
+    }
+    return { status: 'unsupported' };
+  }
+
   private outboundSelfKey(chatJidRaw: string, messageIdRaw: string): string | null {
     const chatJid = normalizeJid(chatJidRaw);
     const messageId = String(messageIdRaw || '').trim();
@@ -1369,6 +1415,114 @@ export class WhatsAppClient {
         if (closedResolve) {
           closedResolve(lastDisconnect?.error ?? new Error('connection closed'));
           closedResolve = null;
+        }
+      }
+    });
+
+    // Signal subscriptions. They only emit journal evidence and never touch the inbound
+    // message path; each handler is isolated so one bad event cannot break the others.
+    this.sock.ev.on('messages.update', (updates: any[]) => {
+      for (const update of updates ?? []) {
+        try {
+          const chatJid = normalizeJid(String(update?.key?.remoteJid || ''));
+          const messageId = String(update?.key?.id || '').trim();
+          if (!chatJid || !messageId) continue;
+          const status = String(update?.update?.status ?? update?.status ?? '').toUpperCase();
+          if (status && status !== 'READ' && status !== 'PLAYED' && status !== 'DELIVERY') {
+            // Other statuses are not our business.
+          }
+          if (status === 'READ' || status === 'PLAYED' || status === 'DELIVERY') {
+            this.emitSignal('receipt', `${messageId}:${status}`, {
+              chatJid,
+              messageId,
+              status: status === 'DELIVERY' ? 'delivered' : status.toLowerCase(),
+              timestamp: Number(update?.update?.messageTimestamp ?? 0) || undefined,
+            });
+            continue;
+          }
+          if (update?.update?.message === null || update?.update?.messageStubType !== undefined) {
+            this.emitSignal('delete', messageId, { chatJid, messageId });
+            continue;
+          }
+          const edited = update?.update?.message?.editedMessage?.message;
+          if (edited) {
+            this.emitSignal('edit', `${messageId}:${Number(update?.update?.messageTimestamp ?? 0)}`, {
+              chatJid,
+              messageId,
+              timestamp: Number(update?.update?.messageTimestamp ?? 0) || undefined,
+            });
+          }
+        } catch (err) {
+          this.lastError = err instanceof Error ? err.message : String(err);
+          this.options.onError(`signal_update_failed: ${this.lastError}`);
+        }
+      }
+    });
+
+    this.sock.ev.on('messages.delete', (event: any) => {
+      try {
+        const keys = Array.isArray(event?.keys) ? event.keys : [];
+        for (const key of keys) {
+          const chatJid = normalizeJid(String(key?.remoteJid || ''));
+          const messageId = String(key?.id || '').trim();
+          if (!chatJid || !messageId) continue;
+          this.emitSignal('delete', messageId, { chatJid, messageId });
+        }
+        // A bulk delete is deliberately not interpreted as a thread wipe: without a target
+        // id there is nothing to journal, and guessing one would be worse than nothing.
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.options.onError(`signal_delete_failed: ${this.lastError}`);
+      }
+    });
+
+    this.sock.ev.on('messages.reaction', (events: any[]) => {
+      for (const event of events ?? []) {
+        try {
+          const chatJid = normalizeJid(String(event?.key?.remoteJid || ''));
+          const targetMessageId = String(event?.key?.id || '').trim();
+          if (!chatJid || !targetMessageId) continue;
+          const senderJid = String(
+            event?.reaction?.key?.participant || event?.reaction?.key?.remoteJid || '',
+          ).trim();
+          const emoji = String(event?.reaction?.text || '').trim();
+          this.emitSignal(
+            'reaction',
+            `${targetMessageId}:${normalizeJid(senderJid) || senderJid}:${emoji}`,
+            {
+              chatJid,
+              targetMessageId,
+              senderId: normalizeJid(senderJid) || senderJid,
+              emoji,
+              removed: emoji.length === 0,
+            },
+          );
+        } catch (err) {
+          this.lastError = err instanceof Error ? err.message : String(err);
+          this.options.onError(`signal_reaction_failed: ${this.lastError}`);
+        }
+      }
+    });
+
+    this.sock.ev.on('message-receipt.update', (updates: any[]) => {
+      for (const update of updates ?? []) {
+        try {
+          const chatJid = normalizeJid(String(update?.key?.remoteJid || ''));
+          const messageId = String(update?.key?.id || '').trim();
+          if (!chatJid || !messageId) continue;
+          const receipt = update?.receipt ?? {};
+          const recipientJid = String(receipt?.userJid || receipt?.participant || '').trim();
+          const type = String(receipt?.receiptType || receipt?.type || 'read').toLowerCase();
+          if (!['read', 'read-self', 'played', 'delivered'].includes(type)) continue;
+          this.emitSignal('receipt', `${messageId}:${recipientJid}:${type}`, {
+            chatJid,
+            messageId,
+            recipientJid: normalizeJid(recipientJid) || recipientJid,
+            status: type === 'read-self' ? 'read' : type,
+          });
+        } catch (err) {
+          this.lastError = err instanceof Error ? err.message : String(err);
+          this.options.onError(`signal_receipt_failed: ${this.lastError}`);
         }
       }
     });

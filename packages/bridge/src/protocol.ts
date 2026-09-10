@@ -352,6 +352,10 @@ export function parseBridgeCommand(
   else if (typed === 'delete_message') validPayload = Boolean(parseDeleteMessage(payload));
   else if (typed === 'react') validPayload = Boolean(parseReact(payload));
   else if (typed === 'presence_update') validPayload = Boolean(parsePresenceUpdate(payload));
+  else if (typed === 'lookup_message')
+    validPayload =
+      typeof (payload as Record<string, unknown>).chatJid === 'string' &&
+      typeof (payload as Record<string, unknown>).messageId === 'string';
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
   else if (typed === 'login_start') validPayload = Boolean(parseLoginStart(payload));
   else if (typed === 'login_wait') validPayload = Boolean(parseLoginWait(payload));

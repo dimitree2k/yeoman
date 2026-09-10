@@ -103,6 +103,10 @@ export class BridgeServer {
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => this.broadcastMessage(msg),
+      onSignal: (kind, payload) =>
+        this.broadcastEvent(
+          createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
+        ),
       onQR: (qr) =>
         this.broadcastEvent(
           createEventEnvelope({
@@ -311,6 +315,15 @@ export class BridgeServer {
       const parsed = parsePresenceUpdatePayload(payload);
       const presence = await this.wa.updatePresence(parsed);
       return { presence };
+    }
+
+    if (type === 'lookup_message') {
+      const chatJid = String(payload.chatJid || '').trim();
+      const messageId = String(payload.messageId || '').trim();
+      if (!chatJid || !messageId) {
+        return { status: 'unsupported' as const };
+      }
+      return this.wa.lookupMessage({ chatJid, messageId });
     }
 
     if (type === 'list_groups') {
