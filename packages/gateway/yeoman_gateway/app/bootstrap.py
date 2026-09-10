@@ -344,10 +344,21 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
         return None
 
 
+def build_thread_registry(config: "Config", store: "ProcessingStore | None"):
+    """Thread registry for the new mode; ``None`` while processing is off."""
+    if store is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.threads import ThreadRegistry
+
+    return ThreadRegistry(store=store, config=config.processing)
+
+
 def build_processing_gate(
     config: "Config",
     policy_adapter: "EnginePolicyAdapter | None",
     store: "ProcessingStore | None",
+    threads: object | None = None,
 ):
     """Fast gate for canonical ingest -> journal -> policy, before expensive work.
 
@@ -363,6 +374,7 @@ def build_processing_gate(
         store=store,
         snapshots=AdapterSnapshotProvider(policy_adapter),
         evaluate=lambda request: policy_adapter.evaluate(request.event),
+        threads=threads if threads is not None else build_thread_registry(config, store),
     )
 
 

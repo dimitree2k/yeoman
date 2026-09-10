@@ -29,6 +29,7 @@ from typing import Any
 from yeoman_gateway.processing.models import (
     CLAIMABLE_EFFECT_STATES,
     EFFECT_STATES,
+    TURN_STATES,
     CanonicalEvent,
     DecisionRecord,
     EffectConflictError,
@@ -45,7 +46,11 @@ from yeoman_gateway.processing.models import (
     RetainedEventMeta,
     RetainedEvidenceMeta,
     RetentionSettings,
+    SourceRef,
     StoredEffect,
+    StoredThread,
+    StoredTurn,
+    TurnStateError,
     canonical_hash,
     canonical_json,
     payload_from_mapping,
@@ -56,7 +61,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = (
     """
@@ -178,6 +183,120 @@ _SCHEMA = (
 )
 
 
+
+#: Ordered additive migrations. ``_MIGRATIONS[1]`` upgrades schema 1 to schema 2; existing
+#: tables (events, effects, decisions, attempts, evidence) are never altered.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: (
+        """
+        CREATE TABLE IF NOT EXISTS threads (
+          thread_id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          root_principal TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'dm',
+          state TEXT NOT NULL DEFAULT 'open',
+          opened_ms INTEGER NOT NULL,
+          last_activity_ms INTEGER NOT NULL,
+          closed_ms INTEGER,
+          close_reason TEXT,
+          reopen_count INTEGER NOT NULL DEFAULT 0,
+          turn_seq INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_threads_chat ON threads(channel, chat_id, state)",
+        "CREATE INDEX IF NOT EXISTS idx_threads_principal "
+        "ON threads(chat_id, root_principal, state)",
+        """
+        CREATE TABLE IF NOT EXISTS turns (
+          turn_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+          principal TEXT NOT NULL,
+          revision INTEGER NOT NULL DEFAULT 1,
+          context_version INTEGER NOT NULL DEFAULT 1,
+          state TEXT NOT NULL DEFAULT 'open',
+          opened_ms INTEGER NOT NULL,
+          updated_ms INTEGER NOT NULL,
+          closed_ms INTEGER,
+          last_generation_id TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, state, opened_ms)",
+        """
+        CREATE TABLE IF NOT EXISTS turn_sources (
+          turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+          event_id TEXT NOT NULL,
+          source_message_id TEXT,
+          role TEXT NOT NULL DEFAULT 'trigger',
+          revision_at_join INTEGER NOT NULL DEFAULT 1,
+          added_ms INTEGER NOT NULL,
+          removed_ms INTEGER,
+          PRIMARY KEY (turn_id, event_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_turn_sources_event ON turn_sources(event_id)",
+        "CREATE INDEX IF NOT EXISTS idx_turn_sources_message ON turn_sources(source_message_id)",
+        """
+        CREATE TABLE IF NOT EXISTS pending_inputs (
+          input_id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          turn_id TEXT,
+          event_id TEXT NOT NULL UNIQUE,
+          principal TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL DEFAULT 'message',
+          decision_id TEXT,
+          relevance TEXT NOT NULL DEFAULT 'unknown',
+          state TEXT NOT NULL DEFAULT 'accepted',
+          enqueued_ms INTEGER NOT NULL,
+          consumed_ms INTEGER
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_pending_thread "
+        "ON pending_inputs(thread_id, state, enqueued_ms)",
+        """
+        CREATE TABLE IF NOT EXISTS thread_messages (
+          row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT UNIQUE,
+          thread_id TEXT NOT NULL,
+          turn_id TEXT,
+          direction TEXT NOT NULL DEFAULT 'out',
+          event_id TEXT,
+          effect_id TEXT UNIQUE,
+          confirmed_ms INTEGER,
+          created_ms INTEGER NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_thread_messages_thread "
+        "ON thread_messages(thread_id, created_ms)",
+        """
+        CREATE TABLE IF NOT EXISTS generations (
+          generation_id TEXT PRIMARY KEY,
+          turn_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          context_version INTEGER NOT NULL,
+          snapshot_hash TEXT NOT NULL,
+          recycle INTEGER NOT NULL DEFAULT 0,
+          created_ms INTEGER NOT NULL,
+          finished_ms INTEGER,
+          outcome TEXT,
+          detail TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_generations_turn ON generations(turn_id, created_ms)",
+        """
+        CREATE TABLE IF NOT EXISTS generation_sources (
+          generation_id TEXT NOT NULL REFERENCES generations(generation_id) ON DELETE CASCADE,
+          event_id TEXT NOT NULL,
+          source_message_id TEXT,
+          role TEXT NOT NULL DEFAULT 'context',
+          revision_at_join INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (generation_id, event_id)
+        )
+        """,
+    ),
+}
+
 class ProcessingStore:
     """Purpose-built durable store for the processing pipeline."""
 
@@ -242,6 +361,7 @@ class ProcessingStore:
     # -- schema ------------------------------------------------------------------------
 
     def _create_schema(self) -> None:
+        """Create the base schema and apply every ordered migration in one transaction."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -250,16 +370,20 @@ class ProcessingStore:
                 row = self._conn.execute(
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()
-                if row is None:
-                    self._conn.execute(
-                        "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                        (str(SCHEMA_VERSION),),
-                    )
-                elif int(row["value"]) > SCHEMA_VERSION:
+                version = int(row["value"]) if row is not None else 1
+                if version > SCHEMA_VERSION:
                     raise ProcessingError(
-                        f"processing store schema {row['value']} is newer than {SCHEMA_VERSION}"
+                        f"processing store schema {version} is newer than {SCHEMA_VERSION}"
                     )
-                # Future versions append ordered migrations here; v1 only creates tables.
+                while version < SCHEMA_VERSION:
+                    for statement in _MIGRATIONS.get(version, ()):
+                        self._conn.execute(statement)
+                    version += 1
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(SCHEMA_VERSION),),
+                )
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -922,6 +1046,475 @@ class ProcessingStore:
             (effect_id, kind, state, detail, observed_ms, worker_id),
         )
 
+
+    # -- threads and turns (Plan 03) ---------------------------------------------------
+
+    def open_thread(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        root_principal: str,
+        kind: str,
+        trigger_event_id: str,
+        now_ms: int,
+    ) -> str:
+        """Open (or re-use) the deterministic thread for this trigger event.
+
+        The id is derived from the source, so a replay of the same event lands in the same
+        thread instead of creating a second one.
+        """
+        thread_id = f"th_{canonical_hash([channel, chat_id, trigger_event_id])[:16]}"
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT state FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO threads (thread_id, channel, chat_id, root_principal, kind,
+                                         state, opened_ms, last_activity_ms)
+                    VALUES (?,?,?,?,?,'open',?,?)
+                    """,
+                    (thread_id, channel, chat_id, root_principal, kind, now_ms, now_ms),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE threads
+                       SET state = 'open', last_activity_ms = ?, closed_ms = NULL,
+                           close_reason = NULL,
+                           reopen_count = CASE WHEN state = 'closed'
+                                               THEN reopen_count + 1 ELSE reopen_count END
+                     WHERE thread_id = ?
+                    """,
+                    (now_ms, thread_id),
+                )
+        return thread_id
+
+    def get_thread(self, thread_id: str) -> StoredThread | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+        return _thread_from_row(row) if row is not None else None
+
+    def list_threads(
+        self,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        principal: str | None = None,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredThread, ...]:
+        query = "SELECT * FROM threads"
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("channel", channel),
+            ("chat_id", chat_id),
+            ("root_principal", principal),
+            ("state", state),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY last_activity_ms DESC, thread_id LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return tuple(_thread_from_row(row) for row in rows)
+
+    def touch_thread(self, thread_id: str, now_ms: int) -> None:
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE threads SET last_activity_ms = ? WHERE thread_id = ?",
+                (now_ms, thread_id),
+            )
+
+    def reopen_thread(self, thread_id: str, now_ms: int) -> bool:
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE threads
+                   SET state = 'open', closed_ms = NULL, close_reason = NULL,
+                       reopen_count = reopen_count + 1, last_activity_ms = ?
+                 WHERE thread_id = ? AND state != 'open'
+                """,
+                (now_ms, thread_id),
+            )
+        return cursor.rowcount == 1
+
+    def close_idle_threads(self, now_ms: int, idle_ms: int) -> tuple[str, ...]:
+        """Close idle threads that have no open turn and no in-flight effect."""
+        with self._write() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id FROM threads
+                 WHERE state = 'open' AND last_activity_ms <= ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM turns t
+                      WHERE t.thread_id = threads.thread_id
+                        AND t.state IN ('open','awaiting')
+                        AND t.updated_ms > ?
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM effects e
+                       JOIN turns t2 ON t2.turn_id = e.turn_id
+                      WHERE t2.thread_id = threads.thread_id
+                        AND e.state IN ('queued','executing')
+                   )
+                """,
+                (now_ms - idle_ms, now_ms - idle_ms),
+            ).fetchall()
+            thread_ids = tuple(str(row["thread_id"]) for row in rows)
+            for thread_id in thread_ids:
+                conn.execute(
+                    """
+                    UPDATE threads SET state = 'closed', closed_ms = ?, close_reason = 'idle'
+                     WHERE thread_id = ? AND state = 'open'
+                    """,
+                    (now_ms, thread_id),
+                )
+                conn.execute(
+                    "UPDATE turns SET state = 'closed', closed_ms = ? "
+                    "WHERE thread_id = ? AND state IN ('open','awaiting')",
+                    (now_ms, thread_id),
+                )
+        return thread_ids
+
+    def open_turn(
+        self,
+        *,
+        thread_id: str,
+        principal: str,
+        trigger_event_id: str,
+        now_ms: int,
+        state: str = "open",
+    ) -> str:
+        """Open a new turn and bump the thread's turn sequence atomically."""
+        with self._write() as conn:
+            row = conn.execute(
+                "UPDATE threads SET turn_seq = turn_seq + 1, last_activity_ms = ? "
+                "WHERE thread_id = ? RETURNING turn_seq",
+                (now_ms, thread_id),
+            ).fetchone()
+            if row is None:
+                raise ProcessingError(f"unknown thread: {thread_id}")
+            turn_seq = int(row["turn_seq"])
+            turn_id = f"tu_{canonical_hash([thread_id, trigger_event_id, turn_seq])[:16]}"
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO turns (turn_id, thread_id, principal, revision,
+                                             context_version, state, opened_ms, updated_ms)
+                VALUES (?,?,?,1,1,?,?,?)
+                """,
+                (turn_id, thread_id, principal, state, now_ms, now_ms),
+            )
+        return turn_id
+
+    def get_turn(self, turn_id: str) -> StoredTurn | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM turns WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+        return _turn_from_row(row) if row is not None else None
+
+    def active_turn(self, thread_id: str) -> StoredTurn | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM turns WHERE thread_id = ? AND state IN ('open','awaiting') "
+                "ORDER BY opened_ms DESC, turn_id LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+        return _turn_from_row(row) if row is not None else None
+
+    def close_turn(self, turn_id: str, *, now_ms: int, state: str = "closed") -> bool:
+        if state not in TURN_STATES:
+            raise TurnStateError(f"unknown turn state: {state}")
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE turns SET state = ?, closed_ms = ?, updated_ms = ? WHERE turn_id = ?",
+                (state, now_ms, now_ms, turn_id),
+            )
+        return cursor.rowcount == 1
+
+    def add_turn_source(
+        self,
+        *,
+        turn_id: str,
+        event_id: str,
+        source_message_id: str | None = None,
+        role: str = "context",
+        revision_at_join: int = 1,
+        now_ms: int,
+    ) -> None:
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT INTO turn_sources (turn_id, event_id, source_message_id, role,
+                                          revision_at_join, added_ms)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(turn_id, event_id) DO NOTHING
+                """,
+                (turn_id, event_id, source_message_id, role, revision_at_join, now_ms),
+            )
+
+    def turn_sources(self, turn_id: str) -> tuple[SourceRef, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM turn_sources WHERE turn_id = ? ORDER BY added_ms, event_id",
+                (turn_id,),
+            ).fetchall()
+        return tuple(
+            SourceRef(
+                event_id=str(row["event_id"]),
+                source_message_id=(
+                    str(row["source_message_id"])
+                    if row["source_message_id"] is not None
+                    else None
+                ),
+                role=str(row["role"]),
+                revision_at_join=int(row["revision_at_join"]),
+                removed_ms=(
+                    int(row["removed_ms"]) if row["removed_ms"] is not None else None
+                ),
+            )
+            for row in rows
+        )
+
+    def thread_sources_available(self, thread_id: str) -> bool:
+        """True while every source of the thread still has its payload (no tombstone)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS missing FROM turn_sources ts
+                  JOIN turns t ON t.turn_id = ts.turn_id
+                  JOIN events e ON e.event_id = ts.event_id
+                 WHERE t.thread_id = ? AND e.payload_json IS NULL
+                """,
+                (thread_id,),
+            ).fetchone()
+            total = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM turn_sources ts
+                  JOIN turns t ON t.turn_id = ts.turn_id
+                 WHERE t.thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        return int(total["n"]) > 0 and int(row["missing"]) == 0
+
+    def attach_event_assignment(
+        self,
+        *,
+        event_id: str,
+        thread_id: str | None,
+        turn_id: str | None,
+        now_ms: int,
+    ) -> None:
+        """Bind one journal event to its thread and turn (existing event columns)."""
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE events SET thread_id = ?, turn_id = ? WHERE event_id = ?",
+                (thread_id, turn_id, event_id),
+            )
+
+    def event_assignment(self, event_id: str) -> tuple[str | None, str | None] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT thread_id, turn_id FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row["thread_id"]) if row["thread_id"] is not None else None,
+            str(row["turn_id"]) if row["turn_id"] is not None else None,
+        )
+
+    def resolve_reference(self, reference: str | None) -> tuple[str | None, str | None] | None:
+        """Resolve a reply/correction reference to (thread_id, turn_id).
+
+        Only confirmed outgoing provider ids, journaled inbound message ids and known turns
+        are anchors; a planned effect without a provider id never resolves anything.
+        """
+        if not reference:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT thread_id, turn_id FROM thread_messages "
+                "WHERE message_id = ? AND confirmed_ms IS NOT NULL",
+                (reference,),
+            ).fetchone()
+            if row is not None:
+                return (str(row["thread_id"]), _opt_str(row["turn_id"]))
+            row = self._conn.execute(
+                "SELECT thread_id, turn_id FROM events "
+                "WHERE source_message_id = ? AND thread_id IS NOT NULL "
+                "ORDER BY created_ms LIMIT 1",
+                (reference,),
+            ).fetchone()
+            if row is not None:
+                return (str(row["thread_id"]), _opt_str(row["turn_id"]))
+            row = self._conn.execute(
+                "SELECT thread_id, turn_id FROM turns WHERE turn_id = ?", (reference,)
+            ).fetchone()
+        if row is not None:
+            return (str(row["thread_id"]), str(row["turn_id"]))
+        return None
+
+    def register_thread_message(
+        self,
+        *,
+        thread_id: str,
+        now_ms: int,
+        direction: str = "out",
+        turn_id: str | None = None,
+        event_id: str | None = None,
+        effect_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        """Register a message of a thread; only a confirmed id becomes a quotable anchor."""
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT INTO thread_messages (message_id, thread_id, turn_id, direction,
+                                             event_id, effect_id, confirmed_ms, created_ms)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(effect_id) DO NOTHING
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    turn_id,
+                    direction,
+                    event_id,
+                    effect_id,
+                    now_ms if message_id else None,
+                    now_ms,
+                ),
+            )
+
+    def attach_confirmed_message_id(
+        self, effect_id: str, provider_message_id: str, now_ms: int
+    ) -> bool:
+        """Turn a planned effect row into a quotable anchor once the provider confirmed it."""
+        if not provider_message_id:
+            raise ValueError("provider_message_id is required")
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE thread_messages SET message_id = ?, confirmed_ms = ? "
+                "WHERE effect_id = ? AND message_id IS NULL",
+                (provider_message_id, now_ms, effect_id),
+            )
+        return cursor.rowcount == 1
+
+    def thread_for_message(self, message_id: str) -> tuple[str, str | None] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT thread_id, turn_id FROM thread_messages "
+                "WHERE message_id = ? AND confirmed_ms IS NOT NULL",
+                (message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (str(row["thread_id"]), _opt_str(row["turn_id"]))
+
+    def count_pending(self, *, thread_id: str | None = None) -> int:
+        query = "SELECT COUNT(*) AS n FROM pending_inputs WHERE state IN ('accepted','deferred')"
+        params: list[Any] = []
+        if thread_id is not None:
+            query += " AND thread_id = ?"
+            params.append(thread_id)
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return int(row["n"])
+
+    def enqueue_pending_input(
+        self,
+        *,
+        input_id: str,
+        thread_id: str,
+        event_id: str,
+        principal: str,
+        now_ms: int,
+        turn_id: str | None = None,
+        kind: str = "message",
+        decision_id: str | None = None,
+        relevance: str = "unknown",
+        state: str = "accepted",
+    ) -> bool:
+        """Add one waiting input. False when the event was already queued."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO pending_inputs (input_id, thread_id, turn_id, event_id, principal,
+                                            kind, decision_id, relevance, state, enqueued_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (
+                    input_id,
+                    thread_id,
+                    turn_id,
+                    event_id,
+                    principal,
+                    kind,
+                    decision_id,
+                    relevance,
+                    state,
+                    now_ms,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def drain_pending_inputs(self, thread_id: str, *, now_ms: int) -> tuple[str, ...]:
+        """Consume accepted inputs of a thread and return their event ids in order."""
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT input_id, event_id FROM pending_inputs "
+                "WHERE thread_id = ? AND state = 'accepted' ORDER BY enqueued_ms, input_id",
+                (thread_id,),
+            ).fetchall()
+            event_ids = tuple(str(row["event_id"]) for row in rows)
+            for row in rows:
+                conn.execute(
+                    "UPDATE pending_inputs SET state = 'consumed', consumed_ms = ? "
+                    "WHERE input_id = ?",
+                    (now_ms, row["input_id"]),
+                )
+        return event_ids
+
+    def promote_deferred(self, thread_id: str, *, now_ms: int, capacity: int) -> tuple[str, ...]:
+        """Promote deferred inputs once the mailbox has room again."""
+        with self._write() as conn:
+            used = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM pending_inputs "
+                    "WHERE thread_id = ? AND state = 'accepted'",
+                    (thread_id,),
+                ).fetchone()["n"]
+            )
+            room = max(0, int(capacity) - used)
+            if room == 0:
+                return ()
+            rows = conn.execute(
+                "SELECT input_id, event_id FROM pending_inputs "
+                "WHERE thread_id = ? AND state = 'deferred' ORDER BY enqueued_ms, input_id "
+                "LIMIT ?",
+                (thread_id, room),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE pending_inputs SET state = 'accepted', enqueued_ms = ? "
+                    "WHERE input_id = ?",
+                    (now_ms, row["input_id"]),
+                )
+        return tuple(str(row["event_id"]) for row in rows)
+
     # -- lineage -----------------------------------------------------------------------
 
     def get_lineage(self, trace_id: str) -> LineageView:
@@ -1125,6 +1718,39 @@ class ProcessingStore:
             ),
         )
 
+
+def _thread_from_row(row: sqlite3.Row) -> StoredThread:
+    return StoredThread(
+        thread_id=str(row["thread_id"]),
+        channel=str(row["channel"]),
+        chat_id=str(row["chat_id"]),
+        root_principal=str(row["root_principal"]),
+        kind=str(row["kind"]),
+        state=str(row["state"]),
+        opened_ms=int(row["opened_ms"]),
+        last_activity_ms=int(row["last_activity_ms"]),
+        closed_ms=int(row["closed_ms"]) if row["closed_ms"] is not None else None,
+        close_reason=str(row["close_reason"]) if row["close_reason"] is not None else None,
+        reopen_count=int(row["reopen_count"]),
+        turn_seq=int(row["turn_seq"]),
+    )
+
+
+def _turn_from_row(row: sqlite3.Row) -> StoredTurn:
+    return StoredTurn(
+        turn_id=str(row["turn_id"]),
+        thread_id=str(row["thread_id"]),
+        principal=str(row["principal"]),
+        revision=int(row["revision"]),
+        context_version=int(row["context_version"]),
+        state=str(row["state"]),
+        opened_ms=int(row["opened_ms"]) if row["opened_ms"] is not None else None,
+        updated_ms=int(row["updated_ms"]) if row["updated_ms"] is not None else None,
+        closed_ms=int(row["closed_ms"]) if row["closed_ms"] is not None else None,
+        last_generation_id=(
+            str(row["last_generation_id"]) if row["last_generation_id"] is not None else None
+        ),
+    )
 
 def _opt_str(value: Any) -> str | None:
     if value is None:

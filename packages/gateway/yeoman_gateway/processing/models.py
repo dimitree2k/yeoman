@@ -21,6 +21,7 @@ import json
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
 DAY_MS = 86_400_000
@@ -747,3 +748,103 @@ def validate_transition(
                 f"{current} may only be requeued with evidence "
                 f"{sorted(REQUEUE_EVIDENCE_KINDS)}, got {sorted(evidence_kinds)}"
             )
+
+
+# --------------------------------------------------------------------------------------
+# Threads, turns and generations (Plan 03)
+# --------------------------------------------------------------------------------------
+
+THREAD_STATES: tuple[str, ...] = ("open", "idle", "closed")
+TURN_STATES: tuple[str, ...] = ("open", "awaiting", "closed", "superseded")
+
+
+class TurnStateError(ProcessingError, ValueError):
+    """A turn change that the turn state machine does not allow."""
+
+
+class UpdateEffect(StrEnum):
+    """What one incoming update does to the running turn."""
+
+    APPEND = "append"
+    SUPERSEDE = "supersede"
+    OBSERVE = "observe"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredThread:
+    thread_id: str
+    channel: str
+    chat_id: str
+    root_principal: str
+    kind: str
+    state: str
+    opened_ms: int
+    last_activity_ms: int
+    closed_ms: int | None = None
+    close_reason: str | None = None
+    reopen_count: int = 0
+    turn_seq: int = 0
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == "open"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTurn:
+    turn_id: str
+    thread_id: str
+    principal: str
+    revision: int = 1
+    context_version: int = 1
+    state: str = "open"
+    opened_ms: int | None = None
+    updated_ms: int | None = None
+    closed_ms: int | None = None
+    last_generation_id: str | None = None
+
+    def to_ref(self, *, channel: str, chat_id: str) -> TurnRef:
+        return TurnRef(
+            turn_id=self.turn_id,
+            thread_id=self.thread_id,
+            chat_id=chat_id,
+            channel=channel,
+            principal=self.principal,
+            revision=self.revision,
+            opened_ms=self.opened_ms,
+            closed_ms=self.closed_ms,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRef:
+    """One source revision a turn or generation saw."""
+
+    event_id: str
+    source_message_id: str | None = None
+    role: str = "trigger"
+    revision_at_join: int = 1
+    removed_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationSnapshot:
+    """Immutable record of what one provider request saw."""
+
+    generation_id: str
+    turn_id: str
+    thread_id: str
+    revision: int
+    context_version: int
+    source_refs: tuple[SourceRef, ...] = ()
+    snapshot_hash: str = ""
+    created_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnBinding:
+    """The turn a producer is currently working for."""
+
+    turn: StoredTurn
+    trace_id: str = ""
+    generation_id: str | None = None

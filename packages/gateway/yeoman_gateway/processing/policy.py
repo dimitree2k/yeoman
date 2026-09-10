@@ -131,6 +131,7 @@ class FastGateResult:
     policy_decision: PolicyDecision | None = None
     journaled_event_id: str | None = None
     shadow: bool = False
+    assignment: Any = None
 
     @property
     def denied(self) -> bool:
@@ -155,12 +156,14 @@ class IngestGate:
         store: ProcessingStore | None,
         snapshots: PolicySnapshotProvider,
         evaluate: Callable[[IngestRequest], PolicyDecision],
+        threads: Any = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         self._config = config
         self._store = store
         self._snapshots = snapshots
         self._evaluate = evaluate
+        self._threads = threads
         self._clock = clock or _now_ms
 
     def enabled_for(self, channel: str, chat_id: str) -> bool:
@@ -236,6 +239,7 @@ class IngestGate:
         outcome = (
             FastGateOutcome.REACT if decision.should_respond else FastGateOutcome.OBSERVE
         )
+        assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
         return self._record(
             request,
             snapshot,
@@ -244,13 +248,20 @@ class IngestGate:
             policy_decision=decision,
             journaled=journaled,
             now=now,
+            assignment=assignment,
         )
 
     # -- internals ---------------------------------------------------------------------
 
-    def _journal(self, request: IngestRequest, *, now: int) -> str | None:
-        if self._store is None:
+    def _assign(self, request: IngestRequest, *, now: int, allow_turn: bool) -> Any:
+        """Attach the canonical event to its thread; never runs for a denied event."""
+        if self._threads is None or self._store is None:
             return None
+        return self._threads.assign(
+            self._canonical_event(request), now_ms=now, allow_turn=allow_turn
+        )
+
+    def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
         event = request.event
         payload: dict[str, Any] = {
             "kind": "message",
@@ -258,10 +269,11 @@ class IngestGate:
             "is_group": event.is_group,
             "mentioned_bot": event.mentioned_bot,
             "reply_to_bot": event.reply_to_bot,
+            "reply_to_message_id": event.raw_metadata.get("reply_to_message_id"),
             "media": list(event.media),
         }
         payload.update(dict(request.payload_extra))
-        canonical = CanonicalEvent(
+        return CanonicalEvent(
             event_id=request.event_id,
             event_key=request.event_key,
             trace_id=request.trace_id,
@@ -274,6 +286,11 @@ class IngestGate:
             source_message_id=event.message_id,
             payload=payload,
         )
+
+    def _journal(self, request: IngestRequest, *, now: int) -> str | None:
+        if self._store is None:
+            return None
+        canonical = self._canonical_event(request)
         return self._store.append_event(
             event_key=canonical.event_key,
             event_id=canonical.event_id,
@@ -293,6 +310,7 @@ class IngestGate:
         journaled: str | None,
         now: int,
         shadow: bool = False,
+        assignment: Any = None,
     ) -> FastGateResult:
         event = request.event
         decision = DecisionRecord(
@@ -319,6 +337,7 @@ class IngestGate:
             policy_decision=policy_decision,
             journaled_event_id=journaled,
             shadow=shadow,
+            assignment=assignment,
         )
 
 
