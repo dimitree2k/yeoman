@@ -18,8 +18,8 @@ from yeoman_gateway.processing.models import (
 from yeoman_gateway.processing.policy import SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.processing.threads import (
-    TurnAuthority,
     ThreadRegistry,
+    TurnAuthority,
     UpdateEffect,
     classify_update,
 )
@@ -56,7 +56,7 @@ class _Executor:
 
 
 class _Config:
-    class threads:
+    class Threads:
         followup_window_seconds = 15
         idle_seconds = 1800
         reopen_window_seconds = 604800
@@ -350,4 +350,214 @@ def test_operation_key_carries_turn_identity(tmp_path: Path) -> None:
         now_ms=T0,
     )
     assert store.count_effects() == 2
+    store.close()
+
+
+# --------------------------------------------------------------------------------------
+# Task 3: actor, bounded postbox, immutable generations
+# --------------------------------------------------------------------------------------
+
+
+def _actor(store: ProcessingStore, registry: ThreadRegistry, thread_id: str):
+    from yeoman_gateway.processing.actor import ThreadActor
+
+    return ThreadActor(store=store, thread_id=thread_id, cap=32, clock=_Clock())
+
+
+def _followup(store: ProcessingStore, thread_id: str, *, event_id: str, kind: str = "message"):
+    return store.enqueue_pending_input(
+        input_id=f"in-{event_id}",
+        thread_id=thread_id,
+        event_id=event_id,
+        principal="orderer@s.whatsapp.net",
+        now_ms=T0 + 1,
+        kind=kind,
+        cap=32,
+    )
+
+
+@pytest.mark.asyncio
+async def test_followup_is_accepted_while_the_provider_call_is_in_flight(tmp_path: Path) -> None:
+    """Barrier test: no sleeps, the provider waits on an event we control."""
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    actor = _actor(store, registry, str(decision.thread_id))
+    snapshot = actor.freeze_snapshot()
+    assert snapshot is not None
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _provider(_snapshot):
+        started.set()
+        await release.wait()
+        return "first answer"
+
+    task = asyncio.create_task(actor.run_generation(snapshot, _provider))
+    await started.wait()
+
+    admission = actor.accept(event_id="m2", principal="orderer@s.whatsapp.net", authorized=True)
+
+    assert admission.accepted is True
+    assert store.count_pending(thread_id=str(decision.thread_id), states=("waiting",)) == 1
+    assert actor.state_lock_busy is False
+
+    release.set()
+    outcome = await task
+
+    assert outcome.state == "restart"  # new context, so the stale text is not sent
+    assert outcome.text is None or outcome.text == "first answer"
+    store.close()
+
+
+def test_postbox_is_bounded_and_deferred_inputs_survive(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    thread_id = str(decision.thread_id)
+
+    for index in range(32):
+        assert _followup(store, thread_id, event_id=f"f{index}") == "waiting"
+    assert _followup(store, thread_id, event_id="overflow") == "deferred"
+
+    assert store.count_pending(thread_id=thread_id, states=("waiting",)) == 32
+    assert store.count_pending(thread_id=thread_id, states=("deferred",)) == 1
+
+    # Durable across a restart.
+    store.close()
+    store = ProcessingStore(tmp_path / "p.db")
+    assert store.count_pending(thread_id=thread_id, states=("deferred",)) == 1
+
+    drained = store.drain_pending_inputs(thread_id, now_ms=T0 + 2)
+    assert len(drained) == 32
+    promoted = store.promote_deferred(thread_id, now_ms=T0 + 3, capacity=32)
+    assert promoted == ("overflow",)
+    store.close()
+
+
+def test_snapshot_is_immutable_and_carries_no_prompt_text(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    actor = _actor(store, registry, str(decision.thread_id))
+
+    first = actor.freeze_snapshot()
+    assert first is not None
+    assert first.revision == 1 and first.context_version == 1
+    assert first.source_refs and first.source_refs[0].event_id == "m1"
+    assert "hi" not in first.snapshot_hash  # hashes only, no prompt text
+
+    store.bump_context_version(first.turn_id, now_ms=T0 + 1)
+    second = actor.freeze_snapshot()
+    assert second is not None
+    assert second.generation_id != first.generation_id
+    assert second.context_version == 2
+    assert first.context_version == 1  # frozen: the running request cannot change
+    assert first.snapshot_hash != second.snapshot_hash
+
+    generations = store.generations_for_turn(first.turn_id)
+    assert len(generations) == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_at_most_two_additional_generations_then_followup_turn(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    thread_id = str(decision.thread_id)
+    actor = _actor(store, registry, thread_id)
+
+    async def _provider(_snapshot):
+        return "answer"
+
+    for expected in (1, 2):
+        snapshot = actor.freeze_snapshot()
+        actor.accept(event_id=f"extra{expected}", principal="orderer@s.whatsapp.net", authorized=True)
+        outcome = await actor.run_generation(snapshot, _provider)
+        assert outcome.state == "restart"
+        assert actor.additional_generations == expected
+
+    snapshot = actor.freeze_snapshot()
+    actor.accept(event_id="extra3", principal="orderer@s.whatsapp.net", authorized=True)
+    outcome = await actor.run_generation(snapshot, _provider)
+
+    assert outcome.state == "send"
+    assert outcome.followup_turn_id is not None
+    assert outcome.followup_turn_id != decision.turn_id
+    assert store.get_turn(outcome.followup_turn_id) is not None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_correction_during_a_generation_supersedes_and_cancels(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    turn_id = str(decision.turn_id)
+    actor = _actor(store, registry, str(decision.thread_id))
+    snapshot = actor.freeze_snapshot()
+
+    store.enqueue_effect(
+        effect_id="fx-stale",
+        operation_key=f"send_text:{CHAT}:{turn_id}:1:src",
+        payload={"text": "old"},
+        target={"channel": "whatsapp", "chat_id": CHAT},
+        turn_id=turn_id,
+        turn_revision=1,
+        now_ms=T0,
+    )
+
+    async def _provider(_snapshot):
+        return "stale answer"
+
+    actor.accept(
+        event_id="del1", kind="delete", principal="orderer@s.whatsapp.net", authorized=True
+    )
+    outcome = await actor.run_generation(snapshot, _provider)
+
+    assert outcome.state == "superseded"
+    assert outcome.revision == 2
+    assert store.effect_state("fx-stale") == "cancelled"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_error_sends_nothing_and_keeps_the_turn_open(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    actor = _actor(store, registry, str(decision.thread_id))
+    snapshot = actor.freeze_snapshot()
+
+    async def _provider(_snapshot):
+        raise RuntimeError("provider down")
+
+    outcome = await actor.run_generation(snapshot, _provider)
+
+    assert outcome.state == "error"
+    assert outcome.text is None
+    assert store.count_effects() == 0
+    assert store.get_turn(str(decision.turn_id)).state == "open"
+    assert store.generations_for_turn(str(decision.turn_id))[0]["outcome"] == "error"
+    store.close()
+
+
+def test_actor_registry_finds_the_active_turn_and_closes_idle_threads(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+
+    turn_ref = actors.active_turn("whatsapp", CHAT)
+    assert turn_ref is not None and turn_ref.turn_id == decision.turn_id
+
+    closed = actors.tick(T0 + 31 * 60_000)
+    assert closed == (decision.thread_id,)
+    assert actors.active_turn("whatsapp", CHAT) is None
     store.close()

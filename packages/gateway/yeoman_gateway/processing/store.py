@@ -35,9 +35,11 @@ from yeoman_gateway.processing.models import (
     EffectConflictError,
     EffectEnvelope,
     EffectTarget,
+    GenerationSnapshot,
     InvalidTransitionError,
     JournalConflictError,
     LineageView,
+    PendingInput,
     ProcessingError,
     PurgeReport,
     RelationMeta,
@@ -1519,9 +1521,16 @@ class ProcessingStore:
             return None
         return (str(row["thread_id"]), _opt_str(row["turn_id"]))
 
-    def count_pending(self, *, thread_id: str | None = None) -> int:
-        query = "SELECT COUNT(*) AS n FROM pending_inputs WHERE state IN ('accepted','deferred')"
-        params: list[Any] = []
+    def count_pending(
+        self, *, thread_id: str | None = None, states: tuple[str, ...] = ("waiting",)
+    ) -> int:
+        """Number of inputs waiting in the postbox (``deferred`` is not waiting)."""
+        wanted = tuple(states)
+        if not wanted:
+            return 0
+        placeholders = ",".join("?" for _ in wanted)
+        query = f"SELECT COUNT(*) AS n FROM pending_inputs WHERE state IN ({placeholders})"
+        params: list[Any] = list(wanted)
         if thread_id is not None:
             query += " AND thread_id = ?"
             params.append(thread_id)
@@ -1541,10 +1550,23 @@ class ProcessingStore:
         kind: str = "message",
         decision_id: str | None = None,
         relevance: str = "unknown",
-        state: str = "accepted",
-    ) -> bool:
-        """Add one waiting input. False when the event was already queued."""
+        cap: int | None = None,
+    ) -> str | None:
+        """Add one waiting input; beyond *cap* it is recorded as ``deferred``.
+
+        The count and the insert happen in one ``BEGIN IMMEDIATE`` transaction. ``deferred``
+        is a projection: the journal row itself is append-only and stays untouched, so the
+        input survives a restart and is never lost.
+        """
         with self._write() as conn:
+            waiting = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM pending_inputs "
+                    "WHERE thread_id = ? AND state = 'waiting'",
+                    (thread_id,),
+                ).fetchone()["n"]
+            )
+            state = "deferred" if cap is not None and waiting >= int(cap) else "waiting"
             cursor = conn.execute(
                 """
                 INSERT INTO pending_inputs (input_id, thread_id, turn_id, event_id, principal,
@@ -1565,32 +1587,54 @@ class ProcessingStore:
                     now_ms,
                 ),
             )
-        return cursor.rowcount == 1
+        return state if cursor.rowcount == 1 else None
 
-    def drain_pending_inputs(self, thread_id: str, *, now_ms: int) -> tuple[str, ...]:
-        """Consume accepted inputs of a thread and return their event ids in order."""
+    def drain_pending_inputs(
+        self, thread_id: str, *, now_ms: int, limit: int | None = None
+    ) -> tuple[PendingInput, ...]:
+        """Consume the waiting inputs of a thread in arrival order."""
+        query = (
+            "SELECT * FROM pending_inputs WHERE thread_id = ? AND state = 'waiting' "
+            "ORDER BY enqueued_ms, input_id"
+        )
+        params: list[Any] = [thread_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
         with self._write() as conn:
-            rows = conn.execute(
-                "SELECT input_id, event_id FROM pending_inputs "
-                "WHERE thread_id = ? AND state = 'accepted' ORDER BY enqueued_ms, input_id",
-                (thread_id,),
-            ).fetchall()
-            event_ids = tuple(str(row["event_id"]) for row in rows)
+            rows = conn.execute(query, params).fetchall()
             for row in rows:
                 conn.execute(
                     "UPDATE pending_inputs SET state = 'consumed', consumed_ms = ? "
                     "WHERE input_id = ?",
                     (now_ms, row["input_id"]),
                 )
-        return event_ids
+        return tuple(_pending_from_row(row) for row in rows)
 
-    def promote_deferred(self, thread_id: str, *, now_ms: int, capacity: int) -> tuple[str, ...]:
-        """Promote deferred inputs once the mailbox has room again."""
+    def pending_inputs(
+        self, thread_id: str, *, states: tuple[str, ...] = ("waiting", "deferred")
+    ) -> tuple[PendingInput, ...]:
+        wanted = tuple(states)
+        if not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM pending_inputs WHERE thread_id = ? "
+                f"AND state IN ({placeholders}) ORDER BY enqueued_ms, input_id",
+                (thread_id, *wanted),
+            ).fetchall()
+        return tuple(_pending_from_row(row) for row in rows)
+
+    def promote_deferred(
+        self, thread_id: str, *, now_ms: int, capacity: int
+    ) -> tuple[str, ...]:
+        """Move deferred inputs back to waiting once the mailbox has room again."""
         with self._write() as conn:
             used = int(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM pending_inputs "
-                    "WHERE thread_id = ? AND state = 'accepted'",
+                    "WHERE thread_id = ? AND state = 'waiting'",
                     (thread_id,),
                 ).fetchone()["n"]
             )
@@ -1605,11 +1649,79 @@ class ProcessingStore:
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    "UPDATE pending_inputs SET state = 'accepted', enqueued_ms = ? "
+                    "UPDATE pending_inputs SET state = 'waiting', enqueued_ms = ? "
                     "WHERE input_id = ?",
                     (now_ms, row["input_id"]),
                 )
         return tuple(str(row["event_id"]) for row in rows)
+
+    # -- generations -------------------------------------------------------------------
+
+    def record_generation(self, snapshot: GenerationSnapshot) -> str:
+        """Persist one immutable generation snapshot (hashes and source revisions)."""
+        created = self._now(snapshot.created_ms)
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO generations (generation_id, turn_id, thread_id, revision,
+                                                   context_version, snapshot_hash, recycle,
+                                                   created_ms)
+                VALUES (?,?,?,?,?,?,0,?)
+                """,
+                (
+                    snapshot.generation_id,
+                    snapshot.turn_id,
+                    snapshot.thread_id,
+                    snapshot.revision,
+                    snapshot.context_version,
+                    snapshot.snapshot_hash,
+                    created,
+                ),
+            )
+            for source in snapshot.source_refs:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO generation_sources (generation_id, event_id,
+                        source_message_id, role, revision_at_join)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        snapshot.generation_id,
+                        source.event_id,
+                        source.source_message_id,
+                        source.role,
+                        source.revision_at_join,
+                    ),
+                )
+            conn.execute(
+                "UPDATE turns SET last_generation_id = ?, updated_ms = ? WHERE turn_id = ?",
+                (snapshot.generation_id, created, snapshot.turn_id),
+            )
+        return snapshot.generation_id
+
+    def finish_generation(
+        self,
+        generation_id: str,
+        *,
+        now_ms: int,
+        outcome: str,
+        detail: str | None = None,
+    ) -> bool:
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE generations SET finished_ms = ?, outcome = ?, detail = ? "
+                "WHERE generation_id = ?",
+                (now_ms, outcome, detail, generation_id),
+            )
+        return cursor.rowcount == 1
+
+    def generations_for_turn(self, turn_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM generations WHERE turn_id = ? ORDER BY created_ms, generation_id",
+                (turn_id,),
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
 
     # -- lineage -----------------------------------------------------------------------
 
@@ -1813,6 +1925,21 @@ class ProcessingStore:
                 int(row["payload_purged_ms"]) if row["payload_purged_ms"] is not None else None
             ),
         )
+
+
+def _pending_from_row(row: sqlite3.Row) -> PendingInput:
+    return PendingInput(
+        input_id=str(row["input_id"]),
+        thread_id=str(row["thread_id"]),
+        event_id=str(row["event_id"]),
+        principal=str(row["principal"]),
+        turn_id=str(row["turn_id"]) if row["turn_id"] is not None else None,
+        kind=str(row["kind"]),
+        decision_id=str(row["decision_id"]) if row["decision_id"] is not None else None,
+        relevance=str(row["relevance"]),
+        state=str(row["state"]),
+        enqueued_ms=int(row["enqueued_ms"]) if row["enqueued_ms"] is not None else None,
+    )
 
 
 def _thread_from_row(row: sqlite3.Row) -> StoredThread:

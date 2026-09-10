@@ -848,3 +848,19 @@ class TurnBinding:
     turn: StoredTurn
     trace_id: str = ""
     generation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInput:
+    """One waiting follow-up of a thread (projection over ``pending_inputs``)."""
+
+    input_id: str
+    thread_id: str
+    event_id: str
+    principal: str = ""
+    turn_id: str | None = None
+    kind: str = "message"
+    decision_id: str | None = None
+    relevance: str = "unknown"
+    state: str = "waiting"
+    enqueued_ms: int | None = None
