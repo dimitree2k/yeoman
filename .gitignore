@@ -4,6 +4,9 @@
 dist/
 build/
 docs/*
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/processing-rollout-runbook.md
 !docs/superpowers/
 docs/superpowers/*
 !docs/superpowers/plans/
