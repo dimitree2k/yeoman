@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 3 as const;
+export const PROTOCOL_VERSION = 4 as const;
 
 const TOKEN_JSON_RE = /("token"\s*:\s*")[^"]*(")/gi;
 const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
@@ -14,9 +14,19 @@ export type BridgeCommandType =
   | 'login_start'
   | 'login_wait'
   | 'logout'
+  | 'lookup_message'
   | 'health';
 
-export type BridgeEventType = 'message' | 'status' | 'qr' | 'error' | 'response';
+export type BridgeEventType =
+  | 'message'
+  | 'edit'
+  | 'delete'
+  | 'reaction'
+  | 'receipt'
+  | 'status'
+  | 'qr'
+  | 'error'
+  | 'response';
 
 export interface ProtocolError {
   code:
@@ -90,6 +100,22 @@ export interface LoginStartPayload {
 
 export interface LoginWaitPayload {
   timeoutMs?: number;
+}
+
+export interface LookupMessagePayload {
+  chatJid: string;
+  messageId: string;
+}
+
+/**
+ * Answer about one provider message. ``found`` comes from a proven local source only;
+ * ``unsupported`` means the bridge has no authority to answer (it is never a claim that
+ * the message is absent), and ``absent`` is reserved for a query that really came back
+ * negative.
+ */
+export interface LookupMessageResult {
+  status: 'found' | 'absent' | 'unsupported';
+  messageId?: string;
 }
 
 export interface EmptyPayload {

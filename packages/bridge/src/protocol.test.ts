@@ -9,7 +9,8 @@ import {
 } from './protocol.js';
 
 test('protocol version gates deterministic message ids', () => {
-  assert.equal(PROTOCOL_VERSION, 3);
+  // v4 adds the edit/delete/reaction/receipt signals and lookup_message.
+  assert.equal(PROTOCOL_VERSION, 4);
 });
 
 test('parseBridgeCommand accepts valid v3 command', () => {

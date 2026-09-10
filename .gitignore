@@ -80,6 +80,7 @@ tests/gateway/*
 !tests/gateway/test_processing_reconcile.py
 !tests/gateway/test_processing_reconcile_service.py
 !tests/gateway/test_processing_signals.py
+!tests/gateway/test_whatsapp_signal_mapping.py
 !tests/gateway/test_processing_transport_receipts.py
 !tests/gateway/test_a2a.py
 !tests/gateway/test_cron_voice_quiet_window.py

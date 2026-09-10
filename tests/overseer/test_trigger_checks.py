@@ -169,7 +169,7 @@ def test_whatsapp_bridge_health_uses_shared_protocol_version(
 
     result = _whatsapp_bridge_health(target="default", timeout_s=1.0)
 
-    assert sent[0]["version"] == PROTOCOL_VERSION == 3
+    assert sent[0]["version"] == PROTOCOL_VERSION == 4
     assert result["whatsapp"]["connected"] is True
 
 def test_whatsapp_bridge_connected_false_when_logged_out(monkeypatch: pytest.MonkeyPatch) -> None:
