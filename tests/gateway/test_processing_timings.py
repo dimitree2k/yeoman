@@ -159,3 +159,69 @@ async def test_dispatcher_records_its_phase_and_counts_a_blocked_effect() -> Non
     # Without instrumentation the dispatcher behaves exactly as before.
     plain = ManagedOutboundDispatcher(router=_Router("sent"), bus=_Bus())
     await plain(message)
+
+
+@pytest.mark.asyncio
+async def test_load_comparison_between_legacy_and_managed_paths() -> None:
+    """A synthetic legacy-versus-managed run: medians/p95 and deferral counters.
+
+    The workload is fixed and the latency is simulated, so the numbers describe this
+    harness only - they are not a claim about real provider latency.
+    """
+    import asyncio
+    import types
+
+    from yeoman_gateway.bus.events import OutboundMessage
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    class _Managed:
+        def manages(self, channel: str, chat_id: str) -> bool:
+            return True
+
+        async def submit_message(self, message, *, principal, capability, payload):
+            await asyncio.sleep(0.001)  # simulated transport round trip
+            return types.SimpleNamespace(state="sent", detail=None, effect_id="fx")
+
+    class _Legacy:
+        def manages(self, channel: str, chat_id: str) -> bool:
+            return False
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.count = 0
+
+        async def publish_outbound(self, message) -> None:
+            await asyncio.sleep(0.001)
+            self.count += 1
+
+    runs = 25
+    legacy_timings = PhaseTimings()
+    legacy_bus = _Bus()
+    legacy = ManagedOutboundDispatcher(router=_Legacy(), bus=legacy_bus)
+    for index in range(runs):
+        message = OutboundMessage(channel="whatsapp", chat_id="chat-1", content=f"l{index}")
+        with legacy_timings.phase("queue_in"):
+            await legacy(message)
+
+    managed_timings = PhaseTimings()
+    managed = ManagedOutboundDispatcher(router=_Managed(), bus=_Bus(), timings=managed_timings)
+    for index in range(runs):
+        message = OutboundMessage(channel="whatsapp", chat_id="chat-1", content=f"m{index}")
+        with managed_timings.phase("queue_in"):
+            await managed(message)
+    managed_timings.note_deferral("budget_exhausted")
+
+    legacy_report = legacy_timings.report()
+    managed_report = managed_timings.report()
+
+    assert legacy_report.samples["queue_in"] == runs
+    assert managed_report.samples["queue_in"] == runs
+    assert managed_report.samples["effect_queue"] == runs
+    assert legacy_bus.count == runs
+
+    lines = compare_reports(legacy_report, managed_report)
+    assert any(line.startswith("queue_in: legacy median=") for line in lines)
+    assert "deferred[budget_exhausted]: legacy=0 managed=1" in lines
+    # Only measured phases are reported, and no message text leaks into a label.
+    assert not any(line.startswith("enrichment") for line in lines)
+    assert not any("l0" in line or "m0" in line for line in lines)
