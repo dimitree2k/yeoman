@@ -598,11 +598,13 @@ class _InnerResponder:
         self.texts = list(texts or ["answer"])
         self.calls = 0
         self.snapshots: list[object] = []
+        self.session_keys: list[str | None] = []
         self._barrier = barrier
         self._started = started
 
-    async def generate_reply(self, event, decision) -> str | None:
+    async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
         self.calls += 1
+        self.session_keys.append(session_key)
         if self.calls == 1:
             if self._started is not None:
                 self._started.set()
@@ -611,14 +613,16 @@ class _InnerResponder:
         return self.texts[min(self.calls - 1, len(self.texts) - 1)]
 
 
-def _event_model(*, message_id: str = "m1", sender: str = "orderer@s.whatsapp.net"):
+def _event_model(
+    *, message_id: str = "m1", sender: str = "orderer@s.whatsapp.net", chat_id: str = CHAT
+):
     from datetime import UTC, datetime
 
     from yeoman_gateway.core.models import InboundEvent
 
     return InboundEvent(
         channel="whatsapp",
-        chat_id=CHAT,
+        chat_id=chat_id,
         sender_id=sender,
         content="hi",
         message_id=message_id,
@@ -739,4 +743,110 @@ async def test_superseded_generation_returns_no_reply(tmp_path: Path) -> None:
 
     assert reply is None
     assert store.effect_state("fx1") == "cancelled"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_group_turns_are_thread_scoped_and_dms_keep_continuity(tmp_path: Path) -> None:
+    """Spec R03: thread context is primary; no invented history, no lost DM continuity."""
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)  # group chat
+    inner = _InnerResponder(["group answer"])
+    wrapper = _wrapper(store, inner, registry)
+
+    await wrapper.generate_reply(_event_model(message_id="m1"), object())
+
+    assert inner.session_keys == [f"whatsapp:{CHAT}:thread:{decision.thread_id}"]
+
+    # A DM keeps its chat-scoped history until the marked legacy carry-over exists.
+    dm = _event_model(message_id="dm1", chat_id="owner@s.whatsapp.net")
+    assert wrapper.session_key_for(dm, thread_id="th_dm") == "whatsapp:owner@s.whatsapp.net"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_two_threads_do_not_mix_state_or_effects(tmp_path: Path) -> None:
+    """Interleaving test: different principals, chats and turn revisions stay apart."""
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+
+    def _thread_for(chat_id: str, principal: str, event_id: str):
+        from yeoman_gateway.processing.models import CanonicalEvent
+
+        event = CanonicalEvent(
+            event_id=event_id,
+            event_key=f"wa:{event_id}",
+            trace_id=f"tr-{event_id}",
+            kind="message",
+            origin="whatsapp",
+            principal=principal,
+            channel="whatsapp",
+            chat_id=chat_id,
+            occurred_ms=T0,
+            source_message_id=event_id,
+            payload={"kind": "message", "text": "hi", "is_group": True, "mentioned_bot": True},
+        )
+        store.append_event(
+            event_key=event.event_key,
+            event_id=event.event_id,
+            trace_id=event.trace_id,
+            payload=dict(event.payload or {}),
+            now_ms=T0,
+        )
+        return registry.assign(event, now_ms=T0)
+
+    first = _thread_for("chat-a@g.us", "a@s.whatsapp.net", "a1")
+    second = _thread_for("chat-b@g.us", "b@s.whatsapp.net", "b1")
+    assert first.thread_id != second.thread_id
+
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+
+    class _Blocking:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.keys: list[str | None] = []
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
+            self.keys.append(session_key)
+            self.started.set()
+            await self.release.wait()
+            return f"answer for {event.chat_id}"
+
+    inner = _Blocking()
+    wrapper = ThreadActorResponder(inner=inner, actors=actors, store=store, clock=_Clock())
+
+    task_a = asyncio.create_task(
+        wrapper.generate_reply(
+            _event_model(message_id="a1", sender="a@s.whatsapp.net", chat_id="chat-a@g.us"),
+            object(),
+        )
+    )
+    await inner.started.wait()
+    task_b = asyncio.create_task(
+        wrapper.generate_reply(
+            _event_model(message_id="b1", sender="b@s.whatsapp.net", chat_id="chat-b@g.us"),
+            object(),
+        )
+    )
+    await asyncio.sleep(0)
+    inner.release.set()
+    reply_a, reply_b = await asyncio.gather(task_a, task_b)
+
+    assert reply_a == "answer for chat-a@g.us"
+    assert reply_b == "answer for chat-b@g.us"
+    assert set(inner.keys) == {
+        f"whatsapp:chat-a@g.us:thread:{first.thread_id}",
+        f"whatsapp:chat-b@g.us:thread:{second.thread_id}",
+    }
+    turn_a = store.get_turn(str(first.turn_id))
+    turn_b = store.get_turn(str(second.turn_id))
+    assert turn_a.principal == "a@s.whatsapp.net"
+    assert turn_b.principal == "b@s.whatsapp.net"
     store.close()

@@ -16,7 +16,11 @@ from typing import Any
 
 from loguru import logger
 
-from yeoman_gateway.processing.actor import MAX_ADDITIONAL_GENERATIONS, ThreadActorRegistry
+from yeoman_gateway.processing.actor import (
+    MAX_ADDITIONAL_GENERATIONS,
+    ThreadActorRegistry,
+    thread_session_key,
+)
 from yeoman_gateway.processing.models import now_ms as _now_ms
 from yeoman_gateway.processing.threads import TurnAuthority
 
@@ -74,13 +78,18 @@ class ThreadActorResponder:
     # -- loop --------------------------------------------------------------------------
 
     async def _run_loop(self, actor: Any, event: Any, decision: Any) -> str | None:
+        session_key = self.session_key_for(event, thread_id=actor.thread_id)
         for _attempt in range(MAX_ADDITIONAL_GENERATIONS + 1):
             snapshot = actor.freeze_snapshot()
             if snapshot is None:
-                return await self._inner.generate_reply(event, decision)
+                return await self._inner.generate_reply(
+                    event, decision, session_key=session_key
+                )
 
             async def _call(_snapshot: Any) -> str | None:
-                return await self._inner.generate_reply(event, decision)
+                return await self._inner.generate_reply(
+                    event, decision, session_key=session_key
+                )
 
             outcome = await actor.run_generation(snapshot, _call)
             if outcome.state == "restart":
@@ -113,6 +122,21 @@ class ThreadActorResponder:
             return None
         thread = self._store.get_thread(thread_id)
         return thread_id if thread is not None else None
+
+    def session_key_for(self, event: Any, *, thread_id: str) -> str:
+        """Thread-scoped session key; the chat key stays for legacy callers.
+
+        Group chats are strictly thread-scoped from now on. A DM keeps its chat-scoped
+        history until the explicitly marked legacy carry-over exists, so the running pilot
+        does not lose continuity (spec R03: thread context primary, no invented history).
+        """
+        channel = str(getattr(event, "channel", "") or "")
+        chat_id = str(getattr(event, "chat_id", "") or "")
+        if not channel or not chat_id:
+            return f"{channel}:{chat_id}"
+        if str(chat_id).endswith("@g.us"):
+            return thread_session_key(channel, chat_id, thread_id)
+        return f"{channel}:{chat_id}"
 
     def _event_id(self, event: Any) -> str:
         return str(getattr(event, "message_id", "") or "")

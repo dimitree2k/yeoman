@@ -2483,9 +2483,17 @@ class LLMResponder(ResponderPort):
         return final_content
 
     @override
-    async def generate_reply(self, event: InboundEvent, decision: PolicyDecision) -> str | None:
+    async def generate_reply(
+        self,
+        event: InboundEvent,
+        decision: PolicyDecision,
+        *,
+        session_key: str | None = None,
+    ) -> str | None:
         route_channel, route_chat_id = self._route_for_event(event)
-        session_key = f"{route_channel}:{route_chat_id}"
+        # A caller that knows the thread passes a thread-scoped key; without one the
+        # previous chat-scoped derivation stays byte-identical.
+        session_key = session_key or f"{route_channel}:{route_chat_id}"
         metadata = self._metadata_for_event(event)
         if "reply_budget" not in metadata and decision.reply_budget:
             state_raw = metadata.get("conversation_state")
