@@ -26,6 +26,12 @@ from yeoman_gateway.processing.models import TurnBinding
 from yeoman_gateway.processing.models import now_ms as _now_ms
 from yeoman_gateway.processing.threads import TurnAuthority
 
+#: Marked, bounded carry-over of the chat-scoped DM history into a thread session.
+#: The chat session itself is never modified, so the change is reversible by key only.
+LEGACY_CONTEXT_MARKER = "[legacy chat context - not thread-bound]"
+LEGACY_CONTEXT_TURNS = 20
+LEGACY_CONTEXT_MAX_CHARS = 6000
+
 
 class ThreadActorResponder:
     """Drives the generation loop for managed threads; a pass-through otherwise."""
@@ -90,6 +96,11 @@ class ThreadActorResponder:
 
     async def _run_loop(self, actor: Any, event: Any, decision: Any) -> str | None:
         session_key = self.session_key_for(event, thread_id=actor.thread_id)
+        self._ensure_legacy_context(
+            channel=str(getattr(event, "channel", "") or ""),
+            chat_id=str(getattr(event, "chat_id", "") or ""),
+            session_key=session_key,
+        )
         for _attempt in range(MAX_ADDITIONAL_GENERATIONS + 1):
             snapshot = actor.freeze_snapshot()
             if snapshot is None:
@@ -160,19 +171,66 @@ class ThreadActorResponder:
         return thread_id
 
     def session_key_for(self, event: Any, *, thread_id: str) -> str:
-        """Thread-scoped session key; the chat key stays for legacy callers.
-
-        Group chats are strictly thread-scoped from now on. A DM keeps its chat-scoped
-        history until the explicitly marked legacy carry-over exists, so the running pilot
-        does not lose continuity (spec R03: thread context primary, no invented history).
-        """
+        """Thread-scoped session key, for groups and DMs alike (spec R03)."""
         channel = str(getattr(event, "channel", "") or "")
         chat_id = str(getattr(event, "chat_id", "") or "")
         if not channel or not chat_id:
             return f"{channel}:{chat_id}"
-        if str(chat_id).endswith("@g.us"):
-            return thread_session_key(channel, chat_id, thread_id)
-        return f"{channel}:{chat_id}"
+        return thread_session_key(channel, chat_id, thread_id)
+
+    def _ensure_legacy_context(
+        self, *, channel: str, chat_id: str, session_key: str
+    ) -> None:
+        """Copy the chat-scoped history once into a thread session, clearly marked.
+
+        The old chat session stays untouched, the copy is bounded in turns and characters,
+        and a marker makes it idempotent. Only the same principal's DM is carried over, so
+        no rights are mixed; groups never use this path.
+        """
+        sessions = getattr(self._inner, "sessions", None)
+        if sessions is None or not channel or not chat_id:
+            return
+        chat_key = f"{channel}:{chat_id}"
+        if chat_key == session_key or str(chat_id).endswith("@g.us"):
+            return
+        try:
+            thread_session = sessions.get_or_create(session_key)
+            if any(
+                LEGACY_CONTEXT_MARKER in str(message.get("content") or "")
+                for message in thread_session.messages
+            ):
+                return
+            chat_session = sessions.get_or_create(chat_key)
+            history = [
+                message
+                for message in chat_session.messages
+                if str(message.get("content") or "").strip()
+            ][-LEGACY_CONTEXT_TURNS:]
+            if not history:
+                return
+            lines: list[str] = []
+            total = 0
+            for message in reversed(history):
+                text = " ".join(str(message.get("content") or "").split())[:400]
+                if not text:
+                    continue
+                line = f"{message.get('role')}: {text}"
+                if total + len(line) > LEGACY_CONTEXT_MAX_CHARS:
+                    break
+                lines.append(line)
+                total += len(line)
+            if not lines:
+                return
+            thread_session.add_message(
+                "system", LEGACY_CONTEXT_MARKER + "\n" + "\n".join(reversed(lines))
+            )
+            sessions.save(thread_session)
+        except Exception as exc:  # continuity is best effort, never fatal
+            logger.warning(
+                "legacy_context_carryover_failed chat={} error_type={}",
+                chat_id,
+                type(exc).__name__,
+            )
 
     def _event_id(self, event: Any) -> str:
         return str(getattr(event, "message_id", "") or "")

@@ -747,8 +747,8 @@ async def test_superseded_generation_returns_no_reply(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_group_turns_are_thread_scoped_and_dms_keep_continuity(tmp_path: Path) -> None:
-    """Spec R03: thread context is primary; no invented history, no lost DM continuity."""
+async def test_group_and_dm_turns_are_thread_scoped(tmp_path: Path) -> None:
+    """Spec R03: thread context is primary; the DM history is carried over, not lost."""
     store = _store(tmp_path)
     registry = ThreadRegistry(store=store, config=_Config())
     decision = _turn(store, registry)  # group chat
@@ -759,9 +759,12 @@ async def test_group_turns_are_thread_scoped_and_dms_keep_continuity(tmp_path: P
 
     assert inner.session_keys == [f"whatsapp:{CHAT}:thread:{decision.thread_id}"]
 
-    # A DM keeps its chat-scoped history until the marked legacy carry-over exists.
+    # A DM is thread-scoped too; its chat history is carried over in a marked block
+    # (see test_processing_pilot_path.test_dm_keeps_its_history_through_a_marked_carryover).
     dm = _event_model(message_id="dm1", chat_id="owner@s.whatsapp.net")
-    assert wrapper.session_key_for(dm, thread_id="th_dm") == "whatsapp:owner@s.whatsapp.net"
+    assert wrapper.session_key_for(dm, thread_id="th_dm") == (
+        "whatsapp:owner@s.whatsapp.net:thread:th_dm"
+    )
     store.close()
 
 

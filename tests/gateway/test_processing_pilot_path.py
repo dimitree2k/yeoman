@@ -278,3 +278,122 @@ async def test_tool_effect_from_a_generation_uses_the_frozen_turn(runtime) -> No
     states = {effect.state for effect in store.list_effects()}
     assert "sent" not in states or transport.sent == []
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# DM legacy carry-over (last Plan 03 item)
+# --------------------------------------------------------------------------------------
+
+
+class _Session:
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.messages: list[dict] = []
+        self.metadata: dict = {}
+
+    def add_message(self, role: str, content: str, **kwargs) -> None:
+        self.messages.append({"role": role, "content": content, **kwargs})
+
+
+class _Sessions:
+    def __init__(self) -> None:
+        self.store: dict[str, _Session] = {}
+        self.saves = 0
+
+    def get_or_create(self, key: str) -> _Session:
+        return self.store.setdefault(key, _Session(key))
+
+    def save(self, session: _Session) -> None:
+        self.saves += 1
+
+
+def _dm_runtime(tmp_path: Path):
+    """A managed DM: no @g.us, so the carry-over path applies."""
+    config = Config.model_validate(
+        {"processing": {"enabled": True, "chats": ["whatsapp:owner@s.whatsapp.net"]}}
+    )
+    policy_path = tmp_path / "policy.json"
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "channels": {
+                "whatsapp": {
+                    "default": {"whoCanTalk": {"mode": "everyone"}, "whenToReply": {"mode": "all"}}
+                }
+            },
+        }
+    )
+    save_policy(policy, policy_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    adapter = EnginePolicyAdapter(
+        engine=PolicyEngine(policy, workspace=workspace, apply_channels={"whatsapp"}),
+        known_tools={"message"},
+        policy_path=policy_path,
+        workspace=workspace,
+    )
+    with patch.dict(os.environ, {"YEOMAN_HOME": str(tmp_path)}):
+        store = build_processing_store(config)
+        assert store is not None
+        registry = build_thread_registry(config, store)
+        gate = build_processing_gate(config, adapter, store, registry)
+    return config, store, registry, gate
+
+
+def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import LEGACY_CONTEXT_MARKER, ThreadActorResponder
+
+    config, store, registry, gate = _dm_runtime(tmp_path)
+    sessions = _Sessions()
+    chat_session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net")
+    chat_session.add_message("user", "earlier question about the pilot")
+    chat_session.add_message("assistant", "earlier answer")
+
+    class _Inner:
+        def __init__(self, sessions: _Sessions) -> None:
+            self.sessions = sessions
+
+        async def generate_reply(self, event, decision, *, session_key=None):
+            return "answer"
+
+    actors = ThreadActorRegistry(store=store, config=config.processing, clock=_Clock())
+    wrapper = ThreadActorResponder(inner=_Inner(sessions), actors=actors, store=store)
+
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id="owner@s.whatsapp.net",
+        sender_id="owner@s.whatsapp.net",
+        content="next question",
+        message_id="dm1",
+        mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+    result = gate.admit(
+        IngestRequest(
+            event_key="whatsapp:owner:dm1", event_id="dm1", trace_id="tr-dm1", event=event
+        )
+    )
+    thread_id = str(result.assignment.thread_id)
+    thread_key = f"whatsapp:owner@s.whatsapp.net:thread:{thread_id}"
+
+    import asyncio
+
+    reply = asyncio.run(wrapper.generate_reply(event, object()))
+
+    assert reply == "answer"
+    carried = sessions.get_or_create(thread_key)
+    marked = [m for m in carried.messages if LEGACY_CONTEXT_MARKER in m["content"]]
+    assert len(marked) == 1
+    assert "earlier question about the pilot" in marked[0]["content"]
+    # The chat session itself is never touched.
+    assert len(chat_session.messages) == 2
+
+    # A second turn must not copy again.
+    asyncio.run(wrapper.generate_reply(event, object()))
+    assert len([m for m in sessions.get_or_create(thread_key).messages
+                if LEGACY_CONTEXT_MARKER in m["content"]]) == 1
+    store.close()
