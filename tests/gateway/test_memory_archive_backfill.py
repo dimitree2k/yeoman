@@ -179,3 +179,19 @@ def test_chats_are_listed_busiest_first(tmp_path: Path) -> None:
     assert pairs[0] == (CHANNEL, "busy@g.us")
     assert (CHANNEL, "quiet@g.us") in pairs
     archive.close()
+
+
+def test_paging_reads_past_one_page(tmp_path: Path) -> None:
+    """Regression: pages are newest-first, so history beyond one page must still be read.
+
+    The first run reported 606 messages for a chat with 2,221 because the anchor advanced
+    by a single message per page.
+    """
+    archive = _archive(tmp_path, 650)
+
+    rows = iter_archive_messages(archive, channel=CHANNEL, chat_id=CHAT, since_ms=0)
+
+    assert len(rows) == 650
+    assert rows[0]["message_id"] == "m0"
+    assert rows[-1]["message_id"] == "m649"
+    archive.close()

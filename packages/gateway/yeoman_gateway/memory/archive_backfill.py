@@ -108,7 +108,9 @@ def iter_archive_messages(
     )
     collected: list[Mapping[str, Any]] = list(rows)
     while rows and len(rows) == PAGE_LIMIT and (wanted is None or len(collected) < wanted):
-        oldest = rows[0]
+        # Pages come back newest-first, so the next anchor is the page's *oldest* row -
+        # taking rows[0] would walk back one message per page and silently lose history.
+        oldest = min(rows, key=lambda row: (row_ms(row) or 0, str(row.get("message_id") or "")))
         oldest_id = str(oldest.get("message_id") or "")
         stamp = row_ms(oldest)
         if not oldest_id or stamp is None or stamp <= int(since_ms):
