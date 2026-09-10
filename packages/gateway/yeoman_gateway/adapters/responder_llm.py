@@ -655,6 +655,20 @@ class LLMResponder(ResponderPort):
         is_owner: bool = False,
         reply_to_message_id: str | None = None,
     ) -> None:
+        from yeoman_gateway.processing.tool_context import (
+            ToolInvocationContext,
+            set_tool_context,
+        )
+
+        set_tool_context(
+            ToolInvocationContext(
+                channel=channel,
+                chat_id=chat_id,
+                session_key=session_key,
+                is_owner=is_owner,
+                reply_to_message_id=reply_to_message_id,
+            )
+        )
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(channel, chat_id)

@@ -481,3 +481,57 @@ def test_ambient_window_never_repeats_the_own_thread() -> None:
 
     assert any("other thread message" in line for line in lines)
     assert not any("own thread message" in line for line in lines)
+
+
+def test_tool_context_is_per_turn_not_per_instance() -> None:
+    """Two overlapping turns must not leak their target into each other's tool call."""
+    import asyncio
+
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        reset_tool_context,
+        set_tool_context,
+    )
+
+    sent: list[tuple[str, str]] = []
+
+    async def _send(message) -> None:
+        sent.append((message.channel, message.chat_id))
+
+    tool = MessageTool(send_callback=_send)
+    tool.set_context("whatsapp", "shared-default@g.us")
+
+    async def _turn(chat_id: str) -> str:
+        token = set_tool_context(ToolInvocationContext(channel="whatsapp", chat_id=chat_id))
+        try:
+            await asyncio.sleep(0)  # let the other turn interleave
+            return await tool.execute(content="hi")
+        finally:
+            reset_tool_context(token)
+
+    async def _main() -> list[str]:
+        return await asyncio.gather(_turn("chat-a@g.us"), _turn("chat-b@g.us"))
+
+    asyncio.run(_main())
+
+    assert sorted(sent) == [("whatsapp", "chat-a@g.us"), ("whatsapp", "chat-b@g.us")]
+    assert ("whatsapp", "shared-default@g.us") not in sent
+
+
+def test_tool_context_falls_back_to_the_instance_default() -> None:
+    import asyncio
+
+    from yeoman_gateway.agent.tools.message import MessageTool
+
+    sent: list[tuple[str, str]] = []
+
+    async def _send(message) -> None:
+        sent.append((message.channel, message.chat_id))
+
+    tool = MessageTool(send_callback=_send)
+    tool.set_context("whatsapp", "shared-default@g.us")
+
+    asyncio.run(tool.execute(content="hi"))
+
+    assert sent == [("whatsapp", "shared-default@g.us")]

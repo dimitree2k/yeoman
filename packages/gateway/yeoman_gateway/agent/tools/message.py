@@ -90,10 +90,15 @@ class MessageTool(Tool):
         **kwargs: Any
     ) -> str:
         del kwargs
+        from yeoman_gateway.processing.tool_context import tool_target
+
+        context_channel, context_chat_id = tool_target(
+            default_channel=self._default_channel, default_chat_id=self._default_chat_id
+        )
         channel_explicit = str(channel or "").strip()
         chat_id_explicit = str(chat_id or "").strip()
-        channel = channel_explicit or self._default_channel.strip()
-        chat_id = chat_id_explicit
+        channel = channel_explicit or context_channel.strip()
+        chat_id = chat_id_explicit or context_chat_id.strip()
         group_ref = str(group or "").strip()
 
         if group_ref:
