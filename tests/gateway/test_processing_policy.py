@@ -17,6 +17,7 @@ from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.loader import save_policy
 from yeoman_gateway.policy.schema import PolicyConfig
+from yeoman_gateway.processing.effects import EffectGateway
 from yeoman_gateway.processing.models import (
     EffectEnvelope,
     EffectTarget,
@@ -117,6 +118,26 @@ class _StaticSnapshots:
 
     def snapshot(self) -> PolicySnapshot:
         return self._snapshot
+
+
+class _Clock:
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+    def __call__(self) -> int:
+        return self.value
+
+
+class _Executor:
+    def __init__(self, result: str = "sent") -> None:
+        self.result = result
+        self.calls: list[str] = []
+
+    async def execute(self, envelope):
+        from yeoman_gateway.processing.models import EffectReceipt
+
+        self.calls.append(envelope.effect_id)
+        return EffectReceipt(effect_id=envelope.effect_id, state=self.result)
 
 
 class _AllowAll:
@@ -573,3 +594,75 @@ def test_missing_engine_denies_capabilities(tmp_path: Path) -> None:
     )
     assert allowed is False
     assert reason == "policy_unavailable"
+
+
+# --------------------------------------------------------------------------------------
+# shadow mode (spec section 5)
+# --------------------------------------------------------------------------------------
+
+
+def _shadow_config(chats: tuple[str, ...] = (f"whatsapp:{'chat@g.us'}",)) -> ProcessingConfig:
+    return ProcessingConfig.model_validate(
+        {"enabled": True, "chats": [], "shadow_chats": list(chats)}
+    )
+
+
+def test_shadow_chat_decides_and_journals_without_acting(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    gate = IngestGate(
+        config=_shadow_config(),
+        store=store,
+        snapshots=_StaticSnapshots(),
+        evaluate=lambda request: _deny(),  # a denial must not stop shadow traffic
+    )
+
+    result = gate.admit(_request())
+
+    assert result is not None
+    assert result.shadow is True
+    assert result.proceed is True  # shadow never blocks
+    assert result.journaled_event_id == "evt-1"
+    assert store.count_events() == 1
+    assert result.decision is not None
+    assert store.get_decision(result.decision.decision_id) is not None
+    store.close()
+
+
+def test_shadow_gate_stays_inert_when_processing_is_disabled(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    config = ProcessingConfig.model_validate(
+        {"enabled": False, "shadow_chats": ["whatsapp:chat@g.us"]}
+    )
+    gate = IngestGate(
+        config=config,
+        store=store,
+        snapshots=_StaticSnapshots(),
+        evaluate=lambda request: _deny(),
+    )
+
+    assert gate.admit(_request()) is None
+    assert store.count_events() == 0
+    store.close()
+
+
+def test_shadow_chat_creates_no_effects(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import IntentEffectRouter
+
+    store = ProcessingStore(tmp_path / "p.db")
+    config = ProcessingConfig.model_validate(
+        {"enabled": True, "chats": [], "shadow_chats": ["whatsapp:chat@g.us"]}
+    )
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=config, clock=_Clock(0))
+
+    assert router.manages("whatsapp", "chat@g.us") is False
+    assert store.count_effects() == 0
+    store.close()

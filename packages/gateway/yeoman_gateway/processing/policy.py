@@ -130,6 +130,7 @@ class FastGateResult:
     decision: DecisionRecord | None = None
     policy_decision: PolicyDecision | None = None
     journaled_event_id: str | None = None
+    shadow: bool = False
 
     @property
     def denied(self) -> bool:
@@ -169,15 +170,46 @@ class IngestGate:
             return bool(getattr(self._config, "enabled", False))
         return bool(checker(channel, chat_id))
 
+    def shadowed(self, channel: str, chat_id: str) -> bool:
+        """True when the chat is observed only: decide and journal, never act."""
+        checker = getattr(self._config, "is_chat_shadowed", None)
+        if checker is None:
+            return False
+        return bool(checker(channel, chat_id))
+
     def admit(self, request: IngestRequest) -> FastGateResult | None:
-        """Journal the event and decide before any enrichment. ``None`` = not managed."""
+        """Journal the event and decide before any enrichment. ``None`` = not managed.
+
+        A shadow chat is journaled and decided like a managed one, but the verdict never
+        stops or redirects the traffic: shadow comparison must not change what the user
+        sees and must not create effects (spec section 5).
+        """
         event = request.event
-        if not self.enabled_for(event.channel, event.chat_id):
+        shadow = self.shadowed(event.channel, event.chat_id)
+        if not shadow and not self.enabled_for(event.channel, event.chat_id):
             return None
 
         now = self._clock()
         snapshot = self._snapshots.snapshot()
         journaled = self._journal(request, now=now)
+
+        if shadow:
+            decision = self._evaluate(request) if snapshot.healthy else None
+            outcome = (
+                FastGateOutcome.REACT
+                if decision is not None and decision.accept_message and decision.should_respond
+                else FastGateOutcome.OBSERVE
+            )
+            return self._record(
+                request,
+                snapshot,
+                outcome=outcome,
+                reason="shadow",
+                policy_decision=decision,
+                journaled=journaled,
+                now=now,
+                shadow=True,
+            )
 
         if not snapshot.healthy:
             return self._record(
@@ -260,6 +292,7 @@ class IngestGate:
         policy_decision: PolicyDecision | None,
         journaled: str | None,
         now: int,
+        shadow: bool = False,
     ) -> FastGateResult:
         event = request.event
         decision = DecisionRecord(
@@ -285,6 +318,7 @@ class IngestGate:
             decision=decision,
             policy_decision=policy_decision,
             journaled_event_id=journaled,
+            shadow=shadow,
         )
 
 

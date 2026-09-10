@@ -110,3 +110,17 @@ def test_chat_activation_is_explicit_and_scoped() -> None:
     assert scoped.is_chat_enabled("whatsapp", "chat1") is True
     assert scoped.is_chat_enabled("whatsapp", "chat2") is False
     assert scoped.is_chat_enabled("telegram", "chat1") is False
+
+
+def test_shadow_chats_are_observed_only() -> None:
+    """Spec section 5: shadow decides and journals, but never owns the chat."""
+    config = ProcessingConfig.model_validate(
+        {"enabled": True, "chats": ["whatsapp:live"], "shadow_chats": ["whatsapp:observed"]}
+    )
+    assert config.is_chat_enabled("whatsapp", "live") is True
+    assert config.is_chat_shadowed("whatsapp", "live") is False
+    assert config.is_chat_enabled("whatsapp", "observed") is False
+    assert config.is_chat_shadowed("whatsapp", "observed") is True
+
+    disabled = ProcessingConfig.model_validate({"shadow_chats": ["whatsapp:observed"]})
+    assert disabled.is_chat_shadowed("whatsapp", "observed") is False

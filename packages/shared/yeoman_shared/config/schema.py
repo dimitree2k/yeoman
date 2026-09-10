@@ -670,6 +670,7 @@ class ProcessingConfig(BaseModel):
 
     enabled: bool = False
     chats: list[str] = Field(default_factory=list)
+    shadow_chats: list[str] = Field(default_factory=list)
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)
@@ -681,11 +682,22 @@ class ProcessingConfig(BaseModel):
     retention: ProcessingRetentionConfig = Field(default_factory=ProcessingRetentionConfig)
 
     def is_chat_enabled(self, channel: str, chat_id: str) -> bool:
-        """True when the new mode is switched on for this exact chat."""
+        """True when the new mode owns this exact chat (effects are allowed)."""
         if not self.enabled:
             return False
         scoped = {entry.strip() for entry in self.chats if entry.strip()}
         return bool(scoped) and f"{channel}:{chat_id}" in scoped
+
+    def is_chat_shadowed(self, channel: str, chat_id: str) -> bool:
+        """True when this chat is only observed.
+
+        Shadow chats decide and journal, but must not produce effects or change what the
+        user sees (spec section 5).
+        """
+        if not self.enabled:
+            return False
+        shadowed = {entry.strip() for entry in self.shadow_chats if entry.strip()}
+        return bool(shadowed) and f"{channel}:{chat_id}" in shadowed
 
 
 class Config(BaseSettings):
