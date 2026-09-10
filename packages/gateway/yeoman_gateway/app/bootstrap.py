@@ -667,6 +667,11 @@ def build_gateway_runtime(
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
 
+    if effect_router is not None:
+        # Approved effects go straight to the channel transport, so a successful send is
+        # a real receipt instead of a queue guess (spec R07).
+        effect_router.set_direct_transport(channels.send_now, channels.send_reaction_now)
+
     # Wire recording indicator: responder switches presence to mic icon during TTS
     async def _recording_notifier(channel: str, chat_id: str) -> None:
         await channels.set_recording(channel, chat_id)

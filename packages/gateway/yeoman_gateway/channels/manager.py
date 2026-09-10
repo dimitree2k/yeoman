@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from yeoman_shared.config.schema import Config
 
+from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
@@ -283,6 +284,29 @@ class ChannelManager:
                 chat_id,
                 e,
             )
+
+    async def send_now(self, message: OutboundMessage) -> None:
+        """Send one already-authorized message directly through its channel.
+
+        This is the transport adapter for approved effects: the call returns only after
+        the channel accepted the message, and raises otherwise. It deliberately bypasses
+        the outbound queue, because the effect gateway - not the queue - owns durability
+        and retry semantics for these messages.
+        """
+        channel = self.channels.get(message.channel)
+        if channel is None:
+            raise RuntimeError(f"channel not available: {message.channel}")
+        await channel.send(message)
+
+    async def send_reaction_now(self, message: ReactionMessage) -> None:
+        """Transport adapter for approved reaction effects."""
+        channel = self.channels.get(message.channel)
+        if channel is None:
+            raise RuntimeError(f"channel not available: {message.channel}")
+        sender = getattr(channel, "send_reaction", None)
+        if sender is None:
+            raise RuntimeError(f"channel does not support reactions: {message.channel}")
+        await sender(message)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

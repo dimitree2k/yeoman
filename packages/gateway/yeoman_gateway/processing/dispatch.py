@@ -106,14 +106,43 @@ class BusEffectExecutor:
         mark_provenance: bool = False,
         security: Any | None = None,
         security_block_message: str = "\U0001f602",
+        direct_sender: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        direct_reaction_sender: Callable[[ReactionMessage], Awaitable[None]] | None = None,
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
         self._security = security
         self._security_block_message = security_block_message
+        self._direct_sender = direct_sender
+        self._direct_reaction_sender = direct_reaction_sender
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
+
+    def set_direct_senders(
+        self,
+        outbound: Callable[[OutboundMessage], Awaitable[None]] | None,
+        reaction: Callable[[ReactionMessage], Awaitable[None]] | None,
+    ) -> None:
+        """Install the channel transport adapter that can confirm a real send."""
+        self._direct_sender = outbound
+        self._direct_reaction_sender = reaction
+
+    async def _deliver(self, message: OutboundMessage) -> bool:
+        """Hand one message to the transport. True when a confirming adapter accepted it."""
+        if self._direct_sender is not None:
+            await self._direct_sender(message)
+            return True
+        await self._bus.publish_outbound(message)
+        return False
+
+    async def _deliver_reaction(self, message: ReactionMessage) -> bool:
+        """Reaction counterpart of :meth:`_deliver`."""
+        if self._direct_reaction_sender is not None:
+            await self._direct_reaction_sender(message)
+            return True
+        await self._bus.publish_reaction(message)
+        return False
 
     def _guard_text(self, envelope: EffectEnvelope, text: str) -> str:
         """Shared outbound control for text-bearing effects.
@@ -144,9 +173,10 @@ class BusEffectExecutor:
         target = envelope.target
 
         provenance = {EFFECT_PROVENANCE_KEY: envelope.effect_id} if self._mark_provenance else {}
+        used_direct = False
 
         if isinstance(payload, TextPayload):
-            await self._bus.publish_outbound(
+            used_direct = await self._deliver(
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -156,7 +186,7 @@ class BusEffectExecutor:
                 )
             )
         elif isinstance(payload, MediaPayload):
-            await self._bus.publish_outbound(
+            used_direct = await self._deliver(
                 OutboundMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -166,7 +196,7 @@ class BusEffectExecutor:
                 )
             )
         elif isinstance(payload, ReactionPayload):
-            await self._bus.publish_reaction(
+            used_direct = await self._deliver_reaction(
                 ReactionMessage(
                     channel=target.channel,
                     chat_id=target.chat_id,
@@ -210,6 +240,12 @@ class BusEffectExecutor:
                     if confirmed
                     else "queued to transport; delivery unconfirmed"
                 ),
+            )
+        if used_direct:
+            return EffectReceipt(
+                effect_id=envelope.effect_id,
+                state="sent",
+                detail="accepted by the channel transport adapter",
             )
         return EffectReceipt(
             effect_id=envelope.effect_id,
@@ -439,6 +475,10 @@ class IntentEffectRouter:
         self._config = config
         self._clock = clock or _now_ms
         self._worker_id = worker_id
+
+    def set_direct_transport(self, outbound: Any, reaction: Any) -> None:
+        """Install the confirming channel transport on the gateway's executor."""
+        self._gateway.set_direct_senders(outbound, reaction)
 
     def effect_covers(self, effect_id: str, channel: str, chat_id: str) -> bool:
         """True only for a real persisted effect whose target is this chat."""

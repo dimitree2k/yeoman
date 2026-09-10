@@ -1158,3 +1158,163 @@ async def test_typing_stays_ephemeral_presence_without_an_effect(tmp_path: Path)
     assert executor.calls == []
     assert store.count_effects() == 0
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# confirming transport (activation enabler)
+# --------------------------------------------------------------------------------------
+
+
+class _ConfirmingTransport:
+    """Stands in for ChannelManager.send_now()."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.sent: list[OutboundMessage] = []
+        self.reacted: list[Any] = []
+
+    async def send_now(self, message: OutboundMessage) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append(message)
+
+    async def send_reaction_now(self, message: Any) -> None:
+        if self.error is not None:
+            raise self.error
+        self.reacted.append(message)
+
+
+@pytest.mark.asyncio
+async def test_confirming_transport_reports_sent(tmp_path: Path) -> None:
+    """With a real transport adapter a successful send is proven, not guessed."""
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+
+    store = ProcessingStore(tmp_path / "p.db")
+    transport = _ConfirmingTransport()
+    executor = BusEffectExecutor(
+        bus=_RecordingBus(),
+        direct_sender=transport.send_now,
+        direct_reaction_sender=transport.send_reaction_now,
+    )
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            capability="send_text",
+        )
+    )
+    result = await gateway.execute_ready("fx1")
+
+    assert result.state == "sent"
+    assert [message.content for message in transport.sent] == ["hi"]
+    assert store.effect_state("fx1") == "sent"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_message_tool_reports_delivery_with_a_confirming_transport(tmp_path: Path) -> None:
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.dispatch import (
+        BusEffectExecutor,
+        ManagedOutboundDispatcher,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    transport = _ConfirmingTransport()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(
+            bus=_RecordingBus(),
+            direct_sender=transport.send_now,
+            direct_reaction_sender=transport.send_reaction_now,
+        ),
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0))
+    tool = MessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=_RecordingBus()))
+
+    result = await tool.execute(content="hi", channel="whatsapp", chat_id=CHAT)
+
+    assert "delivery complete" in result.lower()
+    assert len(transport.sent) == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_refusal_is_proven_not_executed(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+
+    store = ProcessingStore(tmp_path / "p.db")
+    transport = _ConfirmingTransport(error=RuntimeError("WhatsApp bridge not connected"))
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(
+            bus=_RecordingBus(),
+            direct_sender=transport.send_now,
+            direct_reaction_sender=transport.send_reaction_now,
+        ),
+        clock=_Clock(0),
+    )
+    _ = gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            capability="send_text",
+        )
+    )
+    result = await gateway.execute_ready("fx1")
+
+    assert result.state == "failed"  # proven not executed, requeueable with evidence
+    assert store.effect_state("fx1") == "failed"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_after_possible_dispatch_stays_unknown(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor
+
+    store = ProcessingStore(tmp_path / "p.db")
+    transport = _ConfirmingTransport(error=TimeoutError("no bridge response"))
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(
+            bus=_RecordingBus(),
+            direct_sender=transport.send_now,
+            direct_reaction_sender=transport.send_reaction_now,
+        ),
+        clock=_Clock(0),
+    )
+    _ = gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            capability="send_text",
+        )
+    )
+    result = await gateway.execute_ready("fx1")
+
+    assert result.state == "unknown"
+    store.close()

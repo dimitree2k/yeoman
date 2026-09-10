@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from yeoman_gateway.processing.models import (
     DecisionRecord,
@@ -22,6 +22,24 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 from yeoman_gateway.processing.store import ProcessingStore
+
+#: Transport errors that provably happened before anything was dispatched. Everything
+#: else is treated as an unproven outcome, because a failure after the frame was written
+#: cannot be distinguished from a success (spec R06, R07).
+PRE_DISPATCH_ERROR_MARKERS: tuple[str, ...] = (
+    "not connected",
+    "channel not available",
+    "channel does not support",
+    "unknown channel",
+    "not running",
+)
+
+
+def is_pre_dispatch_error(exc: BaseException) -> bool:
+    """True when the transport clearly refused before dispatching."""
+    text = str(exc).lower()
+    return any(marker in text for marker in PRE_DISPATCH_ERROR_MARKERS)
+
 
 #: Reasons that mean "not now, re-evaluate later" instead of "never send this".
 _BLOCKING_REASONS = frozenset({"policy_unhealthy", "permission_denied", "queue_capacity"})
@@ -85,6 +103,13 @@ class EffectGateway:
 
     def set_executor(self, executor: EffectExecutor | None) -> None:
         self._executor = executor
+
+    def set_direct_senders(self, outbound: Any, reaction: Any) -> None:
+        """Give the executor a channel transport adapter that can confirm a real send."""
+        setter = getattr(self._executor, "set_direct_senders", None)
+        if setter is None:
+            raise ProcessingError("current executor cannot accept a direct transport")
+        setter(outbound, reaction)
 
     # -- acceptance --------------------------------------------------------------------
 
@@ -213,23 +238,29 @@ class EffectGateway:
             )
             raise
         except Exception as exc:
+            proven_not_executed = is_pre_dispatch_error(exc)
+            target = "failed" if proven_not_executed else "unknown"
             self._store.transition(
                 effect_id,
                 expected="executing",
-                target="unknown",
+                target=target,
                 now_ms=self._clock(),
                 evidence={
-                    "kind": "dispatch_unknown",
+                    "kind": "not_executed" if proven_not_executed else "dispatch_unknown",
                     "detail": f"{type(exc).__name__}: {str(exc)[:200]}",
                 },
                 worker_id=self._worker_id,
             )
             return self._receipt(
                 effect_id,
-                "unknown",
+                target,
                 stored.operation_key,
                 attempt_id=attempt_id,
-                detail=f"transport raised {type(exc).__name__}; outcome unproven",
+                detail=(
+                    f"transport refused before dispatch ({type(exc).__name__})"
+                    if proven_not_executed
+                    else f"transport raised {type(exc).__name__}; outcome unproven"
+                ),
             )
 
         reported = result.state if result is not None else "unknown"
