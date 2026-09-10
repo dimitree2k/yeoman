@@ -1,0 +1,414 @@
+"""Plan 02 / R05, R08: one dispatch line for managed effects, plus bypass negatives."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
+from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
+from yeoman_gateway.policy.engine import PolicyEngine
+from yeoman_gateway.policy.schema import PolicyConfig
+from yeoman_gateway.processing.dispatch import (
+    BusEffectExecutor,
+    EffectPayloadRejectedError,
+    IntentEffectRouter,
+    validate_payload,
+)
+from yeoman_gateway.processing.effects import EffectGateway
+from yeoman_gateway.processing.models import (
+    DecisionRecord,
+    EffectEnvelope,
+    EffectReceipt,
+    EffectTarget,
+    PolicySnapshot,
+    TextPayload,
+)
+from yeoman_gateway.processing.policy import PolicyCapabilityResolver, SnapshotEffectAuthorizer
+from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_shared.config.schema import Config
+
+CHAT = "chat@g.us"
+OTHER_CHAT = "other@g.us"
+
+
+class _Clock:
+    def __init__(self, value: int = 0) -> None:
+        self.value = value
+
+    def __call__(self) -> int:
+        return self.value
+
+
+class _StaticSnapshots:
+    def __init__(self, healthy: bool = True) -> None:
+        self._snapshot = PolicySnapshot(
+            version="policy-v1", policy_hash="hash-v1", loaded_ms=0, healthy=healthy
+        )
+
+    def snapshot(self) -> PolicySnapshot:
+        return self._snapshot
+
+
+class _AllowAll:
+    def resolve(self, *, principal: str, target: EffectTarget, capability: str):
+        return True, "allow"
+
+
+class _DenyAll:
+    def resolve(self, *, principal: str, target: EffectTarget, capability: str):
+        return False, "permission_denied"
+
+
+class _Executor:
+    def __init__(self, result: str = "sent", error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[EffectEnvelope] = []
+
+    async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
+        self.calls.append(envelope)
+        if self.error is not None:
+            raise self.error
+        return EffectReceipt(effect_id=envelope.effect_id, state=self.result)
+
+
+def _config(chats: tuple[str, ...] = (f"whatsapp:{CHAT}",)) -> Config:
+    return Config.model_validate({"processing": {"enabled": True, "chats": list(chats)}})
+
+
+def _router(store: ProcessingStore, executor: _Executor, capabilities: Any | None = None):
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(),
+            capabilities=capabilities or _AllowAll(),
+            clock=_Clock(0),
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    return IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0)), gateway
+
+
+def _outbound(text: str = "hello", **metadata: Any) -> SendOutboundIntent:
+    return SendOutboundIntent(
+        event=OutboundMessage(
+            channel="whatsapp",
+            chat_id=CHAT,
+            content=text,
+            metadata={"message_id": "m1", **metadata},
+        )
+    )
+
+
+def _reaction() -> SendReactionIntent:
+    return SendReactionIntent(
+        channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"
+    )
+
+
+class _RecordingBus(MessageBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[OutboundMessage] = []
+        self.reacted: list[ReactionMessage] = []
+
+    async def publish_outbound(self, message: OutboundMessage) -> None:
+        self.sent.append(message)
+
+    async def publish_reaction(self, message: ReactionMessage) -> None:
+        self.reacted.append(message)
+
+
+# --------------------------------------------------------------------------------------
+# dispatch line
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_managed_reply_uses_the_effect_path_only(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+
+    handled = await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+
+    assert handled is True
+    assert len(executor.calls) == 1
+    assert isinstance(executor.calls[0].payload, TextPayload)
+    assert executor.calls[0].target.chat_id == CHAT
+    assert executor.calls[0].principal == "owner@s.whatsapp.net"
+    assert bus.sent == []  # the router itself never publishes
+    assert store.count_effects() == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_chat_keeps_the_legacy_path(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(
+        gateway=gateway, config=_config(chats=("whatsapp:somewhere-else@g.us",)), clock=_Clock(0)
+    )
+
+    handled = await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+
+    assert handled is False
+    assert executor.calls == []
+    assert store.count_effects() == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_denied_effect_is_never_executed(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor, capabilities=_DenyAll())
+    bus = _RecordingBus()
+
+    handled = await router.submit_outbound(_outbound("hi"), principal="stranger@s.whatsapp.net")
+
+    assert handled is True  # the managed path owns the chat
+    assert executor.calls == []
+    assert bus.sent == []
+    effects = store.get_lineage("m1").effects
+    assert len(effects) == 1
+    assert effects[0].state == "blocked"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_is_not_sent_twice(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+
+    await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+    await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+
+    assert len(executor.calls) == 1
+    assert store.count_effects() == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_never_becomes_a_chat_error(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor(error=TimeoutError("bridge timeout"))
+    router, gateway = _router(store, executor)
+    bus = _RecordingBus()
+
+    await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+
+    assert bus.sent == []  # no fallback legacy send, no error text
+    stored = store.effect_by_operation_key(
+        next(iter([row.operation_key for row in store.get_lineage("m1").effects]))
+    )
+    assert stored is not None and stored.state == "unknown"
+    assert executor.calls and len(executor.calls) == 1
+    assert gateway.wired is True
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_runs_through_the_same_path(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+
+    await router.submit_reaction(_reaction(), principal="owner@s.whatsapp.net")
+
+    assert len(executor.calls) == 1
+    assert executor.calls[0].capability == "send_reaction"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_payload_validation_rejects_empty_text(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    executor = BusEffectExecutor(bus=bus)
+    envelope = EffectEnvelope(
+        effect_id="fx1",
+        operation_key="k1",
+        payload=TextPayload(text="   "),
+        target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+    )
+    with pytest.raises(EffectPayloadRejectedError):
+        validate_payload(envelope)
+
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    receipt = gateway.submit(envelope)
+    result = await gateway.execute_ready(receipt.effect_id)
+
+    assert result.state == "unknown"  # invalid payload never counts as executed
+    assert bus.sent == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_acceptance_is_not_reported_as_sent(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    bus = _RecordingBus()
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=BusEffectExecutor(bus=bus),
+        clock=_Clock(0),
+    )
+    receipt = gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+        )
+    )
+    result = await gateway.execute_ready(receipt.effect_id)
+
+    assert [message.content for message in bus.sent] == ["hi"]
+    assert result.state == "unknown"
+    assert "unproven" in (result.detail or "")
+    store.close()
+
+
+# --------------------------------------------------------------------------------------
+# bypass negatives (Aufgabe 3)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_model_supplied_principal_is_ignored(tmp_path: Path) -> None:
+    """A producer must pass the triggering principal; model metadata is not authority."""
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_DenyAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(gateway=gateway, config=_config(), clock=_Clock(0))
+
+    intent = SendOutboundIntent(
+        event=OutboundMessage(
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="hi",
+            metadata={"message_id": "m1", "principal": "owner@s.whatsapp.net"},
+        )
+    )
+    await router.submit_outbound(intent, principal="stranger@s.whatsapp.net")
+
+    assert executor.calls == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_chat_target_cannot_reuse_a_permission(tmp_path: Path) -> None:
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "channels": {
+                "whatsapp": {
+                    "default": {"whoCanTalk": {"mode": "everyone"}},
+                    "chats": {OTHER_CHAT: {"whoCanTalk": {"mode": "owner_only"}}},
+                }
+            },
+        }
+    )
+    engine = PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"})
+    resolver = PolicyCapabilityResolver(
+        engine_provider=lambda: engine, known_tools=lambda: {"message"}
+    )
+
+    allowed, _ = resolver.resolve(
+        principal="stranger@s.whatsapp.net",
+        target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+        capability="send_text",
+    )
+    assert allowed is True
+
+    allowed, reason = resolver.resolve(
+        principal="stranger@s.whatsapp.net",
+        target=EffectTarget(channel="whatsapp", chat_id=OTHER_CHAT),
+        capability="send_text",
+    )
+    assert allowed is False
+    assert reason == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_unmapped_capability_cannot_be_declared_by_a_producer(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_DenyAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    receipt = gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            principal="owner@s.whatsapp.net",
+            capability="delegate_write_to_remote_agent",
+        )
+    )
+    result = await gateway.execute_ready(receipt.effect_id)
+
+    assert result.state == "blocked"
+    assert executor.calls == []
+
+    decisions = store.get_lineage("").decisions
+    assert decisions and decisions[0].outcome == "deny"
+    store.close()
+
+
+def test_decision_records_keep_policy_identity(tmp_path: Path) -> None:
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(5)
+    )
+    record: DecisionRecord = authorizer.check(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=TextPayload(text="hi"),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            principal="owner@s.whatsapp.net",
+            capability="send_text",
+        ),
+        None,
+    )
+    assert record.outcome == "allow"
+    assert record.policy_version == "policy-v1"
+    assert record.policy_hash == "hash-v1"
+    assert record.created_ms == 5

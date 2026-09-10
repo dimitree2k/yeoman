@@ -1,10 +1,15 @@
-"""State-aware message processing core (spec R01, R05, R06, R10).
+"""State-aware message processing core (spec R01, R02, R05, R06, R10).
 
 This package is developed behind ``processing.enabled = false``. It adds durable
 identities and idempotent effect states next to the existing archives; it is not a second
 semantic memory database and it does not replace the inbound archive.
 """
 
+from yeoman_gateway.processing.dispatch import (
+    BusEffectExecutor,
+    IntentEffectRouter,
+    validate_payload,
+)
 from yeoman_gateway.processing.effects import EffectAuthorizer, EffectExecutor, EffectGateway
 from yeoman_gateway.processing.models import (
     DAY_MS,
@@ -35,12 +40,27 @@ from yeoman_gateway.processing.models import (
     payload_from_mapping,
     validate_transition,
 )
+from yeoman_gateway.processing.policy import (
+    AdapterSnapshotProvider,
+    CapabilityResolver,
+    FastGateOutcome,
+    FastGateResult,
+    IngestGate,
+    IngestRequest,
+    PolicyCapabilityResolver,
+    PolicySnapshotProvider,
+    SnapshotEffectAuthorizer,
+    effect_guard,
+)
 from yeoman_gateway.processing.store import SCHEMA_VERSION, ProcessingStore
 
 __all__ = [
     "DAY_MS",
     "SCHEMA_VERSION",
+    "AdapterSnapshotProvider",
+    "BusEffectExecutor",
     "CanonicalEvent",
+    "CapabilityResolver",
     "DecisionRecord",
     "DeletePayload",
     "EffectAuthorizer",
@@ -53,21 +73,31 @@ __all__ = [
     "EffectState",
     "EffectTarget",
     "ExternalActionPayload",
+    "FastGateOutcome",
+    "FastGateResult",
+    "IngestGate",
+    "IngestRequest",
+    "IntentEffectRouter",
     "InvalidTransitionError",
     "JournalConflictError",
     "LineageView",
     "MediaPayload",
+    "PolicyCapabilityResolver",
     "PolicySnapshot",
+    "PolicySnapshotProvider",
     "ProcessingError",
     "ProcessingStore",
     "PurgeReport",
     "ReactionPayload",
     "RetentionSettings",
+    "SnapshotEffectAuthorizer",
     "StoredEffect",
     "TextPayload",
     "TurnRef",
     "canonical_hash",
     "canonical_json",
+    "effect_guard",
     "payload_from_mapping",
+    "validate_payload",
     "validate_transition",
 ]

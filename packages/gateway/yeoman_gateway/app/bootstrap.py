@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
     from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.processing.dispatch import IntentEffectRouter
     from yeoman_gateway.processing.store import ProcessingStore
     from yeoman_gateway.providers.base import LLMProvider
 
@@ -124,12 +125,14 @@ class OrchestratorService:
         typing_adapter: ChannelManagerTypingAdapter,
         telemetry: InMemoryTelemetry,
         memory: MemoryService,
+        effect_router: "IntentEffectRouter | None" = None,
     ) -> None:
         self._bus = bus
         self._orchestrator = orchestrator
         self._typing_adapter = typing_adapter
         self._telemetry = telemetry
         self._memory = memory
+        self._effect_router = effect_router
         self._running = False
 
     async def run(self) -> None:
@@ -143,7 +146,7 @@ class OrchestratorService:
             event = _inbound_message_to_event(msg)
             try:
                 intents = await self._orchestrator.handle(event)
-                await self._dispatch_intents(intents)
+                await self._dispatch_intents(intents, principal=event.sender_id)
             except Exception as e:
                 logger.error(
                     "vnext orchestrator failure stage=handle_dispatch channel={} chat={} "
@@ -157,12 +160,18 @@ class OrchestratorService:
     def stop(self) -> None:
         self._running = False
 
-    async def _dispatch_intents(self, intents: list[OrchestratorIntent]) -> None:
+    async def _dispatch_intents(
+        self, intents: list[OrchestratorIntent], *, principal: str = ""
+    ) -> None:
         for intent in intents:
             match intent:
                 case SetTypingIntent():
                     await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
                 case SendOutboundIntent():
+                    if self._effect_router is not None and await self._effect_router.submit_outbound(
+                        intent, principal=principal
+                    ):
+                        continue
                     await self._bus.publish_outbound(
                         OutboundMessage(
                             channel=intent.event.channel,
@@ -174,6 +183,10 @@ class OrchestratorService:
                         )
                     )
                 case SendReactionIntent():
+                    if self._effect_router is not None and await self._effect_router.submit_reaction(
+                        intent, principal=principal
+                    ):
+                        continue
                     await self._bus.publish_reaction(
                         ReactionMessage(
                             channel=intent.channel,
@@ -345,6 +358,43 @@ def build_processing_gate(
         snapshots=AdapterSnapshotProvider(policy_adapter),
         evaluate=lambda request: policy_adapter.evaluate(request.event),
     )
+
+
+def build_effect_router(
+    config: "Config",
+    policy_adapter: "EnginePolicyAdapter | None",
+    store: "ProcessingStore | None",
+    bus: MessageBus,
+):
+    """Effect gateway plus transport executor for the new mode.
+
+    Returns ``None`` while the new mode is disabled, so every producer keeps its legacy
+    path and no second sender exists for the same turn.
+    """
+    if store is None or policy_adapter is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.dispatch import BusEffectExecutor, IntentEffectRouter
+    from yeoman_gateway.processing.effects import EffectGateway
+    from yeoman_gateway.processing.policy import (
+        AdapterSnapshotProvider,
+        PolicyCapabilityResolver,
+        SnapshotEffectAuthorizer,
+    )
+
+    snapshots = AdapterSnapshotProvider(policy_adapter)
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=snapshots,
+            capabilities=PolicyCapabilityResolver(
+                engine_provider=policy_adapter.policy_engine,
+                known_tools=lambda: set(policy_adapter.known_tools),
+            ),
+        ),
+        executor=BusEffectExecutor(bus=bus),
+    )
+    return IntentEffectRouter(gateway=gateway, config=config)
 
 
 def build_gateway_runtime(
@@ -1032,6 +1082,7 @@ def build_gateway_runtime(
         typing_adapter=typing_adapter,
         telemetry=telemetry,
         memory=memory_service,
+        effect_router=build_effect_router(config, policy_adapter, processing_store, bus),
     )
 
     # IPC socket for overseer commands
