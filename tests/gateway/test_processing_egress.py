@@ -829,3 +829,66 @@ async def test_service_principal_without_policy_rights_is_blocked(tmp_path: Path
     assert receipt is not None and receipt.state == "blocked"
     assert executor.calls == []
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# non-migrated capabilities (Plan 02, Aufgabe 3)
+# --------------------------------------------------------------------------------------
+
+
+def test_new_mode_disables_non_migrated_write_capabilities() -> None:
+    from yeoman_gateway.agent.tools.registry import ToolRegistry
+    from yeoman_gateway.processing.dispatch import (
+        NON_MIGRATED_CAPABILITIES,
+        disable_non_migrated_tools,
+    )
+
+    class _Tool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def to_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name}}
+
+        def validate_params(self, params: dict[str, Any]) -> list[str]:
+            return []
+
+        async def execute(self, **kwargs: Any) -> str:
+            return "should not run"
+
+    registry = ToolRegistry()
+    for name in ("message", "send_voice", *NON_MIGRATED_CAPABILITIES):
+        registry.register(_Tool(name))
+
+    disabled = disable_non_migrated_tools(registry)
+
+    assert set(disabled) == set(NON_MIGRATED_CAPABILITIES)
+    visible = {entry["function"]["name"] for entry in registry.get_definitions()}
+    assert visible == {"message", "send_voice"}
+    assert registry.disabled_tools()["exec"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_refuses_execution_even_if_called_directly() -> None:
+    from yeoman_gateway.agent.tools.registry import ToolRegistry
+
+    class _Tool:
+        name = "browse"
+
+        def to_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name}}
+
+        def validate_params(self, params: dict[str, Any]) -> list[str]:
+            return []
+
+        async def execute(self, **kwargs: Any) -> str:
+            raise AssertionError("disabled tool must not execute")
+
+    registry = ToolRegistry()
+    registry.register(_Tool())
+    registry.disable("browse", "no capability check")
+
+    result = await registry.execute("browse", {})
+
+    assert result.startswith("Error")
+    assert "disabled" in result

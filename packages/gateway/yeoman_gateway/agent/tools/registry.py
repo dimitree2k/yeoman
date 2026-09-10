@@ -14,6 +14,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        self._disabled: dict[str, str] = {}
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -22,6 +23,22 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         """Unregister a tool by name."""
         self._tools.pop(name, None)
+        self._disabled.pop(name, None)
+
+    def disable(self, name: str, reason: str) -> None:
+        """Disable a registered tool: hidden from the model and refused on execute."""
+        if name in self._tools:
+            self._disabled[name] = reason
+
+    def enable(self, name: str) -> None:
+        self._disabled.pop(name, None)
+
+    def is_disabled(self, name: str) -> bool:
+        return name in self._disabled
+
+    def disabled_tools(self) -> dict[str, str]:
+        """Names and reasons of every disabled tool."""
+        return dict(self._disabled)
 
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
@@ -32,8 +49,12 @@ class ToolRegistry:
         return name in self._tools
 
     def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+        """Get all tool definitions in OpenAI format (disabled tools stay hidden)."""
+        return [
+            tool.to_schema()
+            for name, tool in self._tools.items()
+            if name not in self._disabled
+        ]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """
@@ -49,6 +70,11 @@ class ToolRegistry:
         Raises:
             KeyError: If tool not found.
         """
+        if name in self._disabled:
+            return (
+                f"Error: Tool '{name}' is disabled in this mode "
+                f"({self._disabled[name]}). Do not retry it."
+            )
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found"

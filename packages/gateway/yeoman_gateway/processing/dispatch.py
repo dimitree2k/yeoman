@@ -276,6 +276,49 @@ class ManagedOutboundDispatcher:
             )
 
 
+#: Capabilities that must not run in the new mode: they write outside the chat
+#: transport without a proven idempotency or containment contract (spec R05, G06).
+#: The value names the concrete re-enable condition.
+NON_MIGRATED_CAPABILITIES: Mapping[str, str] = {
+    "a2a_delegate": (
+        "remote write without an idempotency contract; re-enable when the peer returns "
+        "effects as requests or a proven compatible gateway contract exists"
+    ),
+    "exec": (
+        "shell writes are not contained by default and the sandbox keeps network access; "
+        "re-enable when isolation is enforced rather than lexical"
+    ),
+    "browse": (
+        "browser clicks/fills/JS have no capability check; re-enable with a read-only "
+        "enforced capability"
+    ),
+    "calendar": (
+        "remote CalDAV writes retry blindly after an unknown outcome; re-enable when the "
+        "transport reports an idempotent result"
+    ),
+}
+
+
+def disable_non_migrated_tools(registry: Any, *, only: tuple[str, ...] | None = None) -> dict[str, str]:
+    """Refuse the non-migrated write capabilities while the new mode is active.
+
+    Existing sandbox and tool settings are untouched; this only removes capabilities that
+    have no proven effect contract.
+    """
+    disabled: dict[str, str] = {}
+    for name, reason in NON_MIGRATED_CAPABILITIES.items():
+        if only is not None and name not in only:
+            continue
+        if getattr(registry, "has", lambda _name: False)(name):
+            registry.disable(name, reason)
+            disabled[name] = reason
+    if disabled:
+        logger.warning(
+            "new processing mode disables non-migrated capabilities: {}", sorted(disabled)
+        )
+    return disabled
+
+
 #: Explicit service principals for system producers. A source that is not listed here
 #: must not produce effects in the new mode - no fictional owner (spec R02).
 SERVICE_PRINCIPALS: Mapping[str, str] = {

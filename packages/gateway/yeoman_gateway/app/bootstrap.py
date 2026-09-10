@@ -57,7 +57,10 @@ from yeoman_gateway.persona_evolution import (
     run_persona_evolution_cron,
 )
 from yeoman_gateway.policy.persona import load_persona_text
-from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+from yeoman_gateway.processing.dispatch import (
+    ServiceEffectProducer,
+    disable_non_migrated_tools,
+)
 from yeoman_gateway.processing.models import canonical_hash
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
@@ -608,6 +611,10 @@ def build_gateway_runtime(
     )
     if policy_engine is not None:
         policy_engine.validate(set(responder.tool_names))
+
+    if effect_router is not None:
+        # The new mode must not keep uncontained write capabilities as a bypass.
+        disable_non_migrated_tools(responder.tools)
 
     # Wire /voice command callback: reuses the send_voice tool.
     async def _voice_send_callback(content: str, chat_id: str) -> str:
