@@ -558,3 +558,43 @@ def test_first_dm_message_opens_a_thread(tmp_path: Path) -> None:
     assert followup.thread_id == decision.thread_id  # still the last active DM thread
     assert followup.turn_id != decision.turn_id
     store.close()
+
+
+def test_first_message_of_every_shape_is_decided(tmp_path: Path) -> None:
+    """Pins the class of gap live traffic found: the *first* message of each shape.
+
+    A DM without mention or reply used to fall through to ambient and never open a
+    thread; every shape below must produce a definite decision on an empty store.
+    """
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+
+    cases = {
+        "dm_plain": (_event(event_id="dm1", chat_id="owner@s.whatsapp.net"), JoinRule.DM_LAST_ACTIVE),
+        "group_mention": (_event(event_id="g1", mentioned_bot=True), JoinRule.MENTION_NO_REFERENCE),
+        "group_ambient": (_event(event_id="g2", principal="other@s.whatsapp.net"), JoinRule.AMBIENT),
+    }
+    for name, (event, expected_rule) in cases.items():
+        decision = registry.assign(event, now_ms=T0)
+        assert decision.rule is expected_rule, name
+        if expected_rule is JoinRule.AMBIENT:
+            assert decision.thread_id is None and decision.turn_id is None, name
+        else:
+            assert decision.thread_id and decision.turn_id, name
+    store.close()
+
+
+def test_observed_message_gets_lineage_but_no_turn(tmp_path: Path) -> None:
+    """allow_turn=False (fast gate OBSERVE): lineage only, no turn, no mailbox."""
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+
+    decision = registry.assign(
+        _event(event_id="dm1", chat_id="owner@s.whatsapp.net"), now_ms=T0, allow_turn=False
+    )
+
+    assert decision.thread_id is not None
+    assert decision.turn_id is None
+    assert store.active_turn(decision.thread_id) is None
+    assert store.count_pending(thread_id=decision.thread_id) == 0
+    store.close()
