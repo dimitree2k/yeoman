@@ -164,11 +164,11 @@ def test_candidates_are_capped() -> None:
 
 def test_unknown_basis_is_refused_not_trusted() -> None:
     extractor = _extractor(
-        _payload({"content": "Vielleicht morgen.", "basis": "vibes"}),
+        _payload({"content": "Das Meeting ist am Montag.", "basis": "vibes"}),
         members=frozenset({"member-old"}),
     )
 
-    candidate = extractor([_Event("ev1", "Vielleicht morgen.")])[0]
+    candidate = extractor([_Event("ev1", "Das Meeting ist am Montag.")])[0]
 
     assert check_candidate(candidate).reason == "uncertain"
 
@@ -477,4 +477,95 @@ def test_a_crash_left_running_job_is_requeued(tmp_path: Path) -> None:
     assert requeued == 1
     assert store.list_fact_jobs()[0]["state"] == "queued"
     assert store.list_fact_jobs()[0]["reason"] == "recovered_after_crash"
+    store.close()
+
+
+def test_screens_refuse_what_the_real_backfill_stored() -> None:
+    """Every example below was stored as a fact by the first real backfill."""
+    from yeoman_gateway.memory.extraction_jobs import screen_content
+
+    refused = {
+        "Ich habe Claude erklärt, wer Carsten ist, was er so will und was sein skill ist.":
+            "conversation_reference",
+        "Der Autor würde schauen, ob er sich das nach dem ersten Mal nochmal antun will.":
+            "conversation_reference",
+        "Der Fragesteller trinkt aktuell nur alkoholfreies Bier und Wasser.":
+            "conversation_reference",
+        "Wir haben besprochen, dass es am Freitag losgeht.": "conversation_reference",
+        "Vielleicht ist das Treffen am Montag.": "hedged_statement",
+        "Der Kurs könnte auf 200 steigen.": "hedged_statement",
+        'Der Autor sagt: "noch tests".': "meta_statement",
+    }
+    for content, reason in refused.items():
+        verdict = screen_content(content)
+        assert verdict.rejected, f"should be refused: {content}"
+        assert verdict.reason == reason, f"{content} -> {verdict.reason}"
+
+    kept = [
+        "Die private Krankenkasse beträgt 354€.",
+        "GoPro wird mit Starman Optical verschmolzen.",
+        "Der Stammtisch ist donnerstags.",
+        "Wir haben einen Termin am Freitag.",  # a real agreement, not a conversation record
+    ]
+    for content in kept:
+        assert screen_content(content).accepted, f"should be kept: {content}"
+
+
+def test_rescreen_revokes_stored_noise_and_keeps_real_facts(tmp_path: Path) -> None:
+    from yeoman_gateway.memory.extraction_jobs import rescreen_stored_facts
+    from yeoman_gateway.memory.shared_facts import SharedFact
+
+    def _stored(fact_id: str, content: str) -> SharedFact:
+        return SharedFact(
+            fact_id=fact_id, workspace_id="ws1", chat_scope_key=GROUP, content=content,
+            author_principal="member-old", assertion_status="assertion",
+            visibility_scope="author_only", group_rule="explicit_principals",
+            valid_from_ms=T0, extractor_version="v1", audience=frozenset({"member-old"}),
+        )
+
+    store = MemoryStore(tmp_path / "memory.db")
+    good = store.upsert_fact(_stored("good", "Die private Krankenkasse beträgt 354€."))
+    noise = store.upsert_fact(
+        _stored("noise", "Ich habe Claude erklärt, wer Carsten ist.")
+    )
+
+    dry = rescreen_stored_facts(store, dry_run=True, now_ms=T0)
+    assert dry.checked == 2
+    assert dry.revoked == (noise.fact_id,)
+    assert store.get_fact(noise.fact_id).revoked_at_ms is None  # a dry run changes nothing
+
+    applied = rescreen_stored_facts(store, dry_run=False, now_ms=T0 + 1)
+    assert applied.revoked == (noise.fact_id,)
+    assert applied.kept == 1
+    assert store.get_fact(noise.fact_id).revoked_at_ms == T0 + 1
+    assert store.get_fact(good.fact_id).revoked_at_ms is None
+    store.close()
+
+
+def test_a_revoked_fact_is_never_resurrected_by_a_rerun(tmp_path: Path) -> None:
+    """Re-publishing a revoked statement must not undo the human decision."""
+    from yeoman_gateway.memory.extraction_jobs import SharedFactCandidate
+
+    store = MemoryStore(tmp_path / "memory.db")
+    queue = _queue_with(store, embedder=_StubEmbedder())
+    _run(queue)
+    fact = store.list_facts()[0]
+    job = store.list_fact_jobs()[0]
+    assert store.redact_fact(fact.fact_id, now_ms=T0 + 5) is True
+
+    candidate = SharedFactCandidate(
+        content=fact.content or "Der Stammtisch ist donnerstags.",
+        author_principal="member-old",
+        visibility_scope="author_only",
+        source_refs=(("ev1", 1),),
+        audience=frozenset({"member-old"}),
+    )
+    # The same sources and the same content yield the same fact id.
+    published = queue._publish(candidate, job=job, now_ms=T0 + 6)
+
+    assert published is False
+    assert queue.skipped_existing == 1
+    revived = store.get_fact(fact.fact_id)
+    assert revived.revoked_at_ms == T0 + 5  # still revoked
+    assert revived.content == ""  # and the redacted text was not written back
     store.close()

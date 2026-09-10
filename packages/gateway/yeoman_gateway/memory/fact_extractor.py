@@ -39,6 +39,13 @@ Return JSON only: {"facts": [{"content": str, "basis": str, "valid_until": str|n
 Rules:
 - Only statements the author explicitly asserts about the world, plans, preferences,
   dates or agreements. Never opinions, speculation, guesses or inferences.
+- Never record the conversation itself: not who explained, asked, said or discussed
+  something, and never mention the assistant, the bot, this chat or a chat transcript.
+- Never write about "the author", "the user" or "the questioner" in the third person.
+  State the fact directly, or return nothing for that message.
+- Never store hedged or possible statements ("würde", "könnte", "vielleicht",
+  "eventuell"). If it is not asserted plainly, it is not a fact.
+- Skip jokes, banter and rhetorical remarks, however concrete they sound.
 - Never restate that a message was sent, delivered or read.
 - Never invent facts about a person who is not the author.
 - content: one short sentence in the language of the message.

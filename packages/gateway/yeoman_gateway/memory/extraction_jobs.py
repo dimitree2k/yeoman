@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -174,6 +175,66 @@ def is_meta_statement(content: str) -> bool:
     return any(marker in lowered for marker in META_STATEMENT_MARKERS)
 
 
+#: Records of the conversation itself: who explained, asked or discussed something.
+_CONVERSATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bich habe\b.{0,40}\b(erklärt|gesagt|gefragt|geschrieben|erzählt|gezeigt|"
+        r"empfohlen|berichtet|geantwortet)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bwir haben\b.{0,40}\b(besprochen|geredet|diskutiert|geklärt|ausgemacht)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(wie besprochen|im gespräch|in der unterhaltung|in diesem chat|chatverlauf|"
+        r"as discussed|we discussed|i explained|i asked|i said)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(der autor|die autorin|der fragesteller|der nutzer|der gesprächspartner|"
+        r"the author|the user)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(claude|chatgpt|yeoman|der bot|der assistent|the assistant|the bot)\b",
+        re.IGNORECASE,
+    ),
+)
+
+#: Hedges, intentions and possibilities. A durable fact is stated, not weighed.
+_HEDGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(würde|würden|könnte|könnten|dürfte|vielleicht|eventuell|möglicherweise|"
+        r"vermutlich|angeblich|probably|maybe|might|would)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(ich glaube|ich denke|ich vermute|meiner meinung|i think|i guess)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def screen_content(content: str) -> CandidateVerdict:
+    """The content-only screens, shared by candidate screening and re-screening.
+
+    These are the deterministic rules that decided whether already-stored facts may stay,
+    so the same function runs over new candidates and over the existing database.
+    """
+    if not content.strip():
+        return CandidateVerdict(False, "empty")
+    if is_meta_statement(content):
+        return CandidateVerdict(False, "meta_statement")
+    for pattern in _CONVERSATION_PATTERNS:
+        if pattern.search(content):
+            return CandidateVerdict(False, "conversation_reference")
+    for pattern in _HEDGE_PATTERNS:
+        if pattern.search(content):
+            return CandidateVerdict(False, "hedged_statement")
+    return CandidateVerdict(True, "ok")
+
+
 def check_candidate(candidate: SharedFactCandidate) -> CandidateVerdict:
     """Deterministic screening. Uncertainty refuses the candidate instead of guessing."""
     if candidate.private_handoff:
@@ -182,15 +243,13 @@ def check_candidate(candidate: SharedFactCandidate) -> CandidateVerdict:
         return CandidateVerdict(False, "not_user_source")
     if not candidate.author_principal.strip():
         return CandidateVerdict(False, "missing_author")
-    if not candidate.content.strip():
-        return CandidateVerdict(False, "empty")
+    content_verdict = screen_content(candidate.content)
+    if content_verdict.rejected:
+        return content_verdict
     if candidate.basis in REJECT_BASES:
         return CandidateVerdict(False, candidate.basis)
     if candidate.basis not in ACCEPTED_BASES:
         return CandidateVerdict(False, "uncertain")
-    if is_meta_statement(candidate.content):
-        # "The author says X" is a transcript, not a fact; store X itself or nothing.
-        return CandidateVerdict(False, "meta_statement")
     if candidate.visibility_scope is None:
         return CandidateVerdict(False, "unknown_visibility")
     if candidate.visibility_scope not in ("chat_shared", "principals", "author_only"):
@@ -260,6 +319,54 @@ def publish_visibility(
 
 
 @dataclass(slots=True)
+class RescreenReport:
+    """Result of applying the content screens to already-stored facts."""
+
+    checked: int = 0
+    kept: int = 0
+    revoked: tuple[str, ...] = ()
+    reasons: dict[str, int] = field(default_factory=dict)
+    dry_run: bool = True
+
+    def as_lines(self) -> list[str]:
+        mode = "would revoke" if self.dry_run else "revoked"
+        lines = [f"checked {self.checked} fact(s); {mode} {len(self.revoked)}; kept {self.kept}"]
+        for reason, count in sorted(self.reasons.items()):
+            lines.append(f"  {reason}: {count}")
+        return lines
+
+
+def rescreen_stored_facts(
+    store: object,
+    *,
+    chat_scope_key: str | None = None,
+    dry_run: bool = True,
+    now_ms: int = 0,
+) -> RescreenReport:
+    """Apply the current screens to stored facts and revoke those that fail.
+
+    Tightening a screen must be able to clean up after itself; without this, a rule added
+    today would only ever apply to new candidates.
+    """
+    report = RescreenReport(dry_run=bool(dry_run))
+    for fact in store.list_facts(chat_scope_key=chat_scope_key):  # type: ignore[attr-defined]
+        if fact.revoked_at_ms is not None:
+            continue
+        report.checked += 1
+        verdict = screen_content(fact.content)
+        if verdict.accepted:
+            report.kept += 1
+            continue
+        report.reasons[verdict.reason] = report.reasons.get(verdict.reason, 0) + 1
+        if dry_run:
+            report.revoked += (fact.fact_id,)
+            continue
+        if store.redact_fact(fact.fact_id, now_ms=int(now_ms)):  # type: ignore[attr-defined]
+            report.revoked += (fact.fact_id,)
+    return report
+
+
+@dataclass(slots=True)
 class ExtractionReport:
     """What one ``run_due`` pass did."""
 
@@ -301,6 +408,7 @@ class SharedFactExtractionQueue:
         self._embedder = embedder
         self.embeddings_written = 0
         self.embeddings_failed = 0
+        self.skipped_existing = 0
         self._idle_ms = int(idle_ms)
         self._max_delay_ms = int(max_delay_ms)
         self._max_waiting = max(1, int(max_waiting))
@@ -506,7 +614,15 @@ class SharedFactExtractionQueue:
         fact_id = candidate_fact_id(
             extraction_job_key(refs, self._extractor_version), candidate.content
         )
-        if self._store.get_fact(fact_id) is not None and not candidate.source_refs:
+        existing = self._store.get_fact(fact_id)
+        if existing is not None and (
+            existing.revoked_at_ms is not None or existing.superseded_by
+        ):
+            # A revoked fact stays revoked: re-extracting the same statement must not
+            # undo a human decision (the content was redacted, so it would come back empty).
+            self.skipped_existing += 1
+            return False
+        if existing is not None and not candidate.source_refs:
             return False
         valid_until = candidate.valid_until_ms
         if valid_until is None and self._fact_ttl_ms:

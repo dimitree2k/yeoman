@@ -932,3 +932,32 @@ def _registry_member_lookup(registry):
         return frozenset(members) if members else None
 
     return _lookup
+
+
+@facts_app.command("rescreen")
+def memory_facts_rescreen(
+    chat: str | None = typer.Option(None, "--chat", help="Limit to one chat scope key"),
+    apply: bool = typer.Option(
+        False, "--apply/--dry-run", help="Dry run by default: it reports only"
+    ),
+) -> None:
+    """Apply the current content screens to stored facts and revoke the ones that fail.
+
+    Tightening a rule must be able to clean up after itself; without this the rule would
+    only ever affect new candidates.
+    """
+    import time
+
+    from yeoman_gateway.memory.extraction_jobs import rescreen_stored_facts
+
+    stamp = int(time.time() * 1000)
+    with _memory_service_context() as service:
+        report = rescreen_stored_facts(
+            service.store, chat_scope_key=chat, dry_run=not apply, now_ms=stamp
+        )
+
+    console.print("[bold]Shared fact re-screen[/bold]")
+    for line in report.as_lines():
+        console.print(line)
+    if report.dry_run:
+        console.print("re-run with --apply to revoke")
