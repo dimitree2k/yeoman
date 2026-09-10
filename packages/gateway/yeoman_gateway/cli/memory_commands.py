@@ -27,6 +27,8 @@ from .core import app, console, make_memory_service
 memory_app = typer.Typer(help="Manage long-term memory")
 app.add_typer(memory_app, name="memory")
 notes_app = typer.Typer(help="Manage background group notes capture")
+facts_app = typer.Typer(help="Inspect and correct shared chat facts (admin only)")
+memory_app.add_typer(facts_app, name="facts")
 memory_app.add_typer(notes_app, name="notes")
 
 MEMORY_KINDS = {"preference", "decision", "fact", "episodic"}
@@ -703,3 +705,122 @@ def memory_reindex() -> None:
         service.reindex()
 
     console.print("[green]✓[/green] Memory FTS index rebuilt.")
+
+
+@facts_app.command("list")
+def memory_facts_list(
+    chat: str | None = typer.Option(None, "--chat", help="Filter by chat scope key"),
+    include_inactive: bool = typer.Option(
+        True, "--include-inactive/--active-only", help="Include revoked and superseded facts"
+    ),
+    limit: int = typer.Option(50, "--limit", min=1, max=500),
+) -> None:
+    """List shared facts as metadata: no raw text of other principals is printed."""
+    with _memory_service_context() as service:
+        facts = service.store.list_facts(
+            workspace_id=service.workspace_id,
+            chat_scope_key=chat,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+
+    table = Table(title="Shared facts")
+    for column in ("fact_id", "status", "scope", "audience", "sources", "valid_until_ms"):
+        table.add_column(column)
+    for fact in facts:
+        table.add_row(
+            fact.fact_id,
+            fact.assertion_status,
+            fact.visibility_scope,
+            str(len(fact.audience)),
+            str(len(fact.sources)),
+            "-" if fact.valid_until_ms is None else str(fact.valid_until_ms),
+        )
+    console.print(table)
+    console.print(f"total: {len(facts)}")
+
+
+@facts_app.command("show")
+def memory_facts_show(
+    fact_id: str = typer.Argument(..., help="Fact id"),
+    content: bool = typer.Option(
+        False, "--content", help="Also print the stored text (admin diagnostics)"
+    ),
+) -> None:
+    """Show one fact's metadata, its sources and (optionally) its text."""
+    with _memory_service_context() as service:
+        fact = service.store.get_fact(fact_id)
+
+    if fact is None:
+        console.print(f"fact not found: {fact_id}")
+        raise typer.Exit(code=1)
+    console.print(f"fact_id: {fact.fact_id}")
+    console.print(f"status: {fact.assertion_status}")
+    console.print(f"visibility: {fact.visibility_scope} / rule={fact.group_rule}")
+    console.print(f"chat: {fact.chat_scope_key}")
+    console.print(f"author: {fact.author_principal}")
+    console.print(f"audience: {len(fact.audience)} principal(s)")
+    console.print(f"revoked_at_ms: {fact.revoked_at_ms}")
+    console.print(f"superseded_by: {fact.superseded_by or '-'}")
+    if content:
+        console.print(f"content: {fact.content}")
+    for source in fact.sources:
+        console.print(f"source: {source.source_event_id} rev={source.source_revision}")
+
+
+@facts_app.command("revoke")
+def memory_facts_revoke(
+    fact_ids: list[str] = typer.Argument(..., help="Fact ids to revoke"),
+    now_ms: int | None = typer.Option(None, "--now-ms", help="Override the clock (tests)"),
+) -> None:
+    """Revoke facts by hand: tombstone, cleared text and a bumped acl_epoch."""
+    import time
+
+    stamp = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    with _memory_service_context() as service:
+        for fact_id in fact_ids:
+            changed = service.store.redact_fact(fact_id, now_ms=stamp)
+            console.print(f"{fact_id}: {'revoked' if changed else 'not found'}")
+
+
+@facts_app.command("supersede")
+def memory_facts_supersede(
+    fact_id: str = typer.Argument(..., help="Fact id to supersede"),
+    by: str = typer.Option(..., "--by", help="Replacement reference (fact id or note)"),
+    now_ms: int | None = typer.Option(None, "--now-ms", help="Override the clock (tests)"),
+) -> None:
+    """Supersede a fact: the older revision becomes unreadable, the tombstone points on."""
+    import time
+
+    stamp = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    with _memory_service_context() as service:
+        changed = service.store.set_fact_status(
+            fact_id, status="superseded", now_ms=stamp, superseded_by=by
+        )
+    console.print(f"{fact_id}: {'superseded' if changed else 'not found'} -> {by}")
+
+
+@facts_app.command("jobs")
+def memory_facts_jobs(
+    state: str | None = typer.Option(None, "--state", help="Filter by job state"),
+    limit: int = typer.Option(20, "--limit", min=1, max=500),
+) -> None:
+    """Show extraction job state: what ran, what was skipped and why."""
+    with _memory_service_context() as service:
+        jobs = service.store.list_fact_jobs(state=state, limit=limit)
+        waiting = service.store.count_fact_jobs(state="queued")
+
+    table = Table(title="Shared fact extraction jobs")
+    for column in ("job_key", "state", "reason", "attempts", "due_ms"):
+        table.add_column(column)
+    for job in jobs:
+        table.add_row(
+            str(job["job_key"])[:12],
+            str(job["state"]),
+            str(job.get("reason") or "-"),
+            str(job.get("attempts")),
+            str(job.get("due_ms")),
+        )
+    console.print(table)
+    console.print(f"queued: {waiting}")
+

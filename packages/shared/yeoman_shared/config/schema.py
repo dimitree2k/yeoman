@@ -383,12 +383,30 @@ class MemoryWalConfig(BaseModel):
 
 
 class MemorySharedConfig(BaseModel):
-    """Shared chat facts (Plan 05). Disabled keeps every shared path inert."""
+    """Shared chat facts (Plan 05). Every switch is off by default."""
 
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = bool(DEFAULT_MEMORY["shared"]["enabled"])
-    extract_after_turn: bool = bool(DEFAULT_MEMORY["shared"]["extract_after_turn"])
+    extraction_enabled: bool = bool(DEFAULT_MEMORY["shared"]["extraction_enabled"])
+    extractor_version: str = str(DEFAULT_MEMORY["shared"]["extractor_version"])
+    max_candidates_per_job: int = Field(
+        default=int(DEFAULT_MEMORY["shared"]["max_candidates_per_job"]), ge=1, le=32
+    )
+    max_jobs_waiting: int = Field(
+        default=int(DEFAULT_MEMORY["shared"]["max_jobs_waiting"]), ge=1
+    )
+    max_audience_size: int = Field(
+        default=int(DEFAULT_MEMORY["shared"]["max_audience_size"]), ge=1
+    )
+    require_known_membership: bool = bool(DEFAULT_MEMORY["shared"]["require_known_membership"])
+    allow_author_only_facts: bool = bool(DEFAULT_MEMORY["shared"]["allow_author_only_facts"])
+
+    @model_validator(mode="after")
+    def _validate_switches(self) -> "MemorySharedConfig":
+        if self.extraction_enabled and not self.enabled:
+            raise ValueError("memory.shared.extractionEnabled requires memory.shared.enabled")
+        return self
 
 
 class MemoryConfig(BaseModel):

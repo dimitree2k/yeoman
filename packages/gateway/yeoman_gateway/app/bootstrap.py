@@ -350,6 +350,87 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
         return None
 
 
+@dataclass
+class SharedFactRuntime:
+    """Read gate plus (optionally) the extraction queue for one gateway process."""
+
+    gate: object
+    extraction: object | None
+    memory: object
+    chat_registry: object | None = None
+    policy: object | None = None
+    config: object | None = None
+
+    @property
+    def extraction_enabled(self) -> bool:
+        return self.extraction is not None
+
+    def start(self) -> None:
+        if self.extraction is not None:
+            self.extraction.start()
+
+    def stop(self) -> None:
+        if self.extraction is not None:
+            self.extraction.stop()
+
+
+def build_shared_fact_runtime(
+    config: "Config",
+    *,
+    store: "ProcessingStore | None" = None,
+    processing: object | None = None,
+    chat_registry: object | None = None,
+    policy: object | None = None,
+    memory: "MemoryService | None" = None,
+) -> SharedFactRuntime | None:
+    """Shared-fact runtime (Plan 05), or ``None`` when any switch is off.
+
+    Three switches must agree before anything exists: memory, the shared-fact opt-in and
+    the new processing mode. Disabled mode therefore has no worker thread, no job row and
+    no gate object - the same fail-closed shape as :func:`build_processing_store`.
+    """
+    if not getattr(getattr(config, "memory", None), "enabled", False):
+        return None
+    shared = getattr(config.memory, "shared", None)
+    if shared is None or not bool(getattr(shared, "enabled", False)):
+        return None
+    if not getattr(getattr(config, "processing", None), "enabled", False):
+        return None
+    if memory is None or store is None:
+        return None
+
+    from yeoman_gateway.memory.extraction_jobs import (
+        EXTRACTOR_VERSION,
+        SharedFactExtractionQueue,
+    )
+    from yeoman_gateway.memory.read_gate import FactReadGate
+
+    extraction_cfg = getattr(config.processing, "extraction", None)
+    retention_cfg = getattr(config.processing, "retention", None)
+    fact_ttl_ms = (
+        int(retention_cfg.shared_fact_days) * 24 * 3600 * 1000 if retention_cfg else None
+    )
+    queue = SharedFactExtractionQueue(
+        store=memory.store,
+        journal=store,
+        idle_ms=int(getattr(extraction_cfg, "idle_seconds", 60)) * 1000,
+        max_delay_ms=int(getattr(extraction_cfg, "max_delay_seconds", 300)) * 1000,
+        max_waiting=int(getattr(shared, "max_jobs_waiting", 64)),
+        fact_ttl_ms=fact_ttl_ms,
+        extractor_version=str(getattr(shared, "extractor_version", EXTRACTOR_VERSION)),
+    )
+    runtime = SharedFactRuntime(
+        gate=FactReadGate(memory.store),
+        extraction=queue if bool(getattr(shared, "extraction_enabled", False)) else None,
+        memory=memory,
+        chat_registry=chat_registry,
+        policy=policy,
+        config=shared,
+    )
+    memory.extraction = runtime.extraction
+    return runtime
+
+
 def build_reconciliation_service(
     config: "Config",
     store: "ProcessingStore | None",

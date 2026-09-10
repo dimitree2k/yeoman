@@ -134,7 +134,13 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "db_path": "~/.yeoman/data/memory/memory.db",
     "shared": {
         "enabled": False,
-        "extract_after_turn": True,
+        "extraction_enabled": False,
+        "extractor_version": "shared-facts-v1",
+        "max_candidates_per_job": 4,
+        "max_jobs_waiting": 64,
+        "max_audience_size": 64,
+        "require_known_membership": True,
+        "allow_author_only_facts": False,
     },
     "capture": {
         "enabled": True,

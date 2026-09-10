@@ -93,6 +93,7 @@ tests/gateway/*
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py
+!tests/shared/test_config_memory_shared.py
 !tests/overseer/
 tests/overseer/*
 !tests/overseer/test_alert_formatting.py
