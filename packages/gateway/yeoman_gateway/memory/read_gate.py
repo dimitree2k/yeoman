@@ -153,6 +153,11 @@ class FactReadGate:
         return frozenset(allowed)
 
 
+def chat_scope_key(channel: str, chat_id: str) -> str:
+    """The one scope-key convention shared with ``MemoryService.chat_scope_key``."""
+    return f"channel:{channel}:chat:{chat_id}"
+
+
 def build_read_context(
     *,
     principal_id: str,
@@ -172,7 +177,7 @@ def build_read_context(
     or empty list means "unknown" (``None``), which suppresses injection entirely - for
     a direct chat the only member is the conversation partner.
     """
-    chat_scope_key = f"{channel}:{chat_id}"
+    scope_key = chat_scope_key(channel, chat_id)
     members: frozenset[str] | None = None
 
     if is_direct:
@@ -187,7 +192,7 @@ def build_read_context(
 
     return FactReadContext(
         principal_id=str(principal_id),
-        chat_scope_key=chat_scope_key,
+        chat_scope_key=scope_key,
         current_members=members,
         audience_snapshot_id=None,
         epoch=int(epoch),

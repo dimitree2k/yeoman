@@ -264,6 +264,7 @@ class GatewayRuntime:
     lull_observer: object | None = None
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
+    shared_facts: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def run(self) -> None:
@@ -277,6 +278,8 @@ class GatewayRuntime:
                 await self.lull_observer.start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
+            if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
+                self.shared_facts.start()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -312,6 +315,8 @@ class GatewayRuntime:
                 self.chat_registry.close()
             if self.reconciliation is not None:
                 await self.reconciliation.stop()
+            if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
+                self.shared_facts.stop()
             self.contacts.close()
             self.memory.close()
             if self.processing is not None:
@@ -357,6 +362,7 @@ class SharedFactRuntime:
     gate: object
     extraction: object | None
     memory: object
+    processing: object | None = None
     chat_registry: object | None = None
     policy: object | None = None
     config: object | None = None
@@ -423,6 +429,7 @@ def build_shared_fact_runtime(
         gate=FactReadGate(memory.store),
         extraction=queue if bool(getattr(shared, "extraction_enabled", False)) else None,
         memory=memory,
+        processing=processing,
         chat_registry=chat_registry,
         policy=policy,
         config=shared,
@@ -1569,6 +1576,17 @@ def build_gateway_runtime(
             )
             bus.subscribe_event("InboundObservedEvent", lull_observer.handle)
 
+    shared_fact_runtime = build_shared_fact_runtime(
+        config,
+        store=processing_store,
+        processing=processing_store,
+        chat_registry=chat_registry,
+        policy=policy_adapter,
+        memory=memory_service,
+    )
+    if shared_fact_runtime is not None:
+        responder.shared_facts = shared_fact_runtime
+
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -1586,5 +1604,6 @@ def build_gateway_runtime(
         lull_observer=lull_observer,
         processing=processing_store,
         reconciliation=build_reconciliation_service(config, processing_store),
+        shared_facts=shared_fact_runtime,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

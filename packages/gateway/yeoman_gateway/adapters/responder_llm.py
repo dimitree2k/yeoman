@@ -2324,6 +2324,17 @@ class LLMResponder(ResponderPort):
                         owner_context=is_owner,
                     )
                     retrieved_hits_count = len(retrieved_hits)
+                    # Plan 05: shared facts the *reader* may see, decided in SQL before
+                    # retrieval. Attached only when the shared runtime is wired (opt-in);
+                    # the legacy recall path above stays untouched either way.
+                    shared_text = self._shared_fact_context(
+                        query=memory_query,
+                        channel=channel,
+                        chat_id=chat_id,
+                        is_owner=is_owner,
+                    )
+                    if shared_text:
+                        retrieved_memory_text = f"{retrieved_memory_text}\n{shared_text}".strip()
                 except Exception as e:
                     logger.warning("memory recall failed: {}", e)
 
@@ -2474,6 +2485,13 @@ class LLMResponder(ResponderPort):
             except Exception as e:
                 logger.warning("memory capture failed: {}", e)
 
+            # Plan 05: announce the finished turn to the extraction queue. The queue runs
+            # on its own worker thread, so this never waits for a model call here.
+            try:
+                self._enqueue_shared_extraction(channel=channel, chat_id=chat_id)
+            except Exception as e:
+                logger.warning("shared fact extraction enqueue failed: {}", e)
+
             try:
                 self.memory.post_write_session_state(
                     session_key=session_key,
@@ -2495,6 +2513,91 @@ class LLMResponder(ResponderPort):
                 logger.warning("private handoff consume failed: {}", exc)
         self._current_trace = None
         return final_content
+
+    # -- shared facts (Plan 05) -------------------------------------------------
+
+    def _shared_fact_runtime(self):
+        """The opt-in shared-fact runtime, or ``None`` while it is switched off."""
+        return getattr(self, "shared_facts", None)
+
+    def _trusted_turn_binding(self):
+        """The frozen turn of this generation - never ``metadata`` or model output."""
+        from yeoman_gateway.processing.responder import CURRENT_TURN
+
+        return CURRENT_TURN.get(None)
+
+    def _shared_fact_context(self, *, query: str, channel: str, chat_id: str, is_owner: bool) -> str:
+        runtime = self._shared_fact_runtime()
+        binding = self._trusted_turn_binding()
+        if runtime is None or binding is None or self.memory is None:
+            return ""
+        import time
+
+        from yeoman_gateway.memory.read_gate import build_read_context
+
+        turn = getattr(binding, "turn", None)
+        principal = str(getattr(turn, "principal", "") or "")
+        if not principal:
+            return ""
+        is_direct = not str(chat_id).endswith("@g.us")
+        context = build_read_context(
+            principal_id=principal,
+            channel=channel,
+            chat_id=chat_id,
+            chat_registry=getattr(runtime, "chat_registry", None),
+            policy=getattr(runtime, "policy", None),
+            now_ms=int(time.time() * 1000),
+            epoch=self.memory.store.acl_epoch(),
+            owner=bool(is_owner),
+            is_direct=is_direct,
+            counterpart=str(chat_id) if is_direct else None,
+        )
+        if getattr(runtime.config, "require_known_membership", True) and not context.membership_known:
+            return ""
+        result = self.memory.retrieve_for_context(query=query, read_context=context)
+        if result.denied_count:
+            self._metric("memory_shared_denied", result.denied_count)
+        if not result.text:
+            return ""
+        self._metric("memory_shared_chars", len(result.text))
+        return result.text
+
+    def _enqueue_shared_extraction(self, *, channel: str, chat_id: str) -> bool:
+        """Queue extraction for the finished turn. Returns True when a job was queued."""
+        runtime = self._shared_fact_runtime()
+        if runtime is None or not getattr(runtime, "extraction_enabled", False):
+            return False
+        binding = self._trusted_turn_binding()
+        if binding is None or self.memory is None:
+            return False
+        turn = getattr(binding, "turn", None)
+        turn_id = str(getattr(turn, "turn_id", "") or "")
+        if not turn_id:
+            return False
+        processing = getattr(runtime, "processing", None)
+        if processing is None:
+            return False
+        refs = [
+            (source.event_id, int(source.revision_at_join))
+            for source in processing.turn_sources(turn_id)
+            if source.removed_ms is None
+        ]
+        if not refs:
+            return False
+        import time
+
+        from yeoman_gateway.memory.read_gate import chat_scope_key
+
+        job_key = runtime.extraction.enqueue(
+            turn_ref=turn_id,
+            source_refs=refs,
+            now_ms=int(time.time() * 1000),
+            workspace_id=self.memory.workspace_id,
+            chat_scope_key=chat_scope_key(channel, chat_id),
+        )
+        if job_key:
+            self._metric("memory_shared_job_queued")
+        return bool(job_key)
 
     @override
     async def generate_reply(
