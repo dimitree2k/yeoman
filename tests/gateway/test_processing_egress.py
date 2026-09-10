@@ -1318,3 +1318,91 @@ async def test_failure_after_possible_dispatch_stays_unknown(tmp_path: Path) -> 
 
     assert result.state == "unknown"
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# send budgets (spec R08 start values)
+# --------------------------------------------------------------------------------------
+
+
+def test_send_budget_counts_units_and_slides() -> None:
+    from yeoman_gateway.processing.dispatch import SendBudget
+
+    now = [0.0]
+    budget = SendBudget(units=2, window_seconds=10, waiting_cap=5, clock=lambda: now[0])
+
+    assert budget.reserve("whatsapp:chat") is True
+    assert budget.reserve("whatsapp:chat") is True
+    assert budget.reserve("whatsapp:chat") is False  # hard cap within the window
+    assert budget.spent("whatsapp:chat") == 2
+
+    now[0] = 11.0  # window slides
+    assert budget.reserve("whatsapp:chat") is True
+
+
+@pytest.mark.asyncio
+async def test_chat_budget_blocks_with_a_reason_instead_of_dropping(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import SendBudget
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    budget = SendBudget(units=1, window_seconds=60, waiting_cap=50, clock=lambda: 0.0)
+    router = IntentEffectRouter(
+        gateway=gateway, config=_config(), clock=_Clock(0), budget=budget
+    )
+
+    await router.submit_outbound(_outbound("one"), principal="owner")
+    await router.submit_outbound(_outbound("two"), principal="owner")
+
+    effects = store.list_effects()
+    assert sorted(effect.state for effect in effects) == ["blocked", "sent"]
+    blocked = next(effect for effect in effects if effect.state == "blocked")
+    assert "budget_exhausted" in [item.detail for item in blocked.evidence]
+    assert len(executor.calls) == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_cap_blocks_visibly(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.dispatch import SendBudget
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_DenyAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    budget = SendBudget(units=99, window_seconds=60, waiting_cap=0, clock=lambda: 0.0)
+    router = IntentEffectRouter(
+        gateway=gateway, config=_config(), clock=_Clock(0), budget=budget
+    )
+
+    await router.submit_outbound(_outbound("one"), principal="owner")
+    await router.submit_outbound(_outbound("two"), principal="owner")
+
+    effects = store.list_effects()
+    assert {effect.state for effect in effects} == {"blocked"}
+    details = {item.detail for effect in effects for item in effect.evidence}
+    assert "queue_capacity" in details
+    assert executor.calls == []
+    store.close()
+
+
+def test_media_counts_as_several_transport_units() -> None:
+    from yeoman_gateway.processing.dispatch import payload_units
+    from yeoman_gateway.processing.models import MediaPayload
+
+    assert payload_units(TextPayload(text="hi")) == 1
+    assert payload_units(MediaPayload(media=("a", "b", "c"))) == 3

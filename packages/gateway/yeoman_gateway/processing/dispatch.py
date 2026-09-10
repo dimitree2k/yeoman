@@ -12,6 +12,8 @@ is resolved later by reconciliation (Plan 04) - it is never silently upgraded to
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
@@ -367,6 +369,67 @@ SERVICE_PRINCIPALS: Mapping[str, str] = {
 }
 
 
+class SendBudget:
+    """Hard per-chat send budget and waiting-outbox cap (spec R08 start values).
+
+    Every real transport command counts, media items count individually, and the
+    reservation is atomic within the process. Capacity that was consumed stays consumed
+    until the sliding window ends - including for effects whose outcome is unknown.
+    """
+
+    def __init__(
+        self,
+        *,
+        units: int,
+        window_seconds: int,
+        waiting_cap: int,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if units < 1 or window_seconds < 1:
+            raise ValueError("budget needs at least one unit and a positive window")
+        self._units = int(units)
+        self._window = float(window_seconds)
+        self._waiting_cap = int(waiting_cap)
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._spent: dict[str, list[float]] = {}
+
+    @property
+    def waiting_cap(self) -> int:
+        return self._waiting_cap
+
+    def reserve(self, key: str, units: int = 1) -> bool:
+        """Reserve capacity for one transport command. False = over budget."""
+        wanted = max(1, int(units))
+        now = self._clock()
+        with self._lock:
+            window = [stamp for stamp in self._spent.get(key, []) if now - stamp < self._window]
+            if len(window) + wanted > self._units:
+                self._spent[key] = window
+                return False
+            window.extend([now] * wanted)
+            self._spent[key] = window
+        return True
+
+    def spent(self, key: str) -> int:
+        now = self._clock()
+        with self._lock:
+            window = [stamp for stamp in self._spent.get(key, []) if now - stamp < self._window]
+            self._spent[key] = window
+        return len(window)
+
+
+def budget_key(channel: str, chat_id: str) -> str:
+    return f"{channel}:{chat_id}"
+
+
+def payload_units(payload: Any) -> int:
+    """Media items are separate transport commands; everything else is one unit."""
+    if isinstance(payload, MediaPayload):
+        return max(1, len(payload.media))
+    return 1
+
+
 class ServiceEffectProducer:
     """Effect entry point for system producers without a chat participant.
 
@@ -470,11 +533,23 @@ class IntentEffectRouter:
         config: Any,
         clock: Callable[[], int] | None = None,
         worker_id: str = "effect-gateway",
+        budget: SendBudget | None = None,
     ) -> None:
         self._gateway = gateway
         self._config = config
         self._clock = clock or _now_ms
         self._worker_id = worker_id
+        processing = getattr(config, "processing", None)
+        budgets = getattr(processing, "budgets", None)
+        self._budget = budget or (
+            SendBudget(
+                units=int(budgets.chat_hard_units),
+                window_seconds=int(budgets.chat_hard_window_seconds),
+                waiting_cap=int(budgets.outbox_waiting_per_chat),
+            )
+            if budgets is not None
+            else None
+        )
 
     def set_direct_transport(self, outbound: Any, reaction: Any) -> None:
         """Install the confirming channel transport on the gateway's executor."""
@@ -596,7 +671,53 @@ class IntentEffectRouter:
             created_ms=now,
         )
         receipt = self._gateway.submit(envelope)
+
+        blocked = self._capacity_block(channel, chat_id, payload, receipt.effect_id)
+        if blocked is not None:
+            return blocked
+
         result = await self._gateway.execute_ready(receipt.effect_id)
+        return self._log_undelivered(result, envelope, chat_id)
+
+    def _capacity_block(
+        self, channel: str, chat_id: str, payload: Any, effect_id: str
+    ) -> EffectReceipt | None:
+        """Refuse to dispatch when the chat is over its budget or its outbox is full.
+
+        The effect stays recorded as ``blocked`` with a reason instead of disappearing.
+        """
+        if self._budget is None:
+            return None
+        now = self._clock()
+        waiting = len(
+            self._gateway.store.list_effects(
+                states=("queued", "blocked", "executing"), limit=500
+            )
+        )
+        if waiting > self._budget.waiting_cap:
+            reason = "queue_capacity"
+        elif not self._budget.reserve(budget_key(channel, chat_id), payload_units(payload)):
+            reason = "budget_exhausted"
+        else:
+            return None
+        self._gateway.store.transition(
+            effect_id,
+            expected="queued",
+            target="blocked",
+            now_ms=now,
+            evidence={"kind": "policy", "detail": reason},
+        )
+        logger.warning(
+            "effect blocked effect_id={} reason={} chat={}", effect_id, reason, chat_id
+        )
+        return self._gateway.store.get_effect(effect_id) and self._gateway._receipt(
+            effect_id,
+            "blocked",
+            "",
+            detail=reason,
+        )
+
+    def _log_undelivered(self, result: Any, envelope: Any, chat_id: str) -> None:
         if result.state != "sent":
             logger.warning(
                 "effect not delivered effect_id={} state={} detail={} capability={} chat={}",
