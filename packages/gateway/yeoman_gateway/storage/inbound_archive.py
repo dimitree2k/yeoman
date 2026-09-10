@@ -22,10 +22,19 @@ class InboundArchive:
     def __init__(
         self,
         db_path: Path | None = None,
-        retention_days: int = DEFAULT_RETENTION_DAYS,
+        retention_days: int | None = DEFAULT_RETENTION_DAYS,
     ) -> None:
+        """``retention_days=None`` (or 0) keeps every archived message forever.
+
+        The owner asked for a complete inbound record, so the running gateway uses the
+        keep-forever mode and no longer purges on start; the timed mode stays available
+        for callers that want it.
+        """
         self.db_path = db_path or (get_data_path() / "inbound" / "reply_context.db")
-        self.retention_days = max(1, int(retention_days))
+        self.retention_days = (
+            None if retention_days is None or int(retention_days) <= 0
+            else max(1, int(retention_days))
+        )
         ensure_dir(self.db_path.parent)
 
         self._lock = threading.RLock()
@@ -316,7 +325,13 @@ class InboundArchive:
         return [dict(row) for row in rows]
 
     def purge_older_than(self, days: int = DEFAULT_RETENTION_DAYS) -> int:
-        """Delete rows older than the retention window."""
+        """Delete rows older than the retention window.
+
+        Refuses to delete anything when the archive is in keep-forever mode, so an
+        operator command cannot silently shorten a deliberately complete record.
+        """
+        if self.retention_days is None:
+            return 0
         effective_days = max(1, int(days))
         cutoff = datetime.now(UTC) - timedelta(days=effective_days)
         cutoff_iso = cutoff.isoformat()
@@ -341,12 +356,14 @@ class InboundArchive:
             pass
 
     def _maybe_purge_locked(self) -> None:
+        if self.retention_days is None:
+            return  # keep-forever mode: nothing is ever deleted automatically
         now = time.monotonic()
         if now - self._last_purge_at < PURGE_INTERVAL_SECONDS:
             return
         self._last_purge_at = now
         try:
-            deleted = self.purge_older_than(self.retention_days)
+            deleted = self.purge_older_than(int(self.retention_days))
             if deleted > 0:
                 logger.info(
                     "inbound archive retention purge removed {} rows ({} days)",

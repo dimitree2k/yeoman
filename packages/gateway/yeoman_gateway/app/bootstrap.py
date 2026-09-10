@@ -588,11 +588,11 @@ def build_gateway_runtime(
     processing_store = build_processing_store(config)
 
     session_manager = SessionManager(workspace)
+    # The owner wants a complete inbound record: keep every message, purge nothing.
     inbound_archive = InboundArchive(
         db_path=get_operational_data_path() / "inbound" / "reply_context.db",
-        retention_days=30,
+        retention_days=None,
     )
-    inbound_archive.purge_older_than(days=30)
     model_router = ModelRouter(config.models)
     media_storage = MediaStorage(
         incoming_dir=config.channels.whatsapp.media.incoming_path,

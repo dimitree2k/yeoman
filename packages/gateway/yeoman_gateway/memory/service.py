@@ -695,7 +695,11 @@ class MemoryService:
 
     def remaining_copies(self) -> tuple[str, ...]:
         """Copies this code deliberately does not purge, named instead of implied."""
-        copies = ["journal_payload_until_retention", "sqlite_backups"]
+        copies = [
+            "journal_payload_until_retention",
+            "sqlite_backups",
+            "inbound_reply_archive",  # kept complete by owner decision, never purged
+        ]
         state_dir = Path(getattr(self.config.wal, "state_dir", "data/memory/session-state"))
         if not state_dir.is_absolute():
             state_dir = self.workspace / state_dir

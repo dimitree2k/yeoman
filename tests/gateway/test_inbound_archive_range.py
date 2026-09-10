@@ -84,3 +84,45 @@ def test_lookup_in_range_caps_limit_at_300(tmp_path) -> None:
         "whatsapp", "group@g.us", since, limit=999
     )
     assert len(rows) == 300
+
+
+def test_keep_forever_mode_never_purges(tmp_path) -> None:
+    """The running gateway archives every message and deletes none of them."""
+    archive = InboundArchive(db_path=tmp_path / "keep.db", retention_days=None)
+    _seed_messages(archive, 0, 5)  # timestamp 0: older than any window
+
+    assert archive.purge_older_than(days=1) == 0
+    archive._maybe_purge_locked()
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        message_id="m-new",
+        participant=None,
+        sender_id="user-1",
+        text="newest",
+        timestamp=0,
+        sender_name="User1",
+    )
+
+    rows = archive._conn.execute("SELECT COUNT(*) FROM inbound_messages").fetchone()[0]
+    assert rows == 6
+    archive.close()
+
+
+def test_timed_mode_still_purges_when_asked(tmp_path) -> None:
+    archive = InboundArchive(db_path=tmp_path / "timed.db", retention_days=30)
+    _seed_messages(archive, 0, 4)
+    old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    archive._conn.execute("UPDATE inbound_messages SET created_at = ?", (old,))
+    archive._conn.commit()
+
+    assert archive.purge_older_than(days=1) == 4
+    assert archive._conn.execute("SELECT COUNT(*) FROM inbound_messages").fetchone()[0] == 0
+    archive.close()
+
+
+def test_zero_retention_means_keep_everything(tmp_path) -> None:
+    archive = InboundArchive(db_path=tmp_path / "zero.db", retention_days=0)
+
+    assert archive.retention_days is None
+    archive.close()

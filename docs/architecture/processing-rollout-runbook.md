@@ -161,10 +161,18 @@ Rollback is a configuration change, not a data operation:
 
 Known limits to state honestly when reporting a rollback or a deletion:
 
-- Copies outside the two databases are not purged by a fact revocation: SQLite backups,
-  the inbound archive, session-state Markdown and journal payloads until retention expires.
-  `InvalidationReport.remaining_copies` names them; `yeoman memory facts revoke` does not
-  claim more than it does.
+- Copies outside the two databases are not purged by a fact revocation. `InvalidationReport.remaining_copies`
+  names them: journal payloads until retention, SQLite backups and the inbound reply archive.
+  `yeoman memory facts revoke` does not claim more than it does.
+- **The inbound reply archive is kept complete on purpose** (`retention_days=None`): every
+  message that reaches the orchestrator is recorded and nothing is purged, not at startup
+  and not by the hourly maintenance pass. `purge_older_than()` is a no-op in this mode, so
+  an operator command cannot shorten the record by accident. Messages refused before the
+  orchestrator (for example a blocked sender) never reach it and are therefore absent.
+- **Journal payload retention is deliberately not scheduled yet.** The windows
+  (`processing.retention.*`) and `ProcessingStore.purge()` exist and are unit-tested, but
+  nothing calls them in the running gateway, so event and effect payloads persist. Treat
+  the journal as retaining raw payloads until that is implemented properly.
 - Deletion completeness inside external providers/caches is not asserted.
 - Extracted statements are candidates, not verified truth.
 
