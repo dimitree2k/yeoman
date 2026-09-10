@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterable, Literal
 
 from loguru import logger
 
@@ -32,7 +32,11 @@ from yeoman_gateway.memory.models import (
 )
 from yeoman_gateway.memory.read_gate import FactAclPredicate, FactReadGate
 from yeoman_gateway.memory.session_state import SessionStateStore
-from yeoman_gateway.memory.shared_facts import FactReadContext, FactRetrievalResult
+from yeoman_gateway.memory.shared_facts import (
+    FactReadContext,
+    FactRetrievalResult,
+    InvalidationReport,
+)
 from yeoman_gateway.memory.store import MemoryStore
 from yeoman_gateway.policy.loader import load_policy
 
@@ -614,6 +618,90 @@ class MemoryService:
             existing.vector_score = max(existing.vector_score, hit.vector_score)
             existing.lexical_score = max(existing.lexical_score, hit.lexical_score)
         return list(merged.values())
+
+    def invalidate_sources(
+        self,
+        source_event_ids: Iterable[str],
+        *,
+        now_ms: int,
+        kind: str | None = None,
+        superseded_by: str | None = None,
+    ) -> "InvalidationReport":
+        """Mark every fact derived from the given sources, idempotently.
+
+        A deleted source revokes its facts (tombstone plus redacted text); an edited
+        source supersedes them, so the older revision becomes unreadable while the
+        tombstone points at the replacement. A second call changes nothing.
+        """
+        ids = [str(item) for item in source_event_ids if str(item)]
+        if not ids:
+            return InvalidationReport()
+
+        resolved = kind or self._derive_invalidation_kind(ids)
+        revoked: list[str] = []
+        superseded: list[str] = []
+        for event_id in ids:
+            for fact_id in self.store.facts_by_source_event(event_id):
+                fact = self.store.get_fact(fact_id)
+                if fact is None:
+                    continue
+                if resolved == "edit":
+                    if fact.superseded_by or fact.assertion_status == "superseded":
+                        continue
+                    replacement = superseded_by or f"edit:{event_id}"
+                    if self.store.set_fact_status(
+                        fact_id,
+                        status="superseded",
+                        now_ms=int(now_ms),
+                        superseded_by=replacement,
+                    ):
+                        superseded.append(fact_id)
+                    continue
+                if fact.revoked_at_ms is not None:
+                    continue
+                if self.store.redact_fact(fact_id, now_ms=int(now_ms)):
+                    revoked.append(fact_id)
+
+        cancelled = 0
+        queue = getattr(self, "extraction", None)
+        if queue is not None:
+            cancelled = int(queue.cancel_sources(ids, now_ms=int(now_ms)))
+        return InvalidationReport(
+            revoked=tuple(dict.fromkeys(revoked)),
+            superseded=tuple(dict.fromkeys(superseded)),
+            jobs_cancelled=cancelled,
+            remaining_copies=self.remaining_copies(),
+        )
+
+    def _derive_invalidation_kind(self, source_event_ids: list[str]) -> str:
+        """Read the kind from the journal; anything unclear counts as a deletion."""
+        journal = getattr(self, "journal", None)
+        if journal is None:
+            return "delete"
+        kinds: set[str] = set()
+        for event_id in source_event_ids:
+            for name in ("get_event", "event", "load_event"):
+                method = getattr(journal, name, None)
+                if method is None:
+                    continue
+                try:
+                    event = method(event_id)
+                except Exception:  # pragma: no cover - defensive
+                    event = None
+                if event is not None:
+                    kinds.add(str(getattr(event, "kind", "")))
+                break
+        return "edit" if kinds and kinds <= {"edit"} else "delete"
+
+    def remaining_copies(self) -> tuple[str, ...]:
+        """Copies this code deliberately does not purge, named instead of implied."""
+        copies = ["journal_payload_until_retention", "sqlite_backups"]
+        state_dir = Path(getattr(self.config.wal, "state_dir", "data/memory/session-state"))
+        if not state_dir.is_absolute():
+            state_dir = self.workspace / state_dir
+        if state_dir.exists():
+            copies.append("session_state_markdown")
+        return tuple(copies)
 
     def build_retrieved_context(
         self,

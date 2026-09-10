@@ -695,13 +695,18 @@ class MemoryStore:
             self._conn.execute(
                 """
                 UPDATE memory2_nodes
-                   SET content = '', content_norm = '', is_deleted = 1, updated_at = ?
+                   SET content = '', content_norm = '', updated_at = ?
                  WHERE id = ?
                 """,
                 (datetime.now(UTC).isoformat(), str(fact_id)),
             )
             self._conn.execute(
                 "DELETE FROM memory2_nodes_fts WHERE entry_id = ?", (str(fact_id),)
+            )
+            # Unlike soft_delete, redaction must drop the vector as well: an embedding is
+            # a full copy of the text and would keep deleted content recoverable.
+            self._conn.execute(
+                "DELETE FROM memory2_embeddings WHERE entry_id = ?", (str(fact_id),)
             )
             self._conn.commit()
         self.bump_acl_epoch()
