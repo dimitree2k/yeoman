@@ -216,3 +216,65 @@ async def test_no_turn_means_no_effect_for_turn_bound_producers(runtime) -> None
     assert transport.sent == []
     assert SERVICE_PRINCIPALS  # service producers keep their turn-free path
     assert store.count_effects() == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_effect_from_a_generation_uses_the_frozen_turn(runtime) -> None:
+    """A correction during the provider call must invalidate that turn's tool sends."""
+    from yeoman_gateway.bus.events import OutboundMessage
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store, registry, gate, router, transport, _adapter = runtime
+    result = gate.admit(
+        IngestRequest(
+            event_key=f"whatsapp:{CHAT}:m1",
+            event_id="m1",
+            trace_id="tr-m1",
+            event=_event(message_id="m1"),
+        )
+    )
+    turn_id = str(result.assignment.turn_id)
+    actors = ThreadActorRegistry(store=store, config=_config().processing, clock=_Clock())
+
+    class _ToolSendingResponder:
+        """Stands in for a generation that dispatches a tool effect while it runs."""
+
+        def __init__(self) -> None:
+            self.revision_seen: int | None = None
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
+            # The correction lands while this call is still running.
+            store.bump_turn_revision(
+                turn_id, expected_revision=1, now_ms=1_700_000_002_000, reason="correction"
+            )
+            from yeoman_gateway.processing.dispatch import CURRENT_TURN
+
+            binding = CURRENT_TURN.get()
+            self.revision_seen = binding.turn.revision if binding else None
+            await router.submit_message(
+                OutboundMessage(
+                    channel="whatsapp",
+                    chat_id=CHAT,
+                    content="tool answer",
+                    metadata={"message_id": "m1"},
+                ),
+                principal="orderer@s.whatsapp.net",
+                capability="send_text",
+                payload=__import__(
+                    "yeoman_gateway.processing.models", fromlist=["TextPayload"]
+                ).TextPayload(text="tool answer"),
+            )
+            return "text answer"
+
+    inner = _ToolSendingResponder()
+    wrapper = ThreadActorResponder(inner=inner, actors=actors, store=store)
+    reply = await wrapper.generate_reply(_event(message_id="m1"), object())
+
+    # The generation saw revision 1; its effect was therefore created against revision 1
+    # and cancelled by the correction that arrived during the call.
+    assert inner.revision_seen == 1
+    assert reply is None or reply == "text answer"
+    states = {effect.state for effect in store.list_effects()}
+    assert "sent" not in states or transport.sent == []
+    store.close()

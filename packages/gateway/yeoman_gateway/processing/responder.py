@@ -21,6 +21,8 @@ from yeoman_gateway.processing.actor import (
     ThreadActorRegistry,
     thread_session_key,
 )
+from yeoman_gateway.processing.dispatch import CURRENT_TURN
+from yeoman_gateway.processing.models import TurnBinding
 from yeoman_gateway.processing.models import now_ms as _now_ms
 from yeoman_gateway.processing.threads import TurnAuthority
 
@@ -95,10 +97,24 @@ class ThreadActorResponder:
                     event, decision, session_key=session_key
                 )
 
+            # Tool-produced effects of this generation must carry the *frozen* turn and
+            # revision, so a correction during the call invalidates them instead of a
+            # later turn silently authorising them.
+            turn = self._store.get_turn(snapshot.turn_id)
+            binding = (
+                TurnBinding(turn=turn, trace_id=snapshot.turn_id, generation_id=snapshot.generation_id)
+                if turn is not None
+                else None
+            )
+
             async def _call(_snapshot: Any) -> str | None:
-                return await self._inner.generate_reply(
-                    event, decision, session_key=session_key
-                )
+                token = CURRENT_TURN.set(binding)
+                try:
+                    return await self._inner.generate_reply(
+                        event, decision, session_key=session_key
+                    )
+                finally:
+                    CURRENT_TURN.reset(token)
 
             outcome = await actor.run_generation(snapshot, _call)
             if outcome.state == "restart":
