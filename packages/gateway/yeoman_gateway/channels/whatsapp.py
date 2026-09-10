@@ -393,7 +393,7 @@ class WhatsAppChannel(BaseChannel):
                 "delete_message",
                 {"chatJid": msg.chat_id, "messageId": message_id},
                 timeout_seconds=20.0,
-                max_attempts=SEND_MAX_ATTEMPTS,
+                max_attempts=self._send_attempts(msg.metadata),
             )
             return
 
@@ -416,7 +416,7 @@ class WhatsAppChannel(BaseChannel):
                     "react",
                     payload,
                     timeout_seconds=12.0,
-                    max_attempts=SEND_MAX_ATTEMPTS,
+                    max_attempts=self._send_attempts(msg.metadata),
                 )
                 if bool(msg.metadata.get("reaction_only", False)):
                     return
@@ -472,7 +472,7 @@ class WhatsAppChannel(BaseChannel):
                     "send_media",
                     payload,
                     timeout_seconds=30.0,
-                    max_attempts=SEND_MAX_ATTEMPTS,
+                    max_attempts=self._send_attempts(msg.metadata),
                 )
                 sent_any_media = True
 
@@ -507,7 +507,7 @@ class WhatsAppChannel(BaseChannel):
             "send_text",
             payload,
             timeout_seconds=20.0,
-            max_attempts=SEND_MAX_ATTEMPTS,
+            max_attempts=self._send_attempts(msg.metadata),
         )
 
     async def start_typing(self, chat_id: str) -> None:
@@ -544,7 +544,7 @@ class WhatsAppChannel(BaseChannel):
             "react",
             payload,
             timeout_seconds=20.0,
-            max_attempts=SEND_MAX_ATTEMPTS,
+            max_attempts=self._send_attempts(msg.metadata),
         )
 
     async def _verify_bridge_health(self, token: str, timeout_seconds: float) -> None:
@@ -1694,6 +1694,20 @@ class WhatsAppChannel(BaseChannel):
             or "bridge websocket not connected" in text
             or "connection closed" in text
         )
+
+    @staticmethod
+    def _send_attempts(metadata: Any) -> int:
+        """Transport attempts for one outbound message.
+
+        An effect-delivered message gets exactly one attempt: a timeout after a possible
+        dispatch proves nothing, and a second send command below the effect gateway would
+        be an unauthorized retry of an unknown action (spec R06, R07). Legacy traffic
+        keeps its existing retry behaviour, and safe pre-dispatch reconnects still happen
+        through the connection wait that precedes the attempt.
+        """
+        if isinstance(metadata, dict) and metadata.get("processing_effect"):
+            return 1
+        return SEND_MAX_ATTEMPTS
 
     async def _send_command_with_retry(
         self,

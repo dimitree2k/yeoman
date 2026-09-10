@@ -44,6 +44,7 @@ class ReactionMessage:
     message_id: str
     emoji: str
     participant_jid: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

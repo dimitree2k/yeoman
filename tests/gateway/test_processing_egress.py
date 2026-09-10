@@ -28,7 +28,7 @@ from yeoman_gateway.processing.models import (
 )
 from yeoman_gateway.processing.policy import PolicyCapabilityResolver, SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import ProcessingStore
-from yeoman_shared.config.schema import Config
+from yeoman_shared.config.schema import Config, WhatsAppConfig
 
 CHAT = "chat@g.us"
 OTHER_CHAT = "other@g.us"
@@ -892,3 +892,47 @@ async def test_disabled_tool_refuses_execution_even_if_called_directly() -> None
 
     assert result.startswith("Error")
     assert "disabled" in result
+
+
+@pytest.mark.asyncio
+async def test_effect_delivery_gets_exactly_one_transport_attempt(tmp_path: Path) -> None:
+    """A timeout after a possible dispatch must not re-send below the gateway."""
+    from yeoman_gateway.channels.whatsapp import SEND_MAX_ATTEMPTS, WhatsAppChannel
+    from yeoman_gateway.processing.dispatch import EFFECT_PROVENANCE_KEY
+
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=0, debounce_media_ms=0), _RecordingBus())
+    channel._connected = True
+    calls: list[str] = []
+
+    async def _failing_send(command_type: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        calls.append(command_type)
+        raise TimeoutError("no bridge response")
+
+    channel._send_command = _failing_send  # type: ignore[method-assign]
+
+    # Effect-delivered message: one attempt, then the outcome stays unknown.
+    with pytest.raises(TimeoutError):
+        await channel.send(
+            OutboundMessage(
+                channel="whatsapp",
+                chat_id=CHAT,
+                content="managed",
+                metadata={EFFECT_PROVENANCE_KEY: "fx1"},
+            )
+        )
+    assert [c for c in calls if c == "send_text"] == ["send_text"]
+
+    # Legacy message: the existing retry behaviour is untouched.
+    calls.clear()
+    with pytest.raises(TimeoutError):
+        await channel.send(OutboundMessage(channel="whatsapp", chat_id=CHAT, content="legacy"))
+    assert len([c for c in calls if c == "send_text"]) == SEND_MAX_ATTEMPTS
+
+
+def test_reaction_provenance_reaches_the_transport() -> None:
+    from yeoman_gateway.channels.whatsapp import WhatsAppChannel
+    from yeoman_gateway.processing.dispatch import EFFECT_PROVENANCE_KEY
+
+    channel = WhatsAppChannel(WhatsAppConfig(), _RecordingBus())
+    assert channel._send_attempts({EFFECT_PROVENANCE_KEY: "fx1"}) == 1
+    assert channel._send_attempts({}) > 1

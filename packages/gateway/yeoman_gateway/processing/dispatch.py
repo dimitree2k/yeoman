@@ -172,6 +172,7 @@ class BusEffectExecutor:
                     chat_id=target.chat_id,
                     message_id=payload.message_id,
                     emoji=payload.emoji,
+                    metadata=dict(provenance),
                 )
             )
         elif isinstance(payload, DeletePayload):
