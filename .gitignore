@@ -76,6 +76,9 @@ tests/gateway/*
 !tests/gateway/test_cron_voice_quiet_window.py
 !tests/gateway/test_market_intelligence_tool.py
 !tests/gateway/test_reply_budget.py
+!tests/shared/
+tests/shared/*
+!tests/shared/test_config_processing.py
 !tests/overseer/
 tests/overseer/*
 !tests/overseer/test_alert_formatting.py

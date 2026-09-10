@@ -556,6 +556,138 @@ class PersonaEvolutionConfig(BaseModel):
     proposal_ttl_seconds: int = Field(default=86400, alias="proposalTtlSeconds", ge=60)
 
 
+class ProcessingBudgetsConfig(BaseModel):
+    """Transport budgets and queue limits (spec R08 start values)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    thread_soft_units: int = Field(default=2, ge=1)
+    thread_soft_window_seconds: int = Field(default=10, ge=1)
+    chat_hard_units: int = Field(default=6, ge=1)
+    chat_hard_window_seconds: int = Field(default=60, ge=1)
+    outbox_waiting_per_chat: int = Field(default=20, ge=0)
+
+
+class ProcessingThreadsConfig(BaseModel):
+    """Thread lifetime, follow-up and generation limits (spec R03, R04)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    followup_window_seconds: int = Field(default=15, ge=0)
+    idle_seconds: int = Field(default=1800, ge=1)
+    reopen_window_seconds: int = Field(default=604800, ge=0)
+    pending_inputs_per_thread: int = Field(default=32, ge=1)
+    max_generations_global: int = Field(default=1, ge=1, le=2)
+    max_generations_per_thread: int = Field(default=1, ge=1, le=2)
+
+
+class ProcessingDeadlinesConfig(BaseModel):
+    """Planning deadlines per effect class (spec section 4)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    reactive_ms: int = Field(default=120_000, ge=1)
+    semantic_reaction_ms: int = Field(default=30_000, ge=1)
+    proactive_ms: int = Field(default=60_000, ge=1)
+
+
+class ProcessingReconciliationConfig(BaseModel):
+    """Unknown-effect reconciliation bounds (spec R07)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    backoff_seconds: list[int] = Field(
+        default_factory=lambda: [5, 15, 45, 120, 300, 600]
+    )
+    max_probes: int = Field(default=6, ge=1)
+    deadline_seconds: int = Field(default=600, ge=1)
+    claim_lease_seconds: int = Field(default=30, ge=1)
+    probe_timeout_ms: int = Field(default=10_000, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_probe_within_lease(self) -> "ProcessingReconciliationConfig":
+        if self.probe_timeout_ms > self.claim_lease_seconds * 1000:
+            raise ValueError(
+                "processing.reconciliation.probeTimeoutMs must not exceed claimLeaseSeconds"
+            )
+        if self.max_probes > len(self.backoff_seconds):
+            raise ValueError(
+                "processing.reconciliation.maxProbes exceeds the configured backoff schedule"
+            )
+        if any(step <= 0 for step in self.backoff_seconds):
+            raise ValueError("processing.reconciliation.backoffSeconds must be positive")
+        return self
+
+
+class ProcessingExtractionConfig(BaseModel):
+    """Async shared-memory extraction trigger (spec R09)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    idle_seconds: int = Field(default=60, ge=1)
+    max_delay_seconds: int = Field(default=300, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_windows(self) -> "ProcessingExtractionConfig":
+        if self.max_delay_seconds < self.idle_seconds:
+            raise ValueError(
+                "processing.extraction.maxDelaySeconds must not be below idleSeconds"
+            )
+        return self
+
+
+class ProcessingRetentionConfig(BaseModel):
+    """Retention windows for journal payloads and lineage metadata (spec R06, R10)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    journal_payload_days: int = Field(default=7, ge=0)
+    lineage_metadata_days: int = Field(default=30, ge=0)
+    unresolved_days: int = Field(default=90, ge=0)
+    shared_fact_days: int = Field(default=90, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_windows(self) -> "ProcessingRetentionConfig":
+        if self.journal_payload_days > self.lineage_metadata_days:
+            raise ValueError(
+                "processing.retention.journalPayloadDays must not exceed lineageMetadataDays"
+            )
+        if self.lineage_metadata_days > self.unresolved_days:
+            raise ValueError(
+                "processing.retention.lineageMetadataDays must not exceed unresolvedDays"
+            )
+        return self
+
+
+class ProcessingConfig(BaseModel):
+    """State-aware message processing (spec section 4).
+
+    Disabled by default. Activation is a separate, explicitly ordered step per chat;
+    enabling it here without a chat allowlist only wires the durable core.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    enabled: bool = False
+    chats: list[str] = Field(default_factory=list)
+    db_path: str = "data/processing/processing.db"
+    budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
+    threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)
+    deadlines: ProcessingDeadlinesConfig = Field(default_factory=ProcessingDeadlinesConfig)
+    reconciliation: ProcessingReconciliationConfig = Field(
+        default_factory=ProcessingReconciliationConfig
+    )
+    extraction: ProcessingExtractionConfig = Field(default_factory=ProcessingExtractionConfig)
+    retention: ProcessingRetentionConfig = Field(default_factory=ProcessingRetentionConfig)
+
+    def is_chat_enabled(self, channel: str, chat_id: str) -> bool:
+        """True when the new mode is switched on for this exact chat."""
+        if not self.enabled:
+            return False
+        scoped = {entry.strip() for entry in self.chats if entry.strip()}
+        return bool(scoped) and f"{channel}:{chat_id}" in scoped
+
+
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -580,6 +712,7 @@ class Config(BaseSettings):
         default_factory=PersonaEvolutionConfig,
         alias="personaEvolution",
     )
+    processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
 
     @property
     def workspace_path(self) -> Path:

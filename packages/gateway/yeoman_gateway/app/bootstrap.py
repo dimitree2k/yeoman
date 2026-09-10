@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
     from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.processing.store import ProcessingStore
     from yeoman_gateway.providers.base import LLMProvider
 
 
@@ -239,6 +240,7 @@ class GatewayRuntime:
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
     lull_observer: object | None = None
+    processing: "ProcessingStore | None" = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def run(self) -> None:
@@ -287,7 +289,40 @@ class GatewayRuntime:
                 self.chat_registry.close()
             self.contacts.close()
             self.memory.close()
+            if self.processing is not None:
+                self.processing.close()
             await tracing.shutdown()
+
+
+def build_processing_store(config: "Config") -> "ProcessingStore | None":
+    """Open the durable processing store, but only when the new mode is enabled.
+
+    Disabled mode stays byte-for-byte inert: no second database appears next to the
+    archives. A store that cannot be opened leaves the new mode offline (fail closed)
+    instead of degrading into an unaudited path.
+    """
+    if not config.processing.enabled:
+        return None
+
+    from yeoman_shared.utils.helpers import get_data_path
+
+    from yeoman_gateway.processing.models import DAY_MS, RetentionSettings
+    from yeoman_gateway.processing.store import ProcessingStore
+
+    retention_cfg = config.processing.retention
+    retention = RetentionSettings(
+        journal_payload_ms=retention_cfg.journal_payload_days * DAY_MS,
+        metadata_ms=retention_cfg.lineage_metadata_days * DAY_MS,
+        unresolved_ms=retention_cfg.unresolved_days * DAY_MS,
+    )
+    path = Path(config.processing.db_path).expanduser()
+    if not path.is_absolute():
+        path = get_data_path() / path
+    try:
+        return ProcessingStore(path, retention=retention)
+    except Exception:
+        logger.exception("processing store unavailable; new processing mode stays offline")
+        return None
 
 
 def build_gateway_runtime(
@@ -1146,5 +1181,6 @@ def build_gateway_runtime(
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
         lull_observer=lull_observer,
+        processing=build_processing_store(config),
         startup_hook=_notify_pending_persona_evolution_reviews,
     )
