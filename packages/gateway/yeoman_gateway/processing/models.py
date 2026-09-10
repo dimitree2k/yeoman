@@ -608,6 +608,27 @@ class TransportReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ProbeRecord:
+    """One durable reconciliation probe with its claim and outcome."""
+
+    probe_id: str
+    effect_id: str
+    attempt_number: int
+    due_ms: int
+    created_ms: int
+    lease_owner: str | None = None
+    lease_until_ms: int | None = None
+    started_ms: int | None = None
+    finished_ms: int | None = None
+    outcome: str | None = None
+    evidence_detail: str | None = None
+
+    @property
+    def open(self) -> bool:
+        return self.outcome is None
+
+
+@dataclass(frozen=True, slots=True)
 class EffectEvidence:
     """One durable evidence entry attached to an effect."""
 
@@ -705,6 +726,8 @@ class PurgeReport:
     decisions_deleted: int = 0
     attempts_deleted: int = 0
     evidence_deleted: int = 0
+    probes_deleted: int = 0
+    receipts_deleted: int = 0
 
 
 # --------------------------------------------------------------------------------------

@@ -391,8 +391,8 @@ def test_v1_database_migrates_additively(tmp_path: Path) -> None:
 
     store = ProcessingStore(path)
 
-    assert SCHEMA_VERSION == 3
-    assert store.schema_version == 3
+    assert SCHEMA_VERSION == 4
+    assert store.schema_version == 4
     assert store.count_events() == 1
     assert store.count_effects() == 1
     assert store.list_threads() == ()

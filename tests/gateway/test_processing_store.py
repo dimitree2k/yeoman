@@ -363,3 +363,74 @@ def test_decisions_are_immutable_and_keep_policy_version(tmp_path):
             )
         )
     db.close()
+
+
+# --------------------------------------------------------------------------------------
+# Plan 04: reconciliation probe records
+# --------------------------------------------------------------------------------------
+
+
+def test_probe_records_are_idempotent_and_claimable(tmp_path):
+    from yeoman_gateway.processing.models import ProcessingError
+
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "p.db")
+    db.enqueue_effect(
+        effect_id="fx1", operation_key="k1", payload={"text": "A"}, now_ms=now
+    )
+
+    first = db.schedule_probe("fx1", attempt_number=1, due_ms=now + 5_000, now_ms=now)
+    again = db.schedule_probe("fx1", attempt_number=1, due_ms=now + 9_999, now_ms=now)
+
+    assert first == again  # idempotent per (effect, attempt)
+    assert db.count_probes("fx1") == 1
+    assert db.next_probe_number("fx1") == 2
+    assert db.due_probes(now) == ()
+    due = db.due_probes(now + 5_000)
+    assert [probe.probe_id for probe in due] == [first]
+    assert db.open_probe("fx1").probe_id == first
+    with pytest.raises(ProcessingError):
+        db.schedule_probe("nope", attempt_number=1, due_ms=now, now_ms=now)
+    db.close()
+
+
+def test_probe_claim_is_exclusive_but_takeable_after_expiry(tmp_path):
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "p.db")
+    db.enqueue_effect(effect_id="fx1", operation_key="k1", payload={"text": "A"}, now_ms=now)
+    probe_id = db.schedule_probe("fx1", attempt_number=1, due_ms=now, now_ms=now)
+
+    assert db.claim_probe(probe_id, "worker-a", now, 30_000) is True
+    assert db.claim_probe(probe_id, "worker-b", now, 30_000) is False
+    # A lost claim is taken over once its lease expires.
+    assert db.claim_probe(probe_id, "worker-b", now + 30_001, 30_000) is True
+    # Only the current leaseholder may finish.
+    assert db.finish_probe(probe_id, outcome="confirmed", now_ms=now + 30_002, worker_id="worker-a") is False
+    assert db.finish_probe(probe_id, outcome="confirmed", now_ms=now + 30_002, worker_id="worker-b") is True
+    assert db.count_probes("fx1", outcome="confirmed") == 1
+    assert db.open_probe("fx1") is None
+    assert db.due_probes(now + 60_000) == ()  # finished probes are never due again
+    db.close()
+
+
+def test_retention_keeps_open_probes_and_drops_finished_ones(tmp_path):
+    from yeoman_gateway.processing.models import DAY_MS
+
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "p.db")
+    db.enqueue_effect(effect_id="fx1", operation_key="k1", payload={"text": "A"}, now_ms=now)
+    done = db.schedule_probe("fx1", attempt_number=1, due_ms=now, now_ms=now)
+    open_probe = db.schedule_probe("fx1", attempt_number=2, due_ms=now + DAY_MS, now_ms=now)
+    db.claim_probe(done, "worker-a", now, 30_000)
+    db.finish_probe(done, outcome="inconclusive", now_ms=now, worker_id="worker-a")
+    db.record_transport_receipt(
+        "fx1", channel="whatsapp", chat_id="chat@g.us", provider_message_id="3EB0", now_ms=now
+    )
+
+    report = db.purge(now_ms=now + 31 * DAY_MS)
+
+    assert db.get_probe(done) is None
+    assert db.get_probe(open_probe) is not None  # an open probe survives retention
+    assert db.transport_receipts("fx1") == ()
+    assert report.probes_deleted == 1 and report.receipts_deleted == 1
+    db.close()

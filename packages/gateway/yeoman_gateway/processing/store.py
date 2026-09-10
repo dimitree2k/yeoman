@@ -40,6 +40,7 @@ from yeoman_gateway.processing.models import (
     JournalConflictError,
     LineageView,
     PendingInput,
+    ProbeRecord,
     ProcessingError,
     PurgeReport,
     RelationMeta,
@@ -65,7 +66,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = (
     """
@@ -317,6 +318,28 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ON transport_receipts(effect_id, confirmed_ms)",
         "CREATE INDEX IF NOT EXISTS idx_receipts_provider "
         "ON transport_receipts(channel, chat_id, provider_message_id)",
+    ),
+    3: (
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_probes (
+          probe_id TEXT PRIMARY KEY,
+          effect_id TEXT NOT NULL REFERENCES effects(effect_id) ON DELETE CASCADE,
+          attempt_number INTEGER NOT NULL,
+          due_ms INTEGER NOT NULL,
+          lease_owner TEXT,
+          lease_until_ms INTEGER,
+          started_ms INTEGER,
+          finished_ms INTEGER,
+          outcome TEXT,
+          evidence_detail TEXT,
+          created_ms INTEGER NOT NULL,
+          UNIQUE (effect_id, attempt_number)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_probes_due "
+        "ON reconciliation_probes(outcome, due_ms)",
+        "CREATE INDEX IF NOT EXISTS idx_probes_lease "
+        "ON reconciliation_probes(outcome, lease_until_ms)",
     ),
 }
 
@@ -1741,6 +1764,115 @@ class ProcessingStore:
             ).fetchall()
         return tuple(str(row["effect_id"]) for row in rows)
 
+    # -- reconciliation probes (Plan 04) ------------------------------------------------
+
+    def schedule_probe(
+        self, effect_id: str, *, attempt_number: int, due_ms: int, now_ms: int
+    ) -> str:
+        """Plan one probe; idempotent per ``(effect_id, attempt_number)``."""
+        if attempt_number < 1:
+            raise ValueError("attempt_number must be positive")
+        if self.get_effect(effect_id) is None:
+            raise ProcessingError(f"unknown effect: {effect_id}")
+        probe_id = f"pb_{canonical_hash([effect_id, attempt_number])[:20]}"
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO reconciliation_probes
+                  (probe_id, effect_id, attempt_number, due_ms, created_ms)
+                VALUES (?,?,?,?,?)
+                """,
+                (probe_id, effect_id, int(attempt_number), int(due_ms), now_ms),
+            )
+        return probe_id
+
+    def get_probe(self, probe_id: str) -> ProbeRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM reconciliation_probes WHERE probe_id = ?", (probe_id,)
+            ).fetchone()
+        return _probe_from_row(row) if row is not None else None
+
+    def claim_probe(self, probe_id: str, worker_id: str, now_ms: int, lease_ms: int) -> bool:
+        """Claim a probe; an expired lease of another worker may be taken over."""
+        if not worker_id:
+            raise ValueError("worker_id is required")
+        if lease_ms <= 0:
+            raise ValueError("lease_ms must be positive")
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE reconciliation_probes
+                   SET lease_owner = ?, lease_until_ms = ?, started_ms = ?
+                 WHERE probe_id = ? AND outcome IS NULL
+                   AND (lease_until_ms IS NULL OR lease_until_ms <= ? OR lease_owner = ?)
+                """,
+                (worker_id, now_ms + lease_ms, now_ms, probe_id, now_ms, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def finish_probe(
+        self,
+        probe_id: str,
+        *,
+        outcome: str,
+        now_ms: int,
+        worker_id: str,
+        detail: str | None = None,
+    ) -> bool:
+        """Finish a probe; only its current leaseholder may do so."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE reconciliation_probes
+                   SET outcome = ?, evidence_detail = ?, finished_ms = ?,
+                       lease_owner = NULL, lease_until_ms = NULL
+                 WHERE probe_id = ? AND outcome IS NULL AND lease_owner = ?
+                """,
+                (outcome, detail, now_ms, probe_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def due_probes(self, now_ms: int, *, limit: int = 32) -> tuple[ProbeRecord, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM reconciliation_probes
+                 WHERE outcome IS NULL AND due_ms <= ?
+                   AND (lease_until_ms IS NULL OR lease_until_ms <= ?)
+                 ORDER BY due_ms, probe_id LIMIT ?
+                """,
+                (now_ms, now_ms, max(1, int(limit))),
+            ).fetchall()
+        return tuple(_probe_from_row(row) for row in rows)
+
+    def open_probe(self, effect_id: str) -> ProbeRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM reconciliation_probes WHERE effect_id = ? AND outcome IS NULL "
+                "ORDER BY attempt_number DESC LIMIT 1",
+                (effect_id,),
+            ).fetchone()
+        return _probe_from_row(row) if row is not None else None
+
+    def next_probe_number(self, effect_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(attempt_number) AS n FROM reconciliation_probes WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+        return int(row["n"] or 0) + 1
+
+    def count_probes(self, effect_id: str, *, outcome: str | None = None) -> int:
+        query = "SELECT COUNT(*) AS n FROM reconciliation_probes WHERE effect_id = ?"
+        params: list[Any] = [effect_id]
+        if outcome is not None:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return int(row["n"])
+
     # -- generations -------------------------------------------------------------------
 
     def record_generation(self, snapshot: GenerationSnapshot) -> str:
@@ -1964,6 +2096,16 @@ class ProcessingStore:
                 "DELETE FROM effect_evidence WHERE observed_ms <= ?", (metadata_cutoff,)
             )
             evidence_deleted = int(cursor.rowcount or 0)
+            cursor = conn.execute(
+                "DELETE FROM reconciliation_probes WHERE finished_ms IS NOT NULL "
+                "AND finished_ms <= ?",
+                (metadata_cutoff,),
+            )
+            probes_deleted = int(cursor.rowcount or 0)
+            cursor = conn.execute(
+                "DELETE FROM transport_receipts WHERE confirmed_ms <= ?", (metadata_cutoff,)
+            )
+            receipts_deleted = int(cursor.rowcount or 0)
         return PurgeReport(
             event_payloads_purged=event_payloads_purged,
             effect_payloads_purged=effect_payloads_purged,
@@ -1972,6 +2114,8 @@ class ProcessingStore:
             decisions_deleted=decisions_deleted,
             attempts_deleted=attempts_deleted,
             evidence_deleted=evidence_deleted,
+            probes_deleted=probes_deleted,
+            receipts_deleted=receipts_deleted,
         )
 
     # -- helpers -----------------------------------------------------------------------
@@ -2011,6 +2155,26 @@ class ProcessingStore:
                 int(row["payload_purged_ms"]) if row["payload_purged_ms"] is not None else None
             ),
         )
+
+
+def _probe_from_row(row: sqlite3.Row) -> ProbeRecord:
+    return ProbeRecord(
+        probe_id=str(row["probe_id"]),
+        effect_id=str(row["effect_id"]),
+        attempt_number=int(row["attempt_number"]),
+        due_ms=int(row["due_ms"]),
+        created_ms=int(row["created_ms"]),
+        lease_owner=str(row["lease_owner"]) if row["lease_owner"] is not None else None,
+        lease_until_ms=(
+            int(row["lease_until_ms"]) if row["lease_until_ms"] is not None else None
+        ),
+        started_ms=int(row["started_ms"]) if row["started_ms"] is not None else None,
+        finished_ms=int(row["finished_ms"]) if row["finished_ms"] is not None else None,
+        outcome=str(row["outcome"]) if row["outcome"] is not None else None,
+        evidence_detail=(
+            str(row["evidence_detail"]) if row["evidence_detail"] is not None else None
+        ),
+    )
 
 
 def _transport_receipt_from_row(row: sqlite3.Row) -> TransportReceipt:
