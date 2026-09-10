@@ -9,10 +9,87 @@ import uuid
 from array import array
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from yeoman_shared.utils.helpers import ensure_dir
 
 from yeoman_gateway.memory.models import MemoryEntry, MemoryHit, MemorySector
+from yeoman_gateway.memory.shared_facts import (
+    ASSERTION_STATUSES,
+    FactSource,
+    SharedFact,
+    fact_content_hash,
+)
+
+# Plan 05, Aufgabe 1: additive shared-fact schema. Never touches memory2_nodes.
+_SHARED_FACT_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS memory2_facts (
+      fact_id TEXT PRIMARY KEY REFERENCES memory2_nodes(id) ON DELETE CASCADE,
+      workspace_id TEXT NOT NULL,
+      chat_scope_key TEXT NOT NULL,
+      author_principal TEXT NOT NULL,
+      assertion_status TEXT NOT NULL
+        CHECK(assertion_status IN ('assertion','confirmed','superseded','revoked','expired')),
+      visibility_scope TEXT NOT NULL CHECK(visibility_scope IN ('chat_shared','principals','author_only')),
+      group_rule TEXT NOT NULL
+        CHECK(group_rule IN ('chat_members_at_source','explicit_principals','author_only','none')),
+      audience_snapshot_id TEXT,
+      valid_from_ms INTEGER NOT NULL,
+      valid_until_ms INTEGER,
+      superseded_by TEXT REFERENCES memory2_facts(fact_id),
+      revoked_at_ms INTEGER,
+      extractor_version TEXT NOT NULL,
+      created_ms INTEGER NOT NULL,
+      updated_ms INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory2_facts_scope
+      ON memory2_facts (workspace_id, chat_scope_key, assertion_status, valid_until_ms)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory2_fact_sources (
+      fact_id TEXT NOT NULL REFERENCES memory2_facts(fact_id) ON DELETE CASCADE,
+      source_event_id TEXT NOT NULL,
+      source_revision INTEGER NOT NULL,
+      source_trace_id TEXT NOT NULL DEFAULT '',
+      author_principal TEXT NOT NULL,
+      source_channel TEXT NOT NULL DEFAULT '',
+      source_chat_id TEXT NOT NULL DEFAULT '',
+      occurred_ms INTEGER,
+      PRIMARY KEY (fact_id, source_event_id, source_revision)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory2_fact_principals (
+      fact_id TEXT NOT NULL REFERENCES memory2_facts(fact_id) ON DELETE CASCADE,
+      principal_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('allowed','audience')),
+      PRIMARY KEY (fact_id, principal_id, role)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory2_fact_jobs (
+      job_key TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      chat_scope_key TEXT NOT NULL,
+      source_refs_json TEXT NOT NULL,
+      extractor_version TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('queued','running','done','skipped','cancelled','failed')),
+      reason TEXT,
+      first_activity_ms INTEGER NOT NULL,
+      last_activity_ms INTEGER NOT NULL,
+      due_ms INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_ms INTEGER NOT NULL,
+      updated_ms INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory2_fact_jobs_due ON memory2_fact_jobs (state, due_ms)
+    """,
+)
 
 
 class MemoryStore:
@@ -138,7 +215,327 @@ class MemoryStore:
                 self._conn.execute("SELECT contact_id FROM memory2_nodes LIMIT 0")
             except sqlite3.OperationalError:
                 self._conn.execute("ALTER TABLE memory2_nodes ADD COLUMN contact_id TEXT")
+            self._migrate_shared_facts()
             self._conn.commit()
+
+    def _migrate_shared_facts(self) -> None:
+        """Additive shared-fact schema (Plan 05).
+
+        No column is added to ``memory2_nodes``: an existing row therefore has no fact
+        row and can never acquire shared-fact read rights by accident.
+        """
+        with self._lock:
+            for statement in _SHARED_FACT_SCHEMA:
+                self._conn.execute(statement)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memory2_meta (key, value)"
+                " VALUES ('memory_schema_version', '2')"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memory2_meta (key, value) VALUES ('acl_epoch', '1')"
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM memory2_meta WHERE key = ? LIMIT 1", (str(key),)
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory2_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(key), str(value)),
+            )
+            self._conn.commit()
+
+    def acl_epoch(self) -> int:
+        raw = self.get_meta("acl_epoch")
+        try:
+            return int(raw) if raw is not None else 0
+        except ValueError:
+            return 0
+
+    def bump_acl_epoch(self) -> int:
+        """Invalidate every cached permission decision after a rights change."""
+        with self._lock:
+            next_epoch = self.acl_epoch() + 1
+            self._conn.execute(
+                """
+                INSERT INTO memory2_meta (key, value) VALUES ('acl_epoch', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(next_epoch),),
+            )
+            self._conn.commit()
+        return next_epoch
+
+    # -- shared facts (Plan 05, Aufgabe 1) --------------------------------------
+
+    def upsert_fact(self, fact: SharedFact) -> SharedFact:
+        """Write node, fact row, sources and principals; idempotent per fact id."""
+        now_ms = int(fact.updated_ms or fact.created_ms or 0)
+        entry = MemoryEntry(
+            id=fact.fact_id,
+            workspace_id=fact.workspace_id,
+            scope_type="chat",
+            scope_key=fact.chat_scope_key,
+            sector="semantic",
+            kind="shared_fact",
+            content=fact.content,
+            content_norm=fact.content.strip().lower(),
+            content_hash=fact_content_hash(fact.fact_id, fact.content),
+            salience=0.6,
+            confidence=0.6,
+            source="shared_fact",
+        )
+        self.upsert_node(entry)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory2_facts (
+                    fact_id, workspace_id, chat_scope_key, author_principal,
+                    assertion_status, visibility_scope, group_rule, audience_snapshot_id,
+                    valid_from_ms, valid_until_ms, superseded_by, revoked_at_ms,
+                    extractor_version, created_ms, updated_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fact_id) DO UPDATE SET
+                    assertion_status = excluded.assertion_status,
+                    visibility_scope = excluded.visibility_scope,
+                    group_rule = excluded.group_rule,
+                    audience_snapshot_id = excluded.audience_snapshot_id,
+                    valid_until_ms = excluded.valid_until_ms,
+                    superseded_by = excluded.superseded_by,
+                    revoked_at_ms = excluded.revoked_at_ms,
+                    updated_ms = excluded.updated_ms
+                """,
+                (
+                    fact.fact_id,
+                    fact.workspace_id,
+                    fact.chat_scope_key,
+                    fact.author_principal,
+                    fact.assertion_status,
+                    fact.visibility_scope,
+                    fact.group_rule,
+                    fact.audience_snapshot_id,
+                    int(fact.valid_from_ms),
+                    None if fact.valid_until_ms is None else int(fact.valid_until_ms),
+                    fact.superseded_by,
+                    None if fact.revoked_at_ms is None else int(fact.revoked_at_ms),
+                    fact.extractor_version,
+                    int(fact.created_ms or now_ms),
+                    now_ms,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM memory2_fact_sources WHERE fact_id = ?", (fact.fact_id,)
+            )
+            for source in fact.sources:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO memory2_fact_sources (
+                        fact_id, source_event_id, source_revision, source_trace_id,
+                        author_principal, source_channel, source_chat_id, occurred_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fact.fact_id,
+                        source.source_event_id,
+                        int(source.source_revision),
+                        source.source_trace_id,
+                        source.author_principal,
+                        source.source_channel,
+                        source.source_chat_id,
+                        None if source.occurred_ms is None else int(source.occurred_ms),
+                    ),
+                )
+            self._conn.execute(
+                "DELETE FROM memory2_fact_principals WHERE fact_id = ?", (fact.fact_id,)
+            )
+            for principal in sorted(fact.audience):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO memory2_fact_principals (fact_id, principal_id, role)"
+                    " VALUES (?, ?, 'audience')",
+                    (fact.fact_id, principal),
+                )
+            for principal in sorted(fact.allowed_principals):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO memory2_fact_principals (fact_id, principal_id, role)"
+                    " VALUES (?, ?, 'allowed')",
+                    (fact.fact_id, principal),
+                )
+            self._conn.commit()
+        stored = self.get_fact(fact.fact_id)
+        if stored is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"fact vanished right after write: {fact.fact_id}")
+        return stored
+
+    def get_fact(self, fact_id: str) -> SharedFact | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memory2_facts WHERE fact_id = ? LIMIT 1", (str(fact_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            node = self._conn.execute(
+                "SELECT content FROM memory2_nodes WHERE id = ? LIMIT 1", (str(fact_id),)
+            ).fetchone()
+            source_rows = self._conn.execute(
+                """
+                SELECT * FROM memory2_fact_sources
+                 WHERE fact_id = ?
+                 ORDER BY source_event_id, source_revision
+                """,
+                (str(fact_id),),
+            ).fetchall()
+            principal_rows = self._conn.execute(
+                "SELECT principal_id, role FROM memory2_fact_principals WHERE fact_id = ?",
+                (str(fact_id),),
+            ).fetchall()
+        audience = frozenset(
+            str(r["principal_id"]) for r in principal_rows if str(r["role"]) == "audience"
+        )
+        allowed = frozenset(
+            str(r["principal_id"]) for r in principal_rows if str(r["role"]) == "allowed"
+        )
+        return SharedFact(
+            fact_id=str(row["fact_id"]),
+            workspace_id=str(row["workspace_id"]),
+            chat_scope_key=str(row["chat_scope_key"]),
+            content="" if node is None else str(node["content"]),
+            author_principal=str(row["author_principal"]),
+            assertion_status=str(row["assertion_status"]),  # type: ignore[arg-type]
+            visibility_scope=str(row["visibility_scope"]),  # type: ignore[arg-type]
+            group_rule=str(row["group_rule"]),  # type: ignore[arg-type]
+            valid_from_ms=int(row["valid_from_ms"]),
+            extractor_version=str(row["extractor_version"]),
+            sources=tuple(
+                FactSource(
+                    source_event_id=str(r["source_event_id"]),
+                    source_revision=int(r["source_revision"]),
+                    source_trace_id=str(r["source_trace_id"] or ""),
+                    author_principal=str(r["author_principal"] or ""),
+                    source_channel=str(r["source_channel"] or ""),
+                    source_chat_id=str(r["source_chat_id"] or ""),
+                    occurred_ms=None if r["occurred_ms"] is None else int(r["occurred_ms"]),
+                )
+                for r in source_rows
+            ),
+            allowed_principals=allowed,
+            audience=audience,
+            audience_snapshot_id=(
+                None if row["audience_snapshot_id"] is None else str(row["audience_snapshot_id"])
+            ),
+            valid_until_ms=None if row["valid_until_ms"] is None else int(row["valid_until_ms"]),
+            superseded_by=None if row["superseded_by"] is None else str(row["superseded_by"]),
+            revoked_at_ms=None if row["revoked_at_ms"] is None else int(row["revoked_at_ms"]),
+            created_ms=int(row["created_ms"]),
+            updated_ms=int(row["updated_ms"]),
+        )
+
+    def list_facts(
+        self,
+        *,
+        workspace_id: str | None = None,
+        chat_scope_key: str | None = None,
+        include_inactive: bool = True,
+        limit: int | None = None,
+    ) -> list[SharedFact]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(str(workspace_id))
+        if chat_scope_key is not None:
+            clauses.append("chat_scope_key = ?")
+            params.append(str(chat_scope_key))
+        if not include_inactive:
+            clauses.append("assertion_status IN ('assertion', 'confirmed')")
+            clauses.append("revoked_at_ms IS NULL")
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        sql = f"SELECT fact_id FROM memory2_facts{where} ORDER BY created_ms, fact_id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        facts: list[SharedFact] = []
+        for row in rows:
+            fact = self.get_fact(str(row["fact_id"]))
+            if fact is not None:
+                facts.append(fact)
+        return facts
+
+    def set_fact_status(
+        self,
+        fact_id: str,
+        *,
+        status: str,
+        now_ms: int,
+        superseded_by: str | None = None,
+    ) -> bool:
+        if status not in ASSERTION_STATUSES:
+            raise ValueError(f"unknown assertion status: {status}")
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory2_facts
+                   SET assertion_status = ?,
+                       superseded_by = COALESCE(?, superseded_by),
+                       revoked_at_ms = CASE WHEN ? = 'revoked' THEN ? ELSE revoked_at_ms END,
+                       updated_ms = ?
+                 WHERE fact_id = ?
+                """,
+                (
+                    status,
+                    superseded_by,
+                    status,
+                    int(now_ms),
+                    int(now_ms),
+                    str(fact_id),
+                ),
+            )
+            self._conn.commit()
+            changed = cursor.rowcount > 0
+        if changed:
+            self.bump_acl_epoch()
+        return changed
+
+    def redact_fact(self, fact_id: str, *, now_ms: int) -> bool:
+        """Drop content and audience of a fact, keeping the tombstone and its sources."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory2_facts
+                   SET assertion_status = 'revoked', revoked_at_ms = ?, updated_ms = ?
+                 WHERE fact_id = ?
+                """,
+                (int(now_ms), int(now_ms), str(fact_id)),
+            )
+            if cursor.rowcount == 0:
+                self._conn.commit()
+                return False
+            self._conn.execute(
+                "DELETE FROM memory2_fact_principals WHERE fact_id = ?", (str(fact_id),)
+            )
+            self._conn.execute(
+                """
+                UPDATE memory2_nodes
+                   SET content = '', content_norm = '', is_deleted = 1, updated_at = ?
+                 WHERE id = ?
+                """,
+                (datetime.now(UTC).isoformat(), str(fact_id)),
+            )
+            self._conn.execute(
+                "DELETE FROM memory2_nodes_fts WHERE entry_id = ?", (str(fact_id),)
+            )
+            self._conn.commit()
+        self.bump_acl_epoch()
+        return True
 
     @staticmethod
     def _normalize_query(query: str) -> str:
