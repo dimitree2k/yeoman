@@ -971,3 +971,148 @@ async def test_self_declared_approval_is_not_authorization(tmp_path: Path) -> No
     assert result.state == "blocked"
     assert executor.calls == []
     store.close()
+
+
+# --------------------------------------------------------------------------------------
+# parametrized integration coverage (Plan 02, Aufgabe 2)
+# --------------------------------------------------------------------------------------
+
+
+async def _produce_final_reply(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    await router.submit_outbound(_outbound("hi"), principal="owner@s.whatsapp.net")
+
+
+async def _produce_message_tool(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    from yeoman_gateway.agent.tools.message import MessageTool
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    tool = MessageTool(send_callback=ManagedOutboundDispatcher(router=router, bus=bus))
+    await tool.execute(content="hi", channel="whatsapp", chat_id=CHAT)
+
+
+async def _produce_voice(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
+
+    dispatcher = ManagedOutboundDispatcher(router=router, bus=bus)
+    await dispatcher(
+        OutboundMessage(channel="whatsapp", chat_id=CHAT, content="", media=["/tmp/v.ogg"])
+    )
+
+
+async def _produce_reaction(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    await router.submit_reaction(
+        SendReactionIntent(channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"),
+        principal="owner@s.whatsapp.net",
+    )
+
+
+async def _produce_cron(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    await ServiceEffectProducer(router=router, bus=bus).send(
+        source="cron",
+        operation_ref="cron:job-1:run-1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="reminder",
+    )
+
+
+async def _produce_speakup(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    await ServiceEffectProducer(router=router, bus=bus).send(
+        source="speakup",
+        operation_ref="speakup:1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="spontaneous thought",
+    )
+
+
+async def _produce_ipc(router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    await ServiceEffectProducer(router=router, bus=bus).send(
+        source="ipc",
+        operation_ref="ipc:1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="from overseer",
+    )
+
+
+async def _run_producer(produce, router: IntentEffectRouter, bus: _RecordingBus) -> None:
+    """Producers that report to a model surface the refusal; the ledger still decides."""
+    from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
+
+    try:
+        await produce(router, bus)
+    except EffectNotDeliveredError:
+        pass
+
+
+PRODUCERS = {
+    "final_reply": _produce_final_reply,
+    "message_tool": _produce_message_tool,
+    "voice": _produce_voice,
+    "reaction": _produce_reaction,
+    "cron": _produce_cron,
+    "speakup": _produce_speakup,
+    "ipc": _produce_ipc,
+}
+
+
+@pytest.mark.parametrize("producer_name", sorted(PRODUCERS))
+@pytest.mark.asyncio
+async def test_every_producer_is_authorized_once(
+    tmp_path: Path, producer_name: str
+) -> None:
+    """Allowed -> exactly one executor call; denied -> none; duplicate -> no second call."""
+    produce = PRODUCERS[producer_name]
+
+    # allowed
+    store = ProcessingStore(tmp_path / "allowed.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    await _run_producer(produce, router, _RecordingBus())
+    assert len(executor.calls) == 1, producer_name
+    store.close()
+
+    # denied
+    store = ProcessingStore(tmp_path / "denied.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor, capabilities=_DenyAll())
+    await _run_producer(produce, router, _RecordingBus())
+    assert executor.calls == [], producer_name
+    assert store.count_effects() == 1, producer_name
+    store.close()
+
+    # duplicate operation
+    store = ProcessingStore(tmp_path / "duplicate.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    await _run_producer(produce, router, _RecordingBus())
+    await _run_producer(produce, router, _RecordingBus())
+    assert len(executor.calls) == 1, producer_name
+    store.close()
+
+
+@pytest.mark.parametrize("producer_name", sorted(PRODUCERS))
+@pytest.mark.asyncio
+async def test_generic_transport_error_never_becomes_a_chat_error(
+    tmp_path: Path, producer_name: str
+) -> None:
+    produce = PRODUCERS[producer_name]
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor(error=RuntimeError("bridge exploded"))
+    router, gateway = _router(store, executor)
+    bus = _RecordingBus()
+
+    await _run_producer(produce, router, bus)
+
+    assert executor.calls != [], producer_name
+    assert bus.sent == [], producer_name
+    effects = store.list_effects()
+    assert effects and effects[0].state == "unknown", producer_name
+    store.close()

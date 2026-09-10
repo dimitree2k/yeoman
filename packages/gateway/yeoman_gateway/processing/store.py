@@ -461,6 +461,36 @@ class ProcessingStore:
             row = self._conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
         return int(row["n"])
 
+    def list_effects(
+        self, *, states: Iterable[str] | None = None, limit: int = 100
+    ) -> tuple[RetainedEffectMeta, ...]:
+        """Lineage projections of effects, optionally filtered by state.
+
+        The reconciler (Plan 04) and diagnostics use this; it never exposes payload text.
+        """
+        query = "SELECT * FROM effects"
+        params: list[Any] = []
+        if states is not None:
+            wanted = tuple(states)
+            if not wanted:
+                return ()
+            placeholders = ",".join("?" for _ in wanted)
+            query += f" WHERE state IN ({placeholders})"
+            params.extend(wanted)
+        query += " ORDER BY created_ms, effect_id LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+            effects = tuple(
+                _effect_meta_from_row(
+                    row,
+                    attempts=self._attempts_for(row["effect_id"]),
+                    evidence=self._evidence_for(row["effect_id"]),
+                )
+                for row in rows
+            )
+        return effects
+
     def count_effects(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS n FROM effects").fetchone()
