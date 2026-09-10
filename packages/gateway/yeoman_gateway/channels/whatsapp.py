@@ -868,6 +868,9 @@ class WhatsAppChannel(BaseChannel):
                     verdict.reason,
                     verdict.decision.decision_id if verdict.decision else "-",
                 )
+                # The owner wants a complete inbound record, so a refused message is
+                # archived before the pipeline drops it.
+                self._archive_inbound_event(event)
                 return
 
         event = await self._enrich_media_event(event)

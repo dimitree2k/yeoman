@@ -439,6 +439,7 @@ def build_shared_fact_runtime(
         store=memory.store,
         journal=store,
         extractor=extractor,
+        embedder=getattr(memory, "embedding", None),
         idle_ms=int(getattr(extraction_cfg, "idle_seconds", 60)) * 1000,
         max_delay_ms=int(getattr(extraction_cfg, "max_delay_seconds", 300)) * 1000,
         max_waiting=int(getattr(shared, "max_jobs_waiting", 64)),

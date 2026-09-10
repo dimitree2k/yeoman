@@ -269,3 +269,123 @@ def test_meta_statements_are_refused() -> None:
     )
     assert verdict.rejected
     assert verdict.reason == "meta_statement"
+
+
+class _StubEmbedder:
+    """Deterministic stand-in: 'stammtisch' and 'treffen' land on the same axis."""
+
+    model = "stub-embed"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float] | None:
+        self.calls.append(text)
+        if self.fail:
+            raise RuntimeError("embedding provider down")
+        if "stammtisch" in text.lower() or "treffen" in text.lower():
+            return [1.0, 0.0]
+        return [0.0, 1.0]
+
+
+def _queue_with(
+    store: MemoryStore, *, embedder=None, content: str = "Der Stammtisch ist donnerstags."
+) -> SharedFactExtractionQueue:
+    extractor = _extractor(
+        _payload({"content": content, "basis": "explicit_statement"}),
+        members=frozenset({"member-old"}),
+    )
+
+    class _Journal:
+        def get_event(self, event_id: str):
+            return _Event(event_id, content)
+
+    return SharedFactExtractionQueue(
+        store=store, extractor=extractor, journal=_Journal(), embedder=embedder, clock=lambda: T0
+    )
+
+
+def _run(
+    queue: SharedFactExtractionQueue,
+    *,
+    workspace: str = "ws1",
+    scope: str = GROUP,
+) -> None:
+    queue.enqueue(
+        turn_ref="tu1",
+        source_refs=[("ev1", 1)],
+        now_ms=T0,
+        workspace_id=workspace,
+        chat_scope_key=scope,
+    )
+    queue.run_due(now_ms=T0)
+
+
+def test_published_facts_get_an_embedding(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+    embedder = _StubEmbedder()
+    queue = _queue_with(store, embedder=embedder)
+
+    _run(queue)
+
+    fact = store.list_facts()[0]
+    assert embedder.calls == [fact.content]
+    assert queue.embeddings_written == 1
+    assert store.has_fact_embeddings() is True
+    row = store._conn.execute(
+        "SELECT model, dims FROM memory2_embeddings WHERE entry_id = ?", (fact.fact_id,)
+    ).fetchone()
+    assert row["model"] == "stub-embed"
+    assert row["dims"] == 2
+    store.close()
+
+
+def test_embedding_failure_keeps_the_fact(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+    queue = _queue_with(store, embedder=_StubEmbedder(fail=True))
+
+    _run(queue)
+
+    assert len(store.list_facts()) == 1  # the fact survives ...
+    assert store.has_fact_embeddings() is False  # ... without a vector
+    assert queue.embeddings_failed == 1
+    store.close()
+
+
+def test_fact_is_found_by_meaning_not_only_by_words(tmp_path: Path) -> None:
+    """A query with no word in common still finds the fact, via the vector path."""
+    from unittest.mock import patch
+
+    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.memory.shared_facts import FactReadContext
+    from yeoman_shared.config.schema import Config
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir(exist_ok=True)
+    cfg = Config()
+    cfg.memory.db_path = str(tmp_path / "memory.db")
+    cfg.memory.capture.enabled = False
+    cfg.memory.embedding.enabled = False
+    cfg.memory.shared.enabled = True
+    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+        service = MemoryService(workspace=workspace, config=cfg.memory)
+
+    embedder = _StubEmbedder()
+    queue = _queue_with(service.store, embedder=embedder)
+    scope = "channel:whatsapp:chat:gruppe@g.us"  # the canonical scope key
+    _run(queue, workspace=service.workspace_id, scope=scope)
+    service.embedding = embedder  # retrieval must embed the query too
+
+    context = FactReadContext(
+        principal_id="member-old",
+        chat_scope_key=scope,
+        current_members=frozenset({"member-old"}),
+        now_ms=T0 + 1,
+    )
+    result = service.retrieve_for_context(query="Wann ist das Treffen?", read_context=context)
+
+    assert result.hits, "the semantic match did not surface the fact"
+    assert "Stammtisch" in result.hits[0].entry.content
+    assert "Wann ist das Treffen?" in embedder.calls
+    service.close()

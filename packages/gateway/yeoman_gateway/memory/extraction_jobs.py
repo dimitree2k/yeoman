@@ -275,6 +275,7 @@ class SharedFactExtractionQueue:
         store: "MemoryStore",
         extractor: Callable[[Any], Iterable[SharedFactCandidate]] | None = None,
         journal: Any | None = None,
+        embedder: Any | None = None,
         idle_ms: int = 60_000,
         max_delay_ms: int = 300_000,
         max_waiting: int = 32,
@@ -286,6 +287,9 @@ class SharedFactExtractionQueue:
         self._store = store
         self._extractor = extractor
         self._journal = journal
+        self._embedder = embedder
+        self.embeddings_written = 0
+        self.embeddings_failed = 0
         self._idle_ms = int(idle_ms)
         self._max_delay_ms = int(max_delay_ms)
         self._max_waiting = max(1, int(max_waiting))
@@ -492,7 +496,38 @@ class SharedFactExtractionQueue:
             updated_ms=int(now_ms),
         )
         self._store.upsert_fact(fact)
+        self._embed_fact(fact)
         return True
+
+    def _embed_fact(self, fact: SharedFact) -> None:
+        """Attach a vector so the fact is findable by meaning, not only by words.
+
+        An embedding failure never loses the fact: it stays stored and retrievable
+        lexically, and the failure is counted instead of hidden.
+        """
+        if self._embedder is None or not fact.content.strip():
+            return
+        try:
+            from yeoman_gateway.memory.store import MemoryStore  # noqa: F401  (type only)
+
+            vector = self._embedder.embed(fact.content)
+        except Exception as exc:
+            self.embeddings_failed += 1
+            logger.warning("shared fact embedding failed: {}", exc)
+            return
+        if not vector:
+            self.embeddings_failed += 1
+            return
+        model = str(getattr(self._embedder, "model", "unknown"))
+        try:
+            self._store.set_fact_embedding(
+                fact.fact_id, workspace_id=fact.workspace_id, model=model, vector=list(vector)
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.embeddings_failed += 1
+            logger.warning("shared fact embedding could not be stored: {}", exc)
+            return
+        self.embeddings_written += 1
 
     def _load_events(self, refs: tuple[tuple[str, int], ...]) -> list[Any] | None:
         """All source events, or ``None`` when any payload is no longer available."""

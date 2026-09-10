@@ -423,6 +423,14 @@ class MemoryStore:
                 ).fetchone()
         return int(row["c"])
 
+    def set_fact_embedding(
+        self, fact_id: str, *, workspace_id: str, model: str, vector: list[float]
+    ) -> None:
+        """Store a fact's vector so semantic retrieval can find it."""
+        with self._lock:
+            self._upsert_embedding(str(fact_id), str(workspace_id), str(model), vector)
+            self._conn.commit()
+
     def has_fact_embeddings(self) -> bool:
         """True when at least one shared fact carries a vector.
 
