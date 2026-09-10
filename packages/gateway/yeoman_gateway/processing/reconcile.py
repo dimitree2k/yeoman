@@ -19,10 +19,12 @@ Absence of evidence is never proof: an empty result is ``inconclusive``, not
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
+
+from loguru import logger
 
 from yeoman_gateway.processing.models import (
     DecisionRecord,
@@ -312,8 +314,251 @@ __all__ = [
     "ProbeResult",
     "ReconciliationProbe",
     "ReconciliationResult",
+    "ReconciliationService",
     "no_provider_lookup",
     "operator_decision",
     "probe_due_ms",
     "reconcile_effect",
 ]
+
+
+class ReconciliationService:
+    """Bounded reconciliation loop. It probes; it never executes an effect."""
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        probe: ReconciliationProbe,
+        config: Any,
+        worker_id: str = "reconciler",
+        clock: Callable[[], int] | None = None,
+        tick_seconds: float = 1.0,
+    ) -> None:
+        self._store = store
+        self._probe = probe
+        self._config = config
+        self._worker_id = worker_id
+        self._clock = clock or _now_ms
+        self._tick_seconds = max(0.05, float(tick_seconds))
+        self._task: Any = None
+        self._stopping = False
+        self._counters: dict[str, int] = {
+            "ticks": 0,
+            "probes_run": 0,
+            "confirmed": 0,
+            "not_executed": 0,
+            "inconclusive": 0,
+            "escalated": 0,
+            "recovered": 0,
+        }
+
+    # -- lifecycle ---------------------------------------------------------------------
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        import asyncio
+
+        self._stopping = False
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        import asyncio
+
+        self._stopping = True
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def _run_loop(self) -> None:
+        import asyncio
+
+        while not self._stopping:
+            try:
+                await self.tick_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one bad tick must not end the loop
+                logger.warning("reconciliation tick failed error_type={}", type(exc).__name__)
+            await asyncio.sleep(self._tick_seconds)
+
+    def stats(self) -> Mapping[str, int]:
+        return dict(self._counters)
+
+    # -- work --------------------------------------------------------------------------
+
+    async def tick_once(self) -> tuple[ReconciliationResult, ...]:
+        import asyncio
+
+        now = self._clock()
+        self._counters["ticks"] += 1
+
+        recovered = self._store.recover_executing(now)
+        self._counters["recovered"] += len(recovered)
+        for effect_id in recovered:
+            # The outcome was already open before the restart, so the first probe is due now.
+            self._store.schedule_probe(effect_id, attempt_number=1, due_ms=now, now_ms=now)
+
+        candidates = [
+            effect.effect_id
+            for effect in self._store.list_effects(
+                states=("unknown", "unknown_nonrepeatable"), limit=200
+            )
+        ]
+        if not candidates:
+            return ()
+
+        semaphore = asyncio.Semaphore(max(1, int(self._probe_concurrency())))
+        results: list[ReconciliationResult] = []
+
+        async def _one(effect_id: str) -> None:
+            async with semaphore:
+                result = await self._reconcile_candidate(effect_id, now)
+                if result is not None:
+                    results.append(result)
+
+        await asyncio.gather(*(_one(effect_id) for effect_id in candidates))
+        return tuple(results)
+
+    async def reconcile_effect(self, effect_id: str) -> ReconciliationResult | None:
+        return await self._reconcile_candidate(effect_id, self._clock(), force=True)
+
+    # -- internals ---------------------------------------------------------------------
+
+    def _probe_concurrency(self) -> int:
+        return int(getattr(self._config, "probe_concurrency", 2) or 1)
+
+    def _backoff(self) -> tuple[int, ...]:
+        return tuple(int(step) for step in getattr(self._config, "backoff_seconds", (5, 15, 45)))
+
+    async def _reconcile_candidate(
+        self, effect_id: str, now: int, *, force: bool = False
+    ) -> ReconciliationResult | None:
+        import asyncio
+
+        effect = self._effect_meta(effect_id)
+        if effect is None:
+            return None
+        unknown_ms = int(effect.updated_ms or now)
+        deadline_ms = unknown_ms + int(getattr(self._config, "deadline_seconds", 600)) * 1000
+        max_probes = int(getattr(self._config, "max_probes", 6))
+        backoff = self._backoff()
+
+        probe_record = self._store.open_probe(effect_id)
+        if probe_record is None:
+            attempt = self._store.next_probe_number(effect_id)
+            due_ms = probe_due_ms(unknown_ms, attempt_number=attempt, backoff_seconds=backoff)
+            # Past the deadline no further probe is planned at all; the plan fixes the
+            # deadline as a product decision, not a provider statement.
+            if attempt > max_probes or now >= deadline_ms or due_ms > deadline_ms:
+                return self._escalate(effect_id, now, reason="deadline reached; operator decision required")
+            self._store.schedule_probe(
+                effect_id, attempt_number=attempt, due_ms=due_ms, now_ms=now
+            )
+            probe_record = self._store.open_probe(effect_id)
+            if probe_record is None:
+                return None
+
+        if not force and (probe_record.due_ms > now or now >= deadline_ms):
+            return None
+
+        lease_ms = int(getattr(self._config, "claim_lease_seconds", 30)) * 1000
+        if not self._store.claim_probe(probe_record.probe_id, self._worker_id, now, lease_ms):
+            return None
+
+        timeout_s = max(0.1, int(getattr(self._config, "probe_timeout_ms", 10_000)) / 1000)
+        transport = self._store.effect_transport_receipt(effect_id)
+        signals = ()
+        if transport is not None and transport.provider_message_id:
+            signals = self._store.delivery_signals(
+                chat_id=transport.chat_id, message_id=transport.provider_message_id
+            )
+        request = ProbeRequest(
+            effect=effect,
+            transport=transport,
+            attempt_number=probe_record.attempt_number,
+            deadline_ms=deadline_ms,
+            signals=signals,
+        )
+        try:
+            result = await asyncio.wait_for(self._probe.probe(request), timeout=timeout_s)
+        except asyncio.CancelledError:
+            self._store.finish_probe(
+                probe_record.probe_id,
+                outcome=ProbeOutcome.INCONCLUSIVE.value,
+                now_ms=self._clock(),
+                worker_id=self._worker_id,
+                detail="cancelled",
+            )
+            raise
+        except Exception as exc:
+            result = ProbeResult(
+                ProbeOutcome.INCONCLUSIVE, f"probe raised {type(exc).__name__}"
+            )
+
+        self._store.finish_probe(
+            probe_record.probe_id,
+            outcome=result.outcome.value,
+            now_ms=self._clock(),
+            worker_id=self._worker_id,
+            detail=result.detail,
+        )
+        self._counters["probes_run"] += 1
+        self._counters[result.outcome.value] = self._counters.get(result.outcome.value, 0) + 1
+
+        reconciled = await reconcile_effect(
+            self._store,
+            effect_id,
+            probe=_StaticProbe(result),
+            now_ms=self._clock(),
+            attempt_number=probe_record.attempt_number,
+            deadline_ms=deadline_ms,
+            worker_id=self._worker_id,
+        )
+        return reconciled
+
+    def _escalate(self, effect_id: str, now: int, *, reason: str) -> ReconciliationResult:
+        state = self._store.effect_state(effect_id)
+        if state in ("unknown", "unknown_nonrepeatable"):
+            if state == "unknown":
+                self._store.transition(
+                    effect_id,
+                    expected="unknown",
+                    target="unknown_nonrepeatable",
+                    now_ms=now,
+                    evidence={"kind": "probe", "detail": reason},
+                )
+            self._store.record_evidence(
+                effect_id, kind="operator", now_ms=now, detail="pending local operator decision"
+            )
+            self._counters["escalated"] += 1
+        return ReconciliationResult(
+            effect_id, ProbeOutcome.INCONCLUSIVE, "unknown_nonrepeatable", reason
+        )
+
+    def _effect_meta(self, effect_id: str) -> RetainedEffectMeta | None:
+        for effect in self._store.list_effects(states=None, limit=500):
+            if effect.effect_id == effect_id:
+                return effect
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticProbe:
+    """Replays one already computed result without looking again."""
+
+    result: ProbeResult
+
+    async def probe(self, request: ProbeRequest) -> ProbeResult:
+        return self.result
