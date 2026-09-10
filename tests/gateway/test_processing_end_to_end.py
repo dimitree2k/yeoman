@@ -427,3 +427,14 @@ async def test_soft_thread_limit_refuses_only_when_explicitly_enabled(tmp_path: 
         assert runtime.transport.sent == ["one", "two"]
     finally:
         runtime.store.close()
+
+
+def test_the_session_guard_keeps_stores_away_from_the_runtime_tree() -> None:
+    """The harness bug that motivated tests/conftest.py cannot come back silently."""
+    from pathlib import Path
+
+    from yeoman_shared.utils.helpers import get_data_path
+
+    resolved = get_data_path().resolve()
+    assert "yeoman-home" in str(resolved), resolved
+    assert resolved != (Path.home() / ".yeoman" / "data").resolve()

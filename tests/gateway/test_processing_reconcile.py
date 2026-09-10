@@ -365,6 +365,12 @@ async def test_late_evidence_never_downgrades_a_sent_effect(tmp_path: Path) -> N
 async def test_lineage_exposes_evidence_without_raw_content(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     effect_id = await _make_unknown(store)
+
+    # The payload is retained at this point: if it ever disappears later, the purge
+    # happened between here and the assertion below, which localises the cause.
+    fresh = [item for item in store.list_effects() if item.effect_id == effect_id]
+    assert fresh and fresh[0].payload_available is True
+
     store.record_transport_receipt(
         effect_id, channel="whatsapp", chat_id=CHAT, provider_message_id="3EB0", now_ms=T0
     )
@@ -374,7 +380,18 @@ async def test_lineage_exposes_evidence_without_raw_content(tmp_path: Path) -> N
 
     assert "hi" not in rendered  # no payload text
     assert "4915" not in rendered  # no raw JID
-    assert view.effects[0].payload_available is True
+    # Resolve by id instead of by position, so ordering can never make this flaky.
+    matched = [item for item in view.effects if item.effect_id == effect_id]
+    assert matched, (
+        f"effect {effect_id} missing from the lineage view; "
+        f"view holds {[(item.effect_id, item.state) for item in view.effects]}"
+    )
+    meta = matched[0]
+    assert meta.payload_available is True, (
+        "payload was purged before the lineage was read: "
+        f"purged_ms={meta.payload_purged_ms} state={meta.state} "
+        f"rows={[(item.effect_id, item.payload_available, item.payload_purged_ms) for item in view.effects]}"
+    )
     store.close()
 
 

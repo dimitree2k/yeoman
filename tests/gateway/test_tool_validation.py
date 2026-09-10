@@ -980,7 +980,10 @@ async def test_non_owner_raw_voice_send_does_not_bypass_llm(
 def test_workspace_path_relative_is_scoped_under_yeoman_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Both variables are set: the session guard points YEOMAN_HOME at a throwaway
+    # directory, and this test is precisely about that resolution.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("YEOMAN_HOME", raising=False)
     cfg = Config.model_validate(convert_keys({"agents": {"defaults": {"workspace": "workspace"}}}))
     assert cfg.workspace_path == tmp_path / ".yeoman" / "workspace"
 
@@ -989,6 +992,7 @@ def test_get_workspace_path_relative_is_scoped_under_yeoman_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("YEOMAN_HOME", raising=False)
 
     relative = get_workspace_path("workspace")
     absolute_target = tmp_path / "custom-workspace"

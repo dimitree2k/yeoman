@@ -44,6 +44,7 @@ poetry.lock
 tests/
 !tests/
 tests/*
+!tests/conftest.py
 !tests/gateway/
 tests/gateway/*
 !tests/gateway/test_v1_only_runtime.py
@@ -98,6 +99,7 @@ tests/gateway/*
 !tests/gateway/test_processing_end_to_end.py
 !tests/gateway/test_processing_cutover.py
 !tests/gateway/test_processing_timings.py
+!tests/gateway/test_inbound_archive_range.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py
