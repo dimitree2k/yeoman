@@ -14,6 +14,7 @@ from typing import Any
 from yeoman_shared.utils.helpers import ensure_dir
 
 from yeoman_gateway.memory.models import MemoryEntry, MemoryHit, MemorySector
+from yeoman_gateway.memory.read_gate import FactAclPredicate
 from yeoman_gateway.memory.shared_facts import (
     ASSERTION_STATUSES,
     FactSource,
@@ -252,6 +253,175 @@ class MemoryStore:
                 (str(key), str(value)),
             )
             self._conn.commit()
+
+    def fact_audience(self, fact_id: str) -> tuple[str, ...]:
+        """Stored audience rows of a fact. Missing rows mean nobody, never everybody."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT principal_id FROM memory2_fact_principals"
+                " WHERE fact_id = ? AND role = 'audience' ORDER BY principal_id",
+                (str(fact_id),),
+            ).fetchall()
+        return tuple(str(row["principal_id"]) for row in rows)
+
+    def fact_allowed_principals(self, fact_id: str) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT principal_id FROM memory2_fact_principals"
+                " WHERE fact_id = ? AND role = 'allowed' ORDER BY principal_id",
+                (str(fact_id),),
+            ).fetchall()
+        return tuple(str(row["principal_id"]) for row in rows)
+
+    def select_fact_ids(
+        self,
+        *,
+        sql: str,
+        params: tuple[Any, ...] = (),
+        limit: int | None = None,
+    ) -> list[str]:
+        """Fact ids matching a gate predicate. The predicate is parameterised SQL."""
+        query = f"SELECT n.id FROM memory2_nodes n WHERE n.is_deleted = 0 AND ({sql})"
+        bound: tuple[Any, ...] = tuple(params)
+        if limit is not None:
+            query += " LIMIT ?"
+            bound = (*bound, int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, bound).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def list_fact_sources(self, fact_id: str) -> tuple[FactSource, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM memory2_fact_sources
+                 WHERE fact_id = ?
+                 ORDER BY source_event_id, source_revision
+                """,
+                (str(fact_id),),
+            ).fetchall()
+        return tuple(
+            FactSource(
+                source_event_id=str(row["source_event_id"]),
+                source_revision=int(row["source_revision"]),
+                source_trace_id=str(row["source_trace_id"] or ""),
+                author_principal=str(row["author_principal"] or ""),
+                source_channel=str(row["source_channel"] or ""),
+                source_chat_id=str(row["source_chat_id"] or ""),
+                occurred_ms=None if row["occurred_ms"] is None else int(row["occurred_ms"]),
+            )
+            for row in rows
+        )
+
+    def facts_by_source_event(self, source_event_id: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT fact_id FROM memory2_fact_sources WHERE source_event_id = ?",
+                (str(source_event_id),),
+            ).fetchall()
+        return [str(row["fact_id"]) for row in rows]
+
+    def delete_fact_sources(self, fact_id: str, *, source_event_ids: list[str]) -> int:
+        if not source_event_ids:
+            return 0
+        placeholders = ",".join(["?"] * len(source_event_ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"DELETE FROM memory2_fact_sources WHERE fact_id = ?"
+                f" AND source_event_id IN ({placeholders})",
+                (str(fact_id), *[str(item) for item in source_event_ids]),
+            )
+            self._conn.commit()
+        return int(cursor.rowcount)
+
+    def upsert_fact_job(
+        self,
+        *,
+        job_key: str,
+        workspace_id: str,
+        chat_scope_key: str,
+        source_refs_json: str,
+        extractor_version: str,
+        state: str,
+        due_ms: int,
+        now_ms: int,
+        reason: str | None = None,
+        first_activity_ms: int | None = None,
+        last_activity_ms: int | None = None,
+        attempts: int | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory2_fact_jobs (
+                    job_key, workspace_id, chat_scope_key, source_refs_json,
+                    extractor_version, state, reason, first_activity_ms,
+                    last_activity_ms, due_ms, attempts, created_ms, updated_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_key) DO UPDATE SET
+                    source_refs_json = excluded.source_refs_json,
+                    state = excluded.state,
+                    reason = COALESCE(excluded.reason, memory2_fact_jobs.reason),
+                    first_activity_ms = MIN(memory2_fact_jobs.first_activity_ms, excluded.first_activity_ms),
+                    last_activity_ms = excluded.last_activity_ms,
+                    due_ms = excluded.due_ms,
+                    attempts = COALESCE(?, memory2_fact_jobs.attempts),
+                    updated_ms = excluded.updated_ms
+                """,
+                (
+                    str(job_key),
+                    str(workspace_id),
+                    str(chat_scope_key),
+                    str(source_refs_json),
+                    str(extractor_version),
+                    str(state),
+                    reason,
+                    int(first_activity_ms if first_activity_ms is not None else now_ms),
+                    int(last_activity_ms if last_activity_ms is not None else now_ms),
+                    int(due_ms),
+                    int(attempts or 0),
+                    int(now_ms),
+                    int(now_ms),
+                    None if attempts is None else int(attempts),
+                ),
+            )
+            self._conn.commit()
+
+    def get_fact_job(self, job_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memory2_fact_jobs WHERE job_key = ? LIMIT 1", (str(job_key),)
+            ).fetchone()
+        return None if row is None else {key: row[key] for key in row.keys()}
+
+    def list_fact_jobs(
+        self, *, state: str | None = None, due_before_ms: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(str(state))
+        if due_before_ms is not None:
+            clauses.append("due_ms <= ?")
+            params.append(int(due_before_ms))
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM memory2_fact_jobs{where} ORDER BY due_ms, job_key LIMIT ?",
+                (*params, int(limit)),
+            ).fetchall()
+        return [{key: row[key] for key in row.keys()} for row in rows]
+
+    def count_fact_jobs(self, *, state: str | None = None) -> int:
+        with self._lock:
+            if state is None:
+                row = self._conn.execute("SELECT COUNT(*) AS c FROM memory2_fact_jobs").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory2_fact_jobs WHERE state = ?", (str(state),)
+                ).fetchone()
+        return int(row["c"])
 
     def acl_epoch(self) -> int:
         raw = self.get_meta("acl_epoch")
@@ -738,6 +908,7 @@ class MemoryStore:
         scope_keys: list[str],
         sectors: set[MemorySector] | None = None,
         limit: int = 12,
+        acl: "FactAclPredicate | None" = None,
     ) -> list[MemoryHit]:
         if not scope_keys:
             return []
@@ -757,6 +928,9 @@ class MemoryStore:
             sector_placeholders = ",".join(["?"] * len(sector_values))
             where.append(f"n.sector IN ({sector_placeholders})")
             params.extend(sector_values)
+        if acl is not None:
+            where.append(acl.sql)
+            params.extend(acl.params)
         sql = (
             "SELECT n.*, bm25(memory2_nodes_fts) AS fts_score "
             "FROM memory2_nodes_fts "
@@ -812,6 +986,7 @@ class MemoryStore:
         sectors: set[MemorySector] | None = None,
         limit: int = 12,
         candidate_limit: int = 256,
+        acl: "FactAclPredicate | None" = None,
     ) -> list[MemoryHit]:
         if not scope_keys or not query_vector:
             return []
@@ -827,6 +1002,9 @@ class MemoryStore:
             sector_placeholders = ",".join(["?"] * len(sector_values))
             where.append(f"n.sector IN ({sector_placeholders})")
             params.extend(sector_values)
+        if acl is not None:
+            where.append(acl.sql)
+            params.extend(acl.params)
         sql = (
             "SELECT n.*, e.vector "
             "FROM memory2_nodes n "

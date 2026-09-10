@@ -87,6 +87,7 @@ tests/gateway/*
 !tests/gateway/test_market_intelligence_tool.py
 !tests/gateway/test_reply_budget.py
 !tests/gateway/test_memory_shared_facts.py
+!tests/gateway/test_memory_visibility.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py

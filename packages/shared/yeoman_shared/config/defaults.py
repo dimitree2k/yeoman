@@ -132,6 +132,10 @@ DEFAULT_MEMORY: dict[str, Any] = {
     "enabled": True,
     "mode": "primary",
     "db_path": "~/.yeoman/data/memory/memory.db",
+    "shared": {
+        "enabled": False,
+        "extract_after_turn": True,
+    },
     "capture": {
         "enabled": True,
         "channels": ["cli", "telegram", "whatsapp", "discord", "feishu"],

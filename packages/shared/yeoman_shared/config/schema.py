@@ -382,6 +382,15 @@ class MemoryWalConfig(BaseModel):
     state_dir: str = str(DEFAULT_MEMORY["wal"]["state_dir"])
 
 
+class MemorySharedConfig(BaseModel):
+    """Shared chat facts (Plan 05). Disabled keeps every shared path inert."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_MEMORY["shared"]["enabled"])
+    extract_after_turn: bool = bool(DEFAULT_MEMORY["shared"]["extract_after_turn"])
+
+
 class MemoryConfig(BaseModel):
     """Single active semantic memory system configuration."""
 
@@ -390,6 +399,7 @@ class MemoryConfig(BaseModel):
     enabled: bool = bool(DEFAULT_MEMORY["enabled"])
     mode: Literal["primary", "shadow"] = str(DEFAULT_MEMORY["mode"])
     db_path: str = str(DEFAULT_MEMORY["db_path"])
+    shared: MemorySharedConfig = Field(default_factory=MemorySharedConfig)
     capture: MemoryCaptureConfig = Field(default_factory=MemoryCaptureConfig)
     recall: MemoryRecallConfig = Field(default_factory=MemoryRecallConfig)
     embedding: MemoryEmbeddingConfig = Field(default_factory=MemoryEmbeddingConfig)

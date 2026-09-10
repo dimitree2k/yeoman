@@ -30,7 +30,9 @@ from yeoman_gateway.memory.models import (
     MemoryHit,
     MemorySector,
 )
+from yeoman_gateway.memory.read_gate import FactAclPredicate, FactReadGate
 from yeoman_gateway.memory.session_state import SessionStateStore
+from yeoman_gateway.memory.shared_facts import FactReadContext, FactRetrievalResult
 from yeoman_gateway.memory.store import MemoryStore
 from yeoman_gateway.policy.loader import load_policy
 
@@ -483,6 +485,135 @@ class MemoryService:
         if len(re.findall(r"https?://", payload.lower())) >= 4:
             return "hybrid"
         return "heuristic"
+
+    def shared_fact_gate(self) -> "FactReadGate":
+        """The read gate for shared facts; cached per service instance."""
+        gate = getattr(self, "_shared_fact_gate", None)
+        if gate is None:
+            gate = FactReadGate(self.store)
+            self._shared_fact_gate = gate
+        return gate
+
+    def shared_facts_enabled(self) -> bool:
+        shared = getattr(self.config, "shared", None)
+        return bool(getattr(shared, "enabled", False))
+
+    def retrieve_for_context(
+        self,
+        *,
+        query: str,
+        read_context: "FactReadContext",
+        reply_to_text: str | None = None,
+        limit: int | None = None,
+    ) -> "FactRetrievalResult":
+        """Retrieve shared facts the reader may see - filtered before retrieval.
+
+        The permission decision is part of the search itself (``acl`` predicate), so a
+        forbidden row is never a candidate: it is not embedded, not ranked and cannot
+        reach a provider, a prompt or a trace. A final recheck against the *current*
+        fact rows guards the window between retrieval and rendering.
+        """
+        if not self.shared_facts_enabled():
+            return FactRetrievalResult()
+
+        gate = self.shared_fact_gate()
+        predicate = gate.predicate(read_context)
+        if predicate.sql == "0":
+            return FactRetrievalResult()
+
+        scope_keys = [read_context.chat_scope_key]
+        effective_limit = max(
+            1,
+            int(
+                limit
+                if limit is not None
+                else getattr(self.config.recall, "max_results", 8)
+            ),
+        )
+        candidates = self.store.search_lexical(
+            workspace_id=self.workspace_id,
+            query=query,
+            scope_keys=scope_keys,
+            sectors={"semantic"},
+            limit=effective_limit,
+            acl=predicate,
+        )
+        vector_hits = self._vector_candidates(
+            query=query,
+            scope_keys=scope_keys,
+            limit=effective_limit,
+            acl=predicate,
+        )
+        candidates = self._merge_candidates(candidates, vector_hits)
+
+        allowed = gate.recheck([hit.entry.id for hit in candidates], read_context)
+        denied_count = sum(1 for hit in candidates if hit.entry.id not in allowed)
+        kept = [hit for hit in candidates if hit.entry.id in allowed]
+        if not kept:
+            return FactRetrievalResult(denied_count=denied_count)
+
+        ranked = self._rank_hits(kept)
+        query_text = self._normalize_content(
+            query + (f"\n{reply_to_text}" if reply_to_text else "")
+        )
+        rendered = self._render_hits(
+            ranked,
+            query=query_text,
+            owner_context=bool(read_context.owner),
+            max_chars=int(self.config.recall.max_prompt_chars),
+        )
+        used: dict[str, tuple[tuple[str, int], ...]] = {}
+        for hit in ranked:
+            used[hit.entry.id] = tuple(
+                (source.source_event_id, source.source_revision)
+                for source in self.store.list_fact_sources(hit.entry.id)
+            )
+        return FactRetrievalResult(
+            text=rendered,
+            hits=tuple(ranked),
+            used_source_refs=used,
+            denied_count=denied_count,
+        )
+
+    def _vector_candidates(
+        self,
+        *,
+        query: str,
+        scope_keys: list[str],
+        limit: int,
+        acl: "FactAclPredicate",
+    ) -> list[MemoryHit]:
+        if self.embedding is None:
+            return []
+        try:
+            query_vector = self.embedding.embed(query)
+        except Exception as exc:  # pragma: no cover - provider failure is not fatal
+            logger.warning("shared fact vector search skipped: {}", exc)
+            return []
+        if not query_vector:
+            return []
+        return self.store.search_vector(
+            workspace_id=self.workspace_id,
+            query_vector=query_vector,
+            scope_keys=scope_keys,
+            sectors={"semantic"},
+            limit=limit,
+            acl=acl,
+        )
+
+    @staticmethod
+    def _merge_candidates(
+        lexical: list[MemoryHit], vector: list[MemoryHit]
+    ) -> list[MemoryHit]:
+        merged: dict[str, MemoryHit] = {}
+        for hit in [*lexical, *vector]:
+            existing = merged.get(hit.entry.id)
+            if existing is None:
+                merged[hit.entry.id] = hit
+                continue
+            existing.vector_score = max(existing.vector_score, hit.vector_score)
+            existing.lexical_score = max(existing.lexical_score, hit.lexical_score)
+        return list(merged.values())
 
     def build_retrieved_context(
         self,
