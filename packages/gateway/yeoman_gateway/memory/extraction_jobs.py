@@ -64,6 +64,16 @@ def extraction_job_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def candidate_fact_id(job_key: str, content: str) -> str:
+    """Stable id for one candidate.
+
+    A batch may yield several facts, so the batch key alone cannot be the row id - two
+    candidates of the same batch would collide on ``memory2_nodes.id``. Identical content
+    from the same sources still maps to the same id, which keeps republishing idempotent.
+    """
+    return hashlib.sha256(f"{job_key}\x00{content}".encode("utf-8")).hexdigest()[:32]
+
+
 def turn_settled_job(
     *,
     now_ms: int,
@@ -283,6 +293,7 @@ class SharedFactExtractionQueue:
         extractor_version: str = EXTRACTOR_VERSION,
         clock: Callable[[], int] | None = None,
         poll_seconds: float = 5.0,
+        stale_ms: int = 600_000,
     ) -> None:
         self._store = store
         self._extractor = extractor
@@ -297,6 +308,7 @@ class SharedFactExtractionQueue:
         self._extractor_version = str(extractor_version)
         self._clock = clock if clock is not None else (lambda: int(time.time() * 1000))
         self._poll_seconds = float(poll_seconds)
+        self._stale_ms = max(60_000, int(stale_ms))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -405,9 +417,22 @@ class SharedFactExtractionQueue:
                 cancelled += 1
         return cancelled
 
+    def recover_stale(self, *, now_ms: int, stale_ms: int | None = None) -> int:
+        """Re-queue jobs a crash left ``running``, so a killed run resumes."""
+        threshold = int(stale_ms if stale_ms is not None else self._stale_ms)
+        requeued = 0
+        for job in self._store.list_fact_jobs(state="running", limit=200):
+            last = int(job.get("last_activity_ms") or 0)
+            if last and int(now_ms) - last < threshold:
+                continue
+            self._mark(job, state="queued", reason="recovered_after_crash", now_ms=int(now_ms))
+            requeued += 1
+        return requeued
+
     def run_due(self, *, now_ms: int, limit: int | None = None) -> ExtractionReport:
         """Process due jobs synchronously. The worker thread simply calls this."""
         report = ExtractionReport()
+        self.recover_stale(now_ms=int(now_ms))
         jobs = self._store.list_fact_jobs(state="queued", due_before_ms=int(now_ms), limit=limit or 20)
         for job in jobs:
             self._run_job(job, now_ms=int(now_ms), report=report)
@@ -446,16 +471,27 @@ class SharedFactExtractionQueue:
 
         published = 0
         skipped_reasons: list[str] = []
+        publish_errors: list[str] = []
         for candidate in candidates:
             verdict = check_candidate(candidate)
             if verdict.rejected:
                 skipped_reasons.append(verdict.reason)
                 continue
-            if self._publish(candidate, job=job, now_ms=now_ms):
-                published += 1
+            try:
+                if self._publish(candidate, job=job, now_ms=now_ms):
+                    published += 1
+            except Exception as exc:
+                # One bad candidate must not kill a whole backfill run.
+                publish_errors.append(type(exc).__name__)
+                logger.warning("shared fact publish failed: {}", exc)
         if published:
             self._mark(job, state="done", reason=None, now_ms=now_ms)
             report.note("published", published=published)
+        elif publish_errors:
+            reason = f"publish_error:{publish_errors[0]}"
+            self._mark(job, state="failed", reason=reason, now_ms=now_ms)
+            report.failed += 1
+            report.note(reason)
         else:
             reason = skipped_reasons[0] if skipped_reasons else "no_candidates"
             self._mark(job, state="skipped", reason=reason, now_ms=now_ms)
@@ -467,7 +503,9 @@ class SharedFactExtractionQueue:
         refs = candidate.source_refs or _job_refs(job)
         if not refs:
             return False
-        fact_id = extraction_job_key(refs, self._extractor_version)
+        fact_id = candidate_fact_id(
+            extraction_job_key(refs, self._extractor_version), candidate.content
+        )
         if self._store.get_fact(fact_id) is not None and not candidate.source_refs:
             return False
         valid_until = candidate.valid_until_ms

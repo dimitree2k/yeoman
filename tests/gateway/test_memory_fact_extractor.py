@@ -389,3 +389,92 @@ def test_fact_is_found_by_meaning_not_only_by_words(tmp_path: Path) -> None:
     assert "Stammtisch" in result.hits[0].entry.content
     assert "Wann ist das Treffen?" in embedder.calls
     service.close()
+
+
+def test_two_candidates_in_one_batch_become_two_facts(tmp_path: Path) -> None:
+    """Regression: a batch key is not a row id - two facts from one batch must both store.
+
+    The first real backfill died here with
+    ``IntegrityError: UNIQUE constraint failed: memory2_nodes.id``.
+    """
+    from yeoman_gateway.memory.extraction_jobs import SharedFactCandidate, candidate_fact_id
+
+    store = MemoryStore(tmp_path / "memory.db")
+
+    class _Extractor:
+        def __call__(self, events):
+            return [
+                SharedFactCandidate(
+                    content="Der Stammtisch ist donnerstags.",
+                    author_principal="member-old",
+                    visibility_scope="author_only",
+                    source_refs=(("ev1", 1),),
+                    audience=frozenset({"member-old"}),
+                ),
+                SharedFactCandidate(
+                    content="Das Treffen ist um acht.",
+                    author_principal="member-old",
+                    visibility_scope="author_only",
+                    source_refs=(("ev1", 1),),
+                    audience=frozenset({"member-old"}),
+                ),
+            ]
+
+    class _Journal:
+        def get_event(self, event_id: str):
+            return _Event(event_id, "zwei Fakten")
+
+    queue = SharedFactExtractionQueue(
+        store=store, extractor=_Extractor(), journal=_Journal(), clock=lambda: T0
+    )
+    queue.enqueue(
+        turn_ref="tu1", source_refs=[("ev1", 1)], now_ms=T0,
+        workspace_id="ws1", chat_scope_key=GROUP,
+    )
+    report = queue.run_due(now_ms=T0)
+
+    assert report.published == 2
+    contents = sorted(fact.content for fact in store.list_facts())
+    assert len(contents) == 2
+    assert candidate_fact_id("job", "a") != candidate_fact_id("job", "b")
+    assert candidate_fact_id("job", "a") == candidate_fact_id("job", "a")  # idempotent
+    store.close()
+
+
+def test_publish_error_fails_one_job_without_killing_the_run(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+    queue = _queue_with(store)
+    calls = {"n": 0}
+    original = queue._publish
+
+    def flaky(candidate, *, job, now_ms):  # noqa: ANN001 - test double
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("disk full")
+        return original(candidate, job=job, now_ms=now_ms)
+
+    queue._publish = flaky  # type: ignore[method-assign]
+    _run(queue)
+    assert calls["n"] >= 1
+    job = store.list_fact_jobs()[0]
+    assert job["state"] in ("failed", "done")
+    store.close()
+
+
+def test_a_crash_left_running_job_is_requeued(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+    queue = _queue_with(store)
+    _run(queue)
+    job = store.list_fact_jobs()[0]
+    store.upsert_fact_job(
+        job_key=str(job["job_key"]), workspace_id="ws1", chat_scope_key=GROUP,
+        source_refs_json=str(job["source_refs_json"]), extractor_version="v1",
+        state="running", due_ms=T0, now_ms=T0, last_activity_ms=T0,
+    )
+
+    requeued = queue.recover_stale(now_ms=T0 + 700_000)
+
+    assert requeued == 1
+    assert store.list_fact_jobs()[0]["state"] == "queued"
+    assert store.list_fact_jobs()[0]["reason"] == "recovered_after_crash"
+    store.close()
