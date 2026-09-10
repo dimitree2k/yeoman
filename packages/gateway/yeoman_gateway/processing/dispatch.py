@@ -24,7 +24,7 @@ from loguru import logger
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
-from yeoman_gateway.processing.budget import ChatBudget
+from yeoman_gateway.processing.budget import ChatBudget, ThreadBudget
 from yeoman_gateway.processing.models import (
     DeletePayload,
     EffectEnvelope,
@@ -580,6 +580,18 @@ class IntentEffectRouter:
             if budgets is not None
             else None
         )
+        # Plan 06: soft fairness per thread. Measuring is always on; refusing is opt-in,
+        # because without a re-queue worker a refusal would drop a reply rather than
+        # delay it (`processing.budgets.threadSoftEnforce`).
+        self._thread_budget = (
+            ThreadBudget(
+                limit=int(budgets.thread_soft_units),
+                window_ms=int(budgets.thread_soft_window_seconds) * 1000,
+            )
+            if budgets is not None
+            else None
+        )
+        self._soft_enforce = bool(getattr(budgets, "thread_soft_enforce", False))
         # Plan 06: the durable reservation is authoritative when a store is available -
         # it survives a restart and cannot spend the same attempt twice.
         store = getattr(self._gateway, "store", None)
@@ -724,6 +736,10 @@ class IntentEffectRouter:
                 "no turn bound to this producer; refusing to queue an effect"
             )
 
+        self._note_soft_thread_limit(
+            thread_id=str(getattr(turn, "thread_id", "") or ""), now_ms=now
+        )
+
         envelope = EffectEnvelope(
             effect_id=uuid.uuid4().hex,
             operation_key=f"{operation_key}:{turn_id}:{turn_revision}",
@@ -745,6 +761,27 @@ class IntentEffectRouter:
 
         result = await self._gateway.execute_ready(receipt.effect_id)
         return self._log_undelivered(result, envelope, chat_id)
+
+    def _note_soft_thread_limit(self, *, thread_id: str, now_ms: int) -> None:
+        """Soft fairness: measure what the limit would defer, and enforce only on request.
+
+        The limit is not a permission decision - it decides *when* a thread may speak.
+        Enforcement stays off until a due effect can be re-queued: refusing here without a
+        re-queue worker would drop a reply from a chatty thread instead of delaying it.
+        """
+        budget = self._thread_budget
+        if budget is None or not thread_id:
+            return
+        ready_at = budget.defer_until(thread_id=thread_id, now_ms=now_ms)
+        timings = getattr(self, "_timings", None)
+        if ready_at > now_ms:
+            if timings is not None:
+                timings.note_deferral("thread_soft_limit")
+            if self._soft_enforce:
+                raise EffectNotDeliveredError(
+                    f"thread soft limit reached (thread={thread_id} ready_at_ms={ready_at})"
+                )
+        budget.note_send(thread_id=thread_id, now_ms=now_ms)
 
     def _capacity_block(
         self, channel: str, chat_id: str, payload: Any, effect_id: str

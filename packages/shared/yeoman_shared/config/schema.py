@@ -594,6 +594,9 @@ class ProcessingBudgetsConfig(BaseModel):
     chat_hard_units: int = Field(default=6, ge=1)
     chat_hard_window_seconds: int = Field(default=60, ge=1)
     outbox_waiting_per_chat: int = Field(default=20, ge=0)
+    #: Enforce the soft thread limit as a refusal. Off until blocked effects can be
+    #: re-queued when due - otherwise a chatty thread would lose a reply.
+    thread_soft_enforce: bool = False
 
 
 class ProcessingThreadsConfig(BaseModel):

@@ -59,13 +59,18 @@ class _Transport:
         self.sent.append(message.emoji)
 
 
-def _config(*, chats: tuple[str, ...] = (CHAT,), waiting_cap: int = 20) -> Config:
+def _config(
+    *, chats: tuple[str, ...] = (CHAT,), waiting_cap: int = 20, soft_enforce: bool = False
+) -> Config:
     return Config.model_validate(
         {
             "processing": {
                 "enabled": True,
                 "chats": [f"whatsapp:{chat}" for chat in chats],
-                "budgets": {"outbox_waiting_per_chat": waiting_cap},
+                "budgets": {
+                    "outbox_waiting_per_chat": waiting_cap,
+                    "thread_soft_enforce": soft_enforce,
+                },
             },
             "security": {"enabled": False},
         }
@@ -110,7 +115,12 @@ def runtime(tmp_path: Path):
 
 
 def _make_runtime(
-    tmp_path: Path, *, chats: tuple[str, ...] = (CHAT,), waiting_cap: int = 20, **kwargs
+    tmp_path: Path,
+    *,
+    chats: tuple[str, ...] = (CHAT,),
+    waiting_cap: int = 20,
+    soft_enforce: bool = False,
+    **kwargs,
 ) -> _Runtime:
     policy_path = tmp_path / "policy.json"
     policy = _policy(chats, **kwargs)
@@ -123,7 +133,7 @@ def _make_runtime(
         policy_path=policy_path,
         workspace=workspace,
     )
-    config = _config(chats=chats, waiting_cap=waiting_cap)
+    config = _config(chats=chats, waiting_cap=waiting_cap, soft_enforce=soft_enforce)
     # Pin the database: reopening must never fall back to the default (live) path.
     config.processing.db_path = str(tmp_path / "processing.db")
     with patch.dict(os.environ, {"YEOMAN_HOME": str(tmp_path)}):
@@ -384,3 +394,36 @@ def test_every_effect_has_a_parent_turn(runtime) -> None:
         assert effect.turn_id, "effect without a parent turn"
         assert effect.turn_revision >= 1
         assert runtime.store.get_turn(effect.turn_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_soft_thread_limit_is_measured_by_default(tmp_path: Path) -> None:
+    """A chatty thread keeps working: the limit is measured, not silently enforced."""
+    runtime = _make_runtime(tmp_path, chats=(CHAT,))
+    try:
+        _admit(runtime, message_id="m1")
+        for index in range(3):
+            await _dispatch(runtime, message_id="m1", content=f"answer {index}")
+
+        sent = [effect for effect in runtime.store.list_effects() if effect.state == "sent"]
+        assert len(sent) == 3
+        assert len({effect.turn_id for effect in sent}) == 1  # one chatty thread
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_soft_thread_limit_refuses_only_when_explicitly_enabled(tmp_path: Path) -> None:
+    runtime = _make_runtime(tmp_path / "strict", chats=(CHAT,), soft_enforce=True)
+    try:
+        _admit(runtime, message_id="m1")
+        await _dispatch(runtime, message_id="m1", content="one")
+        await _dispatch(runtime, message_id="m1", content="two")
+
+        with pytest.raises(EffectNotDeliveredError) as limited:
+            await _dispatch(runtime, message_id="m1", content="three")
+
+        assert "thread soft limit" in str(limited.value)
+        assert runtime.transport.sent == ["one", "two"]
+    finally:
+        runtime.store.close()
