@@ -66,7 +66,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = (
     """
@@ -192,6 +192,20 @@ _SCHEMA = (
 #: Ordered additive migrations. ``_MIGRATIONS[1]`` upgrades schema 1 to schema 2; existing
 #: tables (events, effects, decisions, attempts, evidence) are never altered.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
+    4: (
+        """
+        CREATE TABLE IF NOT EXISTS send_budget_reservations (
+          attempt_id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          effect_id TEXT NOT NULL,
+          units INTEGER NOT NULL,
+          reserved_ms INTEGER NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_send_budget_window "
+        "ON send_budget_reservations(channel, chat_id, reserved_ms)",
+    ),
     1: (
         """
         CREATE TABLE IF NOT EXISTS threads (
@@ -2050,6 +2064,69 @@ class ProcessingStore:
         )
 
     # -- retention ---------------------------------------------------------------------
+
+    def reserve_send_budget(
+        self,
+        *,
+        attempt_id: str,
+        channel: str,
+        chat_id: str,
+        effect_id: str,
+        units: int,
+        now_ms: int,
+        limit: int,
+        window_ms: int,
+    ) -> bool:
+        """Atomically reserve capacity for one attempt. True when it may be dispatched.
+
+        The same ``attempt_id`` never spends twice, which makes a retried reservation
+        free; a new attempt counts again. Capacity is durable, so a restart does not
+        return budget that was already spent.
+        """
+        wanted = max(1, int(units))
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT units FROM send_budget_reservations WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+            if existing is not None:
+                return True
+            rows = conn.execute(
+                "SELECT units FROM send_budget_reservations"
+                " WHERE channel = ? AND chat_id = ? AND reserved_ms > ? AND reserved_ms <= ?",
+                (str(channel), str(chat_id), int(now_ms) - int(window_ms), int(now_ms)),
+            ).fetchall()
+            spent = sum(int(row["units"]) for row in rows)
+            if spent + wanted > int(limit):
+                return False
+            conn.execute(
+                """
+                INSERT INTO send_budget_reservations (
+                  attempt_id, channel, chat_id, effect_id, units, reserved_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (str(attempt_id), str(channel), str(chat_id), str(effect_id), wanted, int(now_ms)),
+            )
+            return True
+
+    def send_budget_attempts(
+        self, *, channel: str, chat_id: str, since_ms: int
+    ) -> list[tuple[int, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT reserved_ms, units FROM send_budget_reservations"
+                " WHERE channel = ? AND chat_id = ? AND reserved_ms > ?"
+                " ORDER BY reserved_ms",
+                (str(channel), str(chat_id), int(since_ms)),
+            ).fetchall()
+        return [(int(row["reserved_ms"]), int(row["units"])) for row in rows]
+
+    def count_send_budget_reservations(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM send_budget_reservations"
+            ).fetchone()
+        return int(row["c"])
 
     def purge(self, *, now_ms: int) -> PurgeReport:
         """Apply retention. Payloads are stripped first, metadata later.

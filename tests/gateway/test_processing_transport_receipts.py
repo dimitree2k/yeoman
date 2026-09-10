@@ -159,7 +159,7 @@ def test_receipts_survive_a_reopen(tmp_path: Path) -> None:
     store.close()
 
     store = ProcessingStore(path)
-    assert store.schema_version == 4
+    assert store.schema_version == 5
     receipt = store.effect_transport_receipt("fx1")
     assert receipt is not None and receipt.provider_message_id == "3EB0ABC"
     store.close()

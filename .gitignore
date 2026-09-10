@@ -91,6 +91,7 @@ tests/gateway/*
 !tests/gateway/test_memory_extraction_jobs.py
 !tests/gateway/test_memory_fact_revocation.py
 !tests/gateway/test_responder_shared_facts.py
+!tests/gateway/test_processing_budget.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py

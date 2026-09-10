@@ -23,6 +23,7 @@ from loguru import logger
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
+from yeoman_gateway.processing.budget import ChatBudget
 from yeoman_gateway.processing.models import (
     DeletePayload,
     EffectEnvelope,
@@ -563,6 +564,19 @@ class IntentEffectRouter:
             if budgets is not None
             else None
         )
+        # Plan 06: the durable reservation is authoritative when a store is available -
+        # it survives a restart and cannot spend the same attempt twice.
+        store = getattr(self._gateway, "store", None)
+        self._durable_budget = (
+            ChatBudget(
+                store,
+                limit=int(budgets.chat_hard_units),
+                window_ms=int(budgets.chat_hard_window_seconds) * 1000,
+                waiting_cap=int(budgets.outbox_waiting_per_chat),
+            )
+            if budgets is not None and store is not None and budget is None
+            else None
+        )
 
     def set_direct_transport(self, outbound: Any, reaction: Any) -> None:
         """Install the confirming channel transport on the gateway's executor."""
@@ -731,9 +745,24 @@ class IntentEffectRouter:
                 states=("queued", "blocked", "executing"), limit=500
             )
         )
+        units = payload_units(payload)
         if waiting > self._budget.waiting_cap:
             reason = "queue_capacity"
-        elif not self._budget.reserve(budget_key(channel, chat_id), payload_units(payload)):
+        elif self._durable_budget is not None:
+            record = self._gateway.store.get_effect(effect_id)
+            stamp = int(getattr(record, "updated_ms", 0) or 0)
+            decision = self._durable_budget.reserve(
+                channel=channel,
+                chat_id=chat_id,
+                effect_id=effect_id,
+                attempt_id=f"{effect_id}:{stamp}",
+                units=units,
+                now_ms=now,
+            )
+            if decision.allowed:
+                return None
+            reason = decision.reason or "budget_exhausted"
+        elif not self._budget.reserve(budget_key(channel, chat_id), units):
             reason = "budget_exhausted"
         else:
             return None
