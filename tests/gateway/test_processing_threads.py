@@ -6,7 +6,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from yeoman_gateway.processing.models import (
     THREAD_STATES,
     TURN_STATES,
@@ -28,7 +27,7 @@ T0 = 1_700_000_000_000
 class _Config:
     """The v1 thread defaults, read-only (no new config keys in Plan 03)."""
 
-    class threads:
+    class Threads:
         followup_window_seconds = 15
         idle_seconds = 1800
         reopen_window_seconds = 604800
