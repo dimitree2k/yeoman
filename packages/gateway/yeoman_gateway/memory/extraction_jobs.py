@@ -143,6 +143,27 @@ class CandidateVerdict:
         return not self.accepted
 
 
+#: Phrasings that restate the message instead of stating a fact about the world.
+META_STATEMENT_MARKERS: tuple[str, ...] = (
+    "der autor sagt",
+    "die autorin sagt",
+    "der nutzer sagt",
+    "the author says",
+    "the user says",
+    "die nachricht besagt",
+    "the message says",
+    "laut nachricht",
+    "sagt:",
+    "says:",
+)
+
+
+def is_meta_statement(content: str) -> bool:
+    """True when a candidate only reports what was said instead of stating a fact."""
+    lowered = content.strip().lower()
+    return any(marker in lowered for marker in META_STATEMENT_MARKERS)
+
+
 def check_candidate(candidate: SharedFactCandidate) -> CandidateVerdict:
     """Deterministic screening. Uncertainty refuses the candidate instead of guessing."""
     if candidate.private_handoff:
@@ -157,6 +178,9 @@ def check_candidate(candidate: SharedFactCandidate) -> CandidateVerdict:
         return CandidateVerdict(False, candidate.basis)
     if candidate.basis not in ACCEPTED_BASES:
         return CandidateVerdict(False, "uncertain")
+    if is_meta_statement(candidate.content):
+        # "The author says X" is a transcript, not a fact; store X itself or nothing.
+        return CandidateVerdict(False, "meta_statement")
     if candidate.visibility_scope is None:
         return CandidateVerdict(False, "unknown_visibility")
     if candidate.visibility_scope not in ("chat_shared", "principals", "author_only"):

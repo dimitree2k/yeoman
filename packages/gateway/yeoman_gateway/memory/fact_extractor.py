@@ -46,6 +46,10 @@ Rules:
   "person_speculation", "delivery_claim". Use "explicit_statement" only when the author
   states the fact directly.
 - valid_until: ISO date when the fact is explicitly time-bound, else null.
+- State the fact itself, never that someone said something. Phrases like
+  "Der Autor sagt:" or "the message says" are forbidden - either state the fact or return
+  nothing for that message.
+- Never quote the message back.
 - Return an empty list when nothing qualifies. Never pad the list."""
 
 

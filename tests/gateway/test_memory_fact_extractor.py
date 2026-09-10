@@ -251,3 +251,21 @@ def test_queue_publishes_a_readable_fact_from_the_extractor(tmp_path: Path) -> N
     )
     assert gate.allowed_fact_ids(stranger) == frozenset()
     store.close()
+
+
+def test_meta_statements_are_refused() -> None:
+    """"The author says X" is a transcript, not a fact - proven against real output."""
+    from yeoman_gateway.memory.extraction_jobs import is_meta_statement
+
+    assert is_meta_statement('Der Autor sagt: "noch tests".')
+    assert is_meta_statement("The message says the meeting moved")
+    assert not is_meta_statement("Der Stammtisch ist donnerstags.")
+
+    verdict = check_candidate(
+        _extractor(
+            _payload({"content": 'Der Autor sagt: "noch tests".', "basis": "explicit_statement"}),
+            members=frozenset({"member-old"}),
+        )([_Event("ev1", "noch tests")])[0]
+    )
+    assert verdict.rejected
+    assert verdict.reason == "meta_statement"
