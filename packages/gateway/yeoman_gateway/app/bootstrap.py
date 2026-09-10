@@ -890,6 +890,17 @@ def build_gateway_runtime(
             return
         message = build_persona_evolution_approval_message(proposal)
         for target in targets:
+            if service_effects is not None:
+                await service_effects.send(
+                    source="cron",
+                    operation_ref=(
+                        f"persona-evolution:{proposal.get('proposal_id')}:{target}"
+                    ),
+                    channel=channel,
+                    chat_id=target,
+                    content=message,
+                )
+                continue
             await bus.publish_outbound(
                 OutboundMessage(channel=channel, chat_id=target, content=message)
             )
@@ -1062,10 +1073,23 @@ def build_gateway_runtime(
                 fail_channel = job.payload.approval_channel or job.payload.channel or "cli"
                 fail_chat = job.payload.to or "direct"
                 wf_name = job.payload.workflow_id or job.id
-                await bus.publish_outbound(OutboundMessage(
-                    channel=fail_channel, chat_id=fail_chat,
-                    content=f"Workflow '{wf_name}' failed at step {job.payload.workflow_step}: {response[:200]}. Use /cron workflow_list to review.",
-                ))
+                fail_content = (
+                    f"Workflow '{wf_name}' failed at step {job.payload.workflow_step}: "
+                    f"{response[:200]}. Use /cron workflow_list to review."
+                )
+                if service_effects is not None:
+                    await service_effects.send(
+                        source="cron",
+                        operation_ref=f"workflow:{wf_name}:step{job.payload.workflow_step}:failed",
+                        channel=fail_channel,
+                        chat_id=fail_chat,
+                        content=fail_content,
+                    )
+                else:
+                    await bus.publish_outbound(OutboundMessage(
+                        channel=fail_channel, chat_id=fail_chat,
+                        content=fail_content,
+                    ))
             else:
                 from uuid import uuid4
                 run_id = uuid4().hex[:8]
@@ -1082,11 +1106,23 @@ def build_gateway_runtime(
         remaining = job.payload.max_chain_depth - 1
         if remaining <= 0:
             wf_name = job.payload.workflow_id or job.id
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.approval_channel or job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-                content=f"Workflow '{wf_name}' stopped: max chain depth reached.",
-            ))
+            stop_channel = job.payload.approval_channel or job.payload.channel or "cli"
+            stop_chat = job.payload.to or "direct"
+            stop_content = f"Workflow '{wf_name}' stopped: max chain depth reached."
+            if service_effects is not None:
+                await service_effects.send(
+                    source="cron",
+                    operation_ref=f"workflow:{wf_name}:max-depth",
+                    channel=stop_channel,
+                    chat_id=stop_chat,
+                    content=stop_content,
+                )
+            else:
+                await bus.publish_outbound(OutboundMessage(
+                    channel=stop_channel,
+                    chat_id=stop_chat,
+                    content=stop_content,
+                ))
             return
 
         if job.payload.requires_approval:
@@ -1107,15 +1143,25 @@ def build_gateway_runtime(
                 remaining_depth=remaining,
             ))
 
-            await bus.publish_outbound(OutboundMessage(
-                channel=approval_channel, chat_id=approval_chat,
-                content=(
-                    f"{output}\n\n---\n"
-                    f"Workflow step {job.payload.workflow_step} complete.\n"
-                    f"Next: {next_job.name}\n"
-                    f"Reply with this code to approve: {approval_id}"
-                ),
-            ))
+            approval_content = (
+                f"{output}\n\n---\n"
+                f"Workflow step {job.payload.workflow_step} complete.\n"
+                f"Next: {next_job.name}\n"
+                f"Reply with this code to approve: {approval_id}"
+            )
+            if service_effects is not None:
+                await service_effects.send(
+                    source="cron",
+                    operation_ref=f"workflow-approval:{approval_id}",
+                    channel=approval_channel,
+                    chat_id=approval_chat,
+                    content=approval_content,
+                )
+            else:
+                await bus.publish_outbound(OutboundMessage(
+                    channel=approval_channel, chat_id=approval_chat,
+                    content=approval_content,
+                ))
         else:
             prompt = build_chained_prompt(output, next_job.payload.message, input_from_previous=next_job.payload.input_from_previous)
             next_job.payload.max_chain_depth = remaining
@@ -1127,11 +1173,21 @@ def build_gateway_runtime(
                 model_profile=next_job.payload.model_profile,
             )
             if next_job.payload.deliver and next_job.payload.to:
-                await bus.publish_outbound(OutboundMessage(
-                    channel=next_job.payload.channel or "cli",
-                    chat_id=next_job.payload.to,
-                    content=chain_response or "",
-                ))
+                chain_channel = next_job.payload.channel or "cli"
+                if service_effects is not None:
+                    await service_effects.send(
+                        source="cron",
+                        operation_ref=f"cron:{next_job.id}:{run_id}",
+                        channel=chain_channel,
+                        chat_id=next_job.payload.to,
+                        content=chain_response or "",
+                    )
+                else:
+                    await bus.publish_outbound(OutboundMessage(
+                        channel=chain_channel,
+                        chat_id=next_job.payload.to,
+                        content=chain_response or "",
+                    ))
             if next_job.payload.next_job_id and chain_response is not None and not is_chain_failure(chain_response):
                 await _handle_chain(next_job, chain_response, run_id)
 

@@ -936,3 +936,38 @@ def test_reaction_provenance_reaches_the_transport() -> None:
     channel = WhatsAppChannel(WhatsAppConfig(), _RecordingBus())
     assert channel._send_attempts({EFFECT_PROVENANCE_KEY: "fx1"}) == 1
     assert channel._send_attempts({}) > 1
+
+
+@pytest.mark.asyncio
+async def test_self_declared_approval_is_not_authorization(tmp_path: Path) -> None:
+    """Authorization never comes from an argument; only policy and principal decide."""
+    from yeoman_gateway.processing.models import ExternalActionPayload
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_DenyAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    receipt = gateway.submit(
+        EffectEnvelope(
+            effect_id="fx1",
+            operation_key="k1",
+            payload=ExternalActionPayload(
+                action="remote_write",
+                arguments={"approved": True, "is_owner": True, "policy_override": "allow"},
+            ),
+            target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+            principal="stranger@s.whatsapp.net",
+            capability="external_action",
+        )
+    )
+    result = await gateway.execute_ready(receipt.effect_id)
+
+    assert result.state == "blocked"
+    assert executor.calls == []
+    store.close()

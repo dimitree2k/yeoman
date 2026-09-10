@@ -2606,5 +2606,8 @@ class LLMResponder(ResponderPort):
             exec_tool.close()
 
     async def send_outbound(self, message: OutboundMessage) -> None:
-        """Convenience wrapper used by tests and callers needing direct publish."""
-        await self.bus.publish_outbound(message)
+        """Convenience wrapper for callers needing a direct send.
+
+        Managed chats use the effect path; everything else keeps the legacy publish.
+        """
+        await self._outbound_dispatch_callback(message)
