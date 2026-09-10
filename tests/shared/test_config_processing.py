@@ -124,3 +124,18 @@ def test_shadow_chats_are_observed_only() -> None:
 
     disabled = ProcessingConfig.model_validate({"shadow_chats": ["whatsapp:observed"]})
     assert disabled.is_chat_shadowed("whatsapp", "observed") is False
+
+
+def test_two_global_generations_are_allowed_but_not_default() -> None:
+    """Spec section 4: one generation by default, two only after isolation testing."""
+    assert Config().processing.threads.max_generations_global == 1
+    assert Config().processing.threads.max_generations_per_thread == 1
+
+    two = ProcessingConfig.model_validate(
+        {"threads": {"max_generations_global": 2, "max_generations_per_thread": 2}}
+    )
+    assert two.threads.max_generations_global == 2
+    assert two.threads.max_generations_per_thread == 2
+
+    with pytest.raises(ValidationError):
+        ProcessingConfig.model_validate({"threads": {"max_generations_global": 3}})
