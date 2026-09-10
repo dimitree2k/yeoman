@@ -100,6 +100,7 @@ class ThreadActor:
         self._state_lock = threading.RLock()
         self._state = _ActorState()
         self._lock_owner: int | None = None
+        self._generation_in_flight = False
 
     # -- diagnostics -------------------------------------------------------------------
 
@@ -119,6 +120,11 @@ class ThreadActor:
     @property
     def additional_generations(self) -> int:
         return self._state.additional_generations
+
+    @property
+    def generation_in_flight(self) -> bool:
+        '''True while a provider call is running for this thread.'''
+        return self._generation_in_flight
 
     # -- postbox -----------------------------------------------------------------------
 
@@ -229,6 +235,7 @@ class ThreadActor:
         call: Callable[[GenerationSnapshot], Awaitable[str | None]],
     ) -> GenerationOutcome:
         """Run one provider generation without holding the state lock across the await."""
+        self._generation_in_flight = True
         try:
             if self._slots is not None:
                 async with self._slots:
@@ -253,6 +260,8 @@ class ThreadActor:
                 generation_id=snapshot.generation_id,
                 detail=type(exc).__name__,
             )
+        finally:
+            self._generation_in_flight = False
 
         with self._state_lock:
             return self._evaluate_postbox(snapshot, text)

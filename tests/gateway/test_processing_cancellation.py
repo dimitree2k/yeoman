@@ -83,8 +83,17 @@ def _turn(store: ProcessingStore, registry: ThreadRegistry, *, event_id: str = "
         source_message_id=event_id,
         payload={"kind": "message", "text": "hi", "is_group": True, "mentioned_bot": True},
     )
+    # The fast gate journals first and assigns afterwards; mirror that order.
+    store.append_event(
+        event_key=event.event_key,
+        event_id=event.event_id,
+        trace_id=event.trace_id,
+        payload=dict(event.payload or {}),
+        now_ms=T0,
+    )
     decision = registry.assign(event, now_ms=T0)
     assert decision.turn_id is not None
+    assert store.event_assignment(event.event_id) == (decision.thread_id, decision.turn_id)
     return decision
 
 
@@ -560,4 +569,174 @@ def test_actor_registry_finds_the_active_turn_and_closes_idle_threads(tmp_path: 
     closed = actors.tick(T0 + 31 * 60_000)
     assert closed == (decision.thread_id,)
     assert actors.active_turn("whatsapp", CHAT) is None
+    store.close()
+
+
+# --------------------------------------------------------------------------------------
+# Task 3 wiring: the responder wrapper drives the generation loop
+# --------------------------------------------------------------------------------------
+
+
+def _assign_event(store: ProcessingStore, *, event_id: str, thread_id: str, turn_id: str) -> None:
+    """The fast gate journals and assigns every inbound event before the responder runs."""
+    store.append_event(
+        event_key=f"wa:{event_id}",
+        event_id=event_id,
+        trace_id=f"tr-{event_id}",
+        payload={"kind": "message", "text": "hi", "is_group": True, "mentioned_bot": True},
+        now_ms=T0,
+    )
+    store.attach_event_assignment(
+        event_id=event_id, thread_id=thread_id, turn_id=turn_id, now_ms=T0
+    )
+
+
+class _InnerResponder:
+    """Records calls; the first call can signal that it started and then block."""
+
+    def __init__(self, texts: list[str] | None = None, barrier=None, started=None) -> None:
+        self.texts = list(texts or ["answer"])
+        self.calls = 0
+        self.snapshots: list[object] = []
+        self._barrier = barrier
+        self._started = started
+
+    async def generate_reply(self, event, decision) -> str | None:
+        self.calls += 1
+        if self.calls == 1:
+            if self._started is not None:
+                self._started.set()
+            if self._barrier is not None:
+                await self._barrier.wait()
+        return self.texts[min(self.calls - 1, len(self.texts) - 1)]
+
+
+def _event_model(*, message_id: str = "m1", sender: str = "orderer@s.whatsapp.net"):
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+
+    return InboundEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id=sender,
+        content="hi",
+        message_id=message_id,
+        is_group=True,
+        mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC),
+    )
+
+
+def _wrapper(store: ProcessingStore, inner, registry: ThreadRegistry):
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+    return ThreadActorResponder(inner=inner, actors=actors, store=store, clock=_Clock())
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_event_passes_through_unchanged(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inner = _InnerResponder(["legacy answer"])
+    wrapper = _wrapper(store, inner, ThreadRegistry(store=store, config=_Config()))
+
+    reply = await wrapper.generate_reply(_event_model(message_id="unknown"), object())
+
+    assert reply == "legacy answer"
+    assert inner.calls == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_followup_during_generation_produces_no_second_answer(tmp_path: Path) -> None:
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    barrier = asyncio.Event()
+    started = asyncio.Event()
+    inner = _InnerResponder(["combined answer"], barrier=barrier, started=started)
+    wrapper = _wrapper(store, inner, registry)
+
+    _assign_event(
+        store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
+    )
+    task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
+    await started.wait()
+    followup = await wrapper.generate_reply(_event_model(message_id="m2"), object())
+    assert followup is None  # accepted into the postbox, no second answer path
+    barrier.set()
+    reply = await task
+
+    # The running generation restarted once with the wider snapshot instead of the
+    # follow-up opening a second answer path.
+    assert inner.calls == 2
+    assert reply == "combined answer"
+    assert store.count_pending(thread_id=str(decision.thread_id), states=("waiting",)) == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_new_context_restarts_the_generation_once(tmp_path: Path) -> None:
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    barrier = asyncio.Event()
+    started = asyncio.Event()
+    inner = _InnerResponder(["stale answer", "fresh answer"], barrier=barrier, started=started)
+    wrapper = _wrapper(store, inner, registry)
+
+    _assign_event(
+        store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
+    )
+    task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
+    await started.wait()
+    await wrapper.generate_reply(_event_model(message_id="m2"), object())
+    barrier.set()
+    reply = await task
+
+    assert inner.calls == 2  # one restart with the wider snapshot
+    assert reply == "fresh answer"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_superseded_generation_returns_no_reply(tmp_path: Path) -> None:
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    store.enqueue_effect(
+        effect_id="fx1",
+        operation_key=f"send_text:{CHAT}:{decision.turn_id}:1:src",
+        payload={"text": "old"},
+        target={"channel": "whatsapp", "chat_id": CHAT},
+        turn_id=str(decision.turn_id),
+        turn_revision=1,
+        now_ms=T0,
+    )
+    barrier = asyncio.Event()
+    started = asyncio.Event()
+    inner = _InnerResponder(["stale answer"], barrier=barrier, started=started)
+    wrapper = _wrapper(store, inner, registry)
+    _assign_event(
+        store, event_id="m2", thread_id=str(decision.thread_id), turn_id=str(decision.turn_id)
+    )
+    task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
+    await started.wait()
+    correction = _event_model(message_id="m2")
+    correction.raw_metadata["processing_kind"] = "delete"
+    correction.raw_metadata["explicit_correction"] = True
+    await wrapper.generate_reply(correction, object())
+    barrier.set()
+    reply = await task
+
+    assert reply is None
+    assert store.effect_state("fx1") == "cancelled"
     store.close()
