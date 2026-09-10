@@ -220,10 +220,18 @@ def _rule_mention_no_reference(
 def _rule_dm_last_active(
     data: JoinInput, view: JoinView, policy: ThreadPolicy
 ) -> JoinDecision | None:
-    if data.is_group or data.topic_break:
+    """R03.5: a DM belongs to the last active DM thread, otherwise it starts one.
+
+    A plain DM message is always an order - it mentions nothing and replies to nothing,
+    so without this branch the very first message of a DM would fall through to ambient
+    and never open a thread.
+    """
+    if data.is_group:
         return None
-    if not view.last_active_dm_thread:
-        return None
+    if data.topic_break or not view.last_active_dm_thread:
+        return JoinDecision(
+            rule=JoinRule.DM_LAST_ACTIVE, reason="dm_new_thread", new_thread=True
+        )
     return JoinDecision(
         rule=JoinRule.DM_LAST_ACTIVE,
         thread_id=view.last_active_dm_thread,

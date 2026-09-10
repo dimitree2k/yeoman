@@ -535,3 +535,26 @@ def test_tool_context_falls_back_to_the_instance_default() -> None:
     asyncio.run(tool.execute(content="hi"))
 
     assert sent == [("whatsapp", "shared-default@g.us")]
+
+
+def test_first_dm_message_opens_a_thread(tmp_path: Path) -> None:
+    """A plain DM mentions nothing and replies to nothing: it must still open a thread."""
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+
+    decision = registry.assign(
+        _event(event_id="dm1", chat_id="owner@s.whatsapp.net", mentioned_bot=False), now_ms=T0
+    )
+
+    assert decision.rule is JoinRule.DM_LAST_ACTIVE
+    assert decision.thread_id is not None
+    assert decision.turn_id is not None
+    assert store.get_thread(decision.thread_id).state == "open"
+
+    followup = registry.assign(
+        _event(event_id="dm2", chat_id="owner@s.whatsapp.net", mentioned_bot=False),
+        now_ms=T0 + 120_000,
+    )
+    assert followup.thread_id == decision.thread_id  # still the last active DM thread
+    assert followup.turn_id != decision.turn_id
+    store.close()
