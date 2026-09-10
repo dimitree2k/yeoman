@@ -5,6 +5,7 @@ identities and idempotent effect states next to the existing archives; it is not
 semantic memory database and it does not replace the inbound archive.
 """
 
+from yeoman_gateway.processing.effects import EffectAuthorizer, EffectExecutor, EffectGateway
 from yeoman_gateway.processing.models import (
     DAY_MS,
     CanonicalEvent,
@@ -42,9 +43,12 @@ __all__ = [
     "CanonicalEvent",
     "DecisionRecord",
     "DeletePayload",
+    "EffectAuthorizer",
     "EffectConflictError",
     "EffectEnvelope",
     "EffectEvidence",
+    "EffectExecutor",
+    "EffectGateway",
     "EffectReceipt",
     "EffectState",
     "EffectTarget",
