@@ -397,3 +397,25 @@ def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None
     assert len([m for m in sessions.get_or_create(thread_key).messages
                 if LEGACY_CONTEXT_MARKER in m["content"]]) == 1
     store.close()
+
+
+def test_gate_logs_a_positive_assignment_marker(runtime) -> None:
+    """Rollout visibility works in both directions: assigned and degraded."""
+    from loguru import logger
+
+    _store, _registry, gate, _router, _transport, _adapter = runtime
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        gate.admit(
+            IngestRequest(
+                event_key=f"whatsapp:{CHAT}:m1",
+                event_id="m1",
+                trace_id="tr-m1",
+                event=_event(message_id="m1"),
+            )
+        )
+    finally:
+        logger.remove(sink)
+
+    assert any("thread_assigned" in record for record in records)

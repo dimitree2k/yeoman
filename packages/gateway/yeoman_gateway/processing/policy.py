@@ -242,6 +242,18 @@ class IngestGate:
             FastGateOutcome.REACT if decision.should_respond else FastGateOutcome.OBSERVE
         )
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
+        if assignment is not None and assignment.thread_id:
+            # Positive rollout marker: the degraded paths log too (threads_degraded,
+            # assignment_unavailable), so an operator can grep both directions.
+            logger.info(
+                "thread_assigned chat={} event_id={} thread_id={} turn_id={} rule={} turn={}",
+                event.chat_id,
+                request.event_id,
+                assignment.thread_id,
+                assignment.turn_id or "-",
+                assignment.rule,
+                outcome.value,
+            )
         return self._record(
             request,
             snapshot,
