@@ -313,3 +313,20 @@ async def test_the_ambient_judge_sees_the_approved_emojis() -> None:
 
     system = str(judge._client._provider.calls[0]["messages"][0]["content"])  # type: ignore[attr-defined]
     assert "👍" in system and "💀" in system, "the judge must know what it may send"
+
+
+# the bridge envelope --------------------------------------------------------------------
+
+
+def test_a_provider_message_id_is_read_from_the_bridge_envelope() -> None:
+    """The bridge wraps its results; reading the id flat found nothing and broke replies."""
+    from yeoman_gateway.channels.whatsapp import _receipt_from_bridge
+
+    assert _receipt_from_bridge({"sent": {"to": "x", "messageId": "3EB0ABC"}}) == {
+        "provider_message_id": "3EB0ABC"
+    }
+    assert _receipt_from_bridge(
+        {"reacted": {"chatJid": "x", "messageId": "M1", "outboundMessageId": "M2"}}
+    ) == {"provider_message_id": "M2"}
+    assert _receipt_from_bridge({"sent": {"to": "x"}}) is None
+    assert _receipt_from_bridge(None) is None

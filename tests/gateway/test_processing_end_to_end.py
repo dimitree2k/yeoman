@@ -46,18 +46,39 @@ class _Clock:
 
 @dataclass
 class _Transport:
-    """Stands in for ChannelManager.send_now()."""
+    """Stands in for ChannelManager.send_now().
+
+    It reports its provider ids the way the real bridge does - wrapped in a named envelope -
+    because that shape is exactly what the effect layer has to read.
+    """
 
     sent: list[str] = field(default_factory=list)
     fail: bool = False
+    counter: int = 0
 
-    async def send_now(self, message) -> None:
+    def _next_id(self) -> str:
+        self.counter += 1
+        return f"PROVIDER-{self.counter}"
+
+    async def send_now(self, message) -> dict[str, object] | None:
         if self.fail:
             raise TimeoutError("bridge timeout")
         self.sent.append(message.content)
+        # Same two steps as the live channel: the bridge answers in its named envelope and
+        # the channel normalises it into the receipt the effect layer persists.
+        from yeoman_gateway.channels.whatsapp import _receipt_from_bridge
 
-    async def send_reaction_now(self, message) -> None:
+        return _receipt_from_bridge(
+            {"sent": {"to": message.chat_id, "messageId": self._next_id()}}
+        )
+
+    async def send_reaction_now(self, message) -> dict[str, object] | None:
         self.sent.append(message.emoji)
+        from yeoman_gateway.channels.whatsapp import _receipt_from_bridge
+
+        return _receipt_from_bridge(
+            {"reacted": {"chatId": message.chat_id, "outboundMessageId": self._next_id()}}
+        )
 
 
 def _config(
@@ -1154,15 +1175,15 @@ async def test_a_reply_to_a_bot_message_continues_its_thread(tmp_path: Path) -> 
         first = _admit(runtime, message_id="m1", content="Arvid, fasse das zusammen")
         assert first.assignment is not None and first.assignment.turn_id
 
-        # The answer is dispatched through the effect router, which registers the anchor.
+        # The answer is dispatched through the effect router, which registers the anchor and
+        # fills it in from the transport receipt the bridge reported.
         await _dispatch(runtime, message_id="m1")
         effect = runtime.store.list_effects()[-1]
-        stored = runtime.store.get_effect(effect.effect_id)
-        assert stored is not None
-
-        # The transport reported a provider id, so the message is quotable now.
-        anchor = "PROVIDER-MESSAGE-1"
-        runtime.store.attach_confirmed_message_id(effect.effect_id, anchor, 1_700_000_000_000)
+        receipt = runtime.store.effect_transport_receipt(effect.effect_id)
+        assert receipt is not None and receipt.provider_message_id, (
+            "the provider id from the transport envelope was not stored"
+        )
+        anchor = receipt.provider_message_id
         assert runtime.store.thread_for_message(anchor) is not None, "the anchor is confirmed"
 
         reply_event = _event(message_id="m2", content="und bitte kurz")

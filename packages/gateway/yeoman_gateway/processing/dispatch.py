@@ -872,15 +872,27 @@ class IntentEffectRouter:
             logger.debug("thread_message_plan_skipped effect={} error={}", envelope.effect_id, exc)
 
     def _confirm_quotable_message(self, envelope: EffectEnvelope, result: Any, *, now: int) -> None:
-        """Attach the provider message id the transport reported, if it reported one."""
+        """Attach the provider message id the transport reported, if it reported one.
+
+        The id is read from the persisted receipt: the gateway records it before it reports
+        ``sent``, while the receipt it hands back to the caller does not carry it.
+        """
+        store = getattr(self._gateway, "store", None)
+        attach = getattr(store, "attach_confirmed_message_id", None)
+        if attach is None:
+            return
         provider_id = str(
             getattr(getattr(result, "transport_receipt", None), "provider_message_id", "") or ""
         )
         if not provider_id:
-            return
-        store = getattr(self._gateway, "store", None)
-        attach = getattr(store, "attach_confirmed_message_id", None)
-        if attach is None:
+            reader = getattr(store, "effect_transport_receipt", None)
+            if reader is not None:
+                try:
+                    stored_receipt = reader(envelope.effect_id)
+                except Exception:  # pragma: no cover - defensive
+                    stored_receipt = None
+                provider_id = str(getattr(stored_receipt, "provider_message_id", "") or "")
+        if not provider_id:
             return
         try:
             attach(envelope.effect_id, provider_id, int(now))

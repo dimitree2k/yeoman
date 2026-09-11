@@ -2019,6 +2019,10 @@ class WhatsAppChannel(BaseChannel):
         return int(random.uniform(low, high))
 
 
+#: The named envelopes the bridge wraps its command results in.
+_BRIDGE_ENVELOPE_KEYS = ("sent", "reacted", "deleted", "presence")
+
+
 def _receipt_from_bridge(
     result: Any, *, target_message_id: str | None = None
 ) -> dict[str, Any] | None:
@@ -2030,9 +2034,22 @@ def _receipt_from_bridge(
     """
     if not isinstance(result, dict):
         return None
-    provider_message_id = result.get("messageId") or result.get("outboundMessageId")
-    if target_message_id and not provider_message_id:
-        provider_message_id = result.get("messageId")
+    # The bridge wraps every command result in a named envelope (``{"sent": {...}}``,
+    # ``{"reacted": {...}}``). Reading the id from the outer object found nothing, so no
+    # provider id ever reached the effect layer: "sent" stayed unproven, no transport
+    # receipt was recorded, and a reply to one of our own messages could not be resolved.
+    payload_source = result
+    for envelope in _BRIDGE_ENVELOPE_KEYS:
+        nested = result.get(envelope)
+        if isinstance(nested, dict):
+            payload_source = nested
+            break
+    # A result may name the message it acted on and the one it created; the created id is
+    # ours and is the provider reference. ``send_text`` reports only ``messageId``, a
+    # reaction reports both, a delete only the target.
+    provider_message_id = payload_source.get("outboundMessageId") or payload_source.get(
+        "messageId"
+    )
     payload: dict[str, Any] = {}
     if provider_message_id:
         payload["provider_message_id"] = str(provider_message_id)
