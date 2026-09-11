@@ -569,3 +569,28 @@ def test_a_revoked_fact_is_never_resurrected_by_a_rerun(tmp_path: Path) -> None:
     assert revived.revoked_at_ms == T0 + 5  # still revoked
     assert revived.content == ""  # and the redacted text was not written back
     store.close()
+
+
+def test_f09_historical_sources_fail_closed_to_author_only() -> None:
+    """A backfilled message has no source-time membership, so it cannot be group-shared.
+
+    Review finding F09: the extractor used today's participant list for old sources, which
+    would hand a newly joined member rights that were never proven.
+    """
+    extractor = _extractor(
+        _payload({"content": "Der Stammtisch ist donnerstags.", "basis": "explicit_statement"}),
+        members=frozenset({"member-old", "new_member"}),
+    )
+    historical = _Event("ev-old", "Der Stammtisch ist donnerstags.")
+    historical.payload["archived"] = True
+
+    candidate = extractor([historical])[0]
+
+    assert candidate.visibility_scope == "author_only"
+    assert candidate.audience == frozenset({"member-old"})
+    assert "new_member" not in candidate.audience
+
+    # The same statement from a live turn keeps the proven current membership.
+    live = extractor([_Event("ev-new", "Der Stammtisch ist donnerstags.")])[0]
+    assert live.visibility_scope == "chat_shared"
+    assert live.audience == frozenset({"member-old", "new_member"})

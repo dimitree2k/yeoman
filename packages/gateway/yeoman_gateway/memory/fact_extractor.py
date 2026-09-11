@@ -73,6 +73,7 @@ class _EventView:
     occurred_ms: int | None
     is_group: bool
     is_user_message: bool
+    archived: bool = False
 
 
 def event_view(event: object, *, revision: int = 1) -> _EventView:
@@ -88,6 +89,7 @@ def event_view(event: object, *, revision: int = 1) -> _EventView:
         revision=int(revision),
         occurred_ms=getattr(event, "occurred_ms", None),
         is_group=bool(body.get("is_group")),
+        archived=bool(body.get("archived")),
         is_user_message=str(getattr(event, "kind", "message")) == "message"
         and role not in ("assistant", "system", "bot"),
     )
@@ -165,7 +167,14 @@ class SharedFactExtractor:
         if not rows:
             return []
 
-        audience, group = self._resolve_audience(sources[0])
+        # A backfilled message carries no proven membership snapshot: the registry knows
+        # today's members, not who was in the group when the statement was made. Handing
+        # today's list to an old statement would grant a new member rights that were never
+        # proven, so historical sources fail closed to author-only.
+        if any(view.archived for view in sources):
+            audience, group = frozenset(), sources[0].is_group
+        else:
+            audience, group = self._resolve_audience(sources[0])
         candidates: list[SharedFactCandidate] = []
         for row in rows[: self._max_candidates]:
             candidate = self._to_candidate(
