@@ -111,3 +111,42 @@ def test_f11_accepts_string_participants_too() -> None:
             return {"metadata": {"participants": ["alice", "bob"]}}
 
     assert registry_members(_Strings(), channel="whatsapp", chat_id="x") == {"alice", "bob"}
+
+
+def test_f01_an_unopenable_store_stops_startup_instead_of_falling_back(tmp_path: Path) -> None:
+    """Review F01: returning None uninstalled every guard and let legacy publish.
+
+    The channel path is what matters, so this asserts the startup contract that keeps the
+    channel path intact: with the mode enabled and no usable store, building fails loudly.
+    """
+    import pytest
+    from yeoman_gateway.app.bootstrap import (
+        ProcessingStoreUnavailableError,
+        build_effect_router,
+        build_processing_gate,
+        build_processing_store,
+    )
+    from yeoman_shared.config.schema import Config
+
+    # A file where the database's parent directory should be: opening must fail.
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("x")
+    config = Config.model_validate(
+        {
+            "processing": {
+                "enabled": True,
+                "chats": ["whatsapp:pilot@g.us"],
+                "db_path": str(blocked / "processing.db"),
+            },
+            "security": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(ProcessingStoreUnavailableError):
+        build_processing_store(config)
+
+    # And the disabled mode still stays inert rather than raising.
+    config.processing.enabled = False
+    assert build_processing_store(config) is None
+    assert build_processing_gate(config, None, None, None) is None
+    assert build_effect_router(config, None, None, None) is None

@@ -324,6 +324,10 @@ class GatewayRuntime:
             await tracing.shutdown()
 
 
+class ProcessingStoreUnavailableError(RuntimeError):
+    """The new mode is enabled but its durable store cannot be opened (review F01)."""
+
+
 def build_processing_store(config: "Config") -> "ProcessingStore | None":
     """Open the durable processing store, but only when the new mode is enabled.
 
@@ -350,9 +354,15 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
         path = get_data_path() / path
     try:
         return ProcessingStore(path, retention=retention)
-    except Exception:
-        logger.exception("processing store unavailable; new processing mode stays offline")
-        return None
+    except Exception as exc:
+        # Review F01: returning None here did not keep the mode "offline". Every later
+        # builder then returned None as well, so no fast gate, no effect router and no
+        # managed-outbound guard were installed - and the legacy path published for chats
+        # that are configured as managed. A store we cannot open is a startup failure.
+        logger.critical("processing store unavailable path={} error={}", path, exc)
+        raise ProcessingStoreUnavailableError(
+            f"processing.enabled is set but the store at {path} cannot be opened: {exc}"
+        ) from exc
 
 
 @dataclass
