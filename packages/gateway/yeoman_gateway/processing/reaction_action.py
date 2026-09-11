@@ -63,7 +63,6 @@ class ReactionChooser:
         if provider_cfg is None:
             raise ValueError(f"no provider with credentials for reaction route '{self._route_key}'")
         self._model = model
-        self._timeout_ms = int(getattr(profile, "timeout_ms", 0) or 0)
         self._provider = LiteLLMProvider(
             api_key=provider_cfg.api_key if provider_cfg.api_key else None,
             api_base=provider_cfg.api_base,
