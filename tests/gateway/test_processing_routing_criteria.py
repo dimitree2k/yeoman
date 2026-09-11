@@ -241,3 +241,206 @@ def test_criterion_7_each_ambient_order_gets_its_own_lineage(tmp_path: Path) -> 
     assert store.get_thread(str(first.thread_id)).kind == "ambient"
     assert store.get_thread(str(second.thread_id)).kind == "ambient"
     store.close()
+
+
+def _sent_bot_question(store: ProcessingStore, turn_id: str, text: str) -> str:
+    """A provably sent bot message inside a turn - the only bot evidence that counts."""
+    store.enqueue_effect(
+        effect_id="fx-question",
+        operation_key="q-1",
+        payload={"text": text},
+        target={"channel": "whatsapp", "chat_id": CHAT},
+        turn_id=turn_id,
+        turn_revision=1,
+        now_ms=T0,
+    )
+    store.transition("fx-question", expected="queued", target="executing", now_ms=T0, worker_id="w")
+    store.transition("fx-question", expected="executing", target="sent", now_ms=T0, worker_id="w")
+    return "fx-question"
+
+
+# criterion 1 -------------------------------------------------------------------------------
+
+
+def test_criterion_1_a_single_candidate_is_attached_only_with_a_positive_signal(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+
+    # Without a signal: no attachment, even though exactly one thread is open.
+    store.append_event(
+        event_key="k-m2", event_id="m2", trace_id="t-m2",
+        payload=_event("m2", "Wie wird morgen das Wetter?"), now_ms=T0 + 1,
+    )
+    no_signal = registry.assign(_event("m2", "Wie wird morgen das Wetter?"), now_ms=T0 + 2)
+    assert no_signal.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert no_signal.thread_id != started.thread_id
+
+    # With a positive signal: the single candidate is attached.
+    text = "Zum Mietvertrag: ergänze bitte die Kündigungsfrist."
+    store.append_event(
+        event_key="k-m3", event_id="m3", trace_id="t-m3",
+        payload=_event("m3", text), now_ms=T0 + 3,
+    )
+    attached = registry.assign(_event("m3", text), now_ms=T0 + 4)
+    assert attached.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert attached.thread_id == started.thread_id
+    store.close()
+
+
+# criterion 3 -------------------------------------------------------------------------------
+
+
+def test_criterion_3_a_resolved_reply_beats_every_heuristic(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    first = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    # A second, newer thread exists, so the follow-up heuristic would prefer it.
+    store.append_event(
+        event_key="k-m2", event_id="m2", trace_id="t-m2",
+        payload=_event("m2", "Prüfe die Nebenkostenabrechnung.", mentioned=True), now_ms=T0 + 1,
+    )
+    registry.assign(_event("m2", "Prüfe die Nebenkkostenabrechnung.", mentioned=True), now_ms=T0 + 1)
+
+    quoted = registry.assign(
+        _event("m3", "dazu noch eine Frage", mentioned=False), now_ms=T0 + 2
+    )
+    assert quoted.rule is not JoinRule.REPLY_KNOWN  # nothing to resolve yet
+
+    from yeoman_gateway.processing.models import CanonicalEvent
+
+    reply_event = CanonicalEvent(
+        event_id="m4",
+        event_key="k-m4",
+        trace_id="t-m4",
+        kind="message",
+        channel="whatsapp",
+        chat_id=CHAT,
+        principal=PRINCIPAL,
+        source_message_id="m4",
+        payload={"text": "und dazu?", "is_group": True, "mentioned_bot": False,
+                 "reply_to_message_id": "m1"},
+    )
+    store.append_event(
+        event_key="k-m4", event_id="m4", trace_id="t-m4", payload=reply_event, now_ms=T0 + 3
+    )
+    decision = registry.assign(reply_event, now_ms=T0 + 4)
+
+    assert decision.rule is JoinRule.REPLY_KNOWN, "the explicit reference must win"
+    assert decision.thread_id == first.thread_id
+    assert decision.quote_ref == "m1"
+    store.close()
+
+
+# criterion 13 ------------------------------------------------------------------------------
+
+
+def test_criterion_13_both_signals_attach_and_the_negatives_do_not(tmp_path: Path) -> None:
+    # (a) answer to an open question
+    store = _store(tmp_path)
+    registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+    _sent_bot_question(
+        store, str(started.turn_id), "Soll die Zusammenfassung kurz oder ausführlich sein?"
+    )
+    store.append_event(
+        event_key="k-m2", event_id="m2", trace_id="t-m2",
+        payload=_event("m2", "kurz"), now_ms=T0 + 1,
+    )
+    answered = registry.assign(_event("m2", "kurz"), now_ms=T0 + 2)
+    assert answered.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert answered.thread_id == started.thread_id
+    store.close()
+
+    # (b) explicit call-back and (c) its negatives, each in a fresh chat
+    store2 = _store(tmp_path / "b")
+    registry2 = _seed(store2, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started2 = registry2.assign(
+        _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0
+    )
+    call_back = "Zur Zusammenfassung des Mietvertrags: ergänze bitte die Kündigungsfrist."
+    store2.append_event(
+        event_key="k-m2", event_id="m2", trace_id="t-m2",
+        payload=_event("m2", call_back), now_ms=T0 + 1,
+    )
+    continued = registry2.assign(_event("m2", call_back), now_ms=T0 + 2)
+    assert continued.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert continued.thread_id == started2.thread_id
+    store2.close()
+
+    for negative in ("Wie wird morgen das Wetter?", "mach weiter", "ja"):
+        store3 = _store(tmp_path / "neg" / negative.replace(" ", "-"))
+        registry3 = _seed(store3, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+        started3 = registry3.assign(
+            _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0
+        )
+        store3.append_event(
+            event_key="k-m2", event_id="m2", trace_id="t-m2",
+            payload=_event("m2", negative), now_ms=T0 + 1,
+        )
+        decision3 = registry3.assign(_event("m2", negative), now_ms=T0 + 2)
+        assert decision3.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE, negative
+        assert decision3.thread_id != started3.thread_id, negative
+        store3.close()
+
+
+# criterion 15 ------------------------------------------------------------------------------
+
+
+def test_criterion_15_a_mention_continues_the_single_thread_without_a_reply(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
+    started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
+
+    text = "@Arvid zum Mietvertrag: ergänze bitte die Kündigungsfrist."
+    store.append_event(
+        event_key="k-m2", event_id="m2", trace_id="t-m2",
+        payload=_event("m2", text, mentioned=True), now_ms=T0 + 1,
+    )
+    decision = registry.assign(_event("m2", text, mentioned=True), now_ms=T0 + 2)
+
+    assert decision.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE, "a mention plus one thread continues it"
+    assert decision.thread_id == started.thread_id
+    assert decision.turn_id == started.turn_id
+    store.close()
+
+
+# criterion 9 -------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_9_silence_halts_before_any_typing_or_reply() -> None:
+    """The mechanism behind criterion 9: `should_respond=False` halts the pipeline.
+
+    Typing and the reply are only produced downstream of that halt, so silence cannot show
+    a typing indicator or send anything.
+    """
+    from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.pipeline.access import NoReplyFilterMiddleware
+
+    class _Decision:
+        accept_message = True
+        should_respond = False
+        reason = "when_to_reply:off"
+        notes_enabled = False
+
+    middleware = NoReplyFilterMiddleware()
+    reached: list[str] = []
+
+    class _Ctx:
+        decision = _Decision()
+        event = type("E", (), {"channel": "whatsapp", "chat_id": CHAT})()
+
+        def halt(self) -> None:
+            reached.append("halt")
+
+        def metric(self, *args, **kwargs) -> None:
+            return None
+
+    async def _next(ctx) -> None:
+        reached.append("next")
+
+    await middleware(_Ctx(), _next)
+
+    assert reached == ["halt"], f"silence must stop the pipeline: {reached}"
+    assert PipelineContext is not None  # the type is imported from the real module
