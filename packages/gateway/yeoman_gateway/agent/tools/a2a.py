@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from typing import Any
 
@@ -25,6 +26,29 @@ DELEGATION_WINDOW_MS = 600_000
 DELEGATION_WORKER_ID = "a2a_delegate"
 #: A synchronous call holds its claim for longer than any worker timeout.
 DELEGATION_LEASE_MS = 900_000
+
+#: A peer may prefix its answer with its own reasoning block. That is not part of the
+#: answer: it is private thinking and must not appear as a chat message.
+_REASONING_BLOCK = re.compile(
+    r"^\s*(?:💭\s*)?\*{0,2}\s*reasoning\s*:?\s*\*{0,2}\s*\n+```[a-zA-Z0-9]*\n.*?\n```\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def clean_peer_answer(text: str) -> str:
+    """Strip a leading reasoning block from a peer's answer.
+
+    Falls back to the untouched text when nothing remains, so a peer that answers *only*
+    with reasoning does not turn into an empty message.
+    """
+    cleaned = str(text or "")
+    while True:  # a peer may stack more than one block in front of the answer
+        stripped = _REASONING_BLOCK.sub("", cleaned, count=1)
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    cleaned = cleaned.strip()
+    return cleaned or str(text or "").strip()
 
 
 class A2ADelegateTool(Tool):
@@ -181,7 +205,7 @@ class A2ADelegateTool(Tool):
                 channel=channel,
                 chat_id=chat_id,
                 content=(
-                    f"[{worker} | kein Ergebnis] Die Delegation ist ohne Antwort geblieben "
+                    f"Die Delegation an {worker} ist ohne Ergebnis geblieben "
                     f"({type(exc).__name__}). Ich habe sie bewusst nicht wiederholt."
                 ),
             )
@@ -198,10 +222,8 @@ class A2ADelegateTool(Tool):
             effect_id=effect_id,
             channel=channel,
             chat_id=chat_id,
-            content=(
-                f"[{worker} | Ergebnis der Delegation]\n\n"
-                f"{result.text or '(der Worker hat keine Ausgabe geliefert)'}"
-            ),
+            content=clean_peer_answer(result.text)
+            or "(der Worker hat keine Ausgabe geliefert)",
         )
 
     async def _deliver(self, *, effect_id: str, channel: str, chat_id: str, content: str) -> None:

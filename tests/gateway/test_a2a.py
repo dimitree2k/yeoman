@@ -374,7 +374,7 @@ async def test_a_detached_delegation_answers_at_once_and_delivers_later(tmp_path
     assert sent["source"] == "a2a"
     assert sent["operation_ref"].startswith("a2a-result:")
     assert sent["chat_id"] == "chat@g.us"
-    assert "REPORT" in sent["content"]
+    assert sent["content"] == "REPORT", "no header, no scaffolding around the answer"
 
 
 @pytest.mark.asyncio
@@ -404,7 +404,24 @@ async def test_a_failed_detached_delegation_is_reported_not_retried(tmp_path: Pa
 
     assert effects and effects[0].state == "unknown", "an unproven write is not a failure"
     assert len(delivery.sent) == 1
-    assert "kein Ergebnis" in delivery.sent[0]["content"]
+    assert "ohne Ergebnis geblieben" in delivery.sent[0]["content"]
+    assert "[" not in delivery.sent[0]["content"], "no technical bracket header"
+
+
+def test_a_peer_reasoning_block_never_reaches_the_chat() -> None:
+    """Hermes prefixes its answer with its own reasoning; that is not the answer."""
+    from yeoman_gateway.agent.tools.a2a import clean_peer_answer
+
+    raw = (
+        "💭 **Reasoning:**\n```\n**Scheduling terminal sleep command**\n```\n\n"
+        "ASYNC-TEST OK nach 120 Sekunden."
+    )
+
+    assert clean_peer_answer(raw) == "ASYNC-TEST OK nach 120 Sekunden."
+    assert "Reasoning" not in clean_peer_answer(raw)
+    # A peer answering *only* with reasoning must not become an empty message.
+    only = "💭 **Reasoning:**\n```\nthinking\n```"
+    assert clean_peer_answer(only).strip() != ""
 
 
 # --------------------------------------------------------------------------------------
