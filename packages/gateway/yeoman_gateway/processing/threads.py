@@ -332,6 +332,12 @@ class ThreadRegistry:
     ) -> None:
         self._store = store
         self._policy = policy or (ThreadPolicy.from_config(config) if config else ThreadPolicy())
+        # Owner-released chats where an unaddressed message may still be answered.
+        self._ambient_chats = frozenset(
+            str(entry).strip()
+            for entry in (getattr(config, "ambient_chats", None) or [])
+            if str(entry).strip()
+        )
 
     @property
     def policy(self) -> ThreadPolicy:
@@ -399,18 +405,91 @@ class ThreadRegistry:
                 reason=decision.reason or "reaction_signal",
             )
         if decision.thread_id is None and decision.rule is JoinRule.AMBIENT:
-            # Ambient is background: it is neither a thread nor a turn.
-            if decision.needs_clarification:
-                self._store.attach_event_assignment(
-                    event_id=event.event_id, thread_id=None, turn_id=None, now_ms=moment
-                )
-            return decision
+            # Ambient is background by default: neither a thread nor a turn. In the chats
+            # the owner released for ambient answers, the answer still needs its own
+            # provenance, so it gets an isolated short-lived thread of its own - never a
+            # shared chat turn (routing spec, use case 2).
+            if not allow_turn or not self._ambient_allowed(data):
+                if decision.needs_clarification:
+                    self._store.attach_event_assignment(
+                        event_id=event.event_id, thread_id=None, turn_id=None, now_ms=moment
+                    )
+                return decision
+            return self._persist_ambient(event, data, decision, now_ms=moment)
         if decision.needs_clarification:
             self._store.attach_event_assignment(
                 event_id=event.event_id, thread_id=None, turn_id=None, now_ms=moment
             )
             return decision
         return self._persist(event, data, decision, now_ms=moment, allow_turn=allow_turn)
+
+    def _ambient_allowed(self, data: JoinInput) -> bool:
+        """Whether this chat lets an unaddressed message be answered at all."""
+        if not self._ambient_chats:
+            return False
+        return f"{data.channel}:{data.chat_id}" in self._ambient_chats
+
+    def _persist_ambient(
+        self,
+        event: CanonicalEvent,
+        data: JoinInput,
+        decision: JoinDecision,
+        *,
+        now_ms: int,
+    ) -> JoinDecision:
+        """Give one ambient answer its own thread and turn, and close the previous one."""
+        thread_id = self._store.open_thread(
+            channel=event.channel,
+            chat_id=event.chat_id,
+            root_principal=event.principal,
+            kind="ambient",
+            trigger_event_id=event.event_id,
+            now_ms=now_ms,
+        )
+        turn_id = self._store.open_turn(
+            thread_id=thread_id,
+            principal=event.principal,
+            trigger_event_id=event.event_id,
+            now_ms=now_ms,
+        )
+        self._store.add_turn_source(
+            turn_id=turn_id,
+            event_id=event.event_id,
+            source_message_id=event.source_message_id,
+            role="trigger",
+            revision_at_join=1,
+            now_ms=now_ms,
+        )
+        self._store.attach_event_assignment(
+            event_id=event.event_id, thread_id=thread_id, turn_id=turn_id, now_ms=now_ms
+        )
+        # An ambient order is short-lived: earlier ones stop being candidates immediately.
+        self._close_previous_ambient_threads(data, keep=thread_id, now_ms=now_ms)
+        return replace(
+            decision,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            new_thread=True,
+            new_turn=True,
+            reason="ambient_answer_with_own_lineage",
+            source_message_ids=(str(event.source_message_id or event.event_id),),
+        )
+
+    def _close_previous_ambient_threads(
+        self, data: JoinInput, *, keep: str, now_ms: int
+    ) -> None:
+        for thread in self._store.list_threads(
+            channel=data.channel or None,
+            chat_id=data.chat_id,
+            principal=data.principal,
+            state="open",
+        ):
+            if thread.thread_id == keep or getattr(thread, "kind", "") != "ambient":
+                continue
+            turn = self._store.active_turn(thread.thread_id)
+            if turn is not None:
+                self._store.close_turn(turn.turn_id, now_ms=now_ms, state="closed")
+            self._store.touch_thread(thread.thread_id, now_ms)
 
     # -- persistence -------------------------------------------------------------------
 
@@ -555,7 +634,10 @@ class ThreadRegistry:
         active = [
             (thread.thread_id, self._active_turn_id(thread.thread_id))
             for thread in threads
-            if now_ms - thread.last_activity_ms <= self._policy.followup_window_ms
+            # An ambient answer must never capture the next unmarked message; only an
+            # explicit reply may continue it (routing spec, ambient lineage).
+            if getattr(thread, "kind", "") != "ambient"
+            and now_ms - thread.last_activity_ms <= self._policy.followup_window_ms
         ]
         return tuple(active)
 

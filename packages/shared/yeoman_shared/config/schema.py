@@ -703,6 +703,9 @@ class ProcessingConfig(BaseModel):
     enabled: bool = False
     chats: list[str] = Field(default_factory=list)
     shadow_chats: list[str] = Field(default_factory=list)
+    #: Chats where an ambient (unaddressed) message may still be answered, each with its
+    #: own short-lived lineage. Empty everywhere else (routing spec, owner decision).
+    ambient_chats: list[str] = Field(default_factory=list)
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)

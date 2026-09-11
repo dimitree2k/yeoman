@@ -733,3 +733,65 @@ def test_a_closed_turn_does_not_remove_its_open_thread_from_the_candidates(tmp_p
         assert candidates[0][1] is None  # no active turn, but the thread is a candidate
     finally:
         store.close()
+
+
+class _AmbientConfig(_Config):
+    """The v1 defaults plus the owner-approved chats for ambient answers."""
+
+    ambient_chats = ["whatsapp:chat@g.us"]
+
+
+def test_ambient_answer_gets_its_own_short_lived_lineage(tmp_path: Path) -> None:
+    """Plan 07 / Aufgabe 4: an ambient answer never shares a chat turn.
+
+    In an approved chat an unaddressed message may be answered, but the answer needs its
+    own provenance - a shared turn would mix unrelated orders in one lineage.
+    """
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = ThreadRegistry(store=store, config=_AmbientConfig())
+
+    first = registry.assign(_event(event_id="m1", mentioned_bot=False), now_ms=T0)
+    second = registry.assign(_event(event_id="m2", mentioned_bot=False), now_ms=T0 + 1_000)
+
+    assert first.thread_id and first.turn_id, "an approved ambient answer needs a lineage"
+    assert first.reason == "ambient_answer_with_own_lineage"
+    assert second.thread_id != first.thread_id, "each ambient order gets its own thread"
+    assert second.turn_id != first.turn_id
+    assert store.get_thread(str(first.thread_id)).kind == "ambient"
+    # The earlier ambient order is closed as soon as the next one starts.
+    assert store.get_turn(str(first.turn_id)).state == "closed"
+    store.close()
+
+
+def test_without_approval_ambient_stays_without_a_turn(tmp_path: Path) -> None:
+    """Everywhere else an ambient message produces no turn, no effect and no typing."""
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+
+    decision = registry.assign(_event(event_id="m1", mentioned_bot=False), now_ms=T0)
+
+    assert decision.rule is JoinRule.AMBIENT
+    assert decision.thread_id is None and decision.turn_id is None
+    assert store.event_assignment("m1") in (None, (None, None))
+    store.close()
+
+
+def test_an_ambient_thread_is_never_an_unmarked_continuation_candidate(tmp_path: Path) -> None:
+    """An ambient answer must not capture the next unmarked message."""
+    from yeoman_gateway.processing.threads import JoinInput
+
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = ThreadRegistry(store=store, config=_AmbientConfig())
+    ambient = registry.assign(_event(event_id="m1", mentioned_bot=False), now_ms=T0)
+    assert ambient.thread_id
+
+    candidates = registry._active_threads(
+        JoinInput(
+            event_id="m2", channel="whatsapp", chat_id="chat@g.us",
+            principal="owner@s.whatsapp.net", kind="message", is_group=True,
+        ),
+        now_ms=T0 + 1_000,
+    )
+
+    assert all(thread_id != ambient.thread_id for thread_id, _turn in candidates)
+    store.close()
