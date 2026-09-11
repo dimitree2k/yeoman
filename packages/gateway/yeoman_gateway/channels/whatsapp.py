@@ -21,6 +21,11 @@ from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
 from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
+from yeoman_gateway.implicit_addressing import (
+    DEFAULT_BOT_NAME_ALIASES,
+    contains_bot_name,
+    looks_like_question_or_request,
+)
 from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.vision import VisionDescriber
@@ -809,6 +814,7 @@ class WhatsAppChannel(BaseChannel):
         )
 
     def _to_core_event(self, event: InboundEvent, message_id: str) -> CoreInboundEvent:
+        implicit_address = self._is_implicit_address(event)
         """Local identity normalization, done before any vision/transcription call.
 
         A permission decision must never depend on enriched content, so this conversion
@@ -829,18 +835,34 @@ class WhatsAppChannel(BaseChannel):
             timestamp=_timestamp_to_datetime(event.timestamp),
             participant=effective_participant,
             is_group=event.is_group,
-            mentioned_bot=event.mentioned_bot,
+            mentioned_bot=event.mentioned_bot or implicit_address,
             reply_to_bot=event.reply_to_bot,
             reply_to_message_id=event.reply_to_message_id,
             reply_to_participant=event.reply_to_participant,
             reply_to_text=event.reply_to_text,
             raw_metadata={
+                **({"implicit_bot_address": "plain_name_request"} if implicit_address else {}),
                 "message_id": message_id,
                 "is_group": event.is_group,
                 "media_kind": event.media_kind,
                 "is_voice": event.media_kind == "audio",
             },
         )
+
+    def _is_implicit_address(self, event: InboundEvent) -> bool:
+        """Whether a group message addresses the bot by name, without a platform mention.
+
+        The classic pipeline classifies this as well, but only after the fast gate has
+        already journalled the event and chosen its thread - so routing would treat
+        "Arvid, ..." as ambient and attach it only with a continuity signal (routing spec,
+        criterion 5). The canonical event the gate sees carries the mark instead.
+        """
+        if not event.is_group or event.mentioned_bot or event.reply_to_bot:
+            return False
+        text = str(event.text or "")
+        if not text or not contains_bot_name(text, bot_name_aliases=DEFAULT_BOT_NAME_ALIASES):
+            return False
+        return looks_like_question_or_request(text)
 
     async def _ingest_inbound_event(self, event: InboundEvent) -> None:
         if self._is_duplicate(event.chat_jid, event.message_id):

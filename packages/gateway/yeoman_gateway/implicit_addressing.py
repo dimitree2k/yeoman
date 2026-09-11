@@ -190,10 +190,14 @@ class ConversationState:
         }
 
 
+#: The names that address the bot without a platform mention.
+DEFAULT_BOT_NAME_ALIASES: tuple[str, ...] = ("arvid",)
+
+
 def contains_bot_name(
     text: str,
     *,
-    bot_name_aliases: Sequence[str] = ("arvid",),
+    bot_name_aliases: Sequence[str] = DEFAULT_BOT_NAME_ALIASES,
 ) -> bool:
     return any(
         re.search(rf"(?i)(?<![\w@])@?{re.escape(str(alias).strip())}(?!\w)", text)
