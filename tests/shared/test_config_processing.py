@@ -17,7 +17,9 @@ def test_processing_is_disabled_by_default() -> None:
 
 def test_processing_carries_the_v1_start_values() -> None:
     processing = Config().processing
-    assert processing.threads.followup_window_seconds == 15
+    # Owner decision 11.09.2026: the automatic continuation window starts at ten
+    # minutes instead of the original fifteen seconds (routing spec: 5-10 minutes).
+    assert processing.threads.followup_window_seconds == 600
     assert processing.threads.idle_seconds == 1800
     assert processing.threads.reopen_window_seconds == 7 * 86400
     assert processing.threads.pending_inputs_per_thread == 32

@@ -597,7 +597,9 @@ class ProcessingThreadsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    followup_window_seconds: int = Field(default=15, ge=0)
+    #: Automatic continuation window (spec: "Fortsetzungsfenster"). Owner-set: ten
+    #: minutes, changeable in config.json without a code change.
+    followup_window_seconds: int = Field(default=600, ge=0)
     idle_seconds: int = Field(default=1800, ge=1)
     reopen_window_seconds: int = Field(default=604800, ge=0)
     pending_inputs_per_thread: int = Field(default=32, ge=1)

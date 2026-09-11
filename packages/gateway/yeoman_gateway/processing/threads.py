@@ -139,7 +139,7 @@ class ThreadPolicy:
         if threads is None:
             return cls()
         return cls(
-            followup_window_ms=int(getattr(threads, "followup_window_seconds", 15)) * 1000,
+            followup_window_ms=int(getattr(threads, "followup_window_seconds", 600)) * 1000,
             idle_ms=int(getattr(threads, "idle_seconds", 1800)) * 1000,
             reopen_window_ms=int(getattr(threads, "reopen_window_seconds", 604800)) * 1000,
             pending_inputs_per_thread=int(getattr(threads, "pending_inputs_per_thread", 32)),

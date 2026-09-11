@@ -599,3 +599,24 @@ def test_observed_message_gets_lineage_but_no_turn(tmp_path: Path) -> None:
     assert store.active_turn(decision.thread_id) is None
     assert store.count_pending(thread_id=decision.thread_id) == 0
     store.close()
+
+
+def test_continuation_window_defaults_to_ten_minutes_and_is_configurable() -> None:
+    """Plan 07 / Aufgabe 1: the automatic continuation window is an owner setting.
+
+    The default is ten minutes; a chat that sets its own value gets that value, and the
+    window is read from config rather than duplicated as a constant.
+    """
+    from yeoman_gateway.processing.threads import ThreadPolicy
+    from yeoman_shared.config.schema import Config
+
+    assert Config().processing.threads.followup_window_seconds == 600
+
+    configured = Config.model_validate(
+        {"processing": {"threads": {"followup_window_seconds": 120}}}
+    )
+    policy = ThreadPolicy.from_config(configured.processing)
+
+    assert policy.followup_window_ms == 120_000
+    default_policy = ThreadPolicy.from_config(Config().processing)
+    assert default_policy.followup_window_ms == 600_000
