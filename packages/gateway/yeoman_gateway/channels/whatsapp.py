@@ -157,6 +157,10 @@ class InboundEvent:
     voice_transcript: str | None
     sender_name: str | None = None
     thread_assignment: "dict[str, Any] | None" = None
+    #: Set when the processing core already acted for this message, so the classic pipeline
+    #: must not add its own acknowledgement reaction or stop the granted answer.
+    processing_reacted: bool = False
+    processing_answer_granted: bool = False
     reply_to_media_kind: str | None = None
     reply_to_media_type: str | None = None
     reply_to_media_path: str | None = None
@@ -851,8 +855,7 @@ class WhatsAppChannel(BaseChannel):
             return None
         if not verdict.needs_turn:
             # A reaction is the whole reply: no turn, no typing, no text, own lineage.
-            await self._send_ambient_reaction(event, verdict)
-            return None
+            return await self._send_ambient_reaction(event, verdict)
         try:
             core_event = self._to_core_event(event, event.message_id)
             assignment = self._processing_gate.reconcile_reply(core_event)
@@ -876,11 +879,11 @@ class WhatsAppChannel(BaseChannel):
         )
         return assignment
 
-    async def _send_ambient_reaction(self, event: InboundEvent, verdict: Any) -> None:
+    async def _send_ambient_reaction(self, event: InboundEvent, verdict: Any) -> bool:
         """Send the judge's chosen emoji; a missing reaction path means silence."""
         if self._reaction_action is None or not getattr(verdict, "emoji", None):
             self._processing_gate.note_ambient_declined(event.message_id)
-            return
+            return False
         sent = await self._reaction_action.send(
             emoji=str(verdict.emoji),
             channel=self.name,
@@ -890,7 +893,7 @@ class WhatsAppChannel(BaseChannel):
         )
         if not sent:
             self._processing_gate.note_ambient_declined(event.message_id)
-            return
+            return False
         self._processing_gate.note_ambient_answer(event.message_id)
         logger.info(
             "ambient_reaction_sent chat={} message_id={} emoji={}",
@@ -898,8 +901,9 @@ class WhatsAppChannel(BaseChannel):
             event.message_id,
             sent,
         )
+        return True
 
-    async def _maybe_react(self, event: InboundEvent) -> None:
+    async def _maybe_react(self, event: InboundEvent) -> str | None:
         """One reaction instead of an answer, for chats configured with ``react``.
 
         The answer turn is already withdrawn by the gate (and refused again at admission),
@@ -912,7 +916,7 @@ class WhatsAppChannel(BaseChannel):
                 event.chat_jid,
                 event.message_id,
             )
-            return
+            return None
         try:
             emoji = await self._reaction_action(
                 channel="whatsapp",
@@ -928,13 +932,14 @@ class WhatsAppChannel(BaseChannel):
                 event.message_id,
                 type(exc).__name__,
             )
-            return
+            return None
         logger.info(
             "reaction_action chat={} message_id={} emoji={}",
             event.chat_jid,
             event.message_id,
             emoji or "-",
         )
+        return emoji
 
     def _processing_request(self, event: InboundEvent) -> Any:
         """Canonical base data for the pre-enrichment journal and policy check."""
@@ -1026,7 +1031,8 @@ class WhatsAppChannel(BaseChannel):
                     # The answer is withdrawn; the reaction is the whole reply and needs no
                     # turn, no typing indicator and no pipeline run of its own. Messages the
                     # gate only observed stay observed - no acknowledgement per message.
-                    await self._maybe_react(event)
+                    reacted = await self._maybe_react(event)
+                    event = replace(event, processing_reacted=bool(reacted))
                 else:
                     # Unaddressed and the brake passed. The verdict waits until the media is
                     # readable: a voice message has no text before its transcript exists,
@@ -1059,6 +1065,9 @@ class WhatsAppChannel(BaseChannel):
                         "turn_id": granted.turn_id,
                         "source_message_ids": list(granted.source_message_ids),
                     },
+                    # The core granted this answer; the classic pipeline must not stop it
+                    # with an acknowledgement reaction.
+                    processing_answer_granted=True,
                 )
         self._record_document_cache_item(event)
         self._archive_inbound_event(event)
@@ -1651,6 +1660,8 @@ class WhatsAppChannel(BaseChannel):
                 "reply_to_participant": event.reply_to_participant,
                 "reply_to_text": event.reply_to_text,
                 "mentioned_jids": event.mentioned_jids,
+                "processing_reacted": event.processing_reacted,
+                "processing_answer_granted": event.processing_answer_granted,
                 "media_path": event.media_path,
                 "media_bytes": event.media_bytes,
                 "media_type": event.media_type,

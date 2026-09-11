@@ -19,6 +19,22 @@ from yeoman_gateway.implicit_addressing import (
 )
 
 
+def _processing_owns_outcome(event: object) -> bool:
+    """True when the processing core already acted for this message.
+
+    The core reacts on its own paths (the judge's verdict, the `react` reply action) and
+    grants ambient answers; both are recorded on the event before it reaches the pipeline.
+    In a managed chat that decision is the whole reply, so the classic acknowledgement
+    reactions step aside - exactly one reaction per message, and no halted answer.
+    """
+    metadata = getattr(event, "raw_metadata", None) or {}
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        metadata.get("processing_reacted") or metadata.get("processing_answer_granted")
+    )
+
+
 class ImplicitBotAddressMiddleware:
     """Promote strong implicit address signals without making groups reply to all."""
 
@@ -71,6 +87,13 @@ class ImplicitBotAddressMiddleware:
             return
 
         event = ctx.event
+        if _processing_owns_outcome(event):
+            # The processing core has already decided for this message: it either sent the
+            # one reaction a message may carry or granted an answer. A second, mechanical
+            # face here would overwrite that reaction in the chat (WhatsApp keeps one per
+            # message) and its halt would swallow the granted answer.
+            await next(ctx)
+            return
         state_raw = event.raw_metadata.get("conversation_state")
         state_mode = str(
             state_raw.get("address_mode") if isinstance(state_raw, dict) else ""

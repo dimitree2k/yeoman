@@ -118,3 +118,128 @@ async def test_criterion_5_a_direct_chat_needs_no_address(monkeypatch, tmp_path)
 
     request = gate.requests[0]
     assert "implicit_bot_address" not in dict(request.event.raw_metadata or {})
+
+
+# the processing core owns the reaction in a managed chat ---------------------------------
+
+
+def _bait_ctx(*, metadata: dict, content: str = "ok"):
+    """A short reply to the bot, i.e. the classic acknowledgement case."""
+    from yeoman_gateway.core.models import InboundEvent as CoreEvent
+    from yeoman_gateway.core.pipeline import PipelineContext
+
+    event = CoreEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="111",
+        content=content,
+        message_id="m1",
+        is_group=True,
+        reply_to_bot=True,
+        raw_metadata=dict(metadata),
+    )
+    ctx = PipelineContext(event=event)
+    ctx.decision = type(
+        "D",
+        (),
+        {
+            "accept_message": True,
+            "should_respond": True,
+            "reason": "allowed",
+            "when_to_reply_mode": "all",
+        },
+    )()
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_the_core_reaction_is_not_overwritten_by_an_acknowledgement() -> None:
+    """A short reply to the bot gets exactly one reaction: the core's, not a second face."""
+    from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
+
+    ctx = _bait_ctx(metadata={"processing_reacted": True}, content="ok")
+    reached: list[str] = []
+
+    async def _next(_ctx) -> None:
+        reached.append("next")
+
+    await ImplicitBotAddressMiddleware()(ctx, _next)
+
+    assert reached == ["next"], "the pipeline must continue, not halt"
+    assert ctx.intents == [], "no second reaction on the same message"
+
+
+@pytest.mark.asyncio
+async def test_a_granted_ambient_answer_is_not_halted_by_an_acknowledgement() -> None:
+    from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
+
+    ctx = _bait_ctx(metadata={"processing_answer_granted": True}, content="ok")
+    reached: list[str] = []
+
+    async def _next(_ctx) -> None:
+        reached.append("next")
+
+    await ImplicitBotAddressMiddleware()(ctx, _next)
+
+    assert reached == ["next"], "a granted answer must reach the responder"
+    assert ctx.intents == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_processing_decision_the_classic_ack_still_works() -> None:
+    """Unmanaged chats keep the cheap behaviour: a short reply is acknowledged."""
+    from yeoman_gateway.core.intents import SendReactionIntent
+    from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
+
+    ctx = _bait_ctx(metadata={}, content="ok")
+    reached: list[str] = []
+
+    async def _next(_ctx) -> None:
+        reached.append("next")
+
+    await ImplicitBotAddressMiddleware()(ctx, _next)
+
+    reactions = [i for i in ctx.intents if isinstance(i, SendReactionIntent)]
+    assert [reaction.emoji for reaction in reactions] == ["👍"]
+    assert reached == [], "the classic path still ends the pipeline with its reaction"
+
+
+@pytest.mark.asyncio
+async def test_the_channel_marks_a_message_the_core_reacted_to(monkeypatch, tmp_path) -> None:
+    """The marker has to reach the pipeline, otherwise the double reaction comes back."""
+    channel, _gate = _channel(monkeypatch, tmp_path)
+
+    class _Verdict:
+        denied = False
+        react = True
+        ambient_candidate = False
+        reply_action = "react"
+        assignment = None
+        reason = "allow"
+        decision = None
+
+    class _Gate(_RecordingGate):
+        def admit(self, request):  # noqa: ANN001 - stub
+            self.requests.append(request)
+            return _Verdict()
+
+    class _Reaction:
+        async def __call__(self, **_kwargs) -> str:
+            return "👍"
+
+    published: list[object] = []
+
+    async def _record(message) -> None:
+        published.append(message)
+
+    monkeypatch.setattr(channel.bus, "publish_inbound", _record)
+    channel._processing_gate = _Gate()
+    channel.set_reaction_action(_Reaction())
+
+    await channel._ingest_inbound_event(_event(content="das ist witzig"))
+
+    assert published, "the message must still reach the pipeline"
+    metadata = dict(getattr(published[0], "metadata", {}) or {})
+    assert metadata.get("processing_reacted") is True, (
+        "the classic acknowledgement would send a second reaction"
+    )
