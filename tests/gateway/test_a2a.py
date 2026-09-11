@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +300,111 @@ def test_the_router_exposes_its_gateway_store() -> None:
     router = IntentEffectRouter(gateway=SimpleNamespace(store=store), config=config)
 
     assert router.store is store
+
+
+# --------------------------------------------------------------------------------------
+# detached delegation: answer now, deliver later
+# --------------------------------------------------------------------------------------
+
+
+class _Delivery:
+    """Records what would reach the chat."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, **kwargs: Any) -> None:
+        self.sent.append(kwargs)
+
+
+async def _drain(tool: A2ADelegateTool) -> None:
+    for _ in range(400):
+        if not tool._background:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("detached task did not finish")
+
+
+@pytest.mark.asyncio
+async def test_a_detached_delegation_answers_at_once_and_delivers_later(tmp_path: Path) -> None:
+    """The turn must not wait: the result arrives as its own, idempotent message."""
+
+    class _SlowClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send_message(self, message: str, *, context_id: str | None = None):
+            self.calls += 1
+            await asyncio.sleep(0.2)
+            return A2AWorkerResult(
+                worker="hermes",
+                task_id="task-d",
+                context_id=context_id or "ctx",
+                state="TASK_STATE_COMPLETED",
+                text="REPORT",
+            )
+
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_gateway.processing.tool_context import reset_tool_context
+
+    client = _SlowClient()
+    delivery = _Delivery()
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = A2AWorkerRegistry(
+        [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+        client_factory=lambda worker: client,
+    )
+    tool = A2ADelegateTool(registry, store=store, delivery=delivery)
+    token = _in_turn("m1")
+    try:
+        started = time.monotonic()
+        output = await tool.execute(worker="hermes", message="research X", detach=True)
+        elapsed = time.monotonic() - started
+        assert "delegated" in output
+        assert elapsed < 0.1, f"the turn waited {elapsed:.3f}s for the worker"
+        assert client.calls == 0, "the worker call must not happen inside the turn"
+        await _drain(tool)
+        assert client.calls == 1, "the detached call runs after the turn returned"
+    finally:
+        reset_tool_context(token)
+        store.close()
+
+    assert len(delivery.sent) == 1
+    sent = delivery.sent[0]
+    assert sent["source"] == "a2a"
+    assert sent["operation_ref"].startswith("a2a-result:")
+    assert sent["chat_id"] == "chat@g.us"
+    assert "REPORT" in sent["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_detached_delegation_is_reported_not_retried(tmp_path: Path) -> None:
+    class _FailingClient:
+        async def send_message(self, message: str, *, context_id: str | None = None):
+            raise RuntimeError("peer exploded")
+
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_gateway.processing.tool_context import reset_tool_context
+
+    delivery = _Delivery()
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = A2AWorkerRegistry(
+        [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+        client_factory=lambda worker: _FailingClient(),
+    )
+    tool = A2ADelegateTool(registry, store=store, delivery=delivery)
+    token = _in_turn("m1")
+    try:
+        await tool.execute(worker="hermes", message="research X", detach=True)
+        await _drain(tool)
+        effects = store.list_effects()
+    finally:
+        reset_tool_context(token)
+        store.close()
+
+    assert effects and effects[0].state == "unknown", "an unproven write is not a failure"
+    assert len(delivery.sent) == 1
+    assert "kein Ergebnis" in delivery.sent[0]["content"]
 
 
 # --------------------------------------------------------------------------------------

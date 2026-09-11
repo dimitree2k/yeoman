@@ -430,6 +430,7 @@ class LLMResponder(ResponderPort):
         inbound_archive: "InboundArchive | None" = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         a2a_registry: "A2AWorkerRegistry | None" = None,
+        a2a_delivery: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -464,6 +465,7 @@ class LLMResponder(ResponderPort):
         self.inbound_archive = inbound_archive
         self._private_handoff_store = private_handoff_store
         self._a2a_registry = a2a_registry
+        self._a2a_delivery = a2a_delivery
         self._lazy_media_resolver = lazy_media_resolver
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
@@ -620,6 +622,7 @@ class LLMResponder(ResponderPort):
                 A2ADelegateTool(
                     self._a2a_registry,
                     store=getattr(self._effect_router, "store", None),
+                    delivery=self._a2a_delivery,
                 )
             )
 

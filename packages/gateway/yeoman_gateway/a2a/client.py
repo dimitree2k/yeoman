@@ -53,6 +53,7 @@ class A2AWorker:
     timeout_seconds: float = 120.0
     auth_token_env: str | None = None
     allow_remote: bool = False
+    detach: bool = False
 
     def __post_init__(self) -> None:
         name = str(self.name or "").strip()
@@ -102,6 +103,7 @@ class A2AWorker:
             timeout_seconds=float(getattr(config, "timeout_seconds", 120.0)),
             auth_token_env=getattr(config, "auth_token_env", None),
             allow_remote=bool(getattr(config, "allow_remote", False)),
+            detach=bool(getattr(config, "detach", False)),
         )
 
     @property

@@ -452,6 +452,10 @@ class A2AWorkerConfig(BaseModel):
     auth_token_env: str | None = Field(default=None, alias="authTokenEnv")
     # Remote peers require an explicit per-worker opt-in; local workers are the default.
     allow_remote: bool = Field(default=False, alias="allowRemote")
+    #: Return immediately and deliver the peer's answer as its own chat message later.
+    #: A long task (research, browsing) would otherwise hold the turn open until the worker
+    #: timeout and block every other question in that chat.
+    detach: bool = False
 
 
 class A2AConfig(BaseModel):

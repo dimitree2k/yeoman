@@ -981,6 +981,7 @@ def build_gateway_runtime(
         restrict_to_workspace=restrict_to_workspace,
         session_manager=session_manager,
         effect_router=effect_router,
+        a2a_delivery=service_effects,
         memory_service=memory_service,
         telemetry=telemetry,
         security=security,

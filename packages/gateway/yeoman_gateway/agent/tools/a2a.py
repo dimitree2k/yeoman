@@ -38,9 +38,18 @@ class A2ADelegateTool(Tool):
     is nothing to claim against and the tool behaves as before.
     """
 
-    def __init__(self, registry: A2AWorkerRegistry, *, store: Any | None = None) -> None:
+    def __init__(
+        self,
+        registry: A2AWorkerRegistry,
+        *,
+        store: Any | None = None,
+        delivery: Any | None = None,
+    ) -> None:
         self._registry = registry
         self._store = store
+        #: System producer used to deliver a detached answer as its own chat message.
+        self._delivery = delivery
+        self._background: set[Any] = set()
         self._channel = ""
         self._chat_id = ""
         self._session_key = ""
@@ -80,6 +89,14 @@ class A2ADelegateTool(Tool):
                     "maxLength": 12000,
                     "description": "The self-contained task to send to the worker.",
                 },
+                "detach": {
+                    "type": "boolean",
+                    "description": (
+                        "Answer later instead of waiting: the worker's result then arrives "
+                        "as its own message. Use it for long tasks such as research or "
+                        "browsing; leave it unset for quick lookups."
+                    ),
+                },
             },
             "required": ["worker", "message"],
             "additionalProperties": False,
@@ -96,6 +113,121 @@ class A2ADelegateTool(Tool):
         if self._channel or self._chat_id or self._session_key:
             return None
         return requested
+
+    def _turn_target(self) -> tuple[str, str]:
+        """Where this turn is, preferring the per-turn context over instance state."""
+        context = current_tool_context()
+        if context is not None:
+            return context.channel, context.chat_id
+        return self._channel, self._chat_id
+
+    def _wants_detach(self, worker: str, requested: Any) -> bool:
+        """Detach when the call asks for it, else when the worker is configured for it."""
+        if requested is not None:
+            return bool(requested)
+        configured = self._registry.get(worker)
+        return bool(getattr(configured, "detach", False))
+
+    def _start_detached(
+        self,
+        *,
+        worker: str,
+        message: str,
+        context_id: str | None,
+        effect_id: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        """Run the delegation outside the turn so the chat stays free."""
+        import asyncio
+
+        task = asyncio.create_task(
+            self._run_detached(
+                worker=worker,
+                message=message,
+                context_id=context_id,
+                effect_id=effect_id,
+                channel=channel,
+                chat_id=chat_id,
+            )
+        )
+        # Keep a reference: a bare task may be garbage-collected mid-flight.
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _run_detached(
+        self,
+        *,
+        worker: str,
+        message: str,
+        context_id: str | None,
+        effect_id: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        """Wait for the peer, then deliver its answer as its own message."""
+        try:
+            result = await self._registry.call(worker, message, context_id=context_id)
+        except Exception as exc:
+            # The request may have reached the peer: unresolved, never retried on this key.
+            self._settle_delegation(effect_id, state="unknown", detail=type(exc).__name__)
+            logger.warning(
+                "A2A detached delegation failed worker={} error_type={}",
+                safe_log_token(worker),
+                safe_log_token(type(exc).__name__, max_length=80),
+            )
+            await self._deliver(
+                effect_id=effect_id,
+                channel=channel,
+                chat_id=chat_id,
+                content=(
+                    f"[{worker} | kein Ergebnis] Die Delegation ist ohne Antwort geblieben "
+                    f"({type(exc).__name__}). Ich habe sie bewusst nicht wiederholt."
+                ),
+            )
+            return
+        self._settle_delegation(effect_id, state="sent", detail=result.state)
+        logger.info(
+            "A2A detached delegation completed worker={} task_id={} state={} result_chars={}",
+            safe_log_token(worker),
+            safe_log_token(result.task_id),
+            safe_log_token(result.state, max_length=80),
+            len(result.text or ""),
+        )
+        await self._deliver(
+            effect_id=effect_id,
+            channel=channel,
+            chat_id=chat_id,
+            content=(
+                f"[{worker} | Ergebnis der Delegation]\n\n"
+                f"{result.text or '(der Worker hat keine Ausgabe geliefert)'}"
+            ),
+        )
+
+    async def _deliver(self, *, effect_id: str, channel: str, chat_id: str, content: str) -> None:
+        """Hand one result to the chat through the system-effect path (idempotent)."""
+        producer = self._delivery
+        if producer is None or not channel or not chat_id:
+            logger.warning(
+                "A2A result not delivered effect_id={} channel={}",
+                safe_log_token(effect_id),
+                safe_log_token(channel, max_length=40),
+            )
+            return
+        try:
+            await producer.send(
+                source="a2a",
+                operation_ref=f"a2a-result:{effect_id}",
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+            )
+        except Exception as exc:
+            logger.warning(
+                "A2A result delivery failed effect_id={} error_type={}",
+                safe_log_token(effect_id),
+                safe_log_token(type(exc).__name__, max_length=80),
+            )
 
     def _turn_identity(self) -> str:
         """What identifies the current turn for idempotency purposes."""
@@ -235,6 +367,28 @@ class A2ADelegateTool(Tool):
                 "This task was NOT sent to the worker. If the note says duplicate, the "
                 "identical task already went out for this turn - use that result instead of "
                 "repeating the call."
+            )
+        if self._wants_detach(worker, kwargs.get("detach")):
+            target_channel, target_chat = self._turn_target()
+            self._start_detached(
+                worker=worker,
+                message=message,
+                context_id=context_id,
+                effect_id=effect_id,
+                channel=target_channel,
+                chat_id=target_chat,
+            )
+            logger.info(
+                "A2A delegation detached channel={} chat={} worker={} message_chars={}",
+                safe_log_token(self._channel, max_length=40),
+                private_log_identifier(self._chat_id),
+                safe_log_token(worker),
+                len(message),
+            )
+            return (
+                f"[{worker} | delegated | effect {effect_id[:12] or '-'}]\n"
+                "The task is running in the background. Its result will arrive as its own "
+                "message in this chat - do not wait for it and do not delegate it again."
             )
         logger.info(
             "A2A delegation started channel={} chat={} worker={} context_id={} message_chars={}",

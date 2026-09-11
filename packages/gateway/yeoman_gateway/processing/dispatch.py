@@ -398,6 +398,7 @@ SERVICE_PRINCIPALS: Mapping[str, str] = {
     "ipc": "service:ipc",
     "speakup": "service:speakup",
     "heartbeat": "service:heartbeat",
+    "a2a": "service:a2a",
 }
 
 
