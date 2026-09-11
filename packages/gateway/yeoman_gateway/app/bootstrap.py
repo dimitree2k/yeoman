@@ -464,8 +464,10 @@ def build_shared_fact_runtime(
         from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
 
         try:
+            tz_name = str(getattr(extraction_cfg, "timezone", "UTC") or "UTC")
             extractor = SharedFactExtractor(
                 config=config,
+                timezone_name=tz_name,
                 route_key=str(
                     getattr(
                         getattr(config.memory, "capture", None),

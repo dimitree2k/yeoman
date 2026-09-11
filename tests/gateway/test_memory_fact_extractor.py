@@ -767,3 +767,63 @@ def test_f13_a_mixed_batch_keeps_every_author_with_their_own_statement() -> None
     assert by_author["member-new"].source_refs == (("ev-2", 1),), (
         "a statement must not inherit another author's sources"
     )
+
+
+def test_f12_cet_is_a_zone_not_an_offset() -> None:
+    """CET and CEST differ by an hour; a fixed offset would shift dates twice a year.
+
+    July is CEST (UTC+2), January is CET (UTC+1). Both must resolve to the *local* next
+    day, which a fixed offset gets wrong for half the year.
+    """
+
+    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+
+    extractor = SharedFactExtractor.__new__(SharedFactExtractor)
+    extractor._timezone_name = "Europe/Berlin"  # type: ignore[attr-defined]
+    extractor._tz_offset_minutes = 0  # type: ignore[attr-defined]
+
+    def _resolve(iso: str, content: str = "Wir fliegen morgen nach Mallorca.") -> str:
+        source_ms = int(datetime.fromisoformat(iso).timestamp() * 1000)
+        resolved_text, basis, _until = extractor._resolve_temporal(
+            content, type("V", (), {"occurred_ms": source_ms})()
+        )
+        assert basis == "absolute", f"{iso}: {resolved_text!r} was not resolved"
+        return resolved_text
+
+    # 22:30 UTC is already the next day in Berlin: "morgen" is the 12th, not the 11th.
+    assert "12.07.2026" in _resolve("2026-07-10T22:30:00+00:00")
+    assert "12.01.2026" in _resolve("2026-01-10T23:30:00+00:00")
+
+
+def test_f12_an_unknown_zone_keeps_the_configured_offset() -> None:
+    """The legacy fixed offset stays the fallback - it is not silently dropped."""
+    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+
+    extractor = SharedFactExtractor.__new__(SharedFactExtractor)
+    extractor._timezone_name = "Fixed/Unknown"  # type: ignore[attr-defined]
+    extractor._tz_offset_minutes = 60  # type: ignore[attr-defined]
+
+    iso = "2026-07-10T23:30:00+00:00"
+    source_ms = int(datetime.fromisoformat(iso).timestamp() * 1000)
+
+    def _resolve() -> str:
+        text, basis, _until = extractor._resolve_temporal(
+            "Wir fliegen morgen nach Mallorca.",
+            type("V", (), {"occurred_ms": source_ms})(),
+        )
+        assert basis == "absolute"
+        return text
+
+    assert "12.07.2026" in _resolve(), "UTC+1 puts the source after midnight"
+    extractor._tz_offset_minutes = 0  # type: ignore[attr-defined]
+    assert "11.07.2026" in _resolve(), "UTC does not"
+
+
+def test_f12_the_zone_comes_from_configuration() -> None:
+    from yeoman_shared.config.schema import Config
+
+    assert Config().processing.extraction.timezone == "UTC"
+    configured = Config.model_validate(
+        {"processing": {"extraction": {"timezone": "Europe/Berlin"}}}
+    )
+    assert configured.processing.extraction.timezone == "Europe/Berlin"

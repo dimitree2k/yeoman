@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from loguru import logger
@@ -108,12 +108,15 @@ class SharedFactExtractor:
         member_provider: Callable[[str, str], frozenset[str] | None] | None = None,
         max_candidates: int = MAX_CANDIDATES_PER_JOB,
         tz_offset_minutes: int = 0,
+        timezone_name: str = "UTC",
     ) -> None:
         self._config = config
         self._route_key = str(route_key)
         self._member_provider = member_provider
         self._max_candidates = max(1, int(max_candidates))
-        #: Timezone for relative dates. UTC until a chat-specific offset is configured.
+        #: Timezone for relative dates. A zone name wins over a fixed offset, because
+        #: the offset depends on the date (CET vs CEST).
+        self._timezone_name = str(timezone_name or "UTC")
         self._tz_offset_minutes = int(tz_offset_minutes)
         self._profile_name, self._profile = self._resolve_profile()
         self._model = str(self._profile.model or "").strip()
@@ -260,12 +263,48 @@ class SharedFactExtractor:
         resolved = resolve_relative_time(
             content,
             source_ms=int(source.occurred_ms),
-            tz_offset_minutes=int(self._tz_offset_minutes),
+            tz_offset_minutes=self._offset_minutes_for(int(source.occurred_ms)),
         )
         if resolved is None:
             return content, "unresolved", None
-        stamp = datetime.fromtimestamp(resolved / 1000, tz=timezone.utc).strftime("%d.%m.%Y")
-        return f"{content} ({stamp})", "absolute", resolved + 86_400_000 - 1
+        return (
+            f"{content} ({self._local_date(resolved)})",
+            "absolute",
+            resolved + 86_400_000 - 1,
+        )
+
+    def _zone(self) -> Any | None:
+        """The configured IANA zone, or ``None`` when the name cannot be resolved."""
+        try:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo(self._timezone_name)
+        except Exception:  # an unknown zone name must not stop extraction
+            return None
+
+    def _local_date(self, moment_ms: int) -> str:
+        """The calendar date of one instant, on the same basis the day word was resolved.
+
+        Zone and fallback offset must agree here, otherwise a resolved "morgen" would be
+        printed as the day before it in a chat that configured only a fixed offset.
+        """
+        zone = self._zone()
+        if zone is None:
+            zone = timezone(timedelta(minutes=int(self._tz_offset_minutes)))
+        return datetime.fromtimestamp(moment_ms / 1000, tz=zone).strftime("%d.%m.%Y")
+
+    def _offset_minutes_for(self, source_ms: int) -> int:
+        """The zone's offset at the *source* time, so CET and CEST both come out right.
+
+        An unknown zone name falls back to the fixed offset a caller configured - the
+        legacy behaviour - instead of guessing a season.
+        """
+        zone = self._zone()
+        if zone is None:
+            return int(self._tz_offset_minutes)
+        moment = datetime.fromtimestamp(source_ms / 1000, tz=timezone.utc).astimezone(zone)
+        offset = moment.utcoffset()
+        return int(offset.total_seconds() // 60) if offset is not None else 0
 
     def _resolve_audience(self, source: _EventView) -> tuple[frozenset[str], bool]:
         """Proven participants of the chat, or an empty set when nothing is proven."""

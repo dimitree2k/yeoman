@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from yeoman_shared.config.defaults import (
@@ -659,6 +659,10 @@ class ProcessingExtractionConfig(BaseModel):
 
     idle_seconds: int = Field(default=60, ge=1)
     max_delay_seconds: int = Field(default=300, ge=1)
+    #: IANA timezone for resolving relative dates in extracted facts. A name, not an
+    #: offset: CET and CEST differ by an hour, and a fixed offset would shift every
+    #: date by one hour twice a year.
+    timezone: str = "UTC"
 
     @model_validator(mode="after")
     def _validate_windows(self) -> "ProcessingExtractionConfig":
