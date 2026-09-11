@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from yeoman_shared.reactions import SYSTEM_ORIGIN
+
 from yeoman_gateway.core.intents import SendReactionIntent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.implicit_addressing import (
@@ -128,6 +130,7 @@ class ImplicitBotAddressMiddleware:
                         message_id=event.message_id,
                         emoji=reaction_for_name_mention(content),
                         participant_jid=event.participant,
+                        origin=SYSTEM_ORIGIN,
                     )
                 )
                 ctx.metric("implicit_bot_address_reaction", labels=(("channel", event.channel),))
@@ -190,6 +193,7 @@ class ImplicitBotAddressMiddleware:
                     message_id=event.message_id,
                     emoji=emoji,
                     participant_jid=event.participant,
+                    origin=SYSTEM_ORIGIN,
                 )
             )
             ctx.metric("implicit_bot_address_reaction", labels=(("channel", event.channel),))

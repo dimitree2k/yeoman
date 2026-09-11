@@ -827,6 +827,14 @@ def build_gateway_runtime(
         from yeoman_gateway.processing.dispatch import managed_outbound_guard
 
         bus.set_managed_outbound_guard(managed_outbound_guard(effect_router))
+
+    # The reaction vocabulary is an owner decision, so the effective list is named once at
+    # startup: an emoji missing from it is silently unsendable, and that must be visible.
+    logger.info(
+        "reaction_emojis count={} allowed={}",
+        len(config.processing.reaction_emojis),
+        " ".join(config.processing.reaction_emojis) or "-",
+    )
     service_effects = (
         ServiceEffectProducer(router=effect_router, bus=bus)
         if effect_router is not None
@@ -1063,6 +1071,7 @@ def build_gateway_runtime(
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         owner_alert_resolver=policy_adapter.owner_recipients,
+        allowed_reaction_emojis=config.processing.reaction_emojis,
         workflow_state=workflow_state,
         approval_trigger=_handle_approved_job,
         bus=bus,

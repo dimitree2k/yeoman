@@ -15,6 +15,7 @@ from yeoman_shared.config.defaults import (
     default_model_profiles,
     default_model_routes,
 )
+from yeoman_shared.reactions import DEFAULT_REACTION_EMOJIS, looks_like_emoji
 
 
 def _default_model_profiles() -> dict[str, "ModelProfile"]:
@@ -706,10 +707,16 @@ class ProcessingConfig(BaseModel):
     #: Chats where an ambient (unaddressed) message may still be answered, each with its
     #: own short-lived lineage. Empty everywhere else (routing spec, owner decision).
     ambient_chats: list[str] = Field(default_factory=list)
-    #: Per-chat reply action: "answer" (default) or "silence". A chat that must never
-    #: be answered produces no turn, no effect and no typing indicator. "react" needs
-    #: the reaction path and is not accepted yet (routing spec, answer/react/silence).
+    #: Per-chat reply action: "answer" (default), "react" or "silence". A chat that must
+    #: never be answered produces no turn, no effect and no typing indicator; "react"
+    #: answers with a reaction taken from :attr:`reaction_emojis` (routing spec).
     reply_actions: dict[str, str] = Field(default_factory=dict)
+    #: The complete vocabulary a model-chosen reaction may use, e.g. ["👍", "🤙", "🥱"].
+    #: Anything else is dropped and logged - never replaced by a guessed face, never sent
+    #: as text. An explicitly empty list means "no model-chosen reactions at all".
+    #: Confirmations the gateway decides itself are not model choices and stay unaffected
+    #: (see ``yeoman_shared.reactions``).
+    reaction_emojis: list[str] = Field(default_factory=lambda: list(DEFAULT_REACTION_EMOJIS))
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)
@@ -719,6 +726,26 @@ class ProcessingConfig(BaseModel):
     )
     extraction: ProcessingExtractionConfig = Field(default_factory=ProcessingExtractionConfig)
     retention: ProcessingRetentionConfig = Field(default_factory=ProcessingRetentionConfig)
+
+    @field_validator("reaction_emojis")
+    @classmethod
+    def _validate_reaction_emojis(cls, values: list[str]) -> list[str]:
+        """Reject entries that are not emojis.
+
+        A typo here would silently shrink Arvid's reactions ("thumbsup" instead of 👍), and
+        the gateway would look broken rather than misconfigured. Naming the entry at
+        startup is cheaper than debugging a missing face later.
+        """
+        approved: list[str] = []
+        for value in values:
+            entry = str(value).strip()
+            if not looks_like_emoji(entry):
+                raise ValueError(
+                    "processing.reactionEmojis accepts single emojis only; "
+                    f"{value!r} is not one"
+                )
+            approved.append(entry)
+        return approved
 
     def is_chat_enabled(self, channel: str, chat_id: str) -> bool:
         """True when the new mode owns this exact chat (effects are allowed)."""

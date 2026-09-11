@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from yeoman_shared.reactions import MODEL_ORIGIN, ReactionOrigin
+
 from yeoman_gateway.core.models import OutboundEvent
 
 
@@ -77,6 +79,9 @@ class SendReactionIntent:
     message_id: str
     emoji: str
     participant_jid: str | None = None
+    #: "model" for an emoji the language model chose - it must be one the owner approved -
+    #: or "system" for a confirmation the gateway decides itself.
+    origin: ReactionOrigin = MODEL_ORIGIN
 
 
 type OrchestratorIntent = (

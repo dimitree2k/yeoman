@@ -773,3 +773,50 @@ async def test_criterion_8_a_reaction_has_its_own_lineage(runtime) -> None:
     )
     assert effect.operation_key.startswith("reaction:whatsapp:"), effect.operation_key
     assert "m1" in effect.operation_key, "the triggering message is the provenance"
+
+
+@pytest.mark.asyncio
+async def test_an_unapproved_emoji_never_becomes_an_effect(runtime) -> None:
+    """One decision point for every reaction, whoever produced it.
+
+    The owner approves the vocabulary; a model-chosen emoji outside it is dropped here,
+    and the caller's direct-publish fallback must not smuggle it onto the wire either.
+    """
+    from yeoman_gateway.core.intents import SendReactionIntent
+
+    runtime.config.processing.reaction_emojis = ["👍", "🥱"]
+    approved = SendReactionIntent(
+        channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"
+    )
+
+    assert await runtime.router.submit_reaction(approved, principal="orderer@s.whatsapp.net") is True
+    assert runtime.transport.sent == ["👍"], "the approved emoji reaches the transport"
+
+    unapproved = SendReactionIntent(
+        channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="🤖"
+    )
+    # True = "handled": nothing was queued, and nothing may be published directly instead.
+    assert await runtime.router.submit_reaction(
+        unapproved, principal="orderer@s.whatsapp.net"
+    ) is True
+    assert runtime.transport.sent == ["👍"], "an unapproved emoji must send nothing"
+    assert len(runtime.store.list_effects()) == 1, "and must leave no effect behind"
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_decision_is_not_the_models_taste(runtime) -> None:
+    """Internal confirmations keep working when the owner narrows the list."""
+    from yeoman_gateway.core.intents import SendReactionIntent
+    from yeoman_shared.reactions import SYSTEM_ORIGIN
+
+    runtime.config.processing.reaction_emojis = []
+    blocked = SendReactionIntent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="m1",
+        emoji="🚫",
+        origin=SYSTEM_ORIGIN,
+    )
+
+    assert await runtime.router.submit_reaction(blocked, principal="orderer@s.whatsapp.net") is True
+    assert runtime.transport.sent == ["🚫"]

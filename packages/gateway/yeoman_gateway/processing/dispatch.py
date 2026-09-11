@@ -22,6 +22,7 @@ from contextvars import ContextVar
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from loguru import logger
+from yeoman_shared.reactions import SYSTEM_ORIGIN, allowed_reaction
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
@@ -666,14 +667,35 @@ class IntentEffectRouter:
         return True
 
     async def submit_reaction(self, intent: SendReactionIntent, *, principal: str) -> bool:
+        """Take a reaction over - or refuse it.
+
+        The return value means "do not publish this yourself", not "it was sent". A
+        model-chosen emoji the owner has not approved is consumed here *without* an
+        effect, so the caller's direct-publish fallback cannot leak an unapproved face
+        onto the wire (routing spec; owner decision: no guessed emoji, no text instead).
+        """
+        emoji = intent.emoji
+        if intent.origin != SYSTEM_ORIGIN:
+            emoji = allowed_reaction(intent.emoji, self._allowed_reaction_emojis())
+            if emoji is None:
+                logger.warning(
+                    "reaction_dropped stage=dispatcher channel={} chat={} message_id={} "
+                    "origin={} value={}",
+                    intent.channel,
+                    intent.chat_id,
+                    intent.message_id,
+                    intent.origin,
+                    str(intent.emoji)[:16],
+                )
+                return True
         if not self.manages(intent.channel, intent.chat_id):
             return False
         await self._run(
             channel=intent.channel,
             chat_id=intent.chat_id,
             principal=principal,
-            payload=ReactionPayload(message_id=intent.message_id, emoji=intent.emoji),
-            operation_key=f"reaction:{intent.channel}:{intent.chat_id}:{intent.message_id}:{intent.emoji}",
+            payload=ReactionPayload(message_id=intent.message_id, emoji=emoji),
+            operation_key=f"reaction:{intent.channel}:{intent.chat_id}:{intent.message_id}:{emoji}",
             trace_id=intent.message_id,
             deadline_key="semantic_reaction_ms",
             own_lineage=True,
@@ -717,6 +739,12 @@ class IntentEffectRouter:
         self._frozen_turns.move_to_end(key)
         while len(self._frozen_turns) > self._frozen_turn_cap:
             self._frozen_turns.popitem(last=False)
+
+    def _allowed_reaction_emojis(self) -> tuple[str, ...]:
+        """The owner's reaction vocabulary, read per call so a config change takes effect."""
+        processing = getattr(self._config, "processing", None)
+        approved = getattr(processing, "reaction_emojis", None)
+        return tuple(str(item) for item in approved) if approved is not None else ()
 
     def frozen_turn_for_source(self, source_message_id: str) -> Any | None:
         return self._frozen_turns.get(str(source_message_id or ""))

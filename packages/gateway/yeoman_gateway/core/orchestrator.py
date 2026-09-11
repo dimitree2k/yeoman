@@ -36,7 +36,7 @@ from yeoman_gateway.pipeline.security_input import InputSecurityMiddleware
 from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
@@ -80,6 +80,7 @@ class Orchestrator:
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
         owner_alert_cooldown_seconds: int = 300,
+        allowed_reaction_emojis: Sequence[str] | None = None,
         workflow_state: "WorkflowState | None" = None,
         approval_trigger: "Callable[[PendingApproval], Awaitable[None]] | None" = None,
         bus: "MessageBus | None" = None,
@@ -156,6 +157,7 @@ class Orchestrator:
                 model_router=model_router,
                 owner_alert_resolver=owner_alert_resolver,
                 owner_alert_cooldown_seconds=owner_alert_cooldown_seconds,
+                allowed_reaction_emojis=allowed_reaction_emojis,
             ),
         ])
         self._pipeline = Pipeline(layers)

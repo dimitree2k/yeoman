@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from loguru import logger
+from yeoman_shared.reactions import DEFAULT_REACTION_EMOJIS, allowed_reaction
 
 from yeoman_gateway.core.intents import (
     PersistSessionIntent,
@@ -172,6 +175,7 @@ class OutboundMiddleware:
         model_router: "ModelRouter | None" = None,
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
         owner_alert_cooldown_seconds: int = 300,
+        allowed_reaction_emojis: Sequence[str] | None = None,
     ) -> None:
         self._contacts = contacts
         self._security = security
@@ -182,6 +186,11 @@ class OutboundMiddleware:
         self._model_router = model_router
         self._owner_alert_resolver = owner_alert_resolver
         self._owner_alert_cooldown_seconds = max(30, int(owner_alert_cooldown_seconds))
+        # The owner's reaction vocabulary. `None` means "not configured", which keeps the
+        # shipped default - a middleware built without the config still behaves sanely.
+        self._allowed_reaction_emojis = tuple(
+            DEFAULT_REACTION_EMOJIS if allowed_reaction_emojis is None else allowed_reaction_emojis
+        )
         self._recent_alert_keys: dict[str, float] = {}
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
@@ -199,24 +208,40 @@ class OutboundMiddleware:
             full_content = reaction_match.group(1).strip()
             # Split emoji from optional text body (separated by newline)
             parts = full_content.split("\n", 1)
-            emoji = parts[0].strip()
+            emoji = allowed_reaction(parts[0].strip(), self._allowed_reaction_emojis)
             text_body = parts[1].strip() if len(parts) > 1 else ""
-            ctx.intents.append(
-                SendReactionIntent(
-                    channel=event.channel,
-                    chat_id=event.chat_id,
-                    message_id=event.message_id,
-                    emoji=emoji,
-                    participant_jid=event.participant,
+            if emoji is None:
+                # Fail closed at the only place a *model-chosen* emoji is born: the owner
+                # did not approve it, so nothing is sent - not a guessed face, and not the
+                # marker as text either. A reaction-only reply therefore just stays silent.
+                ctx.metric(
+                    "reaction_dropped",
+                    labels=(("channel", event.channel), ("reason", "not_allowed")),
                 )
-            )
-            ctx.metric("reaction_sent", labels=(("channel", event.channel),))
+                logger.warning(
+                    "reaction_dropped channel={} chat={} message_id={} origin=model value={}",
+                    event.channel,
+                    event.chat_id,
+                    event.message_id,
+                    parts[0].strip()[:16],
+                )
+            else:
+                ctx.intents.append(
+                    SendReactionIntent(
+                        channel=event.channel,
+                        chat_id=event.chat_id,
+                        message_id=event.message_id,
+                        emoji=emoji,
+                        participant_jid=event.participant,
+                    )
+                )
+                ctx.metric("reaction_sent", labels=(("channel", event.channel),))
             if not text_body:
                 ctx.intents.append(
                     PersistSessionIntent(
                         session_key=f"{event.channel}:{event.chat_id}",
                         user_content=event.content,
-                        assistant_content=f"[reacted with {emoji}]",
+                        assistant_content=f"[reacted with {emoji}]" if emoji else "[silence]",
                     )
                 )
                 return

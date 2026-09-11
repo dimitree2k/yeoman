@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from yeoman_shared.reactions import SYSTEM_ORIGIN
+
 from yeoman_gateway.core.intents import RecordMetricIntent, SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
@@ -97,6 +99,7 @@ class AdminCommandMiddleware:
                         message_id=ctx.event.message_id,
                         emoji=admin_result.reaction_emoji,
                         participant_jid=ctx.event.participant,
+                        origin=SYSTEM_ORIGIN,
                     )
                 )
             ctx.halt()

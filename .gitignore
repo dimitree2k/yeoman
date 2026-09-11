@@ -105,6 +105,7 @@ tests/gateway/*
 !tests/gateway/test_processing_review_fixes.py
 !tests/gateway/test_processing_continuation_signals.py
 !tests/gateway/test_processing_routing_criteria.py
+!tests/gateway/test_reaction_emojis.py
 !tests/gateway/test_whatsapp_implicit_address.py
 !tests/shared/
 tests/shared/*

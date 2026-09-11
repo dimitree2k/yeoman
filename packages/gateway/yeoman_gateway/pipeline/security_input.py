@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from yeoman_shared.reactions import SYSTEM_ORIGIN
 
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.core.models import OutboundEvent, SecurityDecision
@@ -112,6 +113,7 @@ class InputSecurityMiddleware:
                     message_id=ctx.event.message_id,
                     emoji=self._BLOCK_EMOJI,
                     participant_jid=ctx.event.participant,
+                    origin=SYSTEM_ORIGIN,
                 )
             )
         else:
