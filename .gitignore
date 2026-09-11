@@ -103,6 +103,7 @@ tests/gateway/*
 !tests/gateway/test_memory_fact_extractor.py
 !tests/gateway/test_memory_archive_backfill.py
 !tests/gateway/test_processing_review_fixes.py
+!tests/gateway/test_processing_retention.py
 !tests/gateway/test_processing_continuation_signals.py
 !tests/gateway/test_processing_routing_criteria.py
 !tests/gateway/test_reaction_emojis.py

@@ -297,6 +297,7 @@ class GatewayRuntime:
     lull_observer: object | None = None
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
+    retention: object | None = None
     shared_facts: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
@@ -313,6 +314,8 @@ class GatewayRuntime:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
                 self.shared_facts.start()
+            if self.retention is not None:
+                await self.retention.start()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -348,6 +351,8 @@ class GatewayRuntime:
                 self.chat_registry.close()
             if self.reconciliation is not None:
                 await self.reconciliation.stop()
+            if self.retention is not None:
+                await self.retention.stop()
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
                 self.shared_facts.stop()
             self.contacts.close()
@@ -631,6 +636,22 @@ def build_reconciliation_service(
         provider_lookup_enabled=bool(reconciliation.provider_lookup_enabled),
     )
     return ReconciliationService(store, probe=evidence, config=reconciliation)
+
+
+def build_retention_service(
+    config: "Config",
+    store: "ProcessingStore | None",
+):
+    """Retention schedule for the new mode; ``None`` while processing is off.
+
+    Disabled mode stays inert: no store, no database and no background task.
+    """
+    if store is None or not config.processing.enabled:
+        return None
+
+    from yeoman_gateway.processing.retention import ProcessingRetentionService
+
+    return ProcessingRetentionService(store)
 
 
 def build_thread_registry(config: "Config", store: "ProcessingStore | None"):
@@ -1816,6 +1837,7 @@ def build_gateway_runtime(
         lull_observer=lull_observer,
         processing=processing_store,
         reconciliation=build_reconciliation_service(config, processing_store),
+        retention=build_retention_service(config, processing_store),
         shared_facts=shared_fact_runtime,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )
