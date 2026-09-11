@@ -350,10 +350,11 @@ class ManagedOutboundDispatcher:
 #: transport without a proven idempotency or containment contract (spec R05, G06).
 #: The value names the concrete re-enable condition.
 NON_MIGRATED_CAPABILITIES: Mapping[str, str] = {
-    "a2a_delegate": (
-        "remote write without an idempotency contract; re-enable when the peer returns "
-        "effects as requests or a proven compatible gateway contract exists"
-    ),
+    # `a2a_delegate` was fenced here for "remote write without an idempotency contract".
+    # That contract now exists in the tool itself: every delegation is claimed in the
+    # processing journal under a key derived from the turn, the worker and the task, and a
+    # repeated claim is refused instead of being sent to the peer again. The journal is
+    # open exactly while this fence is active, so the two cannot drift apart.
     "exec": (
         "shell writes are not contained by default and the sandbox keeps network access; "
         "re-enable when isolation is enforced rather than lexical"

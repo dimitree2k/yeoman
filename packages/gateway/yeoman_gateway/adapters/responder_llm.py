@@ -614,7 +614,14 @@ class LLMResponder(ResponderPort):
         if self._a2a_registry is not None:
             from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
 
-            self.tools.register(A2ADelegateTool(self._a2a_registry))
+            # The processing journal is what makes a delegation idempotent: it is open
+            # exactly when the new mode is active, which is also when the fence applies.
+            self.tools.register(
+                A2ADelegateTool(
+                    self._a2a_registry,
+                    store=getattr(self._effect_router, "store", None),
+                )
+            )
 
         # Recall conversation — search session history on demand
         from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool

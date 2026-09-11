@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -279,3 +281,159 @@ def test_policy_diagnostics_include_a2a_delegate() -> None:
     from yeoman_gateway.cli.policy_commands import _policy_known_tools
 
     assert "a2a_delegate" in _policy_known_tools()
+
+
+# --------------------------------------------------------------------------------------
+# the idempotency contract: one remote write per turn and task
+# --------------------------------------------------------------------------------------
+
+
+class _CountingClient:
+    """Counts what actually reached the peer."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def send_message(
+        self, message: str, *, context_id: str | None = None
+    ) -> A2AWorkerResult:
+        self.calls.append(message)
+        return A2AWorkerResult(
+            worker="hermes",
+            task_id=f"task-{len(self.calls)}",
+            context_id=context_id or "ctx",
+            state="TASK_STATE_COMPLETED",
+            text="worker result",
+        )
+
+
+def _counting_registry(client: _CountingClient) -> A2AWorkerRegistry:
+    return A2AWorkerRegistry(
+        [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+        client_factory=lambda worker: client,
+    )
+
+
+def _in_turn(message_id: str):
+    from yeoman_gateway.processing.tool_context import (
+        ToolInvocationContext,
+        set_tool_context,
+    )
+
+    return set_tool_context(
+        ToolInvocationContext(
+            channel="whatsapp", chat_id="chat@g.us", reply_to_message_id=message_id
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_retried_delegation_never_reaches_the_peer_twice(tmp_path: Path) -> None:
+    """A2A has no server-side idempotency, so the journal claim is the contract."""
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_gateway.processing.tool_context import reset_tool_context
+
+    client = _CountingClient()
+    store = ProcessingStore(tmp_path / "p.db")
+    tool = A2ADelegateTool(_counting_registry(client), store=store)
+    token = _in_turn("m1")
+    try:
+        first = await tool.execute(worker="hermes", message="inspect this")
+        second = await tool.execute(worker="hermes", message="inspect   this")
+        effects = store.list_effects()
+    finally:
+        reset_tool_context(token)
+        store.close()
+
+    assert "TASK_STATE_COMPLETED" in first
+    assert "not-sent" in second and "duplicate" in second
+    assert client.calls == ["inspect this"], "the peer is called exactly once"
+    assert len(effects) == 1, "exactly one effect is on record for this turn"
+    assert effects[0].state == "sent"
+
+
+@pytest.mark.asyncio
+async def test_a_later_turn_may_delegate_the_same_task(tmp_path: Path) -> None:
+    """The claim is bound to the turn, not to the text: a new request is a new write."""
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_gateway.processing.tool_context import reset_tool_context
+
+    client = _CountingClient()
+    store = ProcessingStore(tmp_path / "p.db")
+    tool = A2ADelegateTool(_counting_registry(client), store=store)
+    try:
+        for message_id in ("m1", "m2"):
+            token = _in_turn(message_id)
+            try:
+                output = await tool.execute(worker="hermes", message="inspect this")
+            finally:
+                reset_tool_context(token)
+            assert "TASK_STATE_COMPLETED" in output
+    finally:
+        store.close()
+
+    assert client.calls == ["inspect this", "inspect this"]
+
+
+@pytest.mark.asyncio
+async def test_a_different_task_in_the_same_turn_is_still_delegated(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.store import ProcessingStore
+    from yeoman_gateway.processing.tool_context import reset_tool_context
+
+    client = _CountingClient()
+    store = ProcessingStore(tmp_path / "p.db")
+    tool = A2ADelegateTool(_counting_registry(client), store=store)
+    token = _in_turn("m1")
+    try:
+        await tool.execute(worker="hermes", message="first task")
+        await tool.execute(worker="hermes", message="second task")
+    finally:
+        reset_tool_context(token)
+        store.close()
+
+    assert client.calls == ["first task", "second task"]
+
+
+@pytest.mark.asyncio
+async def test_without_a_journal_the_tool_keeps_its_previous_behaviour() -> None:
+    """Legacy (non-processing) runtimes have no journal and nothing to claim against."""
+    client = _CountingClient()
+    tool = A2ADelegateTool(_counting_registry(client))
+
+    await tool.execute(worker="hermes", message="inspect this")
+    await tool.execute(worker="hermes", message="inspect this")
+
+    assert client.calls == ["inspect this", "inspect this"]
+
+
+def test_the_processing_fence_no_longer_disables_a2a_delegation() -> None:
+    """The contract above is what the fence asked for; the tool must be reachable again."""
+    from yeoman_gateway.agent.tools.registry import ToolRegistry
+    from yeoman_gateway.processing.dispatch import (
+        NON_MIGRATED_CAPABILITIES,
+        disable_non_migrated_tools,
+    )
+
+    class _Tool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def to_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": self.name}}
+
+        def validate_params(self, params: dict[str, Any]) -> list[str]:
+            return []
+
+        async def execute(self, **kwargs: Any) -> str:
+            return ""
+
+    registry = ToolRegistry()
+    for name in ("message", "a2a_delegate", *NON_MIGRATED_CAPABILITIES):
+        registry.register(_Tool(name))
+
+    disabled = disable_non_migrated_tools(registry)
+
+    assert "a2a_delegate" not in disabled
+    assert registry.is_disabled("a2a_delegate") is False
+    visible = {entry["function"]["name"] for entry in registry.get_definitions()}
+    assert "a2a_delegate" in visible
