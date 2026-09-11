@@ -6,7 +6,7 @@
   <p>
     <img src="https://img.shields.io/badge/python-≥3.14-3776AB?logo=python&logoColor=white" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="License">
-    <img src="https://img.shields.io/badge/core-~18k_lines-blueviolet" alt="Lines">
+    <img src="https://img.shields.io/badge/core-~53k_lines-blueviolet" alt="Lines">
     <a href="#channels"><img src="https://img.shields.io/badge/channels-Telegram%20·%20WhatsApp%20·%20Discord%20·%20Feishu-0088cc" alt="Channels"></a>
   </p>
 </div>
@@ -24,6 +24,7 @@
 | **Policy engine** | Deterministic per-channel, per-chat access control with hot-reload — no ad-hoc ACLs |
 | **Multi-channel** | Telegram, WhatsApp (Baileys bridge), Discord, Feishu — unified pipeline |
 | **Durable processing** | Journal → threads/turns → effect outbox → transport receipts → reconciliation: every send is either provable or explicitly unresolved, never guessed |
+| **Reply routing** | direct / continuation / ambient, classified before any model call — a brake and one small judge for unaddressed group chatter, with a per-chat reply action (`answer`, `react`, `silence`) that caps what the verdict may become |
 | **Shared memory** | Source-bound facts with an audience, permission decided *before* retrieval, revocation that bumps a permission epoch |
 | **Memory** | SQLite-backed semantic + FTS recall with session context and background notes |
 | **Voice** | STT via Groq Whisper, TTS via ElevenLabs / OpenRouter — bidirectional voice in WhatsApp |
@@ -71,11 +72,7 @@ canonical journal ─▶ join rules ─▶ thread + turn (revision, authority)
                           reconciler: probe, escalate, or confirm
 ```
 
-<p align="center">
-  <img src="yeoman_arch.svg" alt="architecture" width="900">
-</p>
-
-## Stateful message processing (Phases 01–06)
+## Stateful message processing (Phases 01–07)
 
 Everything below is disabled unless a chat is explicitly activated
 (`processing.enabled` + `processing.chats`); `memory.shared.*` is a second, separate opt-in.
@@ -172,6 +169,31 @@ The rollout order is in the runbook: introduce the mode **disabled**, then **sha
 Rollback is a configuration change: it stops new admissions, leaves claims and unresolved
 effects intact, and deletes neither a database nor an archive.
 
+### 07 · Reply routing, the ambient brake and the judge
+
+Every message is classified as `direct`, `continuation` or `ambient` **before** anything
+expensive happens, and four questions stay separate: assignment, permission, task kind and
+effect origin. A per-chat reply action (`replyActions`: `answer`, `react` or `silence`) caps
+what may come out — it can withdraw an answer, never grant one.
+
+Unaddressed messages in a chat released for ambient answers (`ambientChats`) pass a **brake**
+first: at least `ambient.minSecondsBetweenAnswers` (300 s) **and**
+`ambient.minMessagesSinceAnswer` (6) messages since the last ambient answer. Only then does one
+small **judge** call decide between `answer`, `react` and `none`, and it must be at least
+`ambient.judgeMinConfidence` (0.75) sure — an error, a timeout or an unapproved emoji means
+silence, and a decline restarts the window so the judge is asked at most once per window rather
+than once per message. Naming the bot skips the brake and goes straight to the judge.
+
+The judge decides *whether*, the reply action decides *what*: in a `react` chat an `answer`
+verdict is delivered as a reaction instead of being dropped, and a `silence` chat never spends a
+judge call. A reaction is the whole reply — no turn, no typing indicator, no text — and it
+carries the source message as its own lineage, so it can never adopt someone else's turn.
+
+Model-chosen emojis come from the owner's vocabulary (`reactionEmojis`, 14 entries by default):
+the model may pick one, never invent one. Anything outside the list is dropped and logged rather
+than replaced by a guessed face or sent as text. Confirmations the gateway decides itself
+(blocked input, name mentions, admin acknowledgements) are not model choices and stay unaffected.
+
 ### Data, schemas and retention — as they actually are
 
 | Store | Schema | Notes |
@@ -180,10 +202,14 @@ effects intact, and deletes neither a database nor an archive.
 | `data/memory/memory.db` | **2** | legacy nodes and embeddings, plus facts, sources, principals and extraction jobs |
 | `data/inbound/reply_context.db` | — | inbound archive, **kept complete**: nothing is purged, and messages refused by the fast gate are recorded too |
 
-Two honest limits: **journal payload retention is implemented but not scheduled**, so event
-and effect payloads currently persist despite the configured windows; and a revocation cannot
-reach SQLite backups, the archive, session-state files, or anything a model provider already
-received. Both are stated in the runbook rather than implied away.
+Retention is applied by the gateway itself: `ProcessingRetentionService` sweeps 30 s after start
+and then hourly, stripping event and effect payloads after `journalPayloadDays`, deleting lineage
+metadata after `lineageMetadataDays`, and keeping events that still have unresolved relations
+until `unresolvedDays`. Effects are never deleted, only reduced to a tombstone (ids, hashes,
+state) — that is what keeps an operation key from silently firing a second time after retention.
+One honest limit remains: a revocation cannot reach SQLite backups, the archive, session-state
+files, or anything a model provider already received. It is stated in the runbook rather than
+implied away.
 
 ### Operating it
 
@@ -191,7 +217,7 @@ received. Both are stated in the runbook rather than implied away.
 yeoman status                                 # config, policy, workspace, providers
 yeoman channels whatsapp bridge status
 systemctl --user show yeoman-gateway -p MainPID -p NRestarts -p ActiveState
-yeoman logs | grep -E "protocol v|processing mode|thread_assigned|effect blocked"
+yeoman logs | grep -E "routing_decision|ambient_judge|ambient_brake|reconciliation loop started|processing retention sweep"
 yeoman memory facts list --limit 20           # shared facts: metadata only
 yeoman memory facts jobs --state queued       # extraction backlog
 ```
@@ -222,7 +248,7 @@ Rule of thumb:
 
 - If you are inside the yeoman git checkout, use `./bin/yeoman`
 - If you installed yeoman as a tool or package, use `yeoman`
-- Avoid `python3 -m yeoman.cli.commands` unless `yeoman env` shows that `python3` is the same interpreter backing the active launcher
+- Avoid `python3 -m yeoman_gateway` unless `yeoman env` shows that `python3` is the same interpreter backing the active launcher
 
 Check the active runtime any time:
 
@@ -467,9 +493,13 @@ For the stateful processing line, check these directly:
 
 ```bash
 systemctl --user show yeoman-gateway -p ActiveState -p NRestarts -p MainPID
-yeoman logs | grep -E "protocol v|processing mode|thread_assigned|assignment_unavailable|effect blocked"
+yeoman logs | grep -E "routing_decision|ambient_brake|ambient_judge|assignment_unavailable|routing_effect"
 yeoman memory facts jobs --state queued     # extraction backlog
 ```
+
+Both background schedules announce themselves once per start, which is how an operator can tell
+they are live at all: `reconciliation loop started tick_seconds=…` and, 30 s later, the first
+`processing retention sweep …` line (silent at DEBUG level when there was nothing to purge).
 
 A gateway start that exits with status 0 is the single-instance guard, not a crash; a start
 that exits 1 with "Bridge manifest protocol mismatch" means bridge and gateway disagree about
@@ -531,6 +561,14 @@ the protocol version.
 | `enabled` | `false` | master switch; `false` keeps the chat on the legacy path |
 | `chats` | `[]` | activated chats, `whatsapp:<chat-id>` |
 | `shadowChats` | `[]` | journal and decide, never send |
+| `ambientChats` | `[]` | chats where an unaddressed message may pass the brake and reach the judge |
+| `replyActions` | `{}` | per chat `answer` (default), `react` or `silence`; caps what a verdict may become |
+| `reactionEmojis` | 14 entries | the complete vocabulary a model-chosen reaction may use |
+| `reactionRoute` | `""` | route that picks the emoji; empty uses the memory-capture route |
+| `ambient.minSecondsBetweenAnswers` / `minMessagesSinceAnswer` | `300` / `6` | the brake: both must be met before the judge is asked |
+| `ambient.judgeRoute` / `judgeMinConfidence` / `judgeTimeoutSeconds` | `""` / `0.75` / `12` | the one small verdict call; a hesitant yes stays silence |
+| `threads.followupWindowSeconds` | `600` | automatic continuation window, owner-set in config |
+| `extraction.timezone` | `UTC` | IANA zone for resolving relative dates in extracted facts |
 | `dbPath` | `data/processing/processing.db` | journal, threads, effects, receipts, probes |
 | `budgets.chatHardUnits` / `chatHardWindowSeconds` | `6` / `60` | hard per-chat send budget (sliding) |
 | `budgets.threadSoftUnits` / `threadSoftWindowSeconds` | `2` / `10` | soft per-thread limit |
@@ -542,7 +580,7 @@ the protocol version.
 | `reconciliation.claimLeaseSeconds` | `30` | a crashed claim recovers as `unknown` after this |
 | `reconciliation.providerLookupEnabled` | `false` | provider lookups stay off (no proven contract) |
 | `reconciliation.clientMessageId` | `false` | echo a client message id (off until the bridge proves idempotency) |
-| `retention.journalPayloadDays` / `lineageMetadataDays` / `unresolvedDays` / `sharedFactDays` | `7` / `30` / `90` / `90` | configured windows — see the retention caveat above |
+| `retention.journalPayloadDays` / `lineageMetadataDays` / `unresolvedDays` / `sharedFactDays` | `7` / `30` / `90` / `90` | windows applied by the hourly retention sweep |
 
 ### `memory.shared.*` — shared facts
 
@@ -579,7 +617,7 @@ ignored `tests/gateway/*` need a matching `!tests/gateway/<file>` entry in `.git
 | [`packages/overseer/README.md`](packages/overseer/README.md) | overseer runbooks, triggers, safety rails |
 | [`CHANGELOG.md`](CHANGELOG.md) | release history |
 
-The phased design notes and their evidence lists (plans 01–06, per-task acceptance records)
+The phased design notes and their evidence lists (plans 01–07, per-task acceptance records)
 are kept as private working documents outside this repository.
 
 ## Docker

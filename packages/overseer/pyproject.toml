@@ -1,6 +1,6 @@
 [project]
 name = "yeoman-overseer"
-version = "1.0.0"
+version = "1.1.0"
 description = "Yeoman overseer — autonomous orchestration layer"
 requires-python = ">=3.14"
 dependencies = [

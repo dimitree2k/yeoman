@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 — 11 Sep 2026
+
+First tagged release. `v1.0.0` was documented but never published, so this entry covers the
+~230 commits since then.
+
+### Stateful message processing (phases 01–07)
+- **Durable journal and lineage** (`data/processing/processing.db`): every inbound message becomes a canonical event with an id, a key, a payload hash and a revision. Relations stay resolvable, and an effect is never guessed into existence.
+- **Threads, turns and cancellation**: a join rule starts, bundles or continues a thread. Each turn carries a principal, a revision and a context version; a correction during a provider call bumps the revision and cancels the stale effects instead of letting a later turn authorise them.
+- **Effect outbox with transport receipts**: effects move through a compare-and-set state machine (`planned` → `queued` → `executing` → `sent`/`unknown`/`cancelled`). `sent` is only claimed with a transport receipt or a confirming probe, and a claimed effect lost to a crash recovers to `unknown` with a scheduled probe — never back to `queued`. The reconciler probes with backoff (5 s → 600 s, at most six probes, 600 s deadline) and never re-executes the original effect.
+- **Shared memory facts**: memory nodes with a provenance, an audience and a lifecycle. Permission is a candidate filter bound into the SQL rather than a post-filter, every rights change bumps `acl_epoch`, and facts fail closed — the audience is the intersection of the sources' proven participants, never a union. Optional backfill from archived history is dry-run by default.
+- **Per-chat send budgets**: sliding, persisted and attempt-idempotent; capacity returns 60 s after each individual send, and a restart does not hand capacity back.
+- **Reply routing (phase 07)**: `direct` / `continuation` / `ambient` is classified before any model call. Unaddressed messages in a released chat pass a brake (≥ 300 s **and** ≥ 6 messages since the last ambient answer) before one small judge decides `answer`, `react` or `none` with a confidence floor of 0.75. A per-chat reply action (`answer`, `react`, `silence`) caps what a verdict may become, and model-chosen reactions are restricted to the owner's emoji vocabulary.
+- **WhatsApp bridge protocol v4**: edit, delete, reaction and receipt signals plus `lookup_message` are journaled as first-class events.
+
+### Reliability
+- Journal retention is now scheduled: `ProcessingRetentionService` sweeps 30 s after start and then hourly, stripping event and effect payloads and deleting lineage metadata per the configured windows. Effects are never deleted, only reduced to a tombstone, so an operation key cannot silently fire twice after retention.
+- The reconciler performs its first tick before any channel consumes a message, so an expired `executing` claim is recovered and probed before the next reply is generated.
+- `config.json` and `policy.json` are snapshotted into `<runtime>/backups/{config,policy}/` before every rewrite, with content deduplication and a 30-day retention window (`YEOMAN_BACKUP_RETENTION_DAYS`, `0` disables). Timestamped snapshots no longer accumulate in the runtime root, and a policy snapshot keeps the change id it rolls back to.
+- `bin/yeoman` runs the real package (`yeoman_gateway`) instead of the removed `yeoman.cli.commands` module.
 
 ### Gateway Safety
 - Internal orchestrator and provider failures are now kept out of chat replies, reactions, assistant session entries, and memory capture; failed provider turns clean up their active turn state.

@@ -853,7 +853,7 @@ if [ "${resolved_config_loaded:-false}" = "true" ] && [ "${caldav_enabled:-false
             if [ -n "$host_caldav_missing" ]; then
                 add_issue "system" "WARNING" "SYS-006" "host python3 lacks CalDAV dependencies used by source CLI commands" \
                     "python3 ($host_python) cannot import: $host_caldav_missing; yeoman uses $yeoman_python" \
-                    "Use 'yeoman ...' or the yeoman venv interpreter, or install the missing packages into python3 before running 'python3 -m yeoman.cli.commands ...'."
+                    "Use 'yeoman ...' or the yeoman venv interpreter, or install the missing packages into python3 before running 'python3 -m yeoman_gateway ...'."
             else
                 line_ok "host python3 can also import CalDAV dependencies"
             fi

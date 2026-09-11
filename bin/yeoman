@@ -14,4 +14,4 @@ fi
 export YEOMAN_LAUNCHER_PATH="$ROOT_DIR/bin/yeoman"
 export YEOMAN_LAUNCHER_KIND="repo-wrapper"
 
-exec "$PYTHON_BIN" -m yeoman.cli.commands "$@"
+exec "$PYTHON_BIN" -m yeoman_gateway "$@"

@@ -2013,7 +2013,7 @@ wheels = [
 
 [[package]]
 name = "yeoman-gateway"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "packages/gateway" }
 dependencies = [
     { name = "aiohttp" },
@@ -2075,7 +2075,7 @@ provides-extras = ["overseer"]
 
 [[package]]
 name = "yeoman-overseer"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "packages/overseer" }
 dependencies = [
     { name = "croniter" },
@@ -2100,7 +2100,7 @@ requires-dist = [
 
 [[package]]
 name = "yeoman-shared"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "packages/shared" }
 dependencies = [
     { name = "httpx" },
