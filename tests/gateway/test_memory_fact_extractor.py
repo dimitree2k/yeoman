@@ -594,3 +594,117 @@ def test_f09_historical_sources_fail_closed_to_author_only() -> None:
     live = extractor([_Event("ev-new", "Der Stammtisch ist donnerstags.")])[0]
     assert live.visibility_scope == "chat_shared"
     assert live.audience == frozenset({"member-old", "new_member"})
+
+
+def test_f08_a_job_cancelled_during_extraction_never_publishes(tmp_path: Path) -> None:
+    """Review F08: revocation during the model call must win over the stale candidates.
+
+    Reproduction from the review: the extractor cancels its own sources and makes the
+    source payload unreadable while the job runs, then returns a candidate. The old code
+    published it anyway and overwrote the cancellation with 'done'.
+    """
+    from yeoman_gateway.memory.extraction_jobs import (
+        SharedFactCandidate,
+        SharedFactExtractionQueue,
+    )
+
+    store = MemoryStore(tmp_path / "memory.db")
+
+    class _Event:
+        def __init__(self) -> None:
+            self.event_id = "ev1"
+            self.payload = {"text": "Der Stammtisch ist donnerstags."}
+            self.payload_available = True
+
+    event = _Event()
+
+    class _Journal:
+        def get_event(self, event_id: str):
+            return event
+
+    queue_ref: dict[str, SharedFactExtractionQueue] = {}
+
+    class _Revoking:
+        def __call__(self, events):
+            # A deletion lands while the model is thinking.
+            queue_ref["queue"].cancel_sources(["ev1"], now_ms=T0)
+            event.payload_available = False
+            return [
+                SharedFactCandidate(
+                    content="Der Stammtisch ist donnerstags.",
+                    author_principal="member-old",
+                    visibility_scope="author_only",
+                    source_refs=(("ev1", 1),),
+                    audience=frozenset({"member-old"}),
+                )
+            ]
+
+    queue = SharedFactExtractionQueue(
+        store=store, extractor=_Revoking(), journal=_Journal(), clock=lambda: T0
+    )
+    queue_ref["queue"] = queue
+    queue.enqueue(
+        turn_ref="tu1", source_refs=[("ev1", 1)], now_ms=T0,
+        workspace_id="ws1", chat_scope_key=GROUP,
+    )
+
+    report = queue.run_due(now_ms=T0)
+
+    assert report.published == 0
+    assert store.list_facts() == []
+    job = store.list_fact_jobs()[0]
+    assert job["state"] == "cancelled", (
+        f"the cancellation was overwritten by {job['state']!r}"
+    )
+    assert queue.cancelled_during_extraction == 1
+    store.close()
+
+
+def test_f08_an_unreadable_source_stops_publication(tmp_path: Path) -> None:
+    """The source payload disappearing during the call is treated like a revocation."""
+    from yeoman_gateway.memory.extraction_jobs import (
+        SharedFactCandidate,
+        SharedFactExtractionQueue,
+    )
+
+    store = MemoryStore(tmp_path / "memory.db")
+
+    class _Event:
+        def __init__(self) -> None:
+            self.event_id = "ev1"
+            self.payload = {"text": "Der Stammtisch ist donnerstags."}
+            self.payload_available = True
+
+    event = _Event()
+
+    class _Journal:
+        def get_event(self, event_id: str):
+            return event
+
+    class _Gone:
+        def __call__(self, events):
+            event.payload_available = False
+            return [
+                SharedFactCandidate(
+                    content="Der Stammtisch ist donnerstags.",
+                    author_principal="member-old",
+                    visibility_scope="author_only",
+                    source_refs=(("ev1", 1),),
+                    audience=frozenset({"member-old"}),
+                )
+            ]
+
+    queue = SharedFactExtractionQueue(
+        store=store, extractor=_Gone(), journal=_Journal(), clock=lambda: T0
+    )
+    queue.enqueue(
+        turn_ref="tu1", source_refs=[("ev1", 1)], now_ms=T0,
+        workspace_id="ws1", chat_scope_key=GROUP,
+    )
+
+    report = queue.run_due(now_ms=T0)
+
+    assert report.published == 0
+    assert store.list_facts() == []
+    assert queue.cancelled_during_extraction == 1
+    store.close()

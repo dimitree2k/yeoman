@@ -409,6 +409,7 @@ class SharedFactExtractionQueue:
         self.embeddings_written = 0
         self.embeddings_failed = 0
         self.skipped_existing = 0
+        self.cancelled_during_extraction = 0
         self._idle_ms = int(idle_ms)
         self._max_delay_ms = int(max_delay_ms)
         self._max_waiting = max(1, int(max_waiting))
@@ -577,6 +578,14 @@ class SharedFactExtractionQueue:
             report.note(f"failed:{type(exc).__name__}")
             return
 
+        # Review F08: the model call can take seconds, and a revocation or a deletion may
+        # land meanwhile. Publishing from a stale job would resurrect invalidated sources
+        # and overwrite the cancellation with "done".
+        if not self._still_current(job, refs):
+            self.cancelled_during_extraction += 1
+            report.note("cancelled_during_extraction")
+            return
+
         published = 0
         skipped_reasons: list[str] = []
         publish_errors: list[str] = []
@@ -593,16 +602,16 @@ class SharedFactExtractionQueue:
                 publish_errors.append(type(exc).__name__)
                 logger.warning("shared fact publish failed: {}", exc)
         if published:
-            self._mark(job, state="done", reason=None, now_ms=now_ms)
+            self._finish(job, state="done", reason=None, now_ms=now_ms)
             report.note("published", published=published)
         elif publish_errors:
             reason = f"publish_error:{publish_errors[0]}"
-            self._mark(job, state="failed", reason=reason, now_ms=now_ms)
+            self._finish(job, state="failed", reason=reason, now_ms=now_ms)
             report.failed += 1
             report.note(reason)
         else:
             reason = skipped_reasons[0] if skipped_reasons else "no_candidates"
-            self._mark(job, state="skipped", reason=reason, now_ms=now_ms)
+            self._finish(job, state="skipped", reason=reason, now_ms=now_ms)
             report.note(reason)
 
     def _publish(
@@ -694,6 +703,42 @@ class SharedFactExtractionQueue:
                 return None
             events.append(event)
         return events
+
+    def _still_current(self, job: Mapping[str, Any], refs: tuple[tuple[str, int], ...]) -> bool:
+        """True when the job may still publish: running state and readable sources."""
+        try:
+            current = self._store.get_fact_job(str(job.get("job_key") or ""))
+        except Exception:  # pragma: no cover - defensive
+            return False
+        if current is None or str(current.get("state")) != "running":
+            return False
+        for event_id, _revision in refs:
+            event = _get_event(self._journal, event_id) if self._journal is not None else None
+            if event is None or not getattr(event, "payload_available", True):
+                return False
+        return True
+
+    def _finish(
+        self,
+        job: Mapping[str, Any],
+        *,
+        state: str,
+        reason: str | None,
+        now_ms: int,
+    ) -> bool:
+        """Write a terminal state only while the job is still running.
+
+        A cancellation that arrived during the model call keeps its state; the run simply
+        stops touching the job.
+        """
+        try:
+            current = self._store.get_fact_job(str(job.get("job_key") or ""))
+        except Exception:  # pragma: no cover - defensive
+            current = None
+        if current is not None and str(current.get("state")) not in ("running", "queued"):
+            return False
+        self._mark(job, state=state, reason=reason, now_ms=now_ms)
+        return True
 
     def _mark(
         self,
