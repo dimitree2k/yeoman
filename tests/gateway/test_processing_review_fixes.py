@@ -289,3 +289,88 @@ def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> N
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_f04_a_restart_puts_the_follow_up_into_the_request(tmp_path: Path) -> None:
+    """Review F04: pending inputs were consumed but never reached the provider.
+
+    The old restart loop called the inner responder with the *original* event, so the
+    provider saw the first order twice while the follow-up disappeared.
+    """
+    import asyncio
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store = _store(tmp_path)
+    thread_id = store.open_thread(
+        channel="whatsapp", chat_id=CHAT_A, root_principal="orderer",
+        kind="dm", trigger_event_id="m1", now_ms=T0,
+    )
+    turn_id = store.open_turn(
+        thread_id=thread_id, principal="orderer", trigger_event_id="m1", now_ms=T0
+    )
+    store.append_event(
+        event_key="k1", event_id="m1", trace_id="tr-m1",
+        payload={"text": "Book Tuesday"}, now_ms=T0,
+    )
+    store.append_event(
+        event_key="k2", event_id="m2", trace_id="tr-m2",
+        payload={"text": "At 15:00 please"}, now_ms=T0 + 1,
+    )
+    store.add_turn_source(
+        turn_id=turn_id, event_id="m1", source_message_id="m1", role="trigger",
+        revision_at_join=1, now_ms=T0,
+    )
+    # The wrapper resolves the thread through the journaled assignment.
+    store.attach_event_assignment(
+        event_id="m1", thread_id=thread_id, turn_id=turn_id, now_ms=T0
+    )
+
+    class _Config:
+        threads = type(
+            "T", (), {"max_additional_generations": 2, "postbox_max_waiting": 8}
+        )()
+
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=lambda: T0)
+    actor = actors.actor_for(thread_id)
+
+    seen: list[str] = []
+
+    class _Barrier:
+        """First call parks, a follow-up arrives, then the restart answers."""
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str | None:
+            seen.append(str(getattr(event, "content", "")))
+            if len(seen) == 1:
+                actor.accept(
+                    event_id="m2",
+                    principal="orderer",
+                    kind="message",
+                    explicit_correction=False,
+                    authorized=True,
+                )
+            return "ok"
+
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id=CHAT_A,
+        sender_id="orderer",
+        content="Book Tuesday",
+        message_id="m1",
+        is_group=False,
+        mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+    wrapper = ThreadActorResponder(
+        inner=_Barrier(), actors=actors, store=store, clock=lambda: T0
+    )
+
+    await asyncio.wait_for(wrapper.generate_reply(event, None), timeout=5)
+
+    assert seen, "the provider was never called"
+    assert seen[-1].splitlines() == ["Book Tuesday", "At 15:00 please"], (
+        f"the follow-up never reached the provider: {seen}"
+    )
+    store.close()

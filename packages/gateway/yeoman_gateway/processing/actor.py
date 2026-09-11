@@ -301,6 +301,18 @@ class ThreadActor:
             additional = self._state.additional_generations
             if additional < MAX_ADDITIONAL_GENERATIONS:
                 self._state.additional_generations = additional + 1
+                # Review F04: the drained follow-ups must become sources of this turn,
+                # otherwise the rebooted snapshot freezes without them and the provider is
+                # asked the original question again while the follow-up disappears.
+                for item in pending:
+                    self._store.add_turn_source(
+                        turn_id=snapshot.turn_id,
+                        event_id=item.event_id,
+                        source_message_id=getattr(item, "source_message_id", None),
+                        role="context",
+                        revision_at_join=int(getattr(item, "revision_at_join", 1) or 1),
+                        now_ms=self._clock(),
+                    )
                 context_version = self._store.bump_context_version(
                     snapshot.turn_id, now_ms=self._clock()
                 )
