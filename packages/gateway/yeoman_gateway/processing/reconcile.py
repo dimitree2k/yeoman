@@ -364,6 +364,9 @@ class ReconciliationService:
 
         self._stopping = False
         self._task = asyncio.create_task(self._run_loop())
+        # One startup line so an operator can tell the loop is live; the loop itself
+        # stays quiet because it ticks every second.
+        logger.info("reconciliation loop started tick_seconds={}", self._tick_seconds)
 
     async def stop(self) -> None:
         import asyncio
