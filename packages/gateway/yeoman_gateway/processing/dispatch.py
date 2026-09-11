@@ -787,7 +787,27 @@ class IntentEffectRouter:
             return blocked
 
         result = await self._gateway.execute_ready(receipt.effect_id)
+        self._close_ambient_turn(turn_id, now=now)
         return self._log_undelivered(result, envelope, chat_id)
+
+    def _close_ambient_turn(self, turn_id: str, *, now: int) -> None:
+        """An ambient order ends with its answer: turn and thread close right away.
+
+        Without this, ambient turns would stay open and look like durable work (routing
+        spec: an ambient answer is short-lived and never accumulates).
+        """
+        if not turn_id:
+            return
+        try:
+            turn = self._gateway.store.get_turn(turn_id)
+            if turn is None:
+                return
+            thread = self._gateway.store.get_thread(turn.thread_id)
+            if thread is None or str(getattr(thread, "kind", "")) != "ambient":
+                return
+            self._gateway.store.close_turn(turn_id, now_ms=int(now), state="closed")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("ambient turn close skipped turn={} error={}", turn_id, exc)
 
     def _note_soft_thread_limit(self, *, thread_id: str, now_ms: int) -> None:
         """Soft fairness: measure what the limit would defer, and enforce only on request.

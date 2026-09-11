@@ -241,6 +241,13 @@ class IngestGate:
         outcome = (
             FastGateOutcome.REACT if decision.should_respond else FastGateOutcome.OBSERVE
         )
+        if outcome is FastGateOutcome.REACT and self._reply_action(request) == "silence":
+            # An explicit silence veto: no turn, no effect, no typing indicator. It can
+            # only take an answer away, never grant one (routing spec).
+            logger.debug(
+                "reply_action_silence chat={} event_id={}", request.event.chat_id, request.event_id
+            )
+            outcome = FastGateOutcome.OBSERVE
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
         if assignment is not None and assignment.thread_id:
             # Positive rollout marker: the degraded paths log too (threads_degraded,
@@ -266,6 +273,15 @@ class IngestGate:
         )
 
     # -- internals ---------------------------------------------------------------------
+
+    def _reply_action(self, request: IngestRequest) -> str:
+        """The configured action for this chat: ``answer`` unless silenced."""
+        actions = getattr(self._config, "reply_actions", None) or {}
+        if not isinstance(actions, Mapping):
+            return "answer"
+        key = f"{request.event.channel}:{request.event.chat_id}"
+        value = str(actions.get(key, "answer") or "answer").strip().lower()
+        return value if value in {"answer", "silence"} else "answer"
 
     def _assign(self, request: IngestRequest, *, now: int, allow_turn: bool) -> Any:
         """Attach the canonical event to its thread; never runs for a denied event.

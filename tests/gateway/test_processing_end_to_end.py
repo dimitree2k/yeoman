@@ -60,13 +60,18 @@ class _Transport:
 
 
 def _config(
-    *, chats: tuple[str, ...] = (CHAT,), waiting_cap: int = 20, soft_enforce: bool = False
+    *,
+    chats: tuple[str, ...] = (CHAT,),
+    waiting_cap: int = 20,
+    soft_enforce: bool = False,
+    ambient: tuple[str, ...] = (),
 ) -> Config:
     return Config.model_validate(
         {
             "processing": {
                 "enabled": True,
                 "chats": [f"whatsapp:{chat}" for chat in chats],
+                "ambient_chats": [f"whatsapp:{chat}" for chat in ambient],
                 "budgets": {
                     "outbox_waiting_per_chat": waiting_cap,
                     "thread_soft_enforce": soft_enforce,
@@ -123,6 +128,7 @@ def _make_runtime(
     chats: tuple[str, ...] = (CHAT,),
     waiting_cap: int = 20,
     soft_enforce: bool = False,
+    ambient: tuple[str, ...] = (),
     **kwargs,
 ) -> _Runtime:
     policy_path = tmp_path / "policy.json"
@@ -136,7 +142,12 @@ def _make_runtime(
         policy_path=policy_path,
         workspace=workspace,
     )
-    config = _config(chats=chats, waiting_cap=waiting_cap, soft_enforce=soft_enforce)
+    config = _config(
+        chats=chats,
+        waiting_cap=waiting_cap,
+        soft_enforce=soft_enforce,
+        ambient=ambient,
+    )
     # Pin the database: reopening must never fall back to the default (live) path.
     config.processing.db_path = str(tmp_path / "processing.db")
     with patch.dict(os.environ, {"YEOMAN_HOME": str(tmp_path)}):
@@ -162,7 +173,7 @@ def _make_runtime(
 
 
 def _event(
-    *, message_id: str, content: str = "hi", chat: str = CHAT, mentioned_bot: bool = True
+    *, message_id: str, content: str = "hi", chat: str = CHAT, mentioned: bool = True
 ) -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
@@ -171,26 +182,38 @@ def _event(
         content=content,
         message_id=message_id,
         is_group=True,
-        mentioned_bot=mentioned_bot,
+        mentioned_bot=mentioned,
         timestamp=datetime(2023, 11, 14, tzinfo=UTC),
     )
 
 
-def _admit(runtime: _Runtime, *, message_id: str, chat: str = CHAT, content: str = "hi"):
+def _admit(
+    runtime: _Runtime,
+    *,
+    message_id: str,
+    chat: str = CHAT,
+    content: str = "hi",
+    mentioned: bool = True,
+):
     return runtime.gate.admit(
         IngestRequest(
             event_key=f"whatsapp:{chat}:{message_id}",
             event_id=message_id,
             trace_id=f"tr-{message_id}",
-            event=_event(message_id=message_id, chat=chat, content=content),
+            event=_event(
+                message_id=message_id, chat=chat, content=content, mentioned=mentioned
+            ),
         )
     )
 
 
 @pytest.mark.asyncio
 async def test_implicit_reply_reconciles_an_ambient_event_into_a_turn(runtime) -> None:
+    # An ambient event only becomes a turn in a chat the owner released for ambient
+    # answers; the shared fixture is deliberately neutral, so this test opts in.
+    runtime.registry._ambient_chats = frozenset({f"whatsapp:{CHAT}"})
     runtime.reload_policy(_policy(when_to_reply="mention_only"))
-    event = _event(message_id="ambient-1", content="Arvid, das ist wichtig", mentioned_bot=False)
+    event = _event(message_id="ambient-1", content="Arvid, das ist wichtig", mentioned=False)
     verdict = runtime.gate.admit(
         IngestRequest(
             event_key=f"whatsapp:{CHAT}:ambient-1",
@@ -208,7 +231,7 @@ async def test_implicit_reply_reconciles_an_ambient_event_into_a_turn(runtime) -
     promoted = _event(
         message_id="ambient-1",
         content=event.content,
-        mentioned_bot=True,
+        mentioned=True,
     )
     assignment = runtime.gate.reconcile_reply(promoted)
 
@@ -456,7 +479,7 @@ def test_every_effect_has_a_parent_turn(runtime) -> None:
 @pytest.mark.asyncio
 async def test_soft_thread_limit_is_measured_by_default(tmp_path: Path) -> None:
     """A chatty thread keeps working: the limit is measured, not silently enforced."""
-    runtime = _make_runtime(tmp_path, chats=(CHAT,))
+    runtime = _make_runtime(tmp_path, chats=(CHAT,), ambient=(CHAT,))
     try:
         _admit(runtime, message_id="m1")
         for index in range(3):
@@ -548,3 +571,45 @@ async def test_f02_a_final_reply_keeps_its_frozen_turn(runtime, monkeypatch) -> 
         "the answer was attributed to the newer turn instead of its own"
     )
     assert effects[0].turn_revision == turn_a.revision
+
+
+@pytest.mark.asyncio
+async def test_reply_action_silence_withdraws_the_answer(tmp_path: Path) -> None:
+    """Plan 07 / Aufgabe 4: silence produces no turn, no effect and no typing indicator."""
+    runtime = _make_runtime(tmp_path / "silence", chats=(CHAT,))
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": "silence"}
+
+        result = _admit(runtime, message_id="m1")
+
+        assert result.outcome.value == "observe", "the answer must be withdrawn"
+        assert result.assignment is not None
+        assert result.assignment.turn_id is None, "silence must not open a turn"
+        assert runtime.store.list_effects() == ()
+        assert runtime.transport.sent == []
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ambient_answer_closes_its_turn_after_sending(tmp_path: Path) -> None:
+    """Spec: an ambient answer is short-lived - it must not leave open durable work."""
+    runtime = _make_runtime(tmp_path / "ambient", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        result = _admit(
+            runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False
+        )
+        assignment = result.assignment
+        assert assignment is not None and assignment.turn_id, "ambient needs its own lineage"
+        thread = runtime.store.get_thread(str(assignment.thread_id))
+        assert thread is not None and thread.kind == "ambient"
+
+        await _dispatch(runtime, message_id="m1")
+
+        turn = runtime.store.get_turn(str(assignment.turn_id))
+        assert turn is not None and turn.state == "closed", (
+            "the ambient turn stayed open after its answer was sent"
+        )
+        assert runtime.transport.sent == ["answer"]
+    finally:
+        runtime.store.close()

@@ -706,6 +706,10 @@ class ProcessingConfig(BaseModel):
     #: Chats where an ambient (unaddressed) message may still be answered, each with its
     #: own short-lived lineage. Empty everywhere else (routing spec, owner decision).
     ambient_chats: list[str] = Field(default_factory=list)
+    #: Per-chat reply action: "answer" (default) or "silence". A chat that must never
+    #: be answered produces no turn, no effect and no typing indicator. "react" needs
+    #: the reaction path and is not accepted yet (routing spec, answer/react/silence).
+    reply_actions: dict[str, str] = Field(default_factory=dict)
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)
