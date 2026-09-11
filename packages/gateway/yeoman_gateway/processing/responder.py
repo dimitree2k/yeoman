@@ -44,12 +44,14 @@ class ThreadActorResponder:
         store: Any,
         authority: TurnAuthority | None = None,
         clock: Callable[[], int] | None = None,
+        router: Any | None = None,
     ) -> None:
         self._inner = inner
         self._actors = actors
         self._store = store
         self._authority = authority or TurnAuthority()
         self._clock = clock or _now_ms
+        self._router = router
 
     def __getattr__(self, name: str) -> Any:
         """Everything else (tool access, close, telemetry) stays the inner responder's."""
@@ -128,6 +130,10 @@ class ThreadActorResponder:
                     CURRENT_TURN.reset(token)
 
             outcome = await actor.run_generation(snapshot, _call)
+            if binding is not None and getattr(self, "_router", None) is not None:
+                # The final reply is dispatched by the orchestrator *after* this scope, so
+                # remember the frozen turn against the source message (review F02).
+                self._router.remember_turn_for_source(self._event_id(event), binding)
             if outcome.state == "restart":
                 continue
             if outcome.state in ("error", "superseded"):

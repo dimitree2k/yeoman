@@ -15,6 +15,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -569,6 +570,11 @@ class IntentEffectRouter:
         self._clock = clock or _now_ms
         self._worker_id = worker_id
         self._turn_provider = turn_provider
+        # Review F02: a final reply is dispatched after the generation scope closed, so the
+        # chat's *active* turn may already belong to a newer thread. The turn a generation
+        # was frozen with is remembered per source message and preferred over that heuristic.
+        self._frozen_turns: OrderedDict[str, Any] = OrderedDict()
+        self._frozen_turn_cap = 256
         processing = getattr(config, "processing", None)
         budgets = getattr(processing, "budgets", None)
         self._budget = budget or (
@@ -686,6 +692,7 @@ class IntentEffectRouter:
         return await self._run(
             channel=message.channel,
             chat_id=message.chat_id,
+            source_message_id=str(metadata.get("message_id") or "") or None,
             principal=principal,
             payload=payload,
             operation_key=(
@@ -698,10 +705,24 @@ class IntentEffectRouter:
             ),
         )
 
+    def remember_turn_for_source(self, source_message_id: str, binding: Any) -> None:
+        """Record which turn a generation was frozen with, for its final reply."""
+        key = str(source_message_id or "")
+        if not key or binding is None:
+            return
+        self._frozen_turns[key] = binding
+        self._frozen_turns.move_to_end(key)
+        while len(self._frozen_turns) > self._frozen_turn_cap:
+            self._frozen_turns.popitem(last=False)
+
+    def frozen_turn_for_source(self, source_message_id: str) -> Any | None:
+        return self._frozen_turns.get(str(source_message_id or ""))
+
     async def _run(
         self,
         *,
         channel: str,
+        source_message_id: str | None = None,
         chat_id: str,
         principal: str,
         payload: Any,
@@ -717,8 +738,14 @@ class IntentEffectRouter:
         deadline_ms = int(getattr(deadlines, deadline_key))
 
         binding = CURRENT_TURN.get()
+        frozen = None
+        if binding is None and source_message_id:
+            frozen = self.frozen_turn_for_source(source_message_id)
+            binding = frozen
         turn = getattr(binding, "turn", None)
-        if turn is None and self._turn_provider is not None:
+        if turn is None and frozen is None and self._turn_provider is not None:
+            # Only when nothing is known about this source may the chat's active turn be
+            # used; otherwise a newer thread would silently adopt an older answer.
             turn = self._turn_provider(channel, chat_id)
         if binding is not None and getattr(binding, "trace_id", ""):
             trace_id = binding.trace_id

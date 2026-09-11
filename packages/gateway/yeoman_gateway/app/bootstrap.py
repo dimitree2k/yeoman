@@ -551,6 +551,7 @@ def build_thread_responder(
     threads: object | None,
     responder: object,
     policy_adapter: "EnginePolicyAdapter | None" = None,
+    router: object | None = None,
 ):
     """Responder wrapper that drives the thread actor. ``None`` keeps the legacy path."""
     if store is None or threads is None or not config.processing.enabled:
@@ -570,7 +571,9 @@ def build_thread_responder(
             )
         ),
     )
-    return ThreadActorResponder(inner=responder, actors=actor_registry, store=store)
+    return ThreadActorResponder(
+        inner=responder, actors=actor_registry, store=store, router=router
+    )
 
 
 def build_effect_router(
@@ -984,7 +987,12 @@ def build_gateway_runtime(
 
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     thread_responder = build_thread_responder(
-        config, processing_store, thread_registry, responder, policy_adapter
+        config,
+        processing_store,
+        thread_registry,
+        responder,
+        policy_adapter,
+        effect_router,
     )
 
     orchestrator = Orchestrator(

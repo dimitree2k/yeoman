@@ -479,3 +479,56 @@ def test_the_session_guard_keeps_stores_away_from_the_runtime_tree() -> None:
     resolved = get_data_path().resolve()
     assert "yeoman-home" in str(resolved), resolved
     assert resolved != (Path.home() / ".yeoman" / "data").resolve()
+
+
+@pytest.mark.asyncio
+async def test_f02_a_final_reply_keeps_its_frozen_turn(runtime, monkeypatch) -> None:
+    """Review F02: the reply must not be adopted by a thread that started meanwhile.
+
+    The generation scope closes before the orchestrator dispatches the final reply, so the
+    router used to fall back to the chat's *active* turn - which may already be thread B.
+    """
+    from yeoman_gateway.processing.models import TurnBinding
+
+    first = _admit(runtime, message_id="m1")
+    turn_a = runtime.store.get_turn(str(first.assignment.turn_id))
+    assert turn_a is not None
+
+    # A second thread opens in the same chat while m1 is still being answered.
+    thread_b = runtime.store.open_thread(
+        channel="whatsapp",
+        chat_id=CHAT,
+        root_principal="orderer@s.whatsapp.net",
+        kind="dm",
+        trigger_event_id="m2",
+        now_ms=T0 + 1,
+    )
+    turn_b_id = runtime.store.open_turn(
+        thread_id=thread_b,
+        principal="orderer@s.whatsapp.net",
+        trigger_event_id="m2",
+        now_ms=T0 + 1,
+    )
+    turn_b = runtime.store.get_turn(turn_b_id)
+    assert turn_b is not None and turn_b.turn_id != turn_a.turn_id
+
+    # The chat's active turn is now B, which is exactly what the heuristic would pick.
+    # The router captured its provider at construction, so patch the provider itself.
+    monkeypatch.setattr(
+        runtime.router,
+        "_turn_provider",
+        lambda channel, chat_id: turn_b.to_ref(channel="whatsapp", chat_id=CHAT),
+    )
+
+    # What the responder wrapper records while the generation for m1 is frozen.
+    runtime.router.remember_turn_for_source(
+        "m1", TurnBinding(turn=turn_a, trace_id=turn_a.turn_id, generation_id="gen-a")
+    )
+    await _dispatch(runtime, message_id="m1")
+
+    effects = [effect for effect in runtime.store.list_effects() if effect.turn_id]
+    assert len(effects) == 1
+    assert effects[0].turn_id == turn_a.turn_id, (
+        "the answer was attributed to the newer turn instead of its own"
+    )
+    assert effects[0].turn_revision == turn_a.revision
