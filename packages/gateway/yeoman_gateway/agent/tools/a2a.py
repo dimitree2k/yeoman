@@ -138,9 +138,13 @@ class A2ADelegateTool(Tool):
         context = current_tool_context()
         channel = context.channel if context is not None else self._channel
         chat_id = context.chat_id if context is not None else self._chat_id
-        operation_key = (
-            f"a2a:{worker}:{channel}:{chat_id}:{self._turn_identity()}:{digest[:32]}"
-        )
+        # One delegation per turn and worker - deliberately independent of the wording.
+        # A live run showed why: after a 300 s transport timeout the agent retried the same
+        # task *reworded*, so a message-based key would have let the second, equally
+        # unprovable call through. The message is journaled as payload instead, and a
+        # different message under the same key is a conflict, not a retry.
+        operation_key = f"a2a:{worker}:{channel}:{chat_id}:{self._turn_identity()}"
+
         effect_id = "a2a-" + hashlib.sha256(operation_key.encode("utf-8")).hexdigest()[:32]
         now = int(time.time() * 1000)
         try:

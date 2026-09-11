@@ -393,7 +393,12 @@ async def test_a_later_turn_may_delegate_the_same_task(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_different_task_in_the_same_turn_is_still_delegated(tmp_path: Path) -> None:
+async def test_a_reworded_retry_in_the_same_turn_is_refused(tmp_path: Path) -> None:
+    """One delegation per turn and worker - the wording must not open a second one.
+
+    Live, a 300 s transport timeout made the agent retry the same task reworded. A
+    message-based key would have sent that second, equally unprovable call to the peer.
+    """
     from yeoman_gateway.processing.store import ProcessingStore
     from yeoman_gateway.processing.tool_context import reset_tool_context
 
@@ -402,13 +407,17 @@ async def test_a_different_task_in_the_same_turn_is_still_delegated(tmp_path: Pa
     tool = A2ADelegateTool(_counting_registry(client), store=store)
     token = _in_turn("m1")
     try:
-        await tool.execute(worker="hermes", message="first task")
-        await tool.execute(worker="hermes", message="second task")
+        first = await tool.execute(worker="hermes", message="ask hermes to research X")
+        second = await tool.execute(
+            worker="hermes", message="please have hermes research topic X for me"
+        )
     finally:
         reset_tool_context(token)
         store.close()
 
-    assert client.calls == ["first task", "second task"]
+    assert "TASK_STATE_COMPLETED" in first
+    assert "not-sent" in second, "a reworded retry must not reach the peer"
+    assert client.calls == ["ask hermes to research X"]
 
 
 @pytest.mark.asyncio
