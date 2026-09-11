@@ -29,12 +29,44 @@ Effective switches live in `config.json` (runtime tree):
 | `processing.budgets.chat_hard_units` / `_window_seconds` | hard per-chat send budget | `6` / `60` |
 | `processing.budgets.thread_soft_units` / `_window_seconds` | soft thread deferral | `2` / `10` |
 | `processing.budgets.outbox_waiting_per_chat` | waiting outbox cap | `20` |
+| `processing.threads.followupWindowSeconds` | how long a thread keeps taking continuations | `600` |
+| `processing.ambientChats` | chats where an unaddressed message may still be answered | `[]` |
+| `processing.replyActions` | per chat `answer` (default) or `silence`; `react` is wired next and not accepted yet | `{}` |
+| `processing.reactionEmojis` | the emojis a model-chosen reaction may use | 14 approved emojis |
+| `processing.extraction.timezone` | IANA zone for relative dates ("morgen") | `UTC` |
 
 The gateway log states the effective mode on every start:
 
 ```bash
 yeoman logs | grep -E "processing mode|protocol v"
+yeoman logs | grep reaction_emojis      # the vocabulary that is actually live
 ```
+
+Routing decisions and reactions are observable per message without any content:
+
+```bash
+yeoman logs | grep routing_decision     # classification, candidates, signal, action, lineage
+yeoman logs | grep routing_effect       # one line per queued effect
+yeoman logs | grep reaction_dropped     # a model-chosen emoji that is not approved
+```
+
+### Reaction vocabulary
+
+The model picks the emoji, the owner owns the list. `processing.reactionEmojis` is the
+complete set a *model-chosen* reaction may use; an emoji outside it is dropped and logged
+as `reaction_dropped` - never replaced by a guessed face, and never sent as text, so a
+reaction-only reply simply stays silent. Confirmations the gateway decides itself (blocked
+input, name mention, admin acknowledgement) are not model choices and are unaffected.
+
+Editing the list takes effect on the next gateway start:
+
+```bash
+# config.json (runtime tree), then:
+systemctl --user restart yeoman-gateway
+```
+
+The list also decides what `processing.replyActions: "react"` may send once that action is
+wired: the model then chooses an emoji from exactly this vocabulary instead of writing text.
 
 `new processing mode disables non-migrated capabilities: [...]` is expected and means the
 listed legacy capabilities (A2A, exec, browse, calendar) are refused for activated chats.
