@@ -806,6 +806,20 @@ class WhatsAppChannel(BaseChannel):
         """Attach the verdict that decides whether an unaddressed message may be answered."""
         self._ambient_judge = judge
 
+    @staticmethod
+    def _judge_input(event: InboundEvent) -> str:
+        """What the judge reads: the message, and for media what it actually contains.
+
+        A voice message carries no text until it is transcribed, and an image carries its
+        description - both belong to the question "does this need an answer?".
+        """
+        parts = [str(event.text or "").strip()]
+        for extra in (event.voice_transcript, event.media_description):
+            text = str(extra or "").strip()
+            if text and text not in parts:
+                parts.append(text)
+        return "\n".join(part for part in parts if part)
+
     async def _maybe_answer_ambient(self, event: InboundEvent) -> Any | None:
         """Ask the judge about an unaddressed message; the assignment opens its turn.
 
@@ -822,7 +836,7 @@ class WhatsAppChannel(BaseChannel):
             )
             return None
         try:
-            if not await self._ambient_judge(text=event.text):
+            if not await self._ambient_judge(text=self._judge_input(event)):
                 # A declined message stays observed, and the brake window starts over so
                 # the judge is asked at most once per window instead of once per message.
                 self._processing_gate.note_ambient_declined(event.message_id)
@@ -958,6 +972,7 @@ class WhatsAppChannel(BaseChannel):
         if self._is_duplicate(event.chat_jid, event.message_id):
             return
 
+        ambient_candidate = False
         if self._processing_gate is not None:
             verdict = self._processing_gate.admit(self._processing_request(event))
             if verdict is not None and not verdict.denied:
@@ -976,19 +991,11 @@ class WhatsAppChannel(BaseChannel):
                     # turn, no typing indicator and no pipeline run of its own. Messages the
                     # gate only observed stay observed - no acknowledgement per message.
                     await self._maybe_react(event)
-                elif bool(getattr(verdict, "ambient_candidate", False)):
-                    # Unaddressed, brake passed: only the judge decides whether this becomes
-                    # an answer. Either way the message is archived and seen as context.
-                    granted = await self._maybe_answer_ambient(event)
-                    if granted is not None:
-                        event = replace(
-                            event,
-                            thread_assignment={
-                                "thread_id": granted.thread_id,
-                                "turn_id": granted.turn_id,
-                                "source_message_ids": list(granted.source_message_ids),
-                            },
-                        )
+                else:
+                    # Unaddressed and the brake passed. The verdict waits until the media is
+                    # readable: a voice message has no text before its transcript exists,
+                    # and the judge must see what was actually said.
+                    ambient_candidate = bool(getattr(verdict, "ambient_candidate", False))
             if verdict is not None and verdict.denied:
                 logger.debug(
                     "processing fast gate denied channel=whatsapp chat={} message_id={} "
@@ -1004,6 +1011,19 @@ class WhatsAppChannel(BaseChannel):
                 return
 
         event = await self._enrich_media_event(event)
+        if ambient_candidate:
+            # Only the judge decides whether this becomes an answer. Either way the message
+            # is archived and stays context for the chat.
+            granted = await self._maybe_answer_ambient(event)
+            if granted is not None:
+                event = replace(
+                    event,
+                    thread_assignment={
+                        "thread_id": granted.thread_id,
+                        "turn_id": granted.turn_id,
+                        "source_message_ids": list(granted.source_message_ids),
+                    },
+                )
         self._record_document_cache_item(event)
         self._archive_inbound_event(event)
         self._sync_chat_registry(event)
