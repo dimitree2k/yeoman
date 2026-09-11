@@ -16,30 +16,67 @@ app.add_typer(policy_app, name="policy")
 
 
 def _policy_known_tools() -> set[str]:
-    """Known top-level tools for policy diagnostics."""
-    return {
-        "read_file",
-        "write_file",
-        "edit_file",
-        "list_dir",
-        "exec",
-        "ops",
-        "ops_manage",
-        "web_search",
-        "web_fetch",
-        "web_map",
-        "web_crawl",
-        "deep_research",
-        "market_quote",
-        "market_intelligence",
-        "message",
-        "delete_message",
-        "send_voice",
-        "summarize_history",
-        "spawn",
-        "cron",
-        "a2a_delegate",
-    }
+    """Known top-level tools for policy diagnostics.
+
+    The running gateway validates a policy against the tool registry the responder really
+    built; this CLI cannot build that registry (it has no providers), so it uses the names
+    the tool classes declare. Keeping that list in sync by hand already went wrong once
+    (``browse``, ``fact_check`` and ``resolve_contact`` were missing and made *every*
+    policy write fail), so the declarations are read from the package instead of copied.
+    """
+    return _DECLARED_POLICY_TOOLS | _declared_tool_names()
+
+
+def _declared_tool_names() -> set[str]:
+    """Every tool name the ``agent.tools`` package can offer, read from its sources."""
+    import ast
+    from pathlib import Path
+
+    names: set[str] = set()
+    package = Path(__file__).resolve().parents[1] / "agent" / "tools"
+    for path in sorted(package.glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - unreadable module is not fatal
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "name":
+                continue
+            for child in ast.walk(node):
+                if (
+                    isinstance(child, ast.Return)
+                    and isinstance(child.value, ast.Constant)
+                    and isinstance(child.value.value, str)
+                ):
+                    names.add(child.value.value)
+    return names
+
+
+#: Tools the responder registers outside the ``agent.tools`` classes (registry, memory,
+#: cron, delegation) - the part of the vocabulary that has no class constant to read.
+_DECLARED_POLICY_TOOLS = {
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "exec",
+    "ops",
+    "ops_manage",
+    "web_search",
+    "web_fetch",
+    "web_map",
+    "web_crawl",
+    "deep_research",
+    "market_quote",
+    "market_intelligence",
+    "message",
+    "delete_message",
+    "send_voice",
+    "summarize_history",
+    "spawn",
+    "cron",
+    "a2a_delegate",
+}
 
 
 @policy_app.command("path")
