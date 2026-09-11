@@ -17,6 +17,7 @@ from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.loader import save_policy
 from yeoman_gateway.policy.schema import PolicyConfig
+from yeoman_gateway.processing.ambient_judge import AmbientVerdict
 from yeoman_gateway.processing.effects import EffectGateway
 from yeoman_gateway.processing.models import (
     EffectEnvelope,
@@ -477,6 +478,169 @@ async def test_allowed_media_still_reaches_enrichment(tmp_path: Path) -> None:
     assert enriched == ["m1"]
     assert published == ["m1"]
     assert store.count_events() == 1
+    store.close()
+
+
+# --------------------------------------------------------------------------------------
+# the judge's verdict and the configured reply action (owner decision, option E)
+# --------------------------------------------------------------------------------------
+
+
+class _Judge:
+    """A judge that always returns the same verdict and records being asked."""
+
+    def __init__(self, verdict: AmbientVerdict) -> None:
+        self.verdict = verdict
+        self.asked: list[str] = []
+
+    async def decide(self, text: str) -> AmbientVerdict:
+        self.asked.append(text)
+        return self.verdict
+
+
+class _Reaction:
+    """Records what the channel sent, through both reaction entry points."""
+
+    def __init__(self, chosen: str | None = "🤙") -> None:
+        self.chosen = chosen
+        self.sent: list[str] = []
+
+    async def send(self, *, emoji: str, **_: Any) -> str | None:
+        self.sent.append(emoji)
+        return emoji
+
+    async def __call__(self, **_: Any) -> str | None:
+        if self.chosen is None:
+            return None
+        self.sent.append(self.chosen)
+        return self.chosen
+
+
+def _ambient_gate(store: ProcessingStore, *, action: str = "answer") -> IngestGate:
+    """One chat released for ambient answers, capped by the configured reply action."""
+    from yeoman_gateway.processing.threads import ThreadRegistry
+
+    config = ProcessingConfig.model_validate(
+        {
+            "enabled": True,
+            "chats": ["whatsapp:chat@g.us"],
+            "ambient_chats": ["whatsapp:chat@g.us"],
+            "reply_actions": {"whatsapp:chat@g.us": action},
+            "ambient": {"min_seconds_between_answers": 0, "min_messages_since_answer": 0},
+        }
+    )
+    return IngestGate(
+        config=config,
+        store=store,
+        snapshots=_StaticSnapshots(),
+        threads=ThreadRegistry(store=store, config=config),
+        evaluate=lambda request: PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"message"}),
+            reason="allow",
+        ),
+    )
+
+
+def _ambient_channel(
+    store: ProcessingStore, verdict: AmbientVerdict, *, action: str = "answer"
+) -> tuple[WhatsAppChannel, _Judge, _Reaction, list[WhatsAppInboundEvent]]:
+    channel = WhatsAppChannel(_no_debounce_config(), MessageBus())
+    channel.set_processing_gate(_ambient_gate(store, action=action))
+    judge = _Judge(verdict)
+    channel.set_ambient_judge(judge)
+    reaction = _Reaction()
+    channel.set_reaction_action(reaction)
+    published: list[WhatsAppInboundEvent] = []
+
+    async def _fake_enrich(event: WhatsAppInboundEvent) -> WhatsAppInboundEvent:
+        return event
+
+    async def _fake_publish(event: WhatsAppInboundEvent) -> None:
+        published.append(event)
+
+    channel._enrich_media_event = _fake_enrich  # type: ignore[method-assign]
+    channel._publish_event = _fake_publish  # type: ignore[method-assign]
+    return channel, judge, reaction, published
+
+
+@pytest.mark.asyncio
+async def test_a_judged_reaction_is_the_whole_reply(tmp_path: Path) -> None:
+    """The verdict `react` opens no turn - and the caller must not read a turn from it.
+
+    Returning the reaction's success flag where the caller expected a turn assignment made
+    every judged reaction raise right after the emoji had already gone out.
+    """
+    store = ProcessingStore(tmp_path / "p.db")
+    channel, judge, reaction, published = _ambient_channel(
+        store, AmbientVerdict(action="react", emoji="🤙", confidence=1.0)
+    )
+
+    await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
+
+    assert judge.asked, "the brake passed, so the judge decides"
+    assert reaction.sent == ["🤙"]
+    assert len(published) == 1, "the message still reaches the pipeline as context"
+    assert published[0].processing_reacted is True
+    assert published[0].processing_answer_granted is False
+    assert published[0].thread_assignment is None
+    assert channel._processing_gate.is_ambient_pending("m1") is True, (
+        "a reaction is the reply, so the classic pipeline must not answer as well"
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_verdict_is_capped_to_a_reaction_in_a_react_chat(tmp_path: Path) -> None:
+    """A chat on `react` never gets text: the judge's answer becomes the allowed reaction."""
+    store = ProcessingStore(tmp_path / "p.db")
+    channel, judge, reaction, published = _ambient_channel(
+        store, AmbientVerdict(action="answer", confidence=1.0), action="react"
+    )
+
+    await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
+
+    assert judge.asked, "the judge decides in a react chat too"
+    assert reaction.sent == ["🤙"], "the chooser picks the emoji for the capped delivery"
+    assert published[0].processing_reacted is True
+    assert published[0].processing_answer_granted is False
+    assert published[0].thread_assignment is None, "no text turn in a react chat"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_verdict_still_opens_a_turn_when_text_is_allowed(tmp_path: Path) -> None:
+    """The cap must not turn a normal chat's granted answer into a reaction."""
+    store = ProcessingStore(tmp_path / "p.db")
+    channel, judge, reaction, published = _ambient_channel(
+        store, AmbientVerdict(action="answer", confidence=1.0)
+    )
+
+    await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
+
+    assert judge.asked
+    assert reaction.sent == []
+    assert published[0].processing_answer_granted is True
+    assert published[0].thread_assignment is not None
+    assert published[0].thread_assignment["turn_id"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_silence_chat_never_spends_a_judge_call(tmp_path: Path) -> None:
+    """`silence` is a hard veto: no judge call, no reaction, no turn."""
+    store = ProcessingStore(tmp_path / "p.db")
+    channel, judge, reaction, published = _ambient_channel(
+        store, AmbientVerdict(action="answer", confidence=1.0), action="silence"
+    )
+
+    await channel._ingest_inbound_event(_wa_event(mentioned_bot=False))
+
+    assert judge.asked == []
+    assert reaction.sent == []
+    assert published[0].processing_answer_granted is False
+    assert published[0].thread_assignment is None
     store.close()
 
 

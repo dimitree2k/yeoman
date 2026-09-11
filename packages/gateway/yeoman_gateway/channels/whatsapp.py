@@ -171,6 +171,14 @@ class InboundEvent:
 _PROCESSING_SIGNAL_TYPES = frozenset({"edit", "delete", "reaction", "receipt"})
 
 
+@dataclass(frozen=True, slots=True)
+class _AmbientOutcome:
+    """What the judge's verdict turned into: an answer turn, one reaction, or nothing."""
+
+    assignment: Any | None = None
+    reacted: bool = False
+
+
 class WhatsAppChannel(BaseChannel):
     """WhatsApp channel backed by the Node.js bridge protocol v3."""
 
@@ -824,14 +832,17 @@ class WhatsAppChannel(BaseChannel):
                 parts.append(text)
         return "\n".join(part for part in parts if part)
 
-    async def _maybe_answer_ambient(self, event: InboundEvent) -> Any | None:
-        """Ask the judge about an unaddressed message. Returns the assignment if it answers.
+    async def _maybe_answer_ambient(self, event: InboundEvent) -> _AmbientOutcome:
+        """Ask the judge about an unaddressed message.
 
         The brake already ran in the gate, so this is the second half of the decision. The
         judge has three outcomes: a real answer (turn opened here, after the verdict, so no
         generation or typing happens before it), a single reaction from the owner's
         vocabulary (no turn at all), or silence. A decline restarts the brake window, so the
         judge is asked at most once per window instead of once per message.
+
+        The configured reply action caps what a verdict may become: a chat on ``react`` never
+        gets text, so an ``answer`` verdict is delivered as the reaction that action allows.
         """
         if self._ambient_judge is None:
             logger.warning(
@@ -839,7 +850,7 @@ class WhatsAppChannel(BaseChannel):
                 event.chat_jid,
                 event.message_id,
             )
-            return None
+            return _AmbientOutcome()
         try:
             verdict = await self._ambient_judge.decide(self._judge_input(event))
         except Exception as exc:
@@ -849,13 +860,17 @@ class WhatsAppChannel(BaseChannel):
                 event.message_id,
                 type(exc).__name__,
             )
-            return None
+            return _AmbientOutcome()
         if not verdict.speaks:
             self._processing_gate.note_ambient_declined(event.message_id)
-            return None
+            return _AmbientOutcome()
         if not verdict.needs_turn:
             # A reaction is the whole reply: no turn, no typing, no text, own lineage.
-            return await self._send_ambient_reaction(event, verdict)
+            return _AmbientOutcome(reacted=await self._send_ambient_reaction(event, verdict))
+        if not self._ambient_text_allowed(event):
+            # The judge said "answer", but this chat does not want text: deliver the verdict
+            # as a reaction instead of withdrawing it silently (owner decision, option E).
+            return _AmbientOutcome(reacted=await self._reaction_from_verdict(event, verdict))
         try:
             core_event = self._to_core_event(event, event.message_id)
             assignment = self._processing_gate.reconcile_reply(core_event)
@@ -866,9 +881,9 @@ class WhatsAppChannel(BaseChannel):
                 event.message_id,
                 type(exc).__name__,
             )
-            return None
+            return _AmbientOutcome()
         if assignment is None:
-            return None
+            return _AmbientOutcome()
         self._processing_gate.note_ambient_answer(event.message_id)
         logger.info(
             "ambient_answer_granted chat={} message_id={} thread_id={} turn_id={}",
@@ -877,7 +892,42 @@ class WhatsAppChannel(BaseChannel):
             getattr(assignment, "thread_id", "-"),
             getattr(assignment, "turn_id", "-"),
         )
-        return assignment
+        return _AmbientOutcome(assignment=assignment)
+
+    def _ambient_text_allowed(self, event: InboundEvent) -> bool:
+        """Whether an ``answer`` verdict may open a text turn in this chat."""
+        action_for = getattr(self._processing_gate, "answer_kind_for", None)
+        if action_for is None:  # a gate without the accessor keeps the old behaviour
+            return True
+        return str(action_for(self.name, event.chat_jid)) == "answer"
+
+    async def _reaction_from_verdict(self, event: InboundEvent, verdict: Any) -> bool:
+        """Deliver a capped ``answer`` verdict as one reaction, choosing an emoji if needed."""
+        if getattr(verdict, "emoji", None):
+            return await self._send_ambient_reaction(event, verdict)
+        if self._reaction_action is None:
+            self._processing_gate.note_ambient_declined(event.message_id)
+            return False
+        # An `answer` verdict carries no emoji, so the chooser picks one - one small call,
+        # and only in a chat that does not want text.
+        sent = await self._reaction_action(
+            channel=self.name,
+            chat_id=event.chat_jid,
+            message_id=event.message_id,
+            text=self._judge_input(event),
+            principal=event.sender_id,
+        )
+        if not sent:
+            self._processing_gate.note_ambient_declined(event.message_id)
+            return False
+        self._processing_gate.note_ambient_reacted(event.message_id)
+        logger.info(
+            "ambient_answer_capped_to_reaction chat={} message_id={} emoji={}",
+            event.chat_jid,
+            event.message_id,
+            sent,
+        )
+        return True
 
     async def _send_ambient_reaction(self, event: InboundEvent, verdict: Any) -> bool:
         """Send the judge's chosen emoji; a missing reaction path means silence."""
@@ -894,7 +944,8 @@ class WhatsAppChannel(BaseChannel):
         if not sent:
             self._processing_gate.note_ambient_declined(event.message_id)
             return False
-        self._processing_gate.note_ambient_answer(event.message_id)
+        # The reaction is the reply, so the message stays withdrawn from the answer path.
+        self._processing_gate.note_ambient_reacted(event.message_id)
         logger.info(
             "ambient_reaction_sent chat={} message_id={} emoji={}",
             event.chat_jid,
@@ -1056,19 +1107,23 @@ class WhatsAppChannel(BaseChannel):
         if ambient_candidate:
             # Only the judge decides whether this becomes an answer. Either way the message
             # is archived and stays context for the chat.
-            granted = await self._maybe_answer_ambient(event)
-            if granted is not None:
+            outcome = await self._maybe_answer_ambient(event)
+            if outcome.assignment is not None:
                 event = replace(
                     event,
                     thread_assignment={
-                        "thread_id": granted.thread_id,
-                        "turn_id": granted.turn_id,
-                        "source_message_ids": list(granted.source_message_ids),
+                        "thread_id": outcome.assignment.thread_id,
+                        "turn_id": outcome.assignment.turn_id,
+                        "source_message_ids": list(outcome.assignment.source_message_ids),
                     },
                     # The core granted this answer; the classic pipeline must not stop it
                     # with an acknowledgement reaction.
                     processing_answer_granted=True,
                 )
+            elif outcome.reacted:
+                # The judge's reply was a reaction, so no turn opens - but the classic
+                # acknowledgement branches must stand down all the same.
+                event = replace(event, processing_reacted=True)
         self._record_document_cache_item(event)
         self._archive_inbound_event(event)
         self._sync_chat_registry(event)

@@ -258,6 +258,49 @@ class IngestGate:
             FastGateOutcome.REACT if decision.should_respond else FastGateOutcome.OBSERVE
         )
         reply_action = self._reply_action(request)
+        ambient_candidate = False
+        if outcome is FastGateOutcome.REACT and self._is_ambient_chat(event.channel, event.chat_id):
+            # An unaddressed message in a chat the owner released for ambient answers. Ask
+            # the thread engine what it *would* decide, without persisting anything: only
+            # the ambient fallback is subject to the brake, a real continuation is not.
+            if self._ambient_rule_without_turn(request, now=now):
+                # The judge decides *whether* this is worth a reply; the configured action
+                # only caps what may come out of its verdict. This branch therefore runs
+                # before the action withdraws the answer - otherwise `react` would
+                # short-circuit both the brake and the judge.
+                if reply_action == "silence":
+                    # No verdict could ever be delivered here, so do not spend a judge call.
+                    outcome = FastGateOutcome.OBSERVE
+                else:
+                    self._note_ambient_message(event.channel, event.chat_id)
+                    named = self._mentions_bot_by_name(request)
+                    if named:
+                        # Naming him is a soft address even when the sentence is no request:
+                        # the brake is skipped and the judge decides right away (owner
+                        # decision, 11.09.). Still one small call per name-drop - never an
+                        # answer without a yes, and never a mechanical acknowledgement.
+                        allowed, reason = True, "name"
+                    else:
+                        allowed, reason = self._ambient_brake_allows(
+                            event.channel, event.chat_id, now=now
+                        )
+                    ambient_candidate = allowed
+                    # Observed either way; the judge may upgrade it after a yes.
+                    outcome = FastGateOutcome.OBSERVE
+                    self._mark_ambient_pending(request.event_id, now=now)
+                    if named:
+                        logger.debug(
+                            "ambient_name_bypass chat={} event_id={}",
+                            event.chat_id,
+                            request.event_id,
+                        )
+                    elif not allowed:
+                        logger.debug(
+                            "ambient_brake chat={} event_id={} reason={}",
+                            event.chat_id,
+                            request.event_id,
+                            reason,
+                        )
         react = outcome is FastGateOutcome.REACT and reply_action == "react"
         if outcome is FastGateOutcome.REACT and reply_action != "answer":
             # `silence` and `react` both withdraw the answer turn: no turn, no effect from
@@ -271,41 +314,6 @@ class IngestGate:
                 reply_action,
             )
             outcome = FastGateOutcome.OBSERVE
-        ambient_candidate = False
-        if outcome is FastGateOutcome.REACT and self._is_ambient_chat(event.channel, event.chat_id):
-            # An unaddressed message in a chat the owner released for ambient answers. Ask
-            # the thread engine what it *would* decide, without persisting anything: only
-            # the ambient fallback is subject to the brake, a real continuation is not.
-            if self._ambient_rule_without_turn(request, now=now):
-                self._note_ambient_message(event.channel, event.chat_id)
-                named = self._mentions_bot_by_name(request)
-                if named:
-                    # Naming him is a soft address even when the sentence is no request: the
-                    # brake is skipped and the judge decides right away (owner decision,
-                    # 11.09.). Still one small call per name-drop - never an answer without
-                    # a yes, and never a mechanical acknowledgement.
-                    allowed, reason = True, "name"
-                else:
-                    allowed, reason = self._ambient_brake_allows(
-                        event.channel, event.chat_id, now=now
-                    )
-                ambient_candidate = allowed
-                # Observed either way; the judge may upgrade it after a yes.
-                outcome = FastGateOutcome.OBSERVE
-                self._mark_ambient_pending(request.event_id, now=now)
-                if named:
-                    logger.debug(
-                        "ambient_name_bypass chat={} event_id={}",
-                        event.chat_id,
-                        request.event_id,
-                    )
-                elif not allowed:
-                    logger.debug(
-                        "ambient_brake chat={} event_id={} reason={}",
-                        event.chat_id,
-                        request.event_id,
-                        reason,
-                    )
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
         if assignment is not None:
             # One observation line per message (routing spec, criterion 12): what the
@@ -364,6 +372,15 @@ class IngestGate:
             return value
         logger.warning("reply_action_unknown chat={} value={}", chat_id, value[:24])
         return "answer"
+
+    def answer_kind_for(self, channel: str, chat_id: str) -> str:
+        """How an ``answer`` verdict may be delivered here: ``answer``, ``react`` or ``silence``.
+
+        The judge decides *whether* to speak; the configured action decides *what* may come
+        out. A verdict never overrides the action - the action can withdraw an answer, never
+        grant one (routing spec, use cases 2 and 3).
+        """
+        return self._reply_action_for(channel, chat_id)
 
     # -- ambient brake ---------------------------------------------------------------
 
@@ -455,6 +472,14 @@ class IngestGate:
         message of a busy chat would be judged again, because the thresholds stay met. The
         message itself stays pending - a declined message must never be answered later by
         the classic pipeline.
+        """
+        self._reset_ambient_window(now)
+
+    def note_ambient_reacted(self, event_id: str, *, now: int | None = None) -> None:
+        """The judge answered with a reaction: that reaction *is* the reply.
+
+        The message therefore stays pending, so the classic pipeline cannot answer it as
+        well, and the brake window starts over like after any other ambient answer.
         """
         self._reset_ambient_window(now)
 

@@ -706,6 +706,32 @@ async def test_reply_action_react_never_acknowledges_an_observed_message(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "candidate", "react"),
+    [("answer", True, False), ("react", True, False), ("silence", False, False)],
+)
+async def test_ambient_never_answers_mechanically_whatever_the_action(
+    tmp_path: Path, action: str, candidate: bool, react: bool
+) -> None:
+    """Option E: the judge decides whether, the configured action only caps what comes out.
+
+    An unaddressed message in an ambient chat must reach the judge for every action except
+    `silence`: a `react` chat that short-circuits here would send a mechanical emoji per
+    message and bypass both the brake and the judge.
+    """
+    runtime = _make_runtime(tmp_path / f"ambient-{action}", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": action}
+
+        result = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+
+        assert result.ambient_candidate is candidate
+        assert result.react is react, "ambient is the judge's business, never a reflex"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
 async def test_reply_action_react_sends_nothing_when_no_emoji_fits(tmp_path: Path) -> None:
     from yeoman_gateway.processing.reaction_action import ReactionAction
 
