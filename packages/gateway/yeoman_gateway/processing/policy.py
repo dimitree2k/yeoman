@@ -289,6 +289,44 @@ class IngestGate:
             )
             return None
 
+    def reconcile_reply(self, event: InboundEvent) -> Any:
+        """Upgrade a permitted reply event to a durable thread and turn."""
+        if self._store is None or self._threads is None:
+            return None
+        message_id = str(event.message_id or "").strip()
+        if not message_id:
+            return None
+        request = IngestRequest(
+            event_key=f"{event.channel}:{event.chat_id}:{message_id}",
+            event_id=message_id,
+            trace_id=f"{event.channel}:{event.chat_id}:{message_id}",
+            event=event,
+        )
+        assignment = self._assign(request, now=self._clock(), allow_turn=True)
+        if assignment is not None and assignment.thread_id and assignment.turn_id:
+            logger.info(
+                "reply_assignment_reconciled chat={} event_id={} thread_id={} turn_id={}",
+                event.chat_id,
+                message_id,
+                assignment.thread_id,
+                assignment.turn_id,
+            )
+            return assignment
+        logger.warning(
+            "reply_assignment_failed chat={} event_id={} reason=no_turn",
+            event.chat_id,
+            message_id,
+        )
+        return None
+
+    def admit_reply(self, event: InboundEvent) -> bool:
+        """Ensure managed replies have a turn before generation or typing."""
+        if not self.enabled_for(event.channel, event.chat_id) or self.shadowed(
+            event.channel, event.chat_id
+        ):
+            return True
+        return self.reconcile_reply(event) is not None
+
     def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
         event = request.event
         payload: dict[str, Any] = {

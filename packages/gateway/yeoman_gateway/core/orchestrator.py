@@ -69,6 +69,7 @@ class Orchestrator:
         ambient_window_limit: int = 8,
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: "Callable[[str, str, bool], Awaitable[None]] | None" = None,
+        reply_admission: "Callable[[InboundEvent], bool] | None" = None,
         security: SecurityPort | None = None,
         security_classifier: "InputClassifier | None" = None,
         security_block_message: str = "😂",
@@ -140,7 +141,11 @@ class Orchestrator:
             NewChatNotifyMiddleware(owner_alert_resolver=owner_alert_resolver),
             NoReplyFilterMiddleware(security=security),
             InputSecurityMiddleware(security=security, classifier=security_classifier, block_message=security_block_message),
-            ResponderMiddleware(responder=responder, typing_notifier=typing_notifier),
+            ResponderMiddleware(
+                responder=responder,
+                typing_notifier=typing_notifier,
+                reply_admission=reply_admission,
+            ),
             OutboundMiddleware(
                 contacts=contacts,
                 security=security,

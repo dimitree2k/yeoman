@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 
+from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import ResponderPort
 
@@ -23,13 +24,24 @@ class ResponderMiddleware:
         *,
         responder: ResponderPort,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
+        reply_admission: Callable[[InboundEvent], bool] | None = None,
     ) -> None:
         self._responder = responder
         self._typing_notifier = typing_notifier
+        self._reply_admission = reply_admission
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         if ctx.decision is None:
             await next(ctx)
+            return
+
+        if (
+            ctx.decision.should_respond
+            and self._reply_admission is not None
+            and not self._reply_admission(ctx.event)
+        ):
+            ctx.metric("reply_admission_failed", labels=(("channel", ctx.event.channel),))
+            ctx.halt()
             return
 
         typing_started = False

@@ -77,10 +77,13 @@ def _config(
     )
 
 
-def _policy(chats: tuple[str, ...] = (CHAT,), *, mode: str = "everyone") -> PolicyConfig:
-    default = {"whoCanTalk": {"mode": mode}, "whenToReply": {"mode": "all"}}
+def _policy(
+    chats: tuple[str, ...] = (CHAT,), *, mode: str = "everyone", when_to_reply: str = "all"
+) -> PolicyConfig:
+    default = {"whoCanTalk": {"mode": mode}, "whenToReply": {"mode": when_to_reply}}
     return PolicyConfig.model_validate(
         {
+            "defaults": {"allowedTools": {"mode": "allowlist", "tools": ["message"]}},
             "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
             "runtime": {"reloadOnChange": True},
             "channels": {"whatsapp": {"default": default}},
@@ -158,7 +161,9 @@ def _make_runtime(
     )
 
 
-def _event(*, message_id: str, content: str = "hi", chat: str = CHAT) -> InboundEvent:
+def _event(
+    *, message_id: str, content: str = "hi", chat: str = CHAT, mentioned_bot: bool = True
+) -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
         chat_id=chat,
@@ -166,7 +171,7 @@ def _event(*, message_id: str, content: str = "hi", chat: str = CHAT) -> Inbound
         content=content,
         message_id=message_id,
         is_group=True,
-        mentioned_bot=True,
+        mentioned_bot=mentioned_bot,
         timestamp=datetime(2023, 11, 14, tzinfo=UTC),
     )
 
@@ -180,6 +185,42 @@ def _admit(runtime: _Runtime, *, message_id: str, chat: str = CHAT, content: str
             event=_event(message_id=message_id, chat=chat, content=content),
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_implicit_reply_reconciles_an_ambient_event_into_a_turn(runtime) -> None:
+    runtime.reload_policy(_policy(when_to_reply="mention_only"))
+    event = _event(message_id="ambient-1", content="Arvid, das ist wichtig", mentioned_bot=False)
+    verdict = runtime.gate.admit(
+        IngestRequest(
+            event_key=f"whatsapp:{CHAT}:ambient-1",
+            event_id="ambient-1",
+            trace_id="tr-ambient-1",
+            event=event,
+        )
+    )
+
+    assert verdict is not None
+    assert verdict.outcome.value == "observe"
+    assert verdict.assignment is not None
+    assert verdict.assignment.turn_id is None
+
+    promoted = _event(
+        message_id="ambient-1",
+        content=event.content,
+        mentioned_bot=True,
+    )
+    assignment = runtime.gate.reconcile_reply(promoted)
+
+    assert assignment is not None
+    assert assignment.thread_id is not None
+    assert assignment.turn_id is not None
+    assert runtime.store.event_assignment("ambient-1") == (
+        assignment.thread_id,
+        assignment.turn_id,
+    )
+    await _dispatch(runtime, message_id="ambient-1")
+    assert runtime.transport.sent == ["answer"]
 
 
 async def _dispatch(

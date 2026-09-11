@@ -766,6 +766,9 @@ def build_gateway_runtime(
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
     thread_registry = build_thread_registry(config, processing_store)
+    processing_gate = build_processing_gate(
+        config, policy_adapter, processing_store, thread_registry
+    )
     effect_router = build_effect_router(
         config,
         policy_adapter,
@@ -871,7 +874,7 @@ def build_gateway_runtime(
         media_storage=media_storage,
         provider_factory=provider_factory,
         document_cache=document_cache,
-        processing_gate=build_processing_gate(config, policy_adapter, processing_store),
+        processing_gate=processing_gate,
         processing_signals=(
             SignalJournalSink(processing_store) if processing_store is not None else None
         ),
@@ -983,6 +986,11 @@ def build_gateway_runtime(
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,
         typing_notifier=typing_adapter,
+        reply_admission=(
+            getattr(processing_gate, "admit_reply", None)
+            if processing_gate is not None
+            else None
+        ),
         security=security,
         security_classifier=security_classifier,
         security_block_message=config.security.block_user_message,

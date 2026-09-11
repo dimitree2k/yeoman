@@ -344,7 +344,7 @@ class ThreadRegistry:
         )
 
         stored = self._store.event_assignment(event.event_id)
-        if stored is not None and stored[0] is not None:
+        if stored is not None and stored[0] is not None and (stored[1] is not None or not allow_turn):
             return replace(
                 self.decide(data, self.view_for(data, now_ms=moment)),
                 thread_id=stored[0],
