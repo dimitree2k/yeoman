@@ -301,6 +301,24 @@ class GatewayRuntime:
     shared_facts: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
+    async def _start_processing_services(self) -> None:
+        """Plan 04 start order: recover and reconcile before any channel consumes input.
+
+        The reconciler's first tick runs synchronously, so a claim left ``executing`` by
+        a previous process is turned into ``unknown`` and probed before
+        ``channels.start_all()``. Disabled mode has neither service and stays inert.
+        """
+        if self.reconciliation is not None:
+            try:
+                await self.reconciliation.tick_once()
+            except Exception:
+                # A failed recovery must not stop the gateway from starting; the loop
+                # retries on its next tick.
+                logger.exception("First reconciliation tick failed")
+            await self.reconciliation.start()
+        if self.retention is not None:
+            await self.retention.start()
+
     async def run(self) -> None:
         tracing.init()
         try:
@@ -314,8 +332,7 @@ class GatewayRuntime:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
                 self.shared_facts.start()
-            if self.retention is not None:
-                await self.retention.start()
+            await self._start_processing_services()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),

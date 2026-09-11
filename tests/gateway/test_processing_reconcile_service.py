@@ -285,3 +285,71 @@ async def test_reconciler_starts_before_channels_and_stops_before_the_store(tmp_
     assert probe.calls == 1
     assert service.running is False
     store.close()
+
+
+class _ChannelSpy:
+    def __init__(self) -> None:
+        self.started = False
+
+    async def start_all(self) -> None:
+        self.started = True
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_recovers_before_channels_start(tmp_path: Path) -> None:
+    """The wiring, not just the service: the runtime itself must run the first tick.
+
+    `ReconciliationService.start()` was never called from `GatewayRuntime.run()`, so
+    nothing ever recovered an expired claim or probed an `unknown` effect.
+    """
+    from yeoman_gateway.app.bootstrap import GatewayRuntime
+
+    store = ProcessingStore(tmp_path / "p.db")
+    effect_id = _unknown_effect(store)
+    store.claim_effect(effect_id, "dead-worker", T0, 30_000)
+    probe = _CountingProbe(ProbeOutcome.CONFIRMED)
+    service = ReconciliationService(
+        store, probe=probe, config=_Config(), clock=_Clock(T0 + 30_001), tick_seconds=0.05
+    )
+    channels = _ChannelSpy()
+    runtime = GatewayRuntime(
+        orchestrator=object(),
+        channels=channels,
+        cron=object(),
+        heartbeat=object(),
+        consciousness=None,
+        inbound_archive=object(),
+        responder=object(),
+        memory=object(),
+        contacts=object(),
+        chat_registry=object(),
+        reconciliation=service,
+    )
+
+    await runtime._start_processing_services()
+
+    assert store.effect_state(effect_id) == "sent", "recovery runs in the first tick"
+    assert channels.started is False, "channels start after that tick"
+    assert service.running is True, "the loop keeps running"
+    await service.stop()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_processing_services_are_optional() -> None:
+    from yeoman_gateway.app.bootstrap import GatewayRuntime
+
+    runtime = GatewayRuntime(
+        orchestrator=object(),
+        channels=object(),
+        cron=object(),
+        heartbeat=object(),
+        consciousness=None,
+        inbound_archive=object(),
+        responder=object(),
+        memory=object(),
+        contacts=object(),
+        chat_registry=object(),
+    )
+
+    await runtime._start_processing_services()  # disabled mode: nothing to start
