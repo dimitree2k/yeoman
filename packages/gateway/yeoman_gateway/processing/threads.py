@@ -79,13 +79,19 @@ class JoinInput:
     channel: str
     chat_id: str
     principal: str
+    #: The message text. The continuity signals need the current message, and it is
+    #: canonical base data of the event - never model output.
+    text: str = ""
     kind: str = "message"
     is_group: bool = False
     mentioned_bot: bool = False
     reply_to_message_id: str | None = None
     target_message_id: str | None = None
     explicit_correction: bool = False
-    topic_break: bool = False
+    #: Tri-state per the routing spec: "true" is a certain break, "false" means no break
+    #: was detected (which is *not* proof of continuity), "unknown" means no reliable
+    #: statement at all. Only "true" blocks automatic attachment.
+    topic_break: str = "unknown"
     occurred_ms: int | None = None
 
 
@@ -101,6 +107,22 @@ class JoinView:
     active_threads_for_principal: tuple[tuple[str, str], ...] = ()
     last_active_dm_thread: str | None = None
     last_active_dm_turn: str | None = None
+    continuum: Any = None
+
+    @property
+    def continuity_positive(self) -> bool:
+        return bool(getattr(self.continuum, "positive", False))
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceRow:
+    """One readable thread source handed to the continuity signals."""
+
+    event_id: str
+    text: str
+    role: str = "context"
+    principal: str = ""
+    occurred_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,12 +212,25 @@ def _rule_explicit_correction(
     return None
 
 
+def topic_break_is_certain(data: JoinInput) -> bool:
+    """True only for an explicit break; false/unknown prove nothing."""
+    value = getattr(data, "topic_break", "unknown")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
 def _rule_followup_single_active(
     data: JoinInput, view: JoinView, policy: ThreadPolicy
 ) -> JoinDecision | None:
-    if data.topic_break:
+    if topic_break_is_certain(data):
         return None
     if len(view.active_threads_for_principal) != 1:
+        return None
+    # Spec (routing): a missing topic break is no proof of continuity. Automatic
+    # attachment needs a positive signal from proven sources; otherwise the message is a
+    # new order or ambient instead of being hung on an old thread.
+    if not getattr(view, "continuity_positive", False):
         return None
     thread_id, turn_id = view.active_threads_for_principal[0]
     return JoinDecision(
@@ -322,6 +357,7 @@ class ThreadRegistry:
             active_threads_for_principal=self._active_threads(data, now_ms=now_ms),
             last_active_dm_thread=self._last_dm_thread(data),
             last_active_dm_turn=None,
+            continuum=self._continuum(data, now_ms=now_ms),
         )
 
     def assign(
@@ -454,6 +490,7 @@ class ThreadRegistry:
             else explicit_correction
         )
         return JoinInput(
+            text=str(payload.get("text") or ""),
             event_id=event.event_id,
             channel=event.channel,
             chat_id=event.chat_id,
@@ -521,6 +558,86 @@ class ThreadRegistry:
             if now_ms - thread.last_activity_ms <= self._policy.followup_window_ms
         ]
         return tuple(active)
+
+    def _continuum(self, data: JoinInput, *, now_ms: int) -> Any:
+        """The continuity verdict for the single candidate, from proven sources.
+
+        Only one candidate can be attached, so only that one is evaluated. A message with
+        no text, or a candidate without readable sources, yields no positive signal and is
+        therefore never attached automatically.
+        """
+        from yeoman_gateway.processing.routing import (
+            BotMessageView,
+            SourceView,
+            continuity_signal,
+        )
+
+        text = str(getattr(data, "text", "") or "").strip()
+        candidates = self._active_threads(data, now_ms=now_ms)
+        if not text or len(candidates) != 1:
+            return None
+        thread_id, _turn_id = candidates[0]
+        sources = [
+            SourceView(
+                event_id=source.event_id,
+                text=source.text,
+                role=source.role,
+                principal=source.principal,
+                occurred_ms=source.occurred_ms,
+            )
+            for source in self._thread_sources(thread_id)
+        ]
+        if not sources:
+            return None
+        bot_messages = [
+            BotMessageView(message_id=item[0], text=item[1], occurred_ms=item[2])
+            for item in self._sent_bot_messages(thread_id)
+        ]
+        return continuity_signal(
+            current_text=text, thread_sources=sources, bot_messages=bot_messages
+        )
+
+    def _thread_sources(self, thread_id: str) -> tuple[Any, ...]:
+        """Readable user sources of a thread's active turn, with their journal text."""
+        turn = self._store.active_turn(thread_id)
+        if turn is None:
+            return ()
+        views: list[Any] = []
+        for source in self._store.turn_sources(turn.turn_id):
+            if getattr(source, "removed_ms", None) is not None:
+                continue
+            event = self._store.get_event(source.event_id)
+            payload = getattr(event, "payload", None)
+            text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
+            if not text:
+                continue
+            views.append(
+                _SourceRow(
+                    event_id=source.event_id,
+                    text=text,
+                    role=source.role,
+                    principal=str(getattr(event, "principal", "") or ""),
+                    occurred_ms=getattr(event, "occurred_ms", None),
+                )
+            )
+        return tuple(views)
+
+    def _sent_bot_messages(self, thread_id: str) -> tuple[tuple[str, str, int | None], ...]:
+        """Provably sent bot texts of the thread: transport-confirmed effects only."""
+        turn = self._store.active_turn(thread_id)
+        if turn is None:
+            return ()
+        out: list[tuple[str, str, int | None]] = []
+        for effect_id in self._store.effect_ids_for_turn(turn.turn_id, states=("sent",)):
+            effect = self._store.get_effect(effect_id)
+            if effect is None or str(getattr(effect, "state", "")) != "sent":
+                continue
+            payload = getattr(effect, "payload", None)
+            text = str(getattr(payload, "text", "") or "") if payload is not None else ""
+            if not text:
+                continue
+            out.append((str(effect.effect_id), text, getattr(effect, "updated_ms", None)))
+        return tuple(out)
 
     def _active_turn_id(self, thread_id: str) -> str | None:
         turn = self._store.active_turn(thread_id)

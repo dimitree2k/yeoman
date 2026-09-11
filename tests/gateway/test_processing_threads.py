@@ -90,6 +90,13 @@ def test_new_thread_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     registry = _registry(store)
     event = _event(event_id="m1", mentioned_bot=True)
+    # Journal the event first, exactly as the gate does: idempotency is stored on the
+    # event row, so an unjournaled event cannot prove it.
+    store.append_event(
+        event_key="k-m1", event_id="m1", trace_id="tr-m1",
+        payload={"text": "hello", "is_group": True, "mentioned_bot": True},
+        now_ms=T0,
+    )
 
     first = registry.assign(event, now_ms=T0)
     second = registry.assign(event, now_ms=T0 + 5)
@@ -172,17 +179,47 @@ def test_rule_2_explicit_correction_of_the_orderer_selects_that_turn(tmp_path: P
     store.close()
 
 
-def test_rule_3_followup_within_window_extends_the_single_active_thread(tmp_path: Path) -> None:
+def test_rule_3_followup_needs_a_positive_signal(tmp_path: Path) -> None:
+    """Plan 07 / routing spec: no proven continuity, no automatic attachment.
+
+    A missing topic break is not proof of continuity, so an unmarked message with no
+    signal is a new order rather than an addition to the old thread.
+    """
     store = ProcessingStore(tmp_path / "p.db")
     registry = _registry(store)
     first = registry.assign(_event(event_id="m1", mentioned_bot=True), now_ms=T0)
 
-    followup = registry.assign(_event(event_id="m2", mentioned_bot=False), now_ms=T0 + 5_000)
+    unmarked = registry.assign(_event(event_id="m2", mentioned_bot=False), now_ms=T0 + 5_000)
 
-    assert followup.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
-    assert followup.thread_id == first.thread_id
-    assert followup.turn_id == first.turn_id  # same turn, additional context
+    assert unmarked.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert unmarked.thread_id != first.thread_id or unmarked.new_thread
     store.close()
+
+    # With an explicit call-back to the subject, the single active thread is continued.
+    store2 = ProcessingStore(tmp_path / "p2.db")
+    registry2 = _registry(store2)
+    store2.append_event(
+        event_key="k-m1b", event_id="m1b", trace_id="tr-m1b",
+        payload={"text": "Fasse den Mietvertrag zusammen.", "is_group": True},
+        now_ms=T0,
+    )
+    started = registry2.assign(
+        _event(event_id="m1b", mentioned_bot=True, text="Fasse den Mietvertrag zusammen."),
+        now_ms=T0 + 1_000,
+    )
+    continued = registry2.assign(
+        _event(
+            event_id="m2b",
+            mentioned_bot=False,
+            text="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
+        ),
+        now_ms=T0 + 2_000,
+    )
+
+    assert continued.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
+    assert continued.thread_id == started.thread_id
+    assert continued.turn_id == started.turn_id  # same turn, additional context
+    store2.close()
 
 
 def test_rule_3_does_not_apply_outside_the_window_or_with_a_topic_break(tmp_path: Path) -> None:
@@ -418,6 +455,16 @@ def test_assignment_exposes_the_thread_sources(tmp_path: Path) -> None:
     """The decision carries the thread's source message ids for ambient dedup."""
     store = ProcessingStore(tmp_path / "p.db")
     registry = _registry(store)
+    # Journal the referenced message *with its provider id*: a reply can only resolve
+    # against a journaled source, and before the routing change this test passed through
+    # the unmarked-attachment fallback instead of through the reply reference.
+    store.append_event(
+        event_key="k-m1",
+        event_id="m1",
+        trace_id="tr-m1",
+        payload=_event(event_id="m1", source_message_id="m1", mentioned_bot=True),
+        now_ms=T0,
+    )
     first = registry.assign(
         _event(event_id="m1", source_message_id="m1", mentioned_bot=True), now_ms=T0
     )
@@ -426,7 +473,12 @@ def test_assignment_exposes_the_thread_sources(tmp_path: Path) -> None:
     followup = registry.assign(
         _event(event_id="m2", source_message_id="m2", reply_to_message_id="m1"), now_ms=T0 + 1
     )
-    assert set(followup.source_message_ids) >= {"m1", "m2"}
+    # A resolved reply wins over every heuristic and stays in the referenced thread. It
+    # opens a new turn there (spec: a reply in an open thread may start the next turn), so
+    # the decision exposes that turn's own sources - not the closed turn's.
+    assert followup.rule is JoinRule.REPLY_KNOWN
+    assert followup.thread_id == first.thread_id
+    assert followup.source_message_ids == ("m2",)
     store.close()
 
 

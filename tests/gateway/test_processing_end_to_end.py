@@ -245,26 +245,42 @@ async def _dispatch(
 
 
 @pytest.mark.asyncio
-async def test_a_follow_up_joins_the_thread_and_opens_a_second_turn(runtime) -> None:
-    """Two messages in one chat share the thread but never share a turn."""
-    first = _admit(runtime, message_id="m1")
-    second = _admit(runtime, message_id="m2")
+async def test_an_unmarked_follow_up_needs_a_positive_signal(tmp_path: Path) -> None:
+    """Routing spec: no proven continuity, no automatic attachment - both halves.
 
-    assert first.assignment is not None and second.assignment is not None
-    assert first.assignment.thread_id == second.assignment.thread_id
-    # The follow-up joins the open turn as a second source (bundling, not a new turn).
-    turn_id = str(first.assignment.turn_id)
-    sources = [ref.event_id for ref in runtime.store.turn_sources(turn_id)]
-    assert sources == ["m1", "m2"]
-    await _dispatch(runtime, message_id="m1")
-    await _dispatch(runtime, message_id="m2")
+    A missing topic break is not proof of continuity, so a new subject opens its own
+    thread; an explicit call-back to the subject continues the existing one.
+    """
+    # Half 1: a new subject is not attached to the open thread.
+    fresh = _make_runtime(tmp_path / "new-subject")
+    try:
+        first = _admit(fresh, message_id="m1", content="Fasse den Mietvertrag zusammen.")
+        other = _admit(fresh, message_id="m2", content="Wie wird morgen das Wetter?")
+        assert first.assignment is not None and other.assignment is not None
+        assert other.assignment.thread_id != first.assignment.thread_id
+    finally:
+        fresh.store.close()
 
-    effects = runtime.store.list_effects()
-    assert len(effects) == 2
-    assert {effect.state for effect in effects} == {"sent"}
-    effects_by_turn = {effect.turn_id for effect in effects}
-    assert len(effects_by_turn) == 1  # both answers belong to the bundled turn
-    assert runtime.transport.sent == ["answer", "answer"]
+    # Half 2: an explicit call-back to the subject continues the thread.
+    runtime = _make_runtime(tmp_path / "call-back")
+    try:
+        started = _admit(runtime, message_id="m1", content="Fasse den Mietvertrag zusammen.")
+        continued = _admit(
+            runtime,
+            message_id="m2",
+            content="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
+        )
+        assert continued.assignment is not None
+        assert continued.assignment.thread_id == started.assignment.thread_id
+        await _dispatch(runtime, message_id="m1")
+        await _dispatch(runtime, message_id="m2")
+
+        effects = runtime.store.list_effects()
+        assert len(effects) == 2
+        assert {effect.state for effect in effects} == {"sent"}
+        assert len({effect.turn_id for effect in effects}) == 1  # one bundled turn
+    finally:
+        runtime.store.close()
 
 
 @pytest.mark.asyncio

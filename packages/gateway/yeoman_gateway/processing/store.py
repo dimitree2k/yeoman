@@ -2102,6 +2102,20 @@ class ProcessingStore:
             ).fetchone()
         return int(row["c"])
 
+    def effect_ids_for_turn(self, turn_id: str, *, states: tuple[str, ...] | None = None) -> list[str]:
+        """Effect ids of one turn, looked up directly instead of scanning a page."""
+        if not turn_id:
+            return []
+        query = "SELECT effect_id FROM effects WHERE turn_id = ?"
+        params: list[Any] = [str(turn_id)]
+        if states:
+            query += f" AND state IN ({','.join(['?'] * len(states))})"
+            params.extend(str(item) for item in states)
+        query += " ORDER BY created_ms, effect_id"
+        with self._lock:
+            rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [str(row["effect_id"]) for row in rows]
+
     def effect_meta(self, effect_id: str) -> Any:
         """Lineage projection of one effect, looked up directly by id."""
         with self._lock:
