@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -22,7 +23,11 @@ class _Bus:
 
     async def consume_inbound(self) -> InboundMessage:
         if not self._inbound:
-            raise AssertionError("the scripted service should stop before consuming again")
+            # Review F03: ingest no longer waits for a running generation, so the loop may
+            # ask again before the scripted orchestrator has stopped the service. A real
+            # bus simply has nothing to say; the service's own timeout ends the loop.
+            await asyncio.sleep(30)
+            raise AssertionError("unreachable: the service times out first")  # pragma: no cover
         return self._inbound.popleft()
 
     async def publish_outbound(self, message: OutboundMessage) -> None:
@@ -134,3 +139,51 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
 
     assert [message.content for message in bus.outbound] == ["first intent"]
     assert all(not message.content.startswith("Sorry, I encountered an error:") for message in bus.outbound)
+
+
+@pytest.mark.asyncio
+async def test_f03_a_second_message_is_ingested_during_a_running_generation() -> None:
+    """Review F03: the loop used to wait for pipeline *and* dispatch before reading on.
+
+    A follow-up could therefore never reach the running thread's postbox - the branch that
+    handles it was unreachable in the real bus path.
+    """
+    first_running = asyncio.Event()
+    second_ingested = asyncio.Event()
+    release = asyncio.Event()
+    handled: list[str] = []
+
+    class _Orchestrator:
+        service: OrchestratorService | None = None
+
+        async def handle(self, event: Any) -> list[Any]:
+            handled.append(event.content)
+            if event.content == "first":
+                first_running.set()
+                await release.wait()  # a generation that takes its time
+                self.service.stop()  # type: ignore[union-attr]
+            else:
+                second_ingested.set()
+                self.service.stop()  # type: ignore[union-attr]
+            return []
+
+    bus = _Bus([_message("first"), _message("second")])
+    service = OrchestratorService(
+        bus=bus,
+        orchestrator=_Orchestrator(),
+        typing_adapter=lambda channel, chat_id, enabled: None,
+        telemetry=InMemoryTelemetry(),
+        memory=_Memory(),
+    )
+    orchestrator = service._orchestrator
+    orchestrator.service = service  # type: ignore[attr-defined]
+
+    task = asyncio.create_task(service.run())
+    await asyncio.wait_for(first_running.wait(), timeout=2)
+
+    # The proof: the second message is already being handled while the first is blocked.
+    await asyncio.wait_for(second_ingested.wait(), timeout=2)
+    assert handled == ["first", "second"]
+
+    release.set()
+    await asyncio.wait_for(task, timeout=10)

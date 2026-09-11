@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Any, assert_never
 from uuid import uuid4 as _uuid4
 
 from loguru import logger
@@ -136,6 +136,7 @@ class OrchestratorService:
         telemetry: InMemoryTelemetry,
         memory: MemoryService,
         effect_router: "IntentEffectRouter | None" = None,
+        max_concurrent_messages: int = 4,
     ) -> None:
         self._bus = bus
         self._orchestrator = orchestrator
@@ -144,6 +145,11 @@ class OrchestratorService:
         self._memory = memory
         self._effect_router = effect_router
         self._running = False
+        # Review F03: ingest must not wait for a running generation. Generations stay
+        # bounded by the actor registry (one by default), so a second message can be
+        # admitted and parked in the postbox while the first answer is still in flight.
+        self._ingest_slots = asyncio.Semaphore(max(1, int(max_concurrent_messages)))
+        self._tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         self._running = True
@@ -154,17 +160,43 @@ class OrchestratorService:
                 continue
 
             event = _inbound_message_to_event(msg)
+            task = asyncio.create_task(self._process_message(event))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+        # A stop is graceful: in-flight messages finish (bounded) instead of being cut in
+        # half, so run() returning means the work it accepted is done.
+        await self._drain()
+
+    async def _drain(self, *, timeout: float = 20.0) -> None:
+        while self._tasks:
+            pending = set(self._tasks)
+            _done, still_running = await asyncio.wait(pending, timeout=timeout)
+            if not still_running:
+                return
+            for task in still_running:
+                task.cancel()
+            await asyncio.gather(*still_running, return_exceptions=True)
+            return
+
+    async def _process_message(self, event: Any) -> None:
+        """Run one message through pipeline and dispatch without blocking the loop."""
+        async with self._ingest_slots:
             try:
                 intents = await self._orchestrator.handle(event)
                 await self._dispatch_intents(intents, principal=event.sender_id)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(
                     "vnext orchestrator failure stage=handle_dispatch channel={} chat={} "
-                    "message_id={} error_type={}",
+                    "message_id={} error_type={} state={} detail={}",
                     event.channel,
                     event.chat_id,
                     event.message_id,
                     type(e).__name__,
+                    getattr(e, "state", "-"),
+                    getattr(e, "detail", None) or str(e)[:200],
                 )
 
     def stop(self) -> None:
