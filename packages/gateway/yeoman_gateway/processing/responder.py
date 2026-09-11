@@ -121,10 +121,14 @@ class ThreadActorResponder:
             )
 
             async def _call(_snapshot: Any) -> str | None:
+                # Review F04: a restart must actually put the follow-up into the request.
+                # Re-sending the original event made the actor consume the pending input
+                # without the provider ever seeing it.
+                request_event = self._request_event(event, _snapshot)
                 token = CURRENT_TURN.set(binding)
                 try:
                     return await self._inner.generate_reply(
-                        event, decision, session_key=session_key
+                        request_event, decision, session_key=session_key
                     )
                 finally:
                     CURRENT_TURN.reset(token)
@@ -145,6 +149,41 @@ class ThreadActorResponder:
                 return None
             return outcome.text
         return None
+
+    def _request_event(self, event: Any, snapshot: Any) -> Any:
+        """The event a generation should see: the turn's sources, in order.
+
+        On a restart the snapshot carries the follow-up sources as well, so the request is
+        rebuilt from them. Without journal text for any source the original event is kept -
+        an unreadable source must not silently empty the request.
+        """
+        refs = tuple(getattr(snapshot, "source_refs", ()) or ())
+        if not refs:
+            return event
+        texts: list[str] = []
+        for ref in refs:
+            event_id = str(getattr(ref, "event_id", "") or "")
+            if not event_id:
+                continue
+            source = self._store.get_event(event_id)
+            payload = getattr(source, "payload", None)
+            text = ""
+            if isinstance(payload, dict):
+                text = str(payload.get("text") or "").strip()
+            if text:
+                texts.append(text)
+        if not texts:
+            return event
+        content = "\n".join(texts)
+        if content == str(getattr(event, "content", "") or ""):
+            return event
+        try:
+            from dataclasses import replace as dataclass_replace
+
+            return dataclass_replace(event, content=content)
+        except Exception:  # pragma: no cover - event shapes without dataclass semantics
+            logger.debug("request event could not be rebuilt; keeping the original")
+            return event
 
     # -- helpers -----------------------------------------------------------------------
 

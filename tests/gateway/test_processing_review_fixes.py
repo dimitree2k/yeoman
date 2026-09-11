@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from yeoman_gateway.memory.read_gate import build_read_context, registry_members
 from yeoman_gateway.processing.reconcile import _effect_meta
 from yeoman_gateway.processing.store import ProcessingStore
@@ -119,7 +120,6 @@ def test_f01_an_unopenable_store_stops_startup_instead_of_falling_back(tmp_path:
     The channel path is what matters, so this asserts the startup contract that keeps the
     channel path intact: with the mode enabled and no usable store, building fails loudly.
     """
-    import pytest
     from yeoman_gateway.app.bootstrap import (
         ProcessingStoreUnavailableError,
         build_effect_router,
@@ -287,3 +287,5 @@ def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> N
     # A shared-fact path exists and is reachable from here (sanity, not behaviour).
     assert FactSource and SharedFact
     store.close()
+
+
