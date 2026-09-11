@@ -237,7 +237,7 @@ async def test_the_chooser_never_calls_the_model_without_a_vocabulary() -> None:
 # the ambient judge ----------------------------------------------------------------------
 
 
-def _judge(answer: str, *, min_confidence: float = 0.75):
+def _judge(answer: str, *, min_confidence: float = 0.75, allowed: tuple[str, ...] = ("🤙", "👍")):
     from yeoman_gateway.processing.ambient_judge import AmbientJudge
     from yeoman_gateway.processing.model_route import RouteClient
 
@@ -246,25 +246,70 @@ def _judge(answer: str, *, min_confidence: float = 0.75):
     client.model = "test-model"  # type: ignore[attr-defined]
     client.timeout_ms = 0  # type: ignore[attr-defined]
     client._provider = _FakeProvider(answer)  # type: ignore[attr-defined]
-    return AmbientJudge(client=client, min_confidence=min_confidence, timeout_seconds=5.0)
+    return AmbientJudge(
+        client=client,
+        allowed_emojis=allowed,
+        min_confidence=min_confidence,
+        timeout_seconds=5.0,
+    )
 
 
 @pytest.mark.asyncio
-async def test_the_ambient_judge_needs_a_confident_yes() -> None:
-    assert await _judge('{"answer": true, "confidence": 0.9}').should_answer("Frage?") is True
-    assert await _judge('{"answer": true, "confidence": 0.4}').should_answer("Frage?") is False
-    assert await _judge('{"answer": false, "confidence": 0.99}').should_answer("Frage?") is False
+async def test_the_ambient_judge_can_answer_react_or_stay_silent() -> None:
+    """One call, three outcomes - a reaction must not cost an answer turn."""
+    answered = await _judge('{"action": "answer", "confidence": 0.9}').decide("Frage?")
+    assert answered.action == "answer" and answered.needs_turn is True
+
+    reacted = await _judge('{"action": "react", "emoji": "🤙", "confidence": 0.9}').decide("danke")
+    assert reacted.action == "react" and reacted.emoji == "🤙"
+    assert reacted.needs_turn is False and reacted.speaks is True
+
+    silent = await _judge('{"action": "none", "confidence": 0.9}').decide("neues Thema")
+    assert silent.action == "silence" and silent.speaks is False
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_judge_needs_confidence_for_every_action() -> None:
+    assert (await _judge('{"action": "answer", "confidence": 0.4}').decide("Frage?")).action == (
+        "silence"
+    )
+    assert (
+        await _judge('{"action": "react", "emoji": "👍", "confidence": 0.4}').decide("danke")
+    ).action == "silence"
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_judge_only_reacts_with_approved_emojis() -> None:
+    """An unapproved face is not a reaction - it is silence, never a guess."""
+    unapproved = await _judge('{"action": "react", "emoji": "🤖", "confidence": 0.99}').decide("x")
+    assert unapproved.action == "silence"
+
+    no_emoji = await _judge('{"action": "react", "confidence": 0.99}').decide("x")
+    assert no_emoji.action == "silence"
 
 
 @pytest.mark.asyncio
 async def test_the_ambient_judge_fails_closed() -> None:
-    assert await _judge("klar, antworte!").should_answer("Frage?") is False
-    assert await _judge("").should_answer("Frage?") is False
-    assert await _judge('{"answer": true, "confidence": 0.9}').should_answer("") is False
+    assert (await _judge("klar, antworte!").decide("Frage?")).action == "silence"
+    assert (await _judge("").decide("Frage?")).action == "silence"
+    assert (await _judge('{"action": "answer", "confidence": 0.9}').decide("")).action == "silence"
+    assert (await _judge('{"action": "vielleicht", "confidence": 0.9}').decide("x")).action == (
+        "silence"
+    )
 
 
 def test_the_ambient_judge_prompt_forbids_answering_just_because_it_is_new() -> None:
     from yeoman_gateway.processing.ambient_judge import AMBIENT_JUDGE_PROMPT
 
     assert "Ein neues Thema ist kein Grund zu antworten." in AMBIENT_JUDGE_PROMPT
-    assert "answer=false" in AMBIENT_JUDGE_PROMPT
+    assert "action=none" in AMBIENT_JUDGE_PROMPT
+    assert "Eine Reaktion ist kein Ersatz für eine" in AMBIENT_JUDGE_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_judge_sees_the_approved_emojis() -> None:
+    judge = _judge('{"action": "none", "confidence": 0.9}', allowed=("👍", "💀"))
+    await judge.decide("hallo")
+
+    system = str(judge._client._provider.calls[0]["messages"][0]["content"])  # type: ignore[attr-defined]
+    assert "👍" in system and "💀" in system, "the judge must know what it may send"

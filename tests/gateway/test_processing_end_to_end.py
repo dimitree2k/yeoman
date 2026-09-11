@@ -1077,3 +1077,63 @@ async def test_naming_the_bot_skips_the_ambient_brake(tmp_path: Path) -> None:
         )
     finally:
         runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ambient_reaction_needs_no_turn_and_no_text(tmp_path: Path) -> None:
+    """The judge may settle for a face: nothing is generated, nothing is typed."""
+    from yeoman_gateway.processing.reaction_action import ReactionAction
+
+    runtime = _make_runtime(tmp_path / "ambient-react", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        runtime.config.processing.reaction_emojis = ["👍", "🤙"]
+
+        class _Chooser:
+            async def choose(self, text: str, *, allowed: Sequence[str]) -> str | None:
+                return None
+
+        action = ReactionAction(
+            chooser=_Chooser(), router=runtime.router, allowed_emojis=("👍", "🤙")
+        )
+        sent = await action.send(
+            emoji="👍",
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id="m1",
+            principal="orderer@s.whatsapp.net",
+        )
+
+        assert sent == "👍"
+        assert runtime.transport.sent == ["👍"], "the face reaches the transport"
+        assert runtime.store.list_effects(), "and it does so as a real effect"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unapproved_ambient_reaction_is_refused(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.reaction_action import ReactionAction
+
+    runtime = _make_runtime(tmp_path / "ambient-react-bad", chats=(CHAT,), ambient=(CHAT,))
+    try:
+
+        class _Chooser:
+            async def choose(self, text: str, *, allowed: Sequence[str]) -> str | None:
+                return None
+
+        action = ReactionAction(
+            chooser=_Chooser(), router=runtime.router, allowed_emojis=("👍",)
+        )
+        sent = await action.send(
+            emoji="🤖",
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id="m1",
+            principal="orderer@s.whatsapp.net",
+        )
+
+        assert sent is None
+        assert runtime.transport.sent == []
+        assert runtime.store.list_effects() == ()
+    finally:
+        runtime.store.close()

@@ -575,14 +575,17 @@ def _build_ambient_judge(config: "Config"):
         logger.error("ambient judge disabled: route={} detail={}", route, str(exc)[:160])
         return None
     logger.info(
-        "ambient_judge enabled route={} min_confidence={} min_seconds={} min_messages={}",
+        "ambient_judge enabled route={} emojis={} min_confidence={} min_seconds={} "
+        "min_messages={}",
         route,
+        len(config.processing.reaction_emojis),
         settings.judge_min_confidence,
         settings.min_seconds_between_answers,
         settings.min_messages_since_answer,
     )
     return AmbientJudge(
         client=client,
+        allowed_emojis=tuple(config.processing.reaction_emojis),
         min_confidence=settings.judge_min_confidence,
         timeout_seconds=settings.judge_timeout_seconds,
     )

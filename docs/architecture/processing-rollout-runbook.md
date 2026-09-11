@@ -68,9 +68,15 @@ do, so it takes three gates, in this order:
    skips the brake (owner decision): a sentence with "Arvid" in it is worth the judge's
    look even when it is not a request - but it is still the judge that decides.
 3. **Judge** - one small model call (`processing.ambient.judgeRoute`) with a strict question
-   ("does this need him?"). Only a confident yes opens the answer turn; a no, an error or a
-   timeout means silence, and the brake window starts over - so the judge is asked at most
-   once per window instead of once per message.
+   and three possible outcomes:
+   * `answer` - a real reply; only then is a turn opened (and typing shown),
+   * `react` - one emoji from `processing.reactionEmojis`, sent as a reaction effect with no
+     turn, no typing and no text,
+   * `none` - silence.
+
+   Every outcome needs `processing.ambient.judgeMinConfidence`; an error, a timeout, an
+   unparsed verdict or an unapproved emoji mean silence. A `none` restarts the brake window,
+   so the judge is asked at most once per window instead of once per message.
 
 Observable per message: `ambient_brake` (why not yet), `ambient_judge` (answer, confidence,
 threshold), `ambient_answer_granted`. A declined message stays declined: the classic

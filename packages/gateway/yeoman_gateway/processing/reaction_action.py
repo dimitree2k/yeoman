@@ -138,18 +138,45 @@ class ReactionAction:
         principal: str,
     ) -> str | None:
         """Choose and send one reaction. Returns the emoji, or ``None`` for silence."""
+        emoji = await self._chooser.choose(text, allowed=self._allowed_emojis)
+        if emoji is None:
+            return None
+        return await self.send(
+            emoji=emoji,
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            principal=principal,
+        )
+
+    async def send(
+        self,
+        *,
+        emoji: str,
+        channel: str,
+        chat_id: str,
+        message_id: str,
+        principal: str,
+    ) -> str | None:
+        """Send one already-chosen reaction. Returns the emoji, or ``None`` if refused.
+
+        The emoji is validated here as well: a caller may hand over a verdict from a model
+        call (the ambient judge), and that must pass the owner's vocabulary like any other
+        model-chosen face.
+        """
         if not message_id:
             logger.debug("reaction_action_skipped chat={} reason=no_message_id", chat_id)
             return None
-        emoji = await self._chooser.choose(text, allowed=self._allowed_emojis)
-        if emoji is None:
+        chosen = allowed_reaction(emoji, self._allowed_emojis)
+        if chosen is None:
+            logger.debug("reaction_action_emoji_rejected chat={}", chat_id)
             return None
         delivered = await self._router.submit_reaction(
             SendReactionIntent(
                 channel=channel,
                 chat_id=chat_id,
                 message_id=message_id,
-                emoji=emoji,
+                emoji=chosen,
             ),
             principal=principal,
         )
@@ -158,4 +185,4 @@ class ReactionAction:
                 "reaction_action_not_delivered chat={} message_id={}", chat_id, message_id
             )
             return None
-        return emoji
+        return chosen

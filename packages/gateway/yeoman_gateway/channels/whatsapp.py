@@ -821,12 +821,13 @@ class WhatsAppChannel(BaseChannel):
         return "\n".join(part for part in parts if part)
 
     async def _maybe_answer_ambient(self, event: InboundEvent) -> Any | None:
-        """Ask the judge about an unaddressed message; the assignment opens its turn.
+        """Ask the judge about an unaddressed message. Returns the assignment if it answers.
 
-        The brake already ran in the gate, so this is the second half of the decision: the
-        small call reads the message and answers strictly. Only a confident yes upgrades the
-        observation into a turn - and the turn is opened here, after the verdict, so no
-        generation, no typing indicator and no cost happen before it.
+        The brake already ran in the gate, so this is the second half of the decision. The
+        judge has three outcomes: a real answer (turn opened here, after the verdict, so no
+        generation or typing happens before it), a single reaction from the owner's
+        vocabulary (no turn at all), or silence. A decline restarts the brake window, so the
+        judge is asked at most once per window instead of once per message.
         """
         if self._ambient_judge is None:
             logger.warning(
@@ -836,16 +837,28 @@ class WhatsAppChannel(BaseChannel):
             )
             return None
         try:
-            if not await self._ambient_judge(text=self._judge_input(event)):
-                # A declined message stays observed, and the brake window starts over so
-                # the judge is asked at most once per window instead of once per message.
-                self._processing_gate.note_ambient_declined(event.message_id)
-                return None
+            verdict = await self._ambient_judge.decide(self._judge_input(event))
+        except Exception as exc:
+            logger.warning(
+                "ambient_judge_failed chat={} message_id={} error_type={}",
+                event.chat_jid,
+                event.message_id,
+                type(exc).__name__,
+            )
+            return None
+        if not verdict.speaks:
+            self._processing_gate.note_ambient_declined(event.message_id)
+            return None
+        if not verdict.needs_turn:
+            # A reaction is the whole reply: no turn, no typing, no text, own lineage.
+            await self._send_ambient_reaction(event, verdict)
+            return None
+        try:
             core_event = self._to_core_event(event, event.message_id)
             assignment = self._processing_gate.reconcile_reply(core_event)
         except Exception as exc:
             logger.warning(
-                "ambient_judge_failed chat={} message_id={} error_type={}",
+                "ambient_reply_failed chat={} message_id={} error_type={}",
                 event.chat_jid,
                 event.message_id,
                 type(exc).__name__,
@@ -862,6 +875,29 @@ class WhatsAppChannel(BaseChannel):
             getattr(assignment, "turn_id", "-"),
         )
         return assignment
+
+    async def _send_ambient_reaction(self, event: InboundEvent, verdict: Any) -> None:
+        """Send the judge's chosen emoji; a missing reaction path means silence."""
+        if self._reaction_action is None or not getattr(verdict, "emoji", None):
+            self._processing_gate.note_ambient_declined(event.message_id)
+            return
+        sent = await self._reaction_action.send(
+            emoji=str(verdict.emoji),
+            channel=self.name,
+            chat_id=event.chat_jid,
+            message_id=event.message_id,
+            principal=event.sender_id,
+        )
+        if not sent:
+            self._processing_gate.note_ambient_declined(event.message_id)
+            return
+        self._processing_gate.note_ambient_answer(event.message_id)
+        logger.info(
+            "ambient_reaction_sent chat={} message_id={} emoji={}",
+            event.chat_jid,
+            event.message_id,
+            sent,
+        )
 
     async def _maybe_react(self, event: InboundEvent) -> None:
         """One reaction instead of an answer, for chats configured with ``react``.
