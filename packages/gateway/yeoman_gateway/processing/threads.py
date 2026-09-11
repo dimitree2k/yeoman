@@ -507,8 +507,13 @@ class ThreadRegistry:
         return ((hit[0], hit[1]),)
 
     def _active_threads(self, data: JoinInput, *, now_ms: int) -> tuple[tuple[str, str], ...]:
+        # Candidates are bounded by channel as well: the same chat id can exist on two
+        # channels, and a follow-up must never be attached across them (Plan 07, Aufgabe 1).
         threads = self._store.list_threads(
-            chat_id=data.chat_id, principal=data.principal, state="open"
+            channel=data.channel or None,
+            chat_id=data.chat_id,
+            principal=data.principal,
+            state="open",
         )
         active = [
             (thread.thread_id, self._active_turn_id(thread.thread_id))

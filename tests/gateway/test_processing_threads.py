@@ -620,3 +620,64 @@ def test_continuation_window_defaults_to_ten_minutes_and_is_configurable() -> No
     assert policy.followup_window_ms == 120_000
     default_policy = ThreadPolicy.from_config(Config().processing)
     assert default_policy.followup_window_ms == 600_000
+
+
+def test_candidates_are_bounded_by_window_channel_and_open_state(tmp_path: Path) -> None:
+    """Plan 07 / Aufgabe 1: which threads may even be continuation candidates."""
+    from yeoman_gateway.processing.threads import JoinInput
+
+    store = ProcessingStore(tmp_path / "p.db")
+    try:
+        same_chat = store.open_thread(
+            channel="whatsapp", chat_id="chat@g.us", root_principal="orderer",
+            kind="dm", trigger_event_id="m1", now_ms=T0,
+        )
+        other_channel = store.open_thread(
+            channel="telegram", chat_id="chat@g.us", root_principal="orderer",
+            kind="dm", trigger_event_id="m2", now_ms=T0,
+        )
+        registry = _registry(store)
+        data = JoinInput(
+            channel="whatsapp", chat_id="chat@g.us", principal="orderer",
+            kind="message", event_id="m3",
+        )
+
+        candidates = registry._active_threads(data, now_ms=T0 + 10_000)
+        ids = [thread_id for thread_id, _turn in candidates]
+        assert ids == [same_chat], "only this chat and channel may contribute candidates"
+        assert other_channel not in ids
+
+        # Outside the window nothing is a candidate any more.
+        assert registry._active_threads(data, now_ms=T0 + 16_000) == ()
+    finally:
+        store.close()
+
+
+def test_a_closed_turn_does_not_remove_its_open_thread_from_the_candidates(tmp_path: Path) -> None:
+    """Spec: a finished turn leaves the thread open, and the thread stays a candidate."""
+    from yeoman_gateway.processing.threads import JoinInput
+
+    store = ProcessingStore(tmp_path / "p.db")
+    try:
+        thread_id = store.open_thread(
+            channel="whatsapp", chat_id="chat@g.us", root_principal="orderer",
+            kind="dm", trigger_event_id="m1", now_ms=T0,
+        )
+        turn_id = store.open_turn(
+            thread_id=thread_id, principal="orderer", trigger_event_id="m1", now_ms=T0
+        )
+        store.close_turn(turn_id, now_ms=T0 + 1_000)
+        registry = _registry(store)
+
+        candidates = registry._active_threads(
+            JoinInput(
+                channel="whatsapp", chat_id="chat@g.us", principal="orderer",
+                kind="message", event_id="m2",
+            ),
+            now_ms=T0 + 2_000,
+        )
+
+        assert [thread_id for thread_id, _turn in candidates] == [thread_id]
+        assert candidates[0][1] is None  # no active turn, but the thread is a candidate
+    finally:
+        store.close()
