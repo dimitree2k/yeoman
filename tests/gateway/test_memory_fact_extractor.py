@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ def _extractor(
         (lambda channel, chat_id: members) if members is not None else None
     )
     extractor._max_candidates = max_candidates  # type: ignore[attr-defined]
+    extractor._tz_offset_minutes = 0  # type: ignore[attr-defined]
     extractor._model = "test-model"  # type: ignore[attr-defined]
     extractor._max_tokens = 200  # type: ignore[attr-defined]
     extractor._temperature = 0.0  # type: ignore[attr-defined]
@@ -708,3 +710,60 @@ def test_f08_an_unreadable_source_stops_publication(tmp_path: Path) -> None:
     assert store.list_facts() == []
     assert queue.cancelled_during_extraction == 1
     store.close()
+
+
+def test_f12_a_relative_date_is_resolved_into_the_fact_content() -> None:
+    """Review F12: "morgen" must not be stored as undated, absolute knowledge.
+
+    The resolved date is written into the fact, so the statement carries its own reference
+    date instead of meaning whatever "morgen" meant when it was written.
+    """
+    source_ms = int(datetime(2026, 9, 10, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    event = _Event("ev-morgen", "Wir fliegen morgen nach Mallorca.")
+    event.occurred_ms = source_ms
+    extractor = _extractor(
+        _payload({"content": "Wir fliegen morgen nach Mallorca.", "basis": "explicit_statement"}),
+        members=frozenset({"member-old"}),
+    )
+
+    candidate = extractor([event])[0]
+
+    assert candidate.temporal_basis == "absolute"
+    assert "11.09.2026" in candidate.content, candidate.content
+    assert candidate.valid_until_ms is not None
+    assert check_candidate(candidate).accepted is True
+
+
+def test_f12_a_relative_date_without_a_source_time_is_refused() -> None:
+    """Without a source time the resolution is impossible, so nothing is published."""
+    event = _Event("ev-morgen", "Wir fliegen morgen nach Mallorca.")
+    event.occurred_ms = None
+    extractor = _extractor(
+        _payload({"content": "Wir fliegen morgen nach Mallorca.", "basis": "explicit_statement"}),
+        members=frozenset({"member-old"}),
+    )
+
+    candidate = extractor([event])[0]
+
+    assert candidate.temporal_basis == "unresolved"
+    assert check_candidate(candidate).reason == "unresolved_time"
+
+
+def test_f13_a_mixed_batch_keeps_every_author_with_their_own_statement() -> None:
+    """Review F13: a batch with two participants must not attribute both to the first."""
+    extractor = _extractor(
+        _payload({"content": "Der Stammtisch ist donnerstags.", "basis": "explicit_statement"}),
+        members=frozenset({"member-old", "member-new"}),
+    )
+    first = _Event("ev-1", "Der Stammtisch ist donnerstags.", principal="member-old")
+    second = _Event("ev-2", "Das Treffen ist um acht.", principal="member-new")
+
+    candidates = extractor([first, second])
+
+    assert len(candidates) == 2
+    by_author = {candidate.author_principal: candidate for candidate in candidates}
+    assert set(by_author) == {"member-old", "member-new"}
+    assert by_author["member-old"].source_refs == (("ev-1", 1),)
+    assert by_author["member-new"].source_refs == (("ev-2", 1),), (
+        "a statement must not inherit another author's sources"
+    )

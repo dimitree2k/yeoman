@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from loguru import logger
@@ -23,6 +24,7 @@ from yeoman_gateway.memory.extraction_jobs import (
     ACCEPTED_BASES,
     REJECT_BASES,
     SharedFactCandidate,
+    resolve_relative_time,
 )
 from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 
@@ -105,11 +107,14 @@ class SharedFactExtractor:
         route_key: str,
         member_provider: Callable[[str, str], frozenset[str] | None] | None = None,
         max_candidates: int = MAX_CANDIDATES_PER_JOB,
+        tz_offset_minutes: int = 0,
     ) -> None:
         self._config = config
         self._route_key = str(route_key)
         self._member_provider = member_provider
         self._max_candidates = max(1, int(max_candidates))
+        #: Timezone for relative dates. UTC until a chat-specific offset is configured.
+        self._tz_offset_minutes = int(tz_offset_minutes)
         self._profile_name, self._profile = self._resolve_profile()
         self._model = str(self._profile.model or "").strip()
         self._max_tokens = int(self._profile.max_tokens or 700)
@@ -157,11 +162,30 @@ class SharedFactExtractor:
             logger.debug("shared fact extraction skipped: no user message in turn")
             return []
 
-        author = sources[0].principal
-        if not author:
+        # Review F13: a batch can contain several participants (the archive backfill does).
+        # Each author is extracted separately, so a statement is never attributed to
+        # whoever spoke first and never inherits their sources.
+        by_author: dict[str, list[_EventView]] = {}
+        for view in sources:
+            if not view.principal:
+                continue
+            by_author.setdefault(view.principal, []).append(view)
+        if not by_author:
             logger.debug("shared fact extraction skipped: source has no principal")
             return []
+        if len(by_author) == 1:
+            return self._extract_for_author(next(iter(by_author.items())), first=sources[0])
+        candidates: list[SharedFactCandidate] = []
+        for principal, group in by_author.items():
+            candidates.extend(self._extract_for_author((principal, group), first=group[0]))
+            if len(candidates) >= self._max_candidates:
+                break
+        return candidates[: self._max_candidates]
 
+    def _extract_for_author(
+        self, authored: tuple[str, list[_EventView]], *, first: _EventView
+    ) -> list[SharedFactCandidate]:
+        author, sources = authored
         text = "\n".join(view.text for view in sources)[:4000]
         rows = self._ask_model(text)
         if not rows:
@@ -172,9 +196,9 @@ class SharedFactExtractor:
         # today's list to an old statement would grant a new member rights that were never
         # proven, so historical sources fail closed to author-only.
         if any(view.archived for view in sources):
-            audience, group = frozenset(), sources[0].is_group
+            audience, group = frozenset(), first.is_group
         else:
-            audience, group = self._resolve_audience(sources[0])
+            audience, group = self._resolve_audience(first)
         candidates: list[SharedFactCandidate] = []
         for row in rows[: self._max_candidates]:
             candidate = self._to_candidate(
@@ -219,6 +243,30 @@ class SharedFactExtractor:
             return []
         return [row for row in rows if isinstance(row, Mapping)]
 
+    def _resolve_temporal(
+        self, content: str, source: _EventView
+    ) -> tuple[str, str, int | None]:
+        """Resolve a relative day word against the source time.
+
+        Returns ``(content, basis, end_of_day_ms)``. The resolved date is written into the
+        content, so a stored fact carries its own reference date instead of silently
+        meaning whatever "morgen" meant when it was written. Without a source time the
+        candidate is ``unresolved`` and must not be published.
+        """
+        if not _has_relative_day(content):
+            return content, "absolute", None
+        if source.occurred_ms is None:
+            return content, "unresolved", None
+        resolved = resolve_relative_time(
+            content,
+            source_ms=int(source.occurred_ms),
+            tz_offset_minutes=int(self._tz_offset_minutes),
+        )
+        if resolved is None:
+            return content, "unresolved", None
+        stamp = datetime.fromtimestamp(resolved / 1000, tz=timezone.utc).strftime("%d.%m.%Y")
+        return f"{content} ({stamp})", "absolute", resolved + 86_400_000 - 1
+
     def _resolve_audience(self, source: _EventView) -> tuple[frozenset[str], bool]:
         """Proven participants of the chat, or an empty set when nothing is proven."""
         members: frozenset[str] | None = None
@@ -256,18 +304,31 @@ class SharedFactExtractor:
         # proven audience would be invisible, so it degrades to author_only instead.
         allowed_audience = audience | {author}
         valid_until = _parse_iso_ms(row.get("valid_until"))
+        content, temporal_basis, resolved_ms = self._resolve_temporal(content, sources[0])
+        if resolved_ms is not None and valid_until is None:
+            valid_until = resolved_ms
         return SharedFactCandidate(
             content=content,
             author_principal=author,
             source_role="user",
             basis=basis,
             visibility_scope=scope,
-            temporal_basis="absolute",
+            # "unresolved" stays a candidate and is refused by check_candidate, so the
+            # job records unresolved_time instead of silently dropping the statement.
+            temporal_basis=temporal_basis,
             valid_until_ms=valid_until,
             source_refs=tuple((view.event_id, view.revision) for view in sources),
             source_scopes=tuple(f"{view.channel}:{view.chat_id}" for view in sources),
             audience=frozenset(allowed_audience),
         )
+
+
+_RELATIVE_DAY_WORDS: tuple[str, ...] = ("morgen", "heute", "übermorgen", "uebermorgen")
+
+
+def _has_relative_day(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(word in lowered for word in _RELATIVE_DAY_WORDS)
 
 
 def _extract_json(text: str) -> Any:
