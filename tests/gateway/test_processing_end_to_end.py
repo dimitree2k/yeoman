@@ -83,9 +83,16 @@ def _config(
 
 
 def _policy(
-    chats: tuple[str, ...] = (CHAT,), *, mode: str = "everyone", when_to_reply: str = "all"
+    chats: tuple[str, ...] = (CHAT,),
+    *,
+    mode: str = "everyone",
+    when_to_reply: str = "all",
+    senders: tuple[str, ...] = (),
 ) -> PolicyConfig:
-    default = {"whoCanTalk": {"mode": mode}, "whenToReply": {"mode": when_to_reply}}
+    when: dict[str, object] = {"mode": when_to_reply}
+    if senders:
+        when["senders"] = list(senders)
+    default = {"whoCanTalk": {"mode": mode}, "whenToReply": when}
     return PolicyConfig.model_validate(
         {
             "defaults": {"allowedTools": {"mode": "allowlist", "tools": ["message"]}},
@@ -173,12 +180,17 @@ def _make_runtime(
 
 
 def _event(
-    *, message_id: str, content: str = "hi", chat: str = CHAT, mentioned: bool = True
+    *,
+    message_id: str,
+    content: str = "hi",
+    chat: str = CHAT,
+    mentioned: bool = True,
+    sender: str = "orderer@s.whatsapp.net",
 ) -> InboundEvent:
     return InboundEvent(
         channel="whatsapp",
         chat_id=chat,
-        sender_id="orderer@s.whatsapp.net",
+        sender_id=sender,
         content=content,
         message_id=message_id,
         is_group=True,
@@ -194,6 +206,7 @@ def _admit(
     chat: str = CHAT,
     content: str = "hi",
     mentioned: bool = True,
+    sender: str = "orderer@s.whatsapp.net",
 ):
     return runtime.gate.admit(
         IngestRequest(
@@ -201,7 +214,11 @@ def _admit(
             event_id=message_id,
             trace_id=f"tr-{message_id}",
             event=_event(
-                message_id=message_id, chat=chat, content=content, mentioned=mentioned
+                message_id=message_id,
+                chat=chat,
+                content=content,
+                mentioned=mentioned,
+                sender=sender,
             ),
         )
     )
@@ -644,3 +661,85 @@ def test_the_observation_line_shows_the_reasoning_without_content(runtime) -> No
         "the proving source ids must be visible"
     )
     assert all(secret not in line for line in lines), "the observation line leaked content"
+
+
+def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_path: Path) -> None:
+    """Routing spec, criterion 16.
+
+    Under ``allowed_senders`` and ``owner_only`` a permitted sender's unmarked message in
+    a group may be answered like under ``all`` - no address needed. A sender who is not
+    permitted is answered neither because of a mention nor because of a continuity signal.
+    """
+    permitted = "orderer@s.whatsapp.net"
+    stranger = "stranger@s.whatsapp.net"
+
+    # allowed_senders: the permitted sender's unmarked message is answerable.
+    runtime = _make_runtime(tmp_path / "allowed", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        runtime.reload_policy(
+            _policy(when_to_reply="allowed_senders", senders=(permitted,))
+        )
+        allowed = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+        assert allowed.outcome.value == "react", "a permitted sender may be answered"
+
+        # The same message from someone else is admitted as context at most - never
+        # answered. Admission (whoCanTalk) and reply permission (whenToReply) are
+        # separate dimensions in the spec, so this one asserts the reply side.
+        denied = _admit(
+            runtime,
+            message_id="m2",
+            content="@Arvid hilf mir",
+            mentioned=True,
+            sender=stranger,
+        )
+        assert denied.outcome.value != "react", "an unpermitted sender is never answered"
+        assert denied.outcome.value == "observe"
+
+        # A continuity signal does not make them answerable either: the gate journaled m2
+        # above, so this message would be a textbook continuation - and still no answer.
+        continued = _admit(
+            runtime,
+            message_id="m3",
+            content="Zum Mietvertrag: ergänze bitte die Frist.",
+            mentioned=False,
+            sender=stranger,
+        )
+        assert continued.outcome.value == "observe", "continuity grants no permission"
+    finally:
+        runtime.store.close()
+
+    # whoCanTalk refuses the stranger's message entirely, mention or not: that is the
+    # admission side, and it stays a hard gate.
+    strict = _make_runtime(tmp_path / "strict", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        strict.reload_policy(_policy(mode="allowlist", when_to_reply="all"))
+        blocked = _admit(
+            strict, message_id="m1", content="@Arvid hilf", mentioned=True, sender=stranger
+        )
+        assert blocked.outcome.value == "deny", "an unlisted sender may not talk at all"
+    finally:
+        strict.store.close()
+
+    # owner_only: the owner is treated exactly like the permitted sender above.
+    owner_runtime = _make_runtime(tmp_path / "owner", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        owner_runtime.reload_policy(_policy(when_to_reply="owner_only"))
+        owner = _admit(
+            owner_runtime,
+            message_id="m1",
+            content="nur so",
+            mentioned=False,
+            sender="owner@s.whatsapp.net",
+        )
+        assert owner.outcome.value == "react", "the owner may be answered without a mention"
+    finally:
+        owner_runtime.store.close()
+
+    # mention_only keeps its DM exception: an unmarked DM is answerable, a group is not.
+    dm_runtime = _make_runtime(tmp_path / "dm", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        dm_runtime.reload_policy(_policy(when_to_reply="mention_only"))
+        group = _admit(dm_runtime, message_id="m1", content="nur so", mentioned=False)
+        assert group.outcome.value == "observe", "an unmarked group message stays unanswered"
+    finally:
+        dm_runtime.store.close()
