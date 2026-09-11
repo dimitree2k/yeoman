@@ -743,3 +743,33 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
         assert group.outcome.value == "observe", "an unmarked group message stays unanswered"
     finally:
         dm_runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_criterion_8_a_reaction_has_its_own_lineage(runtime) -> None:
+    """Routing spec, criterion 8.
+
+    A reaction belongs to the message it reacts to: it carries that message's turn and
+    never adopts a different, newer order from the same chat.
+    """
+    from yeoman_gateway.core.intents import SendReactionIntent
+
+    first = _admit(runtime, message_id="m1")
+    second = _admit(runtime, message_id="m2", content="Wie wird morgen das Wetter?")
+    assert first.assignment is not None and second.assignment is not None
+    assert second.assignment.turn_id != first.assignment.turn_id, "two turns exist"
+
+    submitted = await runtime.router.submit_reaction(
+        SendReactionIntent(channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍"),
+        principal="orderer@s.whatsapp.net",
+    )
+    assert submitted is True
+
+    effects = runtime.store.list_effects()
+    assert len(effects) == 1
+    effect = effects[0]
+    assert effect.turn_id == first.assignment.turn_id, (
+        f"the reaction took the wrong order's turn: {effect.turn_id!r}"
+    )
+    assert effect.operation_key.startswith("reaction:whatsapp:"), effect.operation_key
+    assert "m1" in effect.operation_key, "the triggering message is the provenance"

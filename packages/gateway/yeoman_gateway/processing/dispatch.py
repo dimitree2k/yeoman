@@ -37,6 +37,7 @@ from yeoman_gateway.processing.models import (
     ReactionPayload,
     TextPayload,
     TransportReceipt,
+    TurnBinding,
     canonical_hash,
     payload_to_mapping,
 )
@@ -675,6 +676,8 @@ class IntentEffectRouter:
             operation_key=f"reaction:{intent.channel}:{intent.chat_id}:{intent.message_id}:{intent.emoji}",
             trace_id=intent.message_id,
             deadline_key="semantic_reaction_ms",
+            own_lineage=True,
+            source_message_id=intent.message_id,
         )
         return True
 
@@ -729,6 +732,7 @@ class IntentEffectRouter:
         operation_key: str,
         trace_id: str,
         deadline_key: str,
+        own_lineage: bool = False,
     ) -> EffectReceipt:
         now = self._clock()
         processing = self._config.processing
@@ -742,8 +746,19 @@ class IntentEffectRouter:
         if binding is None and source_message_id:
             frozen = self.frozen_turn_for_source(source_message_id)
             binding = frozen
+        if own_lineage and source_message_id and binding is None:
+            # A reaction belongs to the message it reacts to. That message's own recorded
+            # assignment is its lineage - never the chat's currently active turn, which may
+            # belong to an unrelated order (routing spec, criterion 8).
+            assignment = self._gateway.store.event_assignment(source_message_id)
+            if assignment is not None and assignment[1]:
+                target_turn = self._gateway.store.get_turn(str(assignment[1]))
+                if target_turn is not None:
+                    binding = TurnBinding(
+                        turn=target_turn, trace_id=source_message_id, generation_id=None
+                    )
         turn = getattr(binding, "turn", None)
-        if turn is None and frozen is None and self._turn_provider is not None:
+        if turn is None and frozen is None and not own_lineage and self._turn_provider is not None:
             # Only when nothing is known about this source may the chat's active turn be
             # used; otherwise a newer thread would silently adopt an older answer.
             turn = self._turn_provider(channel, chat_id)
@@ -754,6 +769,7 @@ class IntentEffectRouter:
 
         if (
             not turn_id
+            and not own_lineage
             and self._turn_provider is not None
             and principal not in SERVICE_PRINCIPALS.values()
         ):
