@@ -853,7 +853,10 @@ def memory_facts_backfill(
         ArchiveEventSource,
         run_archive_backfill,
     )
-    from yeoman_gateway.memory.extraction_jobs import SharedFactExtractionQueue
+    from yeoman_gateway.memory.extraction_jobs import (
+        EXTRACTOR_VERSION,
+        SharedFactExtractionQueue,
+    )
     from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
     from yeoman_gateway.storage.chat_registry import ChatRegistry
     from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -876,16 +879,37 @@ def memory_facts_backfill(
                 config=config,
                 route_key=config.memory.capture.extract_route,
                 member_provider=_registry_member_lookup(registry),
+                # The backfill resolves the same relative dates as the live path; without
+                # the configured zone a re-extraction would reintroduce the UTC bug it is
+                # meant to repair (F12).
+                timezone_name=str(
+                    getattr(config.processing.extraction, "timezone", "UTC") or "UTC"
+                ),
             )
         except Exception as exc:
             console.print(f"[red]extractor unavailable:[/red] {exc}")
             raise typer.Exit(code=1) from None
         source = ArchiveEventSource(archive)
+        # Mirror the live runtime: the backfill writes facts the running gateway has to
+        # keep reading, so queue version and lifetime must be the configured ones, not the
+        # class defaults. A different version also gives every batch a fresh job key, which
+        # is what makes re-extraction over already-processed history possible at all.
+        shared_cfg = getattr(config.memory, "shared", None)
+        retention_cfg = getattr(config.processing, "retention", None)
         queue = SharedFactExtractionQueue(
             store=service.store,
             journal=source,
             extractor=extractor,
             embedder=service.embedding,
+            max_waiting=int(getattr(shared_cfg, "max_jobs_waiting", 64)),
+            fact_ttl_ms=(
+                int(retention_cfg.shared_fact_days) * 24 * 3600 * 1000
+                if retention_cfg
+                else None
+            ),
+            extractor_version=str(
+                getattr(shared_cfg, "extractor_version", EXTRACTOR_VERSION)
+            ),
             clock=lambda: int(time.time() * 1000),
         )
         report = run_archive_backfill(
