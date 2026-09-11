@@ -2,15 +2,14 @@
 
 import json
 import os
-import shutil
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from yeoman_shared.config.defaults import apply_missing_defaults
 from yeoman_shared.config.schema import Config
+from yeoman_shared.utils.backups import backup_file
 
 CONFIG_VERSION = 2
 
@@ -23,6 +22,7 @@ def get_config_path() -> Path:
 def get_data_dir() -> Path:
     """Get the yeoman data directory."""
     from yeoman_shared.utils.helpers import get_data_path
+
     return get_data_path()
 
 
@@ -148,6 +148,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    _backup_config(path)
     _atomic_write_config(path, config)
 
 
@@ -271,16 +272,13 @@ def _migrate_config_with_change(data: dict[str, Any]) -> tuple[dict[str, Any], b
 
 
 def _backup_config(path: Path) -> None:
-    """Create timestamped backup of config before migration rewrite."""
-    if not path.exists():
-        return
-    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.stem}.backup.{timestamp}{path.suffix}")
-    shutil.copy2(path, backup)
-    try:
-        backup.chmod(0o600)
-    except OSError:
-        pass
+    """Snapshot config into "backups/config" before a rewrite.
+
+    Identical content is never snapshotted twice and snapshots older
+    than the retention window (30 days by default) are pruned; see
+    :mod:`yeoman_shared.utils.backups`.
+    """
+    backup_file(path, category="config")
 
 
 def _atomic_write_config(path: Path, config: Config) -> None:

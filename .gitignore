@@ -107,10 +107,12 @@ tests/gateway/*
 !tests/gateway/test_processing_routing_criteria.py
 !tests/gateway/test_reaction_emojis.py
 !tests/gateway/test_whatsapp_implicit_address.py
+!tests/gateway/test_policy_backup_retention.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py
 !tests/shared/test_config_memory_shared.py
+!tests/shared/test_backups.py
 !tests/overseer/
 tests/overseer/*
 !tests/overseer/test_alert_formatting.py

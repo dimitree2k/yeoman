@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 import typer
+from yeoman_shared.utils.backups import backup_file
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from .channel_commands import _ensure_whatsapp_bridge_token
@@ -180,7 +180,6 @@ def policy_annotate_whatsapp_comments(
 ) -> None:
     """Fill WhatsApp group chat comments in policy.json using the running bridge."""
     import asyncio
-    import shutil
     import time
     import uuid
 
@@ -288,11 +287,11 @@ def policy_annotate_whatsapp_comments(
             console.print(f"[dim]No name returned for {len(missing)} group(s).[/dim]")
         return
 
-    if policy_path.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = policy_path.with_name(f"{policy_path.name}.bak-{stamp}")
-        shutil.copy2(policy_path, backup_path)
+    backup_path = backup_file(policy_path, category="policy", label="policy-set-comments")
+    if backup_path is not None:
         console.print(f"[green]✓[/green] Backup written: {backup_path}")
+    else:
+        console.print("[dim]No new backup: policy content already snapshotted.[/dim]")
 
     save_policy(policy, policy_path)
     console.print(f"[green]✓[/green] Updated policy comments for {updated} group(s): {policy_path}")

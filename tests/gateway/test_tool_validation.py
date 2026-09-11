@@ -4,7 +4,6 @@ import os
 import platform
 import shutil
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +36,6 @@ from yeoman_gateway.cron.types import CronSchedule
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.security.engine import SecurityEngine
 from yeoman_gateway.security.normalize import normalize_text
-from yeoman_shared.config import loader as config_loader
 from yeoman_shared.config.loader import (
     _atomic_write_config,
     _migrate_config,
@@ -383,18 +381,8 @@ def test_config_migration_for_legacy_isolation_keys() -> None:
 
 
 def test_config_load_does_not_backup_when_canonical_config_is_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    class FakeDateTime(datetime):
-        calls = 0
-
-        @classmethod
-        def now(cls, tz=UTC):
-            cls.calls += 1
-            return datetime(2026, 1, 1, 0, 0, cls.calls, tzinfo=tz)
-
-    monkeypatch.setattr(config_loader, "datetime", FakeDateTime)
-
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(
         json.dumps(
@@ -412,12 +400,13 @@ def test_config_load_does_not_backup_when_canonical_config_is_unchanged(
     )
 
     load_config(cfg_path)
-    first_backups = sorted(tmp_path.glob("config.backup.*.json"))
+    backup_dir = tmp_path / "backups" / "config"
+    first_backups = sorted(backup_dir.glob("*-config.json"))
     assert len(first_backups) == 1
 
     load_config(cfg_path)
 
-    assert sorted(tmp_path.glob("config.backup.*.json")) == first_backups
+    assert sorted(backup_dir.glob("*-config.json")) == first_backups
 
 
 def test_persona_manipulation_false_positives_are_allowed() -> None:

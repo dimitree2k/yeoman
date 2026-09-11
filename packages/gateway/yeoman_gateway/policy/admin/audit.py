@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from yeoman_shared.utils.backups import category_dir, find_identical, write_backup_bytes
+
 from yeoman_gateway.policy.loader import load_policy
 from yeoman_gateway.policy.schema import PolicyConfig
 
@@ -29,6 +31,14 @@ class PolicyAuditEntry:
     error: str | None = None
 
 
+def _serialize_policy(policy: PolicyConfig) -> bytes:
+    return json.dumps(
+        policy.model_dump(by_alias=True, exclude_none=True),
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 class PolicyAuditStore:
     """Stores append-only audit rows and policy backup snapshots."""
 
@@ -36,13 +46,16 @@ class PolicyAuditStore:
         self._policy_path = policy_path
         self._root = policy_path.parent / "policy" / "audit"
         self._history_path = self._root / "policy_changes.jsonl"
-        self._backup_dir = self._root / "backups"
+        # Snapshots live in the single runtime backup root so retention
+        # applies to every policy snapshot in one place.
+        self._backup_dir = category_dir(policy_path.parent, "policy")
 
     @property
     def history_path(self) -> Path:
         return self._history_path
 
     def ensure_dirs(self) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
         self._backup_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -56,16 +69,29 @@ class PolicyAuditStore:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def write_backup(self, change_id: str, before_policy: PolicyConfig) -> str:
+        """Snapshot ``before_policy``; return its path relative to the runtime root."""
         self.ensure_dirs()
-        rel = f"backups/{change_id}.json"
-        path = self._root / rel
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(before_policy.model_dump(by_alias=True, exclude_none=True), f, indent=2, ensure_ascii=False)
-        return rel
+        data = _serialize_policy(before_policy)
+        snapshot = find_identical(self._backup_dir, data)
+        if snapshot is None:
+            snapshot = write_backup_bytes(self._backup_dir, label=f"policy-{change_id}", data=data)
+        if snapshot is None:
+            raise OSError(f"failed to write policy snapshot for {change_id}")
+        try:
+            return snapshot.relative_to(self._policy_path.parent).as_posix()
+        except ValueError:  # relative policy path (custom YEOMAN_HOME)
+            return snapshot.as_posix()
 
     def load_backup(self, backup_ref: str) -> PolicyConfig:
-        path = self._root / backup_ref
-        return load_policy(path)
+        return load_policy(self._resolve_backup_path(backup_ref))
+
+    def _resolve_backup_path(self, backup_ref: str) -> Path:
+        candidate = self._policy_path.parent / backup_ref
+        if candidate.is_file():
+            return candidate
+        # Snapshots written before they moved to the shared backup root.
+        legacy = self._root / backup_ref
+        return legacy if legacy.is_file() else candidate
 
     def append(self, entry: PolicyAuditEntry) -> None:
         self.ensure_dirs()
