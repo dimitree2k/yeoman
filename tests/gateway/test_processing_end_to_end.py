@@ -1048,3 +1048,32 @@ async def test_an_addressed_message_ignores_the_ambient_brake(tmp_path: Path) ->
         assert result.assignment is not None and result.assignment.turn_id, "it gets its turn"
     finally:
         runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_naming_the_bot_skips_the_ambient_brake(tmp_path: Path) -> None:
+    """Owner decision 11.09.: a sentence with his name is worth a look, not an answer.
+
+    The brake is strict (600 s / 99 messages), yet naming him lets the judge decide right
+    away - and the judge still has the last word, so nothing is answered mechanically.
+    """
+    runtime = _make_runtime(
+        tmp_path / "named", chats=(CHAT,), ambient=(CHAT,), ambient_brake=(600, 99)
+    )
+    try:
+        plain = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+        assert plain.ambient_candidate is False, "without his name the brake still applies"
+
+        named = _admit(
+            runtime,
+            message_id="m2",
+            content="Arvid hat mal wieder Update bekommen",
+            mentioned=False,
+        )
+        assert named.ambient_candidate is True, "naming him skips the brake"
+        assert named.outcome.value == "observe", "but the judge decides whether he speaks"
+        assert named.assignment is not None and named.assignment.turn_id is None, (
+            "no turn before the verdict"
+        )
+    finally:
+        runtime.store.close()

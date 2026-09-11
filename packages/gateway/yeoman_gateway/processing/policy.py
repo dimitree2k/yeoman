@@ -278,14 +278,28 @@ class IngestGate:
             # the ambient fallback is subject to the brake, a real continuation is not.
             if self._ambient_rule_without_turn(request, now=now):
                 self._note_ambient_message(event.channel, event.chat_id)
-                allowed, reason = self._ambient_brake_allows(
-                    event.channel, event.chat_id, now=now
-                )
+                named = self._mentions_bot_by_name(request)
+                if named:
+                    # Naming him is a soft address even when the sentence is no request: the
+                    # brake is skipped and the judge decides right away (owner decision,
+                    # 11.09.). Still one small call per name-drop - never an answer without
+                    # a yes, and never a mechanical acknowledgement.
+                    allowed, reason = True, "name"
+                else:
+                    allowed, reason = self._ambient_brake_allows(
+                        event.channel, event.chat_id, now=now
+                    )
                 ambient_candidate = allowed
                 # Observed either way; the judge may upgrade it after a yes.
                 outcome = FastGateOutcome.OBSERVE
                 self._mark_ambient_pending(request.event_id, now=now)
-                if not allowed:
+                if named:
+                    logger.debug(
+                        "ambient_name_bypass chat={} event_id={}",
+                        event.chat_id,
+                        request.event_id,
+                    )
+                elif not allowed:
                     logger.debug(
                         "ambient_brake chat={} event_id={} reason={}",
                         event.chat_id,
@@ -386,6 +400,18 @@ class IngestGate:
         rule = getattr(decision, "rule", None)
         is_ambient = rule == JoinRule.AMBIENT or str(rule) == str(JoinRule.AMBIENT)
         return bool(is_ambient and getattr(decision, "thread_id", None) is None)
+
+    @staticmethod
+    def _mentions_bot_by_name(request: IngestRequest) -> bool:
+        """True when the message names the bot, request or not (owner decision 11.09.).
+
+        Deliberately narrower than an address: it does not turn the message into an order,
+        it only lets the judge look at it without waiting for the brake window.
+        """
+        from yeoman_gateway.implicit_addressing import contains_bot_name
+
+        text = str(getattr(request.event, "content", "") or "")
+        return bool(text and contains_bot_name(text))
 
     def _note_ambient_message(self, channel: str, chat_id: str) -> None:
         """Count one more message the chat produced since its last ambient answer."""

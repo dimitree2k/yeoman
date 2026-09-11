@@ -64,7 +64,9 @@ do, so it takes three gates, in this order:
    `Arvid, …` request - never take this path and are answered immediately.
 2. **Brake** (`processing.ambient.*`) - both thresholds must be met: enough time since the
    last ambient answer *and* enough new messages since then. Until they are, the message is
-   only observed: no turn, no typing indicator, no model call.
+   only observed: no turn, no typing indicator, no model call. A message that *names* him
+   skips the brake (owner decision): a sentence with "Arvid" in it is worth the judge's
+   look even when it is not a request - but it is still the judge that decides.
 3. **Judge** - one small model call (`processing.ambient.judgeRoute`) with a strict question
    ("does this need him?"). Only a confident yes opens the answer turn; a no, an error or a
    timeout means silence, and the brake window starts over - so the judge is asked at most
