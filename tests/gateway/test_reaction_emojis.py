@@ -174,3 +174,61 @@ async def test_the_default_vocabulary_keeps_the_persona_reactions_working() -> N
 
     reactions = [i for i in ctx.intents if isinstance(i, SendReactionIntent)]
     assert [reaction.emoji for reaction in reactions] == ["💀"]
+
+
+# the react reply action -----------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakeProvider:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.calls: list[dict[str, object]] = []
+
+    async def chat(self, **kwargs: object) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return _FakeResponse(self.answer)
+
+
+def _chooser(answer: str):
+    """A chooser whose provider answers with a fixed string."""
+    from yeoman_gateway.processing.reaction_action import ReactionChooser
+
+    chooser = ReactionChooser.__new__(ReactionChooser)
+    chooser._config = None  # type: ignore[attr-defined]
+    chooser._route_key = "test.route"  # type: ignore[attr-defined]
+    chooser._timeout_seconds = 5.0  # type: ignore[attr-defined]
+    chooser._timeout_ms = 0  # type: ignore[attr-defined]
+    chooser._model = "test-model"  # type: ignore[attr-defined]
+    chooser._provider = _FakeProvider(answer)  # type: ignore[attr-defined]
+    return chooser
+
+
+@pytest.mark.asyncio
+async def test_the_chooser_asks_for_exactly_one_approved_emoji() -> None:
+    chooser = _chooser("🤙")
+    assert await chooser.choose("danke dir", allowed=["🤙", "🥱"]) == "🤙"
+
+    call = chooser._provider.calls[0]  # type: ignore[attr-defined]
+    assert call["max_tokens"] == 8, "a reaction choice must not be able to write prose"
+    assert call["temperature"] == 0.0
+    system = str(call["messages"][0]["content"])  # type: ignore[index]
+    assert "🤙" in system and "🥱" in system, "the model must see the approved vocabulary"
+
+
+@pytest.mark.asyncio
+async def test_the_chooser_refuses_an_emoji_the_owner_did_not_approve() -> None:
+    assert await _chooser("🤖").choose("irgendwas", allowed=["🤙"]) is None
+    assert await _chooser("none").choose("irgendwas", allowed=["🤙"]) is None
+    assert await _chooser("Der Text ist zu lang").choose("x", allowed=["🤙"]) is None
+
+
+@pytest.mark.asyncio
+async def test_the_chooser_never_calls_the_model_without_a_vocabulary() -> None:
+    chooser = _chooser("🤙")
+    assert await chooser.choose("hallo", allowed=[]) is None
+    assert chooser._provider.calls == []  # type: ignore[attr-defined]

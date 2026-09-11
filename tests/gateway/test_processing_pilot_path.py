@@ -433,7 +433,7 @@ def test_gate_logs_a_positive_assignment_marker(runtime) -> None:
         "topic_break=",
         "continuity=",
         "evidence=",
-        "action=",
+        "outcome=",
         "reply_action=",
         "thread_id=",
         "turn_id=",

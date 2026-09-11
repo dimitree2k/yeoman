@@ -504,6 +504,47 @@ def build_shared_fact_runtime(
     return runtime
 
 
+def _build_reaction_action(
+    config: "Config", effect_router: "IntentEffectRouter | None", store: object | None
+):
+    """The `react` reply action: one cheap emoji choice per message, no answer turn.
+
+    Built only when the mode is on and at least one chat actually asks for reactions - an
+    unused provider client is not worth the start-up cost. A misconfigured route disables
+    the action loudly instead of answering text where a reaction was configured.
+    """
+    if effect_router is None or store is None or not config.processing.enabled:
+        return None
+    wanted = {
+        str(value).strip().lower()
+        for value in (config.processing.reply_actions or {}).values()
+    }
+    if "react" not in wanted:
+        return None
+    from yeoman_gateway.processing.reaction_action import ReactionAction, ReactionChooser
+
+    route = str(getattr(config.processing, "reaction_route", "") or "") or (
+        str(getattr(getattr(config.memory, "capture", None), "extract_route", "") or "")
+        or "memory.capture.extract"
+    )
+    try:
+        chooser = ReactionChooser(config=config, route_key=route)
+    except Exception as exc:
+        logger.error(
+            "reaction action disabled: route={} error_type={} detail={}",
+            route,
+            type(exc).__name__,
+            str(exc)[:160],
+        )
+        return None
+    logger.info("reaction_action enabled route={} emojis={}", route, len(config.processing.reaction_emojis))
+    return ReactionAction(
+        chooser=chooser,
+        router=effect_router,
+        allowed_emojis=tuple(config.processing.reaction_emojis),
+    )
+
+
 def _shared_fact_members(chat_registry: object | None):
     """Proven chat participants, or ``None`` when nothing is proven.
 
@@ -947,6 +988,7 @@ def build_gateway_runtime(
             if processing_store is not None
             else None
         ),
+        reaction_action=_build_reaction_action(config, effect_router, processing_store),
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)

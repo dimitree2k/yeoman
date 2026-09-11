@@ -721,6 +721,10 @@ class ProcessingConfig(BaseModel):
     #: Confirmations the gateway decides itself are not model choices and stay unaffected
     #: (see ``yeoman_shared.reactions``).
     reaction_emojis: list[str] = Field(default_factory=lambda: list(DEFAULT_REACTION_EMOJIS))
+    #: Model route that picks a reaction emoji for ``replyActions: "react"``. One message
+    #: in, one emoji out - it should stay a cheap, fast chat route. Empty means "use the
+    #: memory capture route", which is already a small extraction model.
+    reaction_route: str = ""
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)

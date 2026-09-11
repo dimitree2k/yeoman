@@ -211,6 +211,7 @@ class WhatsAppChannel(BaseChannel):
         self._media_cleanup_task: asyncio.Task[None] | None = None
         self._processing_gate: Any | None = None
         self._processing_signals: Any | None = None
+        self._reaction_action: Any | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
@@ -796,6 +797,47 @@ class WhatsAppChannel(BaseChannel):
         """Attach the fast gate of the new processing mode (``None`` keeps legacy)."""
         self._processing_gate = gate
 
+    def set_reaction_action(self, action: Any | None) -> None:
+        """Attach the ``react`` reply action (``None`` leaves reactions to the pipeline)."""
+        self._reaction_action = action
+
+    async def _maybe_react(self, event: InboundEvent) -> None:
+        """One reaction instead of an answer, for chats configured with ``react``.
+
+        The answer turn is already withdrawn by the gate (and refused again at admission),
+        so this is the whole reply: a small model call picks an approved emoji and the
+        effect router sends it with the message as its own lineage.
+        """
+        if self._reaction_action is None:
+            logger.warning(
+                "reply_action=react has no reaction path chat={} message_id={}",
+                event.chat_jid,
+                event.message_id,
+            )
+            return
+        try:
+            emoji = await self._reaction_action(
+                channel="whatsapp",
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                text=event.text,
+                principal=event.sender_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "reaction_action_failed chat={} message_id={} error_type={}",
+                event.chat_jid,
+                event.message_id,
+                type(exc).__name__,
+            )
+            return
+        logger.info(
+            "reaction_action chat={} message_id={} emoji={}",
+            event.chat_jid,
+            event.message_id,
+            emoji or "-",
+        )
+
     def _processing_request(self, event: InboundEvent) -> Any:
         """Canonical base data for the pre-enrichment journal and policy check."""
         from yeoman_gateway.processing.policy import IngestRequest
@@ -881,6 +923,11 @@ class WhatsAppChannel(BaseChannel):
                             "source_message_ids": list(assignment.source_message_ids),
                         },
                     )
+                if bool(getattr(verdict, "react", False)):
+                    # The answer is withdrawn; the reaction is the whole reply and needs no
+                    # turn, no typing indicator and no pipeline run of its own. Messages the
+                    # gate only observed stay observed - no acknowledgement per message.
+                    await self._maybe_react(event)
             if verdict is not None and verdict.denied:
                 logger.debug(
                     "processing fast gate denied channel=whatsapp chat={} message_id={} "

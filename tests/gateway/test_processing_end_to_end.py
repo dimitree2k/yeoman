@@ -7,6 +7,7 @@ gate, store, registry, effect router and dispatcher are the production objects.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -604,6 +605,123 @@ async def test_reply_action_silence_withdraws_the_answer(tmp_path: Path) -> None
         assert result.assignment.turn_id is None, "silence must not open a turn"
         assert runtime.store.list_effects() == ()
         assert runtime.transport.sent == []
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_action_react_answers_with_one_reaction(tmp_path: Path) -> None:
+    """Plan 07 / Aufgabe 4: `react` replaces the answer - no turn, no typing, one emoji.
+
+    The emoji is chosen by the small chooser call, validated against the owner's
+    vocabulary, and sent as an effect with the message as its own lineage.
+    """
+    from yeoman_gateway.processing.reaction_action import ReactionAction
+
+    runtime = _make_runtime(tmp_path / "react", chats=(CHAT,))
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": "react"}
+        runtime.config.processing.reaction_emojis = ["🤙", "🥱"]
+        content = "Arvid, was hältst du davon?"
+
+        result = _admit(runtime, message_id="m1", content=content)
+        assert result.outcome.value == "observe", "react must not open an answer turn"
+        assert result.reply_action == "react"
+        assert result.react is True, "an answerable message becomes a reaction"
+        assert result.assignment is not None and result.assignment.turn_id is None
+        assert runtime.gate.admit_reply(_event(message_id="m1", content=content)) is False
+
+        class _Chooser:
+            async def choose(self, text: str, *, allowed: Sequence[str]) -> str | None:
+                assert list(allowed) == ["🤙", "🥱"], "the configured vocabulary is used"
+                assert text == content, "the chooser sees the message it reacts to"
+                return "🤙"
+
+        action = ReactionAction(
+            chooser=_Chooser(), router=runtime.router, allowed_emojis=("🤙", "🥱")
+        )
+        emoji = await action(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id="m1",
+            text=content,
+            principal="orderer@s.whatsapp.net",
+        )
+
+        assert emoji == "🤙"
+        assert runtime.transport.sent == ["🤙"], "the reaction reaches the transport"
+        effects = runtime.store.list_effects()
+        assert len(effects) == 1
+        assert effects[0].operation_key.startswith("reaction:whatsapp:")
+        assert "m1" in effects[0].operation_key, "the reaction carries its source"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_action_react_never_acknowledges_an_observed_message(tmp_path: Path) -> None:
+    """A reaction replaces an *answer*, not every message (spec: no acknowledgement emoji)."""
+    runtime = _make_runtime(tmp_path / "react-observed", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": "react"}
+        runtime.reload_policy(_policy(when_to_reply="mention_only"))
+
+        observed = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+
+        assert observed.outcome.value == "observe"
+        assert observed.react is False, "an unaddressed observation must not be acknowledged"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_action_react_sends_nothing_when_no_emoji_fits(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.reaction_action import ReactionAction
+
+    runtime = _make_runtime(tmp_path / "react-silent", chats=(CHAT,))
+    try:
+
+        class _Chooser:
+            async def choose(self, text: str, *, allowed: Sequence[str]) -> str | None:
+                return None
+
+        action = ReactionAction(
+            chooser=_Chooser(), router=runtime.router, allowed_emojis=("🤙",)
+        )
+        emoji = await action(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id="m1",
+            text="irgendwas",
+            principal="orderer@s.whatsapp.net",
+        )
+
+        assert emoji is None
+        assert runtime.transport.sent == []
+        assert runtime.store.list_effects() == ()
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_withdrawn_answer_survives_the_classic_admission(tmp_path: Path) -> None:
+    """The veto must hold where the typing indicator and the generation actually start.
+
+    The fast gate is not the last word: the classic pipeline asks `admit_reply` before it
+    shows typing or calls the provider. A withdrawn answer that still passes admission
+    would be answered anyway - and `react` needs the same guarantee.
+    """
+    runtime = _make_runtime(tmp_path / "silence-admission", chats=(CHAT,))
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": "silence"}
+        event = _event(message_id="m1", mentioned=True, content="Arvid, fasse das zusammen")
+
+        result = _admit(runtime, message_id="m1", content="Arvid, fasse das zusammen")
+
+        assert result.outcome.value == "observe"
+        assert runtime.gate.admit_reply(event) is False, (
+            "the classic pipeline would start typing and generate an answer"
+        )
     finally:
         runtime.store.close()
 

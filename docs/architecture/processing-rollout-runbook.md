@@ -31,8 +31,9 @@ Effective switches live in `config.json` (runtime tree):
 | `processing.budgets.outbox_waiting_per_chat` | waiting outbox cap | `20` |
 | `processing.threads.followupWindowSeconds` | how long a thread keeps taking continuations | `600` |
 | `processing.ambientChats` | chats where an unaddressed message may still be answered | `[]` |
-| `processing.replyActions` | per chat `answer` (default) or `silence`; `react` is wired next and not accepted yet | `{}` |
+| `processing.replyActions` | per chat `answer` (default), `react` or `silence` | `{}` |
 | `processing.reactionEmojis` | the emojis a model-chosen reaction may use | 14 approved emojis |
+| `processing.reactionRoute` | model route that picks the emoji for `react` (empty = the memory capture route) | `""` |
 | `processing.extraction.timezone` | IANA zone for relative dates ("morgen") | `UTC` |
 
 The gateway log states the effective mode on every start:
@@ -58,15 +59,20 @@ as `reaction_dropped` - never replaced by a guessed face, and never sent as text
 reaction-only reply simply stays silent. Confirmations the gateway decides itself (blocked
 input, name mention, admin acknowledgement) are not model choices and are unaffected.
 
+Two paths produce a model-chosen reaction, and both use this vocabulary:
+
+* the persona's `::reaction::<emoji>` marker in a generated answer;
+* `processing.replyActions: "react"` for a chat - a message that would have been answered
+  gets one reaction instead. That choice is a single small model call
+  (`processing.reactionRoute`), so it costs neither a persona prompt nor a typing
+  indicator, and it never acknowledges messages the chat only observes.
+
 Editing the list takes effect on the next gateway start:
 
 ```bash
 # config.json (runtime tree), then:
 systemctl --user restart yeoman-gateway
 ```
-
-The list also decides what `processing.replyActions: "react"` may send once that action is
-wired: the model then chooses an emoji from exactly this vocabulary instead of writing text.
 
 `new processing mode disables non-migrated capabilities: [...]` is expected and means the
 listed legacy capabilities (A2A, exec, browse, calendar) are refused for activated chats.

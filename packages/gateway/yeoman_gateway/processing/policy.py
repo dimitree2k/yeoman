@@ -134,6 +134,12 @@ class FastGateResult:
     journaled_event_id: str | None = None
     shadow: bool = False
     assignment: Any = None
+    #: The chat's configured reply action, so the channel knows whether this message is
+    #: answered, reacted to or silenced without re-reading the configuration.
+    reply_action: str = "answer"
+    #: True when this message would have been answered and the action turned that answer
+    #: into a reaction. Observed messages stay observed - no reaction, no acknowledgement.
+    react: bool = False
 
     @property
     def denied(self) -> bool:
@@ -241,11 +247,18 @@ class IngestGate:
         outcome = (
             FastGateOutcome.REACT if decision.should_respond else FastGateOutcome.OBSERVE
         )
-        if outcome is FastGateOutcome.REACT and self._reply_action(request) == "silence":
-            # An explicit silence veto: no turn, no effect, no typing indicator. It can
-            # only take an answer away, never grant one (routing spec).
+        reply_action = self._reply_action(request)
+        react = outcome is FastGateOutcome.REACT and reply_action == "react"
+        if outcome is FastGateOutcome.REACT and reply_action != "answer":
+            # `silence` and `react` both withdraw the answer turn: no turn, no effect from
+            # the answer path, no typing indicator. Silence sends nothing at all; `react`
+            # sends one reaction from its own path (routing spec, use cases 2 and 3). The
+            # action can only take an answer away, never grant one.
             logger.debug(
-                "reply_action_silence chat={} event_id={}", request.event.chat_id, request.event_id
+                "reply_action_withdrawn chat={} event_id={} action={}",
+                request.event.chat_id,
+                request.event_id,
+                reply_action,
             )
             outcome = FastGateOutcome.OBSERVE
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
@@ -255,7 +268,7 @@ class IngestGate:
             # signal proved the attachment, and what was decided. Never any content.
             logger.info(
                 "routing_decision chat={} event_id={} classification={} candidates={} "
-                "eligible={} topic_break={} continuity={} evidence={} action={} "
+                "eligible={} topic_break={} continuity={} evidence={} outcome={} "
                 "reply_action={} thread_id={} turn_id={} rule={} reason={}",
                 event.chat_id,
                 request.event_id,
@@ -281,18 +294,31 @@ class IngestGate:
             journaled=journaled,
             now=now,
             assignment=assignment,
+            reply_action=reply_action,
+            react=react,
         )
 
     # -- internals ---------------------------------------------------------------------
 
     def _reply_action(self, request: IngestRequest) -> str:
-        """The configured action for this chat: ``answer`` unless silenced."""
+        """The configured action for this chat: ``answer`` unless configured otherwise."""
+        return self._reply_action_for(request.event.channel, request.event.chat_id)
+
+    def _reply_action_for(self, channel: str, chat_id: str) -> str:
+        """``answer``, ``react`` or ``silence`` - never a silent fallback for a typo.
+
+        An unknown value would be a switch that looks set but does nothing, so it degrades
+        to ``answer`` and says so once per occurrence.
+        """
         actions = getattr(self._config, "reply_actions", None) or {}
         if not isinstance(actions, Mapping):
             return "answer"
-        key = f"{request.event.channel}:{request.event.chat_id}"
+        key = f"{channel}:{chat_id}"
         value = str(actions.get(key, "answer") or "answer").strip().lower()
-        return value if value in {"answer", "silence"} else "answer"
+        if value in {"answer", "react", "silence"}:
+            return value
+        logger.warning("reply_action_unknown chat={} value={}", chat_id, value[:24])
+        return "answer"
 
     def _assign(self, request: IngestRequest, *, now: int, allow_turn: bool) -> Any:
         """Attach the canonical event to its thread; never runs for a denied event.
@@ -323,6 +349,10 @@ class IngestGate:
         message_id = str(event.message_id or "").strip()
         if not message_id:
             return None
+        if self._reply_action_for(event.channel, event.chat_id) != "answer":
+            # Second line of defence: nothing may quietly open a turn for a withdrawn
+            # answer, whoever calls this.
+            return None
         request = IngestRequest(
             event_key=f"{event.channel}:{event.chat_id}:{message_id}",
             event_id=message_id,
@@ -347,11 +377,25 @@ class IngestGate:
         return None
 
     def admit_reply(self, event: InboundEvent) -> bool:
-        """Ensure managed replies have a turn before generation or typing."""
+        """Ensure managed replies have a turn before generation or typing.
+
+        This is the last station before the typing indicator and the provider call, so a
+        withdrawn answer has to be refused *here*: reconciliation opens a turn on its own,
+        and a veto that only lives in the fast gate would be answered anyway.
+        """
         if not self.enabled_for(event.channel, event.chat_id) or self.shadowed(
             event.channel, event.chat_id
         ):
             return True
+        action = self._reply_action_for(event.channel, event.chat_id)
+        if action != "answer":
+            logger.debug(
+                "reply_admission_refused chat={} message_id={} action={}",
+                event.chat_id,
+                event.message_id,
+                action,
+            )
+            return False
         return self.reconcile_reply(event) is not None
 
     def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
@@ -404,6 +448,8 @@ class IngestGate:
         now: int,
         shadow: bool = False,
         assignment: Any = None,
+        reply_action: str = "answer",
+        react: bool = False,
     ) -> FastGateResult:
         event = request.event
         decision = DecisionRecord(
@@ -431,6 +477,8 @@ class IngestGate:
             journaled_event_id=journaled,
             shadow=shadow,
             assignment=assignment,
+            reply_action=reply_action,
+            react=react,
         )
 
 
