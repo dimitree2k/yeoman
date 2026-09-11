@@ -142,6 +142,14 @@ class JoinDecision:
     quote_ref: str | None = None
     quote_allowed: bool = False
     source_message_ids: tuple[str, ...] = ()
+    #: Observation fields (routing spec, acceptance criterion 12): how many candidates
+    #: were examined, how many were eligible, and what the continuity verdict was.
+    candidates_checked: int = 0
+    candidates_eligible: int = 0
+    topic_break: str = "unknown"
+    continuity_kind: str = "none"
+    continuity_verdict: str = "none"
+    continuity_evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,7 +403,8 @@ class ThreadRegistry:
                 new_turn=False,
             )
 
-        decision = self.decide(data, self.view_for(data, now_ms=moment))
+        view = self.view_for(data, now_ms=moment)
+        decision = self._observed(self.decide(data, view), data, view)
         if event.kind == "reaction":
             decision = replace(
                 decision,
@@ -422,6 +431,23 @@ class ThreadRegistry:
             )
             return decision
         return self._persist(event, data, decision, now_ms=moment, allow_turn=allow_turn)
+
+    def _observed(
+        self, decision: JoinDecision, data: JoinInput, view: JoinView
+    ) -> JoinDecision:
+        """Attach the observation fields: candidates, topic signal, continuity verdict."""
+        continuum = getattr(view, "continuum", None)
+        return replace(
+            decision,
+            candidates_checked=len(view.active_threads_for_principal),
+            candidates_eligible=(
+                1 if getattr(view, "continuity_positive", False) else 0
+            ),
+            topic_break=str(getattr(data, "topic_break", "unknown")),
+            continuity_kind=str(getattr(continuum, "kind", "none") or "none"),
+            continuity_verdict=str(getattr(continuum, "verdict", "unknown") or "unknown"),
+            continuity_evidence=tuple(getattr(continuum, "evidence_ids", ()) or ()),
+        )
 
     def _ambient_allowed(self, data: JoinInput) -> bool:
         """Whether this chat lets an unaddressed message be answered at all."""

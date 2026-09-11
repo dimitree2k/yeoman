@@ -787,6 +787,15 @@ class IntentEffectRouter:
             return blocked
 
         result = await self._gateway.execute_ready(receipt.effect_id)
+        logger.info(
+            "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",
+            receipt.effect_id,
+            result.state,
+            chat_id,
+            turn_id or "-",
+            turn_revision,
+            getattr(result, "detail", None) or "-",
+        )
         self._close_ambient_turn(turn_id, now=now)
         return self._log_undelivered(result, envelope, chat_id)
 

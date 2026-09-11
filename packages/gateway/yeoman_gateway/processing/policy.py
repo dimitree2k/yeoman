@@ -249,17 +249,28 @@ class IngestGate:
             )
             outcome = FastGateOutcome.OBSERVE
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
-        if assignment is not None and assignment.thread_id:
-            # Positive rollout marker: the degraded paths log too (threads_degraded,
-            # assignment_unavailable), so an operator can grep both directions.
+        if assignment is not None:
+            # One observation line per message (routing spec, criterion 12): what the
+            # message was classified as, how many candidates existed, which continuity
+            # signal proved the attachment, and what was decided. Never any content.
             logger.info(
-                "thread_assigned chat={} event_id={} thread_id={} turn_id={} rule={} turn={}",
+                "routing_decision chat={} event_id={} classification={} candidates={} "
+                "eligible={} topic_break={} continuity={} evidence={} action={} "
+                "reply_action={} thread_id={} turn_id={} rule={} reason={}",
                 event.chat_id,
                 request.event_id,
-                assignment.thread_id,
+                "assigned" if assignment.thread_id else "no_thread",
+                getattr(assignment, "candidates_checked", 0),
+                getattr(assignment, "candidates_eligible", 0),
+                getattr(assignment, "topic_break", "unknown"),
+                getattr(assignment, "continuity_kind", "none"),
+                ",".join(getattr(assignment, "continuity_evidence", ()) or ()) or "-",
+                outcome.value,
+                self._reply_action(request),
+                assignment.thread_id or "-",
                 assignment.turn_id or "-",
                 assignment.rule,
-                outcome.value,
+                getattr(assignment, "reason", "") or "-",
             )
         return self._record(
             request,

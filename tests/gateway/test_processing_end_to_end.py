@@ -613,3 +613,34 @@ async def test_an_ambient_answer_closes_its_turn_after_sending(tmp_path: Path) -
         assert runtime.transport.sent == ["answer"]
     finally:
         runtime.store.close()
+
+
+def test_the_observation_line_shows_the_reasoning_without_content(runtime) -> None:
+    """Criterion 12: classification, candidates, signal with evidence, action, lineage.
+
+    The line exists so an operator can see *why* a message was attached or not; it must
+    never carry message text.
+    """
+    from loguru import logger
+
+    secret = "GEHEIMER-INHALT-4711"
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        _admit(runtime, message_id="m1", content=f"Fasse den Mietvertrag zusammen. {secret}")
+        _admit(
+            runtime,
+            message_id="m2",
+            content="Zum Mietvertrag: ergänze bitte die Kündigungsfrist.",
+        )
+    finally:
+        logger.remove(sink)
+
+    lines = [record for record in records if "routing_decision" in record]
+    assert len(lines) >= 2, f"expected one observation line per message: {records}"
+    continuation = [line for line in lines if "continuity=explicit_callback" in line]
+    assert continuation, f"the call-back signal is not visible: {lines}"
+    assert "evidence=" in continuation[0] and "evidence=-" not in continuation[0], (
+        "the proving source ids must be visible"
+    )
+    assert all(secret not in line for line in lines), "the observation line leaked content"

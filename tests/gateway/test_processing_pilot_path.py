@@ -400,7 +400,12 @@ def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None
 
 
 def test_gate_logs_a_positive_assignment_marker(runtime) -> None:
-    """Rollout visibility works in both directions: assigned and degraded."""
+    """Rollout visibility works in both directions: assigned and degraded.
+
+    The marker is the per-message observation line (routing spec, criterion 12): it shows
+    the classification, candidate counts, continuity verdict with evidence, the action and
+    the lineage - and no message content.
+    """
     from loguru import logger
 
     _store, _registry, gate, _router, _transport, _adapter = runtime
@@ -418,4 +423,20 @@ def test_gate_logs_a_positive_assignment_marker(runtime) -> None:
     finally:
         logger.remove(sink)
 
-    assert any("thread_assigned" in record for record in records)
+    markers = [record for record in records if "routing_decision" in record]
+    assert markers, f"no observation line was logged: {records}"
+    line = markers[0]
+    for field in (
+        "classification=",
+        "candidates=",
+        "eligible=",
+        "topic_break=",
+        "continuity=",
+        "evidence=",
+        "action=",
+        "reply_action=",
+        "thread_id=",
+        "turn_id=",
+    ):
+        assert field in line, f"{field} missing from {line}"
+    assert "assigned" in line or "no_thread" in line
