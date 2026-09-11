@@ -825,12 +825,14 @@ class IntentEffectRouter:
             created_ms=now,
         )
         receipt = self._gateway.submit(envelope)
+        self._plan_quotable_message(envelope, turn=turn, now=now)
 
         blocked = self._capacity_block(channel, chat_id, payload, receipt.effect_id)
         if blocked is not None:
             return blocked
 
         result = await self._gateway.execute_ready(receipt.effect_id)
+        self._confirm_quotable_message(envelope, result, now=now)
         logger.info(
             "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",
             receipt.effect_id,
@@ -842,6 +844,48 @@ class IntentEffectRouter:
         )
         self._close_ambient_turn(turn_id, now=now)
         return self._log_undelivered(result, envelope, chat_id)
+
+    def _plan_quotable_message(self, envelope: EffectEnvelope, *, turn: Any, now: int) -> None:
+        """Reserve the anchor a later reply to this message has to resolve to.
+
+        A reply can only continue a thread when the replied-to bot message is a *confirmed*
+        anchor (spec: bot messages must be proven as sent). The row is created with the
+        effect id and filled in with the provider id once the transport reports it, so a
+        planned effect never becomes quotable.
+        """
+        thread_id = str(getattr(turn, "thread_id", "") or "")
+        if not thread_id or envelope.payload.kind not in {"text", "media"}:
+            return
+        store = getattr(self._gateway, "store", None)
+        register = getattr(store, "register_thread_message", None)
+        if register is None:
+            return
+        try:
+            register(
+                thread_id=thread_id,
+                turn_id=str(getattr(turn, "turn_id", "") or "") or None,
+                direction="out",
+                effect_id=envelope.effect_id,
+                now_ms=int(now),
+            )
+        except Exception as exc:  # pragma: no cover - defensive, like other store hooks
+            logger.debug("thread_message_plan_skipped effect={} error={}", envelope.effect_id, exc)
+
+    def _confirm_quotable_message(self, envelope: EffectEnvelope, result: Any, *, now: int) -> None:
+        """Attach the provider message id the transport reported, if it reported one."""
+        provider_id = str(
+            getattr(getattr(result, "transport_receipt", None), "provider_message_id", "") or ""
+        )
+        if not provider_id:
+            return
+        store = getattr(self._gateway, "store", None)
+        attach = getattr(store, "attach_confirmed_message_id", None)
+        if attach is None:
+            return
+        try:
+            attach(envelope.effect_id, provider_id, int(now))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("thread_message_confirm_skipped effect={} error={}", envelope.effect_id, exc)
 
     def _close_ambient_turn(self, turn_id: str, *, now: int) -> None:
         """An ambient order ends with its answer: turn and thread close right away.

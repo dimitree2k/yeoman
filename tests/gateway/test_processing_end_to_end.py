@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -1137,3 +1137,79 @@ async def test_an_unapproved_ambient_reaction_is_refused(tmp_path: Path) -> None
         assert runtime.store.list_effects() == ()
     finally:
         runtime.store.close()
+
+
+# replies to a bot message ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_reply_to_a_bot_message_continues_its_thread(tmp_path: Path) -> None:
+    """Routing spec, criterion 3: a reply to a known message beats every heuristic.
+
+    The reply target must survive the trip into the journal, and the bot's own message must
+    be a *confirmed* anchor - a planned effect may not become quotable.
+    """
+    runtime = _make_runtime(tmp_path / "reply-continues", chats=(CHAT,))
+    try:
+        first = _admit(runtime, message_id="m1", content="Arvid, fasse das zusammen")
+        assert first.assignment is not None and first.assignment.turn_id
+
+        # The answer is dispatched through the effect router, which registers the anchor.
+        await _dispatch(runtime, message_id="m1")
+        effect = runtime.store.list_effects()[-1]
+        stored = runtime.store.get_effect(effect.effect_id)
+        assert stored is not None
+
+        # The transport reported a provider id, so the message is quotable now.
+        anchor = "PROVIDER-MESSAGE-1"
+        runtime.store.attach_confirmed_message_id(effect.effect_id, anchor, 1_700_000_000_000)
+        assert runtime.store.thread_for_message(anchor) is not None, "the anchor is confirmed"
+
+        reply_event = _event(message_id="m2", content="und bitte kurz")
+        reply_event = replace(
+            reply_event,
+            reply_to_bot=True,
+            reply_to_message_id=anchor,
+        )
+        verdict = runtime.gate.admit(
+            IngestRequest(
+                event_key=f"whatsapp:{CHAT}:m2",
+                event_id="m2",
+                trace_id="tr-m2",
+                event=reply_event,
+            )
+        )
+
+        assert verdict.outcome.value == "react", "a reply to the bot is answered"
+        assert verdict.assignment is not None
+        assert verdict.assignment.rule == "reply_known", verdict.assignment.rule
+        assert verdict.assignment.thread_id == first.assignment.thread_id, (
+            "the reply continues the thread it answers"
+        )
+        assert verdict.ambient_candidate is False, "a known reply is not ambient"
+    finally:
+        runtime.store.close()
+
+
+def test_the_journal_keeps_the_reply_target() -> None:
+    """The reply target must come from the event field, not only from metadata."""
+    from yeoman_gateway.processing.policy import IngestGate
+
+    gate = IngestGate.__new__(IngestGate)
+    request = IngestRequest(
+        event_key="whatsapp:chat:m1",
+        event_id="m1",
+        trace_id="tr-m1",
+        event=replace(
+            _event(message_id="m1"),
+            reply_to_bot=True,
+            reply_to_message_id="TARGET-1",
+            reply_to_text="die Antwort davor",
+        ),
+    )
+
+    payload = gate._canonical_event(request).payload
+
+    assert payload["reply_to_message_id"] == "TARGET-1"
+    assert payload["reply_to_bot"] is True
+    assert payload["reply_to_text"] == "die Antwort davor"

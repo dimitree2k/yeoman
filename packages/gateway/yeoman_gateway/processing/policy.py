@@ -557,7 +557,17 @@ class IngestGate:
             "is_group": event.is_group,
             "mentioned_bot": event.mentioned_bot,
             "reply_to_bot": event.reply_to_bot,
-            "reply_to_message_id": event.raw_metadata.get("reply_to_message_id"),
+            # The event field first: the channel fills it from the bridge, while
+            # raw_metadata only carries what the channel chose to copy. Reading only the
+            # metadata silently dropped every reply target, so a reply to a bot message
+            # could never attach to its thread (routing spec, criterion 3).
+            "reply_to_message_id": (
+                event.reply_to_message_id
+                or event.raw_metadata.get("reply_to_message_id")
+                or event.raw_metadata.get("reply_to")
+            ),
+            "reply_to_text": event.reply_to_text,
+            "reply_to_participant": event.reply_to_participant,
             "media": list(event.media),
         }
         payload.update(dict(request.payload_extra))
