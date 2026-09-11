@@ -61,6 +61,7 @@ from yeoman_gateway.processing.dispatch import (
     ServiceEffectProducer,
     disable_non_migrated_tools,
 )
+from yeoman_gateway.processing.invalidation import SignalInvalidator
 from yeoman_gateway.processing.models import canonical_hash
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.providers.factory import ProviderFactory
@@ -889,7 +890,20 @@ def build_gateway_runtime(
         document_cache=document_cache,
         processing_gate=processing_gate,
         processing_signals=(
-            SignalJournalSink(processing_store) if processing_store is not None else None
+            SignalJournalSink(
+                processing_store,
+                invalidator=(
+                    SignalInvalidator(
+                        store=processing_store,
+                        actors=thread_registry,
+                        memory=memory_service,
+                    )
+                    if processing_store is not None and config.processing.enabled
+                    else None
+                ),
+            )
+            if processing_store is not None
+            else None
         ),
     )
 

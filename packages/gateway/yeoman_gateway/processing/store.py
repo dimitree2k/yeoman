@@ -1490,6 +1490,17 @@ class ProcessingStore:
             str(row["turn_id"]) if row["turn_id"] is not None else None,
         )
 
+    def events_by_source_message(self, message_id: str) -> tuple[Any, ...]:
+        """Journaled events that carry this provider message id, oldest first."""
+        if not message_id:
+            return ()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM events WHERE source_message_id = ? ORDER BY created_ms, event_id",
+                (str(message_id),),
+            ).fetchall()
+        return tuple(self._event_from_row(row) for row in rows)
+
     def resolve_reference(self, reference: str | None) -> tuple[str | None, str | None] | None:
         """Resolve a reply/correction reference to (thread_id, turn_id).
 

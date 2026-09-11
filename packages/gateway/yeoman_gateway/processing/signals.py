@@ -20,6 +20,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from yeoman_gateway.processing.models import (
     DELIVERED_STATUSES_TUPLE as _DELIVERED,
 )
@@ -351,10 +353,14 @@ class SignalJournalSink:
         *,
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
+        invalidator: Any | None = None,
     ) -> None:
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
+        # Review F05: an edit/delete must not stop at the journal. The invalidator raises
+        # the turn revision, cancels stale effects and revokes derived facts.
+        self._invalidator = invalidator
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
         if self._store is None:
@@ -363,13 +369,20 @@ class SignalJournalSink:
         if signal is None:
             return None
         now = int(self._clock()) if self._clock is not None else None
-        return self._store.append_event(
+        event_id = self._store.append_event(
             event_key=signal.event_key,
             event_id=signal.event_id,
             trace_id=signal.trace_id,
             payload=signal.to_event_payload(),
             now_ms=now,
         )
+        if self._invalidator is not None and str(kind) in ("edit", "delete"):
+            try:
+                self._invalidator(kind, payload)
+            except Exception as exc:
+                # Journaling is the durable contract; invalidation must never break it.
+                logger.warning("signal invalidation failed kind={} error={}", kind, exc)
+        return event_id
 
 
 def attach_receipt_evidence(

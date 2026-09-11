@@ -150,3 +150,140 @@ def test_f01_an_unopenable_store_stops_startup_instead_of_falling_back(tmp_path:
     assert build_processing_store(config) is None
     assert build_processing_gate(config, None, None, None) is None
     assert build_effect_router(config, None, None, None) is None
+
+
+def _store_with_message(tmp_path: Path, *, message_id: str = "m1", principal: str = "author-1"):
+    """A store with one journaled message event that carries a turn."""
+    store = _store(tmp_path)
+    thread_id = store.open_thread(
+        channel="whatsapp",
+        chat_id=CHAT_A,
+        root_principal=principal,
+        kind="dm",
+        trigger_event_id=message_id,
+        now_ms=T0,
+    )
+    turn_id = store.open_turn(
+        thread_id=thread_id, principal=principal, trigger_event_id=message_id, now_ms=T0
+    )
+    store.append_event(
+        event_key=f"whatsapp:{CHAT_A}:message:{message_id}",
+        event_id=message_id,
+        trace_id=f"tr-{message_id}",
+        payload={"text": "Fasse den Mietvertrag zusammen."},
+        now_ms=T0,
+    )
+    # The gate writes exactly these columns when it assigns an admitted message.
+    store._conn.execute(
+        "UPDATE events SET source_message_id = ?, principal = ?, channel = ?, chat_id = ?,"
+        " kind = 'message', thread_id = ?, turn_id = ? WHERE event_id = ?",
+        (message_id, principal, "whatsapp", CHAT_A, thread_id, turn_id, message_id),
+    )
+    store._conn.commit()
+    return store, thread_id, turn_id
+
+
+def test_f05_delete_signal_invalidates_the_turn_and_its_effects(tmp_path: Path) -> None:
+    """Review F05: the signal path only journaled. It must reach turn and effects."""
+    from yeoman_gateway.processing.invalidation import SignalInvalidator
+    from yeoman_gateway.processing.signals import SignalJournalSink
+
+    store, _thread_id, turn_id = _store_with_message(tmp_path)
+    _queued(store, "fx-pending", CHAT_A)
+    # The queued effect belongs to the turn whose source is about to be deleted.
+    store._conn.execute(
+        "UPDATE effects SET turn_id = ?, turn_revision = 1 WHERE effect_id = ?",
+        (turn_id, "fx-pending"),
+    )
+    store._conn.commit()
+
+    sink = SignalJournalSink(
+        store,
+        invalidator=SignalInvalidator(store=store, clock=lambda: T0 + 100),
+    )
+    sink(
+        "delete",
+        {"chatJid": CHAT_A, "messageId": "m1", "senderId": "author-1", "isGroup": False},
+    )
+
+    turn = store.get_turn(turn_id)
+    assert turn is not None and turn.revision == 2, "the turn revision was not raised"
+    assert store.effect_state("fx-pending") == "cancelled"
+    # The deletion itself is still journaled as evidence.
+    kinds = [row[0] for row in store._conn.execute("SELECT kind FROM events").fetchall()]
+    assert "delete" in kinds
+    store.close()
+
+
+def test_f05_a_foreign_delete_is_refused_and_changes_nothing(tmp_path: Path) -> None:
+    """Not every signal carries authority: someone else's delete invalidates nothing."""
+    from yeoman_gateway.processing.invalidation import SignalInvalidator
+
+    store, _thread_id, turn_id = _store_with_message(tmp_path)
+    invalidator = SignalInvalidator(store=store, clock=lambda: T0 + 100)
+
+    result = invalidator(
+        "delete",
+        {"chatJid": CHAT_A, "messageId": "m1", "senderId": "someone-else", "isGroup": False},
+    )
+
+    assert result.applied is False
+    assert result.refused == "sender_is_not_author"
+    turn = store.get_turn(turn_id)
+    assert turn is not None and turn.revision == 1
+    store.close()
+
+
+def test_f05_a_reaction_never_invalidates(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.invalidation import SignalInvalidator
+
+    store, _thread_id, turn_id = _store_with_message(tmp_path)
+    invalidator = SignalInvalidator(store=store, clock=lambda: T0 + 100)
+
+    result = invalidator(
+        "reaction",
+        {"chatJid": CHAT_A, "messageId": "m1", "senderId": "author-1", "emoji": "👍"},
+    )
+
+    assert result.applied is False
+    assert result.refused == "not_an_invalidating_signal"
+    turn = store.get_turn(turn_id)
+    assert turn is not None and turn.revision == 1
+    store.close()
+
+
+def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> None:
+    """An edit replaces the statement; a delete removes it."""
+    from yeoman_gateway.memory.shared_facts import FactSource, SharedFact
+    from yeoman_gateway.processing.invalidation import SignalInvalidator
+
+    store, _thread_id, _turn_id = _store_with_message(tmp_path)
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], str]] = []
+
+        def invalidate_sources(self, ids, *, now_ms, kind=None):
+            self.calls.append((list(ids), str(kind)))
+
+            class _Report:
+                revoked = ()
+                superseded = ("fact-1",)
+                jobs_cancelled = 2
+
+            return _Report()
+
+    memory = _Memory()
+    invalidator = SignalInvalidator(store=store, memory=memory, clock=lambda: T0 + 100)
+
+    result = invalidator(
+        "edit",
+        {"chatJid": CHAT_A, "messageId": "m1", "senderId": "author-1", "text": "neu"},
+    )
+
+    assert memory.calls == [(["m1"], "edit")]
+    assert result.facts_superseded == ("fact-1",)
+    assert result.jobs_cancelled == 2
+    # A shared-fact path exists and is reachable from here (sanity, not behaviour).
+    assert FactSource and SharedFact
+    store.close()
