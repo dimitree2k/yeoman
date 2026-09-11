@@ -216,3 +216,28 @@ def test_criterion_14_a_closed_turn_gets_the_next_turn_in_the_same_thread(tmp_pa
     assert decision.turn_id != first.turn_id, "the closed turn is not reopened"
     assert decision.new_turn is True
     store.close()
+
+
+# criterion 7 -------------------------------------------------------------------------------
+
+
+def test_criterion_7_each_ambient_order_gets_its_own_lineage(tmp_path: Path) -> None:
+    """No shared chat turn for independent ambient orders.
+
+    Criterion 7 asks for a valid lineage per ambient order; the effect side of that (the
+    answer carrying its own turn) is covered end to end by
+    ``test_an_ambient_answer_closes_its_turn_after_sending``.
+    """
+    store = _store(tmp_path)
+    registry = _seed(store, _event("m1", "erster Gedanke"))
+    first = registry.assign(_event("m1", "erster Gedanke"), now_ms=T0)
+    second = registry.assign(_event("m2", "zweiter Gedanke"), now_ms=T0 + 500)
+
+    assert first.thread_id and second.thread_id
+    assert first.thread_id != second.thread_id
+    assert first.turn_id != second.turn_id
+    # Neither order borrows the other's thread or turn.
+    assert store.get_turn(str(second.turn_id)).thread_id == second.thread_id
+    assert store.get_thread(str(first.thread_id)).kind == "ambient"
+    assert store.get_thread(str(second.thread_id)).kind == "ambient"
+    store.close()
