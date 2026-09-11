@@ -45,6 +45,7 @@ class ChannelManager:
         processing_gate: Any | None = None,
         processing_signals: Any | None = None,
         reaction_action: Any | None = None,
+        ambient_judge: Any | None = None,
     ):
         self.config = config
         self.bus = bus
@@ -57,6 +58,7 @@ class ChannelManager:
         self.processing_gate = processing_gate
         self.processing_signals = processing_signals
         self.reaction_action = reaction_action
+        self.ambient_judge = ambient_judge
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._reaction_dispatch_task: asyncio.Task | None = None
@@ -116,6 +118,10 @@ class ChannelManager:
                     )
                     if reaction_setter is not None:
                         reaction_setter(self.reaction_action)
+                if self.ambient_judge is not None:
+                    judge_setter = getattr(self.channels["whatsapp"], "set_ambient_judge", None)
+                    if judge_setter is not None:
+                        judge_setter(self.ambient_judge)
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:
                 logger.warning(f"WhatsApp channel not available: {e}")

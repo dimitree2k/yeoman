@@ -66,13 +66,21 @@ def _config(
     waiting_cap: int = 20,
     soft_enforce: bool = False,
     ambient: tuple[str, ...] = (),
+    ambient_brake: tuple[int, int] = (0, 0),
 ) -> Config:
+    # The ambient brake is off in these tests unless a test asks for it: they are about
+    # permission and lineage, and the brake has tests of its own.
+    seconds, messages = ambient_brake
     return Config.model_validate(
         {
             "processing": {
                 "enabled": True,
                 "chats": [f"whatsapp:{chat}" for chat in chats],
                 "ambient_chats": [f"whatsapp:{chat}" for chat in ambient],
+                "ambient": {
+                    "min_seconds_between_answers": seconds,
+                    "min_messages_since_answer": messages,
+                },
                 "budgets": {
                     "outbox_waiting_per_chat": waiting_cap,
                     "thread_soft_enforce": soft_enforce,
@@ -137,6 +145,7 @@ def _make_runtime(
     waiting_cap: int = 20,
     soft_enforce: bool = False,
     ambient: tuple[str, ...] = (),
+    ambient_brake: tuple[int, int] = (0, 0),
     **kwargs,
 ) -> _Runtime:
     policy_path = tmp_path / "policy.json"
@@ -155,6 +164,7 @@ def _make_runtime(
         waiting_cap=waiting_cap,
         soft_enforce=soft_enforce,
         ambient=ambient,
+        ambient_brake=ambient_brake,
     )
     # Pin the database: reopening must never fall back to the default (live) path.
     config.processing.db_path = str(tmp_path / "processing.db")
@@ -728,13 +738,24 @@ async def test_a_withdrawn_answer_survives_the_classic_admission(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_an_ambient_answer_closes_its_turn_after_sending(tmp_path: Path) -> None:
-    """Spec: an ambient answer is short-lived - it must not leave open durable work."""
+    """Spec: an ambient answer is short-lived - it must not leave open durable work.
+
+    The brake and the judge run first (see the ambient brake tests); this one starts after
+    the verdict, where the channel opens the turn with `reconcile_reply`.
+    """
     runtime = _make_runtime(tmp_path / "ambient", chats=(CHAT,), ambient=(CHAT,))
     try:
+        event = _event(message_id="m1", content="nur so ein Gedanke", mentioned=False)
         result = _admit(
             runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False
         )
-        assignment = result.assignment
+        assert result.ambient_candidate is True, "the brake let this one through"
+        assert result.assignment is not None and result.assignment.turn_id is None, (
+            "the turn is opened only after the judge's yes"
+        )
+
+        assignment = runtime.gate.reconcile_reply(event)
+        runtime.gate.note_ambient_answer("m1")
         assert assignment is not None and assignment.turn_id, "ambient needs its own lineage"
         thread = runtime.store.get_thread(str(assignment.thread_id))
         assert thread is not None and thread.kind == "ambient"
@@ -787,6 +808,10 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
     Under ``allowed_senders`` and ``owner_only`` a permitted sender's unmarked message in
     a group may be answered like under ``all`` - no address needed. A sender who is not
     permitted is answered neither because of a mention nor because of a continuity signal.
+
+    "May be answered" is still a two-step decision: the gate marks it as an ambient
+    candidate (brake passed, permission granted) and the judge decides whether it speaks.
+    An unpermitted sender's message never even becomes a candidate.
     """
     permitted = "orderer@s.whatsapp.net"
     stranger = "stranger@s.whatsapp.net"
@@ -798,7 +823,8 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
             _policy(when_to_reply="allowed_senders", senders=(permitted,))
         )
         allowed = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
-        assert allowed.outcome.value == "react", "a permitted sender may be answered"
+        assert allowed.ambient_candidate is True, "a permitted sender may be answered"
+        assert allowed.outcome.value == "observe", "the judge still has to agree"
 
         # The same message from someone else is admitted as context at most - never
         # answered. Admission (whoCanTalk) and reply permission (whenToReply) are
@@ -810,7 +836,7 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
             mentioned=True,
             sender=stranger,
         )
-        assert denied.outcome.value != "react", "an unpermitted sender is never answered"
+        assert denied.ambient_candidate is False, "an unpermitted sender is never answered"
         assert denied.outcome.value == "observe"
 
         # A continuity signal does not make them answerable either: the gate journaled m2
@@ -849,7 +875,7 @@ def test_criterion_16_permitted_senders_answer_ambient_and_others_never_do(tmp_p
             mentioned=False,
             sender="owner@s.whatsapp.net",
         )
-        assert owner.outcome.value == "react", "the owner may be answered without a mention"
+        assert owner.ambient_candidate is True, "the owner may be answered without a mention"
     finally:
         owner_runtime.store.close()
 
@@ -938,3 +964,87 @@ async def test_a_gateway_decision_is_not_the_models_taste(runtime) -> None:
 
     assert await runtime.router.submit_reaction(blocked, principal="orderer@s.whatsapp.net") is True
     assert runtime.transport.sent == ["🚫"]
+
+
+# the ambient brake ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_brake_needs_both_time_and_messages(tmp_path: Path) -> None:
+    """A precondition, not a schedule: nothing is judged before both thresholds are met."""
+    runtime = _make_runtime(
+        tmp_path / "brake", chats=(CHAT,), ambient=(CHAT,), ambient_brake=(300, 6)
+    )
+    try:
+        first = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+        assert first.ambient_candidate is False, "one quiet message is not a conversation"
+        assert first.outcome.value == "observe"
+        assert runtime.store.list_effects() == ()
+
+        for index in range(2, 7):
+            admitted = _admit(
+                runtime, message_id=f"m{index}", content=f"Gedanke {index}", mentioned=False
+            )
+        # The sixth message in the window is the first one the judge may look at.
+        assert admitted.ambient_candidate is True, "six messages are a conversation"
+        assert admitted.outcome.value == "observe", "the judge still decides"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_brake_restarts_its_window_after_every_verdict(tmp_path: Path) -> None:
+    """An answer - and a decline - both restart the window, so the judge stays rare."""
+    runtime = _make_runtime(
+        tmp_path / "brake-window", chats=(CHAT,), ambient=(CHAT,), ambient_brake=(300, 1)
+    )
+    try:
+        granted = _admit(runtime, message_id="m1", content="Frage an die Runde", mentioned=False)
+        assert granted.ambient_candidate is True
+        runtime.gate.note_ambient_answer("m1")
+
+        after_answer = _admit(runtime, message_id="m2", content="noch ein Gedanke", mentioned=False)
+        assert after_answer.ambient_candidate is False, "the answered window starts over"
+
+        runtime.gate.note_ambient_declined("m2")
+        declined = _admit(runtime, message_id="m3", content="und noch einer", mentioned=False)
+        assert declined.ambient_candidate is False, "a decline starts the window over too"
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_declined_ambient_message_can_never_be_answered(tmp_path: Path) -> None:
+    """The judge's no is final: the classic pipeline must not answer it anyway."""
+    runtime = _make_runtime(tmp_path / "ambient-declined", chats=(CHAT,), ambient=(CHAT,))
+    try:
+        event = _event(message_id="m1", content="nur so ein Gedanke", mentioned=False)
+        verdict = _admit(runtime, message_id="m1", content="nur so ein Gedanke", mentioned=False)
+        assert verdict.ambient_candidate is True
+
+        runtime.gate.note_ambient_declined("m1")
+
+        assert runtime.gate.admit_reply(event) is False, (
+            "a declined ambient message must not reach typing or the provider"
+        )
+        assert runtime.gate.reconcile_reply(event) is not None, (
+            "a granted message may still be opened by the channel"
+        )
+    finally:
+        runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_addressed_message_ignores_the_ambient_brake(tmp_path: Path) -> None:
+    """The brake is about unaddressed traffic; an order is answered immediately."""
+    runtime = _make_runtime(
+        tmp_path / "brake-addressed", chats=(CHAT,), ambient=(CHAT,), ambient_brake=(600, 99)
+    )
+    try:
+        result = _admit(runtime, message_id="m1", content="Arvid, hilf mir", mentioned=True)
+
+        assert result.outcome.value == "react", "an addressed order needs no brake"
+        assert result.ambient_candidate is False
+        assert result.assignment is not None and result.assignment.turn_id, "it gets its turn"
+    finally:
+        runtime.store.close()

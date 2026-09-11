@@ -34,6 +34,9 @@ Effective switches live in `config.json` (runtime tree):
 | `processing.replyActions` | per chat `answer` (default), `react` or `silence` | `{}` |
 | `processing.reactionEmojis` | the emojis a model-chosen reaction may use | 14 approved emojis |
 | `processing.reactionRoute` | model route that picks the emoji for `react` (empty = the memory capture route) | `""` |
+| `processing.ambient.minSecondsBetweenAnswers` | minimum distance between two ambient answers in one chat | `300` |
+| `processing.ambient.minMessagesSinceAnswer` | how much new chatter is required first | `6` |
+| `processing.ambient.judgeMinConfidence` | how sure the judge must be before answering at all | `0.75` |
 | `processing.extraction.timezone` | IANA zone for relative dates ("morgen") | `UTC` |
 
 The gateway log states the effective mode on every start:
@@ -50,6 +53,26 @@ yeoman logs | grep routing_decision     # classification, candidates, signal, ac
 yeoman logs | grep routing_effect       # one line per queued effect
 yeoman logs | grep reaction_dropped     # a model-chosen emoji that is not approved
 ```
+
+### Ambient answers (unaddressed messages)
+
+Answering a message Arvid was not addressed in is the most expensive thing this mode can
+do, so it takes three gates, in this order:
+
+1. **Permission** - the chat's policy must allow an answer at all (`all`, `allowed_senders`
+   or `owner_only`; `mention_only` observes). Direct addresses - mention, reply, or a plain
+   `Arvid, …` request - never take this path and are answered immediately.
+2. **Brake** (`processing.ambient.*`) - both thresholds must be met: enough time since the
+   last ambient answer *and* enough new messages since then. Until they are, the message is
+   only observed: no turn, no typing indicator, no model call.
+3. **Judge** - one small model call (`processing.ambient.judgeRoute`) with a strict question
+   ("does this need him?"). Only a confident yes opens the answer turn; a no, an error or a
+   timeout means silence, and the brake window starts over - so the judge is asked at most
+   once per window instead of once per message.
+
+Observable per message: `ambient_brake` (why not yet), `ambient_judge` (answer, confidence,
+threshold), `ambient_answer_granted`. A declined message stays declined: the classic
+pipeline cannot answer it later.
 
 ### Reaction vocabulary
 

@@ -673,9 +673,27 @@ class ProcessingExtractionConfig(BaseModel):
         return self
 
 
+class ProcessingAmbientConfig(BaseModel):
+    """How often Arvid may join a conversation he was not addressed in.
+
+    The thresholds are a **precondition**, not a schedule: both must be met before the
+    judge is asked at all, and the judge may still decline. An unaddressed message that
+    fails them is observed - no turn, no typing indicator, no model call.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    min_seconds_between_answers: int = Field(default=300, ge=0)
+    min_messages_since_answer: int = Field(default=6, ge=0)
+    #: Model route for the small "should I join?" verdict. Empty means the reaction route.
+    judge_route: str = ""
+    #: The judge must be this sure of itself; a hesitant yes stays silence.
+    judge_min_confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    judge_timeout_seconds: float = Field(default=12.0, gt=0)
+
+
 class ProcessingRetentionConfig(BaseModel):
     """Retention windows for journal payloads and lineage metadata (spec R06, R10)."""
-
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     journal_payload_days: int = Field(default=7, ge=0)
@@ -725,6 +743,8 @@ class ProcessingConfig(BaseModel):
     #: in, one emoji out - it should stay a cheap, fast chat route. Empty means "use the
     #: memory capture route", which is already a small extraction model.
     reaction_route: str = ""
+    #: Joining a conversation unaddressed: how often, and how sure the judge must be.
+    ambient: ProcessingAmbientConfig = Field(default_factory=ProcessingAmbientConfig)
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)

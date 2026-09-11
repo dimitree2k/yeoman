@@ -34,6 +34,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_gateway.processing.threads import JoinRule
 
 if TYPE_CHECKING:
     from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
@@ -140,6 +141,9 @@ class FastGateResult:
     #: True when this message would have been answered and the action turned that answer
     #: into a reaction. Observed messages stay observed - no reaction, no acknowledgement.
     react: bool = False
+    #: True when this unaddressed message passed the ambient brake and now waits for the
+    #: judge's verdict. Nothing is generated until that verdict is a yes.
+    ambient_candidate: bool = False
 
     @property
     def denied(self) -> bool:
@@ -173,6 +177,12 @@ class IngestGate:
         self._evaluate = evaluate
         self._threads = threads
         self._clock = clock or _now_ms
+        #: Ambient brake state, per chat: when the last unaddressed answer went out and how
+        #: much the chat has moved since. In memory on purpose - after a restart the brake
+        #: simply starts cold, which is the conservative direction.
+        self._ambient_state: dict[str, dict[str, int]] = {}
+        #: Ambient messages waiting for the judge: observed, not answerable until cleared.
+        self._ambient_pending: dict[str, int] = {}
 
     def enabled_for(self, channel: str, chat_id: str) -> bool:
         """True when the new mode owns this chat; unmanaged chats stay on legacy."""
@@ -261,6 +271,27 @@ class IngestGate:
                 reply_action,
             )
             outcome = FastGateOutcome.OBSERVE
+        ambient_candidate = False
+        if outcome is FastGateOutcome.REACT and self._is_ambient_chat(event.channel, event.chat_id):
+            # An unaddressed message in a chat the owner released for ambient answers. Ask
+            # the thread engine what it *would* decide, without persisting anything: only
+            # the ambient fallback is subject to the brake, a real continuation is not.
+            if self._ambient_rule_without_turn(request, now=now):
+                self._note_ambient_message(event.channel, event.chat_id)
+                allowed, reason = self._ambient_brake_allows(
+                    event.channel, event.chat_id, now=now
+                )
+                ambient_candidate = allowed
+                # Observed either way; the judge may upgrade it after a yes.
+                outcome = FastGateOutcome.OBSERVE
+                self._mark_ambient_pending(request.event_id, now=now)
+                if not allowed:
+                    logger.debug(
+                        "ambient_brake chat={} event_id={} reason={}",
+                        event.chat_id,
+                        request.event_id,
+                        reason,
+                    )
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
         if assignment is not None:
             # One observation line per message (routing spec, criterion 12): what the
@@ -296,6 +327,7 @@ class IngestGate:
             assignment=assignment,
             reply_action=reply_action,
             react=react,
+            ambient_candidate=ambient_candidate,
         )
 
     # -- internals ---------------------------------------------------------------------
@@ -303,7 +335,6 @@ class IngestGate:
     def _reply_action(self, request: IngestRequest) -> str:
         """The configured action for this chat: ``answer`` unless configured otherwise."""
         return self._reply_action_for(request.event.channel, request.event.chat_id)
-
     def _reply_action_for(self, channel: str, chat_id: str) -> str:
         """``answer``, ``react`` or ``silence`` - never a silent fallback for a typo.
 
@@ -319,6 +350,93 @@ class IngestGate:
             return value
         logger.warning("reply_action_unknown chat={} value={}", chat_id, value[:24])
         return "answer"
+
+    # -- ambient brake ---------------------------------------------------------------
+
+    def _ambient_settings(self) -> Any:
+        return getattr(self._config, "ambient", None)
+
+    def _is_ambient_chat(self, channel: str, chat_id: str) -> bool:
+        """True when the owner released this chat for ambient answers at all."""
+        chats = getattr(self._config, "ambient_chats", None) or ()
+        wanted = {str(entry).strip() for entry in chats if str(entry).strip()}
+        return f"{channel}:{chat_id}" in wanted
+
+    def _ambient_rule_without_turn(self, request: IngestRequest, *, now: int) -> bool:
+        """True when the thread engine would file this message as plain ambient.
+
+        A dry classification: nothing is persisted, so a message that still has to earn its
+        answer never gets a turn in the meantime. A continuation with a continuity signal
+        is not ambient and is answered as before.
+        """
+        threads = self._threads
+        if threads is None:
+            return False
+        try:
+            data = threads.input_from_event(self._canonical_event(request))
+            view = threads.view_for(data, now_ms=now)
+            decision = threads.decide(data, view)
+        except Exception as exc:  # pragma: no cover - defensive, like _assign
+            logger.warning(
+                "ambient_classification_failed event_id={} error_type={}",
+                request.event_id,
+                type(exc).__name__,
+            )
+            return False
+        rule = getattr(decision, "rule", None)
+        is_ambient = rule == JoinRule.AMBIENT or str(rule) == str(JoinRule.AMBIENT)
+        return bool(is_ambient and getattr(decision, "thread_id", None) is None)
+
+    def _note_ambient_message(self, channel: str, chat_id: str) -> None:
+        """Count one more message the chat produced since its last ambient answer."""
+        state = self._ambient_state.setdefault(f"{channel}:{chat_id}", {"messages": 0, "last": 0})
+        state["messages"] = int(state.get("messages", 0)) + 1
+
+    def _ambient_brake_allows(self, channel: str, chat_id: str, *, now: int) -> tuple[bool, str]:
+        """Whether the judge may be asked at all: enough silence *and* enough new chatter."""
+        settings = self._ambient_settings()
+        min_seconds = int(getattr(settings, "min_seconds_between_answers", 300) or 0)
+        min_messages = int(getattr(settings, "min_messages_since_answer", 6) or 0)
+        state = self._ambient_state.setdefault(f"{channel}:{chat_id}", {"messages": 0, "last": 0})
+        last = int(state.get("last", 0) or 0)
+        if last and min_seconds:
+            elapsed = max(0, now - last) / 1000.0
+            if elapsed < min_seconds:
+                return False, f"waiting:{int(min_seconds - elapsed)}s"
+        if int(state.get("messages", 0)) < min_messages:
+            return False, f"quiet:{state.get('messages', 0)}/{min_messages}"
+        return True, "due"
+
+    def _mark_ambient_pending(self, event_id: str, *, now: int) -> None:
+        """Remember that this ambient message still needs its verdict before it may speak."""
+        self._ambient_pending[str(event_id)] = now
+        if len(self._ambient_pending) > 512:
+            for key, _ in sorted(self._ambient_pending.items(), key=lambda item: item[1])[:128]:
+                self._ambient_pending.pop(key, None)
+
+    def is_ambient_pending(self, event_id: str) -> bool:
+        return str(event_id) in self._ambient_pending
+
+    def note_ambient_answer(self, event_id: str, *, now: int | None = None) -> None:
+        """The judge said yes: clear the message, restart the brake window."""
+        self._ambient_pending.pop(str(event_id), None)
+        self._reset_ambient_window(now)
+
+    def note_ambient_declined(self, event_id: str, *, now: int | None = None) -> None:
+        """The judge said no: the message stays observed, and the window starts over.
+
+        Restarting the window is what keeps the judge cheap: without it every further
+        message of a busy chat would be judged again, because the thresholds stay met. The
+        message itself stays pending - a declined message must never be answered later by
+        the classic pipeline.
+        """
+        self._reset_ambient_window(now)
+
+    def _reset_ambient_window(self, now: int | None = None) -> None:
+        moment = int(now if now is not None else self._clock())
+        for state in self._ambient_state.values():
+            state["messages"] = 0
+            state["last"] = moment
 
     def _assign(self, request: IngestRequest, *, now: int, allow_turn: bool) -> Any:
         """Attach the canonical event to its thread; never runs for a denied event.
@@ -396,6 +514,13 @@ class IngestGate:
                 action,
             )
             return False
+        if self.is_ambient_pending(str(event.message_id or "")):
+            # Unaddressed in a chat with ambient answers: it may only speak once the judge
+            # cleared it. Until then it is context, not an order - no typing, no call.
+            logger.debug(
+                "ambient_admission_refused chat={} message_id={}", event.chat_id, event.message_id
+            )
+            return False
         return self.reconcile_reply(event) is not None
 
     def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
@@ -450,6 +575,7 @@ class IngestGate:
         assignment: Any = None,
         reply_action: str = "answer",
         react: bool = False,
+        ambient_candidate: bool = False,
     ) -> FastGateResult:
         event = request.event
         decision = DecisionRecord(
@@ -479,6 +605,7 @@ class IngestGate:
             assignment=assignment,
             reply_action=reply_action,
             react=react,
+            ambient_candidate=ambient_candidate,
         )
 
 

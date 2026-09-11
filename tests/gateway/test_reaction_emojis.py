@@ -232,3 +232,39 @@ async def test_the_chooser_never_calls_the_model_without_a_vocabulary() -> None:
     chooser = _chooser("🤙")
     assert await chooser.choose("hallo", allowed=[]) is None
     assert chooser._provider.calls == []  # type: ignore[attr-defined]
+
+
+# the ambient judge ----------------------------------------------------------------------
+
+
+def _judge(answer: str, *, min_confidence: float = 0.75):
+    from yeoman_gateway.processing.ambient_judge import AmbientJudge
+    from yeoman_gateway.processing.model_route import RouteClient
+
+    client = RouteClient.__new__(RouteClient)
+    client.route_key = "test.route"  # type: ignore[attr-defined]
+    client.model = "test-model"  # type: ignore[attr-defined]
+    client.timeout_ms = 0  # type: ignore[attr-defined]
+    client._provider = _FakeProvider(answer)  # type: ignore[attr-defined]
+    return AmbientJudge(client=client, min_confidence=min_confidence, timeout_seconds=5.0)
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_judge_needs_a_confident_yes() -> None:
+    assert await _judge('{"answer": true, "confidence": 0.9}').should_answer("Frage?") is True
+    assert await _judge('{"answer": true, "confidence": 0.4}').should_answer("Frage?") is False
+    assert await _judge('{"answer": false, "confidence": 0.99}').should_answer("Frage?") is False
+
+
+@pytest.mark.asyncio
+async def test_the_ambient_judge_fails_closed() -> None:
+    assert await _judge("klar, antworte!").should_answer("Frage?") is False
+    assert await _judge("").should_answer("Frage?") is False
+    assert await _judge('{"answer": true, "confidence": 0.9}').should_answer("") is False
+
+
+def test_the_ambient_judge_prompt_forbids_answering_just_because_it_is_new() -> None:
+    from yeoman_gateway.processing.ambient_judge import AMBIENT_JUDGE_PROMPT
+
+    assert "Ein neues Thema ist kein Grund zu antworten." in AMBIENT_JUDGE_PROMPT
+    assert "answer=false" in AMBIENT_JUDGE_PROMPT

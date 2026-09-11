@@ -212,6 +212,7 @@ class WhatsAppChannel(BaseChannel):
         self._processing_gate: Any | None = None
         self._processing_signals: Any | None = None
         self._reaction_action: Any | None = None
+        self._ambient_judge: Any | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
@@ -801,6 +802,53 @@ class WhatsAppChannel(BaseChannel):
         """Attach the ``react`` reply action (``None`` leaves reactions to the pipeline)."""
         self._reaction_action = action
 
+    def set_ambient_judge(self, judge: Any | None) -> None:
+        """Attach the verdict that decides whether an unaddressed message may be answered."""
+        self._ambient_judge = judge
+
+    async def _maybe_answer_ambient(self, event: InboundEvent) -> Any | None:
+        """Ask the judge about an unaddressed message; the assignment opens its turn.
+
+        The brake already ran in the gate, so this is the second half of the decision: the
+        small call reads the message and answers strictly. Only a confident yes upgrades the
+        observation into a turn - and the turn is opened here, after the verdict, so no
+        generation, no typing indicator and no cost happen before it.
+        """
+        if self._ambient_judge is None:
+            logger.warning(
+                "ambient answer requested without a judge chat={} message_id={}",
+                event.chat_jid,
+                event.message_id,
+            )
+            return None
+        try:
+            if not await self._ambient_judge(text=event.text):
+                # A declined message stays observed, and the brake window starts over so
+                # the judge is asked at most once per window instead of once per message.
+                self._processing_gate.note_ambient_declined(event.message_id)
+                return None
+            core_event = self._to_core_event(event, event.message_id)
+            assignment = self._processing_gate.reconcile_reply(core_event)
+        except Exception as exc:
+            logger.warning(
+                "ambient_judge_failed chat={} message_id={} error_type={}",
+                event.chat_jid,
+                event.message_id,
+                type(exc).__name__,
+            )
+            return None
+        if assignment is None:
+            return None
+        self._processing_gate.note_ambient_answer(event.message_id)
+        logger.info(
+            "ambient_answer_granted chat={} message_id={} thread_id={} turn_id={}",
+            event.chat_jid,
+            event.message_id,
+            getattr(assignment, "thread_id", "-"),
+            getattr(assignment, "turn_id", "-"),
+        )
+        return assignment
+
     async def _maybe_react(self, event: InboundEvent) -> None:
         """One reaction instead of an answer, for chats configured with ``react``.
 
@@ -928,6 +976,19 @@ class WhatsAppChannel(BaseChannel):
                     # turn, no typing indicator and no pipeline run of its own. Messages the
                     # gate only observed stay observed - no acknowledgement per message.
                     await self._maybe_react(event)
+                elif bool(getattr(verdict, "ambient_candidate", False)):
+                    # Unaddressed, brake passed: only the judge decides whether this becomes
+                    # an answer. Either way the message is archived and seen as context.
+                    granted = await self._maybe_answer_ambient(event)
+                    if granted is not None:
+                        event = replace(
+                            event,
+                            thread_assignment={
+                                "thread_id": granted.thread_id,
+                                "turn_id": granted.turn_id,
+                                "source_message_ids": list(granted.source_message_ids),
+                            },
+                        )
             if verdict is not None and verdict.denied:
                 logger.debug(
                     "processing fast gate denied channel=whatsapp chat={} message_id={} "

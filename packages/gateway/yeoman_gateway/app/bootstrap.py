@@ -545,6 +545,49 @@ def _build_reaction_action(
     )
 
 
+def _build_ambient_judge(config: "Config"):
+    """The verdict that decides whether an unaddressed message may be answered.
+
+    Built only when the mode is on, the owner released at least one chat for ambient
+    answers, and a route is available. A missing route disables ambient answering loudly:
+    silence is the safe failure, an unguarded answer is not.
+    """
+    if not config.processing.enabled or not config.processing.ambient_chats:
+        return None
+    from yeoman_gateway.processing.ambient_judge import AmbientJudge
+    from yeoman_gateway.processing.model_route import (
+        RouteClient,
+        RouteUnavailableError,
+        resolve_route_key,
+    )
+
+    settings = config.processing.ambient
+    route = resolve_route_key(
+        config,
+        getattr(settings, "judge_route", ""),
+        getattr(config.processing, "reaction_route", ""),
+        str(getattr(getattr(config.memory, "capture", None), "extract_route", "") or ""),
+        "memory.capture.extract",
+    )
+    try:
+        client = RouteClient(config=config, route_key=route)
+    except RouteUnavailableError as exc:
+        logger.error("ambient judge disabled: route={} detail={}", route, str(exc)[:160])
+        return None
+    logger.info(
+        "ambient_judge enabled route={} min_confidence={} min_seconds={} min_messages={}",
+        route,
+        settings.judge_min_confidence,
+        settings.min_seconds_between_answers,
+        settings.min_messages_since_answer,
+    )
+    return AmbientJudge(
+        client=client,
+        min_confidence=settings.judge_min_confidence,
+        timeout_seconds=settings.judge_timeout_seconds,
+    )
+
+
 def _shared_fact_members(chat_registry: object | None):
     """Proven chat participants, or ``None`` when nothing is proven.
 
@@ -989,6 +1032,7 @@ def build_gateway_runtime(
             else None
         ),
         reaction_action=_build_reaction_action(config, effect_router, processing_store),
+        ambient_judge=_build_ambient_judge(config),
     )
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
