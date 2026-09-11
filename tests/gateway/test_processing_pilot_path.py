@@ -62,6 +62,17 @@ def _config() -> Config:
     )
 
 
+def test_effect_router_exposes_the_store_tools_journal_against(runtime) -> None:
+    """A tool that must journal before acting resolves the store through this property.
+
+    It used to be absent, so the A2A delegation tool fell back to "no outbox" and sent the
+    task with no idempotency claim - exactly what its fence was meant to prevent.
+    """
+    store, _registry, _gate, router, _transport, _adapter = runtime
+
+    assert router.store is store
+
+
 @pytest.fixture()
 def runtime(tmp_path: Path):
     policy_path = tmp_path / "policy.json"

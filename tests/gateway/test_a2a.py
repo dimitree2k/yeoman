@@ -283,6 +283,23 @@ def test_policy_diagnostics_include_a2a_delegate() -> None:
     assert "a2a_delegate" in _policy_known_tools()
 
 
+def test_the_router_exposes_its_gateway_store() -> None:
+    """The tool resolves its journal via `router.store`, so that seam must exist.
+
+    `getattr(router, "store", None)` quietly returned None because the router keeps the
+    gateway in a private attribute; the delegation then went out unclaimed.
+    """
+    from types import SimpleNamespace
+
+    from yeoman_gateway.processing.dispatch import IntentEffectRouter
+
+    store = object()
+    config = Config.model_validate({"processing": {"enabled": True}})
+    router = IntentEffectRouter(gateway=SimpleNamespace(store=store), config=config)
+
+    assert router.store is store
+
+
 # --------------------------------------------------------------------------------------
 # the idempotency contract: one remote write per turn and task
 # --------------------------------------------------------------------------------------

@@ -615,6 +615,16 @@ class IntentEffectRouter:
             else None
         )
 
+    @property
+    def store(self) -> Any:
+        """The processing store behind this router, or ``None`` when there is none.
+
+        Callers that must journal something before acting — the A2A delegation tool claims
+        its idempotency key here — resolve the store through this property instead of
+        reaching into the gateway, so the wiring cannot silently degrade to "no contract".
+        """
+        return getattr(self._gateway, "store", None)
+
     def set_direct_transport(self, outbound: Any, reaction: Any) -> None:
         """Install the confirming channel transport on the gateway's executor."""
         self._gateway.set_direct_senders(outbound, reaction)

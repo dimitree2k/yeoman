@@ -121,6 +121,14 @@ class A2ADelegateTool(Tool):
         """
         store = self._store
         if store is None:
+            # Without a journal there is no contract. That is the legacy (non-processing)
+            # mode, but it must never pass silently: a wiring mistake once sent a
+            # delegation unclaimed, and the fence exists precisely to prevent that.
+            logger.warning(
+                "A2A delegation without an idempotency claim worker={} channel={}",
+                safe_log_token(worker),
+                safe_log_token(self._channel, max_length=40),
+            )
             return True, "no-outbox", ""
         # Normalise first: the same task with different spacing is the same delegation, and
         # the payload must be a deterministic function of it or the outbox would call it a
