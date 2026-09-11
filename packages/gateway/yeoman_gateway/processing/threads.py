@@ -706,24 +706,24 @@ class ThreadRegistry:
         )
 
     def _thread_sources(self, thread_id: str) -> tuple[Any, ...]:
-        """Readable user sources of a thread's active turn, with their journal text."""
-        turn = self._store.active_turn(thread_id)
-        if turn is None:
-            return ()
+        """Readable sources of the thread's recent turns, with their journal text.
+
+        Reading only the active turn was wrong: after a turn closed, its sources still
+        describe what the thread is about, so a confirmed continuation could never be
+        proven (criterion 14).
+        """
         views: list[Any] = []
-        for source in self._store.turn_sources(turn.turn_id):
-            if getattr(source, "removed_ms", None) is not None:
-                continue
-            event = self._store.get_event(source.event_id)
+        for _turn_id, event_id, role, _message_id in self._store.thread_source_refs(thread_id):
+            event = self._store.get_event(event_id)
             payload = getattr(event, "payload", None)
             text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
             if not text:
                 continue
             views.append(
                 _SourceRow(
-                    event_id=source.event_id,
+                    event_id=event_id,
                     text=text,
-                    role=source.role,
+                    role=role,
                     principal=str(getattr(event, "principal", "") or ""),
                     occurred_ms=getattr(event, "occurred_ms", None),
                 )
@@ -732,11 +732,8 @@ class ThreadRegistry:
 
     def _sent_bot_messages(self, thread_id: str) -> tuple[tuple[str, str, int | None], ...]:
         """Provably sent bot texts of the thread: transport-confirmed effects only."""
-        turn = self._store.active_turn(thread_id)
-        if turn is None:
-            return ()
         out: list[tuple[str, str, int | None]] = []
-        for effect_id in self._store.effect_ids_for_turn(turn.turn_id, states=("sent",)):
+        for effect_id in self._store.thread_effect_ids(thread_id, states=("sent",)):
             effect = self._store.get_effect(effect_id)
             if effect is None or str(getattr(effect, "state", "")) != "sent":
                 continue

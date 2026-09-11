@@ -2102,6 +2102,58 @@ class ProcessingStore:
             ).fetchone()
         return int(row["c"])
 
+    def thread_source_refs(
+        self, thread_id: str, *, limit_turns: int = 5
+    ) -> list[tuple[str, str, str, str | None]]:
+        """Sources of a thread's most recent turns: (turn_id, event_id, role, message_id).
+
+        The continuity signals need the thread's sources, not only its *active* turn's: a
+        closed turn still proves what a thread is about (routing spec, criterion 14).
+        """
+        if not thread_id:
+            return []
+        with self._lock:
+            turns = self._conn.execute(
+                "SELECT turn_id FROM turns WHERE thread_id = ?"
+                " ORDER BY opened_ms DESC, turn_id DESC LIMIT ?",
+                (str(thread_id), max(1, int(limit_turns))),
+            ).fetchall()
+            turn_ids = [str(row["turn_id"]) for row in turns]
+            if not turn_ids:
+                return []
+            placeholders = ",".join(["?"] * len(turn_ids))
+            rows = self._conn.execute(
+                f"SELECT turn_id, event_id, role, source_message_id FROM turn_sources"
+                f" WHERE turn_id IN ({placeholders}) AND removed_ms IS NULL"
+                f" ORDER BY added_ms, event_id",
+                tuple(turn_ids),
+            ).fetchall()
+        return [
+            (
+                str(row["turn_id"]),
+                str(row["event_id"]),
+                str(row["role"] or "context"),
+                None if row["source_message_id"] is None else str(row["source_message_id"]),
+            )
+            for row in rows
+        ]
+
+    def thread_effect_ids(
+        self, thread_id: str, *, states: tuple[str, ...] = ("sent",), limit: int = 50
+    ) -> list[str]:
+        """Effect ids of a whole thread, newest turns first."""
+        if not thread_id:
+            return []
+        placeholders = ",".join(["?"] * len(states))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT e.effect_id FROM effects e JOIN turns t ON t.turn_id = e.turn_id"
+                f" WHERE t.thread_id = ? AND e.state IN ({placeholders})"
+                f" ORDER BY e.created_ms DESC, e.effect_id LIMIT ?",
+                (str(thread_id), *[str(item) for item in states], int(limit)),
+            ).fetchall()
+        return [str(row["effect_id"]) for row in rows]
+
     def effect_ids_for_turn(self, turn_id: str, *, states: tuple[str, ...] | None = None) -> list[str]:
         """Effect ids of one turn, looked up directly instead of scanning a page."""
         if not turn_id:
