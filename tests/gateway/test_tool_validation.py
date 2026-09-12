@@ -859,6 +859,46 @@ async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
 
 
 @pytest.mark.asyncio
+async def test_a2a_delivery_executes_authorized_voice_without_llm_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bus = MessageBus()
+    provider = _CountingProvider()
+    tts = _FakeTTS()
+    responder = LLMResponder(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        model_router=_FakeModelRouter(),  # type: ignore[arg-type]
+        tts=tts,  # type: ignore[arg-type]
+        whatsapp_tts_outgoing_dir=tmp_path,
+    )
+
+    result = await responder.execute_delivery(
+        tool_name="send_voice",
+        channel="whatsapp",
+        chat_id="molty@g.us",
+        text="Direkter Hermes-Test.",
+        session_key="a2a:hermes-1",
+        principal="service:a2a",
+    )
+    await responder.aclose()
+
+    assert result == "Voice message delivered to whatsapp:molty@g.us."
+    assert provider.calls == 0
+    assert tts.last_text == "Direkter Hermes-Test."
+    outbound = await bus.consume_outbound()
+    assert outbound.channel == "whatsapp"
+    assert outbound.chat_id == "molty@g.us"
+    assert outbound.content == ""
+    assert len(outbound.media) == 1
+
+
+@pytest.mark.asyncio
 async def test_send_voice_tool_call_does_not_emit_text_confirmation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

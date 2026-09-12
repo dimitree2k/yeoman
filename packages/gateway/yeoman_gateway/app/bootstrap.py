@@ -1692,6 +1692,8 @@ def build_gateway_runtime(
         session_key: str | None,
         chat_id: str,
         post_to_whatsapp: bool,
+        actor_principal: str | None = None,
+        peer: str | None = None,
     ) -> dict:
         from yeoman_gateway.ipc.owner_turn import process_owner_turn
 
@@ -1713,6 +1715,27 @@ def build_gateway_runtime(
             responder=responder,
             bus=bus,
             outbound_dispatch=_owner_outbound,
+            actor_principal=actor_principal,
+            peer=peer,
+        )
+
+    async def ipc_a2a_send(
+        target: str,
+        kind: str,
+        text: str,
+        idempotency_key: str,
+        peer: str,
+    ) -> dict:
+        from yeoman_gateway.ipc.owner_turn import process_a2a_delivery
+
+        return await process_a2a_delivery(
+            target=target,
+            kind=kind,
+            text=text,
+            idempotency_key=idempotency_key,
+            peer=peer,
+            policy_adapter=policy_adapter,
+            responder=responder,
         )
 
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
@@ -1726,6 +1749,7 @@ def build_gateway_runtime(
         send_message_handler=ipc_send_message,
         trigger_agent_turn_handler=ipc_trigger_agent_turn,
         owner_turn_handler=ipc_owner_turn,
+        a2a_delivery_handler=ipc_a2a_send,
         publish_event_handler=ipc_publish_event,
         rate_limit=ipc_config.command_rate_limit,
     )

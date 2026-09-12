@@ -2726,6 +2726,44 @@ class LLMResponder(ResponderPort):
             private_handoff_id=decision.private_handoff_id,
         )
 
+    async def execute_delivery(
+        self,
+        *,
+        tool_name: str,
+        channel: str,
+        chat_id: str,
+        text: str,
+        session_key: str,
+        principal: str,
+        is_owner: bool = False,
+    ) -> str:
+        """Execute one already-authorized delivery without another model turn."""
+        if tool_name not in {"message", "send_voice"}:
+            raise ValueError(f"unsupported delivery tool: {tool_name}")
+
+        self._set_tool_context(
+            channel=channel,
+            chat_id=chat_id,
+            session_key=session_key,
+            is_owner=is_owner,
+        )
+        arguments: dict[str, Any] = {
+            "content": text,
+            "channel": channel,
+            "chat_id": chat_id,
+        }
+        if tool_name == "send_voice":
+            arguments["verbatim"] = True
+
+        from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
+
+        token = CURRENT_PRINCIPAL.set(str(principal or ""))
+        try:
+            result = await self._execute_tool(tool_name, arguments, is_owner=is_owner)
+        finally:
+            CURRENT_PRINCIPAL.reset(token)
+        return str(result or "")
+
     async def process_direct(
         self,
         content: str,
@@ -2737,15 +2775,17 @@ class LLMResponder(ResponderPort):
         persona_text: str | None = None,
         is_owner: bool = True,
         model_profile: str | None = None,
+        sender_id: str | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> str:
         return await self._generate(
             session_key=session_key,
             channel=channel,
             chat_id=chat_id,
             content=content,
-            sender_id=chat_id,
+            sender_id=str(sender_id or chat_id),
             media=(),
-            metadata={},
+            metadata=dict(metadata or {}),
             allowed_tools=set(allowed_tools or self.tool_names),
             persona_text=persona_text,
             talkative_cooldown_enabled=False,

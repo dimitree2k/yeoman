@@ -25,6 +25,7 @@ class GatewaySocket:
     send_message_handler: Callable[..., Awaitable[dict]] | None = None
     trigger_agent_turn_handler: Callable[..., Awaitable[dict]] | None = None
     owner_turn_handler: Callable[..., Awaitable[dict]] | None = None
+    a2a_delivery_handler: Callable[..., Awaitable[dict]] | None = None
     publish_event_handler: Callable[..., Awaitable[dict]] | None = None
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
     rate_limit: int = 10  # commands per second
@@ -117,6 +118,21 @@ class GatewaySocket:
                     session_key=args.get("session_key"),
                     chat_id=args.get("chat_id", ""),
                     post_to_whatsapp=args.get("post_to_whatsapp") is True,
+                    actor_principal=args.get("actor_principal"),
+                    peer=args.get("peer"),
+                )
+                return {"status": "ok", "response": result}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        if cmd == "a2a_send" and self.a2a_delivery_handler:
+            try:
+                result = await self.a2a_delivery_handler(
+                    target=args.get("target", ""),
+                    kind=args.get("kind", ""),
+                    text=args.get("text", ""),
+                    idempotency_key=args.get("idempotency_key", ""),
+                    peer=args.get("peer", ""),
                 )
                 return {"status": "ok", "response": result}
             except Exception as e:

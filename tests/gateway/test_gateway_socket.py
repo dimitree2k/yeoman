@@ -46,6 +46,54 @@ async def test_send_message_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a2a_send_command_forwards_logical_target() -> None:
+    received: list[dict] = []
+
+    async def mock_a2a_send(**kwargs: str) -> dict:
+        received.append(kwargs)
+        return {"target": kwargs["target"], "kind": kwargs["kind"], "response": "sent"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sock_path = Path(tmpdir) / "gateway.sock"
+        server = GatewaySocket(path=sock_path, a2a_delivery_handler=mock_a2a_send)
+        await server.start()
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(sock_path))
+            request = {
+                "cmd": "a2a_send",
+                "args": {
+                    "target": "Molty Python",
+                    "kind": "voice",
+                    "text": "Hallo Gruppe.",
+                    "idempotency_key": "hermes-1",
+                    "peer": "hermes",
+                },
+            }
+            writer.write(json.dumps(request).encode() + b"\n")
+            await writer.drain()
+            line = await reader.readline()
+            response = json.loads(line)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+    assert response == {
+        "status": "ok",
+        "response": {"target": "Molty Python", "kind": "voice", "response": "sent"},
+    }
+    assert received == [
+        {
+            "target": "Molty Python",
+            "kind": "voice",
+            "text": "Hallo Gruppe.",
+            "idempotency_key": "hermes-1",
+            "peer": "hermes",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unknown_command_returns_error() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         sock_path = Path(tmpdir) / "gateway.sock"
