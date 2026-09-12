@@ -175,7 +175,16 @@ class ThreadActorResponder:
         if not texts:
             return event
         content = "\n".join(texts)
-        if content == str(getattr(event, "content", "") or ""):
+        original = str(getattr(event, "content", "") or "")
+        if (
+            len(refs) == 1
+            and str(getattr(refs[0], "event_id", "") or "") == self._event_id(event)
+            and original
+            and content
+            and original.endswith(content)
+        ):
+            return event
+        if content == original:
             return event
         try:
             from dataclasses import replace as dataclass_replace

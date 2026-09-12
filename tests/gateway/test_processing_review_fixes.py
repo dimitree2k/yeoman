@@ -290,6 +290,88 @@ def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_debounced_content_survives_single_source_snapshot(tmp_path: Path) -> None:
+    """A frozen final-message source must not erase its debounced prefix."""
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store = _store(tmp_path)
+    thread_id = store.open_thread(
+        channel="whatsapp",
+        chat_id=CHAT_A,
+        root_principal="orderer",
+        kind="dm",
+        trigger_event_id="question",
+        now_ms=T0,
+    )
+    turn_id = store.open_turn(
+        thread_id=thread_id,
+        principal="orderer",
+        trigger_event_id="question",
+        now_ms=T0,
+    )
+    store.append_event(
+        event_key="question",
+        event_id="question",
+        trace_id="tr-question",
+        payload={"text": "Which party fits?"},
+        now_ms=T0,
+    )
+    store.add_turn_source(
+        turn_id=turn_id,
+        event_id="question",
+        source_message_id="question",
+        role="trigger",
+        revision_at_join=1,
+        now_ms=T0,
+    )
+    store.attach_event_assignment(
+        event_id="question",
+        thread_id=thread_id,
+        turn_id=turn_id,
+        now_ms=T0,
+    )
+
+    class _Config:
+        threads = type("T", (), {"pending_inputs_per_thread": 8})()
+
+    class _Inner:
+        def __init__(self) -> None:
+            self.content = ""
+
+        async def generate_reply(self, event, decision, *, session_key=None) -> str:
+            self.content = str(event.content)
+            return "ok"
+
+    inner = _Inner()
+    wrapper = ThreadActorResponder(
+        inner=inner,
+        actors=ThreadActorRegistry(store=store, config=_Config(), clock=lambda: T0),
+        store=store,
+        clock=lambda: T0,
+    )
+    content = "First forward\nSecond forward\nThird forward\nWhich party fits?"
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id=CHAT_A,
+        sender_id="orderer",
+        content=content,
+        message_id="question",
+        is_group=False,
+        mentioned_bot=True,
+        timestamp=datetime(2023, 11, 14, tzinfo=UTC),
+    )
+
+    await wrapper.generate_reply(event, None)
+
+    assert inner.content == content
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_f04_a_restart_puts_the_follow_up_into_the_request(tmp_path: Path) -> None:
     """Review F04: pending inputs were consumed but never reached the provider.
 
