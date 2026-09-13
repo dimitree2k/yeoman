@@ -8,12 +8,42 @@ from yeoman_gateway.adapters.responder_llm import (
     _tool_observability_output,
 )
 from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
+from yeoman_gateway.bus.events import InboundMessage, OutboundMessage
+from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.cli.gateway_commands import _should_setup_daemon_logging
+from yeoman_gateway.observability import private_log_identifier, safe_log_token
 
 
 def test_a2a_content_is_redacted_from_generic_observability() -> None:
     arguments = _tool_observability_arguments("a2a_delegate", {"skill": "search.web", "input": {"query": "private"}})
     assert arguments == "[redacted]"
     assert _tool_observability_output("a2a_delegate", "private result") == "[redacted]"
+
+
+def test_daemon_logging_controls_are_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INVOCATION_ID", "systemd")
+    assert _should_setup_daemon_logging() is True
+    monkeypatch.delenv("INVOCATION_ID")
+    monkeypatch.delenv("Yeoman_GATEWAY_DAEMON", raising=False)
+    assert _should_setup_daemon_logging() is False
+
+
+@pytest.mark.asyncio
+async def test_message_bus_boundary_logs_remain_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr("yeoman_gateway.bus.queue.logger.info", lambda message, *args: calls.append((message, args)))
+    from datetime import datetime
+
+    bus = MessageBus()
+    await bus.publish_inbound(InboundMessage(channel="whatsapp", sender_id="owner", chat_id="owner@s.whatsapp.net", content="secret", timestamp=datetime.now(), metadata={"message_id": "m1"}))
+    await bus.publish_outbound(OutboundMessage(channel="whatsapp", chat_id="owner@s.whatsapp.net", content="secret", metadata={"message_id": "m2"}))
+    assert "secret" not in repr(calls)
+
+
+def test_log_identifiers_remain_control_safe() -> None:
+    unsafe = "owner@s.whatsapp.net\nforged=record"
+    assert safe_log_token(unsafe) == r"owner@s.whatsapp.net\x0aforged=record"
+    assert private_log_identifier(unsafe) != unsafe
 
 
 @pytest.mark.asyncio

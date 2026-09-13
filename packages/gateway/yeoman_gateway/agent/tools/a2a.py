@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -30,7 +31,8 @@ class A2ADelegateTool(Tool):
     def __init__(self, registry: A2AWorkerRegistry, *, store: Any | None = None, delivery: Any | None = None) -> None:
         self._registry = registry
         self._store = store
-        del delivery  # A2A v1 profile has no push/detached delivery contract.
+        self._delivery = delivery
+        self._background: set[asyncio.Task[None]] = set()
         self._channel = ""
         self._chat_id = ""
         self._session_key = ""
@@ -52,7 +54,7 @@ class A2ADelegateTool(Tool):
             "type": "object",
             "properties": {
                 "worker": {"type": "string", "minLength": 1, "description": "Registered A2A worker name."},
-                "skill": {"type": "string", "minLength": 1, "description": "Advertised Hermes profile skill."},
+                "skill": {"type": "string", "enum": ["search.web", "research.deep"], "description": "Supported delegated skill."},
                 "input": {"type": "object", "description": "Skill-specific structured input."},
             },
             "required": ["worker", "skill", "input"],
@@ -105,6 +107,8 @@ class A2ADelegateTool(Tool):
         worker, skill, input = str(kwargs.get("worker") or ""), str(kwargs.get("skill") or ""), kwargs.get("input")
         if not worker or not skill or not isinstance(input, dict):
             raise ValueError("worker, skill, and structured input are required")
+        if skill not in {"search.web", "research.deep"}:
+            raise ValueError("a2a_delegate supports only search.web and research.deep")
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
             return f"[{worker} | not-sent | {note}]"
@@ -116,6 +120,21 @@ class A2ADelegateTool(Tool):
             logger.warning("A2A delegation failed channel={} chat={} worker={} skill={} error_type={}", safe_log_token(self._channel, max_length=40), private_log_identifier(self._chat_id), safe_log_token(worker), safe_log_token(skill), type(exc).__name__)
             raise
         self._settle(effect_id, "sent")
+        if skill == "research.deep" and result.state in {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"}:
+            turn = current_tool_context()
+            channel = turn.channel if turn is not None else self._channel
+            chat_id = turn.chat_id if turn is not None else self._chat_id
+            task = asyncio.create_task(self._poll_research(worker, result, effect_id, channel, chat_id))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
         logger.info("A2A delegation completed channel={} chat={} worker={} skill={} task_id={} context_id={} state={}", safe_log_token(self._channel, max_length=40), private_log_identifier(self._chat_id), safe_log_token(result.worker), safe_log_token(result.skill), safe_log_token(result.task_id), safe_log_token(result.context_id), safe_log_token(result.state, max_length=80))
         output = json.dumps(result.output, ensure_ascii=False, sort_keys=True) if result.output is not None else ""
         return f"[{result.worker} | {result.skill} | {result.state} | {result.task_id}]\n{output}".rstrip()
+
+    async def _poll_research(self, worker: str, result: Any, effect_id: str, channel: str, chat_id: str) -> None:
+        try:
+            final = await self._registry.poll_task(worker, result.task_id, skill=result.skill, context_id=result.context_id, reference_task_ids=result.reference_task_ids)
+            if final.output is not None and self._delivery is not None and channel and chat_id:
+                await self._delivery.send(source="a2a", operation_ref=f"a2a-result:{effect_id}", channel=channel, chat_id=chat_id, content=json.dumps(final.output, ensure_ascii=False, sort_keys=True))
+        except Exception as exc:
+            logger.warning("A2A research polling failed worker={} error_type={}", safe_log_token(worker), type(exc).__name__)

@@ -38,9 +38,10 @@ class A2ATransportError(A2AError):
 class A2AProtocolError(A2AError):
     """The worker violated JSON-RPC, A2A, or the Hermes profile."""
 
-    def __init__(self, message: str, *, code: int | None = None) -> None:
+    def __init__(self, message: str, *, code: int | None = None, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
+        self.retryable = retryable
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +226,13 @@ class A2AClient:
         if tuple(correlation.get("reference_task_ids", ())) != references:
             raise A2AProtocolError("A2A result references do not match invocation")
         output = structured.get("output")
+        expected_status = {
+            "TASK_STATE_COMPLETED": "completed",
+            "TASK_STATE_REJECTED": "rejected",
+            "TASK_STATE_FAILED": "failed",
+        }.get(task.get("status", {}).get("state"))
+        if expected_status is not None and structured.get("status") != expected_status:
+            raise A2AProtocolError("A2A task state and profile result status disagree")
         if structured["status"] == "completed":
             if not isinstance(output, dict):
                 raise A2AProtocolError("A2A completed result requires output")
@@ -238,7 +246,8 @@ class A2AClient:
         return None
 
     async def _rpc(self, endpoint: str, method: str, params: dict[str, Any]) -> Any:
-        payload = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method, "params": params}
+        request_id = uuid.uuid4().hex
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         async with self._client() as client:
             try:
                 response = await client.post(endpoint, headers={**self._headers(), "Content-Type": "application/json", "A2A-Version": _A2A_VERSION}, json=payload)
@@ -252,10 +261,12 @@ class A2AClient:
             raise A2ATransportError("A2A worker returned invalid JSON-RPC JSON") from exc
         if not isinstance(body, dict):
             raise A2AProtocolError("A2A JSON-RPC response must be an object")
+        if body.get("jsonrpc") != "2.0" or body.get("id") != request_id:
+            raise A2AProtocolError("A2A JSON-RPC response id is invalid")
         error = body.get("error")
         if isinstance(error, dict):
-            raise A2AProtocolError(str(error.get("message") or "A2A worker returned an error"), code=error.get("code") if isinstance(error.get("code"), int) else None)
-        if body.get("jsonrpc") != "2.0" or "result" not in body:
+            raise A2AProtocolError("A2A worker returned an error", code=error.get("code") if isinstance(error.get("code"), int) else None, retryable=False)
+        if set(body) != {"jsonrpc", "id", "result"}:
             raise A2AProtocolError("A2A JSON-RPC response must contain a result")
         return body["result"]
 
@@ -287,8 +298,13 @@ class A2AClient:
     def _advertised_skills(self, card: dict[str, Any]) -> frozenset[str]:
         capabilities = card.get("capabilities")
         extensions = capabilities.get("extensions") if isinstance(capabilities, dict) else None
-        if not isinstance(extensions, list) or not any(isinstance(item, dict) and item.get("uri") == PROFILE_URI for item in extensions):
+        if not isinstance(extensions, list) or not any(
+            isinstance(item, dict) and item.get("uri") == PROFILE_URI and item.get("required") is True
+            for item in extensions
+        ):
             raise A2AProtocolError("A2A Agent Card does not carry the Hermes profile")
+        if capabilities.get("streaming") is not False or capabilities.get("pushNotifications") is not False:
+            raise A2AProtocolError("A2A Agent Card capabilities are incompatible with this client")
         skills = card.get("skills")
         if not isinstance(skills, list):
             raise A2AProtocolError("A2A Agent Card skills are malformed")
@@ -296,7 +312,10 @@ class A2AClient:
         for item in skills:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                 raise A2AProtocolError("A2A Agent Card skill is malformed")
-            if "application/json" in item.get("inputModes", []) and "application/json" in item.get("outputModes", []):
+            input_modes, output_modes = item.get("inputModes"), item.get("outputModes")
+            if not isinstance(input_modes, list) or not isinstance(output_modes, list) or any(not isinstance(mode, str) for mode in input_modes + output_modes):
+                raise A2AProtocolError("A2A Agent Card skill modes are malformed")
+            if "application/json" in input_modes and "application/json" in output_modes:
                 advertised.add(item["id"])
         return frozenset(advertised)
 
@@ -308,6 +327,9 @@ class A2AClient:
             raise A2AProtocolError("A2A Agent Card advertised an unsafe JSON-RPC endpoint")
         if not self.worker.allow_remote and not _is_loopback_host(parsed.hostname):
             raise A2AProtocolError("A2A Agent Card endpoint is not loopback for a loopback-only worker")
+        configured = urlparse(self.worker.url)
+        if (parsed.scheme, parsed.hostname, parsed.port) != (configured.scheme, configured.hostname, configured.port):
+            raise A2AProtocolError("A2A Agent Card endpoint is outside the trusted origin")
         return endpoint
 
     @staticmethod

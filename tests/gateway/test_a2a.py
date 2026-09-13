@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from yeoman_gateway.a2a.client import A2AWorker, A2AWorkerResult
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
@@ -31,8 +33,60 @@ async def test_registry_rejects_unknown_worker() -> None:
         await A2AWorkerRegistry([]).invoke_skill("missing", "search.web", {"query": "q"})
 
 
+@pytest.mark.asyncio
+async def test_working_research_is_polled_and_delivered() -> None:
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            del input
+            return A2AWorkerResult("hermes", "research-1", context_id or "ctx-1", "TASK_STATE_WORKING", skill, reference_task_ids=tuple(reference_task_ids))
+        async def poll_task(self, task_id, *, skill, context_id, reference_task_ids=()):
+            assert (task_id, skill, context_id, tuple(reference_task_ids)) == ("research-1", "research.deep", "ctx-1", ())
+            return A2AWorkerResult("hermes", task_id, context_id, "TASK_STATE_COMPLETED", skill, {"report": "done", "sources": []})
+    class Delivery:
+        def __init__(self): self.sent = []
+        async def send(self, **kwargs): self.sent.append(kwargs)
+
+    delivery = Delivery()
+    tool = A2ADelegateTool(A2AWorkerRegistry([A2AWorker(name="hermes", url="http://127.0.0.1:9900")], client_factory=lambda _: Client()), delivery=delivery)
+    tool.set_context("whatsapp", "chat@g.us")
+    assert "TASK_STATE_WORKING" in await tool.execute(worker="hermes", skill="research.deep", input={"question": "q", "idempotency_key": "r1"})
+    while tool._background:
+        await asyncio.sleep(0)
+    assert delivery.sent == [{"source": "a2a", "operation_ref": "a2a-result:", "channel": "whatsapp", "chat_id": "chat@g.us", "content": '{"report": "done", "sources": []}'}]
+
+
 def test_workers_are_loopback_only_unless_explicitly_enabled() -> None:
     from yeoman_gateway.a2a.client import A2AWorkerConfigurationError
 
     with pytest.raises(A2AWorkerConfigurationError, match="loopback"):
         A2AWorker(name="remote", url="https://example.test/a2a")
+
+
+def test_router_exposes_gateway_store() -> None:
+    from types import SimpleNamespace
+
+    from yeoman_gateway.processing.dispatch import IntentEffectRouter
+    from yeoman_shared.config.schema import Config
+
+    store = object()
+    assert IntentEffectRouter(gateway=SimpleNamespace(store=store), config=Config.model_validate({"processing": {"enabled": True}})).store is store
+
+
+def test_processing_fence_keeps_a2a_delegate_reachable() -> None:
+    from yeoman_gateway.agent.tools.registry import ToolRegistry
+    from yeoman_gateway.processing.dispatch import (
+        NON_MIGRATED_CAPABILITIES,
+        disable_non_migrated_tools,
+    )
+
+    class Tool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+        def to_schema(self): return {"type": "function", "function": {"name": self.name}}
+        def validate_params(self, params): return []
+        async def execute(self, **kwargs): return ""
+
+    registry = ToolRegistry()
+    for name in ("message", "a2a_delegate", *NON_MIGRATED_CAPABILITIES):
+        registry.register(Tool(name))
+    assert "a2a_delegate" not in disable_non_migrated_tools(registry)

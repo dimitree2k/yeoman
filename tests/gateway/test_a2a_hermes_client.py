@@ -18,6 +18,8 @@ def _card(*skills: str) -> dict[str, object]:
             }
         ],
         "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
             "extensions": [{"uri": "urn:hermes-yeoman:a2a-profile:v1", "required": True}]
         },
         "skills": [
@@ -200,16 +202,39 @@ async def test_client_rejects_malformed_result_and_jsonrpc_error() -> None:
         if request.method == "GET":
             return httpx.Response(200, json=_card("search.web"))
         count += 1
+        request_id = json.loads(request.content)["id"]
         if count == 1:
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": "1", "result": {"task": {}}})
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": "2", "error": {"code": -1, "message": "denied"}})
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "result": {"task": {}}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": "denied"}})
 
     client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(handler))
     with pytest.raises(A2AProtocolError, match="task id"):
         await client.invoke_skill("search.web", {"query": "q"})
-    with pytest.raises(A2AProtocolError, match="denied"):
+    with pytest.raises(A2AProtocolError, match="returned an error") as caught:
         await client.invoke_skill("search.web", {"query": "q"})
+    assert caught.value.code == -1
 
 
 def test_old_text_send_message_api_is_removed() -> None:
     assert not hasattr(A2AClient, "send_message")
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_cross_origin_and_mismatched_rpc_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_TOKEN", "secret")
+
+    async def cross_origin(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**_card("search.web"), "supportedInterfaces": [{"url": "http://127.0.0.2:9900/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}]})
+
+    client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900", auth_token_env="HERMES_TOKEN"), transport=httpx.MockTransport(cross_origin))
+    with pytest.raises(A2AProtocolError, match="trusted origin"):
+        await client.invoke_skill("search.web", {"query": "q"})
+
+    async def wrong_id(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_card("search.web"))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": "other", "result": {"task": _task(state="TASK_STATE_COMPLETED", output={"results": []})}})
+
+    client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(wrong_id))
+    with pytest.raises(A2AProtocolError, match="id"):
+        await client.invoke_skill("search.web", {"query": "q"}, context_id="ctx-1")
