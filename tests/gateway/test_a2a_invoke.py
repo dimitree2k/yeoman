@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.a2a.contracts import ContractSchemas
 from yeoman_gateway.ipc import a2a_invoke
 from yeoman_gateway.ipc.a2a_invoke import process_a2a_invocation
+from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
 from yeoman_gateway.processing.models import EffectReceipt, TransportReceipt
+
+_EFFECT_ID = "a2a-effect-50c84ffe7b1984e86d7f14c7397fee6ed7cf5b11"
 
 
 def _input(**changes: object) -> dict[str, object]:
@@ -52,7 +58,7 @@ class _Resolver:
 class _Effects:
     def __init__(self, receipt: EffectReceipt | None = None, *, unmanaged: bool = False) -> None:
         self.receipt = receipt or EffectReceipt(
-            effect_id="a2a-effect-1", state="sent", accepted=True
+            effect_id=_EFFECT_ID, state="sent", accepted=True
         )
         self.unmanaged = unmanaged
         self.calls: list[dict[str, object]] = []
@@ -106,7 +112,7 @@ async def _invoke(**changes: object) -> tuple[dict[str, object], _Policy, _Resol
         "input": _input(),
         "task_id": "task-1",
         "context_id": "context-1",
-        "effect_id": "a2a-effect-1",
+        "effect_id": _EFFECT_ID,
         "configured_peer": "hermes",
         "advertised_skills": frozenset({"whatsapp.send"}),
         "policy_adapter": policy,
@@ -126,7 +132,7 @@ async def test_valid_text_uses_exact_alias_policy_and_managed_effect() -> None:
 
     assert result["status"] == "completed"
     assert result["output"] == {
-        "delivery_id": "a2a-effect-1",
+        "delivery_id": _EFFECT_ID,
         "status": "sent",
         "recipient": {"type": "group", "alias": "team-example"},
         "sender_account": "default",
@@ -145,11 +151,11 @@ async def test_valid_text_uses_exact_alias_policy_and_managed_effect() -> None:
     assert effects.calls == [
         {
             "source": "a2a",
-            "operation_ref": "a2a-effect-1",
+            "operation_ref": _EFFECT_ID,
             "channel": "whatsapp",
             "chat_id": "private-group@g.us",
             "content": "Hello",
-            "effect_id": "a2a-effect-1",
+            "effect_id": _EFFECT_ID,
             "require_managed": True,
         }
     ]
@@ -286,9 +292,32 @@ async def test_gateway_revalidates_input_before_managed_path_check() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "effect_id",
+    ["", "short", "a2a-effect-" + "f" * 40, "x" * 201],
+)
+async def test_effect_id_must_match_the_deterministic_request_identity(
+    effect_id: str,
+) -> None:
+    result, policy, resolver, effects = await _invoke(effect_id=effect_id)
+
+    assert result["status"] == "rejected"
+    assert result["error"] == {
+        "code": "INVALID_EFFECT_ID",
+        "message": "The effect identity is invalid.",
+        "retryable": False,
+    }
+    assert policy.events == []
+    assert resolver.calls == []
+    assert effects.calls == []
+    ContractSchemas.load().validate_result(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("store", "expected"),
     [
         (_EffectStore(state="queued", provider_message_id=None), "accepted"),
+        (_EffectStore(state="accepted", provider_message_id=None), "accepted"),
         (_EffectStore(state="sent", provider_message_id="provider-1"), "sent"),
         (
             _EffectStore(
@@ -310,6 +339,42 @@ async def test_business_status_uses_only_durable_effect_and_provider_evidence(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "provider_message_id"),
+    [
+        ("planned", None),
+        ("executing", None),
+        ("sent", None),
+        ("failed", "private-provider-id"),
+        ("unknown", "private-provider-id"),
+        ("unknown_nonrepeatable", "private-provider-id"),
+        ("expired", "private-provider-id"),
+        ("blocked", "private-provider-id"),
+        ("cancelled", "private-provider-id"),
+    ],
+)
+async def test_unproven_or_unsuccessful_effect_state_is_a_sanitized_failure(
+    state: str,
+    provider_message_id: str | None,
+) -> None:
+    result, *_ = await _invoke(
+        effect_store=_EffectStore(
+            state=state,
+            provider_message_id=provider_message_id,
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == {
+        "code": "DELIVERY_FAILED",
+        "message": "The delivery could not be completed.",
+        "retryable": False,
+    }
+    assert "private-provider-id" not in str(result)
+    ContractSchemas.load().validate_result(result)
+
+
+@pytest.mark.asyncio
 async def test_retry_keeps_the_caller_effect_identity() -> None:
     effects = _Effects()
     first, *_ = await _invoke(effects=effects)
@@ -317,9 +382,82 @@ async def test_retry_keeps_the_caller_effect_identity() -> None:
 
     assert first == second
     assert [call["effect_id"] for call in effects.calls] == [
-        "a2a-effect-1",
-        "a2a-effect-1",
+        _EFFECT_ID,
+        _EFFECT_ID,
     ]
+
+
+@pytest.mark.asyncio
+async def test_real_socket_composes_with_a2a_invocation_validation_and_identity(
+    tmp_path: Path,
+) -> None:
+    policy = _Policy()
+    resolver = _Resolver()
+    effects = _Effects()
+    store = _EffectStore()
+
+    async def handler(**kwargs: object) -> dict[str, object]:
+        return await process_a2a_invocation(
+            **kwargs,
+            configured_peer="hermes",
+            advertised_skills=frozenset({"whatsapp.send"}),
+            policy_adapter=policy,
+            recipient_resolver=resolver,
+            effects=effects,
+            effect_store=store,
+            sender_account="default",
+        )
+
+    async def invoke(request: dict[str, object]) -> dict[str, object]:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        writer.write(json.dumps(request).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+        return response
+
+    valid = {
+        "cmd": "a2a_invoke",
+        "args": {
+            "peer": "hermes",
+            "skill": "whatsapp.send",
+            "input": _input(),
+            "task_id": "task-1",
+            "context_id": "context-1",
+            "effect_id": _EFFECT_ID,
+        },
+    }
+    server = GatewaySocket(
+        path=tmp_path / "gateway.sock",
+        a2a_invoke_handler=handler,
+        rate_limit=10,
+    )
+    await server.start()
+    try:
+        first = await invoke(valid)
+        second = await invoke(valid)
+        invalid_effect = await invoke(
+            {**valid, "args": {**valid["args"], "effect_id": "random"}}
+        )
+        invalid_input = await invoke(
+            {
+                **valid,
+                "args": {
+                    **valid["args"],
+                    "input": {**valid["args"]["input"], "secret@lid": True},
+                },
+            }
+        )
+    finally:
+        await server.stop()
+
+    assert first["response"]["status"] == "completed"
+    assert second == first
+    assert [call["effect_id"] for call in effects.calls] == [_EFFECT_ID, _EFFECT_ID]
+    assert invalid_effect["response"]["error"]["code"] == "INVALID_EFFECT_ID"
+    assert invalid_input["response"]["error"]["code"] == "INVALID_SKILL_INPUT"
+    assert "secret@lid" not in str(invalid_input)
 
 
 class _AliasStore:

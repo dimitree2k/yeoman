@@ -496,6 +496,10 @@ class ServiceEffectProducer:
         require_managed: bool = False,
     ) -> EffectReceipt | None:
         """Submit one system-produced effect. ``None`` means the legacy path was used."""
+        if require_managed and not effect_id:
+            raise EffectNotDeliveredError(
+                "managed service effect requires a caller effect id"
+            )
         if not self._router.manages(channel, chat_id):
             if require_managed:
                 raise EffectNotDeliveredError(
@@ -849,7 +853,14 @@ class IntentEffectRouter:
         receipt = self._gateway.submit(envelope)
         self._plan_quotable_message(envelope, turn=turn, now=now)
 
-        blocked = self._capacity_block(channel, chat_id, payload, receipt.effect_id)
+        log_chat = (
+            "[a2a-target]"
+            if principal == SERVICE_PRINCIPALS["a2a"]
+            else chat_id
+        )
+        blocked = self._capacity_block(
+            channel, chat_id, payload, receipt.effect_id, log_chat=log_chat
+        )
         if blocked is not None:
             return blocked
 
@@ -859,13 +870,13 @@ class IntentEffectRouter:
             "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",
             receipt.effect_id,
             result.state,
-            chat_id,
+            log_chat,
             turn_id or "-",
             turn_revision,
             getattr(result, "detail", None) or "-",
         )
         self._close_ambient_turn(turn_id, now=now)
-        return self._log_undelivered(result, envelope, chat_id)
+        return self._log_undelivered(result, envelope, log_chat)
 
     def _plan_quotable_message(self, envelope: EffectEnvelope, *, turn: Any, now: int) -> None:
         """Reserve the anchor a later reply to this message has to resolve to.
@@ -962,7 +973,13 @@ class IntentEffectRouter:
         budget.note_send(thread_id=thread_id, now_ms=now_ms)
 
     def _capacity_block(
-        self, channel: str, chat_id: str, payload: Any, effect_id: str
+        self,
+        channel: str,
+        chat_id: str,
+        payload: Any,
+        effect_id: str,
+        *,
+        log_chat: str,
     ) -> EffectReceipt | None:
         """Refuse to dispatch when the chat is over its budget or its outbox is full.
 
@@ -1003,7 +1020,7 @@ class IntentEffectRouter:
             evidence={"kind": "policy", "detail": reason},
         )
         logger.warning(
-            "effect blocked effect_id={} reason={} chat={}", effect_id, reason, chat_id
+            "effect blocked effect_id={} reason={} chat={}", effect_id, reason, log_chat
         )
         return self._gateway.store.get_effect(effect_id) and self._gateway._receipt(
             effect_id,
@@ -1012,7 +1029,7 @@ class IntentEffectRouter:
             detail=reason,
         )
 
-    def _log_undelivered(self, result: Any, envelope: Any, chat_id: str) -> None:
+    def _log_undelivered(self, result: Any, envelope: Any, log_chat: str) -> None:
         if result.state != "sent":
             logger.warning(
                 "effect not delivered effect_id={} state={} detail={} capability={} chat={}",
@@ -1020,7 +1037,7 @@ class IntentEffectRouter:
                 result.state,
                 result.detail,
                 envelope.capability,
-                chat_id,
+                log_chat,
             )
         return result
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol
@@ -115,13 +116,16 @@ def _business_status(store: _EffectStore, effect_id: str) -> tuple[str, str | No
     stored = store.get_effect(effect_id)
     if stored is None:
         raise RuntimeError("effect was not durably recorded")
-    if str(getattr(stored, "state", "")) != "sent":
+    state = str(getattr(stored, "state", ""))
+    if state in {"queued", "accepted"}:
         return "accepted", None
+    if state != "sent":
+        raise RuntimeError("effect outcome is not successful")
 
     receipt = store.effect_transport_receipt(effect_id)
     provider_id = str(getattr(receipt, "provider_message_id", "") or "") or None
     if receipt is None or provider_id is None:
-        return "sent", None
+        raise RuntimeError("sent effect has no durable transport receipt")
     signals = store.delivery_signals(chat_id=receipt.chat_id, message_id=provider_id)
     delivered = any(
         str((getattr(signal, "payload", None) or {}).get("status", "")).lower()
@@ -193,6 +197,16 @@ async def process_a2a_invocation(
             skill=skill,
             code="SKILL_NOT_ADVERTISED",
             message="The skill is not available.",
+            correlation=correlation,
+        )
+    expected_effect_id = "a2a-effect-" + hashlib.sha256(
+        f"{peer}\0{skill}\0{input['idempotency_key']}".encode()
+    ).hexdigest()[:40]
+    if not isinstance(effect_id, str) or effect_id != expected_effect_id:
+        return _failure(
+            skill=skill,
+            code="INVALID_EFFECT_ID",
+            message="The effect identity is invalid.",
             correlation=correlation,
         )
     if "sender" in input:

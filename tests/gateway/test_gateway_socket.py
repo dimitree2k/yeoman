@@ -208,3 +208,36 @@ async def test_a2a_invoke_sanitizes_handler_failures(tmp_path: Path) -> None:
         },
     }
     assert "private-contact@lid" not in str(response)
+
+
+@pytest.mark.asyncio
+async def test_a2a_capabilities_round_trips_available_text_skill_over_real_socket(
+    tmp_path: Path,
+) -> None:
+    async def handler() -> dict[str, object]:
+        return {
+            "skills": ["whatsapp.send"],
+            "content_types": ["text"],
+        }
+
+    server = GatewaySocket(path=tmp_path / "gateway.sock")
+    server.a2a_capabilities_handler = handler
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        writer.write(json.dumps({"cmd": "a2a_capabilities", "args": {}}).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+    assert response == {
+        "status": "ok",
+        "response": {
+            "skills": ["whatsapp.send"],
+            "content_types": ["text"],
+        },
+    }
+    assert "voice" not in str(response)

@@ -27,6 +27,7 @@ class GatewaySocket:
     owner_turn_handler: Callable[..., Awaitable[dict]] | None = None
     a2a_delivery_handler: Callable[..., Awaitable[dict]] | None = None
     a2a_invoke_handler: Callable[..., Awaitable[dict[str, Any]]] | None = None
+    a2a_capabilities_handler: Callable[[], Awaitable[dict[str, Any]]] | None = None
     publish_event_handler: Callable[..., Awaitable[dict]] | None = None
     get_session_state_handler: Callable[..., Awaitable[dict]] | None = None
     rate_limit: int = 10  # commands per second
@@ -149,6 +150,20 @@ class GatewaySocket:
                     context_id=args.get("context_id", ""),
                     effect_id=args.get("effect_id", ""),
                 )
+                return {"status": "ok", "response": result}
+            except Exception:
+                return {
+                    "status": "error",
+                    "error": {
+                        "code": "IPC_HANDLER_FAILED",
+                        "message": "The local runtime could not process the request.",
+                        "retryable": False,
+                    },
+                }
+
+        if cmd == "a2a_capabilities" and self.a2a_capabilities_handler:
+            try:
+                result = await self.a2a_capabilities_handler()
                 return {"status": "ok", "response": result}
             except Exception:
                 return {

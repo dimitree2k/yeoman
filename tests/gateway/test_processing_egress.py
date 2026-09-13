@@ -823,6 +823,65 @@ async def test_service_producer_reuses_caller_effect_id_without_second_send(
 
 
 @pytest.mark.asyncio
+async def test_managed_service_producer_refuses_missing_caller_effect_id(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ServiceEffectProducer,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+
+    with pytest.raises(EffectNotDeliveredError, match="caller effect id"):
+        await ServiceEffectProducer(router=router, bus=bus).send(
+            source="a2a",
+            operation_ref="request-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="do not invent an identity",
+            require_managed=True,
+        )
+
+    assert bus.sent == []
+    assert executor.calls == []
+    assert store.count_effects() == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a2a_managed_dispatch_log_omits_resolved_target(tmp_path: Path) -> None:
+    from loguru import logger
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        await ServiceEffectProducer(router=router, bus=_RecordingBus()).send(
+            source="a2a",
+            operation_ref="request-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="private target must stay out of logs",
+            effect_id="a2a-effect-fixed",
+            require_managed=True,
+        )
+    finally:
+        logger.remove(sink)
+
+    logged = "\n".join(records)
+    assert CHAT not in logged
+    assert "chat=[a2a-target]" in logged
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_service_producer_can_require_managed_without_raw_bus_fallback(
     tmp_path: Path,
 ) -> None:

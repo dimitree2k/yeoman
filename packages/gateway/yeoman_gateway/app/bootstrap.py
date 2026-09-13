@@ -1792,6 +1792,13 @@ def build_gateway_runtime(
             sender_account="default",
         )
 
+    async def ipc_a2a_capabilities() -> dict[str, object]:
+        skills = sorted(advertised_a2a_skills)
+        return {
+            "skills": skills,
+            "content_types": ["text"] if "whatsapp.send" in skills else [],
+        }
+
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
         from yeoman_gateway.bus.events import SystemEvent
 
@@ -1805,6 +1812,7 @@ def build_gateway_runtime(
         owner_turn_handler=ipc_owner_turn,
         a2a_delivery_handler=ipc_a2a_send,
         a2a_invoke_handler=ipc_a2a_invoke,
+        a2a_capabilities_handler=ipc_a2a_capabilities,
         publish_event_handler=ipc_publish_event,
         rate_limit=ipc_config.command_rate_limit,
     )
