@@ -10,6 +10,7 @@ from yeoman_gateway.a2a.client import A2AClient, A2AProtocolError, A2AWorker
 def _card(*skills: str) -> dict[str, object]:
     return {
         "name": "Hermes",
+        "version": "1.0.0",
         "supportedInterfaces": [
             {
                 "url": "http://127.0.0.1:9900/a2a",
@@ -152,7 +153,7 @@ async def test_polling_keeps_reference_correlation_until_final_result() -> None:
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"], "result": task})
 
     client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(handler))
-    result = await client.poll_task("task-1", skill="search.web", context_id="ctx-1", reference_task_ids=["prior-1"], attempts=1)
+    result = await client.poll_task("task-1", skill="search.web", context_id="ctx-1", reference_task_ids=["prior-1"], deadline_seconds=1, interval_seconds=0.01)
 
     assert result.reference_task_ids == ("prior-1",)
     assert polls == 1

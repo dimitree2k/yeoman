@@ -13,7 +13,12 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from yeoman_gateway.a2a.contracts import PROFILE_URI, A2AContractValidationError, ContractSchemas
+from yeoman_gateway.a2a.contracts import (
+    CONTRACT_RELEASE,
+    PROFILE_URI,
+    A2AContractValidationError,
+    ContractSchemas,
+)
 
 _A2A_VERSION = "1.0"
 _AGENT_CARD_PATHS = ("/.well-known/agent-card.json", "/.well-known/agent.json")
@@ -102,6 +107,8 @@ class A2AWorkerResult:
     skill: str
     output: dict[str, Any] | None = None
     reference_task_ids: tuple[str, ...] = ()
+    error_code: str | None = None
+    retryable: bool | None = None
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
@@ -167,18 +174,17 @@ class A2AClient:
             params["tenant"] = tenant
         return self._task_result(await self._rpc(endpoint, "tasks/get", params), skill, context, self._references(reference_task_ids))
 
-    async def poll_task(self, task_id: str, *, skill: str, context_id: str, reference_task_ids: tuple[str, ...] | list[str] = (), attempts: int = 3, interval_seconds: float = 0.25) -> A2AWorkerResult:
-        if attempts < 1 or attempts > 20 or interval_seconds < 0 or interval_seconds > 60:
+    async def poll_task(self, task_id: str, *, skill: str, context_id: str, reference_task_ids: tuple[str, ...] | list[str] = (), deadline_seconds: float = 1800, interval_seconds: float = 5) -> A2AWorkerResult:
+        if deadline_seconds <= 0 or deadline_seconds > 1800 or interval_seconds <= 0 or interval_seconds > 60:
             raise A2AProtocolError("A2A polling bounds are invalid")
         result: A2AWorkerResult | None = None
-        for attempt in range(attempts):
+        deadline = asyncio.get_running_loop().time() + deadline_seconds
+        while asyncio.get_running_loop().time() < deadline:
             result = await self.get_task(task_id, skill=skill, context_id=context_id, reference_task_ids=reference_task_ids)
             if result.state in _TERMINAL_STATES:
                 return result
-            if attempt + 1 < attempts:
-                await asyncio.sleep(interval_seconds)
-        assert result is not None
-        return result
+            await asyncio.sleep(min(interval_seconds, max(0, deadline - asyncio.get_running_loop().time())))
+        raise A2AProtocolError("A2A task polling timed out", retryable=True)
 
     def _validate_invocation(self, invocation: dict[str, Any], *, validate_request: bool = True) -> None:
         try:
@@ -200,10 +206,10 @@ class A2AClient:
         if not isinstance(status, dict) or status.get("state") not in _V1_STATES:
             raise A2AProtocolError("A2A task state is invalid")
         state = status["state"]
-        output = self._structured_output(task, skill, task_id, context, references) if state in _TERMINAL_STATES else None
-        return A2AWorkerResult(worker=self.worker.name, task_id=task_id, context_id=context, state=state, skill=skill, output=output, reference_task_ids=references, raw=task)
+        output, error_code, retryable = self._structured_output(task, skill, task_id, context, references) if state in _TERMINAL_STATES else (None, None, None)
+        return A2AWorkerResult(worker=self.worker.name, task_id=task_id, context_id=context, state=state, skill=skill, output=output, reference_task_ids=references, error_code=error_code, retryable=retryable, raw=task)
 
-    def _structured_output(self, task: dict[str, Any], skill: str, task_id: str, context: str, references: tuple[str, ...]) -> dict[str, Any] | None:
+    def _structured_output(self, task: dict[str, Any], skill: str, task_id: str, context: str, references: tuple[str, ...]) -> tuple[dict[str, Any] | None, str | None, bool | None]:
         artifacts = task.get("artifacts")
         if not isinstance(artifacts, list) or len(artifacts) != 1:
             raise A2AProtocolError("A2A final task requires one structured artifact")
@@ -230,6 +236,7 @@ class A2AClient:
             "TASK_STATE_COMPLETED": "completed",
             "TASK_STATE_REJECTED": "rejected",
             "TASK_STATE_FAILED": "failed",
+            "TASK_STATE_CANCELED": "failed",
         }.get(task.get("status", {}).get("state"))
         if expected_status is not None and structured.get("status") != expected_status:
             raise A2AProtocolError("A2A task state and profile result status disagree")
@@ -240,10 +247,13 @@ class A2AClient:
                 self._schemas.validate_response(skill, output)
             except A2AContractValidationError as exc:
                 raise A2AProtocolError("A2A structured output is invalid") from exc
-            return output
+            return output, None, None
         if output is not None:
             raise A2AProtocolError("A2A non-completed result cannot contain output")
-        return None
+        error = structured.get("error")
+        if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not isinstance(error.get("retryable"), bool):
+            raise A2AProtocolError("A2A terminal failure requires structured error")
+        return None, error["code"], error["retryable"]
 
     async def _rpc(self, endpoint: str, method: str, params: dict[str, Any]) -> Any:
         request_id = uuid.uuid4().hex
@@ -265,7 +275,9 @@ class A2AClient:
             raise A2AProtocolError("A2A JSON-RPC response id is invalid")
         error = body.get("error")
         if isinstance(error, dict):
-            raise A2AProtocolError("A2A worker returned an error", code=error.get("code") if isinstance(error.get("code"), int) else None, retryable=False)
+            if set(body) != {"jsonrpc", "id", "error"} or not isinstance(error.get("code"), int) or not isinstance(error.get("message"), str):
+                raise A2AProtocolError("A2A JSON-RPC error envelope is invalid")
+            raise A2AProtocolError("A2A worker returned an error", code=error["code"], retryable=False)
         if set(body) != {"jsonrpc", "id", "result"}:
             raise A2AProtocolError("A2A JSON-RPC response must contain a result")
         return body["result"]
@@ -296,6 +308,8 @@ class A2AClient:
         raise A2AProtocolError("A2A Agent Card must advertise a v1 JSON-RPC interface")
 
     def _advertised_skills(self, card: dict[str, Any]) -> frozenset[str]:
+        if card.get("version") != CONTRACT_RELEASE:
+            raise A2AProtocolError("A2A Agent Card version is incompatible")
         capabilities = card.get("capabilities")
         extensions = capabilities.get("extensions") if isinstance(capabilities, dict) else None
         if not isinstance(extensions, list) or not any(
