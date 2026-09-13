@@ -336,7 +336,7 @@ class A2ADelegateTool(Tool):
             )
         if self._delivery is not None and channel and chat_id:
             try:
-                await self._delivery.send(
+                receipt = await self._delivery.send(
                     source="a2a",
                     operation_ref=f"a2a-result:{effect_id}",
                     channel=channel,
@@ -350,5 +350,13 @@ class A2ADelegateTool(Tool):
                     type(exc).__name__,
                 )
             else:
+                state = str(getattr(receipt, "state", "") or "")
+                if receipt is not None and state not in {"sent", "delivered"}:
+                    logger.warning(
+                        "A2A research result remains pending worker={} state={}",
+                        safe_log_token(worker),
+                        safe_log_token(state or "unknown"),
+                    )
+                    return
                 if self._research_store is not None:
                     self._research_store.delete(task_id, effect_id=effect_id)

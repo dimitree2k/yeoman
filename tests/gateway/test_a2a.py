@@ -263,6 +263,48 @@ async def test_research_poll_resumes_from_store_after_tool_restart(tmp_path: Pat
     assert A2AResearchStore(path).pending() == ()
 
 
+@pytest.mark.asyncio
+async def test_research_pending_state_survives_an_unknown_delivery_outcome(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    path = tmp_path / "research.db"
+    store = A2AResearchStore(path)
+    pending = PendingResearch(
+        task_id="research-unknown",
+        worker="hermes",
+        skill="research.deep",
+        context_id="ctx-unknown",
+        reference_task_ids=(),
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        effect_id="effect-unknown",
+    )
+    store.put(pending)
+
+    class Registry:
+        async def poll_task(self, worker, task_id, **kwargs):
+            return A2AWorkerResult(
+                worker,
+                task_id,
+                kwargs["context_id"],
+                "TASK_STATE_COMPLETED",
+                kwargs["skill"],
+                {"report": "done", "sources": []},
+            )
+
+    class Delivery:
+        async def send(self, **kwargs):
+            return SimpleNamespace(state="unknown")
+
+    tool = A2ADelegateTool(Registry(), delivery=Delivery(), pending_store=store)
+    while tool._background:
+        await asyncio.sleep(0)
+
+    assert store.pending() == (pending,)
+
+
 def test_workers_are_loopback_only_unless_explicitly_enabled() -> None:
     from yeoman_gateway.a2a.client import A2AWorkerConfigurationError
 

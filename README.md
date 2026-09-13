@@ -308,6 +308,9 @@ chmod 600 ~/.yeoman/a2a-capabilities.env
 yeoman deploy
 yeoman overseer install-units
 systemctl --user daemon-reload
+systemctl --user restart yeoman-gateway.service
+# If the legacy unit exists, stop it before binding the replacement listener:
+systemctl --user disable --now yeoman-a2a-relay.service
 systemctl --user enable --now yeoman-a2a.service
 ```
 
