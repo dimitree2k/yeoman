@@ -258,6 +258,62 @@ yeoman env
 ./bin/yeoman env
 ```
 
+### Standalone A2A relay (v1)
+
+The Hermes/Yeoman A2A relay uses contract release `1.0.1` and profile
+`urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service.
+Put the bearer secret and network boundary settings in
+`~/.yeoman/secrets/a2a.env`. Put the non-secret settings shared with Gateway
+(`YEOMAN_A2A_PEER_ID`, `YEOMAN_A2A_WHATSAPP_ENABLED`, content types, artifact
+paths and limits) in `~/.yeoman/a2a-capabilities.env`. Then run it locally with:
+
+```bash
+yeoman a2a serve
+```
+
+The v1 relay is polling-only: it does not implement streaming or push delivery.
+The previous free-text relay protocol is unsupported; callers must use the
+structured v1 profile.
+
+Validate the installed contract release/profile against every positive and
+negative fixture in a checkout at the exact pinned commit:
+
+```bash
+yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
+```
+
+To try a contract checkout without changing the project pin, use the local
+override wrapper:
+
+```bash
+./scripts/use-local-a2a-contracts /path/to/hermes-yeoman-a2a-contracts run \
+  yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
+```
+
+For persistent operation, deploy and install the source-owned user unit. Keep
+the bearer secret and bind/allow-list values in the private relay environment;
+keep shared capability values in the separate non-secret file loaded by both
+Gateway and relay. Ensure both files are owner-readable only, then perform the
+explicit cutover:
+
+```bash
+mkdir -p ~/.yeoman/secrets
+chmod 700 ~/.yeoman/secrets
+touch ~/.yeoman/secrets/a2a.env
+chmod 600 ~/.yeoman/secrets/a2a.env
+touch ~/.yeoman/a2a-capabilities.env
+chmod 600 ~/.yeoman/a2a-capabilities.env
+# edit secrets/a2a.env: bearer secret, bind host and peer IP allow-list
+# edit a2a-capabilities.env: peer id, enabled skills/content and artifact limits
+yeoman deploy
+yeoman overseer install-units
+systemctl --user daemon-reload
+systemctl --user restart yeoman-gateway.service
+# If the legacy unit exists, stop it before binding the replacement listener:
+systemctl --user disable --now yeoman-a2a-relay.service
+systemctl --user enable --now yeoman-a2a.service
+```
+
 ## Quick Start
 
 **1. Initialize**
@@ -516,6 +572,8 @@ the protocol version.
 | `yeoman status` | Runtime status |
 | `yeoman env` | Show active launcher and Python environment |
 | `yeoman doctor` | Run health checks and report issues |
+| `yeoman a2a serve` | Run the standalone authenticated A2A relay |
+| `yeoman a2a conformance --contracts-checkout PATH` | Validate every pinned A2A fixture |
 | `yeoman logs` | View gateway/bridge/overseer logs |
 | **Channels** | |
 | `yeoman channels login` | Link WhatsApp (scan QR) |

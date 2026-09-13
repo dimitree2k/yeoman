@@ -58,11 +58,12 @@ from yeoman_gateway.persona_evolution import (
 )
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.processing.dispatch import (
+    SERVICE_PRINCIPALS,
     ServiceEffectProducer,
     disable_non_migrated_tools,
 )
 from yeoman_gateway.processing.invalidation import SignalInvalidator
-from yeoman_gateway.processing.models import canonical_hash
+from yeoman_gateway.processing.models import MediaPayload, canonical_hash
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.providers.factory import ProviderFactory
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
@@ -99,6 +100,59 @@ def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolCo
         exec_config.isolation.fail_closed = True
         exec_config.allow_host_execution = False
     return restrict_to_workspace, exec_config
+
+
+def build_a2a_voice_artifact_store(
+    *,
+    root: Path | None,
+    managed_outgoing_root: Path,
+    tts: TTSSynthesizer,
+    model_router: ModelRouter,
+    max_bytes: int,
+    ttl_seconds: int,
+) -> Any | None:
+    """Build the optional voice store only for a usable configured TTS route."""
+    if (
+        root is None
+        or not root.is_absolute()
+        or not managed_outgoing_root.expanduser().is_absolute()
+        or max_bytes <= 0
+        or ttl_seconds <= 0
+    ):
+        return None
+    try:
+        from yeoman_gateway.a2a.artifacts import VoiceArtifactStore
+
+        managed = managed_outgoing_root.expanduser().resolve(strict=True)
+        candidate = root.expanduser().resolve(strict=False)
+        if candidate == managed or not candidate.is_relative_to(managed):
+            return None
+        profile = model_router.resolve("tts.speak", channel="whatsapp")
+        store = VoiceArtifactStore(
+            root,
+            tts=tts,
+            profile=profile,
+            max_bytes=max_bytes,
+            ttl_seconds=ttl_seconds,
+            managed_outgoing_root=managed_outgoing_root,
+        )
+    except (KeyError, OSError, ValueError):
+        return None
+    return store if store.available else None
+
+
+def resolve_a2a_artifact_root(
+    root: Path | None, managed_outgoing_root: Path
+) -> Path | None:
+    """Return a configured A2A subdirectory only when it stays under managed media."""
+    if root is None or not root.is_absolute() or not managed_outgoing_root.is_absolute():
+        return None
+    try:
+        managed = managed_outgoing_root.expanduser().resolve(strict=True)
+        candidate = root.expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    return candidate if candidate != managed and candidate.is_relative_to(managed) else None
 
 
 def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
@@ -319,9 +373,18 @@ class GatewayRuntime:
         if self.retention is not None:
             await self.retention.start()
 
+    def _resume_a2a_research(self) -> None:
+        """Resume durable Hermes polling after the runtime event loop exists."""
+
+        a2a_tool = self.responder.tools.get("a2a_delegate")
+        resume = getattr(a2a_tool, "resume_pending_research", None)
+        if callable(resume):
+            resume()
+
     async def run(self) -> None:
         tracing.init()
         try:
+            self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
             if self.consciousness is not None:
@@ -1738,6 +1801,131 @@ def build_gateway_runtime(
             responder=responder,
         )
 
+    configured_a2a_peer = os.environ.get("YEOMAN_A2A_PEER_ID", "").strip()
+    a2a_content_types = {
+        item.strip()
+        for item in os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text").split(",")
+        if item.strip()
+    }
+    a2a_whatsapp_enabled = os.environ.get(
+        "YEOMAN_A2A_WHATSAPP_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    artifact_root_value = os.environ.get("YEOMAN_A2A_ARTIFACT_ROOT", "").strip()
+    try:
+        artifact_max_bytes = int(
+            os.environ.get("YEOMAN_A2A_MAX_ARTIFACT_BYTES", str(5 * 1024 * 1024))
+        )
+        artifact_ttl_seconds = int(os.environ.get("YEOMAN_A2A_ARTIFACT_TTL_SECONDS", "300"))
+    except ValueError:
+        artifact_max_bytes = artifact_ttl_seconds = 0
+    a2a_voice_store = build_a2a_voice_artifact_store(
+        root=Path(artifact_root_value).expanduser() if artifact_root_value else None,
+        managed_outgoing_root=config.channels.whatsapp.media.outgoing_path,
+        tts=tts,
+        model_router=model_router,
+        max_bytes=artifact_max_bytes,
+        ttl_seconds=artifact_ttl_seconds,
+    )
+    a2a_artifact_root = resolve_a2a_artifact_root(
+        Path(artifact_root_value).expanduser() if artifact_root_value else None,
+        config.channels.whatsapp.media.outgoing_path,
+    )
+    whatsapp_a2a_available = bool(
+        configured_a2a_peer
+        and a2a_whatsapp_enabled
+        and a2a_content_types & {"text", "voice", "image", "file"}
+        and config.channels.whatsapp.enabled
+        and service_effects is not None
+    )
+    voice_a2a_available = bool(
+        whatsapp_a2a_available
+        and "voice" in a2a_content_types
+        and a2a_voice_store is not None
+    )
+    advertised_a2a_skills = frozenset(
+        ({"whatsapp.send"} if whatsapp_a2a_available else set())
+        | ({"media.voice.generate"} if voice_a2a_available else set())
+    )
+
+    async def a2a_media_sender(
+        *, operation_ref: str, chat_id: str, path: str, effect_id: str, caption: str = ""
+    ) -> object:
+        if effect_router is None or not effect_router.manages("whatsapp", chat_id):
+            raise RuntimeError("managed effect path unavailable")
+        payload = MediaPayload(media=(path,), caption=caption)
+        return await effect_router.submit_message(
+            OutboundMessage(
+                channel="whatsapp",
+                chat_id=chat_id,
+                content=caption,
+                media=[path],
+                metadata={"message_id": operation_ref, "service_source": "a2a"},
+            ),
+            principal=SERVICE_PRINCIPALS["a2a"],
+            capability="send_media",
+            payload=payload,
+            effect_id=effect_id,
+        )
+
+    async def ipc_a2a_invoke(
+        peer: str,
+        skill: str,
+        input: dict[str, Any],
+        task_id: str,
+        context_id: str,
+        effect_id: str,
+        resolved_artifacts: list[dict[str, Any]],
+    ) -> dict[str, object]:
+        from functools import partial
+
+        from yeoman_gateway.ipc.a2a_invoke import (
+            process_a2a_invocation,
+            resolve_whatsapp_recipient,
+        )
+
+        return await process_a2a_invocation(
+            peer=peer,
+            skill=skill,
+            input=input,
+            task_id=task_id,
+            context_id=context_id,
+            effect_id=effect_id,
+            configured_peer=configured_a2a_peer,
+            advertised_skills=advertised_a2a_skills,
+            policy_adapter=policy_adapter,
+            recipient_resolver=partial(
+                resolve_whatsapp_recipient,
+                policy_adapter=policy_adapter,
+                contacts_service=contacts_service,
+            ),
+            effects=service_effects,
+            effect_store=processing_store,
+            sender_account="default",
+            enabled_content_types=a2a_content_types,
+            voice_generator=a2a_voice_store,
+            resolved_artifacts=resolved_artifacts,
+            artifact_root=a2a_artifact_root,
+            media_sender=(
+                a2a_media_sender
+                if whatsapp_a2a_available
+                and a2a_artifact_root is not None
+                and (bool(a2a_content_types & {"image", "file"}) or voice_a2a_available)
+                else None
+            ),
+        )
+
+    async def ipc_a2a_capabilities() -> dict[str, object]:
+        skills = sorted(advertised_a2a_skills)
+        content_types = []
+        if "whatsapp.send" in skills:
+            content_types.extend(sorted(a2a_content_types & {"text", "image", "file"}))
+        if "media.voice.generate" in skills:
+            content_types.append("voice")
+        return {
+            "skills": skills,
+            "content_types": content_types,
+        }
+
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
         from yeoman_gateway.bus.events import SystemEvent
 
@@ -1750,6 +1938,8 @@ def build_gateway_runtime(
         trigger_agent_turn_handler=ipc_trigger_agent_turn,
         owner_turn_handler=ipc_owner_turn,
         a2a_delivery_handler=ipc_a2a_send,
+        a2a_invoke_handler=ipc_a2a_invoke,
+        a2a_capabilities_handler=ipc_a2a_capabilities,
         publish_event_handler=ipc_publish_event,
         rate_limit=ipc_config.command_rate_limit,
     )

@@ -664,6 +664,40 @@ class _SanitizingSecurity:
         )
 
 
+def test_security_decision_log_redacts_chat_target_but_keeps_operation_fields() -> None:
+    from loguru import logger
+    from yeoman_gateway.security.engine import SecurityEngine
+    from yeoman_shared.config.schema import SecurityConfig
+
+    sentinel = "120363400000000999@g.us"
+    engine = SecurityEngine(
+        SecurityConfig.model_validate(
+            {"enabled": True, "stages": {"output": True}}
+        )
+    )
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        result = engine.check_output(
+            "secret sk-abc123abc123abc123abc123",
+            context={
+                "channel": "whatsapp",
+                "chat_id": sentinel,
+                "effect_id": "a2a-effect-sentinel",
+                "capability": "send_text",
+            },
+        )
+    finally:
+        logger.remove(sink)
+
+    assert result.decision.action == "sanitize"
+    logged = "\n".join(records)
+    assert sentinel not in logged
+    assert "a2a-effect-sentinel" in logged
+    assert "send_text" in logged
+    assert "whatsapp" in logged
+
+
 @pytest.mark.asyncio
 async def test_text_effects_pass_the_shared_output_control(tmp_path: Path) -> None:
     from yeoman_gateway.processing.dispatch import BusEffectExecutor
@@ -751,6 +785,40 @@ async def test_service_producer_uses_a_service_principal(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_a2a_service_result_does_not_inherit_the_finished_request_turn(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from yeoman_gateway.processing.dispatch import CURRENT_TURN, ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    token = CURRENT_TURN.set(
+        SimpleNamespace(
+            turn=SimpleNamespace(turn_id="closed-turn", revision=7),
+            trace_id="old-request",
+        )
+    )
+    try:
+        await ServiceEffectProducer(router=router, bus=_RecordingBus()).send(
+            source="a2a",
+            operation_ref="a2a-result:research-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="detached result",
+        )
+    finally:
+        CURRENT_TURN.reset(token)
+
+    assert len(executor.calls) == 1
+    assert executor.calls[0].turn_id == ""
+    assert executor.calls[0].trace_id == "a2a-result:research-1"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_service_producer_keeps_legacy_for_unmanaged_chats(tmp_path: Path) -> None:
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
 
@@ -782,6 +850,145 @@ async def test_service_producer_keeps_legacy_for_unmanaged_chats(tmp_path: Path)
     )
     assert [message.content for message in bus.sent] == ["reminder"]
     assert executor.calls == []
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_producer_reuses_caller_effect_id_without_second_send(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    producer = ServiceEffectProducer(router=router, bus=_RecordingBus())
+
+    first = await producer.send(
+        source="a2a",
+        operation_ref="a2a-effect-fixed",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="one delivery",
+        effect_id="a2a-effect-fixed",
+        require_managed=True,
+    )
+    second = await producer.send(
+        source="a2a",
+        operation_ref="a2a-effect-fixed",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="one delivery",
+        effect_id="a2a-effect-fixed",
+        require_managed=True,
+    )
+
+    assert first is not None and first.effect_id == "a2a-effect-fixed"
+    assert second is not None and second.effect_id == "a2a-effect-fixed"
+    assert len(executor.calls) == 1
+    assert store.count_effects() == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_service_producer_refuses_missing_caller_effect_id(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ServiceEffectProducer,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    bus = _RecordingBus()
+
+    with pytest.raises(EffectNotDeliveredError, match="caller effect id"):
+        await ServiceEffectProducer(router=router, bus=bus).send(
+            source="a2a",
+            operation_ref="request-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="do not invent an identity",
+            require_managed=True,
+        )
+
+    assert bus.sent == []
+    assert executor.calls == []
+    assert store.count_effects() == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a2a_managed_dispatch_log_omits_resolved_target(tmp_path: Path) -> None:
+    from loguru import logger
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        await ServiceEffectProducer(router=router, bus=_RecordingBus()).send(
+            source="a2a",
+            operation_ref="request-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="private target must stay out of logs",
+            effect_id="a2a-effect-fixed",
+            require_managed=True,
+        )
+    finally:
+        logger.remove(sink)
+
+    logged = "\n".join(records)
+    assert CHAT not in logged
+    assert "chat=[a2a-target]" in logged
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_producer_can_require_managed_without_raw_bus_fallback(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ServiceEffectProducer,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(
+        gateway=gateway,
+        config=_config(chats=("whatsapp:elsewhere@g.us",)),
+        clock=_Clock(0),
+    )
+    bus = _RecordingBus()
+
+    with pytest.raises(EffectNotDeliveredError, match="managed effect"):
+        await ServiceEffectProducer(router=router, bus=bus).send(
+            source="a2a",
+            operation_ref="a2a-effect-fixed",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="do not bypass",
+            effect_id="a2a-effect-fixed",
+            require_managed=True,
+        )
+
+    assert bus.sent == []
+    assert executor.calls == []
+    assert store.count_effects() == 0
     store.close()
 
 

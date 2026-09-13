@@ -139,3 +139,112 @@ async def test_rate_limiting() -> None:
     )
     assert ok_count == 2
     assert limited_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a2a_invoke_round_trips_exact_arguments_over_real_socket(
+    tmp_path: Path,
+) -> None:
+    received: dict[str, object] = {}
+
+    async def handler(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"accepted": True}
+
+    server = GatewaySocket(path=tmp_path / "gateway.sock")
+    server.a2a_invoke_handler = handler
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        request = {
+            "cmd": "a2a_invoke",
+            "args": {
+                "peer": "hermes",
+                "skill": "whatsapp.send",
+                "input": {"recipient": {"type": "group", "alias": "molty.python"}},
+                "task_id": "task-1",
+                "context_id": "context-1",
+                "effect_id": "a2a-effect-1",
+                "resolved_artifacts": [
+                    {
+                        "peer": "hermes",
+                        "uri": "https://relay.example.test/artifacts/opaque",
+                        "path": "/private/artifact.ogg",
+                    }
+                ],
+            },
+        }
+        writer.write(json.dumps(request).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+    assert response == {"status": "ok", "response": {"accepted": True}}
+    assert received == request["args"]
+
+
+@pytest.mark.asyncio
+async def test_a2a_invoke_sanitizes_handler_failures(tmp_path: Path) -> None:
+    async def handler(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("private-contact@lid")
+
+    server = GatewaySocket(
+        path=tmp_path / "gateway.sock",
+        a2a_invoke_handler=handler,
+    )
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        writer.write(json.dumps({"cmd": "a2a_invoke", "args": {}}).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+    assert response == {
+        "status": "error",
+        "error": {
+            "code": "IPC_HANDLER_FAILED",
+            "message": "The local runtime could not process the request.",
+            "retryable": False,
+        },
+    }
+    assert "private-contact@lid" not in str(response)
+
+
+@pytest.mark.asyncio
+async def test_a2a_capabilities_round_trips_available_text_skill_over_real_socket(
+    tmp_path: Path,
+) -> None:
+    async def handler() -> dict[str, object]:
+        return {
+            "skills": ["whatsapp.send"],
+            "content_types": ["text"],
+        }
+
+    server = GatewaySocket(path=tmp_path / "gateway.sock")
+    server.a2a_capabilities_handler = handler
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_unix_connection(server.path)
+        writer.write(json.dumps({"cmd": "a2a_capabilities", "args": {}}).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+    assert response == {
+        "status": "ok",
+        "response": {
+            "skills": ["whatsapp.send"],
+            "content_types": ["text"],
+        },
+    }
+    assert "voice" not in str(response)

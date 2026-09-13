@@ -1,0 +1,27 @@
+[Unit]
+Description=Yeoman A2A Relay — authenticated Hermes skill relay
+After=network-online.target yeoman-gateway.service
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yeoman a2a serve
+Restart=always
+RestartSec=5
+
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+MemoryMax=256M
+
+BindPaths=%h/.yeoman
+ReadOnlyPaths=%h/Documents/yeoman
+
+Environment=YEOMAN_HOME=%h/.yeoman
+EnvironmentFile=%h/.yeoman/a2a-capabilities.env
+EnvironmentFile=%h/.yeoman/secrets/a2a.env
+
+[Install]
+WantedBy=default.target

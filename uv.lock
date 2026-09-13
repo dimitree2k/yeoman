@@ -441,6 +441,14 @@ wheels = [
 ]
 
 [[package]]
+name = "hermes-yeoman-a2a-contracts"
+version = "1.0.1"
+source = { git = "https://github.com/dimitree2k/hermes-yeoman-a2a-contracts.git?rev=b8886616664b922538a91c7f78c608c963d0826c#b8886616664b922538a91c7f78c608c963d0826c" }
+dependencies = [
+    { name = "jsonschema" },
+]
+
+[[package]]
 name = "hf-xet"
 version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2019,6 +2027,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "caldav" },
     { name = "croniter" },
+    { name = "hermes-yeoman-a2a-contracts" },
     { name = "httpx", extra = ["socks"] },
     { name = "icalendar" },
     { name = "lark-oapi" },
@@ -2050,6 +2059,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.4" },
     { name = "caldav", specifier = ">=3.0.1" },
     { name = "croniter", specifier = ">=6.0.0" },
+    { name = "hermes-yeoman-a2a-contracts", git = "https://github.com/dimitree2k/hermes-yeoman-a2a-contracts.git?rev=b8886616664b922538a91c7f78c608c963d0826c" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.28.1" },
     { name = "icalendar", specifier = ">=7.0.3" },
     { name = "lark-oapi", specifier = ">=1.5.3" },

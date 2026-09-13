@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+checkout=${1:?usage: use-local-a2a-contracts CHECKOUT [uv arguments...]}
+shift
+checkout=$(cd "$checkout" && pwd)
+override=$(mktemp)
+cleanup() { rm -f "$override"; }
+trap cleanup EXIT
+printf 'hermes-yeoman-a2a-contracts @ %s\n' "file://${checkout}" >"$override"
+if [[ ${1:-} == run ]]; then
+  shift
+  UV_OVERRIDE="$override" exec uv run --with-requirements "$override" "$@"
+fi
+UV_OVERRIDE="$override" exec uv "$@"
