@@ -786,6 +786,86 @@ async def test_service_producer_keeps_legacy_for_unmanaged_chats(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_service_producer_reuses_caller_effect_id_without_second_send(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    producer = ServiceEffectProducer(router=router, bus=_RecordingBus())
+
+    first = await producer.send(
+        source="a2a",
+        operation_ref="a2a-effect-fixed",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="one delivery",
+        effect_id="a2a-effect-fixed",
+        require_managed=True,
+    )
+    second = await producer.send(
+        source="a2a",
+        operation_ref="a2a-effect-fixed",
+        channel="whatsapp",
+        chat_id=CHAT,
+        content="one delivery",
+        effect_id="a2a-effect-fixed",
+        require_managed=True,
+    )
+
+    assert first is not None and first.effect_id == "a2a-effect-fixed"
+    assert second is not None and second.effect_id == "a2a-effect-fixed"
+    assert len(executor.calls) == 1
+    assert store.count_effects() == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_producer_can_require_managed_without_raw_bus_fallback(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.processing.dispatch import (
+        EffectNotDeliveredError,
+        ServiceEffectProducer,
+    )
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticSnapshots(), capabilities=_AllowAll(), clock=_Clock(0)
+        ),
+        executor=executor,
+        clock=_Clock(0),
+    )
+    router = IntentEffectRouter(
+        gateway=gateway,
+        config=_config(chats=("whatsapp:elsewhere@g.us",)),
+        clock=_Clock(0),
+    )
+    bus = _RecordingBus()
+
+    with pytest.raises(EffectNotDeliveredError, match="managed effect"):
+        await ServiceEffectProducer(router=router, bus=bus).send(
+            source="a2a",
+            operation_ref="a2a-effect-fixed",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="do not bypass",
+            effect_id="a2a-effect-fixed",
+            require_managed=True,
+        )
+
+    assert bus.sent == []
+    assert executor.calls == []
+    assert store.count_effects() == 0
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_unknown_system_source_is_refused(tmp_path: Path) -> None:
     from yeoman_gateway.processing.dispatch import (
         EffectNotDeliveredError,

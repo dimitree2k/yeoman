@@ -492,9 +492,15 @@ class ServiceEffectProducer:
         content: str,
         capability: str = "send_text",
         reply_to: str | None = None,
+        effect_id: str | None = None,
+        require_managed: bool = False,
     ) -> EffectReceipt | None:
         """Submit one system-produced effect. ``None`` means the legacy path was used."""
         if not self._router.manages(channel, chat_id):
+            if require_managed:
+                raise EffectNotDeliveredError(
+                    "target is not enabled for the managed effect path"
+                )
             await self._bus.publish_outbound(
                 OutboundMessage(
                     channel=channel, chat_id=chat_id, content=content, reply_to=reply_to
@@ -523,6 +529,7 @@ class ServiceEffectProducer:
             principal=principal,
             capability=capability,
             payload=payload,
+            effect_id=effect_id,
         )
 
 
@@ -722,6 +729,7 @@ class IntentEffectRouter:
         principal: str,
         capability: str,
         payload: Any,
+        effect_id: str | None = None,
     ) -> EffectReceipt:
         """One entry point for tool/turn producers that used to publish directly."""
         metadata = dict(message.metadata or {})
@@ -740,6 +748,7 @@ class IntentEffectRouter:
             deadline_key=(
                 "semantic_reaction_ms" if capability == "send_reaction" else "reactive_ms"
             ),
+            effect_id=effect_id,
         )
 
     def remember_turn_for_source(self, source_message_id: str, binding: Any) -> None:
@@ -772,6 +781,7 @@ class IntentEffectRouter:
         operation_key: str,
         trace_id: str,
         deadline_key: str,
+        effect_id: str | None = None,
         own_lineage: bool = False,
     ) -> EffectReceipt:
         now = self._clock()
@@ -824,7 +834,7 @@ class IntentEffectRouter:
         )
 
         envelope = EffectEnvelope(
-            effect_id=uuid.uuid4().hex,
+            effect_id=effect_id or uuid.uuid4().hex,
             operation_key=f"{operation_key}:{turn_id}:{turn_revision}",
             payload=payload,
             target=EffectTarget(channel=channel, chat_id=chat_id),

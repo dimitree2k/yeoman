@@ -1738,6 +1738,60 @@ def build_gateway_runtime(
             responder=responder,
         )
 
+    configured_a2a_peer = os.environ.get("YEOMAN_A2A_PEER_ID", "").strip()
+    a2a_content_types = {
+        item.strip()
+        for item in os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text").split(",")
+        if item.strip()
+    }
+    a2a_whatsapp_enabled = os.environ.get(
+        "YEOMAN_A2A_WHATSAPP_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    advertised_a2a_skills = frozenset(
+        {"whatsapp.send"}
+        if configured_a2a_peer
+        and a2a_whatsapp_enabled
+        and "text" in a2a_content_types
+        and config.channels.whatsapp.enabled
+        and service_effects is not None
+        else set()
+    )
+
+    async def ipc_a2a_invoke(
+        peer: str,
+        skill: str,
+        input: dict[str, Any],
+        task_id: str,
+        context_id: str,
+        effect_id: str,
+    ) -> dict[str, object]:
+        from functools import partial
+
+        from yeoman_gateway.ipc.a2a_invoke import (
+            process_a2a_invocation,
+            resolve_whatsapp_recipient,
+        )
+
+        return await process_a2a_invocation(
+            peer=peer,
+            skill=skill,
+            input=input,
+            task_id=task_id,
+            context_id=context_id,
+            effect_id=effect_id,
+            configured_peer=configured_a2a_peer,
+            advertised_skills=advertised_a2a_skills,
+            policy_adapter=policy_adapter,
+            recipient_resolver=partial(
+                resolve_whatsapp_recipient,
+                policy_adapter=policy_adapter,
+                contacts_service=contacts_service,
+            ),
+            effects=service_effects,
+            effect_store=processing_store,
+            sender_account="default",
+        )
+
     async def ipc_publish_event(kind: str, detail: dict) -> dict:
         from yeoman_gateway.bus.events import SystemEvent
 
@@ -1750,6 +1804,7 @@ def build_gateway_runtime(
         trigger_agent_turn_handler=ipc_trigger_agent_turn,
         owner_turn_handler=ipc_owner_turn,
         a2a_delivery_handler=ipc_a2a_send,
+        a2a_invoke_handler=ipc_a2a_invoke,
         publish_event_handler=ipc_publish_event,
         rate_limit=ipc_config.command_rate_limit,
     )
