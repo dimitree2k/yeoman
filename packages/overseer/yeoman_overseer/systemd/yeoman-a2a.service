@@ -1,6 +1,7 @@
 [Unit]
 Description=Yeoman A2A Relay — authenticated Hermes skill relay
-After=network.target
+After=network-online.target yeoman-gateway.service
+Wants=network-online.target
 StartLimitBurst=5
 StartLimitIntervalSec=300
 
@@ -19,7 +20,7 @@ BindPaths=%h/.yeoman
 ReadOnlyPaths=%h/Documents/yeoman
 
 Environment=YEOMAN_HOME=%h/.yeoman
-EnvironmentFile=-%h/.yeoman/.env
+EnvironmentFile=%h/.yeoman/secrets/a2a.env
 
 [Install]
 WantedBy=default.target

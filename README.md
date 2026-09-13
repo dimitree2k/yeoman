@@ -262,8 +262,8 @@ yeoman env
 
 The Hermes/Yeoman A2A relay uses contract release `1.0.0` and profile
 `urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service;
-configure its private `YEOMAN_A2A_*` values in `~/.yeoman/.env`, then run it
-locally with:
+configure its private `YEOMAN_A2A_*` values in
+`~/.yeoman/secrets/a2a.env`, then run it locally with:
 
 ```bash
 yeoman a2a serve
@@ -289,9 +289,14 @@ override wrapper:
 ```
 
 For persistent operation, deploy and install the source-owned user unit, then
-perform the explicit cutover:
+move only the relay's `YEOMAN_A2A_*` keys out of `~/.yeoman/.env` into the
+private A2A environment file (do not move unrelated provider keys). Ensure the
+file is owner-readable only, then perform the explicit cutover:
 
 ```bash
+install -d -m 700 ~/.yeoman/secrets
+install -m 600 /dev/null ~/.yeoman/secrets/a2a.env
+# edit ~/.yeoman/secrets/a2a.env: move the YEOMAN_A2A_* entries from .env
 yeoman deploy
 yeoman overseer install-units
 systemctl --user daemon-reload

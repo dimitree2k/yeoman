@@ -30,8 +30,13 @@ def test_install_units_includes_a2a_relay(tmp_path, monkeypatch) -> None:
 
     overseer_commands.install_units()
 
-    assert (tmp_path / ".config/systemd/user/yeoman-a2a.service").read_text(encoding="utf-8") == (
+    installed = tmp_path / ".config/systemd/user/yeoman-a2a.service"
+    installed_text = installed.read_text(encoding="utf-8")
+    assert installed_text == (
         overseer_commands.Path(yeoman_overseer.__file__).parent
         .joinpath("systemd/yeoman-a2a.service")
         .read_text(encoding="utf-8")
     )
+    assert "After=network-online.target yeoman-gateway.service" in installed_text
+    assert "Wants=network-online.target" in installed_text
+    assert "EnvironmentFile=%h/.yeoman/secrets/a2a.env" in installed_text
