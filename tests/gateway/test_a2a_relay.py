@@ -71,8 +71,11 @@ class FakeUnixGateway:
 
 
 def _success(request: dict[str, Any]) -> dict[str, Any]:
-    if request["cmd"] == "ping":
-        return {"status": "ok", "response": "pong"}
+    if request["cmd"] == "a2a_capabilities":
+        return {
+            "status": "ok",
+            "response": {"skills": ["whatsapp.send"], "content_types": ["text"]},
+        }
     args = request["args"]
     return {
         "status": "ok",
@@ -104,7 +107,6 @@ def _config(tmp_path: Path, socket_path: Path, **changes: Any) -> relay.RelayCon
         "state_path": tmp_path / "relay.sqlite3",
         "public_url": "https://relay.example.test/a2a",
         "whatsapp_enabled": True,
-        "voice_enabled": False,
         "content_types": frozenset({"text"}),
         "timeout_seconds": 1.0,
         "max_body_bytes": 65_536,
@@ -215,14 +217,13 @@ def test_config_reads_explicit_private_runtime_settings_without_revealing_secret
     monkeypatch.setenv("YEOMAN_A2A_STATE_PATH", str(tmp_path / "state.sqlite3"))
     monkeypatch.setenv("YEOMAN_A2A_PUBLIC_URL", "https://relay.example.test/a2a")
     monkeypatch.setenv("YEOMAN_A2A_WHATSAPP_ENABLED", "true")
-    monkeypatch.setenv("YEOMAN_A2A_VOICE_ENABLED", "false")
-    monkeypatch.setenv("YEOMAN_A2A_CONTENT_TYPES", "text,image")
+    monkeypatch.setenv("YEOMAN_A2A_CONTENT_TYPES", "text")
 
     config = relay.RelayConfig.from_env()
     config.validate()
 
     assert config.allowed_peer_ips == frozenset({"100.64.1.3", "100.64.1.4"})
-    assert config.content_types == frozenset({"text", "image"})
+    assert config.content_types == frozenset({"text"})
     assert "not-for-repr" not in repr(config)
     with pytest.raises(relay.RelayConfigurationError, match="explicit private"):
         relay.RelayConfig(**{**config.__dict__, "bind_host": "0.0.0.0"}).validate()
@@ -235,7 +236,7 @@ def test_config_reads_explicit_private_runtime_settings_without_revealing_secret
 def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
     socket_path = tmp_path / "gateway.sock"
     config = _config(tmp_path, socket_path)
-    with FakeUnixGateway(socket_path, _success):
+    with FakeUnixGateway(socket_path, _success) as gateway:
         service = relay.RelayService(config)
         with _running(service) as address:
             status, card = _request(address, "GET", "/.well-known/agent-card.json", token=None)
@@ -277,6 +278,7 @@ def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
     assert card["defaultInputModes"] == ["application/json"]
     assert card["defaultOutputModes"] == ["application/json"]
     assert [skill["id"] for skill in card["skills"]] == ["whatsapp.send"]
+    assert gateway.requests == [{"cmd": "a2a_capabilities", "args": {}}]
     serialized = json.dumps(card)
     for private_value in (
         config.bearer_secret,
@@ -288,19 +290,46 @@ def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
         assert private_value not in serialized
 
 
-def test_card_omits_configured_skills_when_downstream_socket_is_not_ready(tmp_path: Path) -> None:
-    config = _config(tmp_path, tmp_path / "missing.sock", voice_enabled=True)
+def test_card_omits_configured_skills_when_gateway_capabilities_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, tmp_path / "missing.sock")
 
     assert relay.RelayService(config).agent_card()["skills"] == []
 
 
-def test_voice_card_capability_uses_config_and_downstream_readiness(tmp_path: Path) -> None:
+def test_card_intersects_gateway_capabilities_with_relay_config(tmp_path: Path) -> None:
     socket_path = tmp_path / "gateway.sock"
-    with FakeUnixGateway(socket_path, _success):
-        config = _config(tmp_path, socket_path, voice_enabled=True)
-        skills = relay.RelayService(config).agent_card()["skills"]
+    with FakeUnixGateway(socket_path, _success) as gateway:
+        skills = relay.RelayService(
+            _config(tmp_path, socket_path, whatsapp_enabled=False)
+        ).agent_card()["skills"]
 
-    assert [item["id"] for item in skills] == ["whatsapp.send", "media.voice.generate"]
+    assert skills == []
+    assert gateway.requests == [{"cmd": "a2a_capabilities", "args": {}}]
+
+
+@pytest.mark.parametrize(
+    "gateway_response",
+    [
+        {"status": "error", "error": {"code": "UNAVAILABLE"}},
+        {"status": "ok", "response": {}},
+        {"status": "ok", "response": {"skills": "whatsapp.send", "content_types": ["text"]}},
+        {
+            "status": "ok",
+            "response": {"skills": ["whatsapp.send"], "content_types": ["image"]},
+        },
+    ],
+)
+def test_card_fails_closed_on_unusable_gateway_capabilities(
+    tmp_path: Path, gateway_response: dict[str, Any]
+) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    with FakeUnixGateway(socket_path, lambda _request: gateway_response) as gateway:
+        skills = relay.RelayService(_config(tmp_path, socket_path)).agent_card()["skills"]
+
+    assert skills == []
+    assert gateway.requests == [{"cmd": "a2a_capabilities", "args": {}}]
 
 
 def test_valid_structured_text_invocation_returns_valid_task_and_exact_correlation(
@@ -948,21 +977,14 @@ def test_structured_ipc_error_is_sanitized_and_persisted_as_rejected(tmp_path: P
     assert "49123456789" not in json.dumps(body)
 
 
-def test_disabled_voice_skill_is_not_invokable(tmp_path: Path) -> None:
+def test_return_immediately_true_is_rejected_before_ipc(tmp_path: Path) -> None:
     socket_path = tmp_path / "gateway.sock"
+    payload = _send_payload(_invocation())
+    payload["params"]["configuration"] = {"returnImmediately": True}
     with FakeUnixGateway(socket_path, _success) as gateway:
-        service = relay.RelayService(_config(tmp_path, socket_path, voice_enabled=False))
-        with _running(service) as address:
-            _, body = _request(
-                address,
-                "POST",
-                "/",
-                payload=_send_payload(_invocation(skill="media.voice.generate")),
-            )
+        body = relay.RelayService(_config(tmp_path, socket_path)).dispatch(payload)
 
-    task = body["result"]["task"]
-    assert task["status"]["state"] == "TASK_STATE_REJECTED"
-    assert _profile_result(task)["error"]["code"] == "SKILL_NOT_ADVERTISED"
+    assert body["error"] == {"code": -32602, "message": "Invalid params"}
     assert gateway.requests == []
 
 

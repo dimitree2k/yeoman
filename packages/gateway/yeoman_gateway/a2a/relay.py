@@ -31,19 +31,14 @@ from yeoman_gateway.a2a.contracts import (
 LOG = logging.getLogger("yeoman.a2a.relay")
 _PRIVATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SKILL_ID = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
-_ALLOWED_CONTENT_TYPES = frozenset({"text", "image", "file", "voice"})
+_ALLOWED_CONTENT_TYPES = frozenset({"text"})
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _TERMINAL_STATES = frozenset({"TASK_STATE_COMPLETED", "TASK_STATE_REJECTED", "TASK_STATE_FAILED"})
 _SKILL_CARDS: dict[str, tuple[str, str, list[str]]] = {
     "whatsapp.send": (
         "WhatsApp delivery",
-        "Deliver policy-approved content to a configured recipient alias.",
+        "Deliver policy-approved text to a configured recipient alias.",
         ["whatsapp", "delivery"],
-    ),
-    "media.voice.generate": (
-        "Voice generation",
-        "Generate a deliverable voice artifact using the configured runtime.",
-        ["voice", "audio"],
     ),
 }
 
@@ -117,7 +112,6 @@ class RelayConfig:
     state_path: Path
     public_url: str
     whatsapp_enabled: bool
-    voice_enabled: bool
     content_types: frozenset[str]
     timeout_seconds: float = 30.0
     max_body_bytes: int = 65_536
@@ -136,7 +130,6 @@ class RelayConfig:
             state_path=Path(_required("YEOMAN_A2A_STATE_PATH")).expanduser(),
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),
-            voice_enabled=_boolean("YEOMAN_A2A_VOICE_ENABLED", False),
             content_types=_csv(os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text")),
             timeout_seconds=_number("YEOMAN_A2A_TIMEOUT_SECONDS", 30.0),
             max_body_bytes=_integer("YEOMAN_A2A_MAX_BODY_BYTES", 65_536),
@@ -523,35 +516,50 @@ class RelayService:
         self._requests: dict[str, list[float]] = {}
 
     def _configured_skills(self) -> tuple[str, ...]:
-        skills: list[str] = []
-        if self.config.whatsapp_enabled:
-            skills.append("whatsapp.send")
-        if self.config.voice_enabled:
-            skills.append("media.voice.generate")
-        return tuple(skills)
+        return ("whatsapp.send",) if self.config.whatsapp_enabled else ()
 
-    def _downstream_ready(self) -> bool:
+    def _available_skills(self) -> tuple[str, ...]:
         try:
-            envelope = self._socket_call({"cmd": "ping"})
+            envelope = self._socket_call({"cmd": "a2a_capabilities", "args": {}})
         except _IPCError:
-            return False
-        return envelope == {"status": "ok", "response": "pong"}
+            return ()
+        if set(envelope) != {"status", "response"} or envelope["status"] != "ok":
+            return ()
+        response = envelope["response"]
+        if not isinstance(response, dict) or set(response) != {"skills", "content_types"}:
+            return ()
+        skills = response["skills"]
+        content_types = response["content_types"]
+        if (
+            not isinstance(skills, list)
+            or any(not isinstance(skill, str) for skill in skills)
+            or not isinstance(content_types, list)
+            or any(not isinstance(kind, str) for kind in content_types)
+        ):
+            return ()
+        if (
+            "whatsapp.send" in skills
+            and "text" in content_types
+            and self.config.whatsapp_enabled
+            and "text" in self.config.content_types
+        ):
+            return ("whatsapp.send",)
+        return ()
 
     def agent_card(self) -> dict[str, Any]:
         skills = []
-        if self._downstream_ready():
-            for skill_id in self._configured_skills():
-                name, description, tags = _SKILL_CARDS[skill_id]
-                skills.append(
-                    {
-                        "id": skill_id,
-                        "name": name,
-                        "description": description,
-                        "tags": tags,
-                        "inputModes": ["application/json"],
-                        "outputModes": ["application/json"],
-                    }
-                )
+        for skill_id in self._available_skills():
+            name, description, tags = _SKILL_CARDS[skill_id]
+            skills.append(
+                {
+                    "id": skill_id,
+                    "name": name,
+                    "description": description,
+                    "tags": tags,
+                    "inputModes": ["application/json"],
+                    "outputModes": ["application/json"],
+                }
+            )
         return {
             "name": "Yeoman",
             "description": "Policy-controlled structured messaging capabilities.",
@@ -835,7 +843,7 @@ class RelayService:
         ):
             raise _RequestError(-32602, "Invalid params")
         immediate = configuration.get("returnImmediately")
-        if immediate is not None and not isinstance(immediate, bool):
+        if immediate is not None and (not isinstance(immediate, bool) or immediate):
             raise _RequestError(-32602, "Invalid params")
         if "taskPushNotificationConfig" in configuration:
             raise _RequestError(-32602, "Invalid params")
