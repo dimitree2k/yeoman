@@ -31,6 +31,8 @@ _FORMATS = {
     "text/plain": ("file", ".txt"),
 }
 _SIDECAR_MAX_BYTES = 16_384
+# ponytail: cap stuck libc DNS calls process-wide; use an async resolver if concurrency matters.
+_DNS_SLOTS = threading.BoundedSemaphore(4)
 
 
 class MediaStagingError(RuntimeError):
@@ -289,13 +291,23 @@ class MediaStager:
                 result.put(self.resolver(host, port, type=socket.SOCK_STREAM))
             except Exception as exc:  # noqa: BLE001 - sanitized at the trust boundary
                 result.put(exc)
+            finally:
+                _DNS_SLOTS.release()
 
         remaining = deadline - self.monotonic()
-        if remaining <= 0:
+        if remaining <= 0 or not _DNS_SLOTS.acquire(timeout=remaining):
             raise MediaStagingError("MEDIA_STAGING_FAILED")
-        threading.Thread(target=resolve, daemon=True).start()
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            _DNS_SLOTS.release()
+            raise MediaStagingError("MEDIA_STAGING_FAILED")
         try:
-            answers = result.get(timeout=remaining)
+            threading.Thread(target=resolve, daemon=True).start()
+        except RuntimeError as exc:
+            _DNS_SLOTS.release()
+            raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
+        try:
+            answers = result.get(timeout=max(deadline - self.monotonic(), 0))
             if isinstance(answers, Exception):
                 raise answers
             addresses = {ipaddress.ip_address(str(answer[4][0])) for answer in answers}

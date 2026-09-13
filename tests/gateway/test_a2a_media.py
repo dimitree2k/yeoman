@@ -238,6 +238,51 @@ def test_dns_resolution_obeys_total_staging_deadline(tmp_path: Path) -> None:
     assert isinstance(errors[0], MediaStagingError)
 
 
+def test_repeated_dns_timeouts_bound_concurrent_resolver_workers(
+    tmp_path: Path,
+) -> None:
+    release = threading.Event()
+    drained = threading.Event()
+    lock = threading.Lock()
+    started = 0
+    active = 0
+
+    def blocked_resolver(*_args: object, **_kwargs: object) -> list[tuple[Any, ...]]:
+        nonlocal active, started
+        with lock:
+            started += 1
+            active += 1
+        try:
+            release.wait(2)
+            return _PUBLIC_DNS
+        finally:
+            with lock:
+                active -= 1
+                if active == 0:
+                    drained.set()
+
+    stager = _stager(
+        tmp_path,
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "image/png"},
+            content=_BODIES["image/png"],
+        ),
+        resolver=blocked_resolver,
+        timeout_seconds=0.05,
+    )
+
+    try:
+        for _ in range(12):
+            with pytest.raises(MediaStagingError):
+                stager.stage(_EFFECT_ID, _REQUEST_HASH, _part())
+    finally:
+        release.set()
+        assert drained.wait(1)
+
+    assert started <= 4
+
+
 def test_drip_feed_obeys_total_staging_deadline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
