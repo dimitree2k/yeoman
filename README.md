@@ -294,8 +294,10 @@ private A2A environment file (do not move unrelated provider keys). Ensure the
 file is owner-readable only, then perform the explicit cutover:
 
 ```bash
-install -d -m 700 ~/.yeoman/secrets
-install -m 600 /dev/null ~/.yeoman/secrets/a2a.env
+mkdir -p ~/.yeoman/secrets
+chmod 700 ~/.yeoman/secrets
+touch ~/.yeoman/secrets/a2a.env
+chmod 600 ~/.yeoman/secrets/a2a.env
 # edit ~/.yeoman/secrets/a2a.env: move the YEOMAN_A2A_* entries from .env
 yeoman deploy
 yeoman overseer install-units

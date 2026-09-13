@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import os
+
 from typer.testing import CliRunner
 
 
-def test_a2a_serve_delegates_to_standalone_relay(monkeypatch) -> None:
+def test_a2a_serve_loads_private_env_before_delegating_to_relay(tmp_path, monkeypatch) -> None:
     from yeoman_gateway.a2a import relay
+    from yeoman_gateway.cli import a2a_commands
     from yeoman_gateway.cli.commands import app
 
     called = False
+    env_file = tmp_path / "a2a.env"
+    env_file.write_text(
+        "YEOMAN_A2A_TEST_LOADED=from-file\nYEOMAN_A2A_TEST_OVERRIDE=from-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("YEOMAN_A2A_TEST_LOADED", raising=False)
+    monkeypatch.setenv("YEOMAN_A2A_TEST_OVERRIDE", "caller")
 
     def run() -> int:
         nonlocal called
         called = True
+        assert os.environ["YEOMAN_A2A_TEST_LOADED"] == "from-file"
+        assert os.environ["YEOMAN_A2A_TEST_OVERRIDE"] == "caller"
         return 0
 
     monkeypatch.setattr(relay, "main", run)
+    monkeypatch.setattr(a2a_commands, "_a2a_env_path", lambda: env_file)
 
     result = CliRunner().invoke(app, ["a2a", "serve"])
 
