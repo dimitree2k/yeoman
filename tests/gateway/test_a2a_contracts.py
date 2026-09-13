@@ -80,12 +80,14 @@ def test_registry_validates_invocation_and_skill_response() -> None:
         schemas.validate_response("conversation", {})
 
 
-def test_local_contract_override_keeps_project_metadata_untouched() -> None:
+def test_local_contract_override_keeps_project_metadata_untouched(tmp_path: Path) -> None:
     script = Path("scripts/use-local-a2a-contracts")
     pyproject = Path("pyproject.toml")
+    checkout = tmp_path / "contracts"
+    checkout.mkdir()
     before = pyproject.read_bytes()
     result = subprocess.run(
-        [str(script), "/tmp/hermes-yeoman-a2a-contracts-v1.0.0", "--version"],
+        [str(script), str(checkout), "--version"],
         capture_output=True,
         text=True,
         check=False,

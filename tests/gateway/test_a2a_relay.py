@@ -712,6 +712,35 @@ def test_config_reads_explicit_private_runtime_settings_without_revealing_secret
         ).validate()
 
 
+def test_config_accepts_legacy_service_environment_names_needed_for_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "YEOMAN_A2A_BIND_HOST",
+        "YEOMAN_A2A_ALLOWED_PEER_IPS",
+        "YEOMAN_A2A_BEARER_SECRET",
+        "YEOMAN_A2A_SOCKET_PATH",
+        "YEOMAN_A2A_STATE_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("YEOMAN_A2A_HOST", "100.64.1.2")
+    monkeypatch.setenv("YEOMAN_A2A_ALLOWED_PEERS", "100.64.1.3")
+    monkeypatch.setenv("YEOMAN_A2A_TOKEN", "legacy-secret")
+    monkeypatch.setenv("YEOMAN_A2A_PEER_ID", "hermes")
+    monkeypatch.setenv(
+        "YEOMAN_A2A_PUBLIC_URL", "http://moltypython.example.ts.net:9900"
+    )
+
+    config = relay.RelayConfig.from_env()
+
+    assert config.bind_host == "100.64.1.2"
+    assert config.allowed_peer_ips == frozenset({"100.64.1.3"})
+    assert config.bearer_secret == "legacy-secret"
+    assert config.socket_path == Path("~/.yeoman/run/gateway.sock").expanduser()
+    assert config.state_path == Path("~/.yeoman/data/a2a/relay.db").expanduser()
+    assert config.public_url == "http://moltypython.example.ts.net:9900"
+
+
 def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
     socket_path = tmp_path / "gateway.sock"
     config = _config(tmp_path, socket_path)

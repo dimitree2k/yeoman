@@ -17,11 +17,16 @@ def _a2a_env_path() -> Path:
     return Path.home() / ".yeoman" / "secrets" / "a2a.env"
 
 
+def _a2a_capabilities_env_path() -> Path:
+    return Path.home() / ".yeoman" / "a2a-capabilities.env"
+
+
 @a2a_app.command()
 def serve() -> None:
     """Run the standalone authenticated A2A relay."""
     from yeoman_gateway.a2a import relay
 
+    load_dotenv(_a2a_capabilities_env_path(), override=False)
     load_dotenv(_a2a_env_path(), override=False)
     raise typer.Exit(relay.main())
 

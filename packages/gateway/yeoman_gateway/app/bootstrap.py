@@ -1811,7 +1811,9 @@ def build_gateway_runtime(
         and service_effects is not None
     )
     voice_a2a_available = bool(
-        configured_a2a_peer and "voice" in a2a_content_types and a2a_voice_store is not None
+        whatsapp_a2a_available
+        and "voice" in a2a_content_types
+        and a2a_voice_store is not None
     )
     advertised_a2a_skills = frozenset(
         ({"whatsapp.send"} if whatsapp_a2a_available else set())
@@ -1821,7 +1823,7 @@ def build_gateway_runtime(
     async def a2a_voice_sender(
         *, operation_ref: str, chat_id: str, path: str, effect_id: str
     ) -> object:
-        if effect_router is None:
+        if effect_router is None or not effect_router.manages("whatsapp", chat_id):
             raise RuntimeError("managed effect path unavailable")
         payload = MediaPayload(media=(path,))
         return await effect_router.submit_message(

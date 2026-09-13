@@ -35,6 +35,36 @@ def test_a2a_serve_loads_private_env_before_delegating_to_relay(tmp_path, monkey
     assert called
 
 
+def test_a2a_serve_loads_shared_capabilities_without_overriding_values(
+    tmp_path, monkeypatch
+) -> None:
+    from yeoman_gateway.a2a import relay
+    from yeoman_gateway.cli import a2a_commands
+    from yeoman_gateway.cli.commands import app
+
+    shared = tmp_path / "a2a-capabilities.env"
+    private = tmp_path / "a2a.env"
+    shared.write_text(
+        "YEOMAN_A2A_PEER_ID=hermes\nYEOMAN_A2A_TEST_PRECEDENCE=shared\n",
+        encoding="utf-8",
+    )
+    private.write_text("YEOMAN_A2A_TEST_PRECEDENCE=private\n", encoding="utf-8")
+    monkeypatch.delenv("YEOMAN_A2A_PEER_ID", raising=False)
+    monkeypatch.delenv("YEOMAN_A2A_TEST_PRECEDENCE", raising=False)
+    monkeypatch.setattr(a2a_commands, "_a2a_capabilities_env_path", lambda: shared)
+    monkeypatch.setattr(a2a_commands, "_a2a_env_path", lambda: private)
+
+    def run() -> int:
+        assert os.environ["YEOMAN_A2A_PEER_ID"] == "hermes"
+        assert os.environ["YEOMAN_A2A_TEST_PRECEDENCE"] == "shared"
+        return 0
+
+    monkeypatch.setattr(relay, "main", run)
+    result = CliRunner().invoke(app, ["a2a", "serve"])
+
+    assert result.exit_code == 0, result.output
+
+
 def test_install_units_includes_a2a_relay(tmp_path, monkeypatch) -> None:
     import yeoman_overseer
     from yeoman_gateway.cli import overseer_commands
@@ -53,3 +83,9 @@ def test_install_units_includes_a2a_relay(tmp_path, monkeypatch) -> None:
     assert "After=network-online.target yeoman-gateway.service" in installed_text
     assert "Wants=network-online.target" in installed_text
     assert "EnvironmentFile=%h/.yeoman/secrets/a2a.env" in installed_text
+    assert "EnvironmentFile=%h/.yeoman/a2a-capabilities.env" in installed_text
+
+    gateway = tmp_path / ".config/systemd/user/yeoman-gateway.service"
+    assert "EnvironmentFile=-%h/.yeoman/a2a-capabilities.env" in gateway.read_text(
+        encoding="utf-8"
+    )

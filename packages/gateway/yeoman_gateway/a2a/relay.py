@@ -108,6 +108,13 @@ def _required(name: str) -> str:
     return value
 
 
+def _setting(name: str, legacy_name: str | None = None, default: str = "") -> str:
+    value = os.environ.get(name, "").strip()
+    if not value and legacy_name:
+        value = os.environ.get(legacy_name, "").strip()
+    return value or default
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     """All relay-owned runtime settings, loaded without private defaults."""
@@ -133,14 +140,28 @@ class RelayConfig:
 
     @classmethod
     def from_env(cls) -> RelayConfig:
+        bind_host = _setting("YEOMAN_A2A_BIND_HOST", "YEOMAN_A2A_HOST")
+        if not bind_host:
+            raise RelayConfigurationError("YEOMAN_A2A_BIND_HOST is required")
+        port = _integer("YEOMAN_A2A_PORT", 9900)
         return cls(
-            bind_host=_required("YEOMAN_A2A_BIND_HOST"),
-            port=_integer("YEOMAN_A2A_PORT", 9900),
-            allowed_peer_ips=_csv(_required("YEOMAN_A2A_ALLOWED_PEER_IPS")),
+            bind_host=bind_host,
+            port=port,
+            allowed_peer_ips=_csv(
+                _setting("YEOMAN_A2A_ALLOWED_PEER_IPS", "YEOMAN_A2A_ALLOWED_PEERS")
+            ),
             peer_id=_required("YEOMAN_A2A_PEER_ID"),
-            bearer_secret=_required("YEOMAN_A2A_BEARER_SECRET"),
-            socket_path=Path(_required("YEOMAN_A2A_SOCKET_PATH")).expanduser(),
-            state_path=Path(_required("YEOMAN_A2A_STATE_PATH")).expanduser(),
+            bearer_secret=_setting("YEOMAN_A2A_BEARER_SECRET", "YEOMAN_A2A_TOKEN"),
+            socket_path=Path(
+                _setting(
+                    "YEOMAN_A2A_SOCKET_PATH",
+                    "YEOMAN_A2A_SOCKET",
+                    "~/.yeoman/run/gateway.sock",
+                )
+            ).expanduser(),
+            state_path=Path(
+                _setting("YEOMAN_A2A_STATE_PATH", default="~/.yeoman/data/a2a/relay.db")
+            ).expanduser(),
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),
             content_types=_csv(os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text")),
@@ -191,8 +212,20 @@ class RelayConfig:
         if not self.socket_path.is_absolute() or not self.state_path.is_absolute():
             raise RelayConfigurationError("socket and state paths must be absolute")
         parsed = urlparse(self.public_url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            raise RelayConfigurationError("public URL must be an HTTPS URL without credentials")
+        tailnet_http = bool(
+            parsed.scheme == "http"
+            and parsed.hostname
+            and parsed.hostname.lower().rstrip(".").endswith(".ts.net")
+        )
+        if (
+            (parsed.scheme != "https" and not tailnet_http)
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+        ):
+            raise RelayConfigurationError(
+                "public URL must be HTTPS or an authenticated tailnet HTTP hostname"
+            )
         if parsed.hostname.lower().rstrip(".") in {"localhost", "ip6-localhost"}:
             raise RelayConfigurationError("public URL cannot advertise an internal host")
         if parsed.query or parsed.fragment:

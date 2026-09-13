@@ -30,6 +30,25 @@ def _card(*skills: str) -> dict[str, object]:
     }
 
 
+@pytest.mark.asyncio
+async def test_polling_client_accepts_optional_streaming_and_push_capabilities() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        card = _card("search.web")
+        capabilities = card["capabilities"]
+        assert isinstance(capabilities, dict)
+        capabilities["streaming"] = True
+        capabilities["pushNotifications"] = True
+        return httpx.Response(200, json=card)
+
+    client = A2AClient(
+        A2AWorker(name="hermes", url="http://127.0.0.1:9900"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    card = await client.discover()
+    assert card["capabilities"]["streaming"] is True
+
+
 def _task(*, state: str, output: dict[str, object], task_id: str = "task-1") -> dict[str, object]:
     return {
         "id": task_id,
@@ -214,6 +233,34 @@ async def test_client_rejects_malformed_result_and_jsonrpc_error() -> None:
     with pytest.raises(A2AProtocolError, match="returned an error") as caught:
         await client.invoke_skill("search.web", {"query": "q"})
     assert caught.value.code == -1
+
+
+@pytest.mark.asyncio
+async def test_get_task_rejects_a_different_returned_task_id() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_card("search.web"))
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": _task(
+                    task_id="task-other",
+                    state="TASK_STATE_COMPLETED",
+                    output={"results": []},
+                ),
+            },
+        )
+
+    client = A2AClient(
+        A2AWorker(name="hermes", url="http://127.0.0.1:9900"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(A2AProtocolError, match="task id"):
+        await client.get_task("task-1", skill="search.web", context_id="ctx-1")
 
 
 def test_old_text_send_message_api_is_removed() -> None:

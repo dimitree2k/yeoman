@@ -20,6 +20,7 @@ BindPaths=%h/.yeoman
 ReadOnlyPaths=%h/Documents/yeoman
 
 Environment=YEOMAN_HOME=%h/.yeoman
+EnvironmentFile=%h/.yeoman/a2a-capabilities.env
 EnvironmentFile=%h/.yeoman/secrets/a2a.env
 
 [Install]

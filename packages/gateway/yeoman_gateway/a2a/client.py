@@ -176,7 +176,13 @@ class A2AClient:
         params: dict[str, Any] = {"id": task}
         if tenant:
             params["tenant"] = tenant
-        return self._task_result(await self._rpc(endpoint, "tasks/get", params), skill, context, self._references(reference_task_ids))
+        return self._task_result(
+            await self._rpc(endpoint, "tasks/get", params),
+            skill,
+            context,
+            self._references(reference_task_ids),
+            expected_task_id=task,
+        )
 
     async def poll_task(self, task_id: str, *, skill: str, context_id: str, reference_task_ids: tuple[str, ...] | list[str] = (), deadline_seconds: float = 1800, interval_seconds: float = 5) -> A2AWorkerResult:
         if deadline_seconds <= 0 or deadline_seconds > 1800 or interval_seconds <= 0 or interval_seconds > 60:
@@ -205,13 +211,23 @@ class A2AClient:
         except A2AContractValidationError as exc:
             raise A2AProtocolError("A2A invocation is invalid") from exc
 
-    def _task_result(self, result: Any, skill: str, context: str, references: tuple[str, ...]) -> A2AWorkerResult:
+    def _task_result(
+        self,
+        result: Any,
+        skill: str,
+        context: str,
+        references: tuple[str, ...],
+        *,
+        expected_task_id: str | None = None,
+    ) -> A2AWorkerResult:
         task = result.get("task") if isinstance(result, dict) and isinstance(result.get("task"), dict) else result
         if not isinstance(task, dict):
             raise A2AProtocolError("A2A result must contain a task object")
         task_id, task_context, status = task.get("id"), task.get("contextId"), task.get("status")
         if not isinstance(task_id, str) or not task_id.strip():
             raise A2AProtocolError("A2A task id is required")
+        if expected_task_id is not None and task_id != expected_task_id:
+            raise A2AProtocolError("A2A task id does not match request")
         if not isinstance(task_context, str) or task_context != context:
             raise A2AProtocolError("A2A task context does not match invocation")
         if not isinstance(status, dict) or status.get("state") not in _V1_STATES:
@@ -328,8 +344,6 @@ class A2AClient:
             for item in extensions
         ):
             raise A2AProtocolError("A2A Agent Card does not carry the Hermes profile")
-        if capabilities.get("streaming") is not False or capabilities.get("pushNotifications") is not False:
-            raise A2AProtocolError("A2A Agent Card capabilities are incompatible with this client")
         skills = card.get("skills")
         if not isinstance(skills, list):
             raise A2AProtocolError("A2A Agent Card skills are malformed")

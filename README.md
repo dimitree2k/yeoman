@@ -261,9 +261,11 @@ yeoman env
 ### Standalone A2A relay (v1)
 
 The Hermes/Yeoman A2A relay uses contract release `1.0.0` and profile
-`urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service;
-configure its private `YEOMAN_A2A_*` values in
-`~/.yeoman/secrets/a2a.env`, then run it locally with:
+`urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service.
+Put the bearer secret and network boundary settings in
+`~/.yeoman/secrets/a2a.env`. Put the non-secret settings shared with Gateway
+(`YEOMAN_A2A_PEER_ID`, `YEOMAN_A2A_WHATSAPP_ENABLED`, content types, artifact
+paths and limits) in `~/.yeoman/a2a-capabilities.env`. Then run it locally with:
 
 ```bash
 yeoman a2a serve
@@ -288,17 +290,21 @@ override wrapper:
   yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
 ```
 
-For persistent operation, deploy and install the source-owned user unit, then
-move only the relay's `YEOMAN_A2A_*` keys out of `~/.yeoman/.env` into the
-private A2A environment file (do not move unrelated provider keys). Ensure the
-file is owner-readable only, then perform the explicit cutover:
+For persistent operation, deploy and install the source-owned user unit. Keep
+the bearer secret and bind/allow-list values in the private relay environment;
+keep shared capability values in the separate non-secret file loaded by both
+Gateway and relay. Ensure both files are owner-readable only, then perform the
+explicit cutover:
 
 ```bash
 mkdir -p ~/.yeoman/secrets
 chmod 700 ~/.yeoman/secrets
 touch ~/.yeoman/secrets/a2a.env
 chmod 600 ~/.yeoman/secrets/a2a.env
-# edit ~/.yeoman/secrets/a2a.env: move the YEOMAN_A2A_* entries from .env
+touch ~/.yeoman/a2a-capabilities.env
+chmod 600 ~/.yeoman/a2a-capabilities.env
+# edit secrets/a2a.env: bearer secret, bind host and peer IP allow-list
+# edit a2a-capabilities.env: peer id, enabled skills/content and artifact limits
 yeoman deploy
 yeoman overseer install-units
 systemctl --user daemon-reload
