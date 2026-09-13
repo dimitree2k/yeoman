@@ -9,10 +9,12 @@ import os
 import queue
 import re
 import socket
+import stat
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from itertools import islice
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -31,6 +33,7 @@ _FORMATS = {
     "text/plain": ("file", ".txt"),
 }
 _SIDECAR_MAX_BYTES = 16_384
+_CLEANUP_LIMIT = 64
 # ponytail: cap stuck libc DNS calls process-wide; use an async resolver if concurrency matters.
 _DNS_SLOTS = threading.BoundedSemaphore(4)
 
@@ -259,23 +262,25 @@ class MediaStager:
             raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
 
     def _validate_url(self, uri: str) -> tuple[str, int]:
-        parsed = urlparse(uri)
         try:
+            parsed = urlparse(uri)
             port = parsed.port or 443
-        except ValueError as exc:
+            host = (parsed.hostname or "").lower().rstrip(".")
+            username = parsed.username
+            password = parsed.password
+            path = unquote(parsed.path)
+        except (UnicodeError, ValueError) as exc:
             raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
-        path = unquote(parsed.path)
         if (
             parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
+            or not host
+            or username
+            or password
             or parsed.fragment
             or "\\" in path
             or ".." in path.split("/")
         ):
             raise MediaStagingError("MEDIA_STAGING_FAILED")
-        host = parsed.hostname.lower().rstrip(".")
         origin = f"https://{host}" + (f":{port}" if port != 443 else "")
         if origin not in self.allowed_origins:
             raise MediaStagingError("MEDIA_STAGING_FAILED")
@@ -347,7 +352,9 @@ class MediaStager:
                     transport=transport,
                     trust_env=False,
                 ) as client,
-                client.stream("GET", uri) as response,
+                client.stream(
+                    "GET", uri, headers={"Accept-Encoding": "identity"}
+                ) as response,
             ):
                 if self.monotonic() >= deadline:
                     raise MediaStagingError("MEDIA_STAGING_FAILED")
@@ -357,12 +364,15 @@ class MediaStager:
                 declared = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 if declared != mime_type:
                     raise MediaStagingError("MEDIA_STAGING_FAILED")
+                content_encoding = response.headers.get("Content-Encoding", "").strip().lower()
+                if content_encoding not in {"", "identity"}:
+                    raise MediaStagingError("MEDIA_STAGING_FAILED")
                 raw_length = response.headers.get("Content-Length")
                 if raw_length is not None:
                     length = int(raw_length)
                     if length < 1 or length > self.max_bytes:
                         raise MediaStagingError("MEDIA_STAGING_FAILED")
-                for chunk in response.iter_bytes():
+                for chunk in response.iter_raw():
                     if self.monotonic() >= deadline:
                         raise MediaStagingError("MEDIA_STAGING_FAILED")
                     size += len(chunk)
@@ -400,6 +410,70 @@ class MediaStager:
             "expires_at": self.clock() + self.ttl_seconds,
         }
 
+    def cleanup_expired(self) -> None:
+        """Remove a bounded set of expired media records owned by this stager."""
+        now = self.clock()
+        for sidecar in islice(
+            self.root.glob("a2a-effect-*.media.json"), _CLEANUP_LIMIT
+        ):
+            metadata = self._load(sidecar)
+            if metadata is None:
+                continue
+            try:
+                effect_id = sidecar.name.removesuffix(".media.json")
+                mime_type = metadata["mime_type"]
+                suffix = _FORMATS[mime_type][1]
+                path = self.root / f"{effect_id}{suffix}"
+                request_hash = metadata["request_hash"]
+                recorded_path = metadata["path"]
+                filename = metadata["filename"]
+                digest = metadata["sha256"]
+                size = metadata["size_bytes"]
+                expires_at = metadata["expires_at"]
+                if (
+                    not _EFFECT_ID.fullmatch(effect_id)
+                    or not isinstance(request_hash, str)
+                    or not _REQUEST_HASH.fullmatch(request_hash)
+                    or not isinstance(recorded_path, str)
+                    or Path(recorded_path) != path
+                    or filename != path.name
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size < 1
+                    or not isinstance(expires_at, (int, float))
+                    or isinstance(expires_at, bool)
+                    or not 0 < expires_at <= now
+                    or path.is_symlink()
+                ):
+                    continue
+                try:
+                    path_stat = path.lstat()
+                except FileNotFoundError:
+                    sidecar.unlink()
+                    continue
+                if not stat.S_ISREG(path_stat.st_mode):
+                    continue
+                descriptor = os.open(
+                    path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                with os.fdopen(descriptor, "rb") as source:
+                    opened_stat = os.fstat(source.fileno())
+                    if (
+                        not os.path.samestat(path_stat, opened_stat)
+                        or opened_stat.st_size != size
+                        or hashlib.file_digest(source, "sha256").hexdigest()
+                        != digest
+                    ):
+                        continue
+                if not os.path.samestat(opened_stat, path.lstat()):
+                    continue
+                path.unlink()
+                sidecar.unlink()
+            except (KeyError, OSError, TypeError, ValueError):
+                continue
+
     def _validate_connected_peer(
         self, response: httpx.Response, addresses: tuple[str, ...]
     ) -> None:
@@ -436,10 +510,16 @@ class MediaStager:
 
     def _load(self, sidecar: Path) -> dict[str, Any] | None:
         try:
-            if sidecar.stat().st_size > _SIDECAR_MAX_BYTES:
+            if sidecar.is_symlink():
                 return None
-            value = json.loads(sidecar.read_text())
-        except (OSError, json.JSONDecodeError):
+            descriptor = os.open(
+                sidecar, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            with os.fdopen(descriptor, encoding="utf-8") as source:
+                if os.fstat(source.fileno()).st_size > _SIDECAR_MAX_BYTES:
+                    return None
+                value = json.load(source)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         required = {
             "request_hash",

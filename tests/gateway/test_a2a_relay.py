@@ -337,7 +337,7 @@ def test_enabled_image_and_file_are_staged_once_before_atomic_delivery(
         return httpx.Response(
             200,
             headers={"Content-Type": mime_type, "Content-Length": str(len(body))},
-            content=body,
+            stream=httpx.ByteStream(body),
         )
 
     stager = MediaStager(
@@ -446,6 +446,88 @@ def test_media_staging_rejection_is_terminal_and_url_redacted(
     assert secret_uri not in captured
 
 
+def test_malformed_media_authority_is_sanitized_terminal_rejection(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    secret_uri = "https://[private-token]/file.png"
+    managed = tmp_path / "outgoing"
+    managed.mkdir()
+    config = _config(
+        tmp_path,
+        tmp_path / "missing.sock",
+        content_types=frozenset({"text", "image"}),
+        media_origins=frozenset({"https://media.example.test"}),
+        artifact_root=managed / "a2a",
+        managed_outgoing_root=managed,
+    )
+    invocation = {
+        "skill": "whatsapp.send",
+        "input": {
+            "recipient": {"type": "group", "alias": "team-example"},
+            "content": [{"type": "image", "uri": secret_uri, "mime_type": "image/png"}],
+            "idempotency_key": "malformed-image-authority",
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="yeoman.a2a.relay"):
+        response = relay.RelayService(config).dispatch(_send_payload(invocation))
+
+    task = response["result"]["task"]
+    assert task["status"]["state"] == "TASK_STATE_REJECTED"
+    assert _profile_result(task)["error"]["code"] == "ARTIFACT_DENIED"
+    assert "private-token" not in "\n".join(record.getMessage() for record in caplog.records)
+
+
+def test_relay_cleanup_hook_reclaims_expired_remote_media(tmp_path: Path) -> None:
+    now = [1_000.0]
+    managed = tmp_path / "outgoing"
+    artifact_root = managed / "a2a"
+    body = b"\x89PNG\r\n\x1a\nfixture"
+    stager = MediaStager(
+        artifact_root,
+        allowed_origins={"https://media.example.test"},
+        max_bytes=1_024,
+        ttl_seconds=60,
+        timeout_seconds=1,
+        resolver=lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                stream=httpx.ByteStream(body),
+            )
+        ),
+        clock=lambda: now[0],
+    )
+    staged = stager.stage(
+        "a2a-effect-" + "8" * 40,
+        "a" * 64,
+        {
+            "type": "image",
+            "uri": "https://media.example.test/file.png",
+            "mime_type": "image/png",
+        },
+    )
+    now[0] = 2_000.0
+    service = relay.RelayService(
+        _config(
+            tmp_path,
+            tmp_path / "missing.sock",
+            content_types=frozenset({"text", "image"}),
+            media_origins=frozenset({"https://media.example.test"}),
+            artifact_root=artifact_root,
+            managed_outgoing_root=managed,
+        ),
+        media_stager=stager,
+    )
+
+    assert service.artifact_response("not-an-artifact") is None
+    assert not Path(str(staged["path"])).exists()
+    assert not (artifact_root / ("a2a-effect-" + "8" * 40 + ".media.json")).exists()
+
+
 def test_standalone_relay_suppresses_http_client_url_logs() -> None:
     script = textwrap.dedent(
         """
@@ -473,7 +555,7 @@ def test_standalone_relay_suppresses_http_client_url_logs() -> None:
                     lambda _request: httpx.Response(
                         200,
                         headers={"Content-Type": "image/png"},
-                        content=b"\\x89PNG\\r\\n\\x1a\\nfixture",
+                        stream=httpx.ByteStream(b"\\x89PNG\\r\\n\\x1a\\nfixture"),
                     )
                 ),
             )

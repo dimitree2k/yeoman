@@ -750,6 +750,8 @@ class RelayService:
             return None
 
     def _cleanup_expired_artifacts(self) -> None:
+        if self.media_stager is not None:
+            self.media_stager.cleanup_expired()
         now = time.time()
         expired = self.store.cleanup_expired(now=now)
         root = self._managed_artifact_root()
@@ -1196,6 +1198,7 @@ class RelayService:
         remote = [part for part in content if part["type"] in {"image", "file"}]
         text = [part for part in content if part["type"] == "text"]
         if remote:
+            self._cleanup_expired_artifacts()
             if (
                 len(remote) != 1
                 or voice
