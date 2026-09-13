@@ -795,9 +795,10 @@ class IntentEffectRouter:
         )
         deadline_ms = int(getattr(deadlines, deadline_key))
 
-        binding = CURRENT_TURN.get()
+        service_principal = principal in SERVICE_PRINCIPALS.values()
+        binding = None if service_principal else CURRENT_TURN.get()
         frozen = None
-        if binding is None and source_message_id:
+        if binding is None and source_message_id and not service_principal:
             frozen = self.frozen_turn_for_source(source_message_id)
             binding = frozen
         if own_lineage and source_message_id and binding is None:
@@ -812,7 +813,13 @@ class IntentEffectRouter:
                         turn=target_turn, trace_id=source_message_id, generation_id=None
                     )
         turn = getattr(binding, "turn", None)
-        if turn is None and frozen is None and not own_lineage and self._turn_provider is not None:
+        if (
+            turn is None
+            and frozen is None
+            and not own_lineage
+            and self._turn_provider is not None
+            and not service_principal
+        ):
             # Only when nothing is known about this source may the chat's active turn be
             # used; otherwise a newer thread would silently adopt an older answer.
             turn = self._turn_provider(channel, chat_id)
@@ -825,7 +832,7 @@ class IntentEffectRouter:
             not turn_id
             and not own_lineage
             and self._turn_provider is not None
-            and principal not in SERVICE_PRINCIPALS.values()
+            and not service_principal
         ):
             # A turn-bound producer without a turn must not queue anything: autorisation
             # would otherwise be checked without any revision to compare against.

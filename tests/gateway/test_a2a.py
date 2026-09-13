@@ -270,6 +270,23 @@ def test_workers_are_loopback_only_unless_explicitly_enabled() -> None:
         A2AWorker(name="remote", url="https://example.test/a2a")
 
 
+def test_gateway_runtime_startup_resumes_durable_research() -> None:
+    from types import SimpleNamespace
+
+    from yeoman_gateway.app.bootstrap import GatewayRuntime
+
+    calls: list[str] = []
+    tool = SimpleNamespace(resume_pending_research=lambda: calls.append("resume"))
+    runtime = object.__new__(GatewayRuntime)
+    runtime.responder = SimpleNamespace(
+        tools=SimpleNamespace(get=lambda name: tool if name == "a2a_delegate" else None)
+    )
+
+    runtime._resume_a2a_research()
+
+    assert calls == ["resume"]
+
+
 def test_router_exposes_gateway_store() -> None:
     from types import SimpleNamespace
 

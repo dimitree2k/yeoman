@@ -54,7 +54,7 @@ class A2ADelegateTool(Tool):
         self._channel = ""
         self._chat_id = ""
         self._session_key = ""
-        self._resume_pending_research()
+        self.resume_pending_research()
 
     def set_context(self, channel: str, chat_id: str, *, session_key: str = "") -> None:
         self._channel, self._chat_id, self._session_key = (
@@ -165,7 +165,7 @@ class A2ADelegateTool(Tool):
 
         return asyncio.create_task(coro, context=contextvars.Context())
 
-    def _resume_pending_research(self) -> None:
+    def resume_pending_research(self) -> None:
         """Resume durable polling when the tool is built during gateway startup."""
 
         if self._research_store is None:
@@ -219,7 +219,7 @@ class A2ADelegateTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         # A tool can be created before the event loop exists; make restart recovery
         # deterministic at the first real call as well as at normal async startup.
-        self._resume_pending_research()
+        self.resume_pending_research()
         worker, skill, input = (
             str(kwargs.get("worker") or ""),
             str(kwargs.get("skill") or ""),

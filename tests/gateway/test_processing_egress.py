@@ -785,6 +785,40 @@ async def test_service_producer_uses_a_service_principal(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_a2a_service_result_does_not_inherit_the_finished_request_turn(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from yeoman_gateway.processing.dispatch import CURRENT_TURN, ServiceEffectProducer
+
+    store = ProcessingStore(tmp_path / "p.db")
+    executor = _Executor("sent")
+    router, _ = _router(store, executor)
+    token = CURRENT_TURN.set(
+        SimpleNamespace(
+            turn=SimpleNamespace(turn_id="closed-turn", revision=7),
+            trace_id="old-request",
+        )
+    )
+    try:
+        await ServiceEffectProducer(router=router, bus=_RecordingBus()).send(
+            source="a2a",
+            operation_ref="a2a-result:research-1",
+            channel="whatsapp",
+            chat_id=CHAT,
+            content="detached result",
+        )
+    finally:
+        CURRENT_TURN.reset(token)
+
+    assert len(executor.calls) == 1
+    assert executor.calls[0].turn_id == ""
+    assert executor.calls[0].trace_id == "a2a-result:research-1"
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_service_producer_keeps_legacy_for_unmanaged_chats(tmp_path: Path) -> None:
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
 

@@ -359,9 +359,18 @@ class GatewayRuntime:
         if self.retention is not None:
             await self.retention.start()
 
+    def _resume_a2a_research(self) -> None:
+        """Resume durable Hermes polling after the runtime event loop exists."""
+
+        a2a_tool = self.responder.tools.get("a2a_delegate")
+        resume = getattr(a2a_tool, "resume_pending_research", None)
+        if callable(resume):
+            resume()
+
     async def run(self) -> None:
         tracing.init()
         try:
+            self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
             if self.consciousness is not None:
