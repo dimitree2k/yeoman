@@ -160,6 +160,111 @@ async def test_research_timeout_and_protocol_failures_have_distinct_delivery_cod
 
 
 @pytest.mark.asyncio
+async def test_research_poll_timeout_extends_instead_of_failing_long_research() -> None:
+    """A poll window expiring must not fail research that is still progressing."""
+    from yeoman_gateway.a2a.client import A2APollTimeoutError
+
+    class Delivery:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    class Registry:
+        def __init__(self):
+            self.calls = 0
+
+        async def poll_task(self, worker, task_id, *, skill, context_id, reference_task_ids=()):
+            del worker, task_id, skill, context_id, reference_task_ids
+            self.calls += 1
+            if self.calls <= 2:
+                raise A2APollTimeoutError("window expired")
+            return A2AWorkerResult(
+                "hermes",
+                "task-long",
+                "ctx-long",
+                "TASK_STATE_COMPLETED",
+                "research.deep",
+                {"report": "long research finished", "sources": ["https://example.test"]},
+            )
+
+    registry = Registry()
+    delivery = Delivery()
+    tool = A2ADelegateTool(registry, delivery=delivery)
+
+    await tool._poll_research(
+        "hermes", "task-long", "research.deep", "ctx-long", (), "effect-1", "whatsapp", "chat"
+    )
+
+    assert registry.calls == 3, "the expired windows must be retried, not surfaced"
+    assert len(delivery.sent) == 1
+    assert "long research finished" in delivery.sent[0]["content"]
+    assert "POLL_TIMEOUT" not in delivery.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_research_poll_timeout_is_reported_after_bounded_extensions() -> None:
+    """The extension budget is finite: a task that never reports still ends in timeout."""
+    from yeoman_gateway.a2a.client import A2APollTimeoutError
+
+    class Delivery:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    class Registry:
+        def __init__(self):
+            self.calls = 0
+
+        async def poll_task(self, *args, **kwargs):
+            del args, kwargs
+            self.calls += 1
+            raise A2APollTimeoutError("window expired")
+
+    registry = Registry()
+    delivery = Delivery()
+    tool = A2ADelegateTool(registry, delivery=delivery, research_poll_extensions=2)
+
+    await tool._poll_research(
+        "hermes", "task-stuck", "research.deep", "ctx-stuck", (), "effect-2", "whatsapp", "chat"
+    )
+
+    assert registry.calls == 3, "one initial window plus exactly two extensions"
+    assert len(delivery.sent) == 1
+    assert delivery.sent[0]["content"] == "error=POLL_TIMEOUT retryable=True"
+
+
+@pytest.mark.asyncio
+async def test_research_poll_extensions_can_be_disabled() -> None:
+    from yeoman_gateway.a2a.client import A2APollTimeoutError
+
+    class Delivery:
+        async def send(self, **kwargs):
+            del kwargs
+
+    class Registry:
+        def __init__(self):
+            self.calls = 0
+
+        async def poll_task(self, *args, **kwargs):
+            del args, kwargs
+            self.calls += 1
+            raise A2APollTimeoutError("window expired")
+
+    registry = Registry()
+    tool = A2ADelegateTool(registry, delivery=Delivery(), research_poll_extensions=0)
+
+    await tool._poll_research(
+        "hermes", "task-x", "research.deep", "ctx-x", (), "effect-3", "whatsapp", "chat"
+    )
+
+    assert registry.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_research_poll_is_detached_from_closed_turn_and_deleted_after_delivery(
     tmp_path: Path,
 ) -> None:

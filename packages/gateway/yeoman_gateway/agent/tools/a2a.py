@@ -28,6 +28,14 @@ DELEGATION_WINDOW_MS = 600_000
 DELEGATION_WORKER_ID = "a2a_delegate"
 DELEGATION_LEASE_MS = 900_000
 
+#: One ``poll_task`` call already waits the client's maximum window (1800s). Deep
+#: research can legitimately outlive a single window, so a poll timeout extends the
+#: wait by another round instead of reporting POLL_TIMEOUT for a task that is still
+#: making progress. The budget resets on restart, where durable pending entries are
+#: resumed by ``resume_pending_research``.
+RESEARCH_POLL_EXTENSIONS = 3
+POLL_TIMEOUT_CONTENT = "error=POLL_TIMEOUT retryable=True"
+
 
 class A2ADelegateTool(Tool):
     """Invoke an advertised Hermes profile skill; never sends a text conversation."""
@@ -39,10 +47,12 @@ class A2ADelegateTool(Tool):
         store: Any | None = None,
         delivery: Any | None = None,
         pending_store: A2AResearchStore | None = None,
+        research_poll_extensions: int = RESEARCH_POLL_EXTENSIONS,
     ) -> None:
         self._registry = registry
         self._store = store
         self._delivery = delivery
+        self._research_poll_extensions = max(0, int(research_poll_extensions))
         self._research_store: A2AResearchStore | None
         if pending_store is not None:
             self._research_store = pending_store
@@ -307,33 +317,49 @@ class A2ADelegateTool(Tool):
         channel: str,
         chat_id: str,
     ) -> None:
-        try:
-            final = await self._registry.poll_task(
-                worker,
-                task_id,
-                skill=skill,
-                context_id=context_id,
-                reference_task_ids=reference_task_ids,
-            )
-        except A2APollTimeoutError:
-            final_content = "error=POLL_TIMEOUT retryable=True"
-        except A2ATransportError:
-            final_content = "error=TRANSPORT_FAILURE retryable=True"
-        except A2AProtocolError:
-            final_content = "error=PROTOCOL_FAILURE retryable=False"
-        except Exception as exc:
-            logger.warning(
-                "A2A research polling failed worker={} error_type={}",
-                safe_log_token(worker),
-                type(exc).__name__,
-            )
-            final_content = "error=POLL_FAILURE retryable=False"
-        else:
-            final_content = (
-                json.dumps(final.output, ensure_ascii=False, sort_keys=True)
-                if final.output is not None
-                else f"error={final.error_code} retryable={final.retryable}"
-            )
+        final_content: str
+        extensions = 0
+        while True:
+            try:
+                result = await self._registry.poll_task(
+                    worker,
+                    task_id,
+                    skill=skill,
+                    context_id=context_id,
+                    reference_task_ids=reference_task_ids,
+                )
+            except A2APollTimeoutError:
+                # A single poll already covers the client's maximum window. Extend it a
+                # bounded number of times before reporting a timeout, so long research
+                # is not failed while it is still progressing.
+                if extensions < self._research_poll_extensions:
+                    extensions += 1
+                    logger.info(
+                        "A2A research poll extended worker={} skill={} extension={}",
+                        safe_log_token(worker),
+                        safe_log_token(skill),
+                        extensions,
+                    )
+                    continue
+                final_content = POLL_TIMEOUT_CONTENT
+            except A2ATransportError:
+                final_content = "error=TRANSPORT_FAILURE retryable=True"
+            except A2AProtocolError:
+                final_content = "error=PROTOCOL_FAILURE retryable=False"
+            except Exception as exc:
+                logger.warning(
+                    "A2A research polling failed worker={} error_type={}",
+                    safe_log_token(worker),
+                    type(exc).__name__,
+                )
+                final_content = "error=POLL_FAILURE retryable=False"
+            else:
+                final_content = (
+                    json.dumps(result.output, ensure_ascii=False, sort_keys=True)
+                    if result.output is not None
+                    else f"error={result.error_code} retryable={result.retryable}"
+                )
+            break
         if self._delivery is not None and channel and chat_id:
             try:
                 receipt = await self._delivery.send(
