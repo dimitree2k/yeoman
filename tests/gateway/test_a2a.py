@@ -57,7 +57,11 @@ async def test_working_research_is_polled_and_delivered() -> None:
 
 @pytest.mark.asyncio
 async def test_research_timeout_and_protocol_failures_have_distinct_delivery_codes() -> None:
-    from yeoman_gateway.a2a.client import A2APollTimeoutError, A2AProtocolError
+    from yeoman_gateway.a2a.client import (
+        A2APollTimeoutError,
+        A2AProtocolError,
+        A2ATransportError,
+    )
     class Delivery:
         def __init__(self): self.sent = []
         async def send(self, **kwargs): self.sent.append(kwargs)
@@ -65,11 +69,18 @@ async def test_research_timeout_and_protocol_failures_have_distinct_delivery_cod
         def __init__(self, error): self.error = error
         async def poll_task(self, *args, **kwargs): raise self.error
     result = A2AWorkerResult("hermes", "t", "c", "TASK_STATE_WORKING", "research.deep")
-    for error, expected in ((A2APollTimeoutError("x"), "POLL_TIMEOUT"), (A2AProtocolError("x"), "PROTOCOL_FAILURE")):
+    for error, expected in (
+        (A2APollTimeoutError("x"), "POLL_TIMEOUT"),
+        (A2AProtocolError("x"), "PROTOCOL_FAILURE"),
+        (A2ATransportError("x"), "TRANSPORT_FAILURE"),
+        (RuntimeError("signed private secret"), "POLL_FAILURE"),
+    ):
         delivery = Delivery()
         tool = A2ADelegateTool(Registry(error), delivery=delivery)
         await tool._poll_research("hermes", result, "e", "whatsapp", "chat")
         assert expected in delivery.sent[0]["content"]
+        assert len(delivery.sent) == 1
+        assert "signed private secret" not in delivery.sent[0]["content"]
 
 
 def test_workers_are_loopback_only_unless_explicitly_enabled() -> None:
