@@ -70,15 +70,15 @@ async def test_research_timeout_and_protocol_failures_have_distinct_delivery_cod
         async def poll_task(self, *args, **kwargs): raise self.error
     result = A2AWorkerResult("hermes", "t", "c", "TASK_STATE_WORKING", "research.deep")
     for error, expected in (
-        (A2APollTimeoutError("x"), "POLL_TIMEOUT"),
-        (A2AProtocolError("x"), "PROTOCOL_FAILURE"),
-        (A2ATransportError("x"), "TRANSPORT_FAILURE"),
-        (RuntimeError("signed private secret"), "POLL_FAILURE"),
+        (A2APollTimeoutError("x"), "error=POLL_TIMEOUT retryable=True"),
+        (A2AProtocolError("x"), "error=PROTOCOL_FAILURE retryable=False"),
+        (A2ATransportError("x"), "error=TRANSPORT_FAILURE retryable=True"),
+        (RuntimeError("signed private secret"), "error=POLL_FAILURE retryable=False"),
     ):
         delivery = Delivery()
         tool = A2ADelegateTool(Registry(error), delivery=delivery)
         await tool._poll_research("hermes", result, "e", "whatsapp", "chat")
-        assert expected in delivery.sent[0]["content"]
+        assert delivery.sent[0]["content"] == expected
         assert len(delivery.sent) == 1
         assert "signed private secret" not in delivery.sent[0]["content"]
 
