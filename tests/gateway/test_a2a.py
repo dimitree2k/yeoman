@@ -55,6 +55,23 @@ async def test_working_research_is_polled_and_delivered() -> None:
     assert delivery.sent == [{"source": "a2a", "operation_ref": "a2a-result:", "channel": "whatsapp", "chat_id": "chat@g.us", "content": '{"report": "done", "sources": []}'}]
 
 
+@pytest.mark.asyncio
+async def test_research_timeout_and_protocol_failures_have_distinct_delivery_codes() -> None:
+    from yeoman_gateway.a2a.client import A2APollTimeoutError, A2AProtocolError
+    class Delivery:
+        def __init__(self): self.sent = []
+        async def send(self, **kwargs): self.sent.append(kwargs)
+    class Registry:
+        def __init__(self, error): self.error = error
+        async def poll_task(self, *args, **kwargs): raise self.error
+    result = A2AWorkerResult("hermes", "t", "c", "TASK_STATE_WORKING", "research.deep")
+    for error, expected in ((A2APollTimeoutError("x"), "POLL_TIMEOUT"), (A2AProtocolError("x"), "PROTOCOL_FAILURE")):
+        delivery = Delivery()
+        tool = A2ADelegateTool(Registry(error), delivery=delivery)
+        await tool._poll_research("hermes", result, "e", "whatsapp", "chat")
+        assert expected in delivery.sent[0]["content"]
+
+
 def test_workers_are_loopback_only_unless_explicitly_enabled() -> None:
     from yeoman_gateway.a2a.client import A2AWorkerConfigurationError
 

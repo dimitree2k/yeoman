@@ -10,6 +10,7 @@ from typing import Any
 
 from loguru import logger
 
+from yeoman_gateway.a2a.client import A2APollTimeoutError, A2AProtocolError, A2ATransportError
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.observability import private_log_identifier, safe_log_token
@@ -134,9 +135,15 @@ class A2ADelegateTool(Tool):
     async def _poll_research(self, worker: str, result: Any, effect_id: str, channel: str, chat_id: str) -> None:
         try:
             final = await self._registry.poll_task(worker, result.task_id, skill=result.skill, context_id=result.context_id, reference_task_ids=result.reference_task_ids)
+        except A2APollTimeoutError:
+            final_content = "error=POLL_TIMEOUT retryable=True"
+        except A2ATransportError:
+            final_content = "error=TRANSPORT_FAILURE retryable=True"
+        except A2AProtocolError:
+            final_content = "error=PROTOCOL_FAILURE retryable=False"
         except Exception as exc:
             logger.warning("A2A research polling failed worker={} error_type={}", safe_log_token(worker), type(exc).__name__)
-            final_content = "error=POLL_TIMEOUT retryable=True"
+            final_content = "error=POLL_FAILURE retryable=False"
         else:
             final_content = json.dumps(final.output, ensure_ascii=False, sort_keys=True) if final.output is not None else f"error={final.error_code} retryable={final.retryable}"
         if self._delivery is not None and channel and chat_id:
