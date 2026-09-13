@@ -1876,7 +1876,9 @@ class WhatsAppChannel(BaseChannel):
 
     @staticmethod
     def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        summary: dict[str, Any] = {"to": payload.get("to")}
+        summary: dict[str, Any] = {
+            "to": "[REDACTED]" if payload.get("to") else None
+        }
         if command_type == "send_text":
             summary["text_len"] = len(str(payload.get("text") or ""))
             summary["reply_to"] = bool(payload.get("replyToMessageId"))
@@ -1892,15 +1894,15 @@ class WhatsAppChannel(BaseChannel):
             return summary
         if command_type == "presence_update":
             summary["state"] = payload.get("state")
-            summary["chat_jid"] = payload.get("chatJid")
+            summary["chat_jid"] = "[REDACTED]" if payload.get("chatJid") else None
             return summary
         if command_type == "react":
-            summary["chat_jid"] = payload.get("chatJid")
+            summary["chat_jid"] = "[REDACTED]" if payload.get("chatJid") else None
             summary["message_id"] = payload.get("messageId")
             summary["emoji"] = payload.get("emoji")
             return summary
         if command_type == "delete_message":
-            summary["chat_jid"] = payload.get("chatJid")
+            summary["chat_jid"] = "[REDACTED]" if payload.get("chatJid") else None
             summary["message_id"] = payload.get("messageId")
             return summary
         return summary

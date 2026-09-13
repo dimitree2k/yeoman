@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
+from loguru import logger
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
+from yeoman_shared.config.schema import WhatsAppConfig
 
 
 @pytest.mark.asyncio
@@ -69,3 +74,38 @@ async def test_whatsapp_channel_rejects_malformed_delete_request() -> None:
                 metadata={"delete_message": {}},
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_debug_log_redacts_target_but_keeps_command_summary() -> None:
+    sentinel = "120363400000000999@g.us"
+    sent_frames: list[dict[str, object]] = []
+    channel = object.__new__(WhatsAppChannel)
+    channel.config = WhatsAppConfig(bridge_token="test-token")
+    channel._pending = {}
+    channel._send_lock = asyncio.Lock()
+
+    class _CompletingWebSocket:
+        async def send(self, encoded: str) -> None:
+            frame = json.loads(encoded)
+            sent_frames.append(frame)
+            channel._pending[frame["requestId"]].set_result({"ok": True})
+
+    channel._ws = _CompletingWebSocket()
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="DEBUG")
+    try:
+        result = await channel._send_command(
+            "send_text",
+            {"to": sentinel, "text": "private text"},
+            timeout_seconds=1.0,
+        )
+    finally:
+        logger.remove(sink)
+
+    assert result == {"ok": True}
+    assert sent_frames[0]["payload"] == {"to": sentinel, "text": "private text"}
+    logged = "\n".join(records)
+    assert sentinel not in logged
+    assert "type=send_text" in logged
+    assert "text_len" in logged

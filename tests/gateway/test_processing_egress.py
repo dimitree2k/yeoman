@@ -664,6 +664,40 @@ class _SanitizingSecurity:
         )
 
 
+def test_security_decision_log_redacts_chat_target_but_keeps_operation_fields() -> None:
+    from loguru import logger
+    from yeoman_gateway.security.engine import SecurityEngine
+    from yeoman_shared.config.schema import SecurityConfig
+
+    sentinel = "120363400000000999@g.us"
+    engine = SecurityEngine(
+        SecurityConfig.model_validate(
+            {"enabled": True, "stages": {"output": True}}
+        )
+    )
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        result = engine.check_output(
+            "secret sk-abc123abc123abc123abc123",
+            context={
+                "channel": "whatsapp",
+                "chat_id": sentinel,
+                "effect_id": "a2a-effect-sentinel",
+                "capability": "send_text",
+            },
+        )
+    finally:
+        logger.remove(sink)
+
+    assert result.decision.action == "sanitize"
+    logged = "\n".join(records)
+    assert sentinel not in logged
+    assert "a2a-effect-sentinel" in logged
+    assert "send_text" in logged
+    assert "whatsapp" in logged
+
+
 @pytest.mark.asyncio
 async def test_text_effects_pass_the_shared_output_control(tmp_path: Path) -> None:
     from yeoman_gateway.processing.dispatch import BusEffectExecutor

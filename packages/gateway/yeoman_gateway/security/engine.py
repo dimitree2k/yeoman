@@ -22,6 +22,10 @@ _SENSITIVE_CONTEXT_KEYS = (
     "credential",
     "private_key",
     "cookie",
+    "chat_id",
+    "chat_jid",
+    "chatjid",
+    "target_jid",
 )
 
 _SENSITIVE_VALUE_PATTERNS = (
