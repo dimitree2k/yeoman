@@ -56,16 +56,42 @@ class A2AWorkerRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(self._workers)
 
-    async def call(
+    async def invoke_skill(
         self,
         worker_name: str,
-        message: str,
+        skill: str,
+        input: dict[str, Any],
         *,
         context_id: str | None = None,
+        reference_task_ids: tuple[str, ...] | list[str] = (),
     ) -> A2AWorkerResult:
         name = str(worker_name or "").strip()
         worker = self._workers.get(name)
         if worker is None:
             raise KeyError(f"unknown A2A worker '{name}'")
         client = self._client_factory(worker)
-        return await client.send_message(message, context_id=context_id)
+        return await client.invoke_skill(
+            skill,
+            input,
+            context_id=context_id,
+            reference_task_ids=reference_task_ids,
+        )
+
+    async def get_task(
+        self,
+        worker_name: str,
+        task_id: str,
+        *,
+        skill: str,
+        context_id: str,
+        reference_task_ids: tuple[str, ...] | list[str] = (),
+    ) -> A2AWorkerResult:
+        worker = self._workers.get(str(worker_name or "").strip())
+        if worker is None:
+            raise KeyError(f"unknown A2A worker '{worker_name}'")
+        return await self._client_factory(worker).get_task(
+            task_id,
+            skill=skill,
+            context_id=context_id,
+            reference_task_ids=reference_task_ids,
+        )
