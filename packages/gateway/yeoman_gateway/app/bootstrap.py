@@ -56,6 +56,7 @@ from yeoman_gateway.persona_evolution import (
     persona_evolution_result_needs_notification,
     run_persona_evolution_cron,
 )
+from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.processing.dispatch import (
     SERVICE_PRINCIPALS,
@@ -88,6 +89,11 @@ def _normalize_timestamp(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=UTC)
     return ts.astimezone(UTC)
+
+
+def policy_validation_tools(responder_tools: set[str]) -> set[str]:
+    """Include service-only policy capabilities in startup validation."""
+    return policy_known_tools(responder_tools)
 
 
 def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolConfig"]:
@@ -1067,7 +1073,7 @@ def build_gateway_runtime(
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
     )
     if policy_engine is not None:
-        policy_engine.validate(set(responder.tool_names))
+        policy_engine.validate(policy_validation_tools(set(responder.tool_names)))
 
     if effect_router is not None:
         # The new mode must not keep uncontained write capabilities as a bypass.
@@ -1105,7 +1111,7 @@ def build_gateway_runtime(
     policy_adapter.set_admin_notify_callback(_admin_notify)
 
     # Update policy adapter with actual tool names
-    policy_adapter._known_tools = set(responder.tool_names)
+    policy_adapter._known_tools = policy_validation_tools(set(responder.tool_names))
     admin_command_handler = getattr(policy_adapter, "route_admin_command", None)
     if admin_command_handler is None:
         admin_command_handler = getattr(policy_adapter, "maybe_handle_admin_command", None)

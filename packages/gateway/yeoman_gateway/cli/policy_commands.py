@@ -8,6 +8,8 @@ import typer
 from yeoman_shared.utils.backups import backup_file
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
+from yeoman_gateway.policy.capabilities import policy_known_tools
+
 from .channel_commands import _ensure_whatsapp_bridge_token
 from .core import app, console, make_policy_engine
 
@@ -24,7 +26,7 @@ def _policy_known_tools() -> set[str]:
     (``browse``, ``fact_check`` and ``resolve_contact`` were missing and made *every*
     policy write fail), so the declarations are read from the package instead of copied.
     """
-    return _DECLARED_POLICY_TOOLS | _declared_tool_names()
+    return policy_known_tools(_DECLARED_POLICY_TOOLS | _declared_tool_names())
 
 
 def _declared_tool_names() -> set[str]:
