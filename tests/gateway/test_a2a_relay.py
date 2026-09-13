@@ -1149,7 +1149,7 @@ def test_valid_structured_text_invocation_returns_valid_task_and_exact_correlati
     assert result["output"]["status"] == "sent"
     assert task["metadata"] == {
         "profile": "urn:hermes-yeoman:a2a-profile:v1",
-        "contractRelease": "1.0.0",
+        "contractRelease": "1.0.1",
     }
     assert set(task) == {"id", "contextId", "status", "artifacts", "metadata"}
     assert len(gateway.requests) == 1

@@ -18,8 +18,8 @@ from yeoman_gateway.a2a.contracts import (
 def test_installed_contract_metadata_is_pinned() -> None:
     import a2a_contracts
 
-    assert CONTRACT_RELEASE == a2a_contracts.CONTRACT_VERSION == "1.0.0"
-    assert CONTRACT_COMMIT == "e408cc3d10cc9c76a245d851d7abfa2027874d51"
+    assert CONTRACT_RELEASE == a2a_contracts.CONTRACT_VERSION == "1.0.1"
+    assert CONTRACT_COMMIT == "b8886616664b922538a91c7f78c608c963d0826c"
     assert PROFILE_URI == a2a_contracts.PROFILE_URI == "urn:hermes-yeoman:a2a-profile:v1"
 
 
@@ -110,7 +110,7 @@ backend-path = ["."]
 
 [project]
 name = "hermes-yeoman-a2a-contracts"
-version = "1.0.0"
+version = "1.0.1"
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -121,8 +121,8 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 NAME = "hermes_yeoman_a2a_contracts"
-DIST_INFO = f"{NAME}-1.0.0.dist-info"
-WHEEL = f"{NAME}-1.0.0-py3-none-any.whl"
+DIST_INFO = f"{NAME}-1.0.1.dist-info"
+WHEEL = f"{NAME}-1.0.1-py3-none-any.whl"
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
@@ -131,7 +131,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         wheel.writestr("a2a_contracts/__init__.py", "MARKER = 'local-checkout'\\n")
         wheel.writestr(
             f"{DIST_INFO}/METADATA",
-            "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.0\\n",
+            "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.1\\n",
         )
         wheel.writestr(
             f"{DIST_INFO}/WHEEL",
@@ -145,7 +145,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     path = Path(metadata_directory) / DIST_INFO
     path.mkdir()
     (path / "METADATA").write_text(
-        "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.0\\n"
+        "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.1\\n"
     )
     (path / "WHEEL").write_text(
         "Wheel-Version: 1.0\\nGenerator: contract-test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"

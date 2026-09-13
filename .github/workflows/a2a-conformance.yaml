@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: dimitree2k/hermes-yeoman-a2a-contracts
-          ref: e408cc3d10cc9c76a245d851d7abfa2027874d51
+          ref: b8886616664b922538a91c7f78c608c963d0826c
           path: .contracts
       - uses: astral-sh/setup-uv@v6
       - run: uv sync

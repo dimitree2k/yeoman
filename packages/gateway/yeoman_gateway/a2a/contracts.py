@@ -11,8 +11,8 @@ import a2a_contracts
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
-CONTRACT_RELEASE = "1.0.0"
-CONTRACT_COMMIT = "e408cc3d10cc9c76a245d851d7abfa2027874d51"
+CONTRACT_RELEASE = "1.0.1"
+CONTRACT_COMMIT = "b8886616664b922538a91c7f78c608c963d0826c"
 PROFILE_URI = "urn:hermes-yeoman:a2a-profile:v1"
 
 if a2a_contracts.CONTRACT_VERSION != CONTRACT_RELEASE:

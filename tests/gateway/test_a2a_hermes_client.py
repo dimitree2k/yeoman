@@ -10,7 +10,7 @@ from yeoman_gateway.a2a.client import A2AClient, A2AProtocolError, A2AWorker
 def _card(*skills: str) -> dict[str, object]:
     return {
         "name": "Hermes",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "supportedInterfaces": [
             {
                 "url": "http://127.0.0.1:9900/a2a",
