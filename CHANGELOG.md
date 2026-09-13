@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added the standalone `yeoman a2a serve` relay command, contract conformance
+  check, and source-owned `yeoman-a2a.service` user unit for the structured
+  Hermes/Yeoman A2A v1 relay.
+
 ## v1.1.0 — 11 Sep 2026
 
 First tagged release. `v1.0.0` was documented but never published, so this entry covers the

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import stat
+
 import pytest
 from yeoman_gateway.a2a.client import A2AWorker, A2AWorkerResult
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
@@ -10,7 +12,10 @@ from yeoman_gateway.adapters.responder_llm import (
 from yeoman_gateway.agent.tools.a2a import A2ADelegateTool
 from yeoman_gateway.bus.events import InboundMessage, OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
-from yeoman_gateway.cli.gateway_commands import _should_setup_daemon_logging
+from yeoman_gateway.cli.gateway_commands import (
+    _prepare_private_log_path,
+    _should_setup_daemon_logging,
+)
 from yeoman_gateway.observability import private_log_identifier, safe_log_token
 
 
@@ -44,6 +49,17 @@ def test_log_identifiers_remain_control_safe() -> None:
     unsafe = "owner@s.whatsapp.net\nforged=record"
     assert safe_log_token(unsafe) == r"owner@s.whatsapp.net\x0aforged=record"
     assert private_log_identifier(unsafe) != unsafe
+
+
+def test_gateway_log_path_remains_private(tmp_path) -> None:
+    path = tmp_path / "logs" / "gateway.log"
+    path.parent.mkdir()
+    path.write_text("old")
+    path.parent.chmod(0o755)
+    path.chmod(0o644)
+    _prepare_private_log_path(path)
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 @pytest.mark.asyncio

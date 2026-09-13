@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 # Import command modules for side-effect registration on the shared `app`.
+from . import a2a_commands as _a2a_commands  # noqa: F401
 from . import agent_commands as _agent_commands  # noqa: F401
 from . import channel_commands as _channel_commands  # noqa: F401
 from . import chat_commands as _chat_commands  # noqa: F401

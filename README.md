@@ -258,6 +258,46 @@ yeoman env
 ./bin/yeoman env
 ```
 
+### Standalone A2A relay (v1)
+
+The Hermes/Yeoman A2A relay uses contract release `1.0.0` and profile
+`urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service;
+configure its private `YEOMAN_A2A_*` values in `~/.yeoman/.env`, then run it
+locally with:
+
+```bash
+yeoman a2a serve
+```
+
+The v1 relay is polling-only: it does not implement streaming or push delivery.
+The previous free-text relay protocol is unsupported; callers must use the
+structured v1 profile.
+
+Validate the installed contract release/profile against every positive and
+negative fixture in a checkout at the exact pinned commit:
+
+```bash
+yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
+```
+
+To try a contract checkout without changing the project pin, use the local
+override wrapper:
+
+```bash
+./scripts/use-local-a2a-contracts /path/to/hermes-yeoman-a2a-contracts run \
+  yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
+```
+
+For persistent operation, deploy and install the source-owned user unit, then
+perform the explicit cutover:
+
+```bash
+yeoman deploy
+yeoman overseer install-units
+systemctl --user daemon-reload
+systemctl --user enable --now yeoman-a2a.service
+```
+
 ## Quick Start
 
 **1. Initialize**
@@ -516,6 +556,8 @@ the protocol version.
 | `yeoman status` | Runtime status |
 | `yeoman env` | Show active launcher and Python environment |
 | `yeoman doctor` | Run health checks and report issues |
+| `yeoman a2a serve` | Run the standalone authenticated A2A relay |
+| `yeoman a2a conformance --contracts-checkout PATH` | Validate every pinned A2A fixture |
 | `yeoman logs` | View gateway/bridge/overseer logs |
 | **Channels** | |
 | `yeoman channels login` | Link WhatsApp (scan QR) |

@@ -1,0 +1,20 @@
+name: A2A Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dimitree2k/hermes-yeoman-a2a-contracts
+          ref: e408cc3d10cc9c76a245d851d7abfa2027874d51
+          path: .contracts
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run yeoman a2a conformance --contracts-checkout .contracts
