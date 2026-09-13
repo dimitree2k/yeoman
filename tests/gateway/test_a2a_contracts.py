@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -92,3 +93,90 @@ def test_local_contract_override_keeps_project_metadata_untouched() -> None:
     assert result.returncode == 0, result.stderr
     assert pyproject.read_bytes() == before
     assert "uv" in result.stdout.lower() or "uv" in result.stderr.lower()
+
+
+def test_local_contract_override_run_imports_supplied_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "contracts"
+    package = checkout / "a2a_contracts"
+    package.mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text(
+        """
+[build-system]
+requires = []
+build-backend = "backend"
+backend-path = ["."]
+
+[project]
+name = "hermes-yeoman-a2a-contracts"
+version = "1.0.0"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (checkout / "backend.py").write_text(
+        """
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+NAME = "hermes_yeoman_a2a_contracts"
+DIST_INFO = f"{NAME}-1.0.0.dist-info"
+WHEEL = f"{NAME}-1.0.0-py3-none-any.whl"
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    path = Path(wheel_directory) / WHEEL
+    with ZipFile(path, "w", ZIP_DEFLATED) as wheel:
+        wheel.writestr("a2a_contracts/__init__.py", "MARKER = 'local-checkout'\\n")
+        wheel.writestr(
+            f"{DIST_INFO}/METADATA",
+            "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.0\\n",
+        )
+        wheel.writestr(
+            f"{DIST_INFO}/WHEEL",
+            "Wheel-Version: 1.0\\nGenerator: contract-test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n",
+        )
+        wheel.writestr(f"{DIST_INFO}/RECORD", "")
+    return WHEEL
+
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    path = Path(metadata_directory) / DIST_INFO
+    path.mkdir()
+    (path / "METADATA").write_text(
+        "Metadata-Version: 2.1\\nName: hermes-yeoman-a2a-contracts\\nVersion: 1.0.0\\n"
+    )
+    (path / "WHEEL").write_text(
+        "Wheel-Version: 1.0\\nGenerator: contract-test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"
+    )
+    return DIST_INFO
+
+
+def get_requires_for_build_wheel(config_settings=None):
+    return []
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text("MARKER = 'source-not-imported'\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            str(Path("scripts/use-local-a2a-contracts")),
+            str(checkout),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--offline",
+            "--no-cache",
+            "python",
+            "-c",
+            "import a2a_contracts; print(a2a_contracts.MARKER)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "local-checkout"
