@@ -165,6 +165,13 @@ async def test_a2a_invoke_round_trips_exact_arguments_over_real_socket(
                 "task_id": "task-1",
                 "context_id": "context-1",
                 "effect_id": "a2a-effect-1",
+                "resolved_artifacts": [
+                    {
+                        "peer": "hermes",
+                        "uri": "https://relay.example.test/artifacts/opaque",
+                        "path": "/private/artifact.ogg",
+                    }
+                ],
             },
         }
         writer.write(json.dumps(request).encode() + b"\n")

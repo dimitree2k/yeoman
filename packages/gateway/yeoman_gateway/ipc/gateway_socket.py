@@ -149,6 +149,7 @@ class GatewaySocket:
                     task_id=args.get("task_id", ""),
                     context_id=args.get("context_id", ""),
                     effect_id=args.get("effect_id", ""),
+                    resolved_artifacts=args.get("resolved_artifacts", []),
                 )
                 return {"status": "ok", "response": result}
             except Exception:

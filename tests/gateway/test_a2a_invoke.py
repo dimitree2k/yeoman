@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +69,27 @@ class _Effects:
         if self.unmanaged:
             raise EffectNotDeliveredError("private target leaked@example.test")
         return self.receipt
+
+
+class _VoiceGenerator:
+    def __init__(self, artifact: dict[str, object]) -> None:
+        self.artifact = artifact
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def generate(
+        self, effect_id: str, request: dict[str, object]
+    ) -> dict[str, object]:
+        self.calls.append((effect_id, request))
+        return self.artifact
+
+
+class _VoiceSender:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, **kwargs: object) -> EffectReceipt:
+        self.calls.append(kwargs)
+        return EffectReceipt(effect_id=str(kwargs["effect_id"]), state="sent", accepted=True)
 
 
 class _EffectStore:
@@ -159,6 +181,151 @@ async def test_valid_text_uses_exact_alias_policy_and_managed_effect() -> None:
             "require_managed": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_voice_generation_returns_internal_metadata_without_sending(
+    tmp_path: Path,
+) -> None:
+    effect_id = "a2a-effect-" + hashlib.sha256(
+        b"hermes\0media.voice.generate\0voice-1"
+    ).hexdigest()[:40]
+    artifact = {
+        "path": str(tmp_path / f"{effect_id}.wav"),
+        "mime_type": "audio/wav",
+        "duration_ms": 100,
+        "sha256": "a" * 64,
+        "size_bytes": 1_644,
+        "expires_at": 1_060.0,
+        "filename": f"{effect_id}.wav",
+    }
+    generator = _VoiceGenerator(artifact)
+    effects = _Effects()
+    request = {"text": "Hello", "format": "wav", "idempotency_key": "voice-1"}
+
+    result, *_ = await _invoke(
+        skill="media.voice.generate",
+        input=request,
+        effect_id=effect_id,
+        advertised_skills=frozenset({"media.voice.generate", "whatsapp.send"}),
+        voice_generator=generator,
+        effects=effects,
+    )
+
+    assert result == {
+        "skill": "media.voice.generate",
+        "status": "completed",
+        "output": {"internal_artifact": artifact},
+        "correlation": {
+            "task_id": "task-1",
+            "context_id": "context-1",
+            "idempotency_key": "voice-1",
+        },
+    }
+    assert generator.calls == [(effect_id, request)]
+    assert effects.calls == []
+
+
+@pytest.mark.asyncio
+async def test_second_explicit_voice_send_uses_only_validated_artifact_path(
+    tmp_path: Path,
+) -> None:
+    voice_path = tmp_path / "artifacts" / "voice.wav"
+    voice_path.parent.mkdir()
+    voice_path.write_bytes(b"voice")
+    sha256 = hashlib.sha256(b"voice").hexdigest()
+    uri = "https://relay.example.test/a2a/artifacts/opaque-1"
+    request = _input(
+        content=[
+            {
+                "type": "voice",
+                "uri": uri,
+                "mime_type": "audio/wav",
+                "duration_ms": 100,
+            }
+        ]
+    )
+    effect_id = "a2a-effect-" + hashlib.sha256(
+        b"hermes\0whatsapp.send\0request-1"
+    ).hexdigest()[:40]
+    sender = _VoiceSender()
+
+    result, policy, resolver, effects = await _invoke(
+        input=request,
+        effect_id=effect_id,
+        policy=_Policy(tools=frozenset({"send_voice"})),
+        resolved_artifacts=[
+            {
+                "peer": "hermes",
+                "uri": uri,
+                "path": str(voice_path),
+                "mime_type": "audio/wav",
+                "duration_ms": 100,
+                "sha256": sha256,
+                "size_bytes": 5,
+                "expires_at": 2_000.0,
+            }
+        ],
+        artifact_root=voice_path.parent,
+        clock=lambda: 1_000.0,
+        voice_sender=sender,
+    )
+
+    assert result["status"] == "completed"
+    assert resolver.calls == [("group", "team-example")]
+    assert policy.events[0].content == ""
+    assert effects.calls == []
+    assert sender.calls == [
+        {
+            "operation_ref": effect_id,
+            "chat_id": "private-group@g.us",
+            "path": str(voice_path),
+            "effect_id": effect_id,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("uri", "resolved"),
+    [
+        ("https://external.example/voice.wav", []),
+        ("file:///private/voice.wav", []),
+        (
+            "https://relay.example.test/a2a/artifacts/opaque",
+            [
+                {
+                    "peer": "hermes",
+                    "uri": "https://relay.example.test/a2a/artifacts/opaque",
+                    "path": "/tmp/artifacts/../private.wav",
+                    "mime_type": "audio/wav",
+                    "duration_ms": 100,
+                    "sha256": "a" * 64,
+                    "size_bytes": 5,
+                    "expires_at": 2_000.0,
+                }
+            ],
+        ),
+    ],
+)
+async def test_voice_send_rejects_external_private_or_arbitrary_paths(
+    tmp_path: Path, uri: str, resolved: list[dict[str, object]]
+) -> None:
+    sender = _VoiceSender()
+    result, *_ = await _invoke(
+        input=_input(
+            content=[{"type": "voice", "uri": uri, "mime_type": "audio/wav"}]
+        ),
+        policy=_Policy(tools=frozenset({"send_voice"})),
+        resolved_artifacts=resolved,
+        artifact_root=tmp_path / "artifacts",
+        clock=lambda: 1_000.0,
+        voice_sender=sender,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["error"]["code"] == "ARTIFACT_DENIED"
+    assert sender.calls == []
 
 
 @pytest.mark.asyncio

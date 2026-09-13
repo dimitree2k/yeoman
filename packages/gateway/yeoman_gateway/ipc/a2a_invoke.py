@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections.abc import Callable, Collection, Mapping
+from pathlib import Path
 from typing import Any, Protocol
 
 from yeoman_gateway.a2a.contracts import A2AContractValidationError, ContractSchemas
@@ -15,6 +17,7 @@ from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE, EffectRec
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SKILL = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
 _TEXT_TOOL = "message"
+_VOICE_TOOL = "send_voice"
 
 
 class _PolicyAdapter(Protocol):
@@ -23,6 +26,15 @@ class _PolicyAdapter(Protocol):
 
 class _Effects(Protocol):
     async def send(self, **kwargs: Any) -> EffectReceipt | None: ...
+
+
+class _VoiceGenerator(Protocol):
+    async def generate(
+        self, effect_id: str, request: Mapping[str, Any]
+    ) -> dict[str, object]: ...
+
+
+_VoiceSender = Callable[..., Any]
 
 
 class _EffectStore(Protocol):
@@ -150,9 +162,14 @@ async def process_a2a_invocation(
     effects: _Effects | None,
     effect_store: _EffectStore,
     sender_account: str,
+    voice_generator: _VoiceGenerator | None = None,
+    resolved_artifacts: Collection[Mapping[str, Any]] = (),
+    artifact_root: Path | None = None,
+    voice_sender: _VoiceSender | None = None,
+    clock: Callable[[], float] | None = None,
     schemas: ContractSchemas | None = None,
 ) -> dict[str, object]:
-    """Validate, authorize, and execute one text-only ``whatsapp.send`` request."""
+    """Validate, authorize, and execute one advertised structured request."""
     schemas = schemas or ContractSchemas.load()
     correlation = _correlation(
         task_id=task_id,
@@ -192,13 +209,6 @@ async def process_a2a_invocation(
             message="The skill input is invalid.",
             correlation=correlation,
         )
-    if skill != "whatsapp.send":
-        return _failure(
-            skill=skill,
-            code="SKILL_NOT_ADVERTISED",
-            message="The skill is not available.",
-            correlation=correlation,
-        )
     expected_effect_id = "a2a-effect-" + hashlib.sha256(
         f"{peer}\0{skill}\0{input['idempotency_key']}".encode()
     ).hexdigest()[:40]
@@ -207,6 +217,37 @@ async def process_a2a_invocation(
             skill=skill,
             code="INVALID_EFFECT_ID",
             message="The effect identity is invalid.",
+            correlation=correlation,
+        )
+    if skill == "media.voice.generate":
+        if voice_generator is None:
+            return _failure(
+                skill=skill,
+                code="SKILL_NOT_ADVERTISED",
+                message="The skill is not available.",
+                correlation=correlation,
+            )
+        try:
+            artifact = await voice_generator.generate(effect_id, input)
+        except Exception:
+            return _failure(
+                skill=skill,
+                code="VOICE_GENERATION_FAILED",
+                message="Voice generation failed.",
+                correlation=correlation,
+                status="failed",
+            )
+        return {
+            "skill": skill,
+            "status": "completed",
+            "output": {"internal_artifact": artifact},
+            "correlation": correlation,
+        }
+    if skill != "whatsapp.send":
+        return _failure(
+            skill=skill,
+            code="SKILL_NOT_ADVERTISED",
+            message="The skill is not available.",
             correlation=correlation,
         )
     if "sender" in input:
@@ -218,11 +259,12 @@ async def process_a2a_invocation(
         )
 
     content = input["content"]
-    if any(part["type"] != "text" for part in content):
+    content_types = {part["type"] for part in content}
+    if not content_types <= {"text", "voice"} or len(content_types) > 1:
         return _failure(
             skill=skill,
             code="CONTENT_TYPE_DENIED",
-            message="Only text content is enabled.",
+            message="The requested content is not enabled.",
             correlation=correlation,
         )
     delivery = input.get("delivery") or {}
@@ -256,7 +298,30 @@ async def process_a2a_invocation(
             correlation=correlation,
         )
 
-    text = "\n".join(part["text"] for part in content)
+    voice_path: str | None = None
+    if content_types == {"voice"}:
+        if artifact_root is None or voice_sender is None:
+            return _failure(
+                skill=skill,
+                code="CONTENT_TYPE_DENIED",
+                message="Voice content is not enabled.",
+                correlation=correlation,
+            )
+        voice_path = _validated_voice_path(
+            peer=peer,
+            part=content[0],
+            resolved_artifacts=resolved_artifacts,
+            artifact_root=artifact_root,
+            now=(clock or time.time)(),
+        )
+        if voice_path is None:
+            return _failure(
+                skill=skill,
+                code="ARTIFACT_DENIED",
+                message="The voice artifact is unavailable.",
+                correlation=correlation,
+            )
+    text = "\n".join(part["text"] for part in content if part["type"] == "text")
     event = InboundEvent(
         channel="whatsapp",
         chat_id=chat_id,
@@ -271,7 +336,7 @@ async def process_a2a_invocation(
     if (
         not decision.accept_message
         or not decision.should_respond
-        or _TEXT_TOOL not in decision.allowed_tools
+        or (_VOICE_TOOL if voice_path else _TEXT_TOOL) not in decision.allowed_tools
     ):
         return _failure(
             skill=skill,
@@ -281,15 +346,26 @@ async def process_a2a_invocation(
         )
 
     try:
-        await effects.send(
-            source="a2a",
-            operation_ref=effect_id,
-            channel="whatsapp",
-            chat_id=chat_id,
-            content=text,
-            effect_id=effect_id,
-            require_managed=True,
-        )
+        if voice_path is not None:
+            send_voice = voice_sender
+            if send_voice is None:  # narrowed above; keep the trust boundary explicit
+                raise RuntimeError("voice sender unavailable")
+            await send_voice(
+                operation_ref=effect_id,
+                chat_id=chat_id,
+                path=voice_path,
+                effect_id=effect_id,
+            )
+        else:
+            await effects.send(
+                source="a2a",
+                operation_ref=effect_id,
+                channel="whatsapp",
+                chat_id=chat_id,
+                content=text,
+                effect_id=effect_id,
+                require_managed=True,
+            )
         status, provider_id = _business_status(effect_store, effect_id)
     except EffectNotDeliveredError:
         return _failure(
@@ -333,6 +409,41 @@ async def process_a2a_invocation(
     }
     schemas.validate_result(result)
     return result
+
+
+def _validated_voice_path(
+    *,
+    peer: str,
+    part: Mapping[str, Any],
+    resolved_artifacts: Collection[Mapping[str, Any]],
+    artifact_root: Path | None,
+    now: float,
+) -> str | None:
+    if artifact_root is None or len(resolved_artifacts) != 1:
+        return None
+    artifact = next(iter(resolved_artifacts))
+    if (
+        artifact.get("peer") != peer
+        or artifact.get("uri") != part.get("uri")
+        or artifact.get("mime_type") != part.get("mime_type")
+    ):
+        return None
+    try:
+        root = artifact_root.expanduser().resolve(strict=True)
+        path = Path(str(artifact["path"]))
+        resolved = path.resolve(strict=True)
+        if (
+            path.is_symlink()
+            or not resolved.is_relative_to(root)
+            or not resolved.is_file()
+            or float(artifact["expires_at"]) <= now
+            or resolved.stat().st_size != int(artifact["size_bytes"])
+            or hashlib.sha256(resolved.read_bytes()).hexdigest() != artifact["sha256"]
+        ):
+            return None
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return str(resolved)
 
 
 __all__ = ["process_a2a_invocation", "resolve_whatsapp_recipient"]

@@ -31,13 +31,21 @@ from yeoman_gateway.a2a.contracts import (
 LOG = logging.getLogger("yeoman.a2a.relay")
 _PRIVATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SKILL_ID = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
-_ALLOWED_CONTENT_TYPES = frozenset({"text"})
+_ALLOWED_CONTENT_TYPES = frozenset({"text", "voice"})
+_AUDIO_MIME_TYPES = frozenset(
+    {"audio/ogg", "audio/ogg; codecs=opus", "audio/mpeg", "audio/wav"}
+)
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _TERMINAL_STATES = frozenset({"TASK_STATE_COMPLETED", "TASK_STATE_REJECTED", "TASK_STATE_FAILED"})
 _SKILL_CARDS: dict[str, tuple[str, str, list[str]]] = {
+    "media.voice.generate": (
+        "Voice generation",
+        "Generate a private, short-lived speech artifact without sending it.",
+        ["media", "voice", "tts"],
+    ),
     "whatsapp.send": (
         "WhatsApp delivery",
-        "Deliver policy-approved text to a configured recipient alias.",
+        "Deliver policy-approved text or generated voice to a configured recipient alias.",
         ["whatsapp", "delivery"],
     ),
 }
@@ -113,6 +121,9 @@ class RelayConfig:
     public_url: str
     whatsapp_enabled: bool
     content_types: frozenset[str]
+    artifact_root: Path | None = None
+    artifact_ttl_seconds: int = 300
+    max_artifact_bytes: int = 5 * 1024 * 1024
     timeout_seconds: float = 30.0
     max_body_bytes: int = 65_536
     max_response_bytes: int = 524_288
@@ -131,6 +142,13 @@ class RelayConfig:
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),
             content_types=_csv(os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text")),
+            artifact_root=(
+                Path(value).expanduser()
+                if (value := os.environ.get("YEOMAN_A2A_ARTIFACT_ROOT", "").strip())
+                else None
+            ),
+            artifact_ttl_seconds=_integer("YEOMAN_A2A_ARTIFACT_TTL_SECONDS", 300),
+            max_artifact_bytes=_integer("YEOMAN_A2A_MAX_ARTIFACT_BYTES", 5 * 1024 * 1024),
             timeout_seconds=_number("YEOMAN_A2A_TIMEOUT_SECONDS", 30.0),
             max_body_bytes=_integer("YEOMAN_A2A_MAX_BODY_BYTES", 65_536),
             max_response_bytes=_integer("YEOMAN_A2A_MAX_RESPONSE_BYTES", 524_288),
@@ -176,11 +194,15 @@ class RelayConfig:
             raise RelayConfigurationError("public URL cannot advertise an internal IP address")
         if not self.content_types or not self.content_types <= _ALLOWED_CONTENT_TYPES:
             raise RelayConfigurationError("content types contain an unsupported value")
+        if self.artifact_root is not None and not self.artifact_root.is_absolute():
+            raise RelayConfigurationError("artifact root must be absolute")
         if (
             self.timeout_seconds <= 0
             or self.max_body_bytes <= 0
             or self.max_response_bytes <= 0
             or self.rate_limit_per_minute <= 0
+            or self.artifact_ttl_seconds <= 0
+            or self.max_artifact_bytes <= 0
         ):
             raise RelayConfigurationError("time, size, and rate limits must be positive")
 
@@ -303,6 +325,19 @@ class _RelayStore:
                     PRIMARY KEY(peer, skill, idempotency_key),
                     FOREIGN KEY(task_id) REFERENCES tasks(task_id)
                 );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    opaque_id TEXT PRIMARY KEY,
+                    peer TEXT NOT NULL,
+                    effect_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    expires_at REAL NOT NULL,
+                    UNIQUE(peer, effect_id)
+                );
+                CREATE INDEX IF NOT EXISTS artifacts_peer_id ON artifacts(peer, opaque_id);
                 """
             )
 
@@ -504,6 +539,70 @@ class _RelayStore:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def register_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT opaque_id, path, mime_type, duration_ms, sha256, size_bytes, expires_at
+                   FROM artifacts WHERE peer=? AND effect_id=?""",
+                (artifact["peer"], artifact["effect_id"]),
+            ).fetchone()
+            if row is not None:
+                keys = (
+                    "opaque_id",
+                    "path",
+                    "mime_type",
+                    "duration_ms",
+                    "sha256",
+                    "size_bytes",
+                    "expires_at",
+                )
+                return {"peer": artifact["peer"], "effect_id": artifact["effect_id"]} | dict(
+                    zip(keys, row, strict=True)
+                )
+            connection.execute(
+                """INSERT INTO artifacts
+                   (opaque_id, peer, effect_id, path, mime_type, duration_ms, sha256,
+                    size_bytes, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(
+                    artifact[key]
+                    for key in (
+                        "opaque_id",
+                        "peer",
+                        "effect_id",
+                        "path",
+                        "mime_type",
+                        "duration_ms",
+                        "sha256",
+                        "size_bytes",
+                        "expires_at",
+                    )
+                ),
+            )
+        return artifact
+
+    def get_artifact(self, peer: str, opaque_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT effect_id, path, mime_type, duration_ms, sha256, size_bytes,
+                          expires_at
+                   FROM artifacts WHERE peer=? AND opaque_id=?""",
+                (peer, opaque_id),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "effect_id",
+            "path",
+            "mime_type",
+            "duration_ms",
+            "sha256",
+            "size_bytes",
+            "expires_at",
+        )
+        return {"peer": peer, "opaque_id": opaque_id} | dict(zip(keys, row, strict=True))
+
 
 class RelayService:
     """Protocol logic shared by the thin HTTP handler."""
@@ -515,8 +614,22 @@ class RelayService:
         self._rate_lock = threading.Lock()
         self._requests: dict[str, list[float]] = {}
 
+    def _artifacts_configured(self) -> bool:
+        root = self.config.artifact_root
+        return bool(
+            root is not None
+            and root.is_absolute()
+            and root.is_dir()
+            and os.access(root, os.R_OK | os.X_OK)
+        )
+
     def _configured_skills(self) -> tuple[str, ...]:
-        return ("whatsapp.send",) if self.config.whatsapp_enabled else ()
+        skills = []
+        if self._artifacts_configured() and "voice" in self.config.content_types:
+            skills.append("media.voice.generate")
+        if self.config.whatsapp_enabled:
+            skills.append("whatsapp.send")
+        return tuple(skills)
 
     def _available_skills(self) -> tuple[str, ...]:
         try:
@@ -537,14 +650,22 @@ class RelayService:
             or any(not isinstance(kind, str) for kind in content_types)
         ):
             return ()
+        available = []
+        if (
+            "media.voice.generate" in skills
+            and "voice" in content_types
+            and self._artifacts_configured()
+            and "voice" in self.config.content_types
+        ):
+            available.append("media.voice.generate")
         if (
             "whatsapp.send" in skills
             and "text" in content_types
             and self.config.whatsapp_enabled
             and "text" in self.config.content_types
         ):
-            return ("whatsapp.send",)
-        return ()
+            available.append("whatsapp.send")
+        return tuple(available)
 
     def agent_card(self) -> dict[str, Any]:
         skills = []
@@ -680,6 +801,11 @@ class RelayService:
         except _ProfileRejectionError as exc:
             return self._rejected(request_id, skill, invocation, context_id, references, exc)
 
+        try:
+            resolved_artifacts = self._resolve_voice_artifacts(invocation)
+        except _ProfileRejectionError as exc:
+            return self._rejected(request_id, skill, invocation, context_id, references, exc)
+
         key = invocation["input"]["idempotency_key"]
         claim = self.store.claim(
             peer=self.config.peer_id,
@@ -716,9 +842,10 @@ class RelayService:
                 claim.task_id,
                 claim.context_id,
                 claim.effect_id,
+                resolved_artifacts,
             )
             result = self._validated_runtime_result(
-                skill, result, correlation, claim.reference_task_ids
+                skill, result, correlation, claim.reference_task_ids, claim.effect_id
             )
             state = {
                 "completed": "TASK_STATE_COMPLETED",
@@ -873,6 +1000,34 @@ class RelayService:
                     "CONTENT_TYPE_DENIED", "A requested content type is not enabled."
                 )
 
+    def _resolve_voice_artifacts(self, invocation: dict[str, Any]) -> list[dict[str, Any]]:
+        if invocation["skill"] != "whatsapp.send":
+            return []
+        voice = [part for part in invocation["input"]["content"] if part["type"] == "voice"]
+        if not voice:
+            return []
+        if len(voice) != 1 or len(invocation["input"]["content"]) != 1:
+            raise _ProfileRejectionError(
+                "CONTENT_TYPE_DENIED", "Only one voice artifact can be sent at a time."
+            )
+        artifact = self._artifact_for_uri(voice[0]["uri"])
+        if artifact is None or artifact["mime_type"] != voice[0]["mime_type"]:
+            raise _ProfileRejectionError(
+                "ARTIFACT_DENIED", "The voice artifact is unavailable."
+            )
+        return [
+            {
+                "peer": artifact["peer"],
+                "uri": voice[0]["uri"],
+                "path": artifact["path"],
+                "mime_type": artifact["mime_type"],
+                "duration_ms": artifact["duration_ms"],
+                "sha256": artifact["sha256"],
+                "size_bytes": artifact["size_bytes"],
+                "expires_at": artifact["expires_at"],
+            }
+        ]
+
     def _rejected(
         self,
         request_id: Any,
@@ -945,20 +1100,19 @@ class RelayService:
         task_id: str,
         context_id: str,
         effect_id: str,
+        resolved_artifacts: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        envelope = self._socket_call(
-            {
-                "cmd": "a2a_invoke",
-                "args": {
-                    "peer": self.config.peer_id,
-                    "skill": invocation["skill"],
-                    "input": invocation["input"],
-                    "task_id": task_id,
-                    "context_id": context_id,
-                    "effect_id": effect_id,
-                },
-            }
-        )
+        args = {
+            "peer": self.config.peer_id,
+            "skill": invocation["skill"],
+            "input": invocation["input"],
+            "task_id": task_id,
+            "context_id": context_id,
+            "effect_id": effect_id,
+        }
+        if resolved_artifacts:
+            args["resolved_artifacts"] = resolved_artifacts
+        envelope = self._socket_call({"cmd": "a2a_invoke", "args": args})
         if envelope.get("status") == "error":
             raw_error = envelope.get("error")
             if not isinstance(raw_error, dict):
@@ -997,12 +1151,33 @@ class RelayService:
         result: dict[str, Any],
         expected_correlation: dict[str, Any],
         reference_task_ids: list[str],
+        effect_id: str,
     ) -> dict[str, Any]:
-        self.schemas.validate_result(result)
         gateway_correlation = dict(expected_correlation)
         gateway_correlation.pop("reference_task_ids", None)
         if result.get("skill") != skill or result.get("correlation") != gateway_correlation:
             raise A2AContractValidationError("$.correlation", "does not match invocation")
+        if skill == "media.voice.generate" and result.get("status") == "completed":
+            output = result.get("output")
+            if not isinstance(output, dict) or set(output) != {"internal_artifact"}:
+                raise A2AContractValidationError("$.output", "invalid internal artifact")
+            registered = self._register_artifact(
+                effect_id, output["internal_artifact"]
+            )
+            result = {
+                **result,
+                "output": {
+                    "artifact": {
+                        "uri": registered["uri"],
+                        "artifact_id": registered["opaque_id"],
+                        "filename": registered["filename"],
+                        "sha256": registered["sha256"],
+                    },
+                    "mime_type": registered["mime_type"],
+                    "duration_ms": registered["duration_ms"],
+                },
+            }
+        self.schemas.validate_result(result)
         status = result["status"]
         if status in {"completed", "accepted", "in_progress"}:
             output = result.get("output")
@@ -1013,6 +1188,115 @@ class RelayService:
             result = {**result, "correlation": expected_correlation}
             self.schemas.validate_result(result)
         return result
+
+    def _register_artifact(self, effect_id: str, value: Any) -> dict[str, Any]:
+        required = {
+            "path",
+            "mime_type",
+            "duration_ms",
+            "sha256",
+            "size_bytes",
+            "expires_at",
+            "filename",
+        }
+        if not isinstance(value, dict) or set(value) != required:
+            raise A2AContractValidationError("$.output.internal_artifact", "invalid")
+        root = self.config.artifact_root
+        try:
+            if root is None:
+                raise ValueError
+            resolved_root = root.expanduser().resolve(strict=True)
+            raw_path = Path(value["path"])
+            path = raw_path.resolve(strict=True)
+            size = int(value["size_bytes"])
+            expires_at = min(
+                float(value["expires_at"]), time.time() + self.config.artifact_ttl_seconds
+            )
+            filename = str(value["filename"])
+            if (
+                raw_path.is_symlink()
+                or not path.is_relative_to(resolved_root)
+                or not path.is_file()
+                or path.stat().st_size != size
+                or size < 1
+                or size > self.config.max_artifact_bytes
+                or value["mime_type"] not in _AUDIO_MIME_TYPES
+                or not isinstance(value["duration_ms"], int)
+                or isinstance(value["duration_ms"], bool)
+                or value["duration_ms"] < 1
+                or not re.fullmatch(r"[a-f0-9]{64}", str(value["sha256"]))
+                or hashlib.sha256(path.read_bytes()).hexdigest() != value["sha256"]
+                or expires_at <= time.time()
+                or Path(filename).name != filename
+                or not filename
+            ):
+                raise ValueError
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise A2AContractValidationError("$.output.internal_artifact", "invalid") from exc
+        opaque_id = hashlib.sha256(
+            f"{self.config.bearer_secret}\0{self.config.peer_id}\0{effect_id}".encode()
+        ).hexdigest()[:48]
+        artifact = self.store.register_artifact(
+            {
+                "opaque_id": opaque_id,
+                "peer": self.config.peer_id,
+                "effect_id": effect_id,
+                "path": str(path),
+                "mime_type": value["mime_type"],
+                "duration_ms": value["duration_ms"],
+                "sha256": value["sha256"],
+                "size_bytes": size,
+                "expires_at": expires_at,
+            }
+        )
+        return {
+            **artifact,
+            "filename": filename,
+            "uri": f"{self.config.public_url}/artifacts/{artifact['opaque_id']}",
+        }
+
+    def _artifact_for_uri(self, uri: Any) -> dict[str, Any] | None:
+        prefix = f"{self.config.public_url}/artifacts/"
+        if not isinstance(uri, str) or not uri.startswith(prefix):
+            return None
+        opaque_id = uri.removeprefix(prefix)
+        if not re.fullmatch(r"[a-f0-9]{48}", opaque_id):
+            return None
+        artifact = self.store.get_artifact(self.config.peer_id, opaque_id)
+        if artifact is None or float(artifact["expires_at"]) <= time.time():
+            return None
+        return artifact if self._artifact_bytes(artifact) is not None else None
+
+    def artifact_response(self, opaque_id: str) -> tuple[str, bytes] | None:
+        if not re.fullmatch(r"[a-f0-9]{48}", opaque_id):
+            return None
+        artifact = self.store.get_artifact(self.config.peer_id, opaque_id)
+        if artifact is None or float(artifact["expires_at"]) <= time.time():
+            return None
+        body = self._artifact_bytes(artifact)
+        return (artifact["mime_type"], body) if body is not None else None
+
+    def _artifact_bytes(self, artifact: dict[str, Any]) -> bytes | None:
+        root = self.config.artifact_root
+        try:
+            if root is None:
+                return None
+            path = Path(artifact["path"])
+            resolved = path.resolve(strict=True)
+            if (
+                path.is_symlink()
+                or not resolved.is_relative_to(root.expanduser().resolve(strict=True))
+                or not resolved.is_file()
+                or resolved.stat().st_size != artifact["size_bytes"]
+                or artifact["size_bytes"] > self.config.max_artifact_bytes
+            ):
+                return None
+            body = resolved.read_bytes()
+            if hashlib.sha256(body).hexdigest() != artifact["sha256"]:
+                return None
+            return body
+        except (OSError, TypeError, ValueError):
+            return None
 
 
 def make_handler(service: RelayService) -> type[http.server.BaseHTTPRequestHandler]:
@@ -1032,10 +1316,34 @@ def make_handler(service: RelayService) -> type[http.server.BaseHTTPRequestHandl
             self.wfile.write(encoded)
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path != "/.well-known/agent-card.json":
+            if self.path == "/.well-known/agent-card.json":
+                self._send(200, service.agent_card())
+                return
+            if not self.path.startswith("/artifacts/"):
                 self._send(404, {"error": {"code": "NOT_FOUND"}})
                 return
-            self._send(200, service.agent_card())
+            peer_ip = str(self.client_address[0])
+            if not service.authenticate(peer_ip, self.headers.get("Authorization", "")):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if not service.rate_allowed(peer_ip):
+                self._send(429, {"error": {"code": "RATE_LIMITED"}})
+                return
+            artifact = service.artifact_response(self.path.removeprefix("/artifacts/"))
+            if artifact is None:
+                self._send(404, {"error": {"code": "NOT_FOUND"}})
+                return
+            mime_type, body = artifact
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self) -> None:  # noqa: N802
             peer_ip = str(self.client_address[0])

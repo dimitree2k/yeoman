@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import logging
 import multiprocessing
 import socket
 import threading
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -150,6 +152,21 @@ def _request(
     return response.status, json.loads(raw) if raw else {}
 
 
+def _request_bytes(
+    address: tuple[str, int], path: str, *, token: str | None = "test-secret-value"
+) -> tuple[int, dict[str, str], bytes]:
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    connection = http.client.HTTPConnection(*address, timeout=2)
+    connection.request("GET", path, headers=headers)
+    response = connection.getresponse()
+    raw = response.read()
+    result_headers = {name.lower(): value for name, value in response.getheaders()}
+    connection.close()
+    return response.status, result_headers, raw
+
+
 def _invocation(
     *,
     key: str = "send-001",
@@ -203,6 +220,323 @@ def _dispatch_in_process(
     ready.put(True)
     start.wait(2)
     results.put(service.dispatch(payload))
+
+
+def _voice_gateway(audio_path: Path) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def respond(request: dict[str, Any]) -> dict[str, Any]:
+        if request["cmd"] == "a2a_capabilities":
+            return {
+                "status": "ok",
+                "response": {
+                    "skills": ["media.voice.generate", "whatsapp.send"],
+                    "content_types": ["text", "voice"],
+                },
+            }
+        args = request["args"]
+        correlation = {
+            "task_id": args["task_id"],
+            "context_id": args["context_id"],
+            "idempotency_key": args["input"]["idempotency_key"],
+        }
+        if args["skill"] == "media.voice.generate":
+            audio = audio_path.read_bytes()
+            response = {
+                "skill": args["skill"],
+                "status": "completed",
+                "output": {
+                    "internal_artifact": {
+                        "path": str(audio_path),
+                        "mime_type": "audio/wav",
+                        "duration_ms": 100,
+                        "sha256": hashlib.sha256(audio).hexdigest(),
+                        "size_bytes": len(audio),
+                        "expires_at": time.time() + 120,
+                        "filename": audio_path.name,
+                    }
+                },
+                "correlation": correlation,
+            }
+        else:
+            response = {
+                "skill": args["skill"],
+                "status": "completed",
+                "output": {
+                    "delivery_id": args["effect_id"],
+                    "status": "sent",
+                    "recipient": args["input"]["recipient"],
+                },
+                "correlation": correlation,
+            }
+        return {"status": "ok", "response": response}
+
+    return respond
+
+
+def test_voice_capability_requires_gateway_and_configured_artifact_serving(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    audio_path = artifact_root / "voice.wav"
+    audio_path.write_bytes(b"wav-bytes")
+    socket_path = tmp_path / "gateway.sock"
+
+    with FakeUnixGateway(socket_path, _voice_gateway(audio_path)):
+        enabled = relay.RelayService(
+            _config(
+                tmp_path,
+                socket_path,
+                artifact_root=artifact_root,
+                content_types=frozenset({"text", "voice"}),
+            )
+        ).agent_card()
+        disabled = relay.RelayService(
+            _config(tmp_path, socket_path, state_path=tmp_path / "disabled.sqlite3")
+        ).agent_card()
+        unusable = relay.RelayService(
+            _config(
+                tmp_path,
+                socket_path,
+                state_path=tmp_path / "unusable.sqlite3",
+                artifact_root=tmp_path / "missing-artifacts",
+                content_types=frozenset({"text", "voice"}),
+            )
+        ).agent_card()
+
+    assert [skill["id"] for skill in enabled["skills"]] == [
+        "media.voice.generate",
+        "whatsapp.send",
+    ]
+    assert [skill["id"] for skill in disabled["skills"]] == ["whatsapp.send"]
+    assert [skill["id"] for skill in unusable["skills"]] == ["whatsapp.send"]
+
+
+def test_generated_voice_is_registered_and_served_only_with_authentication(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    audio_path = artifact_root / "voice.wav"
+    audio = b"real-wave-fixture"
+    audio_path.write_bytes(audio)
+    audio_path.chmod(0o600)
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(
+        tmp_path,
+        socket_path,
+        artifact_root=artifact_root,
+        artifact_ttl_seconds=60,
+        max_artifact_bytes=10_000,
+        content_types=frozenset({"text", "voice"}),
+    )
+    invocation = _invocation(skill="media.voice.generate", key="voice-1", text="Hello")
+
+    with FakeUnixGateway(socket_path, _voice_gateway(audio_path)) as gateway:
+        service = relay.RelayService(config)
+        with _running(service) as address:
+            response = service.dispatch(_send_payload(invocation))
+            output = _profile_result(response["result"]["task"])["output"]
+            uri = output["artifact"]["uri"]
+            path = "/artifacts/" + uri.rsplit("/", 1)[-1]
+            unauthenticated = _request_bytes(address, path, token=None)
+            status, headers, body = _request_bytes(address, path)
+
+    service.schemas.validate_response("media.voice.generate", output)
+    assert output["mime_type"] == "audio/wav"
+    assert output["duration_ms"] == 100
+    assert output["artifact"]["sha256"] == hashlib.sha256(audio).hexdigest()
+    assert unauthenticated[0] == 401
+    assert status == 200
+    assert body == audio
+    assert headers["content-type"] == "audio/wav"
+    assert headers["content-length"] == str(len(audio))
+    assert headers["cache-control"] == "no-store"
+    assert [request["cmd"] for request in gateway.requests] == ["a2a_invoke"]
+
+
+def test_generation_retry_reuses_task_and_artifact_without_second_gateway_call(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    audio_path = artifact_root / "voice.wav"
+    audio_path.write_bytes(b"voice")
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(
+        tmp_path,
+        socket_path,
+        artifact_root=artifact_root,
+        artifact_ttl_seconds=60,
+        content_types=frozenset({"text", "voice"}),
+    )
+    payload = _send_payload(_invocation(skill="media.voice.generate", key="voice-retry"))
+
+    with FakeUnixGateway(socket_path, _voice_gateway(audio_path)) as gateway:
+        service = relay.RelayService(config)
+        first = service.dispatch(payload)
+        second = service.dispatch(payload)
+
+    assert second == first
+    assert [request["cmd"] for request in gateway.requests] == ["a2a_invoke"]
+
+
+def test_explicit_voice_send_passes_relay_owned_artifact_path_separately(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    audio_path = artifact_root / "voice.wav"
+    audio_path.write_bytes(b"voice")
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(
+        tmp_path,
+        socket_path,
+        artifact_root=artifact_root,
+        artifact_ttl_seconds=60,
+        content_types=frozenset({"text", "voice"}),
+    )
+    with FakeUnixGateway(socket_path, _voice_gateway(audio_path)) as gateway:
+        service = relay.RelayService(config)
+        generated = service.dispatch(
+            _send_payload(_invocation(skill="media.voice.generate", key="voice-source"))
+        )
+        uri = _profile_result(generated["result"]["task"])["output"]["artifact"]["uri"]
+        invocation = {
+            "skill": "whatsapp.send",
+            "input": {
+                "recipient": {"type": "group", "alias": "team-example"},
+                "content": [{"type": "voice", "uri": uri, "mime_type": "audio/wav"}],
+                "idempotency_key": "voice-send",
+            },
+        }
+        sent = service.dispatch(_send_payload(invocation))
+
+    assert _profile_result(sent["result"]["task"])["status"] == "completed"
+    send_args = gateway.requests[1]["args"]
+    assert send_args["input"] == invocation["input"]
+    assert send_args["resolved_artifacts"] == [
+        {
+            "peer": "hermes-test",
+            "uri": uri,
+            "path": str(audio_path.resolve()),
+            "mime_type": "audio/wav",
+            "duration_ms": 100,
+            "sha256": hashlib.sha256(b"voice").hexdigest(),
+            "size_bytes": 5,
+            "expires_at": pytest.approx(time.time() + 60, abs=2),
+        }
+    ]
+
+
+def test_voice_invocation_is_rejected_when_artifact_serving_is_disabled(
+    tmp_path: Path,
+) -> None:
+    service = relay.RelayService(_config(tmp_path, tmp_path / "missing.sock"))
+
+    response = service.dispatch(
+        _send_payload(_invocation(skill="media.voice.generate", key="disabled-voice"))
+    )
+
+    result = _profile_result(response["result"]["task"])
+    assert result["status"] == "rejected"
+    assert result["error"]["code"] == "SKILL_NOT_ADVERTISED"
+
+
+def test_voice_send_rejects_unknown_and_traversal_artifact_urls(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    service = relay.RelayService(
+        _config(
+            tmp_path,
+            tmp_path / "missing.sock",
+            artifact_root=artifact_root,
+            content_types=frozenset({"text", "voice"}),
+        )
+    )
+    for uri in (
+        "https://external.example/voice.wav",
+        "https://relay.example.test/a2a/artifacts/../private",
+        "https://relay.example.test/a2a/artifacts/unknown",
+    ):
+        invocation = {
+            "skill": "whatsapp.send",
+            "input": {
+                "recipient": {"type": "group", "alias": "team-example"},
+                "content": [{"type": "voice", "uri": uri, "mime_type": "audio/wav"}],
+                "idempotency_key": "bad-" + hashlib.sha256(uri.encode()).hexdigest()[:8],
+            },
+        }
+
+        response = service.dispatch(_send_payload(invocation))
+
+        result = _profile_result(response["result"]["task"])
+        assert result["status"] == "rejected"
+        assert result["error"]["code"] == "ARTIFACT_DENIED"
+
+
+def test_artifact_get_rejects_other_peer_and_expired_records(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    path = root / "voice.wav"
+    path.write_bytes(b"voice")
+    service = relay.RelayService(
+        _config(tmp_path, tmp_path / "missing.sock", artifact_root=root)
+    )
+    common = {
+        "effect_id": "a2a-effect-" + "1" * 40,
+        "path": str(path),
+        "mime_type": "audio/wav",
+        "duration_ms": 100,
+        "sha256": hashlib.sha256(b"voice").hexdigest(),
+        "size_bytes": 5,
+    }
+    service.store.register_artifact(
+        {**common, "opaque_id": "a" * 48, "peer": "other", "expires_at": time.time() + 60}
+    )
+    service.store.register_artifact(
+        {
+            **common,
+            "opaque_id": "b" * 48,
+            "peer": "hermes-test",
+            "effect_id": "a2a-effect-" + "2" * 40,
+            "expires_at": time.time() - 1,
+        }
+    )
+
+    with _running(service) as address:
+        other = _request_bytes(address, "/artifacts/" + "a" * 48)
+        expired = _request_bytes(address, "/artifacts/" + "b" * 48)
+
+    assert other[0] == 404
+    assert expired[0] == 404
+
+
+def test_voice_artifact_path_and_uri_are_never_logged(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    root = tmp_path / "private-artifacts"
+    root.mkdir()
+    path = root / "secret-voice.wav"
+    path.write_bytes(b"voice")
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(
+        tmp_path,
+        socket_path,
+        artifact_root=root,
+        content_types=frozenset({"text", "voice"}),
+    )
+    with (
+        FakeUnixGateway(socket_path, _voice_gateway(path)),
+        caplog.at_level(logging.INFO, logger="yeoman.a2a.relay"),
+    ):
+        response = relay.RelayService(config).dispatch(
+            _send_payload(_invocation(skill="media.voice.generate", key="log-safe"))
+        )
+
+    uri = _profile_result(response["result"]["task"])["output"]["artifact"]["uri"]
+    captured = "\n".join(f"{record.getMessage()} {record.args!r}" for record in caplog.records)
+    assert str(path) not in captured
+    assert uri not in captured
 
 
 def test_config_reads_explicit_private_runtime_settings_without_revealing_secret(
