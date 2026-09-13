@@ -36,6 +36,7 @@ from yeoman_gateway.policy.admin.contracts import (
     PolicyExecutionResult,
 )
 from yeoman_gateway.policy.admin.service import PolicyAdminService
+from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
 from yeoman_gateway.policy.identity import (
     normalize_identity_token,
@@ -152,7 +153,7 @@ class EnginePolicyAdapter(PolicyPort):
         memory_state_dir: str = DEFAULT_SESSION_STATE_DIR,
     ) -> None:
         self._engine = engine
-        self._known_tools = set(known_tools)
+        self._known_tools = policy_known_tools(known_tools)
         self._policy_path = policy_path
         self._session_manager = session_manager
         self._private_handoff_store = private_handoff_store
