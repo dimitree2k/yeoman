@@ -239,3 +239,15 @@ async def test_client_rejects_cross_origin_and_mismatched_rpc_ids(monkeypatch: p
     client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(wrong_id))
     with pytest.raises(A2AProtocolError, match="id"):
         await client.invoke_skill("search.web", {"query": "q"}, context_id="ctx-1")
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_boolean_jsonrpc_error_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_card("search.web"))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": {"code": True, "message": "no"}})
+
+    client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(handler))
+    with pytest.raises(A2AProtocolError, match="envelope"):
+        await client.invoke_skill("search.web", {"query": "q"})

@@ -49,6 +49,10 @@ class A2AProtocolError(A2AError):
         self.retryable = retryable
 
 
+class A2APollTimeoutError(A2AError):
+    """The local bounded poll window elapsed before Hermes finished the task."""
+
+
 @dataclass(frozen=True, slots=True)
 class A2AWorker:
     name: str
@@ -180,11 +184,18 @@ class A2AClient:
         result: A2AWorkerResult | None = None
         deadline = asyncio.get_running_loop().time() + deadline_seconds
         while asyncio.get_running_loop().time() < deadline:
-            result = await self.get_task(task_id, skill=skill, context_id=context_id, reference_task_ids=reference_task_ids)
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                result = await asyncio.wait_for(
+                    self.get_task(task_id, skill=skill, context_id=context_id, reference_task_ids=reference_task_ids),
+                    timeout=remaining,
+                )
+            except TimeoutError as exc:
+                raise A2APollTimeoutError("A2A task polling timed out") from exc
             if result.state in _TERMINAL_STATES:
                 return result
             await asyncio.sleep(min(interval_seconds, max(0, deadline - asyncio.get_running_loop().time())))
-        raise A2AProtocolError("A2A task polling timed out", retryable=True)
+        raise A2APollTimeoutError("A2A task polling timed out")
 
     def _validate_invocation(self, invocation: dict[str, Any], *, validate_request: bool = True) -> None:
         try:
@@ -275,7 +286,7 @@ class A2AClient:
             raise A2AProtocolError("A2A JSON-RPC response id is invalid")
         error = body.get("error")
         if isinstance(error, dict):
-            if set(body) != {"jsonrpc", "id", "error"} or not isinstance(error.get("code"), int) or not isinstance(error.get("message"), str):
+            if set(body) != {"jsonrpc", "id", "error"} or isinstance(error.get("code"), bool) or not isinstance(error.get("code"), int) or not isinstance(error.get("message"), str):
                 raise A2AProtocolError("A2A JSON-RPC error envelope is invalid")
             raise A2AProtocolError("A2A worker returned an error", code=error["code"], retryable=False)
         if set(body) != {"jsonrpc", "id", "result"}:

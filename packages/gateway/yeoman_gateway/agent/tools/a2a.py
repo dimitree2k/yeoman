@@ -134,10 +134,13 @@ class A2ADelegateTool(Tool):
     async def _poll_research(self, worker: str, result: Any, effect_id: str, channel: str, chat_id: str) -> None:
         try:
             final = await self._registry.poll_task(worker, result.task_id, skill=result.skill, context_id=result.context_id, reference_task_ids=result.reference_task_ids)
-            if self._delivery is not None and channel and chat_id:
-                content = json.dumps(final.output, ensure_ascii=False, sort_keys=True) if final.output is not None else f"error={final.error_code} retryable={final.retryable}"
-                await self._delivery.send(source="a2a", operation_ref=f"a2a-result:{effect_id}", channel=channel, chat_id=chat_id, content=content)
         except Exception as exc:
             logger.warning("A2A research polling failed worker={} error_type={}", safe_log_token(worker), type(exc).__name__)
-            if self._delivery is not None and channel and chat_id:
-                await self._delivery.send(source="a2a", operation_ref=f"a2a-result:{effect_id}", channel=channel, chat_id=chat_id, content="error=POLL_TIMEOUT retryable=True")
+            final_content = "error=POLL_TIMEOUT retryable=True"
+        else:
+            final_content = json.dumps(final.output, ensure_ascii=False, sort_keys=True) if final.output is not None else f"error={final.error_code} retryable={final.retryable}"
+        if self._delivery is not None and channel and chat_id:
+            try:
+                await self._delivery.send(source="a2a", operation_ref=f"a2a-result:{effect_id}", channel=channel, chat_id=chat_id, content=final_content)
+            except Exception as exc:
+                logger.warning("A2A research result delivery failed worker={} error_type={}", safe_log_token(worker), type(exc).__name__)

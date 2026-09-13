@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+from datetime import datetime
 
 import pytest
 from yeoman_gateway.a2a.client import A2AWorker, A2AWorkerResult
@@ -33,16 +34,26 @@ def test_daemon_logging_controls_are_preserved(monkeypatch: pytest.MonkeyPatch) 
     assert _should_setup_daemon_logging() is False
 
 
+def test_explicit_daemon_gateway_uses_file_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("Yeoman_GATEWAY_DAEMON", "1")
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    assert _should_setup_daemon_logging() is True
+
+
 @pytest.mark.asyncio
 async def test_message_bus_boundary_logs_remain_private(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr("yeoman_gateway.bus.queue.logger.info", lambda message, *args: calls.append((message, args)))
-    from datetime import datetime
-
     bus = MessageBus()
     await bus.publish_inbound(InboundMessage(channel="whatsapp", sender_id="owner", chat_id="owner@s.whatsapp.net", content="secret", timestamp=datetime.now(), metadata={"message_id": "m1"}))
     await bus.publish_outbound(OutboundMessage(channel="whatsapp", chat_id="owner@s.whatsapp.net", content="secret", metadata={"message_id": "m2"}))
     assert "secret" not in repr(calls)
+    assert [message for message, _ in calls] == [
+        "MessageBus inbound channel={} chat={} message_id={} chars={}",
+        "MessageBus outbound channel={} chat={} message_id={} chars={}",
+    ]
+    assert calls[0][1] == ("whatsapp", private_log_identifier("owner@s.whatsapp.net"), private_log_identifier("m1"), 6)
+    assert calls[1][1] == ("whatsapp", private_log_identifier("owner@s.whatsapp.net"), private_log_identifier("m2"), 6)
 
 
 def test_log_identifiers_remain_control_safe() -> None:
