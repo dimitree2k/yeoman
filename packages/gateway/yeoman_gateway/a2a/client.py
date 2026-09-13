@@ -340,7 +340,9 @@ class A2AClient:
         capabilities = card.get("capabilities")
         extensions = capabilities.get("extensions") if isinstance(capabilities, dict) else None
         if not isinstance(extensions, list) or not any(
-            isinstance(item, dict) and item.get("uri") == PROFILE_URI and item.get("required") is True
+            isinstance(item, dict)
+            and item.get("uri") == PROFILE_URI
+            and ("required" not in item or isinstance(item["required"], bool))
             for item in extensions
         ):
             raise A2AProtocolError("A2A Agent Card does not carry the Hermes profile")

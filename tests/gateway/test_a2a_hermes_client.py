@@ -21,7 +21,7 @@ def _card(*skills: str) -> dict[str, object]:
         "capabilities": {
             "streaming": False,
             "pushNotifications": False,
-            "extensions": [{"uri": "urn:hermes-yeoman:a2a-profile:v1", "required": True}]
+            "extensions": [{"uri": "urn:hermes-yeoman:a2a-profile:v1", "required": False}]
         },
         "skills": [
             {"id": skill, "inputModes": ["application/json"], "outputModes": ["application/json"]}
@@ -47,6 +47,33 @@ async def test_polling_client_accepts_optional_streaming_and_push_capabilities()
 
     card = await client.discover()
     assert card["capabilities"]["streaming"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension",
+    [
+        None,
+        {"uri": "urn:other-profile:v1", "required": False},
+        {"uri": "urn:hermes-yeoman:a2a-profile:v1", "required": "false"},
+        "urn:hermes-yeoman:a2a-profile:v1",
+    ],
+)
+async def test_client_rejects_missing_wrong_or_malformed_profile_extension(extension: object) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        card = _card("search.web")
+        capabilities = card["capabilities"]
+        assert isinstance(capabilities, dict)
+        capabilities["extensions"] = [] if extension is None else [extension]
+        return httpx.Response(200, json=card)
+
+    client = A2AClient(
+        A2AWorker(name="hermes", url="http://127.0.0.1:9900"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(A2AProtocolError, match="does not carry the Hermes profile"):
+        await client.discover()
 
 
 def _task(*, state: str, output: dict[str, object], task_id: str = "task-1") -> dict[str, object]:
