@@ -6,8 +6,10 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import re
 import socket
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import httpcore
 import httpx
 
 _EFFECT_ID = re.compile(r"^a2a-effect-[a-f0-9]{40}$")
@@ -32,6 +35,104 @@ _SIDECAR_MAX_BYTES = 16_384
 
 class MediaStagingError(RuntimeError):
     """A sanitized media trust-boundary failure."""
+
+
+class _DeadlineStream(httpcore.NetworkStream):
+    def __init__(
+        self,
+        stream: httpcore.NetworkStream,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> None:
+        self.stream = stream
+        self.deadline = deadline
+        self.monotonic = monotonic
+
+    def _timeout(
+        self, requested: float | None, error: type[httpcore.TimeoutException]
+    ) -> float:
+        remaining = self.deadline - self.monotonic()
+        if remaining <= 0:
+            raise error("media staging deadline exceeded")
+        return remaining if requested is None else min(requested, remaining)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self.stream.read(max_bytes, self._timeout(timeout, httpcore.ReadTimeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.stream.write(buffer, self._timeout(timeout, httpcore.WriteTimeout))
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def start_tls(
+        self,
+        ssl_context: Any,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        stream = self.stream.start_tls(
+            ssl_context,
+            server_hostname,
+            self._timeout(timeout, httpcore.ConnectTimeout),
+        )
+        return _DeadlineStream(stream, self.deadline, self.monotonic)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self.stream.get_extra_info(info)
+
+
+class _PinnedBackend(httpcore.SyncBackend):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        addresses: tuple[str, ...],
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.addresses = addresses
+        self.deadline = deadline
+        self.monotonic = monotonic
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        if host != self.host or port != self.port:
+            raise httpcore.ConnectError("media endpoint changed")
+        last_error: httpcore.NetworkError | None = None
+        for address in self.addresses:
+            remaining = self.deadline - self.monotonic()
+            if remaining <= 0:
+                raise httpcore.ConnectTimeout("media staging deadline exceeded")
+            try:
+                stream = super().connect_tcp(
+                    address,
+                    port,
+                    timeout=remaining if timeout is None else min(timeout, remaining),
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except httpcore.NetworkError as exc:
+                last_error = exc
+                continue
+            return _DeadlineStream(stream, self.deadline, self.monotonic)
+        if last_error is not None:
+            raise last_error
+        raise httpcore.ConnectError("media endpoint unavailable")
+
+
+class _PinnedTransport(httpx.HTTPTransport):
+    def __init__(self, backend: _PinnedBackend) -> None:
+        super().__init__(trust_env=False)
+        self._pool._network_backend = backend  # type: ignore[attr-defined]
 
 
 def normalized_media_origins(origins: Iterable[str]) -> frozenset[str]:
@@ -97,6 +198,7 @@ class MediaStager:
         self.resolver = resolver or socket.getaddrinfo
         self.transport = transport
         self.clock = clock or time.time
+        self.monotonic = time.monotonic
 
     def stage(
         self,
@@ -107,6 +209,7 @@ class MediaStager:
         """Return deterministic metadata for one validated staged artifact."""
         if not _EFFECT_ID.fullmatch(effect_id) or not _REQUEST_HASH.fullmatch(request_hash):
             raise MediaStagingError("MEDIA_STAGING_FAILED")
+        deadline = self.monotonic() + self.timeout_seconds
         mime_type = str(part.get("mime_type") or "").lower()
         try:
             expected_type, suffix = _FORMATS[mime_type]
@@ -126,7 +229,7 @@ class MediaStager:
         if not isinstance(uri, str):
             raise MediaStagingError("MEDIA_STAGING_FAILED")
         host, port = self._validate_url(uri)
-        self._validate_public_dns(host, port)
+        addresses = self._validate_public_dns(host, port, deadline)
 
         path = self.root / f"{effect_id}{suffix}"
         sidecar = self.root / f"{effect_id}.media.json"
@@ -141,7 +244,9 @@ class MediaStager:
 
         temp = self.root / f".{effect_id}-{uuid.uuid4().hex}.tmp"
         try:
-            metadata = self._download(uri, temp, path, mime_type)
+            metadata = self._download(
+                uri, temp, path, mime_type, host, port, addresses, deadline
+            )
             self._save(sidecar, {"request_hash": request_hash, **metadata})
             return metadata
         except MediaStagingError:
@@ -174,35 +279,69 @@ class MediaStager:
             raise MediaStagingError("MEDIA_STAGING_FAILED")
         return host, port
 
-    def _validate_public_dns(self, host: str, port: int) -> None:
-        try:
-            answers = self.resolver(host, port, type=socket.SOCK_STREAM)
-            addresses = {ipaddress.ip_address(str(answer[4][0])) for answer in answers}
-        except (OSError, TypeError, ValueError, IndexError) as exc:
-            raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
-        if not addresses or any(not address.is_global for address in addresses):
+    def _validate_public_dns(
+        self, host: str, port: int, deadline: float
+    ) -> tuple[str, ...]:
+        result: queue.Queue[object] = queue.Queue(maxsize=1)
+
+        def resolve() -> None:
+            try:
+                result.put(self.resolver(host, port, type=socket.SOCK_STREAM))
+            except Exception as exc:  # noqa: BLE001 - sanitized at the trust boundary
+                result.put(exc)
+
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
             raise MediaStagingError("MEDIA_STAGING_FAILED")
+        threading.Thread(target=resolve, daemon=True).start()
+        try:
+            answers = result.get(timeout=remaining)
+            if isinstance(answers, Exception):
+                raise answers
+            addresses = {ipaddress.ip_address(str(answer[4][0])) for answer in answers}
+        except (OSError, TypeError, ValueError, IndexError, queue.Empty) as exc:
+            raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
+        if (
+            self.monotonic() >= deadline
+            or not addresses
+            or any(not address.is_global for address in addresses)
+        ):
+            raise MediaStagingError("MEDIA_STAGING_FAILED")
+        return tuple(sorted(str(address) for address in addresses))
 
     def _download(
-        self, uri: str, temp: Path, path: Path, mime_type: str
+        self,
+        uri: str,
+        temp: Path,
+        path: Path,
+        mime_type: str,
+        host: str,
+        port: int,
+        addresses: tuple[str, ...],
+        deadline: float,
     ) -> dict[str, object]:
         descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         size = 0
         digest = hashlib.sha256()
         try:
+            transport = self.transport or _PinnedTransport(
+                _PinnedBackend(host, port, addresses, deadline, self.monotonic)
+            )
             with (
                 os.fdopen(descriptor, "wb") as output,
                 httpx.Client(
-                    timeout=self.timeout_seconds,
+                    timeout=max(deadline - self.monotonic(), 0.001),
                     follow_redirects=False,
-                    transport=self.transport,
+                    transport=transport,
                     trust_env=False,
                 ) as client,
                 client.stream("GET", uri) as response,
             ):
+                if self.monotonic() >= deadline:
+                    raise MediaStagingError("MEDIA_STAGING_FAILED")
                 if response.is_redirect or response.status_code != 200:
                     raise MediaStagingError("MEDIA_STAGING_FAILED")
-                self._validate_connected_peer(response)
+                self._validate_connected_peer(response, addresses)
                 declared = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 if declared != mime_type:
                     raise MediaStagingError("MEDIA_STAGING_FAILED")
@@ -212,12 +351,16 @@ class MediaStager:
                     if length < 1 or length > self.max_bytes:
                         raise MediaStagingError("MEDIA_STAGING_FAILED")
                 for chunk in response.iter_bytes():
+                    if self.monotonic() >= deadline:
+                        raise MediaStagingError("MEDIA_STAGING_FAILED")
                     size += len(chunk)
                     if size > self.max_bytes:
                         raise MediaStagingError("MEDIA_STAGING_FAILED")
                     output.write(chunk)
                     digest.update(chunk)
                 if size < 1:
+                    raise MediaStagingError("MEDIA_STAGING_FAILED")
+                if self.monotonic() >= deadline:
                     raise MediaStagingError("MEDIA_STAGING_FAILED")
                 output.flush()
                 os.fsync(output.fileno())
@@ -245,7 +388,9 @@ class MediaStager:
             "expires_at": self.clock() + self.ttl_seconds,
         }
 
-    def _validate_connected_peer(self, response: httpx.Response) -> None:
+    def _validate_connected_peer(
+        self, response: httpx.Response, addresses: tuple[str, ...]
+    ) -> None:
         stream = response.extensions.get("network_stream")
         if stream is None:
             if self.transport is None:
@@ -256,7 +401,7 @@ class MediaStager:
             address = ipaddress.ip_address(str(peer[0]))
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             raise MediaStagingError("MEDIA_STAGING_FAILED") from exc
-        if not address.is_global:
+        if not address.is_global or str(address) not in addresses:
             raise MediaStagingError("MEDIA_STAGING_FAILED")
 
     @staticmethod

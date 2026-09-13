@@ -1638,6 +1638,8 @@ def main() -> int:
         level=os.environ.get("YEOMAN_A2A_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     try:
         serve()
     except KeyboardInterrupt:

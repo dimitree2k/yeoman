@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import socket
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +170,99 @@ def test_rejects_private_connected_peer_after_public_dns_preflight(
         _stager(tmp_path, lambda _request: response).stage(
             _EFFECT_ID, _REQUEST_HASH, _part()
         )
+
+
+def test_public_dns_result_is_pinned_before_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attempted_hosts: list[str] = []
+
+    def connect(
+        address: tuple[str, int],
+        _timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        del source_address
+        attempted_hosts.append(address[0])
+        raise OSError("connection stopped by test")
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+
+    with pytest.raises(MediaStagingError):
+        MediaStager(
+            tmp_path / "outgoing" / "a2a",
+            allowed_origins={"https://media.example.test"},
+            max_bytes=1_024,
+            ttl_seconds=60,
+            timeout_seconds=1,
+            resolver=_resolver,
+        ).stage(_EFFECT_ID, _REQUEST_HASH, _part())
+
+    assert attempted_hosts == ["93.184.216.34"]
+
+
+def test_dns_resolution_obeys_total_staging_deadline(tmp_path: Path) -> None:
+    release = threading.Event()
+    errors: list[Exception] = []
+
+    def blocked_resolver(*_args: object, **_kwargs: object) -> list[tuple[Any, ...]]:
+        release.wait(1)
+        return _PUBLIC_DNS
+
+    stager = _stager(
+        tmp_path,
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "image/png"},
+            content=_BODIES["image/png"],
+        ),
+        resolver=blocked_resolver,
+        timeout_seconds=0.02,
+    )
+
+    def stage() -> None:
+        try:
+            stager.stage(_EFFECT_ID, _REQUEST_HASH, _part())
+        except Exception as exc:  # noqa: BLE001 - captured for the worker assertion
+            errors.append(exc)
+
+    worker = threading.Thread(target=stage, daemon=True)
+    worker.start()
+    worker.join(0.2)
+    finished_before_release = not worker.is_alive()
+    release.set()
+    worker.join(1)
+
+    assert finished_before_release
+    assert len(errors) == 1
+    assert isinstance(errors[0], MediaStagingError)
+
+
+def test_drip_feed_obeys_total_staging_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = [0.0]
+
+    class DripStream(httpx.SyncByteStream):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            now[0] = 0.6
+            yield b"\x89PNG\r\n\x1a\n"
+            now[0] = 1.1
+            yield b"fixture"
+
+    monkeypatch.setattr("yeoman_gateway.a2a.media.time.monotonic", lambda: now[0])
+    response = httpx.Response(
+        200,
+        headers={"Content-Type": "image/png"},
+        stream=DripStream(),
+    )
+
+    with pytest.raises(MediaStagingError):
+        _stager(tmp_path, lambda _request: response).stage(
+            _EFFECT_ID, _REQUEST_HASH, _part()
+        )
+
+    assert not list((tmp_path / "outgoing" / "a2a").glob(f"{_EFFECT_ID}.*"))
 
 
 @pytest.mark.parametrize(

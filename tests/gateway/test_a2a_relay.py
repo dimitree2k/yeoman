@@ -7,6 +7,9 @@ import logging
 import multiprocessing
 import socket
 import sqlite3
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -441,6 +444,59 @@ def test_media_staging_rejection_is_terminal_and_url_redacted(
     assert profile["error"]["code"] == "ARTIFACT_DENIED"
     captured = "\n".join(record.getMessage() for record in caplog.records)
     assert secret_uri not in captured
+
+
+def test_standalone_relay_suppresses_http_client_url_logs() -> None:
+    script = textwrap.dedent(
+        """
+        import socket
+        import tempfile
+        from pathlib import Path
+
+        import httpx
+        from yeoman_gateway.a2a import relay
+        from yeoman_gateway.a2a.media import MediaStager
+
+        secret_uri = "https://media.example.test/file.png?X-Amz-Signature=private"
+
+        def serve():
+            stager = MediaStager(
+                Path(tempfile.mkdtemp()) / "outgoing" / "a2a",
+                allowed_origins={"https://media.example.test"},
+                max_bytes=1024,
+                ttl_seconds=60,
+                timeout_seconds=1,
+                resolver=lambda *_args, **_kwargs: [
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+                ],
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        200,
+                        headers={"Content-Type": "image/png"},
+                        content=b"\\x89PNG\\r\\n\\x1a\\nfixture",
+                    )
+                ),
+            )
+            stager.stage(
+                "a2a-effect-" + "1" * 40,
+                "a" * 64,
+                {"type": "image", "uri": secret_uri, "mime_type": "image/png"},
+            )
+
+        relay.serve = serve
+        raise SystemExit(relay.main())
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "X-Amz-Signature=private" not in result.stderr
 
 
 def test_voice_capability_requires_gateway_and_configured_artifact_serving(
