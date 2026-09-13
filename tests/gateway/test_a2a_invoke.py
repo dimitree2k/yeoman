@@ -8,11 +8,15 @@ from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.a2a.contracts import ContractSchemas
+from yeoman_gateway.bus.events import OutboundMessage
+from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.ipc import a2a_invoke
 from yeoman_gateway.ipc.a2a_invoke import process_a2a_invocation
 from yeoman_gateway.ipc.gateway_socket import GatewaySocket
 from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
 from yeoman_gateway.processing.models import EffectReceipt, TransportReceipt
+from yeoman_shared.config.schema import WhatsAppConfig
 
 _EFFECT_ID = "a2a-effect-50c84ffe7b1984e86d7f14c7397fee6ed7cf5b11"
 
@@ -283,6 +287,36 @@ async def test_second_explicit_voice_send_uses_only_validated_artifact_path(
             "effect_id": effect_id,
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "mime_type"), [(".wav", "audio/wav"), (".mp3", "audio/mpeg")]
+)
+async def test_whatsapp_voice_artifacts_use_audio_command_mime(
+    tmp_path: Path, suffix: str, mime_type: str
+) -> None:
+    path = tmp_path / f"voice{suffix}"
+    path.write_bytes(b"audio")
+    channel = WhatsAppChannel(
+        WhatsAppConfig(media={"outgoing_dir": str(tmp_path)}), MessageBus()
+    )
+    channel._connected = True
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def send(command: str, payload: dict[str, object], **kwargs: object) -> dict[str, str]:
+        calls.append((command, payload))
+        return {"messageId": "provider-1"}
+
+    channel._send_command_with_retry = send  # type: ignore[method-assign]
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp", chat_id="private-group@g.us", content="", media=[str(path)]
+        )
+    )
+
+    assert calls[0][0] == "send_media"
+    assert calls[0][1]["mimeType"] == mime_type
 
 
 @pytest.mark.asyncio

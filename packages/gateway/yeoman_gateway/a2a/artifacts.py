@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
+import itertools
 import json
 import os
 import re
@@ -12,7 +12,6 @@ import shutil
 import subprocess
 import time
 import uuid
-import wave
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,8 @@ _FORMATS = {
     "mp3": ("mp3", ".mp3", "audio/mpeg"),
     "wav": ("wav", ".wav", "audio/wav"),
 }
+_CLEANUP_LIMIT = 64
+_SIDECAR_MAX_BYTES = 16_384
 
 
 class VoiceArtifactError(RuntimeError):
@@ -43,9 +44,15 @@ class VoiceArtifactStore:
         profile: ResolvedProfile,
         max_bytes: int,
         ttl_seconds: int,
+        managed_outgoing_root: Path | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.root = root.expanduser().resolve()
+        self.managed_outgoing_root = (
+            managed_outgoing_root.expanduser().resolve()
+            if managed_outgoing_root is not None
+            else None
+        )
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.tts = tts
@@ -57,7 +64,15 @@ class VoiceArtifactStore:
 
     @property
     def available(self) -> bool:
-        if self.profile.kind != "tts" or not os.access(self.root, os.W_OK | os.X_OK):
+        managed = self.managed_outgoing_root
+        if (
+            self.profile.kind != "tts"
+            or managed is None
+            or self.root == managed
+            or not self.root.is_relative_to(managed)
+            or not os.access(self.root, os.W_OK | os.X_OK)
+            or not shutil.which("ffprobe")
+        ):
             return False
         provider = (self.profile.provider or "openai_tts").strip().lower()
         if provider in {"", "openai_tts"}:
@@ -79,8 +94,11 @@ class VoiceArtifactStore:
     async def generate(
         self, effect_id: str, request: Mapping[str, Any]
     ) -> dict[str, object]:
+        if not self.available:
+            raise VoiceArtifactError("CAPABILITY_UNAVAILABLE")
         if not _EFFECT_ID.fullmatch(effect_id):
             raise VoiceArtifactError("INVALID_EFFECT_ID")
+        self.cleanup_expired()
         request_hash = hashlib.sha256(
             json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -94,7 +112,7 @@ class VoiceArtifactStore:
 
             requested_format = str(request.get("format") or "ogg_opus")
             try:
-                provider_format, extension, mime_type = _FORMATS[requested_format]
+                provider_format, _, _ = _FORMATS[requested_format]
             except KeyError as exc:
                 raise VoiceArtifactError("INVALID_FORMAT") from exc
             text = str(request.get("text") or "")
@@ -113,7 +131,6 @@ class VoiceArtifactStore:
             if len(audio) > self.max_bytes:
                 raise VoiceArtifactError("ARTIFACT_TOO_LARGE")
 
-            path = self.root / f"{effect_id}{extension}"
             temp = self.root / f".{effect_id}-{uuid.uuid4().hex}.tmp"
             try:
                 descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -121,7 +138,8 @@ class VoiceArtifactStore:
                     handle.write(audio)
                     handle.flush()
                     os.fsync(handle.fileno())
-                duration_ms = self._duration_ms(temp, requested_format)
+                duration_ms, extension, mime_type = self._probe(temp)
+                path = self.root / f"{effect_id}{extension}"
                 temp.replace(path)
                 path.chmod(0o600)
             except VoiceArtifactError:
@@ -142,6 +160,39 @@ class VoiceArtifactStore:
             }
             self._save(effect_id, {"request_hash": request_hash, **metadata})
             return metadata
+
+    def cleanup_expired(self, *, limit: int = _CLEANUP_LIMIT) -> int:
+        """Delete a bounded number of expired artifacts owned by this store."""
+        removed = 0
+        candidates = itertools.islice(
+            self.root.glob("a2a-effect-*.json"), max(0, int(limit))
+        )
+        for sidecar in candidates:
+            effect_id = sidecar.stem
+            if not _EFFECT_ID.fullmatch(effect_id) or sidecar.is_symlink():
+                continue
+            try:
+                if sidecar.stat().st_size > _SIDECAR_MAX_BYTES:
+                    continue
+                value = json.loads(sidecar.read_text())
+                if not isinstance(value, dict) or float(value["expires_at"]) > self.clock():
+                    continue
+                artifact = Path(str(value["path"]))
+                filename = str(value["filename"])
+                if (
+                    artifact.parent != self.root
+                    or artifact.name != filename
+                    or not artifact.name.startswith(effect_id + ".")
+                    or artifact.suffix not in {".ogg", ".mp3", ".wav"}
+                    or artifact.is_symlink()
+                ):
+                    continue
+                artifact.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+                removed += 1
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return removed
 
     def _sidecar(self, effect_id: str) -> Path:
         return self.root / f"{effect_id}.json"
@@ -192,36 +243,49 @@ class VoiceArtifactStore:
             return False
 
     @staticmethod
-    def _duration_ms(path: Path, format: str) -> int:
-        if format == "wav":
-            try:
-                with wave.open(io.BytesIO(path.read_bytes()), "rb") as audio:
-                    frames = audio.getnframes()
-                    rate = audio.getframerate()
-                duration = round(frames * 1000 / rate) if rate else 0
-            except (OSError, EOFError, wave.Error):
-                duration = 0
-        else:
-            try:
-                probe = subprocess.run(
-                    [
-                        "ffprobe",
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
-                        str(path),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                duration = round(float(probe.stdout.strip()) * 1000) if not probe.returncode else 0
-            except (OSError, subprocess.SubprocessError, ValueError):
-                duration = 0
+    def _probe(path: Path) -> tuple[int, str, str]:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name,duration:stream=codec_name,codec_type",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            value = json.loads(probe.stdout) if not probe.returncode else {}
+            streams = value.get("streams", [])
+            audio_streams = [
+                item for item in streams if isinstance(item, dict) and item.get("codec_type") == "audio"
+            ]
+            if len(audio_streams) != 1:
+                raise ValueError
+            codec = str(audio_streams[0].get("codec_name") or "").lower()
+            raw_format = str(value.get("format", {}).get("format_name") or "").lower()
+            duration = round(float(value.get("format", {}).get("duration")) * 1000)
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise VoiceArtifactError("INVALID_AUDIO") from exc
         if duration < 1:
             raise VoiceArtifactError("INVALID_AUDIO")
-        return duration
+        formats = set(raw_format.split(","))
+        if "ogg" in formats and codec == "opus":
+            return duration, ".ogg", "audio/ogg; codecs=opus"
+        if "mp3" in formats and codec == "mp3":
+            return duration, ".mp3", "audio/mpeg"
+        if "wav" in formats and codec.startswith(("pcm_", "adpcm_")):
+            return duration, ".wav", "audio/wav"
+        raise VoiceArtifactError("INVALID_AUDIO")

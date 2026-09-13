@@ -105,17 +105,28 @@ def _resolve_security_tool_settings(config: "Config") -> tuple[bool, "ExecToolCo
 def build_a2a_voice_artifact_store(
     *,
     root: Path | None,
+    managed_outgoing_root: Path,
     tts: TTSSynthesizer,
     model_router: ModelRouter,
     max_bytes: int,
     ttl_seconds: int,
 ) -> Any | None:
     """Build the optional voice store only for a usable configured TTS route."""
-    if root is None or not root.is_absolute() or max_bytes <= 0 or ttl_seconds <= 0:
+    if (
+        root is None
+        or not root.is_absolute()
+        or not managed_outgoing_root.expanduser().is_absolute()
+        or max_bytes <= 0
+        or ttl_seconds <= 0
+    ):
         return None
     try:
         from yeoman_gateway.a2a.artifacts import VoiceArtifactStore
 
+        managed = managed_outgoing_root.expanduser().resolve(strict=True)
+        candidate = root.expanduser().resolve(strict=False)
+        if candidate == managed or not candidate.is_relative_to(managed):
+            return None
         profile = model_router.resolve("tts.speak", channel="whatsapp")
         store = VoiceArtifactStore(
             root,
@@ -123,6 +134,7 @@ def build_a2a_voice_artifact_store(
             profile=profile,
             max_bytes=max_bytes,
             ttl_seconds=ttl_seconds,
+            managed_outgoing_root=managed_outgoing_root,
         )
     except (KeyError, OSError, ValueError):
         return None
@@ -1785,6 +1797,7 @@ def build_gateway_runtime(
         artifact_max_bytes = artifact_ttl_seconds = 0
     a2a_voice_store = build_a2a_voice_artifact_store(
         root=Path(artifact_root_value).expanduser() if artifact_root_value else None,
+        managed_outgoing_root=config.channels.whatsapp.media.outgoing_path,
         tts=tts,
         model_router=model_router,
         max_bytes=artifact_max_bytes,

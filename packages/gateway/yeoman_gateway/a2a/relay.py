@@ -30,6 +30,7 @@ from yeoman_gateway.a2a.contracts import (
 
 LOG = logging.getLogger("yeoman.a2a.relay")
 _PRIVATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_EFFECT_ID = re.compile(r"^a2a-effect-[a-f0-9]{40}$")
 _SKILL_ID = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
 _ALLOWED_CONTENT_TYPES = frozenset({"text", "voice"})
 _AUDIO_MIME_TYPES = frozenset(
@@ -122,6 +123,7 @@ class RelayConfig:
     whatsapp_enabled: bool
     content_types: frozenset[str]
     artifact_root: Path | None = None
+    managed_outgoing_root: Path | None = None
     artifact_ttl_seconds: int = 300
     max_artifact_bytes: int = 5 * 1024 * 1024
     timeout_seconds: float = 30.0
@@ -145,6 +147,15 @@ class RelayConfig:
             artifact_root=(
                 Path(value).expanduser()
                 if (value := os.environ.get("YEOMAN_A2A_ARTIFACT_ROOT", "").strip())
+                else None
+            ),
+            managed_outgoing_root=(
+                Path(value).expanduser()
+                if (
+                    value := os.environ.get(
+                        "YEOMAN_A2A_MANAGED_OUTGOING_ROOT", ""
+                    ).strip()
+                )
                 else None
             ),
             artifact_ttl_seconds=_integer("YEOMAN_A2A_ARTIFACT_TTL_SECONDS", 300),
@@ -196,6 +207,11 @@ class RelayConfig:
             raise RelayConfigurationError("content types contain an unsupported value")
         if self.artifact_root is not None and not self.artifact_root.is_absolute():
             raise RelayConfigurationError("artifact root must be absolute")
+        if (
+            self.managed_outgoing_root is not None
+            and not self.managed_outgoing_root.is_absolute()
+        ):
+            raise RelayConfigurationError("managed outgoing root must be absolute")
         if (
             self.timeout_seconds <= 0
             or self.max_body_bytes <= 0
@@ -582,6 +598,19 @@ class _RelayStore:
             )
         return artifact
 
+    def cleanup_expired(self, *, now: float, limit: int = 64) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """DELETE FROM artifacts WHERE opaque_id IN (
+                       SELECT opaque_id FROM artifacts
+                       WHERE expires_at <= ? ORDER BY expires_at LIMIT ?
+                   ) RETURNING effect_id, path""",
+                (now, max(0, int(limit))),
+            ).fetchall()
+        return [
+            {"effect_id": effect_id, "path": path} for effect_id, path in rows
+        ]
+
     def get_artifact(self, peer: str, opaque_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -615,13 +644,60 @@ class RelayService:
         self._requests: dict[str, list[float]] = {}
 
     def _artifacts_configured(self) -> bool:
+        return self._managed_artifact_root() is not None
+
+    def _managed_artifact_root(self) -> Path | None:
         root = self.config.artifact_root
-        return bool(
-            root is not None
-            and root.is_absolute()
-            and root.is_dir()
-            and os.access(root, os.R_OK | os.X_OK)
-        )
+        managed = self.config.managed_outgoing_root
+        try:
+            if root is None or managed is None:
+                return None
+            resolved_root = root.expanduser().resolve(strict=True)
+            resolved_managed = managed.expanduser().resolve(strict=True)
+            if (
+                resolved_root == resolved_managed
+                or not resolved_root.is_relative_to(resolved_managed)
+                or not resolved_root.is_dir()
+                or not os.access(resolved_root, os.R_OK | os.X_OK)
+            ):
+                return None
+            return resolved_root
+        except OSError:
+            return None
+
+    def _cleanup_expired_artifacts(self) -> None:
+        now = time.time()
+        expired = self.store.cleanup_expired(now=now)
+        root = self._managed_artifact_root()
+        if root is None:
+            return
+        for artifact in expired:
+            effect_id = str(artifact["effect_id"])
+            try:
+                path = Path(str(artifact["path"]))
+                if (
+                    not _EFFECT_ID.fullmatch(effect_id)
+                    or path.parent != root
+                    or not path.name.startswith(effect_id + ".")
+                    or path.suffix not in {".ogg", ".mp3", ".wav"}
+                    or path.is_symlink()
+                ):
+                    continue
+                sidecar = root / f"{effect_id}.json"
+                if sidecar.is_symlink() or sidecar.stat().st_size > 16_384:
+                    continue
+                metadata = json.loads(sidecar.read_text())
+                if (
+                    not isinstance(metadata, dict)
+                    or Path(str(metadata["path"])) != path
+                    or str(metadata["filename"]) != path.name
+                    or float(metadata["expires_at"]) > now
+                ):
+                    continue
+                path.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
 
     def _configured_skills(self) -> tuple[str, ...]:
         skills = []
@@ -801,11 +877,6 @@ class RelayService:
         except _ProfileRejectionError as exc:
             return self._rejected(request_id, skill, invocation, context_id, references, exc)
 
-        try:
-            resolved_artifacts = self._resolve_voice_artifacts(invocation)
-        except _ProfileRejectionError as exc:
-            return self._rejected(request_id, skill, invocation, context_id, references, exc)
-
         key = invocation["input"]["idempotency_key"]
         claim = self.store.claim(
             peer=self.config.peer_id,
@@ -836,6 +907,32 @@ class RelayService:
             claim.reference_task_ids,
             key,
         )
+        try:
+            resolved_artifacts = self._resolve_voice_artifacts(invocation)
+        except _ProfileRejectionError as exc:
+            result = _profile_failure(
+                skill,
+                "rejected",
+                exc.code,
+                exc.message,
+                correlation,
+            )
+            task = _task(
+                claim.task_id, claim.context_id, "TASK_STATE_REJECTED", result
+            )
+            task = self.store.finish(
+                peer=self.config.peer_id,
+                claim=claim,
+                lease_token=lease_token,
+                task=task,
+            )
+            LOG.info(
+                "event=a2a_task task_id=%s skill=%s code=%s",
+                claim.task_id,
+                skill,
+                exc.code,
+            )
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"task": task}}
         try:
             result = self._invoke(
                 invocation,
@@ -1190,6 +1287,7 @@ class RelayService:
         return result
 
     def _register_artifact(self, effect_id: str, value: Any) -> dict[str, Any]:
+        self._cleanup_expired_artifacts()
         required = {
             "path",
             "mime_type",
@@ -1201,11 +1299,10 @@ class RelayService:
         }
         if not isinstance(value, dict) or set(value) != required:
             raise A2AContractValidationError("$.output.internal_artifact", "invalid")
-        root = self.config.artifact_root
         try:
-            if root is None:
+            resolved_root = self._managed_artifact_root()
+            if resolved_root is None:
                 raise ValueError
-            resolved_root = root.expanduser().resolve(strict=True)
             raw_path = Path(value["path"])
             path = raw_path.resolve(strict=True)
             size = int(value["size_bytes"])
@@ -1256,6 +1353,7 @@ class RelayService:
         }
 
     def _artifact_for_uri(self, uri: Any) -> dict[str, Any] | None:
+        self._cleanup_expired_artifacts()
         prefix = f"{self.config.public_url}/artifacts/"
         if not isinstance(uri, str) or not uri.startswith(prefix):
             return None
@@ -1268,6 +1366,7 @@ class RelayService:
         return artifact if self._artifact_bytes(artifact) is not None else None
 
     def artifact_response(self, opaque_id: str) -> tuple[str, bytes] | None:
+        self._cleanup_expired_artifacts()
         if not re.fullmatch(r"[a-f0-9]{48}", opaque_id):
             return None
         artifact = self.store.get_artifact(self.config.peer_id, opaque_id)
@@ -1277,15 +1376,15 @@ class RelayService:
         return (artifact["mime_type"], body) if body is not None else None
 
     def _artifact_bytes(self, artifact: dict[str, Any]) -> bytes | None:
-        root = self.config.artifact_root
         try:
+            root = self._managed_artifact_root()
             if root is None:
                 return None
             path = Path(artifact["path"])
             resolved = path.resolve(strict=True)
             if (
                 path.is_symlink()
-                or not resolved.is_relative_to(root.expanduser().resolve(strict=True))
+                or not resolved.is_relative_to(root)
                 or not resolved.is_file()
                 or resolved.stat().st_size != artifact["size_bytes"]
                 or artifact["size_bytes"] > self.config.max_artifact_bytes

@@ -6,6 +6,7 @@ import json
 import logging
 import multiprocessing
 import socket
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -110,6 +111,7 @@ def _config(tmp_path: Path, socket_path: Path, **changes: Any) -> relay.RelayCon
         "public_url": "https://relay.example.test/a2a",
         "whatsapp_enabled": True,
         "content_types": frozenset({"text"}),
+        "managed_outgoing_root": tmp_path,
         "timeout_seconds": 1.0,
         "max_body_bytes": 65_536,
         "max_response_bytes": 65_536,
@@ -311,6 +313,42 @@ def test_voice_capability_requires_gateway_and_configured_artifact_serving(
     assert [skill["id"] for skill in unusable["skills"]] == ["whatsapp.send"]
 
 
+def test_voice_capability_requires_artifact_root_beneath_managed_outgoing_root(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    audio_path = outside / "voice.wav"
+    audio_path.write_bytes(b"voice")
+    socket_path = tmp_path / "gateway.sock"
+
+    with (
+        FakeUnixGateway(socket_path, _voice_gateway(audio_path)),
+        caplog.at_level(logging.INFO, logger="yeoman.a2a.relay"),
+    ):
+        service = relay.RelayService(
+            _config(
+                tmp_path,
+                socket_path,
+                artifact_root=outside,
+                managed_outgoing_root=managed,
+                content_types=frozenset({"text", "voice"}),
+            )
+        )
+        card = service.agent_card()
+        rejected = service.dispatch(
+            _send_payload(_invocation(skill="media.voice.generate", key="outside-root"))
+        )
+
+    assert [skill["id"] for skill in card["skills"]] == ["whatsapp.send"]
+    assert _profile_result(rejected["result"]["task"])["error"]["code"] == "SKILL_NOT_ADVERTISED"
+    captured = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(outside) not in captured
+    assert str(managed) not in captured
+
+
 def test_generated_voice_is_registered_and_served_only_with_authentication(
     tmp_path: Path,
 ) -> None:
@@ -428,6 +466,50 @@ def test_explicit_voice_send_passes_relay_owned_artifact_path_separately(
     ]
 
 
+def test_terminal_voice_send_retry_returns_original_after_artifact_expiry(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    audio_path = artifact_root / "voice.wav"
+    audio_path.write_bytes(b"voice")
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(
+        tmp_path,
+        socket_path,
+        artifact_root=artifact_root,
+        content_types=frozenset({"text", "voice"}),
+    )
+    with FakeUnixGateway(socket_path, _voice_gateway(audio_path)) as gateway:
+        service = relay.RelayService(config)
+        generated = service.dispatch(
+            _send_payload(_invocation(skill="media.voice.generate", key="retry-source"))
+        )
+        uri = _profile_result(generated["result"]["task"])["output"]["artifact"]["uri"]
+        invocation = {
+            "skill": "whatsapp.send",
+            "input": {
+                "recipient": {"type": "group", "alias": "team-example"},
+                "content": [{"type": "voice", "uri": uri, "mime_type": "audio/wav"}],
+                "idempotency_key": "voice-terminal-retry",
+            },
+        }
+        payload = _send_payload(invocation)
+        first = service.dispatch(payload)
+        with sqlite3.connect(config.state_path) as connection:
+            connection.execute("UPDATE artifacts SET expires_at=0")
+        retry = service.dispatch(payload)
+        invocation["input"]["idempotency_key"] = "voice-new-after-expiry"
+        fresh = service.dispatch(_send_payload(invocation))
+
+    assert retry == first
+    assert _profile_result(fresh["result"]["task"])["error"]["code"] == "ARTIFACT_DENIED"
+    assert [request["cmd"] for request in gateway.requests] == [
+        "a2a_invoke",
+        "a2a_invoke",
+    ]
+
+
 def test_voice_invocation_is_rejected_when_artifact_serving_is_disabled(
     tmp_path: Path,
 ) -> None:
@@ -509,6 +591,69 @@ def test_artifact_get_rejects_other_peer_and_expired_records(tmp_path: Path) -> 
 
     assert other[0] == 404
     assert expired[0] == 404
+
+
+def test_artifact_registry_cleanup_is_expired_only_and_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    path = root / "voice.wav"
+    path.write_bytes(b"voice")
+    service = relay.RelayService(
+        _config(tmp_path, tmp_path / "missing.sock", artifact_root=root)
+    )
+    expired_path = root / ("a2a-effect-" + "0" * 40 + ".wav")
+    expired_path.write_bytes(b"voice")
+    expired_sidecar = root / ("a2a-effect-" + "0" * 40 + ".json")
+    expired_sidecar.write_text(
+        json.dumps(
+            {
+                "path": str(expired_path),
+                "filename": expired_path.name,
+                "expires_at": time.time() - 1,
+            }
+        )
+    )
+    common = {
+        "peer": "hermes-test",
+        "path": str(path),
+        "mime_type": "audio/wav",
+        "duration_ms": 100,
+        "sha256": hashlib.sha256(b"voice").hexdigest(),
+        "size_bytes": 5,
+    }
+    for index in range(70):
+        indexed_path = expired_path if index == 0 else path
+        service.store.register_artifact(
+            {
+                **common,
+                "path": str(indexed_path),
+                "opaque_id": f"{index:048x}",
+                "effect_id": "a2a-effect-" + f"{index:040x}",
+                "expires_at": time.time() - 1,
+            }
+        )
+    service.store.register_artifact(
+        {
+            **common,
+            "opaque_id": "f" * 48,
+            "effect_id": "a2a-effect-" + "f" * 40,
+            "expires_at": time.time() + 60,
+        }
+    )
+
+    assert service.artifact_response("0" * 48) is None
+    with sqlite3.connect(service.config.state_path) as connection:
+        expired = connection.execute(
+            "SELECT count(*) FROM artifacts WHERE expires_at <= ?", (time.time(),)
+        ).fetchone()[0]
+        fresh = connection.execute(
+            "SELECT count(*) FROM artifacts WHERE expires_at > ?", (time.time(),)
+        ).fetchone()[0]
+
+    assert 0 < expired <= 6
+    assert fresh == 1
+    assert not expired_path.exists()
+    assert not expired_sidecar.exists()
 
 
 def test_voice_artifact_path_and_uri_are_never_logged(

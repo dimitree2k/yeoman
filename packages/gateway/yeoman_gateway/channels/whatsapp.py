@@ -468,6 +468,10 @@ class WhatsAppChannel(BaseChannel):
                 suffix = validated.suffix.lower()
                 if suffix in {".ogg", ".opus"}:
                     mime = "audio/ogg; codecs=opus"
+                elif suffix == ".mp3":
+                    mime = "audio/mpeg"
+                elif suffix == ".wav":
+                    mime = "audio/wav"
                 elif suffix in {".jpg", ".jpeg"}:
                     mime = "image/jpeg"
                 elif suffix == ".png":
