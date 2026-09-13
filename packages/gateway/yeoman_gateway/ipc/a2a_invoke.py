@@ -18,6 +18,11 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SKILL = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
 _TEXT_TOOL = "message"
 _VOICE_TOOL = "send_voice"
+_MEDIA_TOOL = "send_media"
+_MEDIA_MIME_TYPES = {
+    "image": frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"}),
+    "file": frozenset({"application/pdf", "text/plain"}),
+}
 
 
 class _PolicyAdapter(Protocol):
@@ -34,7 +39,7 @@ class _VoiceGenerator(Protocol):
     ) -> dict[str, object]: ...
 
 
-_VoiceSender = Callable[..., Any]
+_MediaSender = Callable[..., Any]
 
 
 class _EffectStore(Protocol):
@@ -162,10 +167,11 @@ async def process_a2a_invocation(
     effects: _Effects | None,
     effect_store: _EffectStore,
     sender_account: str,
+    enabled_content_types: Collection[str] = frozenset({"text", "voice"}),
     voice_generator: _VoiceGenerator | None = None,
     resolved_artifacts: Collection[Mapping[str, Any]] = (),
     artifact_root: Path | None = None,
-    voice_sender: _VoiceSender | None = None,
+    media_sender: _MediaSender | None = None,
     clock: Callable[[], float] | None = None,
     schemas: ContractSchemas | None = None,
 ) -> dict[str, object]:
@@ -260,7 +266,24 @@ async def process_a2a_invocation(
 
     content = input["content"]
     content_types = {part["type"] for part in content}
-    if not content_types <= {"text", "voice"} or len(content_types) > 1:
+    if not content_types <= set(enabled_content_types):
+        return _failure(
+            skill=skill,
+            code="CONTENT_TYPE_DENIED",
+            message="The requested content is not enabled.",
+            correlation=correlation,
+        )
+    media_parts = [part for part in content if part["type"] in {"image", "file"}]
+    text_parts = [part for part in content if part["type"] == "text"]
+    voice_parts = [part for part in content if part["type"] == "voice"]
+    invalid_content = (
+        not content_types <= {"text", "voice", "image", "file"}
+        or bool(voice_parts) and len(content) != 1
+        or len(media_parts) > 1
+        or bool(media_parts) and (len(text_parts) > 1 or bool(voice_parts))
+        or not media_parts and not voice_parts and not text_parts
+    )
+    if invalid_content:
         return _failure(
             skill=skill,
             code="CONTENT_TYPE_DENIED",
@@ -298,30 +321,44 @@ async def process_a2a_invocation(
             correlation=correlation,
         )
 
-    voice_path: str | None = None
-    if content_types == {"voice"}:
-        if artifact_root is None or voice_sender is None:
+    media_path: str | None = None
+    media_kind = voice_parts[0]["type"] if voice_parts else (
+        media_parts[0]["type"] if media_parts else None
+    )
+    if media_kind is not None:
+        if artifact_root is None or media_sender is None:
             return _failure(
                 skill=skill,
                 code="CONTENT_TYPE_DENIED",
-                message="Voice content is not enabled.",
+                message="Media content is not enabled.",
                 correlation=correlation,
             )
-        voice_path = _validated_voice_path(
+        part = voice_parts[0] if voice_parts else media_parts[0]
+        media_path = _validated_media_path(
             peer=peer,
-            part=content[0],
+            part=part,
             resolved_artifacts=resolved_artifacts,
             artifact_root=artifact_root,
             now=(clock or time.time)(),
         )
-        if voice_path is None:
+        if media_path is None:
             return _failure(
                 skill=skill,
                 code="ARTIFACT_DENIED",
-                message="The voice artifact is unavailable.",
+                message="The media artifact is unavailable.",
                 correlation=correlation,
             )
-    text = "\n".join(part["text"] for part in content if part["type"] == "text")
+    text = "\n".join(part["text"] for part in text_parts)
+    if media_parts:
+        inline_caption = str(media_parts[0].get("caption") or "")
+        if inline_caption and text:
+            return _failure(
+                skill=skill,
+                code="CONTENT_TYPE_DENIED",
+                message="Only one media caption is accepted.",
+                correlation=correlation,
+            )
+        text = inline_caption or text
     event = InboundEvent(
         channel="whatsapp",
         chat_id=chat_id,
@@ -336,7 +373,12 @@ async def process_a2a_invocation(
     if (
         not decision.accept_message
         or not decision.should_respond
-        or (_VOICE_TOOL if voice_path else _TEXT_TOOL) not in decision.allowed_tools
+        or (
+            _VOICE_TOOL
+            if media_kind == "voice"
+            else _MEDIA_TOOL if media_kind in {"image", "file"} else _TEXT_TOOL
+        )
+        not in decision.allowed_tools
     ):
         return _failure(
             skill=skill,
@@ -346,16 +388,19 @@ async def process_a2a_invocation(
         )
 
     try:
-        if voice_path is not None:
-            send_voice = voice_sender
-            if send_voice is None:  # narrowed above; keep the trust boundary explicit
-                raise RuntimeError("voice sender unavailable")
-            await send_voice(
-                operation_ref=effect_id,
-                chat_id=chat_id,
-                path=voice_path,
-                effect_id=effect_id,
-            )
+        if media_path is not None:
+            send_media = media_sender
+            if send_media is None:  # narrowed above; keep the trust boundary explicit
+                raise RuntimeError("media sender unavailable")
+            send_args = {
+                "operation_ref": effect_id,
+                "chat_id": chat_id,
+                "path": media_path,
+                "effect_id": effect_id,
+            }
+            if media_kind in {"image", "file"}:
+                send_args["caption"] = text
+            await send_media(**send_args)
         else:
             await effects.send(
                 source="a2a",
@@ -411,7 +456,7 @@ async def process_a2a_invocation(
     return result
 
 
-def _validated_voice_path(
+def _validated_media_path(
     *,
     peer: str,
     part: Mapping[str, Any],
@@ -422,10 +467,16 @@ def _validated_voice_path(
     if artifact_root is None or len(resolved_artifacts) != 1:
         return None
     artifact = next(iter(resolved_artifacts))
+    kind = str(part.get("type") or "")
+    mime_type = str(part.get("mime_type") or "")
     if (
         artifact.get("peer") != peer
         or artifact.get("uri") != part.get("uri")
-        or artifact.get("mime_type") != part.get("mime_type")
+        or artifact.get("mime_type") != mime_type
+        or (
+            kind in _MEDIA_MIME_TYPES
+            and mime_type not in _MEDIA_MIME_TYPES[kind]
+        )
     ):
         return None
     try:
@@ -436,6 +487,10 @@ def _validated_voice_path(
             path.is_symlink()
             or not resolved.is_relative_to(root)
             or not resolved.is_file()
+            or (
+                "filename" in artifact
+                and str(artifact["filename"]) != resolved.name
+            )
             or float(artifact["expires_at"]) <= now
             or resolved.stat().st_size != int(artifact["size_bytes"])
             or hashlib.sha256(resolved.read_bytes()).hexdigest() != artifact["sha256"]

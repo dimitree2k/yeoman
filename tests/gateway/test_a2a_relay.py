@@ -15,8 +15,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 from yeoman_gateway.a2a import relay
+from yeoman_gateway.a2a.media import MediaStager
 
 
 class FakeUnixGateway:
@@ -272,6 +274,173 @@ def _voice_gateway(audio_path: Path) -> Callable[[dict[str, Any]], dict[str, Any
         return {"status": "ok", "response": response}
 
     return respond
+
+
+def _media_gateway(kinds: list[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def respond(request: dict[str, Any]) -> dict[str, Any]:
+        if request["cmd"] == "a2a_capabilities":
+            return {
+                "status": "ok",
+                "response": {
+                    "skills": ["whatsapp.send"],
+                    "content_types": kinds,
+                },
+            }
+        args = request["args"]
+        return {
+            "status": "ok",
+            "response": {
+                "skill": args["skill"],
+                "status": "completed",
+                "output": {
+                    "delivery_id": args["effect_id"],
+                    "status": "sent",
+                    "recipient": args["input"]["recipient"],
+                    "sender_account": "default",
+                },
+                "correlation": {
+                    "task_id": args["task_id"],
+                    "context_id": args["context_id"],
+                    "idempotency_key": args["input"]["idempotency_key"],
+                },
+            },
+        }
+
+    return respond
+
+
+@pytest.mark.parametrize(
+    ("kind", "mime_type", "suffix", "body"),
+    [
+        ("image", "image/png", ".png", b"\x89PNG\r\n\x1a\nfixture"),
+        ("file", "application/pdf", ".pdf", b"%PDF-1.7\nfixture\n%%EOF"),
+    ],
+)
+def test_enabled_image_and_file_are_staged_once_before_atomic_delivery(
+    tmp_path: Path,
+    kind: str,
+    mime_type: str,
+    suffix: str,
+    body: bytes,
+) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    managed = tmp_path / "outgoing"
+    artifact_root = managed / "a2a"
+    calls = 0
+
+    def download(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": mime_type, "Content-Length": str(len(body))},
+            content=body,
+        )
+
+    stager = MediaStager(
+        artifact_root,
+        allowed_origins={"https://media.example.test"},
+        max_bytes=1_024,
+        ttl_seconds=60,
+        timeout_seconds=1,
+        resolver=lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+        transport=httpx.MockTransport(download),
+    )
+    config = _config(
+        tmp_path,
+        socket_path,
+        content_types=frozenset({"text", kind}),
+        media_origins=frozenset({"https://media.example.test"}),
+        artifact_root=artifact_root,
+        managed_outgoing_root=managed,
+    )
+    invocation = {
+        "skill": "whatsapp.send",
+        "input": {
+            "recipient": {"type": "group", "alias": "team-example"},
+            "content": [
+                {
+                    "type": kind,
+                    "uri": f"https://media.example.test/source{suffix}",
+                    "mime_type": mime_type,
+                    "filename": f"source{suffix}",
+                    "caption": "caption",
+                }
+            ],
+            "idempotency_key": f"{kind}-send",
+        },
+    }
+
+    with FakeUnixGateway(socket_path, _media_gateway(["text", kind])) as gateway:
+        service = relay.RelayService(config, media_stager=stager)
+        first = service.dispatch(_send_payload(invocation))
+        replay = service.dispatch(_send_payload(invocation))
+        conflicting = {
+            **invocation,
+            "input": {
+                **invocation["input"],
+                "content": [
+                    {
+                        **invocation["input"]["content"][0],
+                        "uri": f"https://media.example.test/different{suffix}",
+                    }
+                ],
+            },
+        }
+        conflict = service.dispatch(_send_payload(conflicting))
+
+    result = _profile_result(first["result"]["task"])
+    service.schemas.validate_result(result)
+    service.schemas.validate_response("whatsapp.send", result["output"])
+    assert replay == first
+    assert _profile_result(conflict["result"]["task"])["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert calls == 1
+    assert len(gateway.requests) == 1
+    args = gateway.requests[0]["args"]
+    assert args["effect_id"] == "a2a-effect-" + hashlib.sha256(
+        f"hermes-test\0whatsapp.send\0{kind}-send".encode()
+    ).hexdigest()[:40]
+    assert len(args["resolved_artifacts"]) == 1
+    staged = args["resolved_artifacts"][0]
+    path = Path(staged["path"])
+    assert path == artifact_root.resolve() / f"{args['effect_id']}{suffix}"
+    assert path.read_bytes() == body
+    assert staged["uri"] == invocation["input"]["content"][0]["uri"]
+
+
+def test_media_staging_rejection_is_terminal_and_url_redacted(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    managed = tmp_path / "outgoing"
+    artifact_root = managed / "a2a"
+    secret_uri = "https://other.example.test/file.png?X-Amz-Signature=private"
+    config = _config(
+        tmp_path,
+        socket_path,
+        content_types=frozenset({"text", "image"}),
+        media_origins=frozenset({"https://media.example.test"}),
+        artifact_root=artifact_root,
+        managed_outgoing_root=managed,
+    )
+    invocation = {
+        "skill": "whatsapp.send",
+        "input": {
+            "recipient": {"type": "group", "alias": "team-example"},
+            "content": [{"type": "image", "uri": secret_uri, "mime_type": "image/png"}],
+            "idempotency_key": "denied-image",
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="yeoman.a2a.relay"):
+        result = relay.RelayService(config).dispatch(_send_payload(invocation))
+
+    profile = _profile_result(result["result"]["task"])
+    assert profile["error"]["code"] == "ARTIFACT_DENIED"
+    captured = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret_uri not in captured
 
 
 def test_voice_capability_requires_gateway_and_configured_artifact_serving(
@@ -739,6 +908,64 @@ def test_config_accepts_legacy_service_environment_names_needed_for_cutover(
     assert config.socket_path == Path("~/.yeoman/run/gateway.sock").expanduser()
     assert config.state_path == Path("~/.yeoman/data/a2a/relay.db").expanduser()
     assert config.public_url == "http://moltypython.example.ts.net:9900"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://media.example.test",
+        "https://user:password@media.example.test",
+        "https://127.0.0.1",
+        "https://media.example.test/private",
+    ],
+)
+def test_media_config_requires_public_https_origins_and_confined_root(
+    tmp_path: Path, origin: str
+) -> None:
+    managed = tmp_path / "outgoing"
+    config = _config(
+        tmp_path,
+        tmp_path / "gateway.sock",
+        content_types=frozenset({"image"}),
+        media_origins=frozenset({origin}),
+        managed_outgoing_root=managed,
+        artifact_root=managed / "a2a",
+        port=9900,
+    )
+
+    with pytest.raises(relay.RelayConfigurationError):
+        config.validate()
+
+
+def test_media_config_rejects_missing_or_unconfined_artifact_root(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "outgoing"
+    common = {
+        "content_types": frozenset({"image"}),
+        "media_origins": frozenset({"https://media.example.test"}),
+        "managed_outgoing_root": managed,
+        "port": 9900,
+    }
+    missing = _config(tmp_path, tmp_path / "gateway.sock", **common)
+    outside = _config(
+        tmp_path,
+        tmp_path / "gateway.sock",
+        **common,
+        artifact_root=tmp_path / "outside",
+    )
+    valid = _config(
+        tmp_path,
+        tmp_path / "gateway.sock",
+        **common,
+        artifact_root=managed / "a2a",
+    )
+
+    with pytest.raises(relay.RelayConfigurationError):
+        missing.validate()
+    with pytest.raises(relay.RelayConfigurationError):
+        outside.validate()
+    valid.validate()
 
 
 def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:

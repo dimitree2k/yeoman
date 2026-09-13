@@ -141,6 +141,20 @@ def build_a2a_voice_artifact_store(
     return store if store.available else None
 
 
+def resolve_a2a_artifact_root(
+    root: Path | None, managed_outgoing_root: Path
+) -> Path | None:
+    """Return a configured A2A subdirectory only when it stays under managed media."""
+    if root is None or not root.is_absolute() or not managed_outgoing_root.is_absolute():
+        return None
+    try:
+        managed = managed_outgoing_root.expanduser().resolve(strict=True)
+        candidate = root.expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    return candidate if candidate != managed and candidate.is_relative_to(managed) else None
+
+
 def _inbound_message_to_event(msg: InboundMessage) -> InboundEvent:
     meta = msg.metadata
     # Thread assignment from the fast gate travels with the event so the pipeline can
@@ -1812,10 +1826,14 @@ def build_gateway_runtime(
         max_bytes=artifact_max_bytes,
         ttl_seconds=artifact_ttl_seconds,
     )
+    a2a_artifact_root = resolve_a2a_artifact_root(
+        Path(artifact_root_value).expanduser() if artifact_root_value else None,
+        config.channels.whatsapp.media.outgoing_path,
+    )
     whatsapp_a2a_available = bool(
         configured_a2a_peer
         and a2a_whatsapp_enabled
-        and "text" in a2a_content_types
+        and a2a_content_types & {"text", "voice", "image", "file"}
         and config.channels.whatsapp.enabled
         and service_effects is not None
     )
@@ -1829,17 +1847,17 @@ def build_gateway_runtime(
         | ({"media.voice.generate"} if voice_a2a_available else set())
     )
 
-    async def a2a_voice_sender(
-        *, operation_ref: str, chat_id: str, path: str, effect_id: str
+    async def a2a_media_sender(
+        *, operation_ref: str, chat_id: str, path: str, effect_id: str, caption: str = ""
     ) -> object:
         if effect_router is None or not effect_router.manages("whatsapp", chat_id):
             raise RuntimeError("managed effect path unavailable")
-        payload = MediaPayload(media=(path,))
+        payload = MediaPayload(media=(path,), caption=caption)
         return await effect_router.submit_message(
             OutboundMessage(
                 channel="whatsapp",
                 chat_id=chat_id,
-                content="",
+                content=caption,
                 media=[path],
                 metadata={"message_id": operation_ref, "service_source": "a2a"},
             ),
@@ -1883,12 +1901,15 @@ def build_gateway_runtime(
             effects=service_effects,
             effect_store=processing_store,
             sender_account="default",
+            enabled_content_types=a2a_content_types,
             voice_generator=a2a_voice_store,
             resolved_artifacts=resolved_artifacts,
-            artifact_root=a2a_voice_store.root if a2a_voice_store is not None else None,
-            voice_sender=(
-                a2a_voice_sender
-                if whatsapp_a2a_available and voice_a2a_available
+            artifact_root=a2a_artifact_root,
+            media_sender=(
+                a2a_media_sender
+                if whatsapp_a2a_available
+                and a2a_artifact_root is not None
+                and (bool(a2a_content_types & {"image", "file"}) or voice_a2a_available)
                 else None
             ),
         )
@@ -1897,7 +1918,7 @@ def build_gateway_runtime(
         skills = sorted(advertised_a2a_skills)
         content_types = []
         if "whatsapp.send" in skills:
-            content_types.append("text")
+            content_types.extend(sorted(a2a_content_types & {"text", "image", "file"}))
         if "media.voice.generate" in skills:
             content_types.append("voice")
         return {

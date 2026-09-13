@@ -27,12 +27,13 @@ from yeoman_gateway.a2a.contracts import (
     A2AContractValidationError,
     ContractSchemas,
 )
+from yeoman_gateway.a2a.media import MediaStager, MediaStagingError, normalized_media_origins
 
 LOG = logging.getLogger("yeoman.a2a.relay")
 _PRIVATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _EFFECT_ID = re.compile(r"^a2a-effect-[a-f0-9]{40}$")
 _SKILL_ID = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
-_ALLOWED_CONTENT_TYPES = frozenset({"text", "voice"})
+_ALLOWED_CONTENT_TYPES = frozenset({"text", "voice", "image", "file"})
 _AUDIO_MIME_TYPES = frozenset(
     {"audio/ogg", "audio/ogg; codecs=opus", "audio/mpeg", "audio/wav"}
 )
@@ -129,6 +130,7 @@ class RelayConfig:
     public_url: str
     whatsapp_enabled: bool
     content_types: frozenset[str]
+    media_origins: frozenset[str] = frozenset()
     artifact_root: Path | None = None
     managed_outgoing_root: Path | None = None
     artifact_ttl_seconds: int = 300
@@ -165,6 +167,7 @@ class RelayConfig:
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),
             content_types=_csv(os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text")),
+            media_origins=_csv(os.environ.get("YEOMAN_A2A_MEDIA_ORIGINS", "")),
             artifact_root=(
                 Path(value).expanduser()
                 if (value := os.environ.get("YEOMAN_A2A_ARTIFACT_ROOT", "").strip())
@@ -238,6 +241,12 @@ class RelayConfig:
             raise RelayConfigurationError("public URL cannot advertise an internal IP address")
         if not self.content_types or not self.content_types <= _ALLOWED_CONTENT_TYPES:
             raise RelayConfigurationError("content types contain an unsupported value")
+        try:
+            normalized_media_origins(self.media_origins)
+        except ValueError as exc:
+            raise RelayConfigurationError("media origins must be public HTTPS origins") from exc
+        if self.content_types & {"image", "file"} and not self.media_origins:
+            raise RelayConfigurationError("image and file content require media origins")
         if self.artifact_root is not None and not self.artifact_root.is_absolute():
             raise RelayConfigurationError("artifact root must be absolute")
         if (
@@ -245,6 +254,16 @@ class RelayConfig:
             and not self.managed_outgoing_root.is_absolute()
         ):
             raise RelayConfigurationError("managed outgoing root must be absolute")
+        if self.content_types & {"image", "file"}:
+            if self.artifact_root is None or self.managed_outgoing_root is None:
+                raise RelayConfigurationError("image and file content require artifact roots")
+            try:
+                artifact = self.artifact_root.expanduser().resolve(strict=False)
+                managed = self.managed_outgoing_root.expanduser().resolve(strict=False)
+            except OSError as exc:
+                raise RelayConfigurationError("media artifact root is invalid") from exc
+            if artifact == managed or not artifact.is_relative_to(managed):
+                raise RelayConfigurationError("media artifact root must be confined")
         if (
             self.timeout_seconds <= 0
             or self.max_body_bytes <= 0
@@ -669,12 +688,44 @@ class _RelayStore:
 class RelayService:
     """Protocol logic shared by the thin HTTP handler."""
 
-    def __init__(self, config: RelayConfig, *, schemas: ContractSchemas | None = None) -> None:
+    def __init__(
+        self,
+        config: RelayConfig,
+        *,
+        schemas: ContractSchemas | None = None,
+        media_stager: MediaStager | None = None,
+    ) -> None:
         self.config = config
         self.store = _RelayStore(config.state_path)
         self.schemas = schemas or ContractSchemas.load()
+        self.media_stager = media_stager or self._build_media_stager()
         self._rate_lock = threading.Lock()
         self._requests: dict[str, list[float]] = {}
+
+    def _build_media_stager(self) -> MediaStager | None:
+        root = self.config.artifact_root
+        managed = self.config.managed_outgoing_root
+        if (
+            not self.config.content_types & {"image", "file"}
+            or not self.config.media_origins
+            or root is None
+            or managed is None
+        ):
+            return None
+        try:
+            resolved_managed = managed.expanduser().resolve(strict=True)
+            candidate = root.expanduser().resolve(strict=False)
+            if candidate == resolved_managed or not candidate.is_relative_to(resolved_managed):
+                return None
+            return MediaStager(
+                candidate,
+                allowed_origins=self.config.media_origins,
+                max_bytes=self.config.max_artifact_bytes,
+                ttl_seconds=self.config.artifact_ttl_seconds,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+        except (MediaStagingError, OSError, ValueError):
+            return None
 
     def _artifacts_configured(self) -> bool:
         return self._managed_artifact_root() is not None
@@ -767,12 +818,13 @@ class RelayService:
             and "voice" in self.config.content_types
         ):
             available.append("media.voice.generate")
-        if (
-            "whatsapp.send" in skills
-            and "text" in content_types
-            and self.config.whatsapp_enabled
-            and "text" in self.config.content_types
-        ):
+        shared_send_types = set(content_types) & self.config.content_types
+        usable_send_types = shared_send_types & {"text"}
+        if self.media_stager is not None:
+            usable_send_types |= shared_send_types & {"image", "file"}
+        if self._artifacts_configured():
+            usable_send_types |= shared_send_types & {"voice"}
+        if "whatsapp.send" in skills and self.config.whatsapp_enabled and usable_send_types:
             available.append("whatsapp.send")
         return tuple(available)
 
@@ -941,8 +993,12 @@ class RelayService:
             key,
         )
         try:
-            resolved_artifacts = self._resolve_voice_artifacts(invocation)
-        except _ProfileRejectionError as exc:
+            resolved_artifacts = self._resolve_artifacts(invocation, claim)
+        except (_ProfileRejectionError, MediaStagingError) as exc:
+            if isinstance(exc, MediaStagingError):
+                exc = _ProfileRejectionError(
+                    "ARTIFACT_DENIED", "The media artifact is unavailable."
+                )
             result = _profile_failure(
                 skill,
                 "rejected",
@@ -1130,13 +1186,42 @@ class RelayService:
                     "CONTENT_TYPE_DENIED", "A requested content type is not enabled."
                 )
 
-    def _resolve_voice_artifacts(self, invocation: dict[str, Any]) -> list[dict[str, Any]]:
+    def _resolve_artifacts(
+        self, invocation: dict[str, Any], claim: _Claim
+    ) -> list[dict[str, Any]]:
         if invocation["skill"] != "whatsapp.send":
             return []
-        voice = [part for part in invocation["input"]["content"] if part["type"] == "voice"]
+        content = invocation["input"]["content"]
+        voice = [part for part in content if part["type"] == "voice"]
+        remote = [part for part in content if part["type"] in {"image", "file"}]
+        text = [part for part in content if part["type"] == "text"]
+        if remote:
+            if (
+                len(remote) != 1
+                or voice
+                or len(text) > 1
+                or (remote[0].get("caption") and text)
+            ):
+                raise _ProfileRejectionError(
+                    "CONTENT_TYPE_DENIED", "Only one media artifact can be sent at a time."
+                )
+            if self.media_stager is None:
+                raise _ProfileRejectionError(
+                    "ARTIFACT_DENIED", "The media artifact is unavailable."
+                )
+            staged = self.media_stager.stage(
+                claim.effect_id, claim.request_hash, remote[0]
+            )
+            return [
+                {
+                    "peer": self.config.peer_id,
+                    "uri": remote[0]["uri"],
+                    **staged,
+                }
+            ]
         if not voice:
             return []
-        if len(voice) != 1 or len(invocation["input"]["content"]) != 1:
+        if len(voice) != 1 or len(content) != 1:
             raise _ProfileRejectionError(
                 "CONTENT_TYPE_DENIED", "Only one voice artifact can be sent at a time."
             )

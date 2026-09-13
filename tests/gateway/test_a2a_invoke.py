@@ -96,6 +96,15 @@ class _VoiceSender:
         return EffectReceipt(effect_id=str(kwargs["effect_id"]), state="sent", accepted=True)
 
 
+class _MediaSender:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, **kwargs: object) -> EffectReceipt:
+        self.calls.append(kwargs)
+        return EffectReceipt(effect_id=str(kwargs["effect_id"]), state="sent", accepted=True)
+
+
 class _EffectStore:
     def __init__(
         self,
@@ -272,7 +281,8 @@ async def test_second_explicit_voice_send_uses_only_validated_artifact_path(
         ],
         artifact_root=voice_path.parent,
         clock=lambda: 1_000.0,
-        voice_sender=sender,
+        media_sender=sender,
+        enabled_content_types=frozenset({"text", "voice"}),
     )
 
     assert result["status"] == "completed"
@@ -291,9 +301,239 @@ async def test_second_explicit_voice_send_uses_only_validated_artifact_path(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("suffix", "mime_type"), [(".wav", "audio/wav"), (".mp3", "audio/mpeg")]
+    ("kind", "mime_type", "suffix", "body"),
+    [
+        ("image", "image/png", ".png", b"\x89PNG\r\n\x1a\nfixture"),
+        ("file", "application/pdf", ".pdf", b"%PDF-1.7\nfixture\n%%EOF"),
+    ],
 )
-async def test_whatsapp_voice_artifacts_use_audio_command_mime(
+async def test_enabled_image_and_file_use_validated_managed_media(
+    tmp_path: Path,
+    kind: str,
+    mime_type: str,
+    suffix: str,
+    body: bytes,
+) -> None:
+    path = tmp_path / "artifacts" / f"{_EFFECT_ID}{suffix}"
+    path.parent.mkdir()
+    path.write_bytes(body)
+    uri = f"https://media.example.test/{kind}"
+    caption = f"{kind} caption"
+    sender = _MediaSender()
+
+    result, policy, resolver, effects = await _invoke(
+        input=_input(
+            content=[
+                {
+                    "type": kind,
+                    "uri": uri,
+                    "mime_type": mime_type,
+                    "filename": path.name,
+                    "caption": caption,
+                }
+            ]
+        ),
+        policy=_Policy(tools=frozenset({"send_media"})),
+        resolved_artifacts=[
+            {
+                "peer": "hermes",
+                "uri": uri,
+                "path": str(path),
+                "mime_type": mime_type,
+                "filename": path.name,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body),
+                "expires_at": 2_000.0,
+            }
+        ],
+        artifact_root=path.parent,
+        clock=lambda: 1_000.0,
+        media_sender=sender,
+        enabled_content_types=frozenset({"text", "image", "file"}),
+    )
+
+    assert result["status"] == "completed", result
+    assert result["output"]["delivery_id"] == _EFFECT_ID
+    assert result["output"]["sender_account"] == "default"
+    ContractSchemas.load().validate_result(result)
+    ContractSchemas.load().validate_response("whatsapp.send", result["output"])
+    assert resolver.calls == [("group", "team-example")]
+    assert policy.events[0].content == caption
+    assert effects.calls == []
+    assert sender.calls == [
+        {
+            "operation_ref": _EFFECT_ID,
+            "chat_id": "private-group@g.us",
+            "path": str(path.resolve()),
+            "caption": caption,
+            "effect_id": _EFFECT_ID,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_media_accepts_one_text_part_as_caption(tmp_path: Path) -> None:
+    body = b"\x89PNG\r\n\x1a\nfixture"
+    path = tmp_path / "artifacts" / f"{_EFFECT_ID}.png"
+    path.parent.mkdir()
+    path.write_bytes(body)
+    uri = "https://media.example.test/image"
+    sender = _MediaSender()
+    content = [
+        {"type": "image", "uri": uri, "mime_type": "image/png"},
+        {"type": "text", "text": "separate caption"},
+    ]
+
+    result, policy, _resolver, _effects = await _invoke(
+        input=_input(content=content),
+        policy=_Policy(tools=frozenset({"send_media"})),
+        resolved_artifacts=[
+            {
+                "peer": "hermes",
+                "uri": uri,
+                "path": str(path),
+                "mime_type": "image/png",
+                "filename": path.name,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body),
+                "expires_at": 2_000.0,
+            }
+        ],
+        artifact_root=path.parent,
+        clock=lambda: 1_000.0,
+        media_sender=sender,
+        enabled_content_types=frozenset({"text", "image"}),
+    )
+
+    assert result["status"] == "completed", result
+    assert policy.events[0].content == "separate caption"
+    assert sender.calls[0]["caption"] == "separate caption"
+
+
+@pytest.mark.asyncio
+async def test_media_requires_gateway_content_type_enablement(tmp_path: Path) -> None:
+    body = b"\x89PNG\r\n\x1a\nfixture"
+    path = tmp_path / "artifacts" / f"{_EFFECT_ID}.png"
+    path.parent.mkdir()
+    path.write_bytes(body)
+    uri = "https://media.example.test/image"
+    sender = _MediaSender()
+
+    result, *_ = await _invoke(
+        input=_input(content=[{"type": "image", "uri": uri, "mime_type": "image/png"}]),
+        policy=_Policy(tools=frozenset({"send_media"})),
+        resolved_artifacts=[
+            {
+                "peer": "hermes",
+                "uri": uri,
+                "path": str(path),
+                "mime_type": "image/png",
+                "filename": path.name,
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size_bytes": len(body),
+                "expires_at": 2_000.0,
+            }
+        ],
+        artifact_root=path.parent,
+        clock=lambda: 1_000.0,
+        media_sender=sender,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["error"]["code"] == "CONTENT_TYPE_DENIED"
+    assert sender.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["traversal", "symlink", "expired", "hash"])
+async def test_media_rejects_untrusted_staged_artifact(
+    tmp_path: Path, failure: str
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    body = b"\x89PNG\r\n\x1a\nfixture"
+    path = root / f"{_EFFECT_ID}.png"
+    path.write_bytes(body)
+    if failure == "traversal":
+        path = tmp_path / "outside.png"
+        path.write_bytes(body)
+    elif failure == "symlink":
+        target = root / "target.png"
+        target.write_bytes(body)
+        path.unlink()
+        path.symlink_to(target)
+    uri = "https://media.example.test/image"
+    artifact = {
+        "peer": "hermes",
+        "uri": uri,
+        "path": str(path),
+        "mime_type": "image/png",
+        "filename": path.name,
+        "sha256": "0" * 64 if failure == "hash" else hashlib.sha256(body).hexdigest(),
+        "size_bytes": len(body),
+        "expires_at": 999.0 if failure == "expired" else 2_000.0,
+    }
+    sender = _MediaSender()
+
+    result, *_ = await _invoke(
+        input=_input(content=[{"type": "image", "uri": uri, "mime_type": "image/png"}]),
+        policy=_Policy(tools=frozenset({"send_media"})),
+        resolved_artifacts=[artifact],
+        artifact_root=root,
+        clock=lambda: 1_000.0,
+        media_sender=sender,
+        enabled_content_types=frozenset({"image"}),
+    )
+
+    assert result["status"] == "rejected"
+    assert result["error"]["code"] == "ARTIFACT_DENIED"
+    assert sender.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        [
+            {"type": "image", "uri": "https://media.example.test/a", "mime_type": "image/png"},
+            {"type": "file", "uri": "https://media.example.test/b", "mime_type": "application/pdf"},
+        ],
+        [
+            {"type": "image", "uri": "https://media.example.test/a", "mime_type": "image/png"},
+            {"type": "image", "uri": "https://media.example.test/b", "mime_type": "image/png"},
+        ],
+        [
+            {"type": "image", "uri": "https://media.example.test/a", "mime_type": "image/png"},
+            {"type": "voice", "uri": "https://media.example.test/b", "mime_type": "audio/wav"},
+        ],
+    ],
+)
+async def test_rejects_mixed_or_multiple_media(content: list[dict[str, str]]) -> None:
+    sender = _MediaSender()
+
+    result, *_ = await _invoke(
+        input=_input(content=content),
+        policy=_Policy(tools=frozenset({"send_media", "send_voice"})),
+        media_sender=sender,
+        enabled_content_types=frozenset({"text", "voice", "image", "file"}),
+    )
+
+    assert result["status"] == "rejected"
+    assert result["error"]["code"] == "CONTENT_TYPE_DENIED"
+    assert sender.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "mime_type"),
+    [
+        (".wav", "audio/wav"),
+        (".mp3", "audio/mpeg"),
+        (".pdf", "application/pdf"),
+        (".txt", "text/plain"),
+    ],
+)
+async def test_whatsapp_staged_artifacts_preserve_safe_suffix_mime(
     tmp_path: Path, suffix: str, mime_type: str
 ) -> None:
     path = tmp_path / f"voice{suffix}"
@@ -354,7 +594,7 @@ async def test_voice_send_rejects_external_private_or_arbitrary_paths(
         resolved_artifacts=resolved,
         artifact_root=tmp_path / "artifacts",
         clock=lambda: 1_000.0,
-        voice_sender=sender,
+        media_sender=sender,
     )
 
     assert result["status"] == "rejected"

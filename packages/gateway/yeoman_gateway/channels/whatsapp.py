@@ -480,6 +480,10 @@ class WhatsAppChannel(BaseChannel):
                     mime = "image/webp"
                 elif suffix == ".gif":
                     mime = "image/gif"
+                elif suffix == ".pdf":
+                    mime = "application/pdf"
+                elif suffix == ".txt":
+                    mime = "text/plain"
                 elif suffix == ".mp4":
                     mime = "video/mp4"
 
