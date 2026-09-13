@@ -15,7 +15,6 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,11 +29,23 @@ from yeoman_gateway.a2a.contracts import (
 )
 
 LOG = logging.getLogger("yeoman.a2a.relay")
-_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_PRIVATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_SKILL_ID = re.compile(r"^(conversation|[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+)$")
 _ALLOWED_CONTENT_TYPES = frozenset({"text", "image", "file", "voice"})
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
-_DB_LOCKS: dict[str, threading.RLock] = {}
-_DB_LOCKS_GUARD = threading.Lock()
+_TERMINAL_STATES = frozenset({"TASK_STATE_COMPLETED", "TASK_STATE_REJECTED", "TASK_STATE_FAILED"})
+_SKILL_CARDS: dict[str, tuple[str, str, list[str]]] = {
+    "whatsapp.send": (
+        "WhatsApp delivery",
+        "Deliver policy-approved content to a configured recipient alias.",
+        ["whatsapp", "delivery"],
+    ),
+    "media.voice.generate": (
+        "Voice generation",
+        "Generate a deliverable voice artifact using the configured runtime.",
+        ["voice", "audio"],
+    ),
+}
 
 
 class RelayConfigurationError(ValueError):
@@ -42,17 +53,21 @@ class RelayConfigurationError(ValueError):
 
 
 class _RequestError(ValueError):
-    def __init__(self, code: str, message: str, *, rpc_code: int = -32602) -> None:
+    def __init__(self, rpc_code: int, message: str) -> None:
+        self.rpc_code = rpc_code
+        self.message = message
+        super().__init__(message)
+
+
+class _ProfileRejectionError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
         self.code = code
         self.message = message
-        self.rpc_code = rpc_code
         super().__init__(message)
 
 
 class _IPCError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
+    pass
 
 
 def _csv(value: str) -> frozenset[str]:
@@ -133,7 +148,9 @@ class RelayConfig:
         try:
             bind = ipaddress.ip_address(self.bind_host)
         except ValueError as exc:
-            raise RelayConfigurationError("bind host must be an explicit private IP address") from exc
+            raise RelayConfigurationError(
+                "bind host must be an explicit private IP address"
+            ) from exc
         if bind.is_unspecified or not (bind.is_private or bind.is_loopback or bind in _CGNAT):
             raise RelayConfigurationError("bind host must be an explicit private IP address")
         if not 1 <= self.port <= 65_535:
@@ -145,7 +162,7 @@ class RelayConfig:
                 ipaddress.ip_address(value.split("%", 1)[0])
         except ValueError as exc:
             raise RelayConfigurationError("allowed peer IPs must be IP addresses") from exc
-        if not _IDENTIFIER.fullmatch(self.peer_id):
+        if not _PRIVATE_ID.fullmatch(self.peer_id):
             raise RelayConfigurationError("peer ID is malformed")
         if not self.bearer_secret:
             raise RelayConfigurationError("bearer secret is required")
@@ -180,14 +197,10 @@ class _Claim:
     task_id: str
     effect_id: str
     request_hash: str
+    context_id: str
+    reference_task_ids: list[str]
     task: dict[str, Any]
     conflict: bool = False
-
-
-def _db_lock(path: Path) -> threading.RLock:
-    key = str(path.resolve())
-    with _DB_LOCKS_GUARD:
-        return _DB_LOCKS.setdefault(key, threading.RLock())
 
 
 def _json(value: Any) -> str:
@@ -202,17 +215,23 @@ def _audit() -> dict[str, str]:
     return {"profile": PROFILE_URI, "contractRelease": CONTRACT_RELEASE}
 
 
+def _opaque(value: Any) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 200
+
+
 def _correlation(
     task_id: str,
     context_id: str,
     reference_task_ids: list[str],
-    idempotency_key: str,
+    idempotency_key: str | None,
 ) -> dict[str, Any]:
-    value: dict[str, Any] = {"task_id": task_id, "idempotency_key": idempotency_key}
+    value: dict[str, Any] = {"task_id": task_id}
     if context_id:
         value["context_id"] = context_id
     if reference_task_ids:
         value["reference_task_ids"] = reference_task_ids
+    if idempotency_key is not None:
+        value["idempotency_key"] = idempotency_key
     return value
 
 
@@ -236,14 +255,12 @@ def _profile_failure(
 def _task(
     task_id: str,
     context_id: str,
-    reference_task_ids: list[str],
     state: str,
     result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task: dict[str, Any] = {
         "id": task_id,
         "contextId": context_id,
-        "referenceTaskIds": reference_task_ids,
         "status": {"state": state, "timestamp": _now()},
         "metadata": _audit(),
     }
@@ -269,7 +286,6 @@ def _effect_id(peer: str, skill: str, key: str) -> str:
 class _RelayStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.lock = _db_lock(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
@@ -277,6 +293,8 @@ class _RelayStore:
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
                     peer TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    reference_task_ids TEXT NOT NULL,
                     task_json TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS tasks_peer_id ON tasks(peer, task_id);
@@ -287,7 +305,8 @@ class _RelayStore:
                     request_hash TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     effect_id TEXT NOT NULL,
-                    result_json TEXT,
+                    lease_until REAL NOT NULL DEFAULT 0,
+                    lease_token TEXT,
                     PRIMARY KEY(peer, skill, idempotency_key),
                     FOREIGN KEY(task_id) REFERENCES tasks(task_id)
                 );
@@ -310,7 +329,7 @@ class _RelayStore:
         skill = invocation["skill"]
         key = invocation["input"]["idempotency_key"]
         request_hash = canonical_request_hash(invocation)
-        with self.lock, self._connect() as connection:
+        with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """SELECT request_hash, task_id, effect_id
@@ -330,24 +349,31 @@ class _RelayStore:
                         reference_task_ids,
                     )
                 task_row = connection.execute(
-                    "SELECT task_json FROM tasks WHERE task_id=? AND peer=?", (task_id, peer)
+                    """SELECT context_id, reference_task_ids, task_json
+                       FROM tasks WHERE task_id=? AND peer=?""",
+                    (task_id, peer),
                 ).fetchone()
                 if task_row is None:
                     raise RuntimeError("idempotency row has no task")
-                return _Claim(task_id, effect_id, request_hash, json.loads(task_row[0]))
+                stored_context, stored_references, task_json = task_row
+                return _Claim(
+                    task_id,
+                    effect_id,
+                    request_hash,
+                    stored_context,
+                    json.loads(stored_references),
+                    json.loads(task_json),
+                )
 
             task_id = f"task-{uuid.uuid4().hex}"
             context = context_id or f"context-{uuid.uuid4().hex}"
             effect_id = _effect_id(peer, skill, key)
-            task = _task(
-                task_id,
-                context,
-                reference_task_ids,
-                "TASK_STATE_SUBMITTED",
-            )
+            task = _task(task_id, context, "TASK_STATE_SUBMITTED")
             connection.execute(
-                "INSERT INTO tasks(task_id, peer, task_json) VALUES (?, ?, ?)",
-                (task_id, peer, _json(task)),
+                """INSERT INTO tasks
+                   (task_id, peer, context_id, reference_task_ids, task_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (task_id, peer, context, _json(reference_task_ids), _json(task)),
             )
             connection.execute(
                 """INSERT INTO idempotency
@@ -355,7 +381,7 @@ class _RelayStore:
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (peer, skill, key, request_hash, task_id, effect_id),
             )
-            return _Claim(task_id, effect_id, request_hash, task)
+            return _Claim(task_id, effect_id, request_hash, context, reference_task_ids, task)
 
     def _conflict(
         self,
@@ -370,12 +396,18 @@ class _RelayStore:
         digest = hashlib.sha256(f"{peer}\0{skill}\0{key}\0{request_hash}".encode()).hexdigest()
         task_id = f"task-conflict-{digest[:32]}"
         existing = connection.execute(
-            "SELECT task_json FROM tasks WHERE task_id=? AND peer=?", (task_id, peer)
+            """SELECT context_id, reference_task_ids, task_json
+               FROM tasks WHERE task_id=? AND peer=?""",
+            (task_id, peer),
         ).fetchone()
         if existing is not None:
-            task = json.loads(existing[0])
+            stored_context, stored_references, task_json = existing
+            task = json.loads(task_json)
+            references = json.loads(stored_references)
         else:
-            correlation = _correlation(task_id, context_id, reference_task_ids, key)
+            stored_context = context_id or f"context-{uuid.uuid4().hex}"
+            references = reference_task_ids
+            correlation = _correlation(task_id, stored_context, references, key)
             result = _profile_failure(
                 skill,
                 "rejected",
@@ -383,43 +415,97 @@ class _RelayStore:
                 "The idempotency key was already used for a different request.",
                 correlation,
             )
-            task = _task(
-                task_id,
-                context_id,
-                reference_task_ids,
-                "TASK_STATE_REJECTED",
-                result,
-            )
+            task = _task(task_id, stored_context, "TASK_STATE_REJECTED", result)
             connection.execute(
-                "INSERT INTO tasks(task_id, peer, task_json) VALUES (?, ?, ?)",
-                (task_id, peer, _json(task)),
+                """INSERT INTO tasks
+                   (task_id, peer, context_id, reference_task_ids, task_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (task_id, peer, stored_context, _json(references), _json(task)),
             )
-        return _Claim(task_id, "", request_hash, task, conflict=True)
+        return _Claim(
+            task_id,
+            "",
+            request_hash,
+            stored_context,
+            references,
+            task,
+            conflict=True,
+        )
+
+    def acquire(
+        self, claim: _Claim, peer: str, lease_seconds: float
+    ) -> tuple[str | None, dict[str, Any]]:
+        token = uuid.uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT i.lease_until, t.task_json
+                   FROM idempotency AS i JOIN tasks AS t ON t.task_id=i.task_id
+                   WHERE i.peer=? AND i.task_id=? AND i.request_hash=?""",
+                (peer, claim.task_id, claim.request_hash),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("claim disappeared")
+            lease_until, task_json = row
+            task = json.loads(task_json)
+            if task["status"]["state"] in _TERMINAL_STATES or lease_until > time.time():
+                return None, task
+            connection.execute(
+                """UPDATE idempotency SET lease_until=?, lease_token=?
+                   WHERE peer=? AND task_id=? AND request_hash=?""",
+                (time.time() + lease_seconds, token, peer, claim.task_id, claim.request_hash),
+            )
+            return token, task
 
     def finish(
         self,
         *,
         peer: str,
-        skill: str,
-        key: str,
         claim: _Claim,
+        lease_token: str,
         task: dict[str, Any],
-        result: dict[str, Any],
-    ) -> None:
-        with self.lock, self._connect() as connection:
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT i.lease_token, t.task_json
+                   FROM idempotency AS i JOIN tasks AS t ON t.task_id=i.task_id
+                   WHERE i.peer=? AND i.task_id=? AND i.request_hash=?""",
+                (peer, claim.task_id, claim.request_hash),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("claim disappeared")
+            current_token, task_json = row
+            if current_token != lease_token:
+                return json.loads(task_json)
             connection.execute(
                 "UPDATE tasks SET task_json=? WHERE task_id=? AND peer=?",
                 (_json(task), claim.task_id, peer),
             )
             connection.execute(
-                """UPDATE idempotency SET result_json=?
-                   WHERE peer=? AND skill=? AND idempotency_key=? AND request_hash=?""",
-                (_json(result), peer, skill, key, claim.request_hash),
+                """UPDATE idempotency SET lease_until=0, lease_token=NULL
+                   WHERE peer=? AND task_id=? AND request_hash=?""",
+                (peer, claim.task_id, claim.request_hash),
+            )
+            return task
+
+    def remember(
+        self,
+        peer: str,
+        task: dict[str, Any],
+        context_id: str,
+        reference_task_ids: list[str],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO tasks
+                   (task_id, peer, context_id, reference_task_ids, task_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (task["id"], peer, context_id, _json(reference_task_ids), _json(task)),
             )
 
     def get(self, peer: str, task_id: str) -> dict[str, Any] | None:
-        with self.lock, self._connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT task_json FROM tasks WHERE peer=? AND task_id=?", (peer, task_id)
             ).fetchone()
@@ -429,64 +515,46 @@ class _RelayStore:
 class RelayService:
     """Protocol logic shared by the thin HTTP handler."""
 
-    def __init__(
-        self,
-        config: RelayConfig,
-        *,
-        voice_probe: Callable[[], bool] | None = None,
-        schemas: ContractSchemas | None = None,
-    ) -> None:
+    def __init__(self, config: RelayConfig, *, schemas: ContractSchemas | None = None) -> None:
         self.config = config
         self.store = _RelayStore(config.state_path)
         self.schemas = schemas or ContractSchemas.load()
-        self.voice_probe = voice_probe or (lambda: False)
         self._rate_lock = threading.Lock()
         self._requests: dict[str, list[float]] = {}
 
-    def _skills(self) -> tuple[str, ...]:
+    def _configured_skills(self) -> tuple[str, ...]:
         skills: list[str] = []
         if self.config.whatsapp_enabled:
             skills.append("whatsapp.send")
-        try:
-            voice_ready = self.config.voice_enabled and self.voice_probe() is True
-        except Exception:
-            voice_ready = False
-        if voice_ready:
+        if self.config.voice_enabled:
             skills.append("media.voice.generate")
         return tuple(skills)
 
+    def _downstream_ready(self) -> bool:
+        try:
+            envelope = self._socket_call({"cmd": "ping"})
+        except _IPCError:
+            return False
+        return envelope == {"status": "ok", "response": "pong"}
+
     def agent_card(self) -> dict[str, Any]:
-        descriptions = {
-            "whatsapp.send": (
-                "WhatsApp delivery",
-                "Deliver policy-approved content to a configured recipient alias.",
-                ["whatsapp", "delivery"],
-            ),
-            "media.voice.generate": (
-                "Voice generation",
-                "Generate a deliverable voice artifact using the configured runtime.",
-                ["voice", "audio"],
-            ),
-        }
         skills = []
-        for skill_id in self._skills():
-            name, description, tags = descriptions[skill_id]
-            skills.append(
-                {
-                    "id": skill_id,
-                    "name": name,
-                    "description": description,
-                    "tags": tags,
-                    "inputModes": ["application/json"],
-                    "outputModes": ["application/json"],
-                }
-            )
+        if self._downstream_ready():
+            for skill_id in self._configured_skills():
+                name, description, tags = _SKILL_CARDS[skill_id]
+                skills.append(
+                    {
+                        "id": skill_id,
+                        "name": name,
+                        "description": description,
+                        "tags": tags,
+                        "inputModes": ["application/json"],
+                        "outputModes": ["application/json"],
+                    }
+                )
         return {
             "name": "Yeoman",
             "description": "Policy-controlled structured messaging capabilities.",
-            "url": self.config.public_url,
-            "version": CONTRACT_RELEASE,
-            "protocolVersion": "1.0",
             "supportedInterfaces": [
                 {
                     "url": self.config.public_url,
@@ -494,24 +562,24 @@ class RelayService:
                     "protocolVersion": "1.0",
                 }
             ],
+            "version": CONTRACT_RELEASE,
             "capabilities": {
                 "streaming": False,
                 "pushNotifications": False,
-                "stateTransitionHistory": False,
                 "extendedAgentCard": False,
+                "extensions": [
+                    {
+                        "uri": PROFILE_URI,
+                        "description": "Hermes/Yeoman structured skill profile v1",
+                        "required": True,
+                    }
+                ],
             },
+            "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}},
+            "securityRequirements": [{"schemes": {"bearer": {"list": []}}}],
             "defaultInputModes": ["application/json"],
             "defaultOutputModes": ["application/json"],
-            "extensions": [
-                {
-                    "uri": PROFILE_URI,
-                    "description": "Hermes/Yeoman structured skill profile v1",
-                    "required": True,
-                }
-            ],
             "skills": skills,
-            "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}},
-            "security": [{"bearer": []}],
         }
 
     def authenticate(self, peer_ip: str, authorization: str) -> bool:
@@ -543,185 +611,297 @@ class RelayService:
             self._requests[peer_ip] = recent
             return True
 
+    @staticmethod
+    def rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+    @staticmethod
+    def _check_fields(value: Any, allowed: set[str], required: set[str]) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) - allowed or not required <= set(value):
+            raise _RequestError(-32602, "Invalid params")
+        return value
+
     def dispatch(self, request: Any) -> dict[str, Any]:
-        if not isinstance(request, dict):
-            raise _RequestError("INVALID_REQUEST", "The JSON-RPC request must be an object.")
-        request_id = request.get("id")
-        if request.get("jsonrpc") != "2.0":
-            return self.rpc_error(
-                request_id,
-                _RequestError("INVALID_REQUEST", "jsonrpc must be 2.0.", rpc_code=-32600),
-            )
-        method = request.get("method")
-        params = request.get("params", {})
-        if not isinstance(params, dict):
-            return self.rpc_error(
-                request_id, _RequestError("INVALID_REQUEST", "params must be an object.")
-            )
-        if method in {"GetTask", "tasks/get"}:
-            return self._get_task(request_id, params)
-        if method in {"SendMessage", "message/send"}:
-            return self._send_message(request_id, params)
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": "Method not found"},
-        }
+        request_id = request.get("id") if isinstance(request, dict) else None
+        try:
+            if (
+                not isinstance(request, dict)
+                or set(request) != {"jsonrpc", "id", "method", "params"}
+                or request.get("jsonrpc") != "2.0"
+                or isinstance(request.get("id"), bool)
+                or not isinstance(request.get("id"), (str, int))
+                or not isinstance(request.get("method"), str)
+                or not isinstance(request.get("params"), dict)
+            ):
+                raise _RequestError(-32600, "Invalid Request")
+            method = request["method"]
+            if method in {"GetTask", "tasks/get"}:
+                return self._get_task(request_id, request["params"])
+            if method in {"SendMessage", "message/send"}:
+                return self._send_message(request_id, request["params"])
+            return self.rpc_error(request_id, -32601, "Method not found")
+        except _RequestError as exc:
+            return self.rpc_error(request_id, exc.rpc_code, exc.message)
 
     def _get_task(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
-        task_id = params.get("id", params.get("taskId"))
-        if not isinstance(task_id, str) or not _IDENTIFIER.fullmatch(task_id):
-            return self.rpc_error(
-                request_id,
-                _RequestError("INVALID_IDENTIFIER", "The task identifier is malformed."),
-            )
+        self._check_fields(params, {"tenant", "id", "historyLength"}, {"id"})
+        task_id = params["id"]
+        if not _opaque(task_id):
+            raise _RequestError(-32602, "Invalid params")
+        if "tenant" in params and not isinstance(params["tenant"], str):
+            raise _RequestError(-32602, "Invalid params")
+        history_length = params.get("historyLength")
+        if history_length is not None and (
+            isinstance(history_length, bool)
+            or not isinstance(history_length, int)
+            or history_length < 0
+        ):
+            raise _RequestError(-32602, "Invalid params")
         task = self.store.get(self.config.peer_id, task_id)
         if task is None:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32001, "message": "Task not found"},
-            }
+            return self.rpc_error(request_id, -32001, "Task not found")
         return {"jsonrpc": "2.0", "id": request_id, "result": task}
 
     def _send_message(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        invocation, context_id, references = self._parse_send(params)
+        skill = invocation.get("skill") if isinstance(invocation, dict) else None
+        if not isinstance(skill, str) or not _SKILL_ID.fullmatch(skill):
+            raise _RequestError(-32602, "Invalid params")
         try:
-            invocation, context_id, references = self._validated_invocation(params)
-        except _RequestError as exc:
-            return self.rpc_error(request_id, exc)
-        skill = invocation["skill"]
+            self._validate_profile(invocation)
+        except _ProfileRejectionError as exc:
+            return self._rejected(request_id, skill, invocation, context_id, references, exc)
+
         key = invocation["input"]["idempotency_key"]
-        with self.store.lock:
-            claim = self.store.claim(
-                peer=self.config.peer_id,
-                invocation=invocation,
-                context_id=context_id,
-                reference_task_ids=references,
-            )
-            if claim.conflict or claim.task["status"]["state"] != "TASK_STATE_SUBMITTED":
-                return {"jsonrpc": "2.0", "id": request_id, "result": {"task": claim.task}}
-            task_context = claim.task["contextId"]
-            correlation = _correlation(claim.task_id, task_context, references, key)
-            try:
-                result = self._invoke(
-                    invocation,
-                    claim.task_id,
-                    task_context,
-                    references,
-                    claim.effect_id,
-                )
-                self._validate_runtime_result(skill, result, correlation)
-                state = {
-                    "completed": "TASK_STATE_COMPLETED",
-                    "rejected": "TASK_STATE_REJECTED",
-                    "failed": "TASK_STATE_FAILED",
-                }.get(result["status"], "TASK_STATE_WORKING")
-            except (A2AContractValidationError, _IPCError, KeyError, TypeError):
-                result = _profile_failure(
-                    skill,
-                    "failed",
-                    "INVALID_UPSTREAM_RESULT",
-                    "The local runtime returned an invalid structured result.",
-                    correlation,
-                )
-                state = "TASK_STATE_FAILED"
-            task = _task(claim.task_id, task_context, references, state, result)
-            self.store.finish(
-                peer=self.config.peer_id,
-                skill=skill,
-                key=key,
-                claim=claim,
-                task=task,
-                result=result,
-            )
-        LOG.info(
-            "event=a2a_task task_id=%s context_id=%s skill=%s code=%s",
-            claim.task_id,
-            task_context,
-            skill,
-            result["status"],
+        claim = self.store.claim(
+            peer=self.config.peer_id,
+            invocation=invocation,
+            context_id=context_id,
+            reference_task_ids=references,
         )
+        if claim.conflict or claim.task["status"]["state"] in _TERMINAL_STATES:
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"task": claim.task}}
+
+        deadline = time.monotonic() + (self.config.timeout_seconds * 3) + 1
+        lease_token: str | None = None
+        task = claim.task
+        while lease_token is None and time.monotonic() < deadline:
+            lease_token, task = self.store.acquire(
+                claim, self.config.peer_id, self.config.timeout_seconds * 2 + 0.5
+            )
+            if task["status"]["state"] in _TERMINAL_STATES:
+                return {"jsonrpc": "2.0", "id": request_id, "result": {"task": task}}
+            if lease_token is None:
+                time.sleep(0.01)
+        if lease_token is None:
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"task": task}}
+
+        correlation = _correlation(
+            claim.task_id,
+            claim.context_id,
+            claim.reference_task_ids,
+            key,
+        )
+        try:
+            result = self._invoke(
+                invocation,
+                claim.task_id,
+                claim.context_id,
+                claim.effect_id,
+            )
+            result = self._validated_runtime_result(
+                skill, result, correlation, claim.reference_task_ids
+            )
+            state = {
+                "completed": "TASK_STATE_COMPLETED",
+                "rejected": "TASK_STATE_REJECTED",
+                "failed": "TASK_STATE_FAILED",
+            }.get(result["status"], "TASK_STATE_WORKING")
+        except A2AContractValidationError, _IPCError, KeyError, TypeError:
+            result = _profile_failure(
+                skill,
+                "failed",
+                "INVALID_UPSTREAM_RESULT",
+                "The local runtime returned an invalid structured result.",
+                correlation,
+            )
+            state = "TASK_STATE_FAILED"
+        task = _task(claim.task_id, claim.context_id, state, result)
+        task = self.store.finish(
+            peer=self.config.peer_id,
+            claim=claim,
+            lease_token=lease_token,
+            task=task,
+        )
+        LOG.info("event=a2a_task task_id=%s skill=%s code=%s", claim.task_id, skill, state)
         return {"jsonrpc": "2.0", "id": request_id, "result": {"task": task}}
 
-    def _validated_invocation(
-        self, params: dict[str, Any]
-    ) -> tuple[dict[str, Any], str, list[str]]:
-        message = params.get("message")
-        if not isinstance(message, dict):
-            raise _RequestError("INVALID_REQUEST", "params.message must be an object.")
-        context_id = message.get("contextId", params.get("contextId", ""))
-        if context_id != "" and (
-            not isinstance(context_id, str) or not _IDENTIFIER.fullmatch(context_id)
+    def _parse_send(self, params: dict[str, Any]) -> tuple[dict[str, Any], str, list[str]]:
+        self._check_fields(
+            params,
+            {"tenant", "message", "configuration", "metadata"},
+            {"message"},
+        )
+        if "tenant" in params and not isinstance(params["tenant"], str):
+            raise _RequestError(-32602, "Invalid params")
+        if "metadata" in params and not isinstance(params["metadata"], dict):
+            raise _RequestError(-32602, "Invalid params")
+        self._parse_configuration(params.get("configuration"))
+        message = self._check_fields(
+            params["message"],
+            {
+                "messageId",
+                "contextId",
+                "taskId",
+                "role",
+                "parts",
+                "metadata",
+                "extensions",
+                "referenceTaskIds",
+            },
+            {"messageId", "role", "parts"},
+        )
+        if message["role"] != "ROLE_USER" or not _opaque(message["messageId"]):
+            raise _RequestError(-32602, "Invalid params")
+        if "taskId" in message:
+            if not _opaque(message["taskId"]):
+                raise _RequestError(-32602, "Invalid params")
+            raise _RequestError(-32602, "Invalid params")
+        if "metadata" in message and not isinstance(message["metadata"], dict):
+            raise _RequestError(-32602, "Invalid params")
+        if "extensions" in message and (
+            not isinstance(message["extensions"], list)
+            or any(not isinstance(item, str) for item in message["extensions"])
         ):
-            raise _RequestError("INVALID_IDENTIFIER", "The context identifier is malformed.")
+            raise _RequestError(-32602, "Invalid params")
+
+        context_id = message.get("contextId", "")
+        if "contextId" in message and not _opaque(context_id):
+            raise _RequestError(-32602, "Invalid params")
         references = message.get("referenceTaskIds", [])
         if (
             not isinstance(references, list)
             or len(references) > 20
-            or any(not isinstance(value, str) or not _IDENTIFIER.fullmatch(value) for value in references)
+            or any(not _opaque(value) for value in references)
             or len(set(references)) != len(references)
         ):
-            raise _RequestError("INVALID_IDENTIFIER", "Reference task identifiers are malformed.")
-        parts = message.get("parts")
-        if not isinstance(parts, list):
-            raise _RequestError("INVALID_REQUEST", "Message parts must be a list.")
-        if any(isinstance(part, dict) and "data" in part and "text" in part for part in parts):
-            raise _RequestError("INVALID_REQUEST", "A DataPart cannot also be a text part.")
-        authoritative = [
-            part["data"]
-            for part in parts
-            if isinstance(part, dict)
-            and part.get("mediaType") == "application/json"
-            and "data" in part
-        ]
-        if len(authoritative) != 1:
-            raise _RequestError(
-                "INVALID_REQUEST", "Exactly one application/json DataPart is required."
+            raise _RequestError(-32602, "Invalid params")
+        parts = message["parts"]
+        if not isinstance(parts, list) or not parts:
+            raise _RequestError(-32602, "Invalid params")
+        authoritative: list[Any] = []
+        for part in parts:
+            parsed = self._check_fields(
+                part,
+                {"text", "raw", "url", "data", "metadata", "filename", "mediaType"},
+                set(),
             )
-        invocation = authoritative[0]
+            content = [key for key in ("text", "raw", "url", "data") if key in parsed]
+            if len(content) != 1 or content[0] not in {"text", "data"}:
+                raise _RequestError(-32602, "Invalid params")
+            if "metadata" in parsed and not isinstance(parsed["metadata"], dict):
+                raise _RequestError(-32602, "Invalid params")
+            if "filename" in parsed and not isinstance(parsed["filename"], str):
+                raise _RequestError(-32602, "Invalid params")
+            if "mediaType" in parsed and not isinstance(parsed["mediaType"], str):
+                raise _RequestError(-32602, "Invalid params")
+            if content[0] == "text" and not isinstance(parsed["text"], str):
+                raise _RequestError(-32602, "Invalid params")
+            if content[0] == "data" and parsed.get("mediaType") == "application/json":
+                authoritative.append(parsed["data"])
+        if len(authoritative) != 1:
+            raise _RequestError(-32602, "Invalid params")
+        return authoritative[0], context_id, references
+
+    @staticmethod
+    def _parse_configuration(configuration: Any) -> None:
+        if configuration is None:
+            return
+        if not isinstance(configuration, dict) or set(configuration) - {
+            "acceptedOutputModes",
+            "taskPushNotificationConfig",
+            "historyLength",
+            "returnImmediately",
+        }:
+            raise _RequestError(-32602, "Invalid params")
+        modes = configuration.get("acceptedOutputModes")
+        if modes is not None and (
+            not isinstance(modes, list) or any(not isinstance(mode, str) for mode in modes)
+        ):
+            raise _RequestError(-32602, "Invalid params")
+        history = configuration.get("historyLength")
+        if history is not None and (
+            isinstance(history, bool) or not isinstance(history, int) or history < 0
+        ):
+            raise _RequestError(-32602, "Invalid params")
+        immediate = configuration.get("returnImmediately")
+        if immediate is not None and not isinstance(immediate, bool):
+            raise _RequestError(-32602, "Invalid params")
+        if "taskPushNotificationConfig" in configuration:
+            raise _RequestError(-32602, "Invalid params")
+
+    def _validate_profile(self, invocation: dict[str, Any]) -> None:
         try:
             self.schemas.validate_invocation(invocation)
         except A2AContractValidationError as exc:
-            raise _RequestError("INVALID_REQUEST", "The invocation is invalid.") from exc
+            raise _ProfileRejectionError(
+                "INVALID_INVOCATION", "The invocation is invalid."
+            ) from exc
         skill = invocation["skill"]
-        if skill not in self._skills():
-            raise _RequestError("CAPABILITY_UNAVAILABLE", "The requested skill is unavailable.")
+        if skill not in self._configured_skills():
+            raise _ProfileRejectionError(
+                "SKILL_NOT_ADVERTISED", "The requested skill is not advertised."
+            )
         try:
             self.schemas.validate_request(skill, invocation["input"])
         except A2AContractValidationError as exc:
-            raise _RequestError("INVALID_REQUEST", "The skill input is invalid.") from exc
+            raise _ProfileRejectionError(
+                "INVALID_SKILL_INPUT", "The skill input is invalid."
+            ) from exc
         if skill == "whatsapp.send":
             requested_types = {part["type"] for part in invocation["input"]["content"]}
             if not requested_types <= self.config.content_types:
-                raise _RequestError(
-                    "CAPABILITY_UNAVAILABLE", "A requested content type is unavailable."
+                raise _ProfileRejectionError(
+                    "CONTENT_TYPE_DENIED", "A requested content type is not enabled."
                 )
-        return invocation, context_id, references
 
-    def _invoke(
+    def _rejected(
         self,
+        request_id: Any,
+        skill: str,
         invocation: dict[str, Any],
-        task_id: str,
         context_id: str,
         references: list[str],
-        effect_id: str,
+        rejection: _ProfileRejectionError,
     ) -> dict[str, Any]:
-        request = {
-            "cmd": "a2a_invoke",
-            "args": {
-                "peer": self.config.peer_id,
-                "skill": invocation["skill"],
-                "input": invocation["input"],
-                "task_id": task_id,
-                "context_id": context_id,
-                "reference_task_ids": references,
-                "effect_id": effect_id,
-                "audit": _audit(),
-            },
-        }
+        task_id = f"task-{uuid.uuid4().hex}"
+        task_context = context_id or f"context-{uuid.uuid4().hex}"
+        raw_input = invocation.get("input")
+        raw_key = raw_input.get("idempotency_key") if isinstance(raw_input, dict) else None
+        key = raw_key if isinstance(raw_key, str) and _PRIVATE_ID.fullmatch(raw_key) else None
+        result = _profile_failure(
+            skill,
+            "rejected",
+            rejection.code,
+            rejection.message,
+            _correlation(task_id, task_context, references, key),
+        )
+        self.schemas.validate_result(result)
+        task = _task(task_id, task_context, "TASK_STATE_REJECTED", result)
+        self.store.remember(self.config.peer_id, task, task_context, references)
+        LOG.info(
+            "event=a2a_task task_id=%s skill=%s code=%s",
+            task_id,
+            skill,
+            rejection.code,
+        )
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"task": task}}
+
+    def _socket_call(self, request: dict[str, Any]) -> dict[str, Any]:
         encoded = (_json(request) + "\n").encode()
         if len(encoded) > self.config.max_body_bytes:
             raise _IPCError("IPC_REQUEST_TOO_LARGE")
+        deadline = time.monotonic() + self.config.timeout_seconds
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(self.config.timeout_seconds)
@@ -729,6 +909,10 @@ class RelayService:
                 client.sendall(encoded)
                 response = bytearray()
                 while not response.endswith(b"\n"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _IPCError("IPC_TIMEOUT")
+                    client.settimeout(remaining)
                     chunk = client.recv(65_536)
                     if not chunk:
                         break
@@ -745,6 +929,28 @@ class RelayService:
             raise _IPCError("IPC_INVALID_JSON") from exc
         if not isinstance(envelope, dict):
             raise _IPCError("IPC_INVALID_RESULT")
+        return envelope
+
+    def _invoke(
+        self,
+        invocation: dict[str, Any],
+        task_id: str,
+        context_id: str,
+        effect_id: str,
+    ) -> dict[str, Any]:
+        envelope = self._socket_call(
+            {
+                "cmd": "a2a_invoke",
+                "args": {
+                    "peer": self.config.peer_id,
+                    "skill": invocation["skill"],
+                    "input": invocation["input"],
+                    "task_id": task_id,
+                    "context_id": context_id,
+                    "effect_id": effect_id,
+                },
+            }
+        )
         if envelope.get("status") == "error":
             raw_error = envelope.get("error")
             if not isinstance(raw_error, dict):
@@ -752,7 +958,7 @@ class RelayService:
             correlation = _correlation(
                 task_id,
                 context_id,
-                references,
+                [],
                 invocation["input"]["idempotency_key"],
             )
             candidate = {
@@ -777,11 +983,17 @@ class RelayService:
             raise _IPCError("IPC_INVALID_RESULT")
         return result
 
-    def _validate_runtime_result(
-        self, skill: str, result: dict[str, Any], expected_correlation: dict[str, Any]
-    ) -> None:
+    def _validated_runtime_result(
+        self,
+        skill: str,
+        result: dict[str, Any],
+        expected_correlation: dict[str, Any],
+        reference_task_ids: list[str],
+    ) -> dict[str, Any]:
         self.schemas.validate_result(result)
-        if result.get("skill") != skill or result.get("correlation") != expected_correlation:
+        gateway_correlation = dict(expected_correlation)
+        gateway_correlation.pop("reference_task_ids", None)
+        if result.get("skill") != skill or result.get("correlation") != gateway_correlation:
             raise A2AContractValidationError("$.correlation", "does not match invocation")
         status = result["status"]
         if status in {"completed", "accepted", "in_progress"}:
@@ -789,24 +1001,10 @@ class RelayService:
             if not isinstance(output, dict):
                 raise A2AContractValidationError("$.output", "required")
             self.schemas.validate_response(skill, output)
-
-    def rpc_error(self, request_id: Any, error: _RequestError) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": error.rpc_code,
-                "message": error.message,
-                "data": {
-                    "error": {
-                        "code": error.code,
-                        "message": error.message,
-                        "retryable": False,
-                    },
-                    "audit": _audit(),
-                },
-            },
-        }
+        if reference_task_ids:
+            result = {**result, "correlation": expected_correlation}
+            self.schemas.validate_result(result)
+        return result
 
 
 def make_handler(service: RelayService) -> type[http.server.BaseHTTPRequestHandler]:
@@ -862,14 +1060,10 @@ def make_handler(service: RelayService) -> type[http.server.BaseHTTPRequestHandl
             except TimeoutError:
                 self._send(408, {"error": {"code": "BODY_TIMEOUT"}})
                 return
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self._send(400, {"error": {"code": "INVALID_JSON"}})
+            except UnicodeDecodeError, json.JSONDecodeError:
+                self._send(200, service.rpc_error(None, -32700, "Parse error"))
                 return
-            try:
-                response = service.dispatch(request)
-            except _RequestError as exc:
-                response = service.rpc_error(None, exc)
-            self._send(200, response)
+            self._send(200, service.dispatch(request))
 
         def log_message(self, _format: str, *_args: Any) -> None:
             return
@@ -887,6 +1081,7 @@ def create_server(
 ) -> _RelayHTTPServer:
     bind = address or (service.config.bind_host, service.config.port)
     if ":" in bind[0]:
+
         class IPv6RelayHTTPServer(_RelayHTTPServer):
             address_family = socket.AF_INET6
 
@@ -894,14 +1089,10 @@ def create_server(
     return _RelayHTTPServer(bind, make_handler(service))
 
 
-def serve(
-    config: RelayConfig | None = None,
-    *,
-    voice_probe: Callable[[], bool] | None = None,
-) -> None:
+def serve(config: RelayConfig | None = None) -> None:
     runtime_config = config or RelayConfig.from_env()
     runtime_config.validate()
-    server = create_server(RelayService(runtime_config, voice_probe=voice_probe))
+    server = create_server(RelayService(runtime_config))
     LOG.info("event=a2a_relay_started code=READY")
     try:
         server.serve_forever()

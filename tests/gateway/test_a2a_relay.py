@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import multiprocessing
 import socket
 import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
-
-
-def _relay_module():
-    from yeoman_gateway.a2a import relay
-
-    return relay
+from yeoman_gateway.a2a import relay
 
 
 class FakeUnixGateway:
@@ -74,6 +71,8 @@ class FakeUnixGateway:
 
 
 def _success(request: dict[str, Any]) -> dict[str, Any]:
+    if request["cmd"] == "ping":
+        return {"status": "ok", "response": "pong"}
     args = request["args"]
     return {
         "status": "ok",
@@ -88,15 +87,13 @@ def _success(request: dict[str, Any]) -> dict[str, Any]:
             "correlation": {
                 "task_id": args["task_id"],
                 "context_id": args["context_id"],
-                "reference_task_ids": args["reference_task_ids"],
                 "idempotency_key": args["input"]["idempotency_key"],
             },
         },
     }
 
 
-def _config(tmp_path: Path, socket_path: Path, **changes: Any):
-    relay = _relay_module()
+def _config(tmp_path: Path, socket_path: Path, **changes: Any) -> relay.RelayConfig:
     values: dict[str, Any] = {
         "bind_host": "127.0.0.1",
         "port": 0,
@@ -120,12 +117,11 @@ def _config(tmp_path: Path, socket_path: Path, **changes: Any):
 
 @contextmanager
 def _running(service: Any) -> Iterator[tuple[str, int]]:
-    relay = _relay_module()
     server = relay.create_server(service, ("127.0.0.1", 0))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield server.server_address
+        yield cast(tuple[str, int], server.server_address)
     finally:
         server.shutdown()
         server.server_close()
@@ -182,17 +178,34 @@ def _send_payload(invocation: dict[str, Any], **message_changes: Any) -> dict[st
         ],
     }
     message.update(message_changes)
-    return {"jsonrpc": "2.0", "id": "rpc-1", "method": "SendMessage", "params": {"message": message}}
+    return {
+        "jsonrpc": "2.0",
+        "id": "rpc-1",
+        "method": "SendMessage",
+        "params": {"message": message},
+    }
 
 
 def _profile_result(task: dict[str, Any]) -> dict[str, Any]:
     return task["artifacts"][0]["parts"][0]["data"]
 
 
+def _dispatch_in_process(
+    config: Any,
+    payload: dict[str, Any],
+    ready: Any,
+    start: Any,
+    results: Any,
+) -> None:
+    service = relay.RelayService(config)
+    ready.put(True)
+    start.wait(2)
+    results.put(service.dispatch(payload))
+
+
 def test_config_reads_explicit_private_runtime_settings_without_revealing_secret(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    relay = _relay_module()
     monkeypatch.setenv("YEOMAN_A2A_BIND_HOST", "100.64.1.2")
     monkeypatch.setenv("YEOMAN_A2A_PORT", "9911")
     monkeypatch.setenv("YEOMAN_A2A_ALLOWED_PEER_IPS", "100.64.1.3,100.64.1.4")
@@ -220,14 +233,26 @@ def test_config_reads_explicit_private_runtime_settings_without_revealing_secret
 
 
 def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
-    relay = _relay_module()
-    config = _config(tmp_path, tmp_path / "gateway.sock")
-    service = relay.RelayService(config, voice_probe=lambda: False)
-
-    with _running(service) as address:
-        status, card = _request(address, "GET", "/.well-known/agent-card.json", token=None)
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(tmp_path, socket_path)
+    with FakeUnixGateway(socket_path, _success):
+        service = relay.RelayService(config)
+        with _running(service) as address:
+            status, card = _request(address, "GET", "/.well-known/agent-card.json", token=None)
 
     assert status == 200
+    assert set(card) == {
+        "name",
+        "description",
+        "supportedInterfaces",
+        "version",
+        "capabilities",
+        "securitySchemes",
+        "securityRequirements",
+        "defaultInputModes",
+        "defaultOutputModes",
+        "skills",
+    }
     assert card["supportedInterfaces"] == [
         {
             "url": "https://relay.example.test/a2a",
@@ -238,13 +263,20 @@ def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
     assert card["capabilities"] == {
         "streaming": False,
         "pushNotifications": False,
-        "stateTransitionHistory": False,
         "extendedAgentCard": False,
+        "extensions": [
+            {
+                "uri": "urn:hermes-yeoman:a2a-profile:v1",
+                "description": "Hermes/Yeoman structured skill profile v1",
+                "required": True,
+            }
+        ],
     }
+    assert card["securitySchemes"] == {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
+    assert card["securityRequirements"] == [{"schemes": {"bearer": {"list": []}}}]
     assert card["defaultInputModes"] == ["application/json"]
     assert card["defaultOutputModes"] == ["application/json"]
     assert [skill["id"] for skill in card["skills"]] == ["whatsapp.send"]
-    assert card["extensions"][0]["uri"] == "urn:hermes-yeoman:a2a-profile:v1"
     serialized = json.dumps(card)
     for private_value in (
         config.bearer_secret,
@@ -256,34 +288,42 @@ def test_agent_card_only_exposes_live_structured_skills(tmp_path: Path) -> None:
         assert private_value not in serialized
 
 
-def test_voice_is_advertised_only_when_enabled_and_runtime_probe_succeeds(tmp_path: Path) -> None:
-    relay = _relay_module()
-    config = _config(tmp_path, tmp_path / "gateway.sock", voice_enabled=True)
-    disabled = relay.RelayService(config, voice_probe=lambda: False)
-    enabled = relay.RelayService(config, voice_probe=lambda: True)
+def test_card_omits_configured_skills_when_downstream_socket_is_not_ready(tmp_path: Path) -> None:
+    config = _config(tmp_path, tmp_path / "missing.sock", voice_enabled=True)
 
-    assert [item["id"] for item in disabled.agent_card()["skills"]] == ["whatsapp.send"]
-    assert [item["id"] for item in enabled.agent_card()["skills"]] == [
-        "whatsapp.send",
-        "media.voice.generate",
-    ]
+    assert relay.RelayService(config).agent_card()["skills"] == []
+
+
+def test_voice_card_capability_uses_config_and_downstream_readiness(tmp_path: Path) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    with FakeUnixGateway(socket_path, _success):
+        config = _config(tmp_path, socket_path, voice_enabled=True)
+        skills = relay.RelayService(config).agent_card()["skills"]
+
+    assert [item["id"] for item in skills] == ["whatsapp.send", "media.voice.generate"]
 
 
 def test_valid_structured_text_invocation_returns_valid_task_and_exact_correlation(
     tmp_path: Path,
 ) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
+    payload = _send_payload(_invocation())
+    payload["params"]["configuration"] = {
+        "acceptedOutputModes": ["application/json"],
+        "historyLength": 0,
+        "returnImmediately": False,
+    }
+    payload["params"]["metadata"] = {"caller": "synthetic"}
     with FakeUnixGateway(socket_path, _success) as gateway:
         service = relay.RelayService(_config(tmp_path, socket_path))
         with _running(service) as address:
-            status, body = _request(address, "POST", "/", payload=_send_payload(_invocation()))
+            status, body = _request(address, "POST", "/", payload=payload)
 
     task = body["result"]["task"]
     result = _profile_result(task)
     assert status == 200
     assert task["contextId"] == "context-1"
-    assert task["referenceTaskIds"] == ["previous-1", "previous-2"]
+    assert "referenceTaskIds" not in task
     assert task["status"]["state"] == "TASK_STATE_COMPLETED"
     assert result["status"] == "completed"
     assert result["output"]["status"] == "sent"
@@ -291,62 +331,80 @@ def test_valid_structured_text_invocation_returns_valid_task_and_exact_correlati
         "profile": "urn:hermes-yeoman:a2a-profile:v1",
         "contractRelease": "1.0.0",
     }
+    assert set(task) == {"id", "contextId", "status", "artifacts", "metadata"}
     assert len(gateway.requests) == 1
     ipc = gateway.requests[0]
     assert ipc["cmd"] == "a2a_invoke"
+    assert set(ipc["args"]) == {
+        "peer",
+        "skill",
+        "input",
+        "task_id",
+        "context_id",
+        "effect_id",
+    }
     assert ipc["args"]["peer"] == "hermes-test"
     assert ipc["args"]["context_id"] == "context-1"
-    assert ipc["args"]["reference_task_ids"] == ["previous-1", "previous-2"]
     assert ipc["args"]["skill"] == "whatsapp.send"
     assert ipc["args"]["input"] == _invocation()["input"]
     assert ipc["args"]["effect_id"].startswith("a2a-effect-")
 
 
+def test_logs_never_capture_raw_caller_correlation_or_private_values(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    denied = (
+        "49123456789@s.whatsapp.net",
+        "https://private.invalid/file?X-Amz-Signature=secret",
+        "test-secret-value",
+    )
+    payload = _send_payload(
+        _invocation(),
+        contextId=denied[0],
+        referenceTaskIds=[denied[1]],
+    )
+    with (
+        FakeUnixGateway(socket_path, _success) as gateway,
+        caplog.at_level(logging.INFO, logger="yeoman.a2a.relay"),
+    ):
+        response = relay.RelayService(_config(tmp_path, socket_path)).dispatch(payload)
+
+    assert "result" in response
+    assert len(gateway.requests) == 1
+    captured = "\n".join(f"{record.getMessage()} {record.args!r}" for record in caplog.records)
+    assert all(value not in captured for value in denied)
+
+
 @pytest.mark.parametrize(
-    ("payload", "code"),
+    "payload",
     [
-        (
-            _send_payload(
-                _invocation(),
-                parts=[{"text": '{"operation":"send_whatsapp"}', "mediaType": "text/plain"}],
-            ),
-            "INVALID_REQUEST",
+        _send_payload(
+            _invocation(),
+            parts=[{"text": '{"operation":"send_whatsapp"}', "mediaType": "text/plain"}],
         ),
-        (
-            _send_payload(
-                _invocation(),
-                parts=[
-                    {"data": _invocation(), "mediaType": "application/json"},
-                    {"data": _invocation(), "mediaType": "application/json"},
-                ],
-            ),
-            "INVALID_REQUEST",
+        _send_payload(
+            _invocation(),
+            parts=[
+                {"data": _invocation(), "mediaType": "application/json"},
+                {"data": _invocation(), "mediaType": "application/json"},
+            ],
         ),
-        (_send_payload({"skill": "unknown.skill", "input": {}}), "CAPABILITY_UNAVAILABLE"),
-        (_send_payload({"skill": "whatsapp.send"}), "INVALID_REQUEST"),
-        (
-            _send_payload({"skill": "whatsapp.send", "input": _invocation()["input"], "extra": True}),
-            "INVALID_REQUEST",
-        ),
-        (
-            _send_payload(
-                _invocation(),
-                parts=[
-                    {
-                        "data": _invocation(),
-                        "text": '{"operation":"send_whatsapp"}',
-                        "mediaType": "application/json",
-                    }
-                ],
-            ),
-            "INVALID_REQUEST",
+        _send_payload(
+            _invocation(),
+            parts=[
+                {
+                    "data": _invocation(),
+                    "text": '{"operation":"send_whatsapp"}',
+                    "mediaType": "application/json",
+                }
+            ],
         ),
     ],
 )
 def test_invalid_or_legacy_invocations_never_reach_ipc(
-    tmp_path: Path, payload: dict[str, Any], code: str
+    tmp_path: Path, payload: dict[str, Any]
 ) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     with FakeUnixGateway(socket_path, _success) as gateway:
         service = relay.RelayService(_config(tmp_path, socket_path))
@@ -355,12 +413,156 @@ def test_invalid_or_legacy_invocations_never_reach_ipc(
 
     assert status == 200
     assert body["error"]["code"] == -32602
-    assert body["error"]["data"]["error"]["code"] == code
+    assert body["error"]["message"] == "Invalid params"
     assert gateway.requests == []
 
 
+@pytest.mark.parametrize(
+    ("invocation", "code"),
+    [
+        ({"skill": "unknown.skill", "input": {}}, "SKILL_NOT_ADVERTISED"),
+        ({"skill": "whatsapp.send"}, "INVALID_INVOCATION"),
+        (
+            {"skill": "whatsapp.send", "input": _invocation()["input"], "extra": True},
+            "INVALID_INVOCATION",
+        ),
+        (
+            {
+                "skill": "whatsapp.send",
+                "input": {**_invocation()["input"], "extra": True},
+            },
+            "INVALID_SKILL_INPUT",
+        ),
+        (
+            _invocation(text="image", key="image-1")
+            | {
+                "input": {
+                    "recipient": {"type": "group", "alias": "team-example"},
+                    "content": [
+                        {"type": "image", "uri": "artifact://image/1", "mime_type": "image/png"}
+                    ],
+                    "idempotency_key": "image-1",
+                }
+            },
+            "CONTENT_TYPE_DENIED",
+        ),
+    ],
+)
+def test_profile_validation_failures_return_terminal_contract_rejections(
+    tmp_path: Path, invocation: dict[str, Any], code: str
+) -> None:
+    service = relay.RelayService(_config(tmp_path, tmp_path / "gateway.sock"))
+
+    response = service.dispatch(_send_payload(invocation))
+
+    task = response["result"]["task"]
+    result = _profile_result(task)
+    assert task["status"]["state"] == "TASK_STATE_REJECTED"
+    assert result["error"]["code"] == code
+    service.schemas.validate_result(result)
+
+
+@pytest.mark.parametrize(
+    ("payload", "rpc_code"),
+    [
+        (
+            {
+                **_send_payload(_invocation()),
+                "unexpected": True,
+            },
+            -32600,
+        ),
+        (
+            {
+                **_send_payload(_invocation()),
+                "params": {
+                    "message": _send_payload(_invocation())["params"]["message"],
+                    "extra": True,
+                },
+            },
+            -32602,
+        ),
+        (
+            _send_payload(_invocation(), role="ROLE_AGENT"),
+            -32602,
+        ),
+        (
+            _send_payload(_invocation(), messageId=""),
+            -32602,
+        ),
+        (
+            {
+                **_send_payload(_invocation()),
+                "params": {
+                    "message": {
+                        key: value
+                        for key, value in _send_payload(_invocation())["params"]["message"].items()
+                        if key != "messageId"
+                    }
+                },
+            },
+            -32602,
+        ),
+        (
+            _send_payload(_invocation(), extra=True),
+            -32602,
+        ),
+        (
+            _send_payload(
+                _invocation(),
+                parts=[
+                    {
+                        "data": _invocation(),
+                        "url": "https://example.test/file",
+                        "mediaType": "application/json",
+                    }
+                ],
+            ),
+            -32602,
+        ),
+        (
+            _send_payload(
+                _invocation(),
+                parts=[
+                    {
+                        "data": _invocation(),
+                        "mediaType": "application/json",
+                        "unexpected": True,
+                    }
+                ],
+            ),
+            -32602,
+        ),
+        (
+            {
+                "jsonrpc": "2.0",
+                "id": "rpc-get",
+                "method": "GetTask",
+                "params": {"taskId": "task-1"},
+            },
+            -32602,
+        ),
+        (
+            {
+                "jsonrpc": "2.0",
+                "id": "rpc-get",
+                "method": "GetTask",
+                "params": {"id": "task-1", "historyLength": "zero"},
+            },
+            -32602,
+        ),
+    ],
+)
+def test_protojson_parser_rejects_wrong_roles_oneofs_and_unknown_fields(
+    tmp_path: Path, payload: dict[str, Any], rpc_code: int
+) -> None:
+
+    response = relay.RelayService(_config(tmp_path, tmp_path / "gateway.sock")).dispatch(payload)
+
+    assert response["error"]["code"] == rpc_code
+
+
 def test_optional_text_part_cannot_override_authoritative_data(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     payload = _send_payload(_invocation(text="Authoritative"))
     payload["params"]["message"]["parts"][0]["text"] = json.dumps(
@@ -375,7 +577,6 @@ def test_optional_text_part_cannot_override_authoritative_data(tmp_path: Path) -
 
 
 def test_post_authentication_happens_before_body_read(tmp_path: Path) -> None:
-    relay = _relay_module()
     service = relay.RelayService(_config(tmp_path, tmp_path / "gateway.sock"))
     with _running(service) as address:
         with socket.create_connection(address, timeout=1) as client:
@@ -387,8 +588,32 @@ def test_post_authentication_happens_before_body_read(tmp_path: Path) -> None:
     assert response.startswith(b"HTTP/1.0 401")
 
 
+def test_malformed_json_returns_jsonrpc_parse_error(tmp_path: Path) -> None:
+    service = relay.RelayService(_config(tmp_path, tmp_path / "gateway.sock"))
+    with _running(service) as address:
+        connection = http.client.HTTPConnection(*address, timeout=2)
+        connection.request(
+            "POST",
+            "/",
+            body=b"{broken",
+            headers={
+                "Authorization": "Bearer test-secret-value",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+
+    assert response.status == 200
+    assert body == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+
+
 def test_authenticated_partial_body_is_time_bounded(tmp_path: Path) -> None:
-    relay = _relay_module()
     config = _config(tmp_path, tmp_path / "gateway.sock", timeout_seconds=0.05)
     service = relay.RelayService(config)
     with _running(service) as address:
@@ -404,7 +629,6 @@ def test_authenticated_partial_body_is_time_bounded(tmp_path: Path) -> None:
 
 
 def test_body_and_rate_limits_run_before_ipc(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     with FakeUnixGateway(socket_path, _success) as gateway:
         config = _config(
@@ -415,9 +639,7 @@ def test_body_and_rate_limits_run_before_ipc(tmp_path: Path) -> None:
         )
         service = relay.RelayService(config)
         with _running(service) as address:
-            too_large_status, _ = _request(
-                address, "POST", "/", payload={"padding": "x" * 64}
-            )
+            too_large_status, _ = _request(address, "POST", "/", payload={"padding": "x" * 64})
             limited_status, limited = _request(address, "POST", "/", payload={})
 
     assert too_large_status == 413
@@ -427,14 +649,15 @@ def test_body_and_rate_limits_run_before_ipc(tmp_path: Path) -> None:
 
 
 def test_same_idempotency_key_is_atomic_and_conflicts_are_deterministic(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     with FakeUnixGateway(socket_path, _success) as gateway:
         service = relay.RelayService(_config(tmp_path, socket_path))
         with _running(service) as address:
             request = _send_payload(_invocation())
             with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [pool.submit(_request, address, "POST", "/", payload=request) for _ in range(2)]
+                futures = [
+                    pool.submit(_request, address, "POST", "/", payload=request) for _ in range(2)
+                ]
             responses = [future.result()[1] for future in futures]
             _, conflict = _request(
                 address,
@@ -458,7 +681,6 @@ def test_same_idempotency_key_is_atomic_and_conflicts_are_deterministic(tmp_path
 
 
 def test_terminal_result_survives_restart_without_reexecution(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     config = _config(tmp_path, socket_path)
     with FakeUnixGateway(socket_path, _success) as gateway:
@@ -474,7 +696,6 @@ def test_terminal_result_survives_restart_without_reexecution(tmp_path: Path) ->
 def test_submitted_task_retries_with_same_deterministic_effect_id_after_restart(
     tmp_path: Path,
 ) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     config = _config(tmp_path, socket_path)
     invocation = _invocation()
@@ -495,8 +716,64 @@ def test_submitted_task_retries_with_same_deterministic_effect_id_after_restart(
     assert gateway.requests[0]["args"]["effect_id"] == expected_effect_id
 
 
+def test_submitted_retry_uses_original_persisted_correlation(tmp_path: Path) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(tmp_path, socket_path)
+    service = relay.RelayService(config)
+    claim = service.store.claim(
+        peer=config.peer_id,
+        invocation=_invocation(),
+        context_id=" original/context ",
+        reference_task_ids=[" original reference "],
+    )
+    retry = _send_payload(
+        _invocation(),
+        contextId="retry-context",
+        referenceTaskIds=["retry-reference"],
+    )
+
+    with FakeUnixGateway(socket_path, _success) as gateway:
+        response = relay.RelayService(config).dispatch(retry)
+
+    task = response["result"]["task"]
+    assert task["id"] == claim.task_id
+    assert task["contextId"] == " original/context "
+    assert "referenceTaskIds" not in task
+    assert gateway.requests[0]["args"]["context_id"] == " original/context "
+    assert _profile_result(task)["correlation"]["reference_task_ids"] == [" original reference "]
+
+
+def test_sqlite_claim_serializes_effect_across_processes(tmp_path: Path) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    config = _config(tmp_path, socket_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_dispatch_in_process,
+            args=(config, _send_payload(_invocation()), ready, start, results),
+        )
+        for _ in range(2)
+    ]
+
+    with FakeUnixGateway(socket_path, _success) as gateway:
+        for process in processes:
+            process.start()
+        for _ in processes:
+            assert ready.get(timeout=3) is True
+        start.set()
+        responses = [results.get(timeout=5) for _ in processes]
+        for process in processes:
+            process.join(5)
+            assert process.exitcode == 0
+
+    assert responses[0]["result"]["task"] == responses[1]["result"]["task"]
+    assert len(gateway.requests) == 1
+
+
 def test_get_task_is_peer_scoped_and_rejects_malformed_ids(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     config = _config(tmp_path, socket_path)
     with FakeUnixGateway(socket_path, _success):
@@ -507,36 +784,64 @@ def test_get_task_is_peer_scoped_and_rejects_malformed_ids(tmp_path: Path) -> No
                 address,
                 "POST",
                 "/",
-                payload={"jsonrpc": "2.0", "id": "rpc-get", "method": "tasks/get", "params": {"id": task_id}},
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": "rpc-get",
+                    "method": "tasks/get",
+                    "params": {"id": task_id, "historyLength": 0},
+                },
             )
             _, malformed = _request(
                 address,
                 "POST",
                 "/",
-                payload={"jsonrpc": "2.0", "id": "rpc-get", "method": "GetTask", "params": {"id": " bad "}},
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": "rpc-get",
+                    "method": "GetTask",
+                    "params": {"id": ""},
+                },
             )
 
-        other = _config(tmp_path, socket_path, peer_id="different-peer", bearer_secret="other-secret")
+        other = _config(
+            tmp_path, socket_path, peer_id="different-peer", bearer_secret="other-secret"
+        )
         with _running(relay.RelayService(other)) as address:
             _, hidden = _request(
                 address,
                 "POST",
                 "/",
                 token="other-secret",
-                payload={"jsonrpc": "2.0", "id": "rpc-get", "method": "GetTask", "params": {"id": task_id}},
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": "rpc-get",
+                    "method": "GetTask",
+                    "params": {"id": task_id},
+                },
             )
 
     assert found["result"] == sent["result"]["task"]
-    assert malformed["error"]["data"]["error"]["code"] == "INVALID_IDENTIFIER"
+    assert malformed["error"]["code"] == -32602
     assert hidden["error"]["code"] == -32001
+
+    opaque = relay.RelayService(config).dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": "rpc-get",
+            "method": "GetTask",
+            "params": {"id": " opaque/task id "},
+        }
+    )
+    assert opaque["error"]["code"] == -32001
 
 
 @pytest.mark.parametrize(
     "message_changes",
     [
-        {"contextId": " context-1"},
-        {"contextId": "context/1"},
-        {"referenceTaskIds": ["good", " bad"]},
+        {"contextId": ""},
+        {"contextId": "x" * 201},
+        {"referenceTaskIds": [""]},
+        {"referenceTaskIds": ["x" * 201]},
         {"referenceTaskIds": ["duplicate", "duplicate"]},
         {"referenceTaskIds": [{}]},
     ],
@@ -544,7 +849,6 @@ def test_get_task_is_peer_scoped_and_rejects_malformed_ids(tmp_path: Path) -> No
 def test_malformed_correlation_identifiers_are_rejected_without_repair(
     tmp_path: Path, message_changes: dict[str, Any]
 ) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     with FakeUnixGateway(socket_path, _success) as gateway:
         service = relay.RelayService(_config(tmp_path, socket_path))
@@ -556,12 +860,33 @@ def test_malformed_correlation_identifiers_are_rejected_without_repair(
                 payload=_send_payload(_invocation(), **message_changes),
             )
 
-    assert body["error"]["data"]["error"]["code"] == "INVALID_IDENTIFIER"
+    assert body["error"]["code"] == -32602
     assert gateway.requests == []
 
 
+def test_opaque_correlation_identifiers_are_preserved_without_normalization(tmp_path: Path) -> None:
+    socket_path = tmp_path / "gateway.sock"
+    payload = _send_payload(
+        _invocation(),
+        contextId=" context/opaque ",
+        referenceTaskIds=[" reference one ", "reference/two"],
+    )
+    with FakeUnixGateway(socket_path, _success) as gateway:
+        service = relay.RelayService(_config(tmp_path, socket_path))
+        with _running(service) as address:
+            _, body = _request(address, "POST", "/", payload=payload)
+
+    task = body["result"]["task"]
+    result = _profile_result(task)
+    assert task["contextId"] == " context/opaque "
+    assert result["correlation"]["reference_task_ids"] == [
+        " reference one ",
+        "reference/two",
+    ]
+    assert gateway.requests[0]["args"]["context_id"] == " context/opaque "
+
+
 def test_invalid_outgoing_result_becomes_terminal_profile_failure(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
 
     def invalid_result(request: dict[str, Any]) -> dict[str, Any]:
@@ -595,7 +920,6 @@ def test_invalid_outgoing_result_becomes_terminal_profile_failure(tmp_path: Path
 
 
 def test_structured_ipc_error_is_sanitized_and_persisted_as_rejected(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
 
     def denied(_request: dict[str, Any]) -> dict[str, Any]:
@@ -625,12 +949,9 @@ def test_structured_ipc_error_is_sanitized_and_persisted_as_rejected(tmp_path: P
 
 
 def test_disabled_voice_skill_is_not_invokable(tmp_path: Path) -> None:
-    relay = _relay_module()
     socket_path = tmp_path / "gateway.sock"
     with FakeUnixGateway(socket_path, _success) as gateway:
-        service = relay.RelayService(
-            _config(tmp_path, socket_path, voice_enabled=True), voice_probe=lambda: False
-        )
+        service = relay.RelayService(_config(tmp_path, socket_path, voice_enabled=False))
         with _running(service) as address:
             _, body = _request(
                 address,
@@ -639,12 +960,13 @@ def test_disabled_voice_skill_is_not_invokable(tmp_path: Path) -> None:
                 payload=_send_payload(_invocation(skill="media.voice.generate")),
             )
 
-    assert body["error"]["data"]["error"]["code"] == "CAPABILITY_UNAVAILABLE"
+    task = body["result"]["task"]
+    assert task["status"]["state"] == "TASK_STATE_REJECTED"
+    assert _profile_result(task)["error"]["code"] == "SKILL_NOT_ADVERTISED"
     assert gateway.requests == []
 
 
 def test_unsupported_jsonrpc_method_returns_controlled_error(tmp_path: Path) -> None:
-    relay = _relay_module()
     service = relay.RelayService(_config(tmp_path, tmp_path / "gateway.sock"))
     with _running(service) as address:
         _, body = _request(
