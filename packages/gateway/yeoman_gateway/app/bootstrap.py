@@ -925,7 +925,6 @@ def build_gateway_runtime(
             logger.warning("security classifier disabled: {}", exc)
 
     memory_service = MemoryService(workspace=workspace, config=config.memory, root_config=config)
-    memory_state_dir = config.memory.wal.state_dir
     try:
         imported = memory_service.backfill_from_workspace_files(force=False)
         if imported > 0:
@@ -962,12 +961,10 @@ def build_gateway_runtime(
         known_tools=set(),  # Will be updated after responder is created
         policy_path=policy_path,
         session_manager=session_manager,
+        processing_store=processing_store,
         private_handoff_store=private_handoffs,
         workspace=workspace,
-        memory_state_dir=memory_state_dir,
     )
-    policy_adapter.set_memory_service(memory_service)
-
     file_access_resolver = build_file_access_resolver(
         workspace=workspace,
         policy=policy_engine.policy if policy_engine is not None else None,
@@ -1051,6 +1048,7 @@ def build_gateway_runtime(
         session_manager=session_manager,
         effect_router=effect_router,
         a2a_delivery=service_effects,
+        processing_store=processing_store,
         memory_service=memory_service,
         telemetry=telemetry,
         security=security,
@@ -1080,16 +1078,21 @@ def build_gateway_runtime(
         disable_non_migrated_tools(responder.tools)
 
     # Wire /voice command callback: reuses the send_voice tool.
-    async def _voice_send_callback(content: str, chat_id: str) -> str:
-        return await responder.tools.execute(
-            "send_voice",
-            {
-                "content": content,
-                "channel": "whatsapp",
-                "chat_id": chat_id,
-                "voice": "71c095ed4c03459fb98500db63b88fbe",
-                "verbatim": True,
-            },
+    async def _voice_send_callback(
+        content: str,
+        chat_id: str,
+        source_chat_id: str,
+        principal: str,
+    ) -> str:
+        return await responder.execute_delivery(
+            tool_name="send_voice",
+            channel="whatsapp",
+            chat_id=chat_id,
+            text=content,
+            session_key=f"whatsapp:{source_chat_id}",
+            principal=principal,
+            is_owner=True,
+            voice="71c095ed4c03459fb98500db63b88fbe",
         )
 
     policy_adapter.set_voice_send_callback(_voice_send_callback)

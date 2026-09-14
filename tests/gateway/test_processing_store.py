@@ -155,6 +155,17 @@ def test_schema_version_and_quick_check(tmp_path):
     db.close()
 
 
+def test_voice_send_quota_is_atomic_and_rolling(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    day = 24 * 60 * 60 * 1000
+
+    assert db.claim_voice_send("person@lid", now_ms=1_000, cooldown_ms=day) is True
+    assert db.claim_voice_send("person@lid", now_ms=1_000 + day - 1, cooldown_ms=day) is False
+    assert db.claim_voice_send("person@lid", now_ms=1_000 + day, cooldown_ms=day) is True
+    assert db.claim_voice_send("someone-else@lid", now_ms=1_001, cooldown_ms=day) is True
+    db.close()
+
+
 def test_purge_strips_payloads_but_keeps_tombstones(tmp_path):
     now = 1_700_000_000_000
     db = ProcessingStore(tmp_path / "processing.db")

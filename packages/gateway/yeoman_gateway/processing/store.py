@@ -66,7 +66,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = (
     """
@@ -192,6 +192,14 @@ _SCHEMA = (
 #: Ordered additive migrations. ``_MIGRATIONS[1]`` upgrades schema 1 to schema 2; existing
 #: tables (events, effects, decisions, attempts, evidence) are never altered.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
+    5: (
+        """
+        CREATE TABLE IF NOT EXISTS voice_send_quota (
+          principal TEXT PRIMARY KEY,
+          last_requested_ms INTEGER NOT NULL
+        )
+        """,
+    ),
     4: (
         """
         CREATE TABLE IF NOT EXISTS send_budget_reservations (
@@ -1246,6 +1254,62 @@ class ProcessingStore:
                 )
         return thread_ids
 
+    def close_chat_threads(
+        self, *, channel: str, chat_id: str, now_ms: int
+    ) -> tuple[str, ...]:
+        """End all current work for one chat without deleting its history."""
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT thread_id FROM threads "
+                "WHERE channel = ? AND chat_id = ? AND state IN ('open','idle') "
+                "ORDER BY last_activity_ms, thread_id",
+                (channel, chat_id),
+            ).fetchall()
+            thread_ids = tuple(str(row["thread_id"]) for row in rows)
+            for thread_id in thread_ids:
+                effects = conn.execute(
+                    "SELECT e.effect_id FROM effects e JOIN turns t ON t.turn_id = e.turn_id "
+                    "WHERE t.thread_id = ? AND e.state IN ('planned','queued')",
+                    (thread_id,),
+                ).fetchall()
+                for effect in effects:
+                    effect_id = str(effect["effect_id"])
+                    conn.execute(
+                        "UPDATE effects SET state = 'cancelled', updated_ms = ? "
+                        "WHERE effect_id = ? AND state IN ('planned','queued')",
+                        (now_ms, effect_id),
+                    )
+                    self._append_evidence(
+                        conn,
+                        effect_id=effect_id,
+                        kind="superseded",
+                        state="cancelled",
+                        detail="manual_new",
+                        observed_ms=now_ms,
+                        worker_id=None,
+                    )
+                conn.execute(
+                    "UPDATE pending_inputs SET state = 'cancelled', consumed_ms = ? "
+                    "WHERE thread_id = ? AND state IN ('waiting','deferred')",
+                    (now_ms, thread_id),
+                )
+                conn.execute(
+                    "UPDATE generations SET finished_ms = ?, outcome = 'cancelled', "
+                    "detail = 'manual_new' WHERE thread_id = ? AND finished_ms IS NULL",
+                    (now_ms, thread_id),
+                )
+                conn.execute(
+                    "UPDATE turns SET state = 'superseded', closed_ms = ?, updated_ms = ? "
+                    "WHERE thread_id = ? AND state IN ('open','awaiting')",
+                    (now_ms, now_ms, thread_id),
+                )
+                conn.execute(
+                    "UPDATE threads SET state = 'closed', closed_ms = ?, "
+                    "close_reason = 'manual_new' WHERE thread_id = ?",
+                    (now_ms, thread_id),
+                )
+        return thread_ids
+
     def open_turn(
         self,
         *,
@@ -2244,6 +2308,32 @@ class ProcessingStore:
                 "SELECT COUNT(*) AS c FROM send_budget_reservations"
             ).fetchone()
         return int(row["c"])
+
+    def claim_voice_send(
+        self,
+        principal: str,
+        *,
+        now_ms: int | None = None,
+        cooldown_ms: int = 24 * 60 * 60 * 1000,
+    ) -> bool:
+        """Atomically claim one non-owner voice request in a rolling window."""
+        actor = str(principal or "").strip()
+        if not actor:
+            return False
+        now = self._now(now_ms)
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT last_requested_ms FROM voice_send_quota WHERE principal = ?",
+                (actor,),
+            ).fetchone()
+            if row is not None and now - int(row["last_requested_ms"]) < cooldown_ms:
+                return False
+            conn.execute(
+                "INSERT INTO voice_send_quota (principal, last_requested_ms) VALUES (?, ?) "
+                "ON CONFLICT(principal) DO UPDATE SET last_requested_ms = excluded.last_requested_ms",
+                (actor, now),
+            )
+        return True
 
     def purge(self, *, now_ms: int) -> PurgeReport:
         """Apply retention. Payloads are stripped first, metadata later.

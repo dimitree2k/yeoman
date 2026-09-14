@@ -152,6 +152,76 @@ class TestSessionBoundary:
             "visible after",
         ]
 
+    def test_new_closes_processing_work_without_deleting_history(self, tmp_path):
+        import asyncio
+
+        from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+        from yeoman_gateway.agent.tools.recall_conversation import RecallConversationTool
+        from yeoman_gateway.policy.engine import PolicyEngine
+        from yeoman_gateway.policy.loader import save_policy
+        from yeoman_gateway.policy.schema import PolicyConfig
+        from yeoman_gateway.processing.models import CanonicalEvent
+        from yeoman_gateway.processing.store import ProcessingStore
+        from yeoman_gateway.processing.threads import ThreadRegistry
+        from yeoman_shared.config.schema import ProcessingConfig
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        sessions = SessionManager(workspace, sessions_dir=tmp_path / "sessions")
+        session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net")
+        session.add_message("user", "old foreground context")
+        sessions.save(session)
+
+        store = ProcessingStore(tmp_path / "processing.db")
+        config = ProcessingConfig.model_validate({"enabled": True})
+        registry = ThreadRegistry(store=store, config=config)
+        assigned = registry.assign(
+            CanonicalEvent(
+                event_id="m1",
+                event_key="wa:m1",
+                trace_id="tr-m1",
+                origin="whatsapp",
+                principal="owner@s.whatsapp.net",
+                channel="whatsapp",
+                chat_id="owner@s.whatsapp.net",
+                occurred_ms=1_700_000_000_000,
+                source_message_id="m1",
+                payload={"text": "old foreground context", "is_group": False},
+            ),
+            now_ms=1_700_000_000_000,
+        )
+        policy = PolicyConfig.model_validate(
+            {"owners": {"whatsapp": ["owner@s.whatsapp.net"]}}
+        )
+        policy_path = tmp_path / "policy.json"
+        save_policy(policy, policy_path)
+        adapter = EnginePolicyAdapter(
+            engine=PolicyEngine(policy, workspace=workspace, apply_channels={"whatsapp"}),
+            known_tools=set(),
+            policy_path=policy_path,
+            session_manager=sessions,
+            processing_store=store,
+            workspace=workspace,
+        )
+
+        result = adapter.route_admin_command(_make_event(content="/new", message_id="new-1"))
+
+        assert result is not None and result.status == "handled"
+        assert result.reaction_emoji == "👍"
+        assert session.get_history() == []
+        assert [row["role"] for row in session.get_full_history()] == [
+            "user",
+            "session_boundary",
+        ]
+        assert store.get_thread(assigned.thread_id).state == "closed"
+        assert store.get_turn(assigned.turn_id).state == "superseded"
+        recall = RecallConversationTool(sessions)
+        recall.set_context("whatsapp", "owner@s.whatsapp.net")
+        assert "old foreground context" in asyncio.run(
+            recall.execute(query="old foreground context")
+        )
+        store.close()
+
 
 class TestPreflightHeuristic:
     """Preflight heuristic should detect backward references in messages."""

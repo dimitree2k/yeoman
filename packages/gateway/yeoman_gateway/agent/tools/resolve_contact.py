@@ -89,6 +89,17 @@ def _participant_phone_map(
     return mapped
 
 
+def chat_participant_identifiers(
+    chat_registry: "ChatRegistry | None",
+    *,
+    channel: str,
+    chat_id: str,
+) -> set[str]:
+    """Return the proven LID and phone JIDs recorded for a chat."""
+    mapped = _participant_phone_map(chat_registry, channel=channel, chat_id=chat_id)
+    return set(mapped) | set(mapped.values())
+
+
 def _display_for_identifier(
     contacts: "ContactsService",
     identifier: str,

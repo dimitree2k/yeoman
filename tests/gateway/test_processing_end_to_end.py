@@ -1013,6 +1013,29 @@ async def test_a_gateway_decision_is_not_the_models_taste(runtime) -> None:
     assert runtime.transport.sent == ["🚫"]
 
 
+@pytest.mark.asyncio
+async def test_new_confirmation_survives_the_manual_boundary(runtime) -> None:
+    from yeoman_gateway.core.intents import SendReactionIntent
+    from yeoman_shared.reactions import SYSTEM_ORIGIN
+
+    _admit(runtime, message_id="new-1", content="/new")
+    runtime.store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=T0 + 1)
+
+    confirmed = await runtime.router.submit_reaction(
+        SendReactionIntent(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id="new-1",
+            emoji="👍",
+            origin=SYSTEM_ORIGIN,
+        ),
+        principal="owner@s.whatsapp.net",
+    )
+
+    assert confirmed is True
+    assert runtime.transport.sent == ["👍"]
+
+
 # the ambient brake ---------------------------------------------------------------------
 
 

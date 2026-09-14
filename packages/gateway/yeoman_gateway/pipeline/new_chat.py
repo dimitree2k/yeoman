@@ -1,8 +1,4 @@
-"""New-chat notification middleware (WhatsApp only).
-
-Corresponds to orchestrator stage 8: notify the owner when the bot encounters
-a new WhatsApp chat for the first time, with quick approval shortcuts.
-"""
+"""Notify the owner when Yeoman encounters a new WhatsApp chat."""
 
 from __future__ import annotations
 
@@ -98,17 +94,13 @@ class NewChatNotifyMiddleware:
             lines.append(f"📛 Name: {group_name}")
         if group_desc:
             lines.append(f"📝 Description: {group_desc}")
-        lines.append(f"🆔 ID: `{event.chat_id}`")
-        lines.append("")
-        lines.append("⚡ Quick commands:")
-        lines.append(f"  /approve {event.chat_id}  → allow + reply all")
-        lines.append(f"  /approve-mention {event.chat_id}  → allow + mention only")
-        lines.append(f"  /deny {event.chat_id}  → block")
-        lines.append("")
-        lines.append("Or use full commands:")
-        lines.append(f"  /policy allow-group {event.chat_id}")
-        lines.append(f"  /policy set-when {event.chat_id} all|mention_only")
-        lines.append(f"  /policy block-group {event.chat_id}")
+        if is_group:
+            lines.append(f"Group approval: `{event.chat_id}`")
+            lines.append("")
+            lines.append("Reply to this message with yes/ja or no/nein.")
+            lines.append("Approved groups are mention-only with spontaneity disabled.")
+        else:
+            lines.append(f"🆔 ID: `{event.chat_id}`")
 
         message = "\n".join(lines)
 

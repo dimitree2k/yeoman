@@ -255,11 +255,7 @@ class ThreadActorResponder:
             ):
                 return
             chat_session = sessions.get_or_create(chat_key)
-            history = [
-                message
-                for message in chat_session.messages
-                if str(message.get("content") or "").strip()
-            ][-LEGACY_CONTEXT_TURNS:]
+            history = chat_session.get_history(max_messages=LEGACY_CONTEXT_TURNS)
             if not history:
                 return
             lines: list[str] = []

@@ -6,7 +6,7 @@ import ast
 import asyncio
 import json
 import re
-import shlex
+import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -60,7 +60,6 @@ from yeoman_gateway.media.tts import (
     write_tts_audio_file,
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
-from yeoman_gateway.policy.persona import uses_compact_prompt
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
@@ -431,6 +430,7 @@ class LLMResponder(ResponderPort):
         private_handoff_store: "PrivateHandoffStore | None" = None,
         a2a_registry: "A2AWorkerRegistry | None" = None,
         a2a_delivery: object | None = None,
+        processing_store: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -466,6 +466,7 @@ class LLMResponder(ResponderPort):
         self._private_handoff_store = private_handoff_store
         self._a2a_registry = a2a_registry
         self._a2a_delivery = a2a_delivery
+        self._processing_store = processing_store
         self._lazy_media_resolver = lazy_media_resolver
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
@@ -762,62 +763,6 @@ class LLMResponder(ResponderPort):
         return base
 
     @staticmethod
-    def _parse_owner_raw_voice_command(content: str) -> tuple[str, str] | None:
-        compact = str(content or "").strip()
-        if not compact:
-            return None
-        lowered = compact.lower()
-        if not (lowered.startswith("!voice-send") or lowered.startswith("!voice_send")):
-            return None
-        try:
-            tokens = shlex.split(compact)
-        except ValueError:
-            return "", ""
-        if len(tokens) < 3:
-            return "", ""
-        target = str(tokens[1] or "").strip()
-        text = " ".join(tokens[2:]).strip()
-        if not target or not text:
-            return "", ""
-        return target, text
-
-    async def _maybe_handle_owner_raw_voice_command(
-        self,
-        *,
-        channel: str,
-        content: str,
-        is_owner: bool,
-    ) -> str | None:
-        if not is_owner:
-            return None
-        parsed = self._parse_owner_raw_voice_command(content)
-        if parsed is None:
-            return None
-        target, text = parsed
-        if not target or not text:
-            return "Usage: !voice-send <here|chat_id|group_alias> <text>"
-        if channel != "whatsapp":
-            return "Error: !voice-send currently supports only WhatsApp sessions"
-
-        args: dict[str, Any] = {"content": text}
-        args["verbatim"] = True
-        target_lower = target.lower()
-        if target_lower not in {"here", "this", "current"}:
-            if "@" in target:
-                args["chat_id"] = target
-            else:
-                args["group"] = target
-
-        result = await self._execute_tool(
-            "send_voice",
-            args,
-            is_owner=True,
-        )
-        if str(result).startswith("Error:"):
-            return result
-        return "done"
-
-    @staticmethod
     def _route_for_event(event: InboundEvent) -> tuple[str, str]:
         if event.channel != "system":
             return event.channel, event.chat_id
@@ -870,6 +815,60 @@ class LLMResponder(ResponderPort):
         """Attach (or detach) the new-mode effect router for tool producers."""
         self._effect_router = router
 
+    def _voice_send_governance_error(self, request: VoiceSendRequest) -> str | None:
+        """Enforce non-owner recipient membership and the rolling daily quota."""
+        from yeoman_gateway.agent.tools.resolve_contact import chat_participant_identifiers
+        from yeoman_gateway.memory.read_gate import registry_members
+        from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
+        from yeoman_gateway.processing.tool_context import current_tool_context
+
+        context = current_tool_context()
+        if (
+            context is None
+            or context.is_owner
+            or not context.session_key.startswith("whatsapp:")
+            or request.chat_id == context.chat_id
+        ):
+            return None
+
+        def refusal() -> str:
+            reason = secrets.choice(
+                (
+                    "the voice pigeon is on a union break",
+                    "the premium microphone hamster has left the building",
+                    "the inter-chat megaphone needs its monthly moon calibration",
+                    "the tiny relay wizard has exceeded the free-tier spell budget",
+                )
+            )
+            return (
+                "Error: Voice delivery refused. Reply briefly in the user's language with "
+                f"this absurd reason: {reason}. Then jokingly ask for a monthly premium "
+                "payment. Never provide payment details."
+            )
+
+        if context.channel != "whatsapp" or not context.chat_id.endswith("@g.us"):
+            return refusal()
+        members = registry_members(
+            self.chat_registry,
+            channel=context.channel,
+            chat_id=context.chat_id,
+        )
+        members.update(
+            chat_participant_identifiers(
+                self.chat_registry,
+                channel=context.channel,
+                chat_id=context.chat_id,
+            )
+        )
+        if request.chat_id not in members:
+            return refusal()
+
+        principal = CURRENT_PRINCIPAL.get().strip()
+        claim = getattr(self._processing_store, "claim_voice_send", None)
+        if not principal or claim is None or not claim(principal):
+            return refusal()
+        return None
+
     async def _send_voice_message(self, request: VoiceSendRequest) -> str:
         channel = str(request.channel or "").strip()
         chat_id = str(request.chat_id or "").strip()
@@ -880,6 +879,9 @@ class LLMResponder(ResponderPort):
             return "Error: send_voice currently supports only WhatsApp"
         if not content:
             return "Error: Voice content is empty"
+        governance_error = self._voice_send_governance_error(request)
+        if governance_error is not None:
+            return governance_error
         if self._tts is None or self._whatsapp_tts_outgoing_dir is None:
             return "Error: Voice sending runtime is not configured"
 
@@ -1781,74 +1783,6 @@ class LLMResponder(ResponderPort):
 
         return final_content or "🤔❓"
 
-    async def _handle_approve_command(self, channel: str, sender_id: str, content: str) -> str | None:
-        """Handle owner approve/deny commands for new groups.
-
-        Commands:
-        - /approve <chat_id> - Allow group + reply to all
-        - /deny <chat_id> - Block group
-        - yes <chat_id> - Shortcut for approve
-        - approve <chat_id> - Shortcut for approve
-        """
-        # Check if sender is owner
-        if self.owner_alert_resolver is None:
-            return None
-        owners = self.owner_alert_resolver(channel)
-        if sender_id not in owners:
-            return None
-
-        content_lower = content.lower().strip()
-
-        # Parse command
-        chat_id = None
-        command_type = None
-
-        # /approve <chat_id>
-        if content_lower.startswith("/approve "):
-            chat_id = content[8:].strip()
-            command_type = "approve"
-        # /deny <chat_id>
-        elif content_lower.startswith("/deny "):
-            chat_id = content[5:].strip()
-            command_type = "deny"
-        # just "yes" or "approve" - need to find pending group from context
-        elif content_lower in ("yes", "approve", "approved"):
-            # Could track pending approvals, for now just return help
-            return "Please specify the group ID: /approve <chat_id@g.us>"
-        # "yes <chat_id>" or "approve <chat_id>"
-        elif content_lower.startswith("yes ") or content_lower.startswith("approve "):
-            parts = content.split(None, 1)
-            if len(parts) == 2:
-                chat_id = parts[1].strip()
-                command_type = "approve"
-        elif content_lower.startswith("deny "):
-            parts = content.split(None, 1)
-            if len(parts) == 2:
-                chat_id = parts[1].strip()
-                command_type = "deny"
-
-        if not chat_id or not command_type:
-            return None
-
-        # Validate chat_id format
-        if not chat_id.endswith("@g.us") and not chat_id.endswith("@s.whatsapp.net"):
-            return "Invalid chat ID format. Use: /approve <chat_id@g.us>"
-
-        # Execute the command via policy admin (if available) or return instructions
-        if command_type == "approve":
-            return (
-                f"✅ Approving group {chat_id}\n"
-                f"Run these commands:\n"
-                f"  /policy allow-group {chat_id}\n"
-                f"  /policy set-when {chat_id} all"
-            )
-        else:  # deny
-            return (
-                f"🚫 Blocking group {chat_id}\n"
-                f"Run:\n"
-                f"  /policy block-group {chat_id}"
-            )
-
     @staticmethod
     def _topic_tokens(text: str) -> set[str]:
         compact = re.sub(r"https?://\S+", " ", text.lower())
@@ -2196,12 +2130,6 @@ class LLMResponder(ResponderPort):
         session_history_limit: int | None = None,
         private_handoff_id: str | None = None,
     ) -> str | None:
-        # Handle owner approve/deny commands
-        if is_owner and channel == "whatsapp":
-            approval_response = await self._handle_approve_command(channel, sender_id or "", content)
-            if approval_response:
-                return approval_response
-
         trace = lf.start_trace(
             name="generate",
             metadata={
@@ -2306,160 +2234,152 @@ class LLMResponder(ResponderPort):
             self._current_trace = None
             return None
 
-        owner_raw_voice_reply = await self._maybe_handle_owner_raw_voice_command(
-            channel=channel,
-            content=content,
-            is_owner=is_owner,
-        )
-        if owner_raw_voice_reply is not None:
-            final_content = owner_raw_voice_reply
-        else:
-            if self._lazy_media_resolver is not None:
-                try:
-                    retrieval = await self._lazy_media_resolver.resolve(
-                        channel=channel,
-                        chat_id=chat_id,
-                        content=content,
-                        metadata=metadata,
-                    )
-                    if retrieval is not None:
-                        metadata["temporary_media_retrieval"] = retrieval
-                        self._metric(
-                            "temporary_media_retrieval_chars",
-                            len(str(retrieval.get("content") or "")),
-                        )
-                except Exception as e:
-                    logger.warning("lazy media retrieval failed: {}", e)
-
-            retrieved_memory_text = ""
-            retrieved_hits_count = 0
-            if self.memory is not None:
-                try:
-                    # Augment the memory query with recent ambient messages so that vague
-                    # inputs like "what do you think?" can surface relevant memories.
-                    memory_query = content
-                    ambient_raw = metadata.get("ambient_context_window") if metadata else None
-                    if isinstance(ambient_raw, list) and ambient_raw:
-                        ambient_snippet = " ".join(
-                            (line.split("] ", 1)[-1] if "] " in line else line)
-                            for line in ambient_raw[:5]
-                            if isinstance(line, str)
-                        ).strip()
-                        if ambient_snippet:
-                            memory_query = f"{ambient_snippet} {content}".strip()
-                    retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
-                        channel=channel,
-                        chat_id=chat_id,
-                        sender_id=sender_id,
-                        query=memory_query,
-                        reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
-                        reply_to_jid=str(metadata.get("reply_to_participant") or "").strip() or None,
-                        owner_context=is_owner,
-                    )
-                    retrieved_hits_count = len(retrieved_hits)
-                    # Plan 05: shared facts the *reader* may see, decided in SQL before
-                    # retrieval. Attached only when the shared runtime is wired (opt-in);
-                    # the legacy recall path above stays untouched either way.
-                    shared_text = self._shared_fact_context(
-                        query=memory_query,
-                        channel=channel,
-                        chat_id=chat_id,
-                        is_owner=is_owner,
-                    )
-                    if shared_text:
-                        retrieved_memory_text = f"{retrieved_memory_text}\n{shared_text}".strip()
-                except Exception as e:
-                    logger.warning("memory recall failed: {}", e)
-
-                if retrieved_hits_count > 0:
-                    self._metric("memory_recall_hit")
-                else:
-                    self._metric("memory_recall_miss")
-                if retrieved_memory_text:
-                    self._metric("memory_prompt_chars", len(retrieved_memory_text))
-
-            talkative_reply = await self._maybe_talkative_cooldown_reply(
-                session_key=session_key,
-                sender_id=sender_id,
-                content=content,
-                metadata=metadata,
-                enabled=talkative_cooldown_enabled,
-                streak_threshold=talkative_cooldown_streak_threshold,
-                topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
-                cooldown_seconds=talkative_cooldown_cooldown_seconds,
-                delay_seconds=talkative_cooldown_delay_seconds,
-                use_llm_message=talkative_cooldown_use_llm_message,
-            )
-            if talkative_reply is not None:
-                final_content = talkative_reply
-            else:
-                # Append contacts roster if present
-                roster_text = metadata.pop("_contacts_roster_text", None)
-                if roster_text:
-                    if retrieved_memory_text:
-                        retrieved_memory_text = f"{retrieved_memory_text}\n\n{roster_text}"
-                    else:
-                        retrieved_memory_text = str(roster_text)
-
-                messages = self.context.build_messages(
-                    history=session.get_history(
-                        max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
-                    ),
-                    current_message=content,
-                    current_metadata=metadata,
-                    retrieved_memory_text=retrieved_memory_text,
-                    persona_text=persona_text,
-                    media=list(media),
+        if self._lazy_media_resolver is not None:
+            try:
+                retrieval = await self._lazy_media_resolver.resolve(
                     channel=channel,
                     chat_id=chat_id,
-                    allowed_tools=allowed_tools,
+                    content=content,
+                    metadata=metadata,
                 )
-
-                self._current_session = session
-                resolved_profile = self._profile_for_name(model_profile)
-                try:
-                    final_content = await self._chat_loop(
-                        messages=messages,
-                        allowed_tools=allowed_tools,
-                        security_context={
-                            "channel": channel,
-                            "chat_id": chat_id,
-                            "sender_id": sender_id or "",
-                            "session_key": session_key,
-                        },
-                        is_owner=is_owner,
-                        model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
-                        provider=self._provider_for_profile(resolved_profile),
-                        max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
-                        temperature=(
-                            float(getattr(resolved_profile, "temperature"))
-                            if getattr(resolved_profile, "temperature", None) is not None
-                            else None
-                        ),
-                        reasoning=(
-                            getattr(resolved_profile, "reasoning", None)
-                            if isinstance(getattr(resolved_profile, "reasoning", None), dict)
-                            else None
-                        ),
-                        current_user_message=content,
-                        current_channel=channel,
-                        current_chat_id=chat_id,
-                        current_sender_id=sender_id or "",
-                        current_is_group=bool(metadata.get("is_group", False)),
-                        current_origin_label=str(
-                            metadata.get("group_name")
-                            or metadata.get("subject")
-                            or metadata.get("chat_name")
-                            or chat_id
-                        ),
-                        current_metadata=metadata,
-                        trace=trace,
+                if retrieval is not None:
+                    metadata["temporary_media_retrieval"] = retrieval
+                    self._metric(
+                        "temporary_media_retrieval_chars",
+                        len(str(retrieval.get("content") or "")),
                     )
-                except LLMProviderError:
-                    logger.warning("Provider-error turn dropped channel={} chat={}", channel, chat_id)
-                    final_content = None
-                finally:
-                    self._current_session = None
+            except Exception as e:
+                logger.warning("lazy media retrieval failed: {}", e)
+
+        retrieved_memory_text = ""
+        retrieved_hits_count = 0
+        if self.memory is not None:
+            try:
+                # Augment the memory query with recent ambient messages so that vague
+                # inputs like "what do you think?" can surface relevant memories.
+                memory_query = content
+                ambient_raw = metadata.get("ambient_context_window") if metadata else None
+                if isinstance(ambient_raw, list) and ambient_raw:
+                    ambient_snippet = " ".join(
+                        (line.split("] ", 1)[-1] if "] " in line else line)
+                        for line in ambient_raw[:5]
+                        if isinstance(line, str)
+                    ).strip()
+                    if ambient_snippet:
+                        memory_query = f"{ambient_snippet} {content}".strip()
+                retrieved_memory_text, retrieved_hits = self.memory.build_retrieved_context(
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    query=memory_query,
+                    reply_to_text=str(metadata.get("reply_to_text") or "").strip() or None,
+                    reply_to_jid=str(metadata.get("reply_to_participant") or "").strip() or None,
+                    owner_context=is_owner,
+                )
+                retrieved_hits_count = len(retrieved_hits)
+                # Plan 05: shared facts the *reader* may see, decided in SQL before
+                # retrieval. Attached only when the shared runtime is wired (opt-in);
+                # the legacy recall path above stays untouched either way.
+                shared_text = self._shared_fact_context(
+                    query=memory_query,
+                    channel=channel,
+                    chat_id=chat_id,
+                    is_owner=is_owner,
+                )
+                if shared_text:
+                    retrieved_memory_text = f"{retrieved_memory_text}\n{shared_text}".strip()
+            except Exception as e:
+                logger.warning("memory recall failed: {}", e)
+
+            if retrieved_hits_count > 0:
+                self._metric("memory_recall_hit")
+            else:
+                self._metric("memory_recall_miss")
+            if retrieved_memory_text:
+                self._metric("memory_prompt_chars", len(retrieved_memory_text))
+
+        talkative_reply = await self._maybe_talkative_cooldown_reply(
+            session_key=session_key,
+            sender_id=sender_id,
+            content=content,
+            metadata=metadata,
+            enabled=talkative_cooldown_enabled,
+            streak_threshold=talkative_cooldown_streak_threshold,
+            topic_overlap_threshold=talkative_cooldown_topic_overlap_threshold,
+            cooldown_seconds=talkative_cooldown_cooldown_seconds,
+            delay_seconds=talkative_cooldown_delay_seconds,
+            use_llm_message=talkative_cooldown_use_llm_message,
+        )
+        if talkative_reply is not None:
+            final_content = talkative_reply
+        else:
+            # Append contacts roster if present
+            roster_text = metadata.pop("_contacts_roster_text", None)
+            if roster_text:
+                if retrieved_memory_text:
+                    retrieved_memory_text = f"{retrieved_memory_text}\n\n{roster_text}"
+                else:
+                    retrieved_memory_text = str(roster_text)
+
+            messages = self.context.build_messages(
+                history=session.get_history(
+                    max_messages=self._resolve_history_limit(chat_id, session_history_limit, content),
+                ),
+                current_message=content,
+                current_metadata=metadata,
+                retrieved_memory_text=retrieved_memory_text,
+                persona_text=persona_text,
+                media=list(media),
+                channel=channel,
+                chat_id=chat_id,
+                allowed_tools=allowed_tools,
+            )
+
+            self._current_session = session
+            resolved_profile = self._profile_for_name(model_profile)
+            try:
+                final_content = await self._chat_loop(
+                    messages=messages,
+                    allowed_tools=allowed_tools,
+                    security_context={
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "sender_id": sender_id or "",
+                        "session_key": session_key,
+                    },
+                    is_owner=is_owner,
+                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
+                    provider=self._provider_for_profile(resolved_profile),
+                    max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
+                    temperature=(
+                        float(getattr(resolved_profile, "temperature"))
+                        if getattr(resolved_profile, "temperature", None) is not None
+                        else None
+                    ),
+                    reasoning=(
+                        getattr(resolved_profile, "reasoning", None)
+                        if isinstance(getattr(resolved_profile, "reasoning", None), dict)
+                        else None
+                    ),
+                    current_user_message=content,
+                    current_channel=channel,
+                    current_chat_id=chat_id,
+                    current_sender_id=sender_id or "",
+                    current_is_group=bool(metadata.get("is_group", False)),
+                    current_origin_label=str(
+                        metadata.get("group_name")
+                        or metadata.get("subject")
+                        or metadata.get("chat_name")
+                        or chat_id
+                    ),
+                    current_metadata=metadata,
+                    trace=trace,
+                )
+            except LLMProviderError:
+                logger.warning("Provider-error turn dropped channel={} chat={}", channel, chat_id)
+                final_content = None
+            finally:
+                self._current_session = None
 
         if final_content is None:
             if not _user_message_already_added:
@@ -2473,7 +2393,7 @@ class LLMResponder(ResponderPort):
         final_content = self._normalize_social_question_ending(final_content, metadata)
         final_content, budget_result = enforce_reply_budget(
             final_content,
-            None if uses_compact_prompt(persona_text) else metadata.get("reply_budget"),
+            metadata.get("reply_budget"),
             user_content=content,
             tool_used=bool(metadata.get("reply_budget_tool_used", False)),
         )
@@ -2736,6 +2656,7 @@ class LLMResponder(ResponderPort):
         session_key: str,
         principal: str,
         is_owner: bool = False,
+        voice: str | None = None,
     ) -> str:
         """Execute one already-authorized delivery without another model turn."""
         if tool_name not in {"message", "send_voice"}:
@@ -2754,6 +2675,8 @@ class LLMResponder(ResponderPort):
         }
         if tool_name == "send_voice":
             arguments["verbatim"] = True
+            if voice:
+                arguments["voice"] = voice
 
         from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
 

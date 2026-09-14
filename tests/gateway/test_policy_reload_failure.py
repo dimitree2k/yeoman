@@ -10,7 +10,6 @@ import pytest
 from loguru import logger
 from yeoman_gateway.adapters import policy_engine as policy_engine_module
 from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
-from yeoman_gateway.core.admin_commands import AdminCommandContext
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.loader import save_policy
@@ -220,19 +219,18 @@ def test_admin_command_recovers_from_reload_error(tmp_path: Path) -> None:
     _force_reload_check(adapter)
     assert adapter.evaluate(_event()).accept_message is False
 
-    result = adapter.policy_admin_handle(
-        AdminCommandContext(
+    result = adapter.route_admin_command(
+        InboundEvent(
             channel="whatsapp",
             chat_id="owner@s.whatsapp.net",
             sender_id="owner@s.whatsapp.net",
-            participant=None,
+            content="yes",
             is_group=False,
-            raw_text="/policy allow-group recovered@g.us",
-        ),
-        ["allow-group", "recovered@g.us"],
+            reply_to_text="Group approval: `recovered@g.us`",
+        )
     )
 
-    assert result.outcome == "applied"
+    assert result is not None and result.outcome == "applied"
     assert adapter._policy_reload_error is None
     assert path.exists()
     assert adapter.evaluate(_event()).accept_message is True
@@ -244,18 +242,17 @@ def test_first_admin_command_can_recover_from_invalid_policy(tmp_path: Path) -> 
     invalid["unknownField"] = "reject me"
     _replace_json(path, invalid)
 
-    result = adapter.policy_admin_handle(
-        AdminCommandContext(
+    result = adapter.route_admin_command(
+        InboundEvent(
             channel="whatsapp",
             chat_id="owner@s.whatsapp.net",
             sender_id="owner@s.whatsapp.net",
-            participant=None,
+            content="ja",
             is_group=False,
-            raw_text="/policy allow-group recovered@g.us",
-        ),
-        ["allow-group", "recovered@g.us"],
+            reply_to_text="Group approval: `recovered@g.us`",
+        )
     )
 
-    assert result.outcome == "applied"
+    assert result is not None and result.outcome == "applied"
     assert adapter._policy_reload_error is None
     assert adapter.evaluate(_event()).accept_message is True

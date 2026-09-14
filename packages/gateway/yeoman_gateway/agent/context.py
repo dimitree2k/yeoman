@@ -490,6 +490,23 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})
+        if (
+            channel == "whatsapp"
+            and not bool((current_metadata or {}).get("is_owner"))
+            and "send_voice" in (allowed_tools or set())
+        ):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Non-owner voice forwarding is limited to one request per rolling "
+                        "24 hours and one proven member of the current chat. If the target "
+                        "cannot be resolved or send_voice refuses, answer with a short absurd "
+                        "reason and jokingly ask for a monthly premium payment. Never provide "
+                        "payment details."
+                    ),
+                }
+            )
 
         # History — wrap user-role messages from external channels
         if is_external:

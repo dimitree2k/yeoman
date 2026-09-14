@@ -441,14 +441,18 @@ Owner response controls (WhatsApp owner only):
 
 ```text
 /stop              # pause current chat until /start
-/stop all          # pause every chat until /start all
+/stop all          # owner DM only: pause every chat until /start all
 /start             # resume current chat
-/start all         # resume all chats
-/pause 30min       # pause current chat for a duration
-/pause all 1h      # pause all chats for a duration
+/start all         # owner DM only: resume all chats
+/pause 30min       # pause current chat (maximum 120 minutes)
+/pause all         # owner DM only: pause every chat until /start all
+/pause all 1h      # owner DM only: pause all chats for any duration
 ```
 
 Supported pause units: `s`, `min`, `h`, `d` (for example `45s`, `15min`, `2h`, `1d`).
+New WhatsApp groups are approved by replying to the owner notification with
+`yes`/`ja` or blocked with `no`/`nein`. Approved groups are always mention-only
+and have spontaneous replies disabled.
 
 ## Providers
 

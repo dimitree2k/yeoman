@@ -422,6 +422,37 @@ async def test_followup_is_accepted_while_the_provider_call_is_in_flight(tmp_pat
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_manual_new_suppresses_an_in_flight_generation(tmp_path: Path) -> None:
+    import asyncio
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    actor = _actor(store, registry, str(decision.thread_id))
+    snapshot = actor.freeze_snapshot()
+    assert snapshot is not None
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _provider(_snapshot):
+        started.set()
+        await release.wait()
+        return "stale answer"
+
+    task = asyncio.create_task(actor.run_generation(snapshot, _provider))
+    await started.wait()
+    store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=T0 + 1)
+    release.set()
+    outcome = await task
+
+    assert outcome.state == "superseded"
+    assert outcome.text is None
+    assert store.generations_for_turn(snapshot.turn_id)[0]["outcome"] == "cancelled"
+    store.close()
+
+
 def test_postbox_is_bounded_and_deferred_inputs_survive(tmp_path: Path) -> None:
     store = _store(tmp_path)
     registry = ThreadRegistry(store=store, config=_Config())

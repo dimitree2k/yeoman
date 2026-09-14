@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -15,7 +16,7 @@ from yeoman_gateway.channels.whatsapp import InboundEvent as WhatsAppInboundEven
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.policy.engine import PolicyEngine
-from yeoman_gateway.policy.loader import save_policy
+from yeoman_gateway.policy.loader import load_policy, save_policy
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.ambient_judge import AmbientVerdict
 from yeoman_gateway.processing.effects import EffectGateway
@@ -199,6 +200,121 @@ def _wa_event(**overrides: Any) -> WhatsAppInboundEvent:
     }
     data.update(overrides)
     return WhatsAppInboundEvent(**data)
+
+
+def _admin_event(
+    content: str,
+    *,
+    chat_id: str = "owner@s.whatsapp.net",
+    is_group: bool = False,
+    reply_to_text: str | None = None,
+) -> InboundEvent:
+    return InboundEvent(
+        channel="whatsapp",
+        chat_id=chat_id,
+        sender_id="owner@s.whatsapp.net",
+        content=content,
+        is_group=is_group,
+        reply_to_text=reply_to_text,
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/reset",
+        "/voicemessages status",
+        "/policy help",
+        "/forget something",
+        "/approve 123@g.us",
+        "/approve-mention 123@g.us",
+        "/deny 123@g.us",
+    ],
+)
+def test_removed_whatsapp_commands_are_unknown(tmp_path: Path, command: str) -> None:
+    adapter, _ = _adapter(tmp_path)
+    result = adapter.route_admin_command(_admin_event(command))
+    assert result is not None and result.status == "unknown"
+
+
+def test_pause_scope_and_duration_rules(tmp_path: Path) -> None:
+    adapter, _ = _adapter(tmp_path)
+
+    allowed = adapter.route_admin_command(_admin_event("/pause 120min"))
+    refused = adapter.route_admin_command(_admin_event("/pause 121min"))
+    group_global = adapter.route_admin_command(
+        _admin_event("/stop all", chat_id="group@g.us", is_group=True)
+    )
+    long_global = adapter.route_admin_command(_admin_event("/pause all 400d"))
+    indefinite = adapter.route_admin_command(_admin_event("/pause all"))
+
+    assert allowed is not None and allowed.outcome == "applied"
+    assert refused is not None and refused.outcome == "invalid"
+    assert group_global is not None and group_global.outcome == "invalid"
+    assert long_global is not None and long_global.outcome == "applied"
+    assert indefinite is not None and indefinite.outcome == "applied"
+    assert adapter._global_pause_until_ms == -1
+
+
+@pytest.mark.parametrize("answer,approved", [("ja", True), ("nein", False)])
+def test_quoted_group_decision_sets_safe_policy(
+    tmp_path: Path,
+    answer: str,
+    approved: bool,
+) -> None:
+    adapter, path = _adapter(tmp_path)
+    result = adapter.route_admin_command(
+        _admin_event(answer, reply_to_text="Group approval: `123@g.us`")
+    )
+
+    assert result is not None and result.outcome == "applied"
+    override = load_policy(path).channels["whatsapp"].chats["123@g.us"]
+    assert override.who_can_talk is not None
+    assert override.who_can_talk.mode == ("everyone" if approved else "allowlist")
+    assert override.when_to_reply is not None
+    assert override.when_to_reply.mode == ("mention_only" if approved else "off")
+    assert override.spontaneity is not None and override.spontaneity.enabled is False
+
+
+def test_non_owner_voice_slash_addresses_mention_only_group(tmp_path: Path) -> None:
+    adapter, path = _adapter(tmp_path)
+    policy = load_policy(path)
+    policy.channels["whatsapp"].default.when_to_reply.mode = "mention_only"
+    save_policy(policy, path)
+    adapter._engine = PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"})
+
+    decision = adapter.evaluate(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="friends@g.us",
+            sender_id="person@lid",
+            content='/voice "Alice" "hello"',
+            is_group=True,
+        )
+    )
+
+    assert decision.accept_message is True
+    assert decision.should_respond is True
+
+
+@pytest.mark.asyncio
+async def test_owner_voice_command_invokes_shared_delivery(tmp_path: Path) -> None:
+    adapter, _ = _adapter(tmp_path)
+    adapter.resolve_whatsapp_group = lambda reference: (reference, None)  # type: ignore[method-assign]
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def send(content: str, target: str, source: str, principal: str) -> str:
+        calls.append((content, target, source, principal))
+        return "Voice message delivered."
+
+    adapter.set_voice_send_callback(send)
+    result = adapter.route_admin_command(_admin_event('/voice "123@g.us" "hello there"'))
+    await asyncio.sleep(0)
+
+    assert result is not None and result.outcome == "sent"
+    assert calls == [
+        ("hello there", "123@g.us", "owner@s.whatsapp.net", "owner@s.whatsapp.net")
+    ]
 
 
 # --------------------------------------------------------------------------------------

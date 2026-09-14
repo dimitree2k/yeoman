@@ -275,6 +275,19 @@ class ThreadActor:
         self._state.pending_seen.extend(item.event_id for item in pending)
         turn = self._store.get_turn(snapshot.turn_id)
 
+        if turn is None or turn.state in {"closed", "superseded"}:
+            self._store.finish_generation(
+                snapshot.generation_id,
+                now_ms=self._clock(),
+                outcome="cancelled",
+                detail="turn_closed",
+            )
+            return GenerationOutcome(
+                state="superseded",
+                generation_id=snapshot.generation_id,
+                detail="turn_closed",
+            )
+
         superseding = [item for item in pending if item.kind in {"delete", "edit"}]
         if superseding or (turn is not None and turn.revision != snapshot.revision):
             revision = turn.revision if turn is not None else snapshot.revision

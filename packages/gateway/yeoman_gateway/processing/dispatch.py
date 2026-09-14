@@ -808,7 +808,7 @@ class IntentEffectRouter:
             assignment = self._gateway.store.event_assignment(source_message_id)
             if assignment is not None and assignment[1]:
                 target_turn = self._gateway.store.get_turn(str(assignment[1]))
-                if target_turn is not None:
+                if target_turn is not None and target_turn.closed_ms is None:
                     binding = TurnBinding(
                         turn=target_turn, trace_id=source_message_id, generation_id=None
                     )

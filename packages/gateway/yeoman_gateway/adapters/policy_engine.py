@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import threading
@@ -14,9 +13,8 @@ from typing import TYPE_CHECKING, Any, Literal, override
 
 import websockets
 from loguru import logger
-from yeoman_shared.config.defaults import DEFAULT_SESSION_STATE_DIR
 from yeoman_shared.config.loader import load_config
-from yeoman_shared.utils.helpers import get_operational_data_path, safe_filename
+from yeoman_shared.utils.helpers import get_operational_data_path
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.core.admin_commands import (
@@ -28,29 +26,15 @@ from yeoman_gateway.core.admin_commands import (
 )
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import PolicyPort
-from yeoman_gateway.memory.session_state import resolve_session_state_dir
-from yeoman_gateway.policy.admin.contracts import (
-    PolicyActorContext,
-    PolicyCommand,
-    PolicyExecutionOptions,
-    PolicyExecutionResult,
-)
 from yeoman_gateway.policy.admin.service import PolicyAdminService
 from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
-from yeoman_gateway.policy.identity import (
-    normalize_identity_token,
-    normalize_sender_list,
-    resolve_actor_identity,
-)
+from yeoman_gateway.policy.identity import normalize_sender_list, resolve_actor_identity
 from yeoman_gateway.policy.loader import load_policy, save_policy
 from yeoman_gateway.policy.schema import (
-    BlockedSendersPolicyOverride,
     ChatPolicyOverride,
     PolicyConfig,
-    VoiceOutputPolicyOverride,
-    VoicePolicyOverride,
-    WhenToReplyMode,
+    SpontaneityPolicyOverride,
     WhenToReplyPolicyOverride,
     WhoCanTalkPolicyOverride,
 )
@@ -59,21 +43,6 @@ if TYPE_CHECKING:
     from yeoman_gateway.processing.models import PolicySnapshot
     from yeoman_gateway.session.manager import SessionManager
     from yeoman_gateway.storage.private_handoff import PrivateHandoff, PrivateHandoffStore
-
-_POLICY_ADMIN_USAGE = (
-    "Policy commands (owner DM only):\n"
-    "/policy help\n"
-    "/policy list-groups [query]\n"
-    "/policy allow-group <chat_id@g.us>\n"
-    "/policy block-group <chat_id@g.us>\n"
-    "/policy set-when <chat_id@g.us> <all|mention_only|allowed_senders|owner_only|off>\n"
-    "/policy set-persona <chat_id@g.us> <persona_path>\n"
-    "/policy clear-persona <chat_id@g.us>\n"
-    "/policy block-sender <chat_id@g.us> <sender_id>\n"
-    "/policy unblock-sender <chat_id@g.us> <sender_id>\n"
-    "/policy list-blocked <chat_id@g.us>\n"
-    "/policy status-group <chat_id@g.us>"
-)
 
 _PAUSE_STATE_VERSION = 1
 _PAUSE_INDEFINITE = -1
@@ -98,6 +67,10 @@ _PAUSE_DURATION_UNITS = {
     "days": 86400,
 }
 _PAUSE_DURATION_PATTERN = re.compile(r"^(?P<value>\d+)(?P<unit>[a-zA-Z]*)$")
+_GROUP_APPROVAL_TARGET_PATTERN = re.compile(
+    r"(?:Group approval|🆔 ID):\s*`?([^\s`]+@g\.us)`?",
+    re.IGNORECASE,
+)
 
 
 def _to_actor(event: InboundEvent) -> ActorContext:
@@ -117,7 +90,8 @@ def _to_actor(event: InboundEvent) -> ActorContext:
         sender_primary=identity.primary,
         sender_aliases=list(identity.aliases),
         is_group=event.is_group,
-        mentioned_bot=event.mentioned_bot,
+        mentioned_bot=event.mentioned_bot
+        or bool(re.match(r"^/voice(?:\s|$)", event.content.strip(), re.IGNORECASE)),
         reply_to_bot=event.reply_to_bot,
         content=event.content,
         is_voice=bool(event.raw_metadata.get("is_voice", False))
@@ -148,14 +122,15 @@ class EnginePolicyAdapter(PolicyPort):
         reload_on_change: bool | None = None,
         reload_check_interval_seconds: float | None = None,
         session_manager: "SessionManager | None" = None,
+        processing_store: Any | None = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
-        memory_state_dir: str = DEFAULT_SESSION_STATE_DIR,
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
         self._policy_path = policy_path
         self._session_manager = session_manager
+        self._processing_store = processing_store
         self._private_handoff_store = private_handoff_store
         if workspace is not None:
             self._workspace = workspace.expanduser().resolve()
@@ -163,26 +138,17 @@ class EnginePolicyAdapter(PolicyPort):
             self._workspace = self._engine.workspace
         else:
             self._workspace = (Path.home() / ".yeoman" / "workspace").resolve()
-        self._memory_state_dir = str(memory_state_dir or DEFAULT_SESSION_STATE_DIR)
         self._policy_admin_service: PolicyAdminService | None = None
-        self._memory_service: object | None = None
         self._admin_router = AdminCommandRouter(
             [
-                ApproveCommandHandler(self),
-                ApproveMentionCommandHandler(self),
                 CommandCatalogCommandHandler(self),
-                DenyCommandHandler(self),
                 HelpAliasCommandHandler(self),
                 PauseCommandHandler(self),
                 PanicCommandHandler(self),
-                PolicyAdminCommandHandler(self),
                 StartCommandHandler(self),
                 StopCommandHandler(self),
-                VoiceMessagesCommandHandler(self),
                 VoiceSendCommandHandler(self),
-                ResetSessionCommandHandler(self),
                 NewSessionCommandHandler(self),
-                ForgetCommandHandler(self),
             ]
         )
         self._pause_state_path = self._resolve_pause_state_path()
@@ -286,10 +252,6 @@ class EnginePolicyAdapter(PolicyPort):
             private_handoff_remaining_replies=handoff.remaining_replies,
             source=str(self._policy_path) if self._policy_path else "private_handoff",
         )
-
-    def set_memory_service(self, memory_service: object) -> None:
-        """Late-binding setter for MemoryService (avoids circular bootstrap)."""
-        self._memory_service = memory_service
 
     @property
     def known_tools(self) -> frozenset[str]:
@@ -461,7 +423,7 @@ class EnginePolicyAdapter(PolicyPort):
         return f"{seconds}s"
 
     @classmethod
-    def _parse_pause_duration_ms(cls, raw: str) -> int:
+    def _parse_pause_duration_ms(cls, raw: str, *, max_seconds: int | None = None) -> int:
         token = "".join(part.strip() for part in raw.split()).lower()
         if not token:
             raise ValueError("duration is required (example: 30min, 1h)")
@@ -476,8 +438,8 @@ class EnginePolicyAdapter(PolicyPort):
         total_seconds = value * multiplier
         if total_seconds < 1:
             raise ValueError("duration must be at least 1 second")
-        if total_seconds > 30 * 86_400:
-            raise ValueError("duration must be 30 days or less")
+        if max_seconds is not None and total_seconds > max_seconds:
+            raise ValueError("duration must be 120 minutes or less")
         return total_seconds * 1000
 
     def _set_chat_pause(self, *, channel: str, chat_id: str, until_ms: int) -> None:
@@ -878,21 +840,15 @@ class EnginePolicyAdapter(PolicyPort):
         """Route one deterministic slash command and return structured outcome."""
         if event.channel != "whatsapp":
             return None
+        approval = self._handle_group_approval_reply(event)
+        if approval is not None:
+            return approval
         return self._admin_router.route(_to_admin_context(event))
 
-    def policy_admin_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
-
-    def session_reset_is_applicable(self, ctx: AdminCommandContext) -> bool:
+    def session_boundary_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
-
-    def forget_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
 
     def command_catalog_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return bool(self._owner_policy_for_context(ctx))
-
-    def voice_messages_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
 
     def voice_send_is_applicable(self, ctx: AdminCommandContext) -> bool:
@@ -900,10 +856,6 @@ class EnginePolicyAdapter(PolicyPort):
 
     def response_control_is_applicable(self, ctx: AdminCommandContext) -> bool:
         return bool(self._owner_policy_for_context(ctx))
-
-    def approve_is_applicable(self, ctx: AdminCommandContext) -> bool:
-        """Check if approve/deny commands are applicable (owner in DM)."""
-        return bool(self._owner_policy_for_context(ctx)) and not ctx.is_group
 
     def _get_group_name(self, chat_id: str) -> str | None:
         """Get group name from chat_registry or bridge."""
@@ -933,212 +885,50 @@ class EnginePolicyAdapter(PolicyPort):
 
         return None
 
-    def approve_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        """Handle /approve <chat_id> - allow group + set reply mode to 'all'."""
-        if len(argv) != 1:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /approve <chat_id@g.us>",
-                command_name="approve",
-                outcome="invalid",
-                source="dm",
-            )
-
-        try:
-            chat_id = self._parse_group_chat_id(argv[0])
-        except ValueError as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Invalid approve arguments: {e}",
-                command_name="approve",
-                outcome="invalid",
-                source="dm",
-            )
-
-        policy = self._load_policy_for_admin()
+    def _handle_group_approval_reply(self, event: InboundEvent) -> AdminCommandResult | None:
+        choice = event.content.strip().casefold()
+        if choice not in {"yes", "ja", "no", "nein"} or event.is_group:
+            return None
+        ctx = _to_admin_context(event)
+        policy = self._owner_policy_for_context(ctx)
         if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Approve unavailable: policy engine is not active.",
-                command_name="approve",
-                outcome="error",
-                source="dm",
-            )
-
-        # Get group name for comment
-        group_name = self._get_group_name(chat_id)
-
-        # Set whoCanTalk=everyone and whenToReply=all
+            return None
+        match = _GROUP_APPROVAL_TARGET_PATTERN.search(event.reply_to_text or "")
+        if match is None:
+            return None
+        chat_id = self._parse_group_chat_id(match.group(1))
+        approved = choice in {"yes", "ja"}
         override = self._whatsapp_chat_override(policy, chat_id)
-        override.who_can_talk = WhoCanTalkPolicyOverride(mode="everyone", senders=[])
-        override.when_to_reply = WhenToReplyPolicyOverride(mode="all", senders=[])
-        if group_name and not override.comment:
-            override.comment = group_name
-
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Failed to apply policy change: {e}",
-                command_name="approve",
-                outcome="error",
-                source="dm",
-            )
-
-        name_suffix = f" ({group_name})" if group_name else ""
-        return AdminCommandResult(
-            status="handled",
-            response=f"✅ Approved {chat_id}{name_suffix}: whoCanTalk=everyone, whenToReply=all.",
-            command_name="approve",
-            outcome="applied",
-            source="dm",
-            metric_events=(
-                AdminMetricEvent(name="approve_command_total", labels=(("channel", ctx.channel),)),
-            ),
+        override.who_can_talk = WhoCanTalkPolicyOverride(
+            mode="everyone" if approved else "allowlist",
+            senders=[] if approved else list(policy.owners.get("whatsapp", [])),
         )
-
-    def approve_mention_handle(
-        self, ctx: AdminCommandContext, argv: list[str]
-    ) -> AdminCommandResult:
-        """Handle /approve-mention <chat_id> - allow group + set reply mode to 'mention_only'."""
-        if len(argv) != 1:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /approve-mention <chat_id@g.us>",
-                command_name="approve-mention",
-                outcome="invalid",
-                source="dm",
-            )
-
-        try:
-            chat_id = self._parse_group_chat_id(argv[0])
-        except ValueError as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Invalid approve-mention arguments: {e}",
-                command_name="approve-mention",
-                outcome="invalid",
-                source="dm",
-            )
-
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Approve unavailable: policy engine is not active.",
-                command_name="approve-mention",
-                outcome="error",
-                source="dm",
-            )
-
-        # Get group name for comment
-        group_name = self._get_group_name(chat_id)
-
-        # Set whoCanTalk=everyone and whenToReply=mention_only
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.who_can_talk = WhoCanTalkPolicyOverride(mode="everyone", senders=[])
-        override.when_to_reply = WhenToReplyPolicyOverride(mode="mention_only", senders=[])
-        if group_name and not override.comment:
-            override.comment = group_name
-
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Failed to apply policy change: {e}",
-                command_name="approve-mention",
-                outcome="error",
-                source="dm",
-            )
-
-        name_suffix = f" ({group_name})" if group_name else ""
-        return AdminCommandResult(
-            status="handled",
-            response=f"✅ Approved {chat_id}{name_suffix}: whoCanTalk=everyone, whenToReply=mention_only.",
-            command_name="approve-mention",
-            outcome="applied",
-            source="dm",
-            metric_events=(
-                AdminMetricEvent(
-                    name="approve_mention_command_total", labels=(("channel", ctx.channel),)
-                ),
-            ),
+        override.when_to_reply = WhenToReplyPolicyOverride(
+            mode="mention_only" if approved else "off",
+            senders=[],
         )
-
-    def deny_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        """Handle /deny <chat_id> - block group (owners only)."""
-        if len(argv) != 1:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /deny <chat_id@g.us>",
-                command_name="deny",
-                outcome="invalid",
-                source="dm",
-            )
-
-        try:
-            chat_id = self._parse_group_chat_id(argv[0])
-        except ValueError as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Invalid deny arguments: {e}",
-                command_name="deny",
-                outcome="invalid",
-                source="dm",
-            )
-
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Deny unavailable: policy engine is not active.",
-                command_name="deny",
-                outcome="error",
-                source="dm",
-            )
-
-        owner_senders = list(policy.owners.get("whatsapp", []))
-        if not owner_senders:
-            return AdminCommandResult(
-                status="handled",
-                response="Cannot deny group: owners.whatsapp is empty in policy.",
-                command_name="deny",
-                outcome="error",
-                source="dm",
-            )
-
-        # Get group name for comment
+        override.spontaneity = SpontaneityPolicyOverride(enabled=False)
         group_name = self._get_group_name(chat_id)
-
-        # Set whoCanTalk=allowlist (owners only)
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.who_can_talk = WhoCanTalkPolicyOverride(mode="allowlist", senders=owner_senders)
         if group_name and not override.comment:
             override.comment = group_name
-
         try:
             self._save_policy_and_reload(policy)
-        except Exception as e:
+        except Exception as exc:
             return AdminCommandResult(
                 status="handled",
-                response=f"Failed to apply policy change: {e}",
-                command_name="deny",
+                response=f"Failed to apply group decision: {exc}",
+                command_name="group-approval",
                 outcome="error",
                 source="dm",
             )
-
-        name_suffix = f" ({group_name})" if group_name else ""
+        action = "Approved" if approved else "Blocked"
+        detail = "mention-only, spontaneity off" if approved else "replies off"
         return AdminCommandResult(
             status="handled",
-            response=f"🚫 Denied {chat_id}{name_suffix}: whoCanTalk=allowlist (owners only).",
-            command_name="deny",
+            response=f"{action} {chat_id}: {detail}.",
+            command_name="group-approval",
             outcome="applied",
             source="dm",
-            metric_events=(
-                AdminMetricEvent(name="deny_command_total", labels=(("channel", ctx.channel),)),
-            ),
         )
 
     def panic_is_applicable(self, ctx: AdminCommandContext) -> bool:
@@ -1198,6 +988,15 @@ class EnginePolicyAdapter(PolicyPort):
                     source=source,
                 )
 
+        if scope == "all" and ctx.is_group:
+            return AdminCommandResult(
+                status="handled",
+                response="Global response controls are available only in the owner DM.",
+                command_name="stop",
+                outcome="invalid",
+                source=source,
+            )
+
         policy = self._load_policy_for_admin()
         if policy is None:
             return AdminCommandResult(
@@ -1251,40 +1050,46 @@ class EnginePolicyAdapter(PolicyPort):
 
     def pause_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         source = "dm" if not ctx.is_group else "group"
-        if not argv:
+        scope = "chat"
+        duration_parts = argv
+        if argv and argv[0].strip().lower() == "all":
+            scope = "all"
+            duration_parts = argv[1:]
+
+        if scope == "all" and ctx.is_group:
             return AdminCommandResult(
                 status="handled",
-                response="Usage: /pause <duration> or /pause all <duration>",
+                response="Global response controls are available only in the owner DM.",
                 command_name="pause",
                 outcome="invalid",
                 source=source,
             )
-
-        scope = "chat"
-        duration_parts = argv
-        if argv[0].strip().lower() == "all":
-            scope = "all"
-            duration_parts = argv[1:]
-            if not duration_parts:
+        if not duration_parts:
+            if scope == "all":
+                duration_ms = _PAUSE_INDEFINITE
+            else:
                 return AdminCommandResult(
                     status="handled",
-                    response="Usage: /pause <duration> or /pause all <duration>",
+                    response="Usage: /pause <duration> or /pause all [duration]",
                     command_name="pause",
                     outcome="invalid",
                     source=source,
                 )
-
-        duration_expr = "".join(part.strip() for part in duration_parts)
-        try:
-            duration_ms = self._parse_pause_duration_ms(duration_expr)
-        except ValueError as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Invalid pause duration: {e}",
-                command_name="pause",
-                outcome="invalid",
-                source=source,
-            )
+        else:
+            duration_expr = "".join(part.strip() for part in duration_parts)
+            try:
+                duration_ms = self._parse_pause_duration_ms(
+                    duration_expr,
+                    max_seconds=2 * 60 * 60 if scope == "chat" else None,
+                )
+            except ValueError as e:
+                return AdminCommandResult(
+                    status="handled",
+                    response=f"Invalid pause duration: {e}",
+                    command_name="pause",
+                    outcome="invalid",
+                    source=source,
+                )
 
         policy = self._load_policy_for_admin()
         if policy is None:
@@ -1299,21 +1104,27 @@ class EnginePolicyAdapter(PolicyPort):
             return AdminCommandResult(status="ignored")
 
         self._prune_expired_pauses()
-        until_ms = self._now_ms() + duration_ms
-        duration_text = self._format_duration_seconds(duration_ms // 1000)
+        until_ms = (
+            _PAUSE_INDEFINITE if duration_ms == _PAUSE_INDEFINITE else self._now_ms() + duration_ms
+        )
+        duration_text = (
+            "until /start all"
+            if duration_ms == _PAUSE_INDEFINITE
+            else f"for {self._format_duration_seconds(duration_ms // 1000)}"
+        )
         try:
             if scope == "all":
                 self._set_global_pause(until_ms)
-                response = f"⏸️ Responses paused for all chats for {duration_text}. Use /start all to resume sooner."
+                response = f"⏸️ Responses paused for all chats {duration_text}."
             else:
                 self._set_chat_pause(channel=ctx.channel, chat_id=ctx.chat_id, until_ms=until_ms)
                 if self._is_global_pause_active():
                     response = (
-                        f"⏸️ Responses paused for this chat for {duration_text}. "
+                        f"⏸️ Responses paused for this chat {duration_text}. "
                         "Global pause is active too; use /start all to resume everywhere."
                     )
                 else:
-                    response = f"⏸️ Responses paused for this chat for {duration_text}. Use /start to resume sooner."
+                    response = f"⏸️ Responses paused for this chat {duration_text}. Use /start to resume sooner."
         except Exception as e:
             return AdminCommandResult(
                 status="handled",
@@ -1351,6 +1162,15 @@ class EnginePolicyAdapter(PolicyPort):
                     outcome="invalid",
                     source=source,
                 )
+
+        if scope == "all" and ctx.is_group:
+            return AdminCommandResult(
+                status="handled",
+                response="Global response controls are available only in the owner DM.",
+                command_name="start",
+                outcome="invalid",
+                source=source,
+            )
 
         policy = self._load_policy_for_admin()
         if policy is None:
@@ -1414,58 +1234,6 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
-    def session_reset_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        if argv:
-            return AdminCommandResult(status="handled", response="Usage: /reset")
-
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Session reset unavailable: policy engine is not active.",
-            )
-        if not self._is_whatsapp_owner(ctx, policy):
-            return AdminCommandResult(status="ignored")
-        if self._session_manager is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Session reset unavailable: session manager is not configured.",
-            )
-
-        session_key = f"{ctx.channel}:{ctx.chat_id}"
-        try:
-            session = self._session_manager.get_or_create(session_key)
-            cleared_messages = len(session.messages)
-            session.clear()
-            self._session_manager.save(session)
-        except Exception as e:
-            return AdminCommandResult(status="handled", response=f"Session reset failed: {e}")
-
-        wal_path = self._session_wal_path(session_key)
-        wal_cleared = False
-        try:
-            wal_path.unlink()
-            wal_cleared = True
-        except FileNotFoundError:
-            pass
-        except Exception:
-            # WAL cleanup is best-effort; session history reset already succeeded.
-            wal_cleared = False
-
-        message = f"Conversation history cleared for {ctx.chat_id} ({cleared_messages} messages)."
-        if wal_cleared:
-            message += " Session state cleared."
-        return AdminCommandResult(
-            status="handled",
-            response=message,
-            command_name="reset",
-            outcome="applied",
-            source="dm",
-            metric_events=(
-                AdminMetricEvent(name="session_reset_total", labels=(("channel", ctx.channel),)),
-            ),
-        )
-
     def new_session_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         policy = self._load_policy_for_admin()
         if policy is None:
@@ -1483,6 +1251,16 @@ class EnginePolicyAdapter(PolicyPort):
         except Exception as e:
             return AdminCommandResult(status="handled", response=f"Session boundary failed: {e}")
 
+        if self._processing_store is not None:
+            try:
+                self._processing_store.close_chat_threads(
+                    channel=ctx.channel,
+                    chat_id=ctx.chat_id,
+                    now_ms=self._now_ms(),
+                )
+            except Exception as e:
+                return AdminCommandResult(status="handled", response=f"Thread boundary failed: {e}")
+
         return AdminCommandResult(
             status="handled",
             response=None,
@@ -1492,192 +1270,15 @@ class EnginePolicyAdapter(PolicyPort):
             source="dm" if not ctx.is_group else "group",
         )
 
-    def forget_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        if not argv:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /forget <query>",
-                command_name="forget",
-                outcome="usage",
-                source="dm",
-            )
-
-        # Confirm sub-command: /forget confirm <hash> [indices]
-        if argv[0].lower() == "confirm":
-            return self._forget_confirm(ctx, argv[1:])
-
-        # Preview sub-command: /forget <query tokens...>
-        return self._forget_preview(ctx, argv)
-
-    def _forget_preview(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        if self._memory_service is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Memory service is not available.",
-                command_name="forget",
-                outcome="error",
-                source="dm",
-            )
-
-        query = " ".join(argv)
-        hits = self._memory_service.forget(query=query, limit=10)
-        if not hits:
-            return AdminCommandResult(
-                status="handled",
-                response=f"No memories found matching '{query}'.",
-                command_name="forget",
-                outcome="empty",
-                source="dm",
-            )
-
-        total = len(hits)
-        ids = [h.entry.id for h in hits]
-        token = self._forget_hash(ids)
-        self._forget_preview_ids = ids
-
-        lines = [f"Found {total} memor{'y' if total == 1 else 'ies'}:"]
-        for i, hit in enumerate(hits, 1):
-            chat_label = self._forget_chat_label(hit.entry.chat_id)
-            content = hit.entry.content
-            if len(content) > 80:
-                content = content[:77] + "..."
-            lines.append(f'{i}. ({chat_label}, {hit.entry.created_at[:10]}) "{content}"')
-
-        lines.append("")
-        lines.append(f"/forget confirm {token} — delete all")
-        if total > 1:
-            lines.append(f"/forget confirm {token} 1,3 — delete selected")
-
-        return AdminCommandResult(
-            status="handled",
-            response="\n".join(lines),
-            command_name="forget",
-            outcome="preview",
-            source="dm",
-            metric_events=(
-                AdminMetricEvent(
-                    name="memory_forget_preview_total",
-                    labels=(("channel", ctx.channel),),
-                ),
-            ),
-        )
-
-    def _forget_confirm(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        if self._memory_service is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Memory service is not available.",
-                command_name="forget",
-                outcome="error",
-                source="dm",
-            )
-
-        if not argv:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /forget confirm <hash> [indices]",
-                command_name="forget",
-                outcome="usage",
-                source="dm",
-            )
-
-        provided_hash = argv[0].strip().lower()
-
-        # Parse optional index filter: /forget confirm abc1 1,3,5
-        index_filter: list[int] | None = None
-        if len(argv) > 1:
-            try:
-                index_filter = [int(x.strip()) for x in argv[1].split(",") if x.strip()]
-            except ValueError:
-                return AdminCommandResult(
-                    status="handled",
-                    response="Invalid index format. Use: /forget confirm <hash> 1,3,5",
-                    command_name="forget",
-                    outcome="error",
-                    source="dm",
-                )
-
-        preview_ids = getattr(self, "_forget_preview_ids", None)
-        if not preview_ids:
-            return AdminCommandResult(
-                status="handled",
-                response="Preview expired or invalid. Run /forget again.",
-                command_name="forget",
-                outcome="expired",
-                source="dm",
-            )
-
-        expected_hash = self._forget_hash(preview_ids)
-        if provided_hash != expected_hash:
-            return AdminCommandResult(
-                status="handled",
-                response="Preview expired or invalid. Run /forget again.",
-                command_name="forget",
-                outcome="expired",
-                source="dm",
-            )
-
-        # Apply index filter if provided
-        if index_filter is not None:
-            max_idx = len(preview_ids)
-            out_of_range = [i for i in index_filter if i < 1 or i > max_idx]
-            if out_of_range:
-                return AdminCommandResult(
-                    status="handled",
-                    response=f"Index {out_of_range[0]} out of range (1-{max_idx}). Run /forget again.",
-                    command_name="forget",
-                    outcome="error",
-                    source="dm",
-                )
-            ids_to_delete = [preview_ids[i - 1] for i in index_filter]
-        else:
-            ids_to_delete = list(preview_ids)
-
-        count = self._memory_service.forget_confirm(ids_to_delete)
-        self._forget_preview_ids = None  # Clear after confirm
-
-        return AdminCommandResult(
-            status="handled",
-            response=f"Forgot {count} memor{'y' if count == 1 else 'ies'}.",
-            command_name="forget",
-            outcome="applied",
-            source="dm",
-            metric_events=(
-                AdminMetricEvent(
-                    name="memory_forget_total",
-                    labels=(("channel", ctx.channel),),
-                    value=count,
-                ),
-            ),
-        )
-
-    @staticmethod
-    def _forget_hash(ids: list[str]) -> str:
-        """4-char hex hash over sorted entry IDs."""
-        payload = "\n".join(sorted(ids))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:4]
-
-    def _forget_chat_label(self, chat_id: str | None) -> str:
-        """Human-readable label for a chat_id in the preview."""
-        if not chat_id:
-            return "unknown"
-        if chat_id.endswith("@g.us"):
-            name = self._get_group_name(chat_id)
-            return name or chat_id
-        return "DM"
-
     def command_catalog_handle(
         self, ctx: AdminCommandContext, argv: list[str]
     ) -> AdminCommandResult:
-        include_all = False
         if argv:
             normalized = argv[0].strip().lower()
-            if len(argv) == 1 and normalized in {"all", "full"}:
-                include_all = True
-            elif len(argv) == 1 and normalized in {"help", "-h", "--help"}:
+            if len(argv) == 1 and normalized in {"help", "-h", "--help"}:
                 return AdminCommandResult(
                     status="handled",
-                    response="Usage: /commands [all]",
+                    response="Usage: /commands",
                     command_name="commands",
                     outcome="applied",
                     source="dm" if not ctx.is_group else "group",
@@ -1685,7 +1286,7 @@ class EnginePolicyAdapter(PolicyPort):
             else:
                 return AdminCommandResult(
                     status="handled",
-                    response="Usage: /commands [all]",
+                    response="Usage: /commands",
                     command_name="commands",
                     outcome="invalid",
                     source="dm" if not ctx.is_group else "group",
@@ -1693,29 +1294,24 @@ class EnginePolicyAdapter(PolicyPort):
 
         lines = [
             "Available slash commands for this chat:",
-            "- /commands [all] — list available commands",
-            "- /reset — clear conversation history for this chat",
-            "- /stop [all] — pause replies for this chat or all chats",
-            "- /pause <duration> or /pause all <duration> — timed pause (e.g. 30min, 1h)",
-            "- /start [all] — resume this chat or all chats",
-            "- /voicemessages <status|on|off|in_kind|always|text|inherit>",
-            "- !voice-send <here|chat_id|group_alias> <text> — owner raw voice send (no LLM paraphrase)",
+            "- /commands — list available commands",
+            "- /help — alias for /commands",
+            "- /new — close current threads and start fresh context",
+            "- /stop — pause this chat until /start",
+            "- /pause <duration> — pause this chat for up to 120 minutes",
+            "- /start — resume this chat",
+            '- /voice "group" "message" — send a voice note (owner)',
         ]
+        if not ctx.is_group:
+            lines.extend(
+                [
+                    "- /stop all or /pause all — pause all chats until /start all",
+                    "- /pause all <duration> — pause all chats for any duration",
+                    "- /start all — resume all chats",
+                ]
+            )
         if self.panic_is_applicable(ctx):
             lines.append("- /panic [now] — emergency stop gateway + WhatsApp bridge")
-        if self.approve_is_applicable(ctx):
-            lines.append("- /approve <chat_id@g.us> — approve new chat (allow + reply all)")
-            lines.append(
-                "- /approve-mention <chat_id@g.us> — approve new chat (allow + mention only)"
-            )
-            lines.append("- /deny <chat_id@g.us> — block chat (owners only)")
-        if self.policy_admin_is_applicable(ctx):
-            lines.append("- /policy help — policy admin commands")
-            if include_all and self._policy_admin_service is not None:
-                lines.append("")
-                lines.extend(self._policy_admin_service.registry.usage_lines())
-        else:
-            lines.append("In your DM with Arvid: /policy help")
         return AdminCommandResult(
             status="handled",
             response="\n".join(lines),
@@ -1724,148 +1320,16 @@ class EnginePolicyAdapter(PolicyPort):
             source="dm" if not ctx.is_group else "group",
         )
 
-    @staticmethod
-    def _voice_mode_token(raw: str) -> str | None:
-        value = raw.strip().lower().replace("-", "_")
-        aliases = {
-            "on": "in_kind",
-            "off": "off",
-            "status": "status",
-            "inherit": "inherit",
-            "default": "inherit",
-            "inkind": "in_kind",
-        }
-        mode = aliases.get(value, value)
-        valid = {"status", "inherit", "text", "in_kind", "always", "off"}
-        if mode not in valid:
-            return None
-        return mode
-
-    @staticmethod
-    def _voice_output_override_is_empty(override: VoiceOutputPolicyOverride) -> bool:
-        return (
-            override.mode is None
-            and override.tts_route is None
-            and override.voice is None
-            and override.format is None
-            and override.max_sentences is None
-            and override.max_chars is None
-        )
-
-    @classmethod
-    def _cleanup_voice_override(cls, override: ChatPolicyOverride) -> None:
-        voice = override.voice
-        if voice is None:
-            return
-        if voice.input is not None and voice.input.wake_phrases is None:
-            voice.input = None
-        if voice.output is not None and cls._voice_output_override_is_empty(voice.output):
-            voice.output = None
-        if voice.input is None and voice.output is None:
-            override.voice = None
-
-    def voice_messages_handle(
-        self, ctx: AdminCommandContext, argv: list[str]
-    ) -> AdminCommandResult:
-        if len(argv) > 1:
-            return AdminCommandResult(
-                status="handled",
-                response="Usage: /voicemessages <status|on|off|in_kind|always|text|inherit>",
-                command_name="voicemessages",
-                outcome="invalid",
-                source="dm" if not ctx.is_group else "group",
-            )
-
-        mode_token = "status"
-        if argv:
-            parsed = self._voice_mode_token(argv[0])
-            if parsed is None:
-                return AdminCommandResult(
-                    status="handled",
-                    response="Usage: /voicemessages <status|on|off|in_kind|always|text|inherit>",
-                    command_name="voicemessages",
-                    outcome="invalid",
-                    source="dm" if not ctx.is_group else "group",
-                )
-            mode_token = parsed
-
-        if self._engine is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Voice settings unavailable: policy engine is not active.",
-                command_name="voicemessages",
-                outcome="error",
-                source="dm" if not ctx.is_group else "group",
-            )
-
-        if mode_token == "status":
-            effective = self._engine.resolve_policy("whatsapp", ctx.chat_id)
-            return AdminCommandResult(
-                status="handled",
-                response=f"Voice messages for this chat: {effective.voice_output_mode}.",
-                command_name="voicemessages",
-                outcome="applied",
-                source="dm" if not ctx.is_group else "group",
-            )
-
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return AdminCommandResult(
-                status="handled",
-                response="Voice settings unavailable: policy is not loaded.",
-                command_name="voicemessages",
-                outcome="error",
-                source="dm" if not ctx.is_group else "group",
-            )
-
-        override = self._whatsapp_chat_override(policy, ctx.chat_id)
-        if mode_token == "inherit":
-            if override.voice is not None and override.voice.output is not None:
-                override.voice.output.mode = None
-        else:
-            if override.voice is None:
-                override.voice = VoicePolicyOverride()
-            if override.voice.output is None:
-                override.voice.output = VoiceOutputPolicyOverride()
-            override.voice.output.mode = mode_token  # type: ignore[assignment]
-        self._cleanup_voice_override(override)
-
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return AdminCommandResult(
-                status="handled",
-                response=f"Failed to apply voice setting: {e}",
-                command_name="voicemessages",
-                outcome="error",
-                source="dm" if not ctx.is_group else "group",
-            )
-
-        effective = self._engine.resolve_policy("whatsapp", ctx.chat_id)
-        return AdminCommandResult(
-            status="handled",
-            response=f"Voice messages updated for this chat: {effective.voice_output_mode}.",
-            command_name="voicemessages",
-            outcome="applied",
-            source="dm" if not ctx.is_group else "group",
-            metric_events=(
-                AdminMetricEvent(
-                    name="voice_messages_set_total",
-                    labels=(("channel", ctx.channel), ("mode", effective.voice_output_mode)),
-                ),
-            ),
-        )
-
     # ── /voice ad-hoc send ────────────────────────────────────────────────
 
-    _voice_send_callback: Any | None = None  # async (content, group) -> str
+    _voice_send_callback: Any | None = None
     _admin_notify_callback: Any | None = None  # async (channel, chat_id, text) -> None
 
     def set_voice_send_callback(
         self,
         callback: Any,
     ) -> None:
-        """Set async callback: (content: str, group: str) -> str."""
+        """Set async callback for an owner-requested voice delivery."""
         self._voice_send_callback = callback
 
     def set_admin_notify_callback(
@@ -1916,7 +1380,7 @@ class EnginePolicyAdapter(PolicyPort):
             from loguru import logger
 
             try:
-                result = await callback(message, chat_id)
+                result = await callback(message, chat_id, source_chat_id, ctx.sender_id)
             except Exception as exc:
                 result = f"Error: /voice exception ({type(exc).__name__}: {exc})"
 
@@ -1950,41 +1414,6 @@ class EnginePolicyAdapter(PolicyPort):
             ),
         )
 
-    def policy_admin_handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        policy = self._load_policy_for_admin()
-        if policy is None:
-            return AdminCommandResult(
-                status="handled", response="Policy admin unavailable: policy engine is not active."
-            )
-        if not self._is_whatsapp_owner(ctx, policy):
-            return AdminCommandResult(status="ignored")
-        if self._policy_admin_service is None:
-            return AdminCommandResult(
-                status="handled", response="Policy admin service unavailable."
-            )
-
-        subcommand = argv[0] if argv else "help"
-        command = PolicyCommand(
-            namespace="policy",
-            subcommand=subcommand,
-            argv=tuple(argv[1:]) if argv else (),
-            raw_text=ctx.raw_text.strip() or f"/policy {' '.join(argv)}".strip(),
-        )
-        execution = self._policy_admin_service.execute(
-            command=command,
-            actor=PolicyActorContext(
-                source="dm",
-                channel=ctx.channel,
-                chat_id=ctx.chat_id,
-                sender_id=ctx.sender_id,
-                is_group=ctx.is_group,
-                is_owner=True,
-            ),
-            options=PolicyExecutionOptions(),
-            policy_override=policy if self._policy_reload_error is not None else None,
-        )
-        return self._execution_to_admin_result(execution)
-
     def _load_policy_for_admin(self) -> PolicyConfig | None:
         if self._engine is None or self._policy_path is None:
             return None
@@ -2006,62 +1435,6 @@ class EnginePolicyAdapter(PolicyPort):
         if not self._is_whatsapp_owner(ctx, policy):
             return None
         return policy
-
-    def _session_wal_path(self, session_key: str) -> Path:
-        state_dir = resolve_session_state_dir(self._workspace, self._memory_state_dir)
-        safe_key = safe_filename(session_key.replace(":", "_"))
-        return state_dir / f"{safe_key}.md"
-
-    def _execution_to_admin_result(self, execution: PolicyExecutionResult) -> AdminCommandResult:
-        status = "handled"
-        if execution.outcome == "denied" and not execution.message.strip():
-            status = "ignored"
-        elif execution.unknown_command:
-            status = "unknown"
-
-        command_name = execution.command_name or "help"
-        metrics: list[AdminMetricEvent] = [
-            AdminMetricEvent(
-                name="policy_admin_execute_total",
-                labels=(
-                    ("outcome", execution.outcome),
-                    ("source", execution.source),
-                    ("command", command_name),
-                ),
-            )
-        ]
-        if (
-            self._policy_admin_service is not None
-            and self._policy_admin_service.registry.is_mutating(command_name)
-        ):
-            metrics.append(
-                AdminMetricEvent(
-                    name="policy_admin_mutation_total",
-                    labels=(
-                        ("command", command_name),
-                        ("dry_run", "true" if execution.dry_run else "false"),
-                    ),
-                )
-            )
-        if execution.is_rollback:
-            metrics.append(
-                AdminMetricEvent(
-                    name="policy_admin_rollback_total",
-                    labels=(("outcome", execution.outcome),),
-                )
-            )
-        if execution.audit_write_failed:
-            metrics.append(AdminMetricEvent(name="policy_admin_audit_write_fail_total"))
-
-        return AdminCommandResult(
-            status=status,  # type: ignore[arg-type]
-            response=execution.message if status != "ignored" else None,
-            command_name=command_name,
-            outcome=execution.outcome,
-            source=execution.source,
-            dry_run=execution.dry_run,
-            metric_events=tuple(metrics),
-        )
 
     @staticmethod
     def _panic_shutdown_worker(delay_s: float) -> None:
@@ -2117,28 +1490,6 @@ class EnginePolicyAdapter(PolicyPort):
             raise ValueError("chat id must be a WhatsApp group id ending in @g.us")
         return chat_id
 
-    def _parse_when_mode(self, value: str) -> WhenToReplyMode:
-        mode = value.strip().lower().replace("-", "_")
-        aliases = {
-            "mention": "mention_only",
-            "mentions": "mention_only",
-            "mentiononly": "mention_only",
-            "allowed": "allowed_senders",
-            "owner": "owner_only",
-        }
-        mode = aliases.get(mode, mode)
-        valid = {"all", "mention_only", "allowed_senders", "owner_only", "off"}
-        if mode not in valid:
-            raise ValueError(
-                "mode must be one of: all, mention_only, allowed_senders, owner_only, off"
-            )
-        return mode  # type: ignore[return-value]
-
-    def _sender_keys(self, senders: list[str]) -> set[str]:
-        return {
-            normalize_identity_token(value) for value in senders if normalize_identity_token(value)
-        }
-
     def _whatsapp_chat_override(self, policy: PolicyConfig, chat_id: str) -> ChatPolicyOverride:
         channel = policy.channels.get("whatsapp")
         if channel is None:
@@ -2169,305 +1520,6 @@ class EnginePolicyAdapter(PolicyPort):
         self._last_reload_check = time.monotonic()
         self._policy_reload_error = None
 
-    def _cmd_allow_group(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 3:
-            return "Usage: /policy allow-group <chat_id@g.us>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid allow-group arguments: {e}"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.who_can_talk = WhoCanTalkPolicyOverride(mode="everyone", senders=[])
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: whoCanTalk=everyone."
-
-    def _cmd_block_group(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 3:
-            return "Usage: /policy block-group <chat_id@g.us>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid block-group arguments: {e}"
-
-        owner_senders = list(policy.owners.get("whatsapp", []))
-        if not owner_senders:
-            return "Cannot block group: owners.whatsapp is empty in policy."
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.who_can_talk = WhoCanTalkPolicyOverride(mode="allowlist", senders=owner_senders)
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: whoCanTalk=allowlist (owners only)."
-
-    def _cmd_status_group(self, tokens: list[str]) -> str:
-        if len(tokens) != 3:
-            return "Usage: /policy status-group <chat_id@g.us>"
-        if self._engine is None:
-            return "Policy engine is not active."
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid status-group arguments: {e}"
-        effective = self._engine.resolve_policy("whatsapp", chat_id)
-        return (
-            f"{chat_id}\n"
-            f"whoCanTalk={effective.who_can_talk_mode}\n"
-            f"whenToReply={effective.when_to_reply_mode}\n"
-            f"blockedSenders={','.join(effective.blocked_senders)}\n"
-            f"personaFile={effective.persona_file or '-'}\n"
-            f"allowedTools.mode={effective.allowed_tools_mode}\n"
-            f"allowedTools.tools={','.join(effective.allowed_tools_tools)}\n"
-            f"allowedTools.deny={','.join(effective.allowed_tools_deny)}"
-        )
-
-    def _cmd_set_when(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 4:
-            return "Usage: /policy set-when <chat_id@g.us> <all|mention_only|allowed_senders|owner_only|off>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-            mode = self._parse_when_mode(tokens[3])
-        except ValueError as e:
-            return f"Invalid set-when arguments: {e}"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.when_to_reply = WhenToReplyPolicyOverride(mode=mode, senders=[])
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: whenToReply={mode}."
-
-    def _cmd_set_persona(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 4:
-            return "Usage: /policy set-persona <chat_id@g.us> <persona_path>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid set-persona arguments: {e}"
-        persona_path = tokens[3].strip()
-        if not persona_path:
-            return "Invalid set-persona arguments: persona_path cannot be empty"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.persona_file = persona_path
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: personaFile={persona_path}."
-
-    def _cmd_clear_persona(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 3:
-            return "Usage: /policy clear-persona <chat_id@g.us>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid clear-persona arguments: {e}"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        override.persona_file = None
-        try:
-            self._save_policy_and_reload(policy)
-        except Exception as e:
-            return f"Failed to apply policy change: {e}"
-        return (
-            f"Policy updated for {chat_id}: personaFile cleared (inherits channel/default policy)."
-        )
-
-    def _cmd_block_sender(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 4:
-            return "Usage: /policy block-sender <chat_id@g.us> <sender_id>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid block-sender arguments: {e}"
-        sender = tokens[3].strip()
-        if not sender:
-            return "Invalid block-sender arguments: sender_id cannot be empty"
-        sender_key = normalize_identity_token(sender)
-        if not sender_key:
-            return "Invalid block-sender arguments: sender_id cannot be empty"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        current = list(override.blocked_senders.senders) if override.blocked_senders else []
-        keys = self._sender_keys(current)
-        if sender_key not in keys:
-            current.append(sender)
-            override.blocked_senders = BlockedSendersPolicyOverride(senders=current)
-            try:
-                self._save_policy_and_reload(policy)
-            except Exception as e:
-                return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: blocked sender {sender}."
-
-    def _cmd_unblock_sender(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 4:
-            return "Usage: /policy unblock-sender <chat_id@g.us> <sender_id>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid unblock-sender arguments: {e}"
-        sender = tokens[3].strip()
-        if not sender:
-            return "Invalid unblock-sender arguments: sender_id cannot be empty"
-        sender_key = normalize_identity_token(sender)
-        if not sender_key:
-            return "Invalid unblock-sender arguments: sender_id cannot be empty"
-
-        override = self._whatsapp_chat_override(policy, chat_id)
-        current = list(override.blocked_senders.senders) if override.blocked_senders else []
-        updated = [value for value in current if normalize_identity_token(value) != sender_key]
-        if len(updated) != len(current):
-            override.blocked_senders = BlockedSendersPolicyOverride(senders=updated)
-            try:
-                self._save_policy_and_reload(policy)
-            except Exception as e:
-                return f"Failed to apply policy change: {e}"
-        return f"Policy updated for {chat_id}: unblocked sender {sender}."
-
-    def _cmd_list_blocked(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) != 3:
-            return "Usage: /policy list-blocked <chat_id@g.us>"
-        try:
-            chat_id = self._parse_group_chat_id(tokens[2])
-        except ValueError as e:
-            return f"Invalid list-blocked arguments: {e}"
-        override = self._whatsapp_chat_override(policy, chat_id)
-        values = list(override.blocked_senders.senders) if override.blocked_senders else []
-        if not values:
-            return f"{chat_id}: blockedSenders is empty."
-        lines = [f"{chat_id}: blockedSenders ({len(values)})"]
-        for value in values:
-            lines.append(f"- {value}")
-        return "\n".join(lines)
-
-    def _cmd_list_groups(self, tokens: list[str], policy: PolicyConfig) -> str:
-        if len(tokens) > 3:
-            return "Usage: /policy list-groups [query]"
-        query = tokens[2].strip().lower() if len(tokens) == 3 else ""
-
-        records: dict[str, dict[str, Any]] = {}
-
-        def ensure(chat_id: str) -> dict[str, Any]:
-            rec = records.get(chat_id)
-            if rec is None:
-                rec = {
-                    "chat_id": chat_id,
-                    "in_policy": False,
-                    "comment": "",
-                    "seen_session": False,
-                    "seen_log": False,
-                    "session_mtime": 0.0,
-                }
-                records[chat_id] = rec
-            return rec
-
-        # Policy-defined groups with optional comments.
-        wa = policy.channels.get("whatsapp")
-        if wa is not None:
-            for chat_id, override in wa.chats.items():
-                if not isinstance(chat_id, str) or not chat_id.endswith("@g.us"):
-                    continue
-                rec = ensure(chat_id)
-                rec["in_policy"] = True
-                comment = (override.comment or "").strip()
-                if comment:
-                    rec["comment"] = comment
-
-        base_dir = (
-            self._policy_path.parent if self._policy_path is not None else Path.home() / ".yeoman"
-        )
-
-        # Session files show groups observed by runtime.
-        sessions_dir = base_dir / "data" / "inbound"
-        if sessions_dir.exists():
-            for path in sessions_dir.glob("whatsapp_*@g.us.jsonl"):
-                chat_id = path.name[len("whatsapp_") : -len(".jsonl")]
-                if not chat_id.endswith("@g.us"):
-                    continue
-                rec = ensure(chat_id)
-                rec["seen_session"] = True
-                try:
-                    rec["session_mtime"] = max(float(rec["session_mtime"]), path.stat().st_mtime)
-                except OSError:
-                    pass
-
-        # Gateway log is a fallback source for recently observed group IDs.
-        log_path = base_dir / "var" / "logs" / "gateway.log"
-        if log_path.exists():
-            try:
-                with open(log_path, encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        for chat_id in re.findall(r"chat=([0-9a-zA-Z-]+@g\.us)", line):
-                            rec = ensure(chat_id)
-                            rec["seen_log"] = True
-            except OSError:
-                pass
-
-        # Bridge lookup can resolve human-readable group subjects even if policy has no comment.
-        bridge_names = self._list_group_subjects_from_bridge(list(records.keys()))
-        for bridge_chat_id, subject in bridge_names.items():
-            rec2: dict[str, Any] | None = records.get(bridge_chat_id)
-            if rec2 is None:
-                rec2 = ensure(bridge_chat_id)
-                records[bridge_chat_id] = rec2
-            rec2["seen_bridge"] = True
-            if not str(rec.get("comment") or "").strip():
-                rec["comment"] = subject
-
-        if not records:
-            return "No WhatsApp groups discovered yet."
-
-        rows: list[dict[str, Any]] = []
-        for rec in records.values():
-            chat_id = str(rec["chat_id"])
-            comment = str(rec["comment"] or "")
-            if query and query not in chat_id.lower() and query not in comment.lower():
-                continue
-            rows.append(rec)
-        if not rows:
-            return f"No WhatsApp groups matched '{query}'."
-
-        rows.sort(
-            key=lambda r: (
-                0 if bool(r["in_policy"]) else 1,
-                -float(r["session_mtime"]),
-                str(r["chat_id"]),
-            )
-        )
-
-        max_rows = 40
-        shown = rows[:max_rows]
-        lines = [f"Known WhatsApp groups: {len(rows)} (showing {len(shown)})"]
-        for rec in shown:
-            chat_id = str(rec["chat_id"])
-            comment = str(rec["comment"] or "")
-            sources: list[str] = []
-            if rec["in_policy"]:
-                sources.append("policy")
-            if rec["seen_session"]:
-                sources.append("sessions")
-            if rec["seen_log"]:
-                sources.append("log")
-            if rec.get("seen_bridge"):
-                sources.append("bridge")
-            source_text = "+".join(sources) if sources else "unknown"
-            if comment:
-                lines.append(f"- {chat_id} | {source_text} | {comment}")
-            else:
-                lines.append(f"- {chat_id} | {source_text}")
-
-        if len(rows) > max_rows:
-            lines.append(f"... and {len(rows) - max_rows} more")
-        lines.append(
-            "Use: /policy allow-group <chat_id@g.us> or /policy block-group <chat_id@g.us>"
-        )
-        return "\n".join(lines)
 
     def _list_group_subjects_from_bridge(self, ids: list[str]) -> dict[str, str]:
         target_ids = [cid for cid in ids if isinstance(cid, str) and cid.endswith("@g.us")]
@@ -2551,44 +1603,6 @@ class EnginePolicyAdapter(PolicyPort):
         return result_holder
 
 
-class PolicyAdminCommandHandler(AdminCommandHandler):
-    """Deterministic `/policy ...` command namespace handler."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "policy"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.policy_admin_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.policy_admin_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/policy help"
-
-
-class ResetSessionCommandHandler(AdminCommandHandler):
-    """Deterministic `/reset` command for clearing chat session context."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "reset"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.session_reset_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.session_reset_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/reset"
-
-
 class NewSessionCommandHandler(AdminCommandHandler):
     """Deterministic `/new` command for inserting a session boundary."""
 
@@ -2599,32 +1613,13 @@ class NewSessionCommandHandler(AdminCommandHandler):
         return "new"
 
     def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.session_reset_is_applicable(ctx)
+        return self._adapter.session_boundary_is_applicable(ctx)
 
     def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
         return self._adapter.new_session_handle(ctx, argv)
 
     def help_hint(self) -> str:
         return "/new"
-
-
-class ForgetCommandHandler(AdminCommandHandler):
-    """Deterministic `/forget` command for soft-deleting memories."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "forget"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.forget_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.forget_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/forget <query>"
 
 
 class CommandCatalogCommandHandler(AdminCommandHandler):
@@ -2741,25 +1736,6 @@ class PanicCommandHandler(AdminCommandHandler):
         return "/panic"
 
 
-class VoiceMessagesCommandHandler(AdminCommandHandler):
-    """Deterministic `/voicemessages` command for per-chat voice output mode."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "voicemessages"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.voice_messages_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.voice_messages_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/voicemessages"
-
-
 class VoiceSendCommandHandler(AdminCommandHandler):
     """Ad-hoc `/voice` command: synthesize TTS and send to a WhatsApp group.
 
@@ -2780,60 +1756,3 @@ class VoiceSendCommandHandler(AdminCommandHandler):
 
     def help_hint(self) -> str:
         return '/voice "group" "message"'
-
-
-class ApproveCommandHandler(AdminCommandHandler):
-    """Quick `/approve` command for new chat approval (allow + reply all)."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "approve"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.approve_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.approve_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/approve <chat_id@g.us>"
-
-
-class ApproveMentionCommandHandler(AdminCommandHandler):
-    """Quick `/approve-mention` command for new chat approval (allow + mention only)."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "approve-mention"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.approve_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.approve_mention_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/approve-mention <chat_id@g.us>"
-
-
-class DenyCommandHandler(AdminCommandHandler):
-    """Quick `/deny` command for blocking a chat (owners only)."""
-
-    def __init__(self, adapter: EnginePolicyAdapter) -> None:
-        self._adapter = adapter
-
-    def namespace(self) -> str:
-        return "deny"
-
-    def is_applicable(self, ctx: AdminCommandContext) -> bool:
-        return self._adapter.approve_is_applicable(ctx)
-
-    def handle(self, ctx: AdminCommandContext, argv: list[str]) -> AdminCommandResult:
-        return self._adapter.deny_handle(ctx, argv)
-
-    def help_hint(self) -> str:
-        return "/deny <chat_id@g.us>"

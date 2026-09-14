@@ -368,6 +368,68 @@ def test_a_thread_with_open_work_is_not_closed(tmp_path: Path) -> None:
     store.close()
 
 
+def test_manual_boundary_closes_only_the_target_chats_work(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+    target = registry.assign(_event(event_id="m1", chat_id="target@g.us", mentioned_bot=True), now_ms=T0)
+    other = registry.assign(_event(event_id="m2", chat_id="other@g.us", mentioned_bot=True), now_ms=T0)
+    store.enqueue_effect(
+        effect_id="fx1",
+        operation_key="k1",
+        payload={"text": "queued answer"},
+        target={"channel": "whatsapp", "chat_id": "target@g.us"},
+        turn_id=target.turn_id,
+        now_ms=T0,
+    )
+    store.enqueue_pending_input(
+        input_id="pending1",
+        thread_id=target.thread_id,
+        turn_id=target.turn_id,
+        event_id="followup1",
+        principal="owner@s.whatsapp.net",
+        now_ms=T0,
+    )
+
+    closed = store.close_chat_threads(
+        channel="whatsapp", chat_id="target@g.us", now_ms=T0 + 1_000
+    )
+
+    assert closed == (target.thread_id,)
+    assert store.get_thread(target.thread_id).state == "closed"
+    assert store.get_thread(target.thread_id).close_reason == "manual_new"
+    assert store.get_turn(target.turn_id).state == "superseded"
+    assert store.effect_state("fx1") == "cancelled"
+    assert store.pending_inputs(target.thread_id) == ()
+    assert store.get_thread(other.thread_id).state == "open"
+    assert store.get_turn(other.turn_id).state == "open"
+    store.close()
+
+
+def test_reply_does_not_reopen_a_manually_closed_thread(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+    first = registry.assign(_event(event_id="m1", mentioned_bot=True), now_ms=T0)
+    store.register_thread_message(
+        thread_id=first.thread_id,
+        turn_id=first.turn_id,
+        direction="out",
+        effect_id="fx1",
+        now_ms=T0,
+    )
+    store.attach_confirmed_message_id("fx1", "provider-1", T0)
+    store.close_chat_threads(channel="whatsapp", chat_id="chat@g.us", now_ms=T0 + 1)
+
+    reply = registry.assign(
+        _event(event_id="m2", reply_to_message_id="provider-1"), now_ms=T0 + 2
+    )
+
+    assert reply.thread_id != first.thread_id
+    assert reply.new_thread is True
+    assert store.get_thread(first.thread_id).state == "closed"
+    assert store.get_thread(reply.thread_id).state == "open"
+    store.close()
+
+
 def test_thread_without_sources_is_not_reopened_after_retention(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     registry = _registry(store)
@@ -428,8 +490,8 @@ def test_v1_database_migrates_additively(tmp_path: Path) -> None:
 
     store = ProcessingStore(path)
 
-    assert SCHEMA_VERSION == 5
-    assert store.schema_version == 5
+    assert SCHEMA_VERSION == 6
+    assert store.schema_version == 6
     assert store.count_events() == 1
     assert store.count_effects() == 1
     assert store.list_threads() == ()

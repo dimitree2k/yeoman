@@ -33,6 +33,13 @@ from yeoman_gateway.core.orchestrator import Orchestrator
 from yeoman_gateway.core.ports import PolicyPort, ResponderPort
 from yeoman_gateway.cron.service import CronService
 from yeoman_gateway.cron.types import CronSchedule
+from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
+from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_gateway.processing.tool_context import (
+    ToolInvocationContext,
+    reset_tool_context,
+    set_tool_context,
+)
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from yeoman_gateway.security.engine import SecurityEngine
 from yeoman_gateway.security.normalize import normalize_text
@@ -812,7 +819,7 @@ async def test_responder_blocks_tool_call_via_security(
 
 
 @pytest.mark.asyncio
-async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
+async def test_removed_owner_raw_voice_send_reaches_llm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -821,21 +828,10 @@ async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
     workspace.mkdir()
     bus = MessageBus()
     provider = _CountingProvider()
-    tts = _FakeTTS()
-
-    def _resolve_group(reference: str) -> tuple[str | None, str | None]:
-        if reference == "Finanzgruppe":
-            return "491786127564-1611913127@g.us", None
-        return None, "unknown group reference"
-
     responder = LLMResponder(
         bus=bus,
         provider=provider,
         workspace=workspace,
-        group_resolver=_resolve_group,
-        model_router=_FakeModelRouter(),  # type: ignore[arg-type]
-        tts=tts,  # type: ignore[arg-type]
-        whatsapp_tts_outgoing_dir=tmp_path,
     )
 
     out = await responder.process_direct(
@@ -847,15 +843,77 @@ async def test_owner_raw_voice_send_bypasses_llm_and_sends_verbatim(
     )
     await responder.aclose()
 
-    assert out == "done"
-    assert provider.calls == 0
-    assert tts.last_text == "hey ihr penner! was geht?"
-    outbound = await bus.consume_outbound()
-    assert outbound.channel == "whatsapp"
-    assert outbound.chat_id == "491786127564-1611913127@g.us"
-    assert outbound.content == ""
-    assert len(outbound.media) == 1
-    assert Path(outbound.media[0]).exists()
+    assert out == "llm-called"
+    assert provider.calls == 1
+    assert bus.outbound_size == 0
+
+
+class _VoiceRegistry:
+    def get_chat(self, channel: str, chat_id: str) -> dict[str, Any] | None:
+        if (channel, chat_id) != ("whatsapp", "friends@g.us"):
+            return None
+        return {
+            "metadata": {
+                "participants": [
+                    {
+                        "id": "friend@lid",
+                        "phoneNumber": "491234@s.whatsapp.net",
+                    }
+                ]
+            }
+        }
+
+
+def test_non_owner_voice_guard_requires_current_chat_member_and_one_per_day(
+    tmp_path: Path,
+) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=_CountingProvider(),
+        workspace=tmp_path,
+        chat_registry=_VoiceRegistry(),  # type: ignore[arg-type]
+        processing_store=store,
+    )
+    context_token = set_tool_context(
+        ToolInvocationContext(
+            channel="whatsapp",
+            chat_id="friends@g.us",
+            session_key="whatsapp:friends@g.us",
+            is_owner=False,
+        )
+    )
+    principal_token = CURRENT_PRINCIPAL.set("requester@lid")
+    try:
+        outsider = responder._voice_send_governance_error(
+            VoiceSendRequest(
+                channel="whatsapp",
+                chat_id="outsider@s.whatsapp.net",
+                content="hi",
+            )
+        )
+        first = responder._voice_send_governance_error(
+            VoiceSendRequest(
+                channel="whatsapp",
+                chat_id="491234@s.whatsapp.net",
+                content="hi",
+            )
+        )
+        second = responder._voice_send_governance_error(
+            VoiceSendRequest(
+                channel="whatsapp",
+                chat_id="491234@s.whatsapp.net",
+                content="again",
+            )
+        )
+    finally:
+        CURRENT_PRINCIPAL.reset(principal_token)
+        reset_tool_context(context_token)
+        store.close()
+
+    assert "monthly premium" in (outsider or "").lower()
+    assert first is None
+    assert "monthly premium" in (second or "").lower()
 
 
 @pytest.mark.asyncio

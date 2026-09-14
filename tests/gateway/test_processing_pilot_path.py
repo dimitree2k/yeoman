@@ -27,6 +27,7 @@ from yeoman_gateway.policy.loader import save_policy
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.dispatch import ManagedOutboundDispatcher
 from yeoman_gateway.processing.policy import IngestRequest
+from yeoman_gateway.session.manager import Session
 from yeoman_shared.config.schema import Config
 
 CHAT = "pilot@g.us"
@@ -296,25 +297,15 @@ async def test_tool_effect_from_a_generation_uses_the_frozen_turn(runtime) -> No
 # --------------------------------------------------------------------------------------
 
 
-class _Session:
-    def __init__(self, key: str) -> None:
-        self.key = key
-        self.messages: list[dict] = []
-        self.metadata: dict = {}
-
-    def add_message(self, role: str, content: str, **kwargs) -> None:
-        self.messages.append({"role": role, "content": content, **kwargs})
-
-
 class _Sessions:
     def __init__(self) -> None:
-        self.store: dict[str, _Session] = {}
+        self.store: dict[str, Session] = {}
         self.saves = 0
 
-    def get_or_create(self, key: str) -> _Session:
-        return self.store.setdefault(key, _Session(key))
+    def get_or_create(self, key: str) -> Session:
+        return self.store.setdefault(key, Session(key))
 
-    def save(self, session: _Session) -> None:
+    def save(self, session: Session) -> None:
         self.saves += 1
 
 
@@ -351,7 +342,7 @@ def _dm_runtime(tmp_path: Path):
     return config, store, registry, gate
 
 
-def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None:
+def test_dm_carries_only_history_after_new_boundary(tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
     from yeoman_gateway.core.models import InboundEvent
@@ -363,6 +354,9 @@ def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None
     chat_session = sessions.get_or_create("whatsapp:owner@s.whatsapp.net")
     chat_session.add_message("user", "earlier question about the pilot")
     chat_session.add_message("assistant", "earlier answer")
+    chat_session.add_boundary()
+    chat_session.add_message("user", "fresh question after new")
+    chat_session.add_message("assistant", "fresh answer")
 
     class _Inner:
         def __init__(self, sessions: _Sessions) -> None:
@@ -399,9 +393,10 @@ def test_dm_keeps_its_history_through_a_marked_carryover(tmp_path: Path) -> None
     carried = sessions.get_or_create(thread_key)
     marked = [m for m in carried.messages if LEGACY_CONTEXT_MARKER in m["content"]]
     assert len(marked) == 1
-    assert "earlier question about the pilot" in marked[0]["content"]
+    assert "fresh question after new" in marked[0]["content"]
+    assert "earlier question about the pilot" not in marked[0]["content"]
     # The chat session itself is never touched.
-    assert len(chat_session.messages) == 2
+    assert len(chat_session.messages) == 5
 
     # A second turn must not copy again.
     asyncio.run(wrapper.generate_reply(event, object()))

@@ -181,6 +181,13 @@ def _rule_reply_known(
 ) -> JoinDecision | None:
     if not view.reply_thread_id:
         return None
+    if view.reply_thread_state in ("idle", "closed") and not view.reply_reopenable:
+        return JoinDecision(
+            rule=JoinRule.REPLY_KNOWN,
+            reason="reply_to_closed_thread",
+            new_thread=True,
+            quote_ref=data.reply_to_message_id,
+        )
     reopenable = view.reply_thread_state in (None, "open") or view.reply_reopenable
     return JoinDecision(
         rule=JoinRule.REPLY_KNOWN,
@@ -632,6 +639,8 @@ class ThreadRegistry:
             return False
         thread = self._store.get_thread(thread_id)
         if thread is None:
+            return False
+        if thread.close_reason == "manual_new":
             return False
         if now_ms - thread.last_activity_ms > self._policy.reopen_window_ms:
             return False
