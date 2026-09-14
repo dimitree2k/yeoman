@@ -105,3 +105,23 @@ def resolve_actor_identity(channel: str, sender_id: str, metadata: dict[str, Any
     primary = aliases[0] if aliases else ""
     return ActorIdentity(primary=primary, aliases=tuple(aliases))
 
+
+def canonical_user_id(
+    channel: str, sender_id: str = "", metadata: dict[str, Any] | None = None
+) -> str:
+    """Return a quota identity from trusted WhatsApp bridge metadata only.
+
+    A bare sender/LID is deliberately not a fallback: generic IPC and model-provided
+    values must never turn into a person identity or an owner exception.
+    """
+    del sender_id
+    if channel != "whatsapp":
+        return ""
+    meta = metadata or {}
+    if any(bool(meta.get(key)) for key in ("lid_conflict", "lidConflict", "identity_conflict")):
+        return ""
+    raw = normalize_identity_token(str(meta.get("sender_phone_jid") or ""))
+    if not raw:
+        return ""
+    token = raw.split("@", 1)[0].split(":", 1)[0].lstrip("+")
+    return f"whatsapp:{token}" if token.isdigit() else ""

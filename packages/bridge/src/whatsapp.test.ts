@@ -44,6 +44,33 @@ test('resolveParticipantJid falls back to remote JID in groups when participant 
   assert.equal(resolved, '491786127564-1611913127@g.us');
 });
 
+test('refreshLidCache keeps conflicting mappings blocked instead of overwriting', async () => {
+  const statuses: Array<{ name: string; payload: unknown }> = [];
+  const client = new WhatsAppClient({
+    authDir: '/tmp/yeoman-lid-conflict-test',
+    onMessage: () => {},
+    onQR: () => {},
+    onStatus: (name, payload) => statuses.push({ name, payload }),
+    onError: () => {},
+  });
+  (client as any).connected = true;
+  let phone = '491700000001@s.whatsapp.net';
+  (client as any).sock = {
+    groupFetchAllParticipating: async () => ({
+      'group@g.us': { participants: [{ id: '123@lid', phoneNumber: phone }] },
+    }),
+  };
+
+  await (client as any).refreshLidCache();
+  assert.equal(client.resolvePhoneJid('123@lid'), phone);
+  phone = '491700000002@s.whatsapp.net';
+  await (client as any).refreshLidCache();
+
+  assert.equal(client.resolvePhoneJid('123@lid'), undefined);
+  assert.equal((client as any).isLidConflict('123@lid'), true);
+  assert.equal(statuses.some(({ name }) => name === 'lid_mapping_conflict'), true);
+});
+
 test('shouldIgnoreFromMeInbound drops self messages by default', () => {
   assert.equal(shouldIgnoreFromMeInbound(true, false, false), true);
   assert.equal(shouldIgnoreFromMeInbound(true, undefined, false), true);

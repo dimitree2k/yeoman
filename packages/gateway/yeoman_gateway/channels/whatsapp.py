@@ -165,6 +165,7 @@ class InboundEvent:
     reply_to_media_type: str | None = None
     reply_to_media_path: str | None = None
     reply_to_media_bytes: int | None = None
+    lid_conflict: bool = False
 
 
 #: Bridge frame types that only carry journal evidence (never a chat turn).
@@ -684,6 +685,7 @@ class WhatsAppChannel(BaseChannel):
         participant_jid = str(payload.get("participantJid") or "").strip()
         sender_id = str(payload.get("senderId") or "").strip()
         sender_phone_jid = str(payload.get("senderPhoneJid") or "").strip() or None
+        lid_conflict = bool(payload.get("lidConflict", False))
         sender_name = str(payload.get("senderName") or "").strip() or None
         text = str(payload.get("text") or "").strip()
 
@@ -775,6 +777,7 @@ class WhatsAppChannel(BaseChannel):
             participant_jid=participant_jid,
             sender_id=sender_id,
             sender_phone_jid=sender_phone_jid,
+            lid_conflict=lid_conflict,
             sender_name=sender_name,
             is_group=bool(payload.get("isGroup", False)),
             text=text,
@@ -1050,6 +1053,8 @@ class WhatsAppChannel(BaseChannel):
                 "is_group": event.is_group,
                 "media_kind": event.media_kind,
                 "is_voice": event.media_kind == "audio",
+                "sender_phone_jid": event.sender_phone_jid,
+                "lid_conflict": event.lid_conflict,
             },
         )
 
@@ -1713,6 +1718,8 @@ class WhatsAppChannel(BaseChannel):
                 "chat": event.chat_jid,
                 "participant": effective_participant,
                 "participant_lid": event.participant_jid if event.sender_phone_jid else None,
+                "sender_phone_jid": event.sender_phone_jid,
+                "lid_conflict": event.lid_conflict,
                 "sender": effective_sender or event.sender_id,
                 "sender_name": event.sender_name,
                 "is_group": event.is_group,

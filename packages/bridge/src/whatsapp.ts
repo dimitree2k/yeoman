@@ -45,6 +45,7 @@ export interface InboundMessageV2 {
   participantJid: string;
   senderId: string;
   senderPhoneJid?: string;
+  lidConflict?: boolean;
   senderName?: string;
   isGroup: boolean;
   text: string;
@@ -484,6 +485,7 @@ export class WhatsAppClient {
 
   /** Maps LID user tokens to phone-number JIDs (e.g. "169303366209721" → "491757070305@s.whatsapp.net"). */
   private readonly lidToPhone = new Map<string, string>();
+  private readonly lidConflicts = new Set<string>();
 
   private qrWaiters = new Set<(value: string) => void>();
   private connectWaiters = new Set<(value: boolean) => void>();
@@ -820,7 +822,19 @@ export class WhatsAppClient {
     if (normalized.endsWith('@s.whatsapp.net')) return undefined;
     const token = jidUserToken(normalized);
     if (!token) return undefined;
+    if (this.lidConflicts.has(token)) return undefined;
     return this.lidToPhone.get(token);
+  }
+
+  private phoneJidForParticipant(jid: string): string | undefined {
+    const normalized = normalizeJid(jid);
+    if (normalized.endsWith('@s.whatsapp.net')) return normalized;
+    return this.resolvePhoneJid(normalized);
+  }
+
+  isLidConflict(jid: string): boolean {
+    const token = jidUserToken(normalizeJid(jid));
+    return Boolean(token && this.lidConflicts.has(token));
   }
 
   /**
@@ -843,7 +857,14 @@ export class WhatsAppClient {
           const phoneJid = normalizeJid(phoneRaw);
           const lidToken = jidUserToken(lidRaw);
           if (phoneJid && phoneJid.endsWith('@s.whatsapp.net') && lidToken) {
-            if (!this.lidToPhone.has(lidToken)) added++;
+            const existing = this.lidToPhone.get(lidToken);
+            if (existing && existing !== phoneJid) {
+              this.lidConflicts.add(lidToken);
+              this.options.onStatus('lid_mapping_conflict', { lid: lidToken });
+              continue;
+            }
+            if (this.lidConflicts.has(lidToken)) continue;
+            if (!existing) added++;
             this.lidToPhone.set(lidToken, phoneJid);
           }
         }
@@ -1614,7 +1635,8 @@ export class WhatsAppClient {
           chatJid,
           participantJid,
           senderId,
-          senderPhoneJid: this.resolvePhoneJid(participantJid) || undefined,
+          senderPhoneJid: this.phoneJidForParticipant(participantJid),
+          lidConflict: this.isLidConflict(participantJid),
           senderName: (msg.pushName || '').trim() || undefined,
           isGroup,
           text: limitText(extracted.text, 8_000),

@@ -423,6 +423,7 @@ export class BridgeServer {
           participantJid: msg.participantJid,
           senderId: msg.senderId,
           senderPhoneJid: msg.senderPhoneJid,
+          lidConflict: msg.lidConflict,
           senderName: msg.senderName,
           isGroup: msg.isGroup,
           text: msg.text,
