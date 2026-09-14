@@ -342,6 +342,31 @@ class SpeakupLog:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS approval_claims (
+                    proposal_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    owner_channel TEXT NOT NULL DEFAULT '',
+                    owner_chat_id TEXT NOT NULL DEFAULT '',
+                    owner_id TEXT NOT NULL DEFAULT '',
+                    payload_hash TEXT NOT NULL DEFAULT '',
+                    proposal_revision INTEGER NOT NULL DEFAULT 1,
+                    target_effect_id TEXT NOT NULL DEFAULT '',
+                    claimed_at_ms INTEGER,
+                    resolved_at_ms INTEGER,
+                    resolution TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_approval_state
+                ON approval_claims(state, updated_at_ms)
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS activation_state (
                     scope TEXT PRIMARY KEY,
                     activation_epoch INTEGER NOT NULL DEFAULT 1,
@@ -611,6 +636,119 @@ class SpeakupLog:
                 (str(channel), str(chat_id), int(since_ms)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    async def record_approval_claim(
+        self,
+        proposal_id: str,
+        *,
+        owner_channel: str,
+        owner_chat_id: str,
+        owner_id: str,
+        payload_hash: str,
+        proposal_revision: int,
+        target_effect_id: str,
+        now_ms: int,
+        ttl_ms: int = 3_600_000,
+    ) -> bool:
+        """Persist CAS state ``pending -> claimed`` for one owner approval.
+
+        A caller-supplied boolean is never approval authority: ``submit_proposal``
+        loads this row and refuses when the claimed hash/revision does not match the
+        payload it is about to submit. Repeated codes converge on the same claim.
+        """
+        del ttl_ms
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT * FROM approval_claims WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO approval_claims (
+                        proposal_id, state, owner_channel, owner_chat_id, owner_id,
+                        payload_hash, proposal_revision, target_effect_id,
+                        claimed_at_ms, created_at_ms, updated_at_ms
+                    ) VALUES (?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(proposal_id),
+                        str(owner_channel),
+                        str(owner_chat_id),
+                        str(owner_id),
+                        str(payload_hash),
+                        int(proposal_revision),
+                        str(target_effect_id),
+                        int(now_ms),
+                        int(now_ms),
+                        int(now_ms),
+                    ),
+                )
+                return True
+            state = str(row["state"])
+            if state == "terminal":
+                return False
+            if str(row["payload_hash"]) not in {"", str(payload_hash)}:
+                # A different payload may never be submitted under this claim.
+                return False
+            if str(row["owner_chat_id"]) not in {"", str(owner_chat_id)}:
+                return False
+            if str(row["owner_channel"]) not in {"", str(owner_channel)}:
+                return False
+            conn.execute(
+                """
+                UPDATE approval_claims
+                SET state = 'claimed', claimed_at_ms = COALESCE(claimed_at_ms, ?),
+                    updated_at_ms = ?, target_effect_id = ?
+                WHERE proposal_id = ?
+                """,
+                (int(now_ms), int(now_ms), str(target_effect_id), str(proposal_id)),
+            )
+        return True
+
+    async def approval_claim(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approval_claims WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def resolve_approval_claim(
+        self,
+        proposal_id: str,
+        *,
+        resolution: str,
+        now_ms: int,
+    ) -> bool:
+        """Move a claim to its terminal state. Idempotent per proposal."""
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT state FROM approval_claims WHERE proposal_id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            if str(row["state"]) == "terminal":
+                return False
+            conn.execute(
+                """
+                UPDATE approval_claims
+                SET state = 'terminal', resolution = ?, resolved_at_ms = ?, updated_at_ms = ?
+                WHERE proposal_id = ?
+                """,
+                (str(resolution), int(now_ms), int(now_ms), str(proposal_id)),
+            )
+        return True
+
+    async def proposal_row(self, proposal_id: str) -> dict[str, Any] | None:
+        """Read one durable proposal row (survives restart; no in-memory state)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM speakups WHERE id = ?",
+                (str(proposal_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     async def record_preview_effect(
         self,

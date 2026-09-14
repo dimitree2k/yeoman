@@ -9,6 +9,7 @@ never regains capacity by crossing a window boundary (spec section 9).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -580,3 +581,394 @@ class _RecordingExecutor:
 class _NeverCalledExecutor:
     async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
         raise AssertionError(f"must not execute {envelope.effect_id}")
+
+
+# -- approval binding and recovery (A02, A34, A35) -------------------------------------
+
+OWNER = "owner@s.whatsapp.net"
+GROUP = "group@g.us"
+_FIXED_NOW = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+
+
+class _AllowSecurity:
+    def check_output(self, text: str, context: dict[str, object] | None = None):
+        del text, context
+        from yeoman_gateway.core.models import SecurityDecision, SecurityResult
+
+        return SecurityResult(
+            stage="output", decision=SecurityDecision(action="allow", reason="ok")
+        )
+
+
+class _SanitizingSecurity(_AllowSecurity):
+    def check_output(self, text: str, context: dict[str, object] | None = None):
+        del context
+        from yeoman_gateway.core.models import SecurityDecision, SecurityResult
+
+        return SecurityResult(
+            stage="output",
+            decision=SecurityDecision(action="sanitize", reason="redacted"),
+            sanitized_text=f"{text} [redacted]",
+        )
+
+
+class _FakeMemory:
+    def search(self, **kwargs: object) -> list[object]:
+        del kwargs
+        return []
+
+
+class _RecordingEffects:
+    """A managed-only service effect producer: ``None`` is never success here."""
+
+    def __init__(self, *, state: str = "sent", raises: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._state = state
+        self._raises = raises
+
+    def target_calls(self, chat_id: str) -> list[dict[str, object]]:
+        return [call for call in self.calls if call.get("chat_id") == chat_id]
+
+    async def send(self, **kwargs: object):
+        require_managed = bool(kwargs.pop("require_managed", False))
+        self.calls.append({**kwargs, "require_managed": require_managed})
+        if self._raises:
+            raise RuntimeError("transport unavailable")
+        if require_managed and not kwargs.get("effect_id"):
+            raise AssertionError("managed delivery requires a stable effect id")
+        return EffectReceipt(
+            effect_id=str(kwargs.get("effect_id") or ""),
+            state=self._state,
+            operation_key=str(kwargs.get("operation_ref") or ""),
+            accepted=True,
+            attempt_id="attempt-1",
+            transport_receipt=(
+                TransportReceipt(
+                    channel=str(kwargs.get("channel")),
+                    chat_id=str(kwargs.get("chat_id")),
+                    provider_message_id="prov-1",
+                    confirmed_ms=1,
+                )
+                if self._state == "sent"
+                else None
+            ),
+        )
+
+
+def _group_policy(*, group: bool = True) -> object:
+    from yeoman_gateway.policy.schema import PolicyConfig
+
+    return PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": [OWNER]},
+            "channels": {
+                "whatsapp": {
+                    "chats": {
+                        OWNER: {"spontaneity": {"enabled": True, "profile": "helpful"}},
+                        GROUP: {
+                            "whoCanTalk": {"mode": "everyone"},
+                            "whenToReply": {"mode": "all"},
+                            **(
+                                {"spontaneity": {"enabled": True, "profile": "balanced",
+                                                  "preview": "owner_dm"}}
+                                if group
+                                else {}
+                            ),
+                        },
+                    }
+                }
+            },
+        }
+    )
+
+
+def _build_tools(tmp_path: Path, *, security: object | None = None, policy: object | None = None):
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+    from yeoman_gateway.consciousness.tools import ConsciousnessTools
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    config = Config(
+        consciousness=ConsciousnessConfig.model_validate(
+            {
+                "enabled": True,
+                "ownerDmDefaultEnabled": False,
+                "defaultDailyCap": 3,
+                "approvalTimeoutSeconds": 3600,
+                "maxSpeakupLengthChars": 200,
+            }
+        )
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = SpeakupApprovalStore(
+        tmp_path / "approvals.json", now=lambda: _FIXED_NOW.timestamp()
+    )
+    tools = ConsciousnessTools(
+        config=config,
+        policy_engine=PolicyEngine(policy or _group_policy(), workspace=tmp_path),
+        bus=MessageBus(),
+        log=log,
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=_FakeMemory(),
+        security=security or _AllowSecurity(),
+        approval_store=store,
+        now=lambda: _FIXED_NOW,
+    )
+    tools.begin_run(trigger="cron")
+    return tools, store, log
+
+
+async def _previewed_group_proposal(tools, log) -> str:
+    proposal = await tools.propose_speakup(
+        chat_id=GROUP,
+        message="hello group",
+        action_type="observation",
+        confidence=0.9,
+    )
+    proposal_id = str(proposal["proposal_id"])
+    result = await tools.commit_speakup(proposal_id)
+    assert result["status"] == "queued_for_approval"
+    return proposal_id
+
+
+@pytest.mark.asyncio
+async def test_approval_binds_payload_revision(tmp_path: Path) -> None:
+    """An approval for one payload cannot submit a later, different payload (A35)."""
+    tools, store, log = _build_tools(tmp_path)
+    tools._service_effects = _RecordingEffects()
+    proposal_id = await _previewed_group_proposal(tools, log)
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    assert approval.payload_hash
+
+    await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id=OWNER,
+        owner_id=OWNER,
+        payload_hash=approval.payload_hash,
+        proposal_revision=approval.proposal_revision,
+        target_effect_id="",
+        now_ms=1_000,
+    )
+    # A different payload now occupies the same proposal id.
+    changed = await log.proposal_row(proposal_id)
+    assert changed is not None
+    tools._proposals[proposal_id] = tools._proposals[proposal_id].__class__(
+        proposal_id=proposal_id,
+        channel="whatsapp",
+        chat_id=GROUP,
+        message="a completely different message",
+        action_type="observation",
+        profile="balanced",
+        confidence=0.9,
+        trigger="cron",
+        context_snapshot={},
+    )
+    result = await tools.submit_proposal(proposal_id)
+    assert result["status"] == "rejected"
+    assert result["reason"] == "approval_payload_changed"
+    assert tools._service_effects.target_calls(GROUP) == []
+
+
+@pytest.mark.asyncio
+async def test_sanitizer_change_invalidates_approval(tmp_path: Path) -> None:
+    tools, store, log = _build_tools(tmp_path, security=_SanitizingSecurity())
+    effects = _RecordingEffects()
+    tools._service_effects = effects
+    proposal_id = await _previewed_group_proposal(tools, log)
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id=OWNER,
+        owner_id=OWNER,
+        payload_hash=approval.payload_hash,
+        proposal_revision=1,
+        target_effect_id="",
+        now_ms=1_000,
+    )
+    result = await tools.submit_proposal(proposal_id)
+    assert result == {"status": "rejected", "reason": "sanitized_payload_changed"}
+    assert effects.target_calls(GROUP) == []
+
+
+@pytest.mark.asyncio
+async def test_approval_invalidated_by_off_after_preview(tmp_path: Path) -> None:
+    """An approval cannot survive the owner switching the target chat off (A03)."""
+    tools, store, log = _build_tools(tmp_path)
+    effects = _RecordingEffects()
+    tools._service_effects = effects
+    proposal_id = await _previewed_group_proposal(tools, log)
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id=OWNER,
+        owner_id=OWNER,
+        payload_hash=approval.payload_hash,
+        proposal_revision=1,
+        target_effect_id="",
+        now_ms=1_000,
+    )
+    # The owner switches the chat off before submitting the approval.
+    tools.policy_engine = type(tools.policy_engine)(
+        type(tools.policy_engine.policy).model_validate(
+            {
+                "owners": {"whatsapp": [OWNER]},
+                "channels": {
+                    "whatsapp": {
+                        "chats": {
+                            OWNER: {"spontaneity": {"enabled": True, "profile": "helpful"}},
+                            GROUP: {"spontaneity": {"enabled": False}},
+                        }
+                    }
+                },
+            }
+        ),
+        workspace=tmp_path,
+    )
+    result = await tools.submit_proposal(proposal_id)
+    assert result["status"] == "rejected"
+    assert result["reason"] == "chat_not_eligible"
+    assert effects.target_calls(GROUP) == []
+
+
+@pytest.mark.asyncio
+async def test_stale_quote_is_refused_before_submission(tmp_path: Path) -> None:
+    """A quote that no longer exists is never silently dropped: the send is refused."""
+    tools, store, log = _build_tools(tmp_path)
+    effects = _RecordingEffects()
+    proposal = await tools.propose_speakup(
+        chat_id=OWNER,
+        message="quoted answer",
+        action_type="observation",
+        confidence=0.9,
+    )
+    proposal_id = str(proposal["proposal_id"])
+    cached = tools._proposals[proposal_id]
+    from dataclasses import replace
+
+    tools._proposals[proposal_id] = replace(cached, reply_to_message_id="vanished-msg")
+    result = await tools.commit_speakup(proposal_id)
+    assert result == {"status": "rejected", "reason": "stale_quote"}
+    assert effects.target_calls(OWNER) == []
+    assert effects.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transport_exception_keeps_authorization_recoverable(tmp_path: Path) -> None:
+    tools, store, log = _build_tools(tmp_path)
+    tools._service_effects = _RecordingEffects()
+    proposal_id = await _previewed_group_proposal(tools, log)
+    failing = _RecordingEffects(raises=True)
+    tools._service_effects = failing
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id=OWNER,
+        owner_id=OWNER,
+        payload_hash=approval.payload_hash,
+        proposal_revision=1,
+        target_effect_id="",
+        now_ms=1_000,
+    )
+    with pytest.raises(RuntimeError):
+        await tools.submit_proposal(proposal_id)
+    claim = await log.approval_claim(proposal_id)
+    assert claim is not None and claim["state"] == "claimed"
+    row = await log.proposal_row(proposal_id)
+    assert row is not None and row["status"] == "submitted"
+
+    # The retry succeeds and converges on one target effect.
+    retried = _RecordingEffects()
+    tools._service_effects = retried
+    again = await tools.submit_proposal(proposal_id)
+    assert again["status"] == "transport_accepted"
+    target_calls = retried.target_calls(GROUP)
+    assert len(target_calls) == 1
+    assert target_calls[0]["require_managed"] is True
+    # The allowance is consumed exactly once, by the evidenced acceptance.
+    assert await log.consumed_slots(
+        channel="whatsapp",
+        chat_id=GROUP,
+        category="comment",
+        now_ms=5_000,
+        window_ms=1_800_000,
+    ) == 1
+    record = await log.delivery_record(
+        proposal_id=proposal_id, effect_id=str(target_calls[0]["effect_id"])
+    )
+    assert record is not None and record["delivery_state"] == "transport_accepted"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_approval_code_converges_on_one_effect(tmp_path: Path) -> None:
+    tools, store, log = _build_tools(tmp_path)
+    effects = _RecordingEffects()
+    tools._service_effects = effects
+    proposal_id = await _previewed_group_proposal(tools, log)
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    args = {
+        "owner_channel": "whatsapp",
+        "owner_chat_id": OWNER,
+        "owner_id": OWNER,
+        "payload_hash": approval.payload_hash,
+        "proposal_revision": 1,
+        "target_effect_id": "",
+        "now_ms": 1_000,
+    }
+    assert await log.record_approval_claim(proposal_id, **args)
+    assert await log.record_approval_claim(proposal_id, **args)
+    first = await tools.submit_proposal(proposal_id)
+    assert first["status"] == "transport_accepted"
+    await log.resolve_approval_claim(proposal_id, resolution="submitted", now_ms=2_000)
+    second = await tools.submit_proposal(proposal_id)
+    assert second.get("duplicate") is True
+    assert len(effects.target_calls(GROUP)) == 1
+    assert await log.consumed_slots(
+        channel="whatsapp",
+        chat_id=GROUP,
+        category="comment",
+        now_ms=5_000,
+        window_ms=1_800_000,
+    ) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_wrong_owner_claim_is_refused(tmp_path: Path) -> None:
+    tools, store, log = _build_tools(tmp_path)
+    tools._service_effects = _RecordingEffects()
+    proposal_id = await _previewed_group_proposal(tools, log)
+    approval = await store.get(proposal_id)
+    assert approval is not None
+    assert await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id=OWNER,
+        owner_id=OWNER,
+        payload_hash=approval.payload_hash,
+        proposal_revision=1,
+        target_effect_id="",
+        now_ms=1_000,
+    )
+    # A different owner chat may never adopt the same claim.
+    assert not await log.record_approval_claim(
+        proposal_id,
+        owner_channel="whatsapp",
+        owner_chat_id="intruder@s.whatsapp.net",
+        owner_id="intruder@s.whatsapp.net",
+        payload_hash=approval.payload_hash,
+        proposal_revision=1,
+        target_effect_id="",
+        now_ms=1_100,
+    )
+    log.close()

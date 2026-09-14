@@ -33,6 +33,11 @@ class PendingSpeakupApproval:
     trigger: str = "cron"
     daily_cap: int = 1
     reply_to_message_id: str | None = None
+    #: Canonical hash of the exact previewed payload (content, target, quote,
+    #: action). An owner approval is bound to this tuple: a changed draft, quote,
+    #: target or action invalidates the approval (spec section 9).
+    payload_hash: str = ""
+    proposal_revision: int = 1
 
     @property
     def approve_code(self) -> str:
@@ -159,3 +164,10 @@ class SpeakupApprovalStore:
     async def list_pending(self) -> list[PendingSpeakupApproval]:
         async with self._lock:
             return list(self._approvals)
+
+    async def get(self, proposal_id: str) -> PendingSpeakupApproval | None:
+        async with self._lock:
+            for approval in self._approvals:
+                if approval.proposal_id == proposal_id:
+                    return approval
+            return None
