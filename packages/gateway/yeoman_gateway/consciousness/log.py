@@ -111,30 +111,28 @@ def _held_or_accepted_count(
     accepted_since_ms: int | None = None,
     accepted_before_ms: int | None = None,
 ) -> int:
-    """Accepted sends in the accounting window plus every unresolved hold.
+    """Accepted sends inside the accounting window **plus** every unresolved hold.
 
-    Unresolved holds are counted regardless of age: an unknown outcome never
-    regains capacity by crossing a day or rolling-window boundary (spec section 9).
+    The two sets are a union, not an intersection: a hold that was never accepted
+    still occupies its slot, and an unresolved hold is counted regardless of age -
+    an unknown outcome never regains capacity by crossing a day or rolling-window
+    boundary (spec section 9).
     """
     sql = [
         "SELECT COUNT(*) AS c FROM delivery_reservations",
-        "WHERE channel = ? AND chat_id = ? AND category = ?",
+        "WHERE channel = ? AND chat_id = ? AND category = ? AND proposal_id <> ?",
     ]
-    params: list[Any] = [channel, chat_id, category]
-    if accepted_since_ms is None and accepted_before_ms is None:
-        sql.append("AND accepted_at_ms IS NOT NULL")
-    else:
-        sql.append("AND accepted_at_ms IS NOT NULL AND accepted_at_ms >= ?")
-        params.append(int(accepted_since_ms if accepted_since_ms is not None else 0))
-        if accepted_before_ms is not None:
-            sql.append("AND accepted_at_ms < ?")
-            params.append(int(accepted_before_ms))
-    sql.append(
-        "AND delivery_state IN "
-        "('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')"
-    )
-    sql.append("AND proposal_id <> ?")
-    params.append(exclude_proposal_id)
+    params: list[Any] = [channel, chat_id, category, exclude_proposal_id]
+    if accepted_since_ms is not None:
+        sql.append(
+            "AND ((accepted_at_ms IS NOT NULL AND accepted_at_ms >= ?"
+            " AND (? IS NULL OR accepted_at_ms < ?))"
+            " OR delivery_state IN"
+            " ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown'))"
+        )
+        params.append(int(accepted_since_ms))
+        params.append(None if accepted_before_ms is None else int(accepted_before_ms))
+        params.append(None if accepted_before_ms is None else int(accepted_before_ms))
     row = conn.execute(" ".join(sql), tuple(params)).fetchone()
     return int(row["c"] if row else 0)
 
@@ -268,14 +266,14 @@ class SpeakupLog:
                     activation_epoch INTEGER,
                     lane TEXT NOT NULL DEFAULT 'production',
                     proposal_revision INTEGER NOT NULL DEFAULT 1,
-                    PRIMARY KEY (proposal_id, effect_id)
+                    PRIMARY KEY (effect_id, category)
                 )
                 """
             )
             self._conn.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_effect
-                ON delivery_reservations(effect_id)
+                CREATE INDEX IF NOT EXISTS idx_delivery_proposal
+                ON delivery_reservations(proposal_id, effect_id)
                 """
             )
             self._conn.execute(
@@ -369,7 +367,7 @@ class SpeakupLog:
 
     # -- participation ledger ----------------------------------------------------------
 
-    async def reserve_delivery(
+    def reserve_delivery_sync(
         self,
         *,
         proposal_id: str,
@@ -383,7 +381,7 @@ class SpeakupLog:
         activation_epoch: int | None = None,
         lane: str = "production",
     ) -> bool:
-        """Reserve every applicable capacity dimension in one transaction.
+        """Synchronous reservation core: one transaction, no check-then-send race.
 
         ``limits`` entries are ``(category, limit, window_ms)`` for a rolling
         window, or ``(category, limit, window_ms, "calendar_day")`` for the
@@ -398,26 +396,32 @@ class SpeakupLog:
             raise ValueError("proposal_id and effect_id are required")
         if not limits:
             return False
+        checked: list[tuple[str, int, int, str]] = []
+        for entry in limits:
+            category, limit, window_ms = str(entry[0]), int(entry[1]), int(entry[2])
+            window_kind = str(entry[3]) if len(entry) > 3 else "rolling"
+            if category not in RESERVATION_CATEGORIES:
+                raise ValueError(f"unknown reservation category: {category}")
+            if limit <= 0:
+                return False
+            checked.append((category, limit, window_ms, window_kind))
         with self._write() as conn:
+            # The effect id is unique across the ledger. One effect owns one
+            # reservation row per dimension; the delivery state lives on every row
+            # of that effect and is always written for all of them together.
             existing = conn.execute(
                 """
-                SELECT delivery_state, released_at_ms FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                SELECT delivery_state FROM delivery_reservations
+                WHERE effect_id = ? LIMIT 1
                 """,
-                (proposal, effect),
+                (effect,),
             ).fetchone()
             if existing is not None:
                 state = str(existing["delivery_state"])
                 if state in RELEASED_DELIVERY_STATES:
                     return False
                 return state != "released"
-            for entry in limits:
-                category, limit, window_ms = entry[0], int(entry[1]), int(entry[2])
-                window_kind = str(entry[3]) if len(entry) > 3 else "rolling"
-                if category not in RESERVATION_CATEGORIES:
-                    raise ValueError(f"unknown reservation category: {category}")
-                if limit <= 0:
-                    return False
+            for category, limit, window_ms, window_kind in checked:
                 if window_kind == "calendar_day":
                     allowed, _reason = _calendar_day_capacity(
                         conn=conn,
@@ -441,6 +445,7 @@ class SpeakupLog:
                     )
                 if not allowed:
                     return False
+            for category, limit, window_ms, window_kind in checked:
                 conn.execute(
                     """
                     INSERT INTO delivery_reservations (
@@ -449,6 +454,7 @@ class SpeakupLog:
                         delivery_state, attempt_state, observed_revision,
                         activation_epoch, lane, proposal_revision
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 'unsubmitted', ?, ?, ?, ?)
+                    ON CONFLICT(effect_id, category) DO NOTHING
                     """,
                     (
                         proposal,
@@ -467,6 +473,34 @@ class SpeakupLog:
                     ),
                 )
         return True
+
+    async def reserve_delivery(
+        self,
+        *,
+        proposal_id: str,
+        effect_id: str,
+        channel: str,
+        chat_id: str,
+        now_ms: int,
+        limits: tuple[tuple[str, int, int], ...] | tuple[tuple[str, int, int, str], ...],
+        proposal_revision: int = 1,
+        observed_revision: int | None = None,
+        activation_epoch: int | None = None,
+        lane: str = "production",
+    ) -> bool:
+        """Async wrapper around :meth:`reserve_delivery_sync`."""
+        return self.reserve_delivery_sync(
+            proposal_id=proposal_id,
+            effect_id=effect_id,
+            channel=channel,
+            chat_id=chat_id,
+            now_ms=now_ms,
+            limits=limits,
+            proposal_revision=proposal_revision,
+            observed_revision=observed_revision,
+            activation_epoch=activation_epoch,
+            lane=lane,
+        )
 
     async def reserve_judge_attempt(
         self,
@@ -625,9 +659,9 @@ class SpeakupLog:
                         WHEN delivery_state = 'reserved' THEN 'submitted'
                         ELSE delivery_state
                     END
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (int(now_ms), str(proposal_id), str(effect_id)),
+                (int(now_ms), str(effect_id)),
             )
 
     async def project_transport_accepted(
@@ -653,9 +687,9 @@ class SpeakupLog:
             row = conn.execute(
                 """
                 SELECT delivery_state, accepted_at_ms FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(proposal_id), str(effect_id)),
+                (str(effect_id),),
             ).fetchone()
             if row is None:
                 raise ValueError("no reservation for this proposal/effect")
@@ -671,14 +705,13 @@ class SpeakupLog:
                     accepted_at_ms = COALESCE(accepted_at_ms, ?),
                     provider_message_id = COALESCE(?, provider_message_id),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'accepted'
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
                 (
                     int(now_ms),
                     provider_message_id,
                     str(evidence_kind),
                     str(evidence_ref),
-                    str(proposal_id),
                     str(effect_id),
                 ),
             )
@@ -709,9 +742,9 @@ class SpeakupLog:
             row = conn.execute(
                 """
                 SELECT delivery_state FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(proposal_id), str(effect_id)),
+                (str(effect_id),),
             ).fetchone()
             if row is None:
                 raise ValueError("no reservation for this proposal/effect")
@@ -725,7 +758,7 @@ class SpeakupLog:
                     accepted_at_ms = COALESCE(accepted_at_ms, ?),
                     provider_message_id = COALESCE(?, provider_message_id),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'delivered'
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
                 (
                     int(now_ms),
@@ -733,7 +766,6 @@ class SpeakupLog:
                     provider_message_id,
                     str(evidence_kind),
                     str(evidence_ref),
-                    str(proposal_id),
                     str(effect_id),
                 ),
             )
@@ -757,14 +789,13 @@ class SpeakupLog:
                 SET delivery_state = 'delivery_unknown',
                     accepted_at_ms = COALESCE(accepted_at_ms, ?),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'unknown'
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                   AND delivery_state IN ('reserved', 'submitted', 'transport_accepted')
                 """,
                 (
                     int(now_ms),
                     str(evidence_kind),
                     str(evidence_ref),
-                    str(proposal_id),
                     str(effect_id),
                 ),
             )
@@ -790,9 +821,9 @@ class SpeakupLog:
             row = conn.execute(
                 """
                 SELECT delivery_state FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(proposal_id), str(effect_id)),
+                (str(effect_id),),
             ).fetchone()
             if row is None:
                 return False
@@ -806,9 +837,9 @@ class SpeakupLog:
                 UPDATE delivery_reservations
                 SET delivery_state = ?, released_at_ms = ?, evidence_kind = 'release',
                     evidence_ref = ?, attempt_state = 'released'
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(state), int(now_ms), str(reason), str(proposal_id), str(effect_id)),
+                (str(state), int(now_ms), str(reason), str(effect_id)),
             )
         await self.mark_status(proposal_id, status=state, reason=reason)
         return True
@@ -818,9 +849,9 @@ class SpeakupLog:
             row = self._conn.execute(
                 """
                 SELECT delivery_state FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(proposal_id), str(effect_id)),
+                (str(effect_id),),
             ).fetchone()
         return str(row["delivery_state"]) if row is not None else None
 
@@ -829,9 +860,67 @@ class SpeakupLog:
             row = self._conn.execute(
                 """
                 SELECT * FROM delivery_reservations
-                WHERE proposal_id = ? AND effect_id = ?
+                WHERE effect_id = ?
                 """,
-                (str(proposal_id), str(effect_id)),
+                (str(effect_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def record_delivery(
+        self,
+        *,
+        effect_id: str,
+        state: str,
+        provider_message_id: str | None,
+        now_ms: int,
+        evidence_kind: str,
+        evidence_ref: str,
+    ) -> bool:
+        """Single entry point for one evidenced delivery transition, keyed by effect id.
+
+        This is the interface named by the implementation plan; the richer
+        ``project_*`` methods are the projections it dispatches to. It refuses to
+        guess: the evidence kind decides which state is admissible, so a provider
+        message id can never be promoted to ``delivered``.
+        """
+        row = self._delivery_row_for_effect(effect_id)
+        if row is None:
+            raise ValueError(f"no reservation for effect {effect_id}")
+        proposal_id = str(row["proposal_id"])
+        if state == "transport_accepted":
+            await self.project_transport_accepted(
+                proposal_id,
+                effect_id=str(effect_id),
+                provider_message_id=provider_message_id,
+                evidence_kind=evidence_kind,
+                evidence_ref=evidence_ref,
+                now_ms=now_ms,
+            )
+            return True
+        if state == "delivered":
+            return await self.project_recipient_delivery(
+                proposal_id,
+                effect_id=str(effect_id),
+                provider_message_id=provider_message_id,
+                evidence_kind=evidence_kind,
+                evidence_ref=evidence_ref,
+                now_ms=now_ms,
+            )
+        if state == "failed":
+            return await self.release_delivery(
+                proposal_id,
+                effect_id=str(effect_id),
+                state="failed",
+                reason=evidence_ref or evidence_kind,
+                now_ms=now_ms,
+            )
+        raise ValueError(f"unsupported delivery state: {state}")
+
+    def _delivery_row_for_effect(self, effect_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM delivery_reservations WHERE effect_id = ? LIMIT 1",
+                (str(effect_id),),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -870,15 +959,17 @@ class SpeakupLog:
                 accepted_since_ms=int(now_ms) - max(1, int(window_ms)) + 1,
             )
 
-    async def unresolved_delivery_reservations(
-        self, *, limit: int = 200
-    ) -> list[dict[str, Any]]:
-        """Holds that still need reconciliation, oldest first."""
+    async def pending_delivery_reservations(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Holds that are not terminally released, oldest first.
+
+        ``attempt_state='unsubmitted'`` rows are cancellable speculation; rows that
+        were already handed to transport need reconciliation, never a blind resend.
+        """
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT * FROM delivery_reservations
-                WHERE delivery_state IN ('submitted', 'transport_accepted', 'delivery_unknown')
+                WHERE delivery_state IN ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')
                 ORDER BY created_at_ms ASC
                 LIMIT ?
                 """,

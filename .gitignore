@@ -47,6 +47,7 @@ tests/*
 !tests/conftest.py
 !tests/gateway/
 tests/gateway/*
+!tests/gateway/test_participation_delivery.py
 !tests/gateway/test_v1_only_runtime.py
 !tests/gateway/test_lazy_document_media.py
 !tests/gateway/test_consciousness_phase1.py
