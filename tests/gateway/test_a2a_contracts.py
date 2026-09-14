@@ -19,7 +19,7 @@ def test_installed_contract_metadata_is_pinned() -> None:
     import a2a_contracts
 
     assert CONTRACT_RELEASE == a2a_contracts.CONTRACT_VERSION == "1.0.1"
-    assert CONTRACT_COMMIT == "b8886616664b922538a91c7f78c608c963d0826c"
+    assert CONTRACT_COMMIT == "1c658bfc4d5ae872f47d9abeef5aa365cf305af1"
     assert PROFILE_URI == a2a_contracts.PROFILE_URI == "urn:hermes-yeoman:a2a-profile:v1"
 
 
@@ -65,6 +65,20 @@ def test_registry_resolves_refs_and_rejects_unknown_fields() -> None:
     )
     with pytest.raises(A2AContractValidationError, match=r"\$: additional"):
         schemas.validate_request("conversation", {"text": "hello", "extra": True})
+
+
+def test_contract_supports_trading_analyze_with_the_research_shape() -> None:
+    schemas = ContractSchemas.load()
+    schemas.validate_request(
+        "trading.analyze",
+        {"question": "Analyse AAPL", "idempotency_key": "trading-1"},
+    )
+    schemas.validate_response("trading.analyze", {"report": "done", "sources": []})
+    with pytest.raises(A2AContractValidationError, match="ticker"):
+        schemas.validate_request(
+            "trading.analyze",
+            {"question": "Analyse AAPL", "idempotency_key": "trading-1", "ticker": "AAPL"},
+        )
 
 
 def test_registry_rejects_unknown_skill() -> None:

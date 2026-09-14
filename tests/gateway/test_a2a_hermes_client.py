@@ -166,6 +166,54 @@ async def test_research_returns_immediate_working_task_without_polling() -> None
 
 
 @pytest.mark.asyncio
+async def test_trading_analyze_sends_the_versioned_structured_invocation() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=_card("trading.analyze"))
+        payload = json.loads(request.content)
+        assert payload["params"]["message"]["parts"] == [{
+            "data": {
+                "skill": "trading.analyze",
+                "input": {"question": "Analyse AAPL", "idempotency_key": "trading-1"},
+            },
+            "mediaType": "application/json",
+        }]
+        task_id = "trading-1"
+        context_id = payload["params"]["message"]["contextId"]
+        result = {
+            "skill": "trading.analyze",
+            "status": "completed",
+            "output": {"report": "done", "sources": []},
+            "correlation": {"task_id": task_id, "context_id": context_id},
+        }
+        task = {
+            "id": task_id,
+            "contextId": context_id,
+            "status": {"state": "TASK_STATE_COMPLETED"},
+            "artifacts": [{"parts": [{"data": result, "mediaType": "application/json"}]}],
+        }
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": {"task": task}},
+        )
+
+    client = A2AClient(
+        A2AWorker(name="hermes", url="http://127.0.0.1:9900"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.invoke_skill(
+        "trading.analyze", {"question": "Analyse AAPL", "idempotency_key": "trading-1"}
+    )
+
+    assert result.output == {"report": "done", "sources": []}
+    assert [request.method for request in requests] == ["GET", "POST"]
+
+
+@pytest.mark.asyncio
 async def test_get_task_validates_final_artifact_and_correlation() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
