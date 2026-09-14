@@ -66,7 +66,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA = (
     """
@@ -197,6 +197,17 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         CREATE TABLE IF NOT EXISTS voice_send_quota (
           principal TEXT PRIMARY KEY,
           last_requested_ms INTEGER NOT NULL
+        )
+        """,
+    ),
+    6: (
+        """
+        CREATE TABLE IF NOT EXISTS capability_quota (
+          canonical_user_id TEXT NOT NULL,
+          quota_key TEXT NOT NULL,
+          claim_id TEXT NOT NULL,
+          claimed_at_ms INTEGER NOT NULL,
+          PRIMARY KEY (canonical_user_id, quota_key)
         )
         """,
     ),
@@ -2334,6 +2345,61 @@ class ProcessingStore:
                 (actor, now),
             )
         return True
+
+    def claim_capability(
+        self,
+        canonical_user_id: str,
+        quota_key: str,
+        claim_id: str,
+        *,
+        cooldown_ms: int,
+        now_ms: int | None = None,
+    ) -> tuple[bool, int]:
+        """Atomically claim one globally keyed capability cooldown."""
+        user = str(canonical_user_id or "").strip()
+        key = str(quota_key or "").strip()
+        claim = str(claim_id or "").strip()
+        cooldown = int(cooldown_ms)
+        if not user or not key or not claim:
+            raise ValueError("canonical_user_id, quota_key and claim_id are required")
+        if cooldown <= 0:
+            raise ValueError("cooldown_ms must be positive")
+        now = self._now(now_ms)
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT claimed_at_ms FROM capability_quota "
+                "WHERE canonical_user_id = ? AND quota_key = ?",
+                (user, key),
+            ).fetchone()
+            if row is not None:
+                retry_at = int(row["claimed_at_ms"]) + cooldown
+                if now < retry_at:
+                    return False, retry_at
+            conn.execute(
+                "INSERT INTO capability_quota "
+                "(canonical_user_id, quota_key, claim_id, claimed_at_ms) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(canonical_user_id, quota_key) DO UPDATE SET "
+                "claim_id = excluded.claim_id, claimed_at_ms = excluded.claimed_at_ms",
+                (user, key, claim, now),
+            )
+        return True, 0
+
+    def release_capability(
+        self, canonical_user_id: str, quota_key: str, claim_id: str
+    ) -> bool:
+        """Release only the exact claim that was created by the caller."""
+        user = str(canonical_user_id or "").strip()
+        key = str(quota_key or "").strip()
+        claim = str(claim_id or "").strip()
+        if not user or not key or not claim:
+            raise ValueError("canonical_user_id, quota_key and claim_id are required")
+        with self._write() as conn:
+            cursor = conn.execute(
+                "DELETE FROM capability_quota "
+                "WHERE canonical_user_id = ? AND quota_key = ? AND claim_id = ?",
+                (user, key, claim),
+            )
+            return cursor.rowcount == 1
 
     def purge(self, *, now_ms: int) -> PurgeReport:
         """Apply retention. Payloads are stripped first, metadata later.

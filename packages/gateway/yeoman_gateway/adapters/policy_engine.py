@@ -573,6 +573,11 @@ class EnginePolicyAdapter(PolicyPort):
             error=error,
         )
 
+    def current_policy_snapshot(self) -> "PolicySnapshot":
+        """Refresh the existing provider before a protected execution claim."""
+        self._maybe_reload()
+        return self.policy_snapshot()
+
     @override
     def evaluate(self, event: InboundEvent) -> PolicyDecision:
         if self._engine is None:
@@ -617,6 +622,8 @@ class EnginePolicyAdapter(PolicyPort):
         actor = _to_actor(event)
         decision = self._engine.evaluate(actor, self._known_tools)
         is_owner = self._engine.is_owner(actor)
+        if event.channel == "whatsapp" and bool(event.raw_metadata.get("lid_conflict")):
+            is_owner = False
         voice_output_mode = "text"
         voice_output_tts_route = "tts.speak"
         voice_output_voice = "alloy"

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 
 class PolicyModel(BaseModel):
@@ -456,6 +456,12 @@ class FileAccessPolicy(PolicyModel):
         return self
 
 
+class CapabilityQuotaPolicy(PolicyModel):
+    """Cooldown for one globally keyed expensive capability."""
+
+    cooldown_seconds: StrictInt = Field(default=86_400, alias="cooldownSeconds", gt=0)
+
+
 class PolicyConfig(PolicyModel):
     """Root policy configuration."""
 
@@ -466,3 +472,17 @@ class PolicyConfig(PolicyModel):
     channels: dict[str, ChannelPolicy] = Field(default_factory=_default_channels)
     memory_notes: MemoryNotesPolicy = Field(default_factory=MemoryNotesPolicy, alias="memoryNotes")
     file_access: FileAccessPolicy | None = Field(default=None, alias="fileAccess")
+    capability_quotas: dict[str, CapabilityQuotaPolicy] = Field(
+        default_factory=dict, alias="capabilityQuotas"
+    )
+
+    @field_validator("capability_quotas")
+    @classmethod
+    def _validate_capability_quota_names(
+        cls, values: dict[str, CapabilityQuotaPolicy]
+    ) -> dict[str, CapabilityQuotaPolicy]:
+        supported = {"deep_research", "trading_guru"}
+        unknown = sorted(set(values) - supported)
+        if unknown:
+            raise ValueError(f"unsupported capability quota: {unknown[0]}")
+        return values
