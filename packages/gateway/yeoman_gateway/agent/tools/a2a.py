@@ -6,14 +6,17 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import re
 import time
 from typing import Any
 
 from loguru import logger
 
 from yeoman_gateway.a2a.client import A2APollTimeoutError, A2AProtocolError, A2ATransportError
+from yeoman_gateway.a2a.contracts import A2AContractValidationError
 from yeoman_gateway.a2a.registry import A2AWorkerRegistry
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.channels.whatsapp import _markdown_to_whatsapp as _to_chat_markup
 from yeoman_gateway.observability import private_log_identifier, safe_log_token
 from yeoman_gateway.processing.models import (
     EffectConflictError,
@@ -35,6 +38,158 @@ DELEGATION_LEASE_MS = 900_000
 #: resumed by ``resume_pending_research``.
 RESEARCH_POLL_EXTENSIONS = 3
 POLL_TIMEOUT_CONTENT = "error=POLL_TIMEOUT retryable=True"
+
+#: The worker wraps its answer in a reasoning preamble and returns it as JSON. Neither belongs
+#: in a chat message, so the delivery path renders the structured payload into chat text.
+_REASONING_FENCE_RE = re.compile(r"^\s*💭?\s*\*\*Reasoning:\*\*\s*```[\s\S]*?```\s*", re.MULTILINE)
+_REASONING_BLOCK_RE = re.compile(r"^\s*💭?\s*\*\*Reasoning:\*\*[\s\S]*?(?=\n\s*\n|$)", re.MULTILINE)
+_SERVER_PATH_LINE_RE = re.compile(
+    r"^\s*(?:[-•*]\s*)?(?:Der\s+)?(?:vollständige[rn]?\s+)?(?:Report|Vollreport|Reportdatei)"
+    r"[^\n]*?(?:/[\w./-]+\.md|/\w+/\.hermes/\S*)[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SERVER_PATH_RE = re.compile(r"(?:^|\s)(?:/home/|/srv/|/var/|/opt/)\S*")
+_SOURCE_LINE_LIMIT = 5
+#: A chat answer stays short by default: the long report belongs in the file, not in the message.
+_CARD_DECISION_HEADINGS = (
+    "entscheidung",
+    "kurzfazit",
+    "fazit",
+    "ergebnis",
+    "decision",
+    "summary",
+    "take",
+)
+_CARD_HEADING_RE = re.compile(r"^#{2,4}\s*(.+?)\s*$")
+_CARD_DECISION_RE = re.compile(r"\*{1,2}(buy|sell|hold|underweight|overweight|neutral|reduzieren|kaufen|verkaufen|halten)\*{1,2}", re.IGNORECASE)
+_CARD_BULLET_LIMIT = 4
+_CARD_FALLBACK_CHARS = 700
+_CARD_NOTE = "Langfassung auf Abruf."
+
+
+def _strip_reasoning(text: str) -> str:
+    """Drop the model's planning preamble: a chat reader wants the answer, not the plan."""
+    stripped = _REASONING_FENCE_RE.sub("", text, count=1)
+    if stripped == text:
+        stripped = _REASONING_BLOCK_RE.sub("", text, count=1)
+    return stripped.strip()
+
+
+def _strip_markdown_line_breaks(text: str) -> str:
+    """Two trailing spaces are markdown's hard line break; in a chat they are stray whitespace."""
+    return re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
+
+
+def _strip_server_paths(text: str) -> str:
+    """Remove lines naming the worker's report file: that path is not reachable from the chat."""
+    without_lines = _SERVER_PATH_LINE_RE.sub("", text)
+    return _SERVER_PATH_RE.sub(" ", without_lines).strip()
+
+
+def _source_lines(sources: Any) -> str:
+    if not isinstance(sources, list):
+        return ""
+    lines: list[str] = []
+    for entry in sources[:_SOURCE_LINE_LIMIT]:
+        if isinstance(entry, dict):
+            title = str(entry.get("title") or "").strip()
+            url = str(entry.get("url") or "").strip()
+        else:
+            title, url = "", str(entry).strip()
+        if not url and not title:
+            continue
+        lines.append(f"• {title}: {url}" if title and url else f"• {title or url}")
+    if not lines:
+        return ""
+    return "Quellen:\n" + "\n".join(lines)
+
+
+def _card_body(text: str) -> str:
+    """Condense a long report into lead, decision and the strongest reasons.
+
+    The full report stays in the file; a chat reader wants the verdict and why, not the whole
+    document. Falls back to a bounded excerpt when no decision section is recognisable.
+    """
+    lines = text.splitlines()
+    heading_rows = [
+        (index, match.group(1))
+        for index, line in enumerate(lines)
+        if (match := _CARD_HEADING_RE.match(line.strip()))
+    ]
+    title = next(
+        (line.strip()[2:].strip() for line in lines if line.strip().startswith("# ")),
+        "",
+    )
+    if not title and heading_rows:
+        title = heading_rows[0][1]
+    lead = " ".join(title.split())
+
+    decision_row = next(
+        (
+            (index, title)
+            for index, title in heading_rows
+            if any(token in title.lower() for token in _CARD_DECISION_HEADINGS)
+        ),
+        None,
+    )
+    decision = ""
+    bullets: list[str] = []
+    if decision_row is not None:
+        for line in lines[decision_row[0] + 1 :]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            heading = _CARD_HEADING_RE.match(stripped)
+            if heading:
+                if bullets:
+                    # The reasons usually sit in the section after the verdict; stop there.
+                    break
+                continue
+            if stripped.startswith(("- ", "* ", "• ")):
+                if len(bullets) < _CARD_BULLET_LIMIT:
+                    bullets.append("• " + stripped[2:].strip())
+                elif bullets:
+                    break
+                continue
+            if not decision:
+                decision = stripped
+    if not decision and not bullets:
+        return " ".join(text.split())[:_CARD_FALLBACK_CHARS]
+
+    parts = [part for part in (lead, decision, *bullets) if part]
+    return "\n\n".join(parts)
+
+
+def render_research_output(payload: Any, *, mode: str = "card") -> str:
+    """Render a research result as chat text.
+
+    The structured payload is ``{"report": ..., "sources": [...]}`` where the report carries a
+    reasoning preamble and server-side file paths. For a chat message all three are noise, so
+    the body is cleaned and the sources are listed explicitly instead of being buried in prose.
+
+    ``mode="card"`` (the default) condenses the report to the verdict plus its strongest reasons
+    and points at the full version on request; ``mode="full"`` keeps the whole cleaned report for
+    callers that need the detail. Plain strings (errors, summaries) pass through unchanged.
+    """
+    if isinstance(payload, dict):
+        report = payload.get("report")
+        text = str(report) if isinstance(report, str) else ""
+        sources = _source_lines(payload.get("sources"))
+        if not text and not sources:
+            return ""
+        # Condense while the markdown structure is still intact: the chat conversion below
+        # flattens headings into plain lines, which would hide the section boundaries.
+        cleaned = _strip_markdown_line_breaks(_strip_server_paths(_strip_reasoning(text))).strip()
+        body = _card_body(cleaned) if mode == "card" else cleaned
+        body = _to_chat_markup(body).strip()
+        if mode == "card" and body and body != cleaned:
+            body = f"{body}\n\n{_CARD_NOTE}"
+        if sources:
+            return f"{body}\n\n{sources}" if body else sources
+        return body
+    if payload is None:
+        return ""
+    return str(payload)
 
 
 class A2ADelegateTool(Tool):
@@ -121,11 +276,16 @@ class A2ADelegateTool(Tool):
             else f"window:{int(time.time() * 1000) // DELEGATION_WINDOW_MS}"
         )
         operation_key = f"a2a:{worker}:{channel}:{chat_id}:{turn}"
-        effect_id = "a2a-" + hashlib.sha256(operation_key.encode()).hexdigest()[:32]
+        # The window makes an identical retry collapse onto one effect; the payload digest keeps
+        # two *different* delegations in the same window distinct. Without it, a corrected retry
+        # after a locally rejected invocation conflicts with the rejected attempt's effect and
+        # never reaches the worker (production 2026-09-14).
+        effect_key = f"{operation_key}:{digest}"
+        effect_id = "a2a-" + hashlib.sha256(effect_key.encode()).hexdigest()[:32]
         try:
             stored = self._store.enqueue_effect(
                 effect_id=effect_id,
-                operation_key=operation_key,
+                operation_key=effect_key,
                 payload=ExternalActionPayload(
                     action="a2a_delegate",
                     arguments={"worker": worker, "skill": skill, "input_sha256": digest},
@@ -136,11 +296,30 @@ class A2ADelegateTool(Tool):
                 target=EffectTarget(channel="a2a", chat_id=worker),
                 state="queued",
             )
-            if str(stored) != effect_id or not self._store.claim_effect(
+            if str(stored) != effect_id:
+                # The store collapsed this call onto an existing effect; only an identical
+                # payload is a retry. Log it, because the caller sees just the note.
+                logger.warning(
+                    "A2A delegation collapsed onto an existing effect worker={} note=duplicate",
+                    safe_log_token(worker),
+                )
+                return False, "duplicate", effect_id
+            if not self._store.claim_effect(
                 effect_id, DELEGATION_WORKER_ID, int(time.time() * 1000), DELEGATION_LEASE_MS
             ):
+                # Same payload, same window, already settled (for example by a failed attempt):
+                # the store never re-executes an unproven effect on its own.
+                logger.warning(
+                    "A2A delegation already settled in this window worker={} state={} note=duplicate",
+                    safe_log_token(worker),
+                    self._effect_state(effect_id),
+                )
                 return False, "duplicate", effect_id
         except EffectConflictError:
+            logger.warning(
+                "A2A delegation conflicts with an earlier effect in this window worker={} note=conflict",
+                safe_log_token(worker),
+            )
             return False, "conflict", effect_id
         except Exception as exc:
             logger.warning(
@@ -150,6 +329,61 @@ class A2ADelegateTool(Tool):
             )
             return False, "claim-failed", ""
         return True, "claimed", effect_id
+
+    def _effect_state(self, effect_id: str) -> str:
+        """Best-effort state of a stored effect, for logs only."""
+        getter = getattr(self._store, "effect_state", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            return str(getter(effect_id) or "unknown")
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _is_local_rejection(exc: BaseException) -> bool:
+        """True when the invocation was rejected before any network transmission.
+
+        ``A2AClient`` validates the invocation locally and reports the schema violation as the
+        cause; a worker-side or transport failure never carries that cause.
+        """
+        return isinstance(exc, A2AProtocolError) and isinstance(
+            exc.__cause__, A2AContractValidationError
+        )
+
+    @staticmethod
+    def _question_text(input: dict[str, Any]) -> str:
+        """The owner-facing request text, bounded: it is echoed in the follow-up header."""
+        raw = input.get("question")
+        if not isinstance(raw, str):
+            return ""
+        return " ".join(raw.split())[:300]
+
+    @staticmethod
+    def _elapsed_text(created_ms: int, now_ms: int) -> str:
+        minutes = max(0, int((now_ms - created_ms) / 60000)) if created_ms else 0
+        if minutes < 1:
+            return "unter einer Minute"
+        if minutes < 60:
+            return f"{minutes} Minuten"
+        hours = minutes // 60
+        rest = minutes % 60
+        return f"{hours} h {rest} min" if rest else f"{hours} h"
+
+    def _follow_up_content(self, content: str, question: str, created_ms: int) -> str:
+        """Label a detached result as the answer to a specific, earlier request.
+
+        A long run can finish while the chat has moved on to another topic, so the delivered
+        message states which request it answers and how long it took. Nothing is suppressed:
+        the answer still arrives, it is just not mistaken for a reply to the current question.
+        """
+        head = "Nachtrag zur Trading-Recherche"
+        if question:
+            head += f" zu deiner Frage „{question}“"
+        head += f" (angefragt vor {self._elapsed_text(created_ms, int(time.time() * 1000))}):"
+        if not content:
+            return head
+        return f"{head}\n\n{content}"
 
     def _settle(self, effect_id: str, state: str) -> None:
         if self._store is None or not effect_id:
@@ -208,6 +442,8 @@ class A2ADelegateTool(Tool):
                 pending.effect_id,
                 pending.channel,
                 pending.chat_id,
+                pending.question,
+                pending.created_ms,
             )
         )
         self._background.add(task)
@@ -254,6 +490,22 @@ class A2ADelegateTool(Tool):
                 worker, skill, input, context_id=self._context_id()
             )
         except Exception as exc:
+            reason = str(exc)
+            if self._is_local_rejection(exc):
+                # Nothing left this host: the invocation was rejected before transmission, so
+                # the effect is proven not-executed. Settle it as a failure instead of an
+                # unproven outcome (which the store never re-executes) and hand the caller the
+                # reason, so a corrected retry is possible and the model can act on it.
+                self._settle(effect_id, "failed")
+                logger.warning(
+                    "A2A delegation rejected locally channel={} chat={} worker={} skill={} reason={}",
+                    safe_log_token(self._channel, max_length=40),
+                    private_log_identifier(self._chat_id),
+                    safe_log_token(worker),
+                    safe_log_token(skill),
+                    safe_log_token(reason, max_length=200),
+                )
+                return f"[{worker} | not-sent | rejected] {reason}"
             self._settle(effect_id, "unknown")
             logger.warning(
                 "A2A delegation failed channel={} chat={} worker={} skill={} error_type={}",
@@ -281,6 +533,8 @@ class A2ADelegateTool(Tool):
                 channel=channel,
                 chat_id=chat_id,
                 effect_id=effect_id,
+                question=self._question_text(input),
+                created_ms=int(time.time() * 1000),
             )
             if self._research_store is not None:
                 self._research_store.put(pending)
@@ -316,6 +570,8 @@ class A2ADelegateTool(Tool):
         effect_id: str,
         channel: str,
         chat_id: str,
+        question: str = "",
+        created_ms: int = 0,
     ) -> None:
         final_content: str
         extensions = 0
@@ -354,10 +610,8 @@ class A2ADelegateTool(Tool):
                 )
                 final_content = "error=POLL_FAILURE retryable=False"
             else:
-                final_content = (
-                    json.dumps(result.output, ensure_ascii=False, sort_keys=True)
-                    if result.output is not None
-                    else f"error={result.error_code} retryable={result.retryable}"
+                final_content = render_research_output(result.output) or (
+                    f"error={result.error_code} retryable={result.retryable}"
                 )
             break
         if self._delivery is not None and channel and chat_id:
@@ -367,7 +621,7 @@ class A2ADelegateTool(Tool):
                     operation_ref=f"a2a-result:{effect_id}",
                     channel=channel,
                     chat_id=chat_id,
-                    content=final_content,
+                    content=self._follow_up_content(final_content, question, created_ms),
                 )
             except Exception as exc:
                 logger.warning(

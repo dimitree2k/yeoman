@@ -209,7 +209,11 @@ class A2AClient:
             if validate_request:
                 self._schemas.validate_request(str(invocation["skill"]), invocation["input"])
         except A2AContractValidationError as exc:
-            raise A2AProtocolError("A2A invocation is invalid") from exc
+            # The caller can fix this, so the message names the offending fields. Retryable
+            # because a corrected invocation is expected to succeed and nothing was sent yet.
+            raise A2AProtocolError(
+                f"A2A invocation rejected locally: {exc}", retryable=True
+            ) from exc
 
     def _task_result(
         self,

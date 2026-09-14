@@ -325,3 +325,45 @@ async def test_client_rejects_boolean_jsonrpc_error_code() -> None:
     client = A2AClient(A2AWorker(name="hermes", url="http://127.0.0.1:9900"), transport=httpx.MockTransport(handler))
     with pytest.raises(A2AProtocolError, match="envelope"):
         await client.invoke_skill("search.web", {"query": "q"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("skill", "payload"),
+    [
+        # The 2026-09-14 production failure: unknown fields instead of the required key.
+        (
+            "research.deep",
+            {"question": "Analyse AAPL", "topic": "AAPL stock analysis", "ticker": "AAPL"},
+        ),
+        # Unknown fields next to the required ones.
+        (
+            "research.deep",
+            {"question": "Analyse AAPL", "idempotency_key": "aapl-1", "symbol": "AAPL"},
+        ),
+        # Only the required key is missing.
+        ("research.deep", {"question": "Analyse AAPL", "output_format": "markdown"}),
+        # A value outside the schema bounds.
+        ("research.deep", {"question": "Analyse AAPL", "idempotency_key": "aapl-1", "max_sources": 900}),
+    ],
+)
+async def test_local_validation_names_the_offending_field_without_sending(
+    skill: str, payload: dict[str, object]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
+        raise AssertionError(f"nothing may be sent for an invalid invocation: {request.url}")
+
+    client = A2AClient(
+        A2AWorker(name="hermes", url="http://127.0.0.1:9900"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(A2AProtocolError) as caught:
+        await client.invoke_skill(skill, payload, context_id="ctx-1")
+
+    message = str(caught.value)
+    assert "rejected locally" in message
+    assert caught.value.retryable is True
+    assert "$" in message
+    # The actionable part: which field was wrong.
+    assert any(name in message for name in ("idempotency_key", "topic", "ticker", "symbol", "max_sources")), message

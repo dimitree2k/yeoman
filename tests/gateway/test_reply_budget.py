@@ -14,6 +14,13 @@ from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
 
+_LONG_REPLY = (
+    "Das ist ein kompakter erster Satz, der fuer den Chat reicht. "
+    "Danach kommt ein langer zweiter Satz mit zu viel erklaerendem Ballast, "
+    "der im Verlauf nicht als alte Assistenzantwort weitergetragen werden soll."
+)
+_SHORT_REPLY = "Das ist ein kompakter erster Satz, der fuer den Chat reicht."
+
 
 class _LongReplyProvider(LLMProvider):
     async def chat(
@@ -26,13 +33,7 @@ class _LongReplyProvider(LLMProvider):
         reasoning: dict[str, Any] | None = None,
     ) -> LLMResponse:
         del messages, tools, model, max_tokens, temperature, reasoning
-        return LLMResponse(
-            content=(
-                "Das ist ein kompakter erster Satz, der fuer den Chat reicht. "
-                "Danach kommt ein langer zweiter Satz mit zu viel erklaerendem Ballast, "
-                "der im Verlauf nicht als alte Assistenzantwort weitergetragen werden soll."
-            )
-        )
+        return LLMResponse(content=_LONG_REPLY)
 
     def get_default_model(self) -> str:
         return "test/model"
@@ -203,6 +204,67 @@ async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path, comp
 
     session = responder.sessions.get_or_create("whatsapp:group@g.us")
     assistant_rows = [row for row in session.messages if row.get("role") == "assistant"]
-    expected = (await _LongReplyProvider().chat([])).content if compact else "Das ist ein kompakter erster Satz, der fuer den Chat reicht."
-    assert reply == expected
+    # Compact personas are no longer exempt: the configured budget clips both branches.
+    assert reply == _SHORT_REPLY
     assert assistant_rows[-1]["content"] == reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_metadata", "content", "expected"),
+    [
+        ({}, "Arvid, kurze Einschaetzung", _SHORT_REPLY),
+        ({"reply_budget_tool_used": True}, "Arvid, kurze Einschaetzung", _LONG_REPLY),
+        ({}, "Arvid, was macht die Aktie heute?", _LONG_REPLY),
+    ],
+    ids=["short_no_tool_no_signal", "long_tool_used", "long_current_data_signal"],
+)
+async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
+    tmp_path: Path,
+    extra_metadata: dict[str, object],
+    content: str,
+    expected: str,
+) -> None:
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts/RUNTIME.md").write_text("Runtime rules")
+    (tmp_path / "prompts/AGENTS.md").write_text("Evidence rules")
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=_LongReplyProvider(),
+        workspace=tmp_path,
+        max_iterations=1,
+    )
+    event = InboundEvent(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        sender_id="u1",
+        content=content,
+        is_group=True,
+        mentioned_bot=True,
+        raw_metadata={
+            "conversation_state": {"answer_shape": "short_take"},
+            "reply_budget": {
+                "enabled": True,
+                "answer_shape": "short_take",
+                "target_chars": 80,
+                "hard_max_chars": 600,
+                "long_form_max_chars": 2200,
+                "long_form_allowed": False,
+                "hard_cap_enabled": True,
+            },
+            **extra_metadata,
+        },
+    )
+
+    reply = await responder.generate_reply(
+        event,
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset(),
+            reason="test",
+            persona_text="<!-- prompt-chain: compact -->\nPersona",
+        ),
+    )
+
+    assert reply == expected

@@ -109,15 +109,16 @@ async def test_working_research_is_polled_and_delivered() -> None:
     )
     while tool._background:
         await asyncio.sleep(0)
-    assert delivery.sent == [
-        {
-            "source": "a2a",
-            "operation_ref": "a2a-result:",
-            "channel": "whatsapp",
-            "chat_id": "chat@g.us",
-            "content": '{"report": "done", "sources": []}',
-        }
-    ]
+    assert len(delivery.sent) == 1
+    sent = delivery.sent[0]
+    assert sent["source"] == "a2a"
+    assert sent["operation_ref"] == "a2a-result:"
+    assert sent["channel"] == "whatsapp"
+    assert sent["chat_id"] == "chat@g.us"
+    # A detached result is labelled as a follow-up to the request that started it.
+    assert sent["content"].startswith("Nachtrag zur Trading-Recherche zu deiner Frage „q“")
+    assert sent["content"].endswith("done")
+    assert '{"report"' not in sent["content"], "structured payloads are rendered, not dumped"
 
 
 @pytest.mark.asyncio
@@ -154,7 +155,8 @@ async def test_research_timeout_and_protocol_failures_have_distinct_delivery_cod
         await tool._poll_research(
             "hermes", result.task_id, result.skill, result.context_id, (), "e", "whatsapp", "chat"
         )
-        assert delivery.sent[0]["content"] == expected
+        assert delivery.sent[0]["content"].endswith(expected)
+        assert delivery.sent[0]["content"].startswith("Nachtrag zur Trading-Recherche")
         assert len(delivery.sent) == 1
         assert "signed private secret" not in delivery.sent[0]["content"]
 
@@ -234,7 +236,89 @@ async def test_research_poll_timeout_is_reported_after_bounded_extensions() -> N
 
     assert registry.calls == 3, "one initial window plus exactly two extensions"
     assert len(delivery.sent) == 1
-    assert delivery.sent[0]["content"] == "error=POLL_TIMEOUT retryable=True"
+    assert delivery.sent[0]["content"].endswith("error=POLL_TIMEOUT retryable=True")
+    assert delivery.sent[0]["content"].startswith("Nachtrag zur Trading-Recherche")
+
+
+@pytest.mark.asyncio
+async def test_follow_up_header_names_the_request_and_its_age() -> None:
+    """A result that arrives after the chat moved on is marked as a follow-up, not suppressed."""
+    import time as _time
+
+    from yeoman_gateway.a2a.client import A2AWorkerResult
+
+    class Registry:
+        def __init__(self) -> None:
+            self.references: tuple[str, ...] = ()
+
+        async def poll_task(self, *args, **kwargs):
+            return A2AWorkerResult(
+                "hermes",
+                "task-late",
+                "ctx-late",
+                "TASK_STATE_COMPLETED",
+                "research.deep",
+                {"report": "fertig"},
+                reference_task_ids=self.references,
+            )
+
+    class Delivery:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, object]] = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    delivery = Delivery()
+    tool = A2ADelegateTool(Registry(), delivery=delivery)
+    asked = "TradingAgents-Analyse für Microsoft (MSFT) für heute: Kurs, Treiber, Risiken."
+
+    await tool._poll_research(
+        "hermes",
+        "task-late",
+        "research.deep",
+        "ctx-late",
+        (),
+        "effect-late",
+        "whatsapp",
+        "chat@g.us",
+        asked,
+        int(_time.time() * 1000) - 12 * 60 * 1000,
+    )
+
+    content = str(delivery.sent[0]["content"])
+    assert content.startswith("Nachtrag zur Trading-Recherche zu deiner Frage „TradingAgents-Analyse für Microsoft (MSFT)")
+    assert "angefragt vor 12 Minuten" in content
+    assert content.endswith("fertig"), content
+    assert '{"report"' not in content
+
+
+@pytest.mark.asyncio
+async def test_follow_up_header_survives_a_missing_question() -> None:
+    """Resumed tasks from an older schema have no stored question: still labelled, never bare."""
+    from yeoman_gateway.a2a.client import A2AWorkerResult
+
+    class Registry:
+        async def poll_task(self, *args, **kwargs):
+            return A2AWorkerResult(
+                "hermes", "t", "c", "TASK_STATE_COMPLETED", "research.deep", {"report": "x"}
+            )
+
+    class Delivery:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, object]] = []
+
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    delivery = Delivery()
+    tool = A2ADelegateTool(Registry(), delivery=delivery)
+    await tool._poll_research(
+        "hermes", "t", "research.deep", "c", (), "e", "whatsapp", "chat@g.us", "", 0
+    )
+
+    content = str(delivery.sent[0]["content"])
+    assert content.startswith("Nachtrag zur Trading-Recherche (angefragt vor unter einer Minute):")
 
 
 @pytest.mark.asyncio
@@ -474,3 +558,286 @@ def test_processing_fence_keeps_a2a_delegate_reachable() -> None:
     for name in ("message", "a2a_delegate", *NON_MIGRATED_CAPABILITIES):
         registry.register(Tool(name))
     assert "a2a_delegate" not in disable_non_migrated_tools(registry)
+
+
+def _delegate_tool(processing: ProcessingStore, client: object) -> A2ADelegateTool:
+    return A2ADelegateTool(
+        A2AWorkerRegistry(
+            [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+            client_factory=lambda _: client,
+        ),
+        store=processing,
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_rejection_can_be_retried_with_corrected_arguments(tmp_path: Path) -> None:
+    """A locally rejected invocation never left the host, so a corrected retry must go out.
+
+    Production 2026-09-14: attempt 1 was rejected by local schema validation, attempt 2
+    corrected the arguments and was answered with "conflict", attempt 3 with "duplicate" -
+    the delegation never reached Hermes.
+    """
+    from yeoman_gateway.a2a.client import A2AProtocolError
+    from yeoman_gateway.a2a.contracts import A2AContractValidationError
+
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(dict(input))
+            if len(calls) == 1:
+                raise A2AProtocolError(
+                    "A2A invocation rejected locally: $: required (missing required fields: idempotency_key)",
+                    retryable=True,
+                ) from A2AContractValidationError(
+                    "$", "required", detail="missing required fields: idempotency_key"
+                )
+            return A2AWorkerResult(
+                "hermes", "task-9", "ctx-9", "TASK_STATE_COMPLETED", skill, {"report": "ok"}
+            )
+
+    processing = ProcessingStore(tmp_path / "processing.db")
+    tool = _delegate_tool(processing, Client())
+
+    first = await tool.execute(
+        worker="hermes", skill="research.deep", input={"question": "Analyse ORCL"}
+    )
+    second = await tool.execute(
+        worker="hermes",
+        skill="research.deep",
+        input={"question": "Analyse ORCL", "idempotency_key": "orcl-1"},
+    )
+
+    assert "rejected locally" in first
+    assert "not-sent | rejected" in first, "the note must say the invocation never left the host"
+    assert "TASK_STATE_COMPLETED" in second, second
+    assert calls == [{"question": "Analyse ORCL"}, {"question": "Analyse ORCL", "idempotency_key": "orcl-1"}]
+    states = [processing.effect_state(effect.effect_id) for effect in processing.list_effects()]
+    assert "failed" in states, states
+
+
+@pytest.mark.asyncio
+async def test_identical_retry_after_a_local_rejection_is_still_not_resent(tmp_path: Path) -> None:
+    """The idempotency contract stays intact: same payload in the same window is one effect."""
+    from yeoman_gateway.a2a.client import A2AProtocolError
+    from yeoman_gateway.a2a.contracts import A2AContractValidationError
+
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(dict(input))
+            raise A2AProtocolError("A2A invocation rejected locally: $: required") from (
+                A2AContractValidationError("$", "required", detail="missing required fields: x")
+            )
+
+    processing = ProcessingStore(tmp_path / "processing.db")
+    tool = _delegate_tool(processing, Client())
+    payload = {"question": "Analyse ORCL"}
+
+    first = await tool.execute(worker="hermes", skill="research.deep", input=payload)
+    second = await tool.execute(worker="hermes", skill="research.deep", input=payload)
+
+    assert "rejected locally" in first
+    assert "duplicate" in second
+    assert len(calls) == 1, "the store must still collapse an identical retry"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_still_blocks_a_retry_as_unproven(tmp_path: Path) -> None:
+    """An unproven remote outcome keeps the store's reconciliation contract.
+
+    A local rejection is proven not-executed and may be retried; a transport failure is not,
+    so the identical retry is collapsed and the client must not be called a second time.
+    """
+    from yeoman_gateway.a2a.client import A2ATransportError
+
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(dict(input))
+            raise A2ATransportError("hermes unreachable")
+
+    processing = ProcessingStore(tmp_path / "processing.db")
+    tool = _delegate_tool(processing, Client())
+    payload = {"question": "Analyse ORCL", "idempotency_key": "orcl-2"}
+
+    with pytest.raises(A2ATransportError):
+        await tool.execute(worker="hermes", skill="research.deep", input=payload)
+
+    states = [processing.effect_state(effect.effect_id) for effect in processing.list_effects()]
+    assert states == ["unknown"], states
+
+    second = await tool.execute(worker="hermes", skill="research.deep", input=payload)
+    assert "duplicate" in second, second
+    assert len(calls) == 1, "an unproven effect must not be re-sent without reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_a_claim_conflict_is_reported_and_logged(tmp_path: Path) -> None:
+    """Defensive path: the store reports a conflict before anything is sent."""
+    from yeoman_gateway.processing.models import EffectConflictError
+
+    calls: list[dict[str, object]] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(dict(input))
+            raise AssertionError("a conflicting claim must never reach the worker")
+
+    class ConflictingStore(ProcessingStore):
+        def enqueue_effect(self, **kwargs):
+            raise EffectConflictError("same operation key, different payload")
+
+    tool = _delegate_tool(ConflictingStore(tmp_path / "processing.db"), Client())
+
+    response = await tool.execute(
+        worker="hermes", skill="research.deep", input={"question": "Analyse ORCL"}
+    )
+
+    assert response == "[hermes | not-sent | conflict]"
+    assert calls == []
+
+
+def test_research_output_is_rendered_for_chat_not_dumped_as_json() -> None:
+    """The payload Hermes returns is JSON with a reasoning preamble; the chat must not see either."""
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    payload = {
+        "report": (
+            "💭 **Reasoning:**\n```\n**Planning concise German summary**\n"
+            "**Checking sources**\n```\n\n"
+            "# ORCL — Analyse\n\n## Entscheidung\n\n**Underweight** bei 150 USD.\n\n"
+            "- RPO 664 Mrd. USD\n- FCF negativ\n\n"
+            "Vollständiger Report: /home/deploy/.hermes/tradingagents/reports/ORCL/2026-09-14.md"
+        ),
+        "sources": [
+            {"title": "Oracle IR", "url": "https://investor.oracle.com/q1fy27"},
+            {"title": "Yahoo Finance", "url": "https://finance.yahoo.com/quote/ORCL"},
+        ],
+    }
+
+    rendered = render_research_output(payload)
+
+    assert "Reasoning" not in rendered, rendered
+    assert "```" not in rendered, rendered
+    assert '{"report"' not in rendered
+    assert "# ORCL" not in rendered and "## " not in rendered
+    assert "*Underweight*" in rendered
+    assert "• RPO 664 Mrd. USD" in rendered
+    assert "Quellen:" in rendered
+    assert "https://investor.oracle.com/q1fy27" in rendered
+    assert "/home/deploy/.hermes" not in rendered, "keine Serverpfade im Chat"
+
+
+def test_research_output_without_sources_or_report_stays_readable() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    assert render_research_output({"report": "Nur Text."}) == "Nur Text."
+    plain = render_research_output("error=POLL_TIMEOUT retryable=True")
+    assert plain == "error=POLL_TIMEOUT retryable=True"
+    assert render_research_output({}) == ""
+    assert render_research_output(None) == ""
+
+
+def test_follow_up_content_uses_the_rendered_report() -> None:
+    """Header plus rendered body: no JSON, no reasoning, no server path."""
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    payload = {
+        "report": "💭 **Reasoning:**\n```\nplan\n```\n\n# MSFT\n\n**Overweight**.\n\n"
+        "Report: /home/deploy/.hermes/tradingagents/reports/MSFT/2026-09-14.md",
+        "sources": [],
+    }
+    body = render_research_output(payload)
+    assert body.startswith("MSFT"), body
+    assert "Overweight" in body
+    assert "Reasoning" not in body
+
+
+def test_research_output_has_no_markdown_line_break_artifacts() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    rendered = render_research_output(
+        {"report": "Zeile eins  \nZeile zwei\n\nAbsatz  \n"}, mode="full"
+    )
+    assert "  \n" not in rendered, repr(rendered)
+    assert rendered == "Zeile eins\nZeile zwei\n\nAbsatz"
+
+
+_LONG_REPORT = """💭 **Reasoning:**
+```
+Plan A
+Plan B
+```
+
+# ORCL — TradingAgents-Analyse für heute, 14.09.2026
+
+## Entscheidung
+
+**Underweight** — bestehende Position reduzieren, keine neuen Longs vor dem FOMC.
+
+## Begründung
+
+- Oracle meldete 30 % Umsatzwachstum, aber negativen Free Cashflow von 5 Mrd. USD.
+- Ablehnung am fallenden 200-Tage-SMA bei 166,82 USD.
+- RPO von 664 Mrd. USD stützt die Story, die Umwandlung in Cash bleibt offen.
+- Bewertung bleibt hoch, Refinanzierung teuer.
+
+## Risiken
+
+- FOMC nächste Woche.
+
+Report: /home/deploy/.hermes/tradingagents/reports/ORCL/2026-09-14.md
+"""
+
+
+def test_card_mode_is_a_short_summary_of_a_long_report() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    card = render_research_output(
+        {"report": _LONG_REPORT, "sources": [{"title": "Oracle IR", "url": "https://oracle.com/ir"}]},
+        mode="card",
+    )
+
+    assert card.startswith("ORCL — TradingAgents-Analyse für heute, 14.09.2026"), card
+    assert "*Underweight*" in card
+    assert "• Oracle meldete 30 % Umsatzwachstum" in card
+    assert card.count("• ") <= 5, card  # four reasons plus the source list
+    assert "FOMC nächste Woche" not in card, "Risiko-Abschnitt gehört nur in die Langfassung"
+    assert "Reasoning" not in card and "```" not in card and '{"report"' not in card
+    assert "/home/deploy" not in card
+    assert "https://oracle.com/ir" in card
+    assert len(card) <= 1400, len(card)
+    assert "Langfassung" in card
+
+
+def test_card_mode_falls_back_to_a_short_excerpt_without_a_decision_heading() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    card = render_research_output({"report": "## Lage\n\nKurzer Text ohne Entscheidung."}, mode="card")
+    assert "Lage" in card
+    assert "Kurzer Text ohne Entscheidung." in card
+
+
+def test_full_mode_keeps_the_whole_report() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    full = render_research_output({"report": _LONG_REPORT}, mode="full")
+    # Full mode keeps every section; headings are flattened for chat, not dropped.
+    assert "Risiken" in full
+    assert "FOMC nächste Woche" in full
+    assert "Bewertung bleibt hoch" in full
+    assert "Langfassung auf Abruf." not in full
+
+
+def test_card_mode_keeps_errors_and_short_answers_unchanged() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    assert render_research_output("error=POLL_TIMEOUT retryable=True", mode="card") == (
+        "error=POLL_TIMEOUT retryable=True"
+    )
+    short = "Der Markt ist zu; ORCL schloss bei 150,28 USD."
+    assert render_research_output({"report": short}, mode="card").startswith(short)

@@ -25,6 +25,10 @@ class PendingResearch:
     channel: str
     chat_id: str
     effect_id: str
+    #: What the owner actually asked, and when. A long run can finish while the chat has moved
+    #: on to something else, so the delivered result is labelled as a follow-up to this request.
+    question: str = ""
+    created_ms: int = 0
 
 
 class A2AResearchStore:
@@ -56,10 +60,24 @@ class A2AResearchStore:
                     reference_task_ids TEXT NOT NULL,
                     channel TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
-                    effect_id TEXT NOT NULL
+                    effect_id TEXT NOT NULL,
+                    question TEXT NOT NULL DEFAULT '',
+                    created_ms INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            existing = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(pending_research)")
+            }
+            for column, definition in (
+                ("question", "TEXT NOT NULL DEFAULT ''"),
+                ("created_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in existing:
+                    connection.execute(
+                        f"ALTER TABLE pending_research ADD COLUMN {column} {definition}"
+                    )
 
     def put(self, pending: PendingResearch) -> None:
         if not pending.task_id or not pending.worker or not pending.skill or not pending.context_id:
@@ -72,8 +90,8 @@ class A2AResearchStore:
                 """
                 INSERT INTO pending_research
                     (task_id, worker, skill, context_id, reference_task_ids,
-                     channel, chat_id, effect_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     channel, chat_id, effect_id, question, created_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     worker=excluded.worker,
                     skill=excluded.skill,
@@ -81,7 +99,9 @@ class A2AResearchStore:
                     reference_task_ids=excluded.reference_task_ids,
                     channel=excluded.channel,
                     chat_id=excluded.chat_id,
-                    effect_id=excluded.effect_id
+                    effect_id=excluded.effect_id,
+                    question=excluded.question,
+                    created_ms=excluded.created_ms
                 """,
                 (
                     pending.task_id,
@@ -92,6 +112,8 @@ class A2AResearchStore:
                     pending.channel,
                     pending.chat_id,
                     pending.effect_id,
+                    pending.question,
+                    int(pending.created_ms),
                 ),
             )
 
@@ -100,7 +122,7 @@ class A2AResearchStore:
             rows = connection.execute(
                 """
                 SELECT task_id, worker, skill, context_id, reference_task_ids,
-                       channel, chat_id, effect_id
+                       channel, chat_id, effect_id, question, created_ms
                 FROM pending_research
                 ORDER BY rowid
                 """
@@ -122,6 +144,8 @@ class A2AResearchStore:
                     channel=str(row["channel"]),
                     chat_id=str(row["chat_id"]),
                     effect_id=str(row["effect_id"]),
+                    question=str(row["question"] or ""),
+                    created_ms=int(row["created_ms"] or 0),
                 )
             )
         return tuple(result)

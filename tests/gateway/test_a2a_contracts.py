@@ -182,3 +182,79 @@ def get_requires_for_build_wheel(config_settings=None):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "local-checkout"
+
+
+def test_validation_error_names_the_missing_required_field() -> None:
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_request(
+            "research.deep", {"question": "Analyse AAPL", "output_format": "markdown"}
+        )
+    message = str(caught.value)
+    assert "idempotency_key" in message
+    assert "required" in message
+    assert "$" in message
+
+
+def test_validation_error_names_the_unexpected_field() -> None:
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_request(
+            "research.deep", {"question": "Analyse AAPL", "ticker": "AAPL"}
+        )
+    message = str(caught.value)
+    assert "ticker" in message
+    assert "additionalProperties" in message
+
+
+def test_validation_error_reports_every_root_level_violation() -> None:
+    """The 2026-09-14 production failure: a missing key and two unknown fields at once."""
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_request(
+            "research.deep",
+            {"question": "Analyse AAPL", "topic": "AAPL stock analysis", "ticker": "AAPL"},
+        )
+    message = str(caught.value)
+    for fragment in ("idempotency_key", "ticker", "topic", "additionalProperties", "required"):
+        assert fragment in message, message
+
+
+def test_validation_error_names_a_nested_offending_field() -> None:
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_invocation(
+            {"skill": "research.deep", "input": {"question": "ok", "idempotency_key": "k"}, "extra": 1}
+        )
+    message = str(caught.value)
+    assert "extra" in message
+    assert "additionalProperties" in message
+
+
+def test_validation_error_is_bounded_and_single_line() -> None:
+    payload = {f"unexpected_{index}": index for index in range(200)}
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_invocation(
+            {"skill": "research.deep", "input": {"question": "ok", "idempotency_key": "k"}, **payload}
+        )
+    message = str(caught.value)
+    assert "\n" not in message
+    assert len(message) <= 500
+
+
+def test_validation_error_names_only_the_fields_the_payload_omits() -> None:
+    """jsonschema lists every required key; the message must name the absent one only."""
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_request(
+            "research.deep", {"question": "Analyse AAPL", "output_format": "markdown"}
+        )
+    message = str(caught.value)
+    assert "idempotency_key" in message
+    missing_clause = message.split("missing required fields:")[1].split(")")[0]
+    assert "question" not in missing_clause, message
+
+
+def test_validation_error_does_not_repeat_the_validator_message() -> None:
+    with pytest.raises(A2AContractValidationError) as caught:
+        ContractSchemas.load().validate_request(
+            "research.deep", {"question": "Analyse AAPL", "ticker": "AAPL"}
+        )
+    message = str(caught.value)
+    assert message.count("ticker") == 1, message
+    assert "were unexpected" not in message, message
