@@ -172,6 +172,40 @@ async def test_group_preview_queues_owner_approval_instead_of_sending_directly(t
 
 
 @pytest.mark.asyncio
+async def test_service_preview_does_not_count_as_target_send(tmp_path: Path) -> None:
+    """A preview is an owner-destination effect, never a target send (spec section 9)."""
+    tools, approvals, log = _tools(tmp_path, opt_in_group=True)
+
+    class Effects:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def send(self, **kwargs: object):
+            self.calls.append(kwargs)
+            return None
+
+    effects = Effects()
+    tools._service_effects = effects
+    target = next(c for c in await tools.read_eligible_chats() if c["is_group"])
+    proposal = await tools.propose_speakup(
+        channel=target["channel"],
+        chat_id=target["chat_id"],
+        message="A useful observation.",
+        action_type="observation",
+        confidence=0.9,
+    )
+    result = await tools.commit_speakup(proposal["proposal_id"])
+
+    assert result["status"] == "queued_for_approval"
+    assert len(await approvals.list_pending()) == 1
+    # The preview went to the owner DM only.
+    assert [call["chat_id"] for call in effects.calls] == ["owner@s.whatsapp.net"]
+    assert await log.count_sent_today(
+        channel=target["channel"], chat_id=target["chat_id"], now=tools._now()
+    ) == 0
+
+
+@pytest.mark.asyncio
 async def test_chat_window_uses_most_recent_messages(tmp_path: Path) -> None:
     tools, _, _ = _tools(tmp_path, opt_in_group=True)
     archive = tools.inbound_archive

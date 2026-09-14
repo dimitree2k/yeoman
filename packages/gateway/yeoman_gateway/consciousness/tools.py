@@ -13,7 +13,7 @@ from yeoman_shared.config.schema import Config
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
-from yeoman_gateway.consciousness.log import SpeakupLog
+from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -455,17 +455,39 @@ class ConsciousnessTools:
                 )
                 preview_content = "\n".join(preview_lines)
                 if self._service_effects is not None:
-                    await self._service_effects.send(
+                    preview_ref = f"speakup-preview:{proposal.proposal_id}"
+                    preview_effect_id = deterministic_effect_id(
+                        channel=approval.owner_channel,
+                        chat_id=approval.owner_chat_id,
+                        operation="preview",
+                        proposal_id=proposal.proposal_id,
+                    )
+                    receipt = await self._service_effects.send(
                         source="speakup",
-                        operation_ref=f"speakup-preview:{proposal.proposal_id}",
+                        operation_ref=preview_ref,
                         channel=approval.owner_channel,
                         chat_id=approval.owner_chat_id,
                         content=preview_content,
+                        effect_id=preview_effect_id,
                     )
-                    await self.log.mark_sent(
-                        proposal.proposal_id, now=self._now().timestamp()
+                    # A preview is an owner-destination effect. It never touches the
+                    # target chat and therefore never consumes a target send allowance
+                    # (spec section 9). The proposal stays queued for approval; the
+                    # owner-destination effect is recorded separately from target truth.
+                    await self.log.record_preview_effect(
+                        proposal.proposal_id,
+                        preview_effect_id=preview_effect_id,
+                        preview_operation_ref=preview_ref,
+                        accepted=bool(getattr(receipt, "accepted", False)),
+                        now=self._now().timestamp(),
                     )
-                    return {"status": "sent", "proposal_id": proposal.proposal_id}
+                    await self.log.mark_status(
+                        proposal.proposal_id, status="awaiting_approval"
+                    )
+                    return {
+                        "status": "queued_for_approval",
+                        "proposal_id": proposal.proposal_id,
+                    }
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=approval.owner_channel,
