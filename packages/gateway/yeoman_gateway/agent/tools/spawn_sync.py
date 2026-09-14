@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.processing.tool_context import current_tool_context
 
 if TYPE_CHECKING:
     from yeoman_gateway.agent.subagent import SubagentManager
@@ -42,4 +43,6 @@ class SpawnSyncTool(Tool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        return await self._manager.spawn_sync(task=kwargs["task"])
+        return await self._manager.spawn_sync(
+            task=kwargs["task"], invocation_context=current_tool_context()
+        )

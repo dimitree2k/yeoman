@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.agent.tools.base import Tool
+from yeoman_gateway.processing.tool_context import current_tool_context
 
 if TYPE_CHECKING:
     from yeoman_gateway.agent.subagent import SubagentManager
@@ -55,4 +56,5 @@ class FactCheckTool(Tool):
             task=task,
             label="fact-check",
             timeout_seconds=60.0,
+            invocation_context=current_tool_context(),
         )

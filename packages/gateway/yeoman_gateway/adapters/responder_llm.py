@@ -431,6 +431,7 @@ class LLMResponder(ResponderPort):
         a2a_registry: "A2AWorkerRegistry | None" = None,
         a2a_delivery: object | None = None,
         processing_store: object | None = None,
+        quota_governance: object | None = None,
         lazy_media_resolver: "LazyMediaResolver | None" = None,
         whatsapp_session_history_limit: int = 15,
         whatsapp_session_history_limit_group: int = 20,
@@ -467,6 +468,7 @@ class LLMResponder(ResponderPort):
         self._a2a_registry = a2a_registry
         self._a2a_delivery = a2a_delivery
         self._processing_store = processing_store
+        self._quota_governance = quota_governance
         self._lazy_media_resolver = lazy_media_resolver
         self._session_history_limit = whatsapp_session_history_limit
         self._session_history_limit_group = whatsapp_session_history_limit_group
@@ -493,6 +495,7 @@ class LLMResponder(ResponderPort):
             exec_config=self.exec_config,
             restrict_to_workspace=self.effective_restrict_to_workspace,
             file_access_resolver=file_access_resolver,
+            quota_governance=quota_governance,
         )
         self._register_default_tools()
 
@@ -547,7 +550,13 @@ class LLMResponder(ResponderPort):
         self.tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
         self.tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
-        self.tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        self.tools.register(
+            DeepResearchTool(
+                api_key=self.tavily_api_key,
+                web_config=self.web_config,
+                quota_governance=self._quota_governance,
+            )
+        )
         self.tools.register(MarketQuoteTool())
         self.tools.register(MarketIntelligenceTool())
         self.tools.register(YoutubeTranscriptTool())
@@ -624,6 +633,7 @@ class LLMResponder(ResponderPort):
                     self._a2a_registry,
                     store=getattr(self._effect_router, "store", None),
                     delivery=self._a2a_delivery,
+                    quota_governance=self._quota_governance,
                 )
             )
 
@@ -663,6 +673,7 @@ class LLMResponder(ResponderPort):
         channel: str,
         chat_id: str,
         session_key: str,
+        canonical_user_id: str = "",
         is_owner: bool = False,
         reply_to_message_id: str | None = None,
     ) -> None:
@@ -676,6 +687,7 @@ class LLMResponder(ResponderPort):
                 channel=channel,
                 chat_id=chat_id,
                 session_key=session_key,
+                canonical_user_id=canonical_user_id,
                 is_owner=is_owner,
                 reply_to_message_id=reply_to_message_id,
             )
@@ -2151,6 +2163,10 @@ class LLMResponder(ResponderPort):
         metadata = dict(metadata)
         metadata["is_owner"] = bool(is_owner)
 
+        from yeoman_gateway.policy.identity import canonical_user_id as resolve_canonical_user_id
+
+        canonical_id = resolve_canonical_user_id(channel, str(sender_id or ""), metadata)
+
         session = self.sessions.get_or_create(session_key)
 
         # Save session immediately on first message (even if no response yet)
@@ -2169,6 +2185,7 @@ class LLMResponder(ResponderPort):
             channel=channel,
             chat_id=chat_id,
             session_key=session_key,
+            canonical_user_id=canonical_id,
             is_owner=is_owner,
             reply_to_message_id=(
                 str(metadata.get("reply_to_message_id") or "").strip() or None
@@ -2696,7 +2713,7 @@ class LLMResponder(ResponderPort):
         chat_id: str = "direct",
         allowed_tools: set[str] | None = None,
         persona_text: str | None = None,
-        is_owner: bool = True,
+        is_owner: bool = False,
         model_profile: str | None = None,
         sender_id: str | None = None,
         metadata: dict[str, object] | None = None,

@@ -1067,25 +1067,42 @@ class DeepResearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, api_key: str | None = None, web_config: "WebToolsConfig | None" = None):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        web_config: "WebToolsConfig | None" = None,
+        quota_governance: Any | None = None,
+    ):
         from yeoman_shared.config.schema import WebToolsConfig as WebToolsCfg
 
         self._config = web_config or WebToolsCfg()
         self.api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
+        self._quota_governance = quota_governance
         _rate_limiter.configure(self._config.rate_limit_rpm)
 
     async def execute(
         self, query: str, depth: str = "advanced", max_results: int = 5, **kwargs: Any
     ) -> str:
         logger.info("deep_research query={!r} depth={}", query, depth)
+        if not isinstance(query, str) or not query.strip():
+            return "Error: query is required"
+        if depth not in {"basic", "advanced"}:
+            return "Error: depth must be basic or advanced"
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= 10:
+            return "Error: max_results must be between 1 and 10"
         if not _rate_limiter.check():
             return "Error: Rate limit exceeded. Try again shortly."
 
         if not self.api_key:
             return "Error: TAVILY_API_KEY not configured"
 
+        if self._quota_governance is not None:
+            quota = self._quota_governance.claim(self.name, {"query": query})
+            if not quota.allowed:
+                return self._quota_governance.refusal(self.name, quota)
+
         try:
-            n = min(max(max_results, 1), 10)
+            n = max_results
             all_results: list[dict[str, Any]] = []
             all_answers: list[str] = []
             queries_done: set[str] = {query}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import uuid
 from pathlib import Path
@@ -29,6 +30,12 @@ from yeoman_gateway.agent.tools.web import (
 )
 from yeoman_gateway.bus.events import InboundMessage
 from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.processing.tool_context import (
+    ToolInvocationContext,
+    current_tool_context,
+    reset_tool_context,
+    set_tool_context,
+)
 from yeoman_gateway.providers.base import LLMProvider
 
 
@@ -52,6 +59,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         file_access_resolver: "FileAccessResolver | None" = None,
+        quota_governance: Any | None = None,
     ):
         from yeoman_shared.config.schema import ExecToolConfig
         self.provider = provider
@@ -63,6 +71,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.file_access_resolver = file_access_resolver
+        self.quota_governance = quota_governance
         self.effective_restrict_to_workspace = (
             restrict_to_workspace
             or (
@@ -78,6 +87,7 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        invocation_context: ToolInvocationContext | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -100,8 +110,10 @@ class SubagentManager:
         }
 
         # Create background task
+        context = invocation_context or current_tool_context()
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent_with_context(task_id, task, display_label, origin, context),
+            context=contextvars.copy_context(),
         )
         self._running_tasks[task_id] = bg_task
 
@@ -117,6 +129,7 @@ class SubagentManager:
         label: str | None = None,
         timeout_seconds: float = 120.0,
         memory_context: str | None = None,
+        invocation_context: ToolInvocationContext | None = None,
     ) -> str:
         """
         Run a subagent synchronously — block until it returns a result.
@@ -130,7 +143,10 @@ class SubagentManager:
 
         try:
             result = await asyncio.wait_for(
-                self._run_subagent_sync(task_id, task, memory_context=memory_context),
+                self._run_subagent_sync_with_context(
+                    task_id, task, memory_context=memory_context,
+                    invocation_context=invocation_context or current_tool_context(),
+                ),
                 timeout=timeout_seconds,
             )
             return result
@@ -153,6 +169,13 @@ class SubagentManager:
         tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
         tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
         tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
+        tools.register(
+            DeepResearchTool(
+                api_key=self.tavily_api_key,
+                web_config=self.web_config,
+                quota_governance=self.quota_governance,
+            )
+        )
 
         system_prompt = self._build_subagent_prompt(task)
         if memory_context:
@@ -253,7 +276,13 @@ class SubagentManager:
             tools.register(WebFetchTool(api_key=self.tavily_api_key, web_config=self.web_config))
             tools.register(WebMapTool(api_key=self.tavily_api_key, web_config=self.web_config))
             tools.register(WebCrawlTool(api_key=self.tavily_api_key, web_config=self.web_config))
-            tools.register(DeepResearchTool(api_key=self.tavily_api_key, web_config=self.web_config))
+            tools.register(
+                DeepResearchTool(
+                    api_key=self.tavily_api_key,
+                    web_config=self.web_config,
+                    quota_governance=self.quota_governance,
+                )
+            )
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
@@ -323,6 +352,39 @@ class SubagentManager:
         finally:
             if exec_tool:
                 await exec_tool.aclose()
+
+    async def _run_subagent_with_context(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        context: ToolInvocationContext | None,
+    ) -> None:
+        if context is None:
+            await self._run_subagent(task_id, task, label, origin)
+            return
+        token = set_tool_context(context)
+        try:
+            await self._run_subagent(task_id, task, label, origin)
+        finally:
+            reset_tool_context(token)
+
+    async def _run_subagent_sync_with_context(
+        self,
+        task_id: str,
+        task: str,
+        *,
+        memory_context: str | None,
+        invocation_context: ToolInvocationContext | None,
+    ) -> str:
+        if invocation_context is None:
+            return await self._run_subagent_sync(task_id, task, memory_context=memory_context)
+        token = set_tool_context(invocation_context)
+        try:
+            return await self._run_subagent_sync(task_id, task, memory_context=memory_context)
+        finally:
+            reset_tool_context(token)
 
     async def _announce_result(
         self,

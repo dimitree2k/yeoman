@@ -37,6 +37,7 @@ DELEGATION_LEASE_MS = 900_000
 #: making progress. The budget resets on restart, where durable pending entries are
 #: resumed by ``resume_pending_research``.
 RESEARCH_POLL_EXTENSIONS = 3
+ASYNC_RESEARCH_SKILLS = frozenset({"research.deep", "trading.analyze"})
 POLL_TIMEOUT_CONTENT = "error=POLL_TIMEOUT retryable=True"
 
 #: The worker wraps its answer in a reasoning preamble and returns it as JSON. Neither belongs
@@ -203,11 +204,13 @@ class A2ADelegateTool(Tool):
         delivery: Any | None = None,
         pending_store: A2AResearchStore | None = None,
         research_poll_extensions: int = RESEARCH_POLL_EXTENSIONS,
+        quota_governance: Any | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
         self._delivery = delivery
         self._research_poll_extensions = max(0, int(research_poll_extensions))
+        self._quota_governance = quota_governance
         self._research_store: A2AResearchStore | None
         if pending_store is not None:
             self._research_store = pending_store
@@ -248,7 +251,7 @@ class A2ADelegateTool(Tool):
                 },
                 "skill": {
                     "type": "string",
-                    "enum": ["search.web", "research.deep"],
+                    "enum": ["search.web", "research.deep", "trading.analyze"],
                     "description": "Supported delegated skill.",
                 },
                 "input": {"type": "object", "description": "Skill-specific structured input."},
@@ -258,7 +261,7 @@ class A2ADelegateTool(Tool):
         }
 
     def _context_id(self) -> str | None:
-        return None if self._channel or self._chat_id or self._session_key else None
+        return self._session_key or None
 
     def _claim(self, worker: str, skill: str, input: dict[str, Any]) -> tuple[bool, str, str]:
         if self._store is None:
@@ -473,11 +476,28 @@ class A2ADelegateTool(Tool):
         )
         if not worker or not skill or not isinstance(input, dict):
             raise ValueError("worker, skill, and structured input are required")
-        if skill not in {"search.web", "research.deep"}:
-            raise ValueError("a2a_delegate supports only search.web and research.deep")
+        if skill not in {"search.web", "research.deep", "trading.analyze"}:
+            raise ValueError("a2a_delegate supports only search.web, research.deep and trading.analyze")
+        if worker not in self._registry.names:
+            raise ValueError(f"unknown A2A worker '{worker}'")
+        if skill == "trading.analyze" and worker != "hermes":
+            return f"[{worker} | not-sent | worker-binding]"
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
             return f"[{worker} | not-sent | {note}]"
+        quota = None
+        if self._quota_governance is not None:
+            quota = self._quota_governance.claim(
+                self.name, {"skill": skill, "input": input}
+            )
+            if not quota.allowed:
+                self._settle(effect_id, "failed")
+                retry = (
+                    f" retry_at_ms={quota.retry_at_ms}"
+                    if quota.reason == "quota_exhausted"
+                    else ""
+                )
+                return f"[{worker} | not-sent | {quota.reason}{retry}]"
         logger.info(
             "A2A delegation started channel={} chat={} worker={} skill={}",
             safe_log_token(self._channel, max_length=40),
@@ -497,6 +517,8 @@ class A2ADelegateTool(Tool):
                 # unproven outcome (which the store never re-executes) and hand the caller the
                 # reason, so a corrected retry is possible and the model can act on it.
                 self._settle(effect_id, "failed")
+                if quota is not None:
+                    self._quota_governance.release(quota)
                 logger.warning(
                     "A2A delegation rejected locally channel={} chat={} worker={} skill={} reason={}",
                     safe_log_token(self._channel, max_length=40),
@@ -517,7 +539,7 @@ class A2ADelegateTool(Tool):
             )
             raise
         self._settle(effect_id, "sent")
-        if skill == "research.deep" and result.state in {
+        if skill in ASYNC_RESEARCH_SKILLS and result.state in {
             "TASK_STATE_SUBMITTED",
             "TASK_STATE_WORKING",
         }:

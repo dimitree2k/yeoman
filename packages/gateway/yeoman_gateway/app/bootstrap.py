@@ -965,6 +965,12 @@ def build_gateway_runtime(
         private_handoff_store=private_handoffs,
         workspace=workspace,
     )
+    from yeoman_gateway.processing.quota import CapabilityQuotaGovernance
+
+    quota_governance = CapabilityQuotaGovernance(
+        store=processing_store,
+        policy_provider=policy_adapter,
+    )
     file_access_resolver = build_file_access_resolver(
         workspace=workspace,
         policy=policy_engine.policy if policy_engine is not None else None,
@@ -1066,6 +1072,7 @@ def build_gateway_runtime(
         inbound_archive=inbound_archive,
         private_handoff_store=private_handoffs,
         a2a_registry=a2a_registry,
+        quota_governance=quota_governance,
         lazy_media_resolver=lazy_media_resolver,
         whatsapp_session_history_limit=config.channels.whatsapp.session_history_limit,
         whatsapp_session_history_limit_group=config.channels.whatsapp.session_history_limit_group,
