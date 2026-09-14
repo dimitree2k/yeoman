@@ -10,11 +10,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Read the pin from the gateway instead of repeating it here: the checker rejects a
+      # checkout whose HEAD is not `CONTRACT_COMMIT`, so a second copy silently breaks CI
+      # the moment the pin moves.
+      - name: Resolve the pinned contract commit
+        id: pin
+        run: |
+          ref=$(sed -n 's/^CONTRACT_COMMIT = "\([0-9a-f]\{40\}\)"$/\1/p' \
+            packages/gateway/yeoman_gateway/a2a/contracts.py)
+          test -n "$ref" || { echo "no CONTRACT_COMMIT pin in contracts.py"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: dimitree2k/hermes-yeoman-a2a-contracts
-          ref: 1c658bfc4d5ae872f47d9abeef5aa365cf305af1
+          ref: ${{ steps.pin.outputs.ref }}
           path: .contracts
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
+      # The code check compares this checkout against CONTRACT_COMMIT and against the
+      # installed package's schemas, which `uv sync` resolved from the same pin.
       - run: uv run yeoman a2a conformance --contracts-checkout .contracts

@@ -282,6 +282,12 @@ negative fixture in a checkout at the exact pinned commit:
 yeoman a2a conformance --contracts-checkout /path/to/hermes-yeoman-a2a-contracts
 ```
 
+To move the pin, update the commit in `pyproject.toml`, run `uv lock`, and set
+`CONTRACT_COMMIT` in `packages/gateway/yeoman_gateway/a2a/contracts.py` to the
+same commit. `tests/gateway/test_a2a_contracts.py` fails if those two disagree,
+and the conformance workflow checks out the commit named by `CONTRACT_COMMIT`
+rather than repeating it, so there is no second copy to keep in step.
+
 To try a contract checkout without changing the project pin, use the local
 override wrapper:
 

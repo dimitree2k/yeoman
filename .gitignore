@@ -87,6 +87,7 @@ tests/gateway/*
 !tests/gateway/test_whatsapp_signal_mapping.py
 !tests/gateway/test_processing_transport_receipts.py
 !tests/gateway/test_a2a.py
+!tests/gateway/test_a2a_ci_contract_pin.py
 !tests/gateway/test_capability_quota.py
 !tests/gateway/test_cron_voice_quiet_window.py
 !tests/gateway/test_market_intelligence_tool.py
