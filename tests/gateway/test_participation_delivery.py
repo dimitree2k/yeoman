@@ -1285,3 +1285,114 @@ def _append_receipt(
         },
         now_ms=1200,
     )
+
+
+# -- historical rows and restart truth (A23, A24) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_historical_sent_row_is_preserved_but_not_verified(tmp_path: Path) -> None:
+    """A legacy ``sent`` row stays as history and never becomes learning evidence (A23)."""
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await _proposal(log, "legacy")
+    await log.mark_sent("legacy", now=1.0)
+    row = await log.proposal_row("legacy")
+    assert row is not None and row["status"] == "sent"
+    # No reservation, no provider receipt, no delivered anchor and no outcome sample.
+    assert await log.delivered_reservation_rows(
+        channel=CHANNEL, chat_id=CHAT, since_ms=0, limit=10
+    ) == []
+    assert await log.participation_outcome_samples(
+        channel=CHANNEL, chat_id=CHAT, limit=10
+    ) == []
+    assert await log.pending_outcome_deliveries(before_ms=10**12) == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_drops_speculative_queue_but_keeps_durable_truth(
+    tmp_path: Path,
+) -> None:
+    """Restart keeps attempts, approvals and effects; speculative batching is gone (A24)."""
+    from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
+    from yeoman_gateway.consciousness.participation_runtime import SourceOwner
+
+    db_path = tmp_path / "speakups.db"
+    log = SpeakupLog(db_path)
+    await _proposal(log, "p1")
+    await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="e1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 3, HOUR_MS),),
+    )
+    assert await log.reserve_judge_attempt(
+        "opp:0",
+        opportunity_id="opp",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        hourly_limit=2,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    owner = SourceOwner(store=log)
+    assert owner.claim(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner="participation",
+    ).granted
+    log.close()
+
+    reopened = SpeakupLog(db_path)
+    # Durable truth survived: the hold, the attempt charge and the source claim.
+    assert await reopened.delivery_state(proposal_id="p1", effect_id="e1") == "reserved"
+    assert not await reopened.reserve_judge_attempt(
+        "opp:0",
+        opportunity_id="opp",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=2000,
+        hourly_limit=2,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    assert await reopened.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=2000, window_ms=HOUR_MS
+    ) == 1
+    restarted_owner = SourceOwner(store=reopened)
+
+    handled: list[str] = []
+    release = asyncio.Event()
+
+    async def handle(opportunity) -> None:
+        handled.append(opportunity.opportunity_id)
+        await release.wait()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1)
+    # A fresh scheduler has no queue: the old speculative batch cannot reappear.
+    assert scheduler.pending_count == 0
+    await scheduler.start()
+    try:
+        assert (
+            restarted_owner.claim(
+                channel=CHANNEL,
+                chat_id=CHAT,
+                source_event_id="m1",
+                activation_epoch=2,
+                owner="participation",
+            ).reason
+            == "already_owned"
+        )
+        await asyncio.sleep(0.05)
+        assert handled == []
+    finally:
+        release.set()
+        await scheduler.stop()
+    reopened.close()
