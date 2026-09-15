@@ -95,6 +95,8 @@ class ParticipationRuntime:
         snapshot_provider: SnapshotProvider,
         is_paused: Callable[[str, str], str | None] | None = None,
         is_source_allowed: Callable[[str, str, Sequence[str]], bool] | None = None,
+        source_principals: Callable[[str, str, Sequence[str]], Sequence[str]] | None = None,
+        is_participant_allowed: Callable[[str, str, str], bool] | None = None,
         submission: Any | None = None,
         reactor: Any | None = None,
         clock_ms: Callable[[], int] | None = None,
@@ -106,6 +108,12 @@ class ParticipationRuntime:
         self._is_paused = is_paused or (lambda channel, chat_id: None)
         self._is_source_allowed = is_source_allowed or (
             lambda channel, chat_id, sources: True
+        )
+        self._source_principals = source_principals or (
+            lambda channel, chat_id, sources: ()
+        )
+        self._is_participant_allowed = is_participant_allowed or (
+            lambda channel, chat_id, sender: True
         )
         self._submission = submission
         self._reactor = reactor
@@ -241,6 +249,14 @@ class ParticipationRuntime:
             opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
         ):
             raise ParticipationBlockedError("source_not_authorized")
+        # The originating participants must still be authorized *themselves*: a
+        # service principal that may transport an effect is not a substitute for the
+        # sender's access (spec section 3.1).
+        for sender in self._source_principals(
+            opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
+        ):
+            if not self._is_participant_allowed(opportunity.channel, opportunity.chat_id, sender):
+                raise ParticipationBlockedError("source_principal_not_authorized")
         actions = snapshot.get("allowed_actions")
         if isinstance(actions, (list, tuple)) and not set(actions) - {"silence"}:
             # Only silence is feasible: do not spend a provider call to be told that.
@@ -454,6 +470,7 @@ class ParticipationAuthorizationRequest:
     reservation_state: str | None
     payload_hash: str
     expected_payload_hash: str
+    source_principals_authorized: bool = True
 
 
 class ParticipationEffectAuthorizer:
@@ -478,6 +495,8 @@ class ParticipationEffectAuthorizer:
             return False, str(request.is_paused)
         if not request.source_authorized:
             return False, "source_not_authorized"
+        if not request.source_principals_authorized:
+            return False, "source_principal_not_authorized"
         if request.reservation_state is None:
             return False, "no_reservation"
         if request.reservation_state in {"failed", "cancelled", "expired"}:

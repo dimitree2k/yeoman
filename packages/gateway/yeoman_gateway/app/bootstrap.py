@@ -847,6 +847,37 @@ def _build_participation_runtime(
             return False
         return str(getattr(resolved, "when_to_reply_mode", "")) != "off"
 
+    def _source_principals(
+        channel: str, chat_id: str, sources: object
+    ) -> tuple[str, ...]:
+        if inbound_archive is None or not hasattr(inbound_archive, "senders_for_messages"):
+            return ()
+        try:
+            senders = inbound_archive.senders_for_messages(  # type: ignore[attr-defined]
+                channel, chat_id, tuple(str(item) for item in sources)  # type: ignore[arg-type]
+            )
+        except Exception:
+            return ()
+        return tuple(sorted(set(senders.values())))
+
+    def _is_participant_allowed(channel: str, chat_id: str, sender: str) -> bool:
+        if policy_engine is None or not sender:
+            return False
+        from yeoman_gateway.policy.engine import ActorContext
+
+        try:
+            decision = policy_engine.evaluate(  # type: ignore[attr-defined]
+                ActorContext(
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_primary=str(sender),
+                    sender_aliases=[str(sender)],
+                )
+            )
+        except Exception:
+            return False
+        return bool(getattr(decision, "accept_message", False))
+
     submission = _ParticipationSubmission(responder=responder)
     reactor = _ParticipationReactor(responder=responder)
     decision_runtime = ParticipationDecisionRuntime(
@@ -856,6 +887,8 @@ def _build_participation_runtime(
         snapshot_provider=_snapshot,
         is_paused=_is_paused,
         is_source_allowed=_is_source_allowed,
+        source_principals=_source_principals,
+        is_participant_allowed=_is_participant_allowed,
         submission=submission,
         reactor=reactor,
     )

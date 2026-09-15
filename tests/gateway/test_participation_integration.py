@@ -775,3 +775,70 @@ async def test_social_continuation_cannot_modify_another_participants_task(
     assert "thread_id" not in fields
     assert "turn_id" not in fields
     log.close()
+
+
+# -- A30: service permission never substitutes for source authorization ----------------
+
+
+@pytest.mark.asyncio
+async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> None:
+    """A denied originating participant cannot authorize a purpose (A30)."""
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db")
+    archive.record_inbound(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        message_id="m1",
+        participant="mallory@s.whatsapp.net",
+        sender_id="mallory@s.whatsapp.net",
+        sender_name="mallory",
+        text="answer me",
+        timestamp=int(NOW_MS / 1000),
+    )
+    submitter_calls: list[str] = []
+
+    class _SpySubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            submitter_calls.append("generated")
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    runtime, judge, context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=_SpySubmission()
+    )
+    runtime._source_principals = lambda channel, chat_id, sources: tuple(
+        archive.senders_for_messages(channel, chat_id, tuple(sources)).values()
+    )
+    runtime._is_participant_allowed = lambda channel, chat_id, sender: False
+    result = await runtime.evaluate_participation(_opportunity("m1"))
+    assert result == {"status": "skipped", "reason": "source_principal_not_authorized"}
+    assert judge.calls == 0
+    assert submitter_calls == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_allowed_source_principal_still_proceeds(tmp_path: Path) -> None:
+    runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
+    runtime._source_principals = lambda channel, chat_id, sources: ("anna@s.whatsapp.net",)
+    runtime._is_participant_allowed = lambda channel, chat_id, sender: sender.endswith(
+        "anna@s.whatsapp.net"
+    )
+    result = await runtime.evaluate_participation(_opportunity("m1"))
+    assert result["status"] == "submitted"
+    assert judge.calls == 1
+    log.close()
+
+
+def test_service_permission_is_not_a_source_authorization() -> None:
+    """The final authorizer refuses when only the service principal is permitted."""
+    allowed, reason = _auth_check(source_principals_authorized=False)
+    assert (allowed, reason) == (False, "source_principal_not_authorized")
+
+
+def _auth_check(**overrides: object):
+    from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
+
+    return ParticipationEffectAuthorizer().check(_authorization(**overrides))
