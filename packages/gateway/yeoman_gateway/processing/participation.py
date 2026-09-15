@@ -347,8 +347,13 @@ class ParticipationJudge:
                     collected.append(token)
             evidence_ids = tuple(collected)
 
-        anchor = _bounded_id(payload.get("anchor_message_id"))
-        target = _bounded_id(payload.get("target_message_id"))
+        speaks = action != "silence"
+        # Fields that cannot change what happens are only validated when they matter.
+        # A silent verdict that decorates itself with a stray target, anchor or action
+        # category is incoherent, but it is still silence - and rejecting it would
+        # discard a correct "do not speak" decision over an unused field.
+        anchor = _bounded_id(payload.get("anchor_message_id")) if speaks else None
+        target = _bounded_id(payload.get("target_message_id")) if speaks else None
         if anchor is not None and anchor not in view.anchor_ids:
             raise ParticipationDecisionError("unknown_evidence", detail="anchor_not_supplied")
         if target is not None and target not in view.message_ids:
@@ -370,7 +375,7 @@ class ParticipationJudge:
 
         purpose = _bounded_text(payload.get("purpose"), MAX_PURPOSE_CHARS)
         reason = _bounded_text(payload.get("reason"), MAX_REASON_CHARS)
-        contribution = _bounded_id(payload.get("contribution_type"))
+        contribution = _bounded_id(payload.get("contribution_type")) if speaks else None
         if contribution is not None and contribution not in view.allowed_contribution_types:
             raise ParticipationDecisionError(
                 "invalid_response", detail="contribution_type_not_allowed"
@@ -386,7 +391,7 @@ class ParticipationJudge:
             raise ParticipationDecisionError("invalid_response", detail="purpose_required")
 
         emoji: str | None = None
-        if action == "react":
+        if action == "react":  # a silent verdict never carries a face
             emoji = allowed_reaction(payload.get("emoji") or "", self._allowed_emojis)
             if emoji is None:
                 raise ParticipationDecisionError("unknown_emoji")
