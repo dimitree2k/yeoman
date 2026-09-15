@@ -195,6 +195,16 @@ class ConsciousnessTools:
         *,
         trigger: str | None = None,
     ) -> bool:
+        activation = self._participation_snapshot(channel, chat_id)
+        if activation is not None and (activation.live or activation.observing):
+            # Observer admission is independent of the legacy planner list. Silence is
+            # always available, but it is not an actionable opportunity.
+            actions = await self.available_actions_for(
+                channel=channel,
+                chat_id=chat_id,
+                now_ms=int(self._now().timestamp() * 1000),
+            )
+            return any(action != "silence" for action in actions)
         eligible = self._resolve_eligible(chat_id, channel=channel)
         if not isinstance(eligible, EligibleChat):
             return False
@@ -1182,6 +1192,8 @@ class ConsciousnessTools:
                 chat_id = self._owner_dm_chat_id(channel, owner)
                 if not chat_id or self._is_group_chat(channel, chat_id):
                     continue
+                if self._participation_owns(channel, chat_id):
+                    continue
                 resolved = self.policy_engine.resolve_policy(channel, chat_id)
                 if self._explicit_chat_disabled(channel, chat_id):
                     continue
@@ -1275,19 +1287,34 @@ class ConsciousnessTools:
     def _participation_owns(self, channel: str, chat_id: str) -> bool:
         """Whether the participation lane owns this chat's social decisions.
 
-        Requires the global switch, the chat's explicit opt-in and a valid activation
-        candidate: a chat that merely opted in while participation is globally off keeps
-        its existing legacy behaviour. Any failure means "legacy keeps owning it", which
-        is the conservative direction.
+        The policy engine's snapshot is the shared activation matrix used by the adapter
+        and the observer. Any resolution failure leaves production ownership with legacy.
         """
-        participation = getattr(getattr(self.config, "processing", None), "participation", None)
-        if participation is None or not bool(getattr(participation, "enabled", False)):
-            return False
+        snapshot = self._participation_snapshot(channel, chat_id)
+        return bool(snapshot is not None and snapshot.live)
+
+    def _participation_snapshot(self, channel: str, chat_id: str):
+        """Resolve the canonical activation matrix from the real processing config."""
+        processing = getattr(self.config, "processing", None)
+        resolver = getattr(self.policy_engine, "resolve_participation_snapshot", None)
+        if processing is None or resolver is None:
+            return None
+        managed_checker = getattr(processing, "is_chat_enabled", None)
+        shadow_checker = getattr(processing, "is_chat_shadowed", None)
         try:
-            resolved = self.policy_engine.resolve_participation(channel, chat_id)
-        except Exception:  # noqa: BLE001 - an unreadable policy must not silence legacy
-            return False
-        return bool(getattr(resolved, "enabled", False))
+            managed = bool(managed_checker(channel, chat_id)) if managed_checker else False
+            processing_shadowed = (
+                bool(shadow_checker(channel, chat_id)) if shadow_checker else False
+            )
+            return resolver(
+                channel,
+                chat_id,
+                processing_config=processing,
+                managed=managed,
+                processing_shadowed=processing_shadowed,
+            )
+        except Exception:  # noqa: BLE001 - an unreadable policy cannot create new work
+            return None
 
     def _explicit_chat_disabled(self, channel: str, chat_id: str) -> bool:
         channel_policy = self.policy_engine.policy.channels.get(channel)

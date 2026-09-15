@@ -690,11 +690,14 @@ class PolicyEngine:
         participation_config = getattr(processing_config, "participation", None)
         resolved = self.resolve_participation(channel, chat_id)
         sources = self.participation_sources(channel, chat_id)
+        processing_enabled = bool(getattr(processing_config, "enabled", False))
         enabled = bool(getattr(participation_config, "enabled", False))
         shadow = bool(getattr(participation_config, "shadow", True))
         judge_route = str(getattr(participation_config, "judge_route", "") or "")
         invalid_reason = ""
-        if enabled and not judge_route.strip():
+        if enabled and not processing_enabled:
+            invalid_reason = "processing_disabled"
+        elif enabled and not judge_route.strip():
             invalid_reason = "missing_judge_route"
         elif enabled and resolved.enabled and not managed:
             invalid_reason = "target_not_managed"

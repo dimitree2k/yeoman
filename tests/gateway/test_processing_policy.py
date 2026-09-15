@@ -496,6 +496,115 @@ def test_ambient_is_observed_without_a_reactive_turn(tmp_path: Path) -> None:
     store.close()
 
 
+def test_live_participation_ambient_has_no_legacy_answer_turn(tmp_path: Path) -> None:
+    """A live social cutover observes ambient input without opening a legacy turn."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        gate = _ambient_gate(store)
+        gate._participation_owns = lambda channel, chat_id: True  # noqa: SLF001
+        event = _event(mentioned_bot=False)
+        result = gate.admit(
+            IngestRequest(
+                event_key="whatsapp:chat@g.us:m1",
+                event_id="m1",
+                trace_id="cutover",
+                event=event,
+            )
+        )
+
+        assert result is not None
+        assert result.outcome is FastGateOutcome.OBSERVE
+        assert not result.ambient_candidate
+        assert result.assignment is None or result.assignment.turn_id is None
+        assert gate.admit_reply(event) is False
+    finally:
+        store.close()
+
+
+def test_live_participation_ambient_cutover_uses_bootstrap_ownership(
+    tmp_path: Path,
+) -> None:
+    """The composed gate uses the adapter's real processing admission, not a lambda."""
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.app.bootstrap import build_processing_gate
+    from yeoman_shared.config.schema import Config, ProcessingConfig
+
+    policy = PolicyConfig.model_validate(
+        {
+            "channels": {
+                "whatsapp": {
+                    "chats": {"chat@g.us": {"participation": {"enabled": True}}}
+                }
+            }
+        }
+    )
+    processing = ProcessingConfig.model_validate(
+        {
+            "enabled": True,
+            "chats": ["whatsapp:chat@g.us"],
+            "ambient_chats": ["whatsapp:chat@g.us"],
+            "ambient": {"min_seconds_between_answers": 0, "min_messages_since_answer": 0},
+            "participation": {"enabled": True, "shadow": False, "judgeRoute": "r"},
+        }
+    )
+    config = Config(processing=processing)
+    engine = PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"})
+    adapter = EnginePolicyAdapter(
+        engine=engine,
+        known_tools=set(),
+        policy_path=None,
+        workspace=tmp_path,
+        processing_config=processing,
+    )
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        gate = build_processing_gate(config, adapter, store)
+        assert gate is not None
+        event = _event(mentioned_bot=False)
+        result = gate.admit(
+            IngestRequest(
+                event_key="whatsapp:chat@g.us:m1",
+                event_id="m1",
+                trace_id="bootstrap-cutover",
+                event=event,
+            )
+        )
+
+        assert result is not None
+        assert result.outcome is FastGateOutcome.OBSERVE
+        assert not result.ambient_candidate
+        assert result.assignment is None or result.assignment.turn_id is None
+        assert gate.admit_reply(event) is False
+    finally:
+        store.close()
+
+
+def test_legacy_ambient_without_participation_cutover_keeps_judge_candidate(
+    tmp_path: Path,
+) -> None:
+    """Without a cutover, the existing ambient judge path still receives the candidate."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        gate = _ambient_gate(store)
+        event = _event(mentioned_bot=False)
+        result = gate.admit(
+            IngestRequest(
+                event_key="whatsapp:chat@g.us:m1",
+                event_id="m1",
+                trace_id="legacy",
+                event=event,
+            )
+        )
+
+        assert result is not None
+        assert result.outcome is FastGateOutcome.OBSERVE
+        assert result.ambient_candidate
+        assert result.assignment is None or result.assignment.turn_id is None
+        assert gate.is_ambient_pending(event.message_id)
+    finally:
+        store.close()
+
+
 def test_mention_creates_a_reactive_turn(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     gate = _gate(
@@ -512,6 +621,51 @@ def test_mention_creates_a_reactive_turn(tmp_path: Path) -> None:
     assert result is not None
     assert result.outcome is FastGateOutcome.REACT
     store.close()
+
+
+def test_live_cutover_keeps_a_direct_thread_continuation(tmp_path: Path) -> None:
+    """Ownership only redirects unaddressed social input, not a proven reply thread."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        gate = _ambient_gate(store)
+        gate._participation_owns = lambda channel, chat_id: True  # noqa: SLF001
+        first = _event(mentioned_bot=True)
+        initial = gate.admit(
+            IngestRequest(
+                event_key="whatsapp:chat@g.us:m1",
+                event_id="m1",
+                trace_id="direct",
+                event=first,
+            )
+        )
+        assert initial is not None and initial.assignment is not None
+        assert initial.assignment.turn_id is not None
+
+        continuation = InboundEvent(
+            channel="whatsapp",
+            chat_id="chat@g.us",
+            sender_id="sender@s.whatsapp.net",
+            content="follow-up",
+            message_id="m2",
+            is_group=True,
+            reply_to_message_id="m1",
+        )
+        result = gate.admit(
+            IngestRequest(
+                event_key="whatsapp:chat@g.us:m2",
+                event_id="m2",
+                trace_id="direct-continuation",
+                event=continuation,
+            )
+        )
+
+        assert result is not None
+        assert result.outcome is FastGateOutcome.REACT
+        assert result.assignment is not None
+        assert result.assignment.thread_id == initial.assignment.thread_id
+        assert result.assignment.turn_id is not None
+    finally:
+        store.close()
 
 
 def test_unmanaged_chat_is_not_touched_by_the_new_mode(tmp_path: Path) -> None:

@@ -264,15 +264,19 @@ class IngestGate:
         )
         reply_action = self._reply_action(request)
         ambient_candidate = False
-        if (
-            outcome is FastGateOutcome.REACT
-            and self._is_ambient_chat(event.channel, event.chat_id)
-            and not self._legacy_owner_stood_down(event.channel, event.chat_id)
+        if outcome is FastGateOutcome.REACT and self._ambient_rule_without_turn(
+            request, now=now
         ):
-            # An unaddressed message in a chat the owner released for ambient answers. Ask
-            # the thread engine what it *would* decide, without persisting anything: only
-            # the ambient fallback is subject to the brake, a real continuation is not.
-            if self._ambient_rule_without_turn(request, now=now):
+            if self._legacy_owner_stood_down(event.channel, event.chat_id):
+                # Participation is the sole production owner for social input. Keep the
+                # source as context for that lane, but never let the legacy answer path open
+                # a turn or become an ambient judge candidate.
+                outcome = FastGateOutcome.OBSERVE
+                self._mark_ambient_pending(request.event_id, now=now)
+            elif self._is_ambient_chat(event.channel, event.chat_id):
+                # An unaddressed message in a chat the owner released for ambient answers. Ask
+                # the thread engine what it *would* decide, without persisting anything: only
+                # the ambient fallback is subject to the brake, a real continuation is not.
                 # The judge decides *whether* this is worth a reply; the configured action
                 # only caps what may come out of its verdict. This branch therefore runs
                 # before the action withdraws the answer - otherwise `react` would
@@ -552,6 +556,12 @@ class IngestGate:
             trace_id=f"{event.channel}:{event.chat_id}:{message_id}",
             event=event,
         )
+        if self._legacy_owner_stood_down(event.channel, event.chat_id) and self._ambient_rule_without_turn(
+            request, now=self._clock()
+        ):
+            # A source observed by the live participation lane is context only. Do not let a
+            # later reconciliation call reopen it as a legacy ambient answer.
+            return None
         assignment = self._assign(request, now=self._clock(), allow_turn=True)
         if assignment is not None and assignment.thread_id and assignment.turn_id:
             logger.info(

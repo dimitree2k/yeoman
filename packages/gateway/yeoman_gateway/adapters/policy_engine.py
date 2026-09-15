@@ -28,7 +28,7 @@ from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.ports import PolicyPort
 from yeoman_gateway.policy.admin.service import PolicyAdminService
 from yeoman_gateway.policy.capabilities import policy_known_tools
-from yeoman_gateway.policy.engine import ActorContext, PolicyEngine
+from yeoman_gateway.policy.engine import ActorContext, ParticipationSnapshot, PolicyEngine
 from yeoman_gateway.policy.identity import normalize_sender_list, resolve_actor_identity
 from yeoman_gateway.policy.loader import load_policy, save_policy
 from yeoman_gateway.policy.schema import (
@@ -400,32 +400,54 @@ class EnginePolicyAdapter(PolicyPort):
     def participation_policy(self, channel: str, chat_id: str) -> bool:
         """Whether the participation lane owns this chat's social decisions.
 
-        True only for a valid activation: the global switch is on and the chat opted in.
-        The processing shadow set is deliberately not consulted here - processing shadow
-        forbids *live participation*, and in that case the new lane is not the production
-        owner either, so the legacy path keeps its existing behaviour.
+        True only for the canonical snapshot's valid live activation. Processing target
+        management and shadow state are part of that snapshot, so every caller uses the
+        same ownership matrix instead of independently inferring production ownership.
         """
+        snapshot = self.resolve_participation_snapshot(channel, chat_id)
+        return bool(snapshot is not None and snapshot.live)
+
+    def resolve_participation_snapshot(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        activation_epoch: int = 1,
+        policy_version: str | None = None,
+    ) -> ParticipationSnapshot | None:
+        """Resolve one activation snapshot using the real processing target state."""
         engine = self._engine
-        if engine is None:
-            return False
-        # Accept either the whole Config or a ProcessingConfig: the adapter is wired with
-        # the processing block, and reading one level too deep would silently disable the
-        # cutover.
         holder = self._processing_config
-        participation = getattr(holder, "participation", None)
-        if participation is None:
-            participation = getattr(getattr(holder, "processing", None), "participation", None)
-        if participation is None or not bool(getattr(participation, "enabled", False)):
-            return False
-        if bool(getattr(participation, "shadow", True)):
-            # Global shadow: nothing may produce effects in the new lane, so it is not a
-            # production owner and the legacy path stays exactly as it was.
-            return False
+        if holder is None:
+            return None
+        processing = getattr(holder, "processing", None) or holder
+        if engine is None or getattr(processing, "participation", None) is None:
+            return None
+        managed_checker = getattr(processing, "is_chat_enabled", None)
+        shadow_checker = getattr(processing, "is_chat_shadowed", None)
         try:
-            resolved = engine.resolve_participation(channel, chat_id)
+            managed = bool(managed_checker(channel, chat_id)) if managed_checker else False
+            processing_shadowed = (
+                bool(shadow_checker(channel, chat_id)) if shadow_checker else False
+            )
+            snapshot = engine.resolve_participation_snapshot(
+                channel,
+                chat_id,
+                processing_config=processing,
+                activation_epoch=int(activation_epoch),
+                policy_version=(
+                    str(policy_version)
+                    if policy_version is not None
+                    else str(self.policy_snapshot().version)
+                ),
+                managed=managed,
+                processing_shadowed=processing_shadowed,
+            )
         except Exception:
-            return False
-        return bool(getattr(resolved, "enabled", False))
+            return None
+        if not self.policy_snapshot().healthy:
+            return None
+        return snapshot
 
     def participation_pause_reason(self, channel: str, chat_id: str) -> str | None:
         """The owner's hard stop for autonomous participation in one chat, or ``None``.
