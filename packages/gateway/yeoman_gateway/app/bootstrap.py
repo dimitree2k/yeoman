@@ -356,6 +356,7 @@ class GatewayRuntime:
     speakup_log: object | None = None
     lull_observer: object | None = None
     opportunity_scheduler: object | None = None
+    participation_maintenance: object | None = None
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
     retention: object | None = None
@@ -400,6 +401,10 @@ class GatewayRuntime:
                 await self.lull_observer.start()
             if self.opportunity_scheduler is not None:
                 await self.opportunity_scheduler.start()
+            if self.participation_maintenance is not None:
+                maintenance_start = getattr(self.participation_maintenance, "start", None)
+                if maintenance_start is not None:
+                    await maintenance_start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
@@ -427,6 +432,10 @@ class GatewayRuntime:
             self.heartbeat.stop()
             if self.opportunity_scheduler is not None:
                 await self.opportunity_scheduler.stop()
+            if self.participation_maintenance is not None:
+                maintenance_stop = getattr(self.participation_maintenance, "stop", None)
+                if maintenance_stop is not None:
+                    await maintenance_stop()
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
                 self.lull_observer.stop()
             if self.consciousness is not None:
@@ -692,28 +701,154 @@ def _build_participation_runtime(
     config: Config,
     source_owner: object,
     log: object,
-) -> tuple[object | None, object | None]:
-    """Build the disabled-by-default opportunity scheduler.
+    policy_engine: object | None,
+    inbound_archive: object | None,
+    processing_store: object | None,
+    responder: object | None,
+    policy_adapter: object | None,
+) -> tuple[object | None, object | None, object | None]:
+    """Build the disabled-by-default participation runtime and scheduler.
 
-    Returns ``(runtime, scheduler)``. Both are ``None`` unless autonomy is enabled
-    globally: with the feature off, observers keep their legacy behaviour exactly and
-    nothing new is constructed. A missing route or store leaves the new path absent
-    rather than falling back to an unguarded one.
+    Returns ``(offer_runtime, scheduler, decision_runtime)``. All three are ``None``
+    unless autonomy is enabled globally: with the feature off, observers keep their
+    legacy behaviour exactly and nothing new is constructed. A missing route or store
+    leaves the new path absent rather than falling back to an unguarded one.
     """
     participation = getattr(config.processing, "participation", None)
     if participation is None or not bool(getattr(participation, "enabled", False)):
-        return None, None
+        return None, None, None
+    from yeoman_gateway.consciousness.delivery import (
+        DeliveryAnchorReader,
+        ParticipationReceiptReconciler,
+    )
     from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
-    from yeoman_gateway.consciousness.participation_runtime import ParticipationRuntime
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationRuntime as OpportunityOfferRuntime,
+    )
+    from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
+    from yeoman_gateway.processing.participation import ParticipationJudge
+    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+    from yeoman_gateway.processing.participation_runtime import (
+        ParticipationRuntime as ParticipationDecisionRuntime,
+    )
+
+    route_key = str(getattr(participation, "judge_route", "") or "").strip()
+    if not route_key:
+        logger.error("participation disabled: judgeRoute is required when it is enabled")
+        return None, None, None
+    try:
+        client = RouteClient(config=config, route_key=route_key)
+    except RouteUnavailableError as exc:
+        logger.error(
+            "participation disabled: route={} detail={}", route_key, str(exc)[:160]
+        )
+        return None, None, None
+    judge = ParticipationJudge(
+        client=client,
+        allowed_emojis=tuple(config.processing.reaction_emojis),
+        timeout_seconds=float(getattr(participation, "judge_timeout_seconds", 12.0)),
+        max_input_tokens=int(getattr(participation, "judge_max_input_tokens", 4000)),
+        max_output_tokens=int(getattr(participation, "judge_max_output_tokens", 256)),
+    )
+
+    anchors = (
+        DeliveryAnchorReader(log=log, store=processing_store)  # type: ignore[arg-type]
+        if processing_store is not None
+        else None
+    )
+
+    def _taste_hits(channel: str, chat_id: str) -> list[dict[str, object]]:
+        taste_reader = getattr(responder, "memory", None)
+        if taste_reader is None or not hasattr(taste_reader, "learned_chat_taste"):
+            return []
+        hits = taste_reader.learned_chat_taste(
+            channel=channel,
+            chat_id=chat_id,
+            limit=5,
+            require_meta={"provenance": "participation:v1"},
+        )
+        rendered: list[dict[str, object]] = []
+        for hit in hits:
+            entry = getattr(hit, "entry", None)
+            rendered.append(
+                {
+                    "content": str(getattr(entry, "content", "")),
+                    "provenance": "participation:v1",
+                    "confidence": getattr(entry, "confidence", None),
+                }
+            )
+        return rendered
+
+    context_builder = ParticipationContextBuilder(
+        archive=inbound_archive,
+        policy=policy_engine,
+        anchors=anchors,
+        taste=_taste_hits,
+    )
+
+    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+        persisted = int(log.activation_epoch_sync("participation"))  # type: ignore[attr-defined]
+        resolved = policy_engine.resolve_participation_snapshot(  # type: ignore[attr-defined]
+            channel,
+            chat_id,
+            processing_config=config.processing,
+            activation_epoch=persisted,
+            managed=True,
+        )
+        reaction_limit = int(resolved.participation.max_reactions_per_window)
+        comment_limit = int(resolved.participation.max_unsolicited_comments_per_window)
+        window_ms = int(resolved.participation.comment_window_minutes) * 60_000
+        return {
+            "enabled": resolved.enabled,
+            "opted_in": resolved.opted_in,
+            "invalid_reason": resolved.invalid_reason,
+            "activation_epoch": resolved.activation_epoch,
+            "lane": "shadow" if resolved.shadow else "production",
+            "judge_calls_per_hour": int(
+                resolved.participation.max_unaddressed_judge_calls_per_hour
+            ),
+            "min_gap_seconds": int(resolved.participation.min_unaddressed_judge_gap_seconds),
+            "continuation_reserve": int(resolved.participation.continuation_judge_reserve),
+            "reaction_limits": (("reaction", reaction_limit, window_ms),)
+            if reaction_limit > 0
+            else (),
+            "comment_limits": (("comment", comment_limit, window_ms),)
+            if comment_limit > 0
+            else (),
+            "payload_hash": "",
+        }
+
+    def _is_paused(channel: str, chat_id: str) -> str | None:
+        probe = getattr(policy_adapter, "participation_pause_reason", None)
+        if probe is None:
+            return None
+        return probe(channel, chat_id)
+
+    def _is_source_allowed(channel: str, chat_id: str, sources: object) -> bool:
+        del sources
+        if policy_engine is None:
+            return False
+        try:
+            resolved = policy_engine.resolve_policy(channel, chat_id)  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        return str(getattr(resolved, "when_to_reply_mode", "")) != "off"
+
+    submission = _ParticipationSubmission(responder=responder)
+    reactor = _ParticipationReactor(responder=responder)
+    decision_runtime = ParticipationDecisionRuntime(
+        judge=judge,
+        context_builder=context_builder,
+        ledger=log,
+        snapshot_provider=_snapshot,
+        is_paused=_is_paused,
+        is_source_allowed=_is_source_allowed,
+        submission=submission,
+        reactor=reactor,
+    )
 
     async def _handle(opportunity: object) -> None:
-        # The production handler is wired in the processing coordinator; until it is,
-        # the scheduler records the opportunity and produces no effect.
-        logger.info(
-            "participation_opportunity_admitted chat={} revision={}",
-            getattr(opportunity, "chat_id", "-"),
-            getattr(opportunity, "observed_revision", 0),
-        )
+        await decision_runtime.evaluate_participation(opportunity)  # type: ignore[arg-type]
 
     scheduler = OpportunityScheduler(
         handle=_handle,
@@ -723,12 +858,154 @@ def _build_participation_runtime(
         max_pending_source_bytes=int(getattr(participation, "max_pending_source_bytes", 16_384)),
         ttl_seconds=int(getattr(participation, "opportunity_ttl_seconds", 120)),
     )
-    runtime = ParticipationRuntime(
+    offer_runtime = OpportunityOfferRuntime(
         scheduler=scheduler,
         source_owner=source_owner,  # type: ignore[arg-type]
         activation_epoch=int(log.activation_epoch_sync("participation")),  # type: ignore[attr-defined]
     )
-    return runtime, scheduler
+    reconciler = (
+        ParticipationReceiptReconciler(log=log, store=processing_store)  # type: ignore[arg-type]
+        if processing_store is not None
+        else None
+    )
+    logger.info(
+        "participation runtime built route={} shadow={} pending_chats={} concurrency={}",
+        route_key,
+        bool(getattr(participation, "shadow", True)),
+        int(getattr(participation, "max_pending_chats", 64)),
+        int(getattr(participation, "max_concurrent_decisions", 2)),
+    )
+    return offer_runtime, scheduler, (decision_runtime, reconciler)
+
+
+class _ParticipationSubmission:
+    """Adapter from a selected comment to the draft-only generator and effect path."""
+
+    def __init__(self, *, responder: object | None) -> None:
+        self._responder = responder
+
+    async def generate_draft(
+        self, *, opportunity: object, decision: object, context: object
+    ) -> str | None:
+        generator = getattr(self._responder, "generate_participation_draft", None)
+        if generator is None:
+            return None
+        event, policy_decision = _participation_event(opportunity, decision)
+        return await generator(
+            event,
+            policy_decision,
+            purpose=str(getattr(decision, "purpose", "") or ""),
+            context=dict(context or {}),
+        )
+
+    async def submit(
+        self,
+        *,
+        admission: object,
+        effect_id: str,
+        content: str,
+        payload_hash: str,
+    ) -> object:
+        del payload_hash
+        submitter = getattr(self._responder, "submit_participation_comment", None)
+        if submitter is None:
+            return _ParticipationOutcome(status="no_submission_path")
+        return await submitter(
+            admission=admission, effect_id=effect_id, content=content
+        )
+
+
+class _ParticipationReactor:
+    """Adapter from a selected reaction to the existing reaction effect path."""
+
+    def __init__(self, *, responder: object | None) -> None:
+        self._responder = responder
+
+    async def __call__(
+        self,
+        *,
+        target_message_id: str,
+        emoji: str,
+        channel: str,
+        chat_id: str,
+        effect_id: str,
+    ) -> object | None:
+        reactor = getattr(self._responder, "react_to_participation", None)
+        if reactor is None:
+            return None
+        del effect_id
+        return await reactor(
+            target_message_id=target_message_id,
+            emoji=emoji,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ParticipationOutcome:
+    status: str
+
+
+def _participation_event(opportunity: object, decision: object) -> tuple[object, object]:
+    """Build the synthetic inbound event and policy decision for one draft.
+
+    The event carries the admitted target only: no task, thread or turn identity, and
+    its allowed tool set is empty. Direct requests never come through here.
+    """
+    from datetime import UTC, datetime
+
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+
+    channel = str(getattr(opportunity, "channel", ""))
+    chat_id = str(getattr(opportunity, "chat_id", ""))
+    event = InboundEvent(
+        channel=channel,
+        chat_id=chat_id,
+        sender_id="",
+        content=str(getattr(decision, "purpose", "") or ""),
+        timestamp=datetime.now(UTC),
+        is_group=str(chat_id).endswith("@g.us"),
+        raw_metadata={"participation": True, "opportunity_id": getattr(opportunity, "opportunity_id", "")},
+    )
+    policy_decision = PolicyDecision(
+        accept_message=False,
+        should_respond=False,
+        allowed_tools=frozenset(),
+        reason="participation_draft_only",
+        persona_text=None,
+    )
+    return event, policy_decision
+
+
+def _archive_feedback_reader(archive: object | None, reconciler: object | None):
+    """Exact quoted-reply/reaction lookup for one delivered provider message."""
+
+    def _lookup(*, channel: str, chat_id: str, message_id: str) -> dict[str, object] | None:
+        if archive is None or not message_id:
+            return None
+        try:
+            rows = archive.lookup_messages_in_range(  # type: ignore[attr-defined]
+                channel, chat_id, _far_past(), None, limit=50, latest=True
+            )
+        except Exception:
+            return None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            quoted = str(row.get("reply_to_message_id") or row.get("quoted_message_id") or "")
+            if quoted and quoted == str(message_id):
+                return {"kind": "reply", "event_id": str(row.get("message_id") or "")}
+        return None
+
+    del reconciler
+    return _lookup
+
+
+def _far_past():
+    from datetime import UTC, datetime
+
+    return datetime(2000, 1, 1, tzinfo=UTC)
 
 
 def _shared_fact_members(chat_registry: object | None):
@@ -1117,6 +1394,7 @@ def build_gateway_runtime(
         group_resolver=policy_adapter.resolve_whatsapp_group,
         model_router=model_router,
         routed_provider_factory=provider_factory.create_chat_provider,
+        service_effects=service_effects,
         tts=tts,
         whatsapp_tts_outgoing_dir=config.channels.whatsapp.media.outgoing_path,
         inbound_archive=inbound_archive,
@@ -2013,6 +2291,7 @@ def build_gateway_runtime(
     consciousness_service = None
     lull_observer = None
     opportunity_scheduler = None
+    participation_maintenance = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
         from yeoman_gateway.consciousness.burst import BurstObserver
@@ -2075,11 +2354,51 @@ def build_gateway_runtime(
             speakup_log=speakup_log,
         )
         source_owner = SourceOwner(store=speakup_log)
-        participation_runtime, opportunity_scheduler = _build_participation_runtime(
-            config=config,
-            source_owner=source_owner,
-            log=speakup_log,
+        participation_runtime, opportunity_scheduler, participation_decision = (
+            _build_participation_runtime(
+                config=config,
+                source_owner=source_owner,
+                log=speakup_log,
+                policy_engine=policy_engine,
+                inbound_archive=inbound_archive,
+                processing_store=processing_store,
+                responder=responder,
+                policy_adapter=policy_adapter,
+            )
         )
+        if isinstance(participation_decision, tuple):
+            _decision_runtime, _reconciler = participation_decision
+        else:
+            _decision_runtime, _reconciler = None, None
+        if _decision_runtime is not None:
+            attach = getattr(responder, "attach_participation", None)
+            if attach is not None:
+                attach(_decision_runtime)
+        if _reconciler is not None:
+            # Receipt reconciliation keeps running even when judging is disabled.
+            speakup_log.set_explicit_feedback_reader(
+                _archive_feedback_reader(inbound_archive, _reconciler)
+            )
+        participation_maintenance = None
+        maintenance_config = getattr(config.processing, "participation_maintenance", None)
+        if maintenance_config is not None and bool(
+            getattr(maintenance_config, "enabled", False)
+        ):
+            from yeoman_gateway.consciousness.participation_maintenance import (
+                ParticipationMaintenance,
+            )
+
+            participation_maintenance = ParticipationMaintenance(
+                ledger=speakup_log,
+                reconciler=_reconciler,
+                archive=inbound_archive,
+                classifier=None,
+                observation_window_minutes=int(
+                    getattr(maintenance_config, "observation_window_minutes", 120)
+                ),
+                batch_size=int(getattr(maintenance_config, "batch_size", 20)),
+                interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
+            )
 
         def _trigger(channel: str, chat_id: str, trigger: str) -> object:
             """Offer a bounded opportunity when autonomy applies, else legacy tick.
@@ -2159,6 +2478,7 @@ def build_gateway_runtime(
         speakup_log=speakup_log,
         lull_observer=lull_observer,
         opportunity_scheduler=opportunity_scheduler,
+        participation_maintenance=participation_maintenance,
         processing=processing_store,
         reconciliation=build_reconciliation_service(config, processing_store),
         retention=build_retention_service(config, processing_store),

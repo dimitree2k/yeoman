@@ -392,6 +392,14 @@ class _TalkativeCooldownState:
     cooldown_until: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class _ParticipationSubmitOutcome:
+    """Local submission outcome. Only a provider state counts as acceptance."""
+
+    status: str
+    receipt: object | None = None
+
+
 def _render_participation_transcript(context: dict[str, object], *, limit: int = 4000) -> str:
     """Render the trusted context as plain data lines for the draft prompt."""
     lines: list[str] = []
@@ -447,6 +455,7 @@ class LLMResponder(ResponderPort):
         group_resolver: "Callable[[str], tuple[str | None, str | None]] | None" = None,
         model_router: "ModelRouter | None" = None,
         routed_provider_factory: "Callable[[str, str | None], LLMProvider] | None" = None,
+        service_effects: object | None = None,
         tts: "TTSSynthesizer | None" = None,
         whatsapp_tts_outgoing_dir: Path | None = None,
         whatsapp_tts_max_raw_bytes: int = 160 * 1024,
@@ -508,6 +517,7 @@ class LLMResponder(ResponderPort):
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace, sessions_dir=workspace / "sessions")
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._service_effect_sender = service_effects
         self.tools = ToolRegistry()  # type: ignore[no-untyped-call]  # boundary-any
         subagent_model_to_use = subagent_model or self.model
         self.subagents = SubagentManager(
@@ -2849,6 +2859,66 @@ class LLMResponder(ResponderPort):
             session_history_limit=None,
             draft_only=True,
         )
+
+    async def submit_participation_comment(
+        self, *, admission: object, effect_id: str, content: str
+    ) -> object:
+        """Submit one already-reserved participation comment through managed delivery.
+
+        The participation ledger already owns the allowance and the idempotent effect
+        id; this call only performs the managed effect submission. A missing managed
+        path is reported as a non-success instead of falling back to raw outbound.
+        """
+        producer = self._service_effect_sender
+        if producer is None:
+            return _ParticipationSubmitOutcome(status="no_managed_path")
+        try:
+            receipt = await producer.send(
+                source="speakup",
+                operation_ref=f"participation:{effect_id}",
+                channel=str(getattr(admission, "channel", "")),
+                chat_id=str(getattr(admission, "chat_id", "")),
+                content=str(content),
+                effect_id=str(effect_id),
+                require_managed=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "participation_submission_failed error_type={}", type(exc).__name__
+            )
+            return _ParticipationSubmitOutcome(status="submission_failed")
+        state = str(getattr(receipt, "state", "") or "submitted")
+        return _ParticipationSubmitOutcome(status=state, receipt=receipt)
+
+    async def react_to_participation(
+        self,
+        *,
+        target_message_id: str,
+        emoji: str,
+        channel: str,
+        chat_id: str,
+    ) -> object | None:
+        """Submit one autonomous reaction through the managed reaction effect path."""
+        producer = self._service_effect_sender
+        if producer is None:
+            return None
+        sender = getattr(producer, "send_reaction", None)
+        if sender is None:
+            return None
+        try:
+            return await sender(
+                source="speakup",
+                operation_ref=f"participation-reaction:{target_message_id}",
+                channel=str(channel),
+                chat_id=str(chat_id),
+                message_id=str(target_message_id),
+                emoji=str(emoji),
+            )
+        except Exception as exc:
+            logger.warning(
+                "participation_reaction_failed error_type={}", type(exc).__name__
+            )
+            return None
 
     async def execute_delivery(
         self,

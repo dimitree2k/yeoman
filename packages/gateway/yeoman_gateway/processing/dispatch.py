@@ -482,6 +482,47 @@ class ServiceEffectProducer:
         self._bus = bus
         self._deadline_key = deadline_key
 
+    async def send_reaction(
+        self,
+        *,
+        source: str,
+        operation_ref: str,
+        channel: str,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+        effect_id: str | None = None,
+        require_managed: bool = False,
+    ) -> EffectReceipt:
+        """Submit one managed reaction effect and return its structured receipt.
+
+        A boolean "the router handled it" is never success evidence: the caller
+        receives the receipt, and only a ``sent`` state with a provider record counts
+        as transport acceptance (spec section 9).
+        """
+        if require_managed and not effect_id:
+            raise EffectNotDeliveredError("managed reaction effect requires a caller effect id")
+        if not self._router.manages(channel, chat_id):
+            raise EffectNotDeliveredError("target is not enabled for the managed effect path")
+        principal = SERVICE_PRINCIPALS.get(source)
+        if not principal:
+            raise EffectNotDeliveredError(
+                f"system source {source!r} has no registered service principal"
+            )
+        payload = ReactionPayload(message_id=str(message_id), emoji=str(emoji))
+        return await self._router.submit_message(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                metadata={"message_id": operation_ref, "service_source": source},
+            ),
+            principal=principal,
+            capability="send_reaction",
+            payload=payload,
+            effect_id=effect_id,
+        )
+
     async def send(
         self,
         *,

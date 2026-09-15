@@ -72,6 +72,7 @@ class ParticipationMaintenance:
         classifier: Any | None = None,
         observation_window_minutes: int = 120,
         batch_size: int = 20,
+        interval_seconds: int = 900,
         clock_ms: Any | None = None,
     ) -> None:
         self._ledger = ledger
@@ -81,6 +82,47 @@ class ParticipationMaintenance:
         self._window_ms = max(1, int(observation_window_minutes)) * 60_000
         self._batch_size = max(1, int(batch_size))
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
+        self._interval_seconds = max(1, int(interval_seconds))
+        self._running = False
+        self._task: Any | None = None
+
+    async def start(self) -> None:
+        """Run the bounded maintenance loop as its own task."""
+        if self._running:
+            return
+        import asyncio
+
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        import asyncio
+
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown path
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:
+        import asyncio
+
+        while self._running:
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - maintenance never crashes the gateway
+                logger.warning(
+                    "participation_maintenance_tick_failed error_type={}", type(exc).__name__
+                )
+            try:
+                await asyncio.sleep(self._interval_seconds)
+            except asyncio.CancelledError:
+                raise
 
     async def run_once(self, *, now_ms: int | None = None) -> MaintenanceReport:
         moment = int(now_ms if now_ms is not None else self._clock_ms())
