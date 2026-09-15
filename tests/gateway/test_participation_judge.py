@@ -440,3 +440,29 @@ async def test_ambient_adapter_maps_the_same_decision_and_fails_closed() -> None
     )
     verdict = await AmbientJudgeAdapter(judge=failing).decide("a question")
     assert verdict.action == "silence"
+
+
+@pytest.mark.asyncio
+async def test_silence_mislabelled_as_continuation_is_still_silence() -> None:
+    """A silent verdict with a stray intent label changes nothing and is accepted."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="silence", intent="continue", reason="nothing to add"
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context(anchors=[]))
+    assert decision.action == "silence"
+
+
+@pytest.mark.asyncio
+async def test_prompt_offers_only_coherent_intents() -> None:
+    from yeoman_gateway.processing.participation import _JudgeContext
+
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    # No delivered anchors and no trusted direct addressing: only "initiate" is offered.
+    await judge.decide(_opportunity(), _context(anchors=[], direct_addressed=False))
+    prompt = client.calls[0][1]["content"]
+    assert "Allowed intents for this opportunity: initiate" in prompt
+    assert "continue" not in prompt.split("Conversation context")[0].split("Allowed intents")[1]
+
+    with_anchor = _JudgeContext.from_mapping(_context())
+    assert "continue" in judge._allowed_intents(with_anchor)  # noqa: SLF001
