@@ -484,3 +484,306 @@ async def test_offer_of_many_duplicate_revisions_queues_once() -> None:
         release.set()
         await scheduler.stop()
     assert calls == 1
+
+
+# -- attempt limits and action-aware admission (03.2) ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attempts_are_charged_before_the_provider_and_never_refunded(
+    tmp_path,
+) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    assert await log.reserve_judge_attempt(
+        "o1:0",
+        opportunity_id="o1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_000,
+        hourly_limit=1,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    await log.record_judge_outcome("o1:0", outcome="timeout")
+    # A failed attempt is not refunded: it still occupies the hour.
+    assert not await log.reserve_judge_attempt(
+        "o2:0",
+        opportunity_id="o2",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=2_000,
+        hourly_limit=1,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_attempt_id_never_calls_the_provider_twice(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    args = dict(
+        opportunity_id="o1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_000,
+        hourly_limit=12,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    assert await log.reserve_judge_attempt("o1:0", **args)
+    assert not await log.reserve_judge_attempt("o1:0", **args)
+    rows = await log.judge_attempts_since(
+        channel="whatsapp", chat_id=CHAT, since_ms=0
+    )
+    assert len(rows) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reconsiderations_share_the_total_quota(tmp_path) -> None:
+    """A reconsideration inside the chain needs no new gap but does cost an attempt."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    args = dict(
+        opportunity_id="o1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        hourly_limit=2,
+        min_gap_ms=3_600_000,
+        continuation_candidate=True,
+        continuation_reserve=0,
+    )
+    assert await log.reserve_judge_attempt("o1:0", now_ms=1_000, **args)
+    # Inside the chain the minimum gap does not apply to the same opportunity.
+    assert await log.reserve_judge_attempt("o1:1", now_ms=1_100, **args)
+    assert not await log.reserve_judge_attempt("o1:2", now_ms=1_200, **args)
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_continuation_reserve_protects_related_candidates(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = dict(
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_000,
+        hourly_limit=4,
+        min_gap_ms=0,
+        continuation_reserve=2,
+    )
+    # Background initiation may use at most limit - reserve slots.
+    assert await log.reserve_judge_attempt(
+        "b1:0", opportunity_id="b1", continuation_candidate=False, **base
+    )
+    assert await log.reserve_judge_attempt(
+        "b2:0", opportunity_id="b2", continuation_candidate=False, **base
+    )
+    assert not await log.reserve_judge_attempt(
+        "b3:0", opportunity_id="b3", continuation_candidate=False, **base
+    )
+    # A related continuation still reaches the judge.
+    assert await log.reserve_judge_attempt(
+        "c1:0", opportunity_id="c1", continuation_candidate=True, **base
+    )
+    assert await log.reserve_judge_attempt(
+        "c2:0", opportunity_id="c2", continuation_candidate=True, **base
+    )
+    # The total cap still binds.
+    assert not await log.reserve_judge_attempt(
+        "c3:0", opportunity_id="c3", continuation_candidate=True, **base
+    )
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_limits_survive_restart(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    db_path = tmp_path / "speakups.db"
+    log = SpeakupLog(db_path)
+    assert await log.reserve_judge_attempt(
+        "o1:0",
+        opportunity_id="o1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_000,
+        hourly_limit=1,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    log.close()
+    reopened = SpeakupLog(db_path)
+    assert not await reopened.reserve_judge_attempt(
+        "o2:0",
+        opportunity_id="o2",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_500,
+        hourly_limit=1,
+        min_gap_ms=0,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_minimum_gap_applies_to_unrelated_attempts(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    base = dict(
+        channel="whatsapp",
+        chat_id=CHAT,
+        hourly_limit=12,
+        min_gap_ms=30_000,
+        continuation_candidate=False,
+        continuation_reserve=0,
+    )
+    assert await log.reserve_judge_attempt("o1:0", opportunity_id="o1", now_ms=1_000, **base)
+    assert not await log.reserve_judge_attempt(
+        "o2:0", opportunity_id="o2", now_ms=5_000, **base
+    )
+    assert await log.reserve_judge_attempt(
+        "o3:0", opportunity_id="o3", now_ms=40_000, **base
+    )
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_hourly_limit_denies_every_attempt(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    assert not await log.reserve_judge_attempt(
+        "o1:0",
+        opportunity_id="o1",
+        channel="whatsapp",
+        chat_id=CHAT,
+        now_ms=1_000,
+        hourly_limit=0,
+        min_gap_ms=0,
+        continuation_candidate=True,
+        continuation_reserve=0,
+    )
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_available_actions_shrink_with_budgets_but_never_lose_silence(
+    tmp_path,
+) -> None:
+    from pathlib import Path
+
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.tools import ConsciousnessTools
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.policy.schema import PolicyConfig
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    from tests.gateway.test_participation_delivery import (
+        GROUP,
+        _AllowSecurity,
+        _FakeMemory,
+    )
+
+    policy = PolicyConfig.model_validate(
+        {
+            "channels": {
+                "whatsapp": {
+                    "chats": {
+                        GROUP: {
+                            "participation": {
+                                "enabled": True,
+                                "maxReactionsPerWindow": 0,
+                                "maxUnsolicitedCommentsPerWindow": 1,
+                                "commentWindowMinutes": 30,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    tools = ConsciousnessTools(
+        config=Config(consciousness=ConsciousnessConfig(enabled=True)),
+        policy_engine=PolicyEngine(policy, workspace=tmp_path),
+        bus=MessageBus(),
+        log=log,
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=_FakeMemory(),
+        security=_AllowSecurity(),
+        approval_store=SpeakupApprovalStore(tmp_path / "approvals.json"),
+    )
+    actions = await tools.available_actions_for(
+        channel="whatsapp", chat_id=GROUP, now_ms=1_000
+    )
+    # A zero reaction cap disables reactions outright; silence always remains.
+    assert "react" not in actions
+    assert "comment" in actions
+    assert "silence" in actions
+
+    # Spend the single comment slot; the preflight then offers only silence.
+    assert await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="e1",
+        channel="whatsapp",
+        chat_id=GROUP,
+        now_ms=1_000,
+        limits=(("comment", 1, 30 * 60_000),),
+    )
+    exhausted = await tools.available_actions_for(
+        channel="whatsapp", chat_id=GROUP, now_ms=1_500
+    )
+    assert exhausted == ("silence",)
+    assert Path(tmp_path).exists()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_emoji_traffic_does_not_reset_the_comment_window(tmp_path) -> None:
+    """Human emoji traffic must not manufacture unlimited new exchanges."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    window_ms = 30 * 60_000
+    limits = (("comment", 2, window_ms),)
+    assert await log.reserve_delivery(
+        proposal_id="p1", effect_id="e1", channel="whatsapp", chat_id=CHAT,
+        now_ms=1_000, limits=limits,
+    )
+    async def fake_reaction_traffic() -> None:
+        # Inbound chat activity is not a reservation: it cannot reset the window.
+        return None
+
+    for tick in range(5):
+        await fake_reaction_traffic()
+        assert await log.consumed_slots(
+            channel="whatsapp", chat_id=CHAT, category="comment",
+            now_ms=1_000 + tick * 1_000, window_ms=window_ms,
+        ) == 1
+    assert await log.reserve_delivery(
+        proposal_id="p2", effect_id="e2", channel="whatsapp", chat_id=CHAT,
+        now_ms=2_000, limits=limits,
+    )
+    assert not await log.reserve_delivery(
+        proposal_id="p3", effect_id="e3", channel="whatsapp", chat_id=CHAT,
+        now_ms=3_000, limits=limits,
+    )
+    log.close()

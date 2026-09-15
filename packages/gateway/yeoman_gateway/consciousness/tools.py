@@ -837,24 +837,120 @@ class ConsciousnessTools:
     ) -> tuple[tuple[str, int, int, str], ...]:
         """Every capacity dimension one proposal must acquire before sending.
 
-        An unsolicited initiating comment consumes both initiation (UTC calendar
-        day) and comment (rolling window) capacity; a reaction consumes its own
-        dimension. Authority to *try* is enforced by the ledger transaction, so a
-        zero limit denies the action rather than silently skipping the check.
+        An unsolicited initiating comment consumes both initiation and comment
+        capacity; a reaction consumes its own dimension. Authority to *try* is
+        enforced by the ledger transaction, so a zero limit denies the action
+        rather than silently skipping the check.
         """
-        categories: list[str]
-        if proposal.action_type in {"reaction", "react"}:
-            categories = ["reaction"]
-        elif proposal.trigger in {"continuation", "reply"}:
-            categories = ["comment"]
-        else:
-            categories = ["initiation", "comment"]
+        categories = self._reservation_categories(proposal)
         limits: list[tuple[str, int, int, str]] = []
         for category in categories:
-            window_limit, window_ms = DEFAULT_PROPOSAL_RESERVATION_LIMITS[category]
-            window_kind = "calendar_day" if category == "initiation" else "rolling"
+            window_limit, window_ms, window_kind = self.participation_limits_for(
+                channel=proposal.channel,
+                chat_id=proposal.chat_id,
+                category=category,
+            )
             limits.append((category, window_limit, window_ms, window_kind))
         return tuple(limits)
+
+    @staticmethod
+    def _reservation_categories(proposal: SpeakupProposal) -> list[str]:
+        if proposal.action_type in {"reaction", "react"}:
+            return ["reaction"]
+        if proposal.trigger in {"continuation", "reply"}:
+            return ["comment"]
+        return ["initiation", "comment"]
+
+    def participation_limits_for(
+        self, *, channel: str, chat_id: str, category: str
+    ) -> tuple[int, int, str]:
+        """Effective reservation limits for one chat, from resolved policy.
+
+        The values come from the chat's participation policy; the module fallbacks
+        keep the legacy single-owner path working while participation is disabled.
+        """
+        try:
+            resolved = self.policy_engine.resolve_participation(channel, chat_id)
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            if category == "reaction":
+                return (
+                    int(resolved.max_reactions_per_window),
+                    int(resolved.comment_window_minutes) * 60_000,
+                    "rolling",
+                )
+            return (
+                int(resolved.max_unsolicited_comments_per_window),
+                int(resolved.comment_window_minutes) * 60_000,
+                "rolling",
+            )
+        fallback_limit, fallback_window = DEFAULT_PROPOSAL_RESERVATION_LIMITS[category]
+        window_kind = "calendar_day" if category == "initiation" else "rolling"
+        return (fallback_limit, fallback_window, window_kind)
+
+    async def available_actions_for(
+        self, *, channel: str, chat_id: str, now_ms: int
+    ) -> tuple[str, ...]:
+        """The action set the judge may choose from, after hard policy and budgets.
+
+        Silence is always possible. An action with zero remaining capacity is not
+        offered, so the provider is never asked a question whose answer is already
+        refused. This is a preflight, not an authorization: the ledger transaction
+        still decides at reservation time.
+        """
+        resolved = self.policy_engine.resolve_participation(channel, chat_id)
+        actions: list[str] = ["silence"]
+        if resolved.allow_reactions:
+            limit, window_ms, window_kind = self.participation_limits_for(
+                channel=channel, chat_id=chat_id, category="reaction"
+            )
+            if limit > 0 and await self._has_capacity(
+                channel=channel,
+                chat_id=chat_id,
+                category="reaction",
+                limit=limit,
+                window_ms=window_ms,
+                window_kind=window_kind,
+                now_ms=now_ms,
+            ):
+                actions.append("react")
+        if resolved.allow_continuation or resolved.allow_initiation:
+            limit, window_ms, window_kind = self.participation_limits_for(
+                channel=channel, chat_id=chat_id, category="comment"
+            )
+            if limit > 0 and await self._has_capacity(
+                channel=channel,
+                chat_id=chat_id,
+                category="comment",
+                limit=limit,
+                window_ms=window_ms,
+                window_kind=window_kind,
+                now_ms=now_ms,
+            ):
+                actions.append("comment")
+        return tuple(actions)
+
+    async def _has_capacity(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        category: str,
+        limit: int,
+        window_ms: int,
+        window_kind: str,
+        now_ms: int,
+    ) -> bool:
+        used = await self.log.consumed_slots(
+            channel=channel,
+            chat_id=chat_id,
+            category=category,
+            now_ms=now_ms,
+            window_ms=window_ms,
+            window_kind=window_kind,
+        )
+        return used < int(limit)
 
     async def _load_proposal(self, proposal_id: str) -> SpeakupProposal | None:
         """Rehydrate a proposal from durable storage (survives a restart).

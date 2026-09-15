@@ -578,18 +578,25 @@ class SpeakupLog:
                 # Background initiation may not consume the protected continuation slots.
                 return False
             if int(min_gap_ms) > 0:
-                last_row = conn.execute(
-                    """
-                    SELECT created_at_ms FROM judge_attempts
-                    WHERE channel = ? AND chat_id = ?
-                    ORDER BY created_at_ms DESC LIMIT 1
-                    """,
-                    (str(channel), str(chat_id)),
+                # A reconsideration inside the already admitted chain needs no new gap;
+                # it still pays an attempt from the same total quota.
+                same_chain = conn.execute(
+                    "SELECT 1 FROM judge_attempts WHERE opportunity_id = ? LIMIT 1",
+                    (str(opportunity_id),),
                 ).fetchone()
-                if last_row is not None:
-                    gap = int(now_ms) - int(last_row["created_at_ms"])
-                    if gap < int(min_gap_ms):
-                        return False
+                if same_chain is None:
+                    last_row = conn.execute(
+                        """
+                        SELECT created_at_ms FROM judge_attempts
+                        WHERE channel = ? AND chat_id = ?
+                        ORDER BY created_at_ms DESC LIMIT 1
+                        """,
+                        (str(channel), str(chat_id)),
+                    ).fetchone()
+                    if last_row is not None:
+                        gap = int(now_ms) - int(last_row["created_at_ms"])
+                        if gap < int(min_gap_ms):
+                            return False
             evaluation_index = 0
             head = attempt.rsplit(":", 1)
             if len(head) == 2 and head[1].isdigit():
