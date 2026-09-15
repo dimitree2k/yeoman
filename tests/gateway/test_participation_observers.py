@@ -22,6 +22,7 @@ from yeoman_gateway.processing.participation import ParticipationOpportunity
 from yeoman_shared.config.schema import Config, ConsciousnessConfig
 
 CHAT = "synthetic@g.us"
+OTHER = "other@g.us"
 
 #: The lull observer compares its clock against event timestamps, so the events are
 #: placed comfortably inside its activity window and before its silence threshold.
@@ -258,3 +259,86 @@ async def test_observer_offer_is_never_a_second_production_owner(tmp_path: Path)
         release.set()
         await scheduler.stop()
     log.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_ingress_admits_new_material_only(tmp_path: Path) -> None:
+    """Inbound messages reach the scheduler; our own output and tool traffic do not."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationIngress,
+        ParticipationRuntime,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    handled: list[str] = []
+    release = asyncio.Event()
+
+    async def handle(opportunity) -> None:
+        handled.append(opportunity.trigger)
+        await release.wait()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1, ttl_seconds=600)
+    await scheduler.start()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler, source_owner=owner, activation_epoch=1, is_enabled=lambda c, i: True
+    )
+    ingress = ParticipationIngress(runtime=runtime, ledger=log, is_active=lambda c, i: True)
+    try:
+        assert ingress.handle_event(_observed(100.0, message_id="m1")) is True
+        await asyncio.sleep(0.05)
+        assert handled == ["inbound"]
+        # A message with no durable identity, our own output, and tool traffic are all
+        # refused: none of them is new human material to consider.
+        assert ingress.handle_event(_observed(101.0, message_id="")) is False
+        assert (
+            ingress.handle_event(
+                InboundObservedEvent(
+                    channel="whatsapp",
+                    chat_id=CHAT,
+                    sender_id="arvid",
+                    content="our own message",
+                    timestamp=102.0,
+                    message_id="m2",
+                    is_group=True,
+                    metadata={"participation": True},
+                )
+            )
+            is False
+        )
+        assert (
+            ingress.handle_event(
+                InboundObservedEvent(
+                    channel="whatsapp",
+                    chat_id=CHAT,
+                    sender_id="arvid",
+                    content="tool traffic",
+                    timestamp=103.0,
+                    message_id="m3",
+                    is_group=True,
+                    metadata={"spawned_by_tool": True},
+                )
+            )
+            is False
+        )
+    finally:
+        release.set()
+        await scheduler.stop()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_ingress_revisions_are_durable_and_monotonic(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    first = log.next_source_revision_sync(channel="whatsapp", chat_id=CHAT)
+    second = log.next_source_revision_sync(channel="whatsapp", chat_id=CHAT)
+    other = log.next_source_revision_sync(channel="whatsapp", chat_id=OTHER)
+    assert (first, second, other) == (1, 2, 1)
+    log.close()
+    reopened = SpeakupLog(tmp_path / "speakups.db")
+    # A restart never hands out a smaller revision for the same chat.
+    assert reopened.next_source_revision_sync(channel="whatsapp", chat_id=CHAT) == 3
+    reopened.close()

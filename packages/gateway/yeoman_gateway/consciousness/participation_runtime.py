@@ -298,3 +298,74 @@ class ActivationEpochTracker:
 
     def current(self) -> int:
         return int(self._store.activation_epoch_sync(self._scope))  # type: ignore[attr-defined]
+
+
+class ParticipationIngress:
+    """Turns observed inbound messages into admitted opportunities.
+
+    The scheduling half of the trigger contract: burst and lull supply activity
+    *windows*, this supplies the new material inside them. It performs bounded local
+    work only - claim the sources, compute the durable revision, offer - and returns
+    without awaiting a judge, generator or transport.
+    """
+
+    def __init__(
+        self,
+        *,
+        runtime: ParticipationRuntime,
+        ledger: object,
+        is_active: Any | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._ledger = ledger
+        self._is_active = is_active or (lambda channel, chat_id: True)
+
+    def handle_event(self, event: object) -> bool:
+        """Offer one observed inbound message. Returns whether it was admitted."""
+        channel = str(getattr(event, "channel", "") or "").strip()
+        chat_id = str(getattr(event, "chat_id", "") or "").strip()
+        if not channel or not chat_id:
+            return False
+        if not self._is_active(channel, chat_id):
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("participation") or metadata.get("spawned_by_tool"):
+            # Our own output and tool-internal traffic are not new human material.
+            return False
+        principal = str(getattr(event, "sender_id", "") or "").strip()
+        if not principal:
+            return False
+        source_id = str(
+            getattr(event, "message_id", "") or metadata.get("message_id") or ""
+        ).strip()
+        if not source_id:
+            # Without a durable source identity there is nothing to admit later.
+            return False
+        revision = int(
+            self._ledger.next_source_revision_sync(  # type: ignore[attr-defined]
+                channel=channel, chat_id=chat_id
+            )
+        )
+        # Event timestamps come from the channel clock and may sit far from this
+        # process's clock; the opportunity's lifetime is measured locally, so an
+        # obviously unusable timestamp falls back to "now" instead of expiring the
+        # candidate at dequeue.
+        import time as _time
+
+        now_ms = int(_time.time() * 1000)
+        try:
+            created_ms = int(float(getattr(event, "timestamp", 0) or 0) * 1000) or now_ms
+        except (TypeError, ValueError):
+            created_ms = now_ms
+        if created_ms <= 0 or abs(now_ms - created_ms) > 86_400_000:
+            created_ms = now_ms
+        return self._runtime.offer_source(
+            channel=channel,
+            chat_id=chat_id,
+            source_event_ids=(source_id,),
+            observed_revision=revision,
+            trigger="inbound",
+            created_at_ms=created_ms,
+        )
