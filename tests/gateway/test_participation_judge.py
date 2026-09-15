@@ -511,3 +511,43 @@ def test_opportunity_identity_has_no_control_characters() -> None:
         source_event_ids=("m1",), observed_revision=1,
     )
     assert value.isprintable()
+
+
+@pytest.mark.asyncio
+async def test_silence_ignores_irrelevant_stray_fields() -> None:
+    """A correct "do not speak" decision is not discarded over an unused field."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="silence",
+        intent="continue",
+        contribution_type="cold_joke",
+        target_message_id="m-not-in-context",
+        anchor_message_id="anchor-not-in-context",
+        purpose="",
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context(anchors=[]))
+    assert decision.action == "silence"
+    assert decision.contribution_type is None
+    assert decision.target_message_id is None
+    assert decision.anchor_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_speaking_decisions_still_validate_every_relevant_field() -> None:
+    """The leniency stops at silence: anything that speaks is validated strictly."""
+    for payload_overrides, reason in (
+        ({"contribution_type": "cold_joke"}, "invalid_response"),
+        ({"target_message_id": "m-not-in-context"}, "unknown_evidence"),
+    ):
+        fields: dict[str, object] = {
+            "action": "comment",
+            "intent": "initiate",
+            "purpose": "x",
+            "contribution_type": "observation",
+        }
+        fields.update(payload_overrides)
+        judge = ParticipationJudge(
+            client=_Client(_payload(**fields)), allowed_emojis=(EMOJI,)
+        )
+        with pytest.raises(ParticipationDecisionError) as error:
+            await judge.decide(_opportunity(), _context())
+        assert error.value.reason == reason
