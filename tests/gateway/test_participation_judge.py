@@ -239,13 +239,13 @@ async def test_foreign_or_unknown_evidence_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_string_ids_do_not_stringify_into_trusted_ids() -> None:
+async def test_non_string_ids_never_stringify_into_trusted_ids() -> None:
+    """A non-string id is discarded, not coerced; the trusted default applies."""
     judge = ParticipationJudge(client=_Client(_payload(
         action="react", intent="continue", emoji=EMOJI, target_message_id=7
     )), allowed_emojis=(EMOJI,))
-    with pytest.raises(ParticipationDecisionError) as error:
-        await judge.decide(_opportunity(), _context())
-    assert error.value.reason == "missing_target"
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.target_message_id == "m2"  # the newest retained message, not "7"
 
 
 @pytest.mark.asyncio
@@ -593,3 +593,30 @@ async def test_model_can_still_name_a_specific_category() -> None:
         action="comment", intent="initiate", purpose="x", contribution_type="light_humor"
     )), allowed_emojis=(EMOJI,))
     assert (await judge.decide(_opportunity(), _context())).contribution_type == "light_humor"
+
+
+@pytest.mark.asyncio
+async def test_reaction_labelled_continue_is_still_a_gesture() -> None:
+    """A reaction anchors on its target message; it does not need an Arvid anchor."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="react", intent="continue", emoji=EMOJI, target_message_id="m2",
+        reason="brief thanks",
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context(anchors=[]))
+    assert decision.action == "react"
+    assert decision.target_message_id == "m2"
+
+
+@pytest.mark.asyncio
+async def test_comment_labelled_continue_still_requires_a_delivered_anchor() -> None:
+    """Prose that claims continuity must be grounded in something Arvid actually sent."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="continue", purpose="pick up the thread",
+        target_message_id="m2",
+    )), allowed_emojis=(EMOJI,))
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context(anchors=[]))
+    assert error.value.detail in {
+        "continuation_without_anchor",
+        "continuation_without_delivered_anchor",
+    }

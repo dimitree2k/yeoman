@@ -365,10 +365,12 @@ class ParticipationJudge:
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_supplied")
         if action == "react" and target is None:
             raise ParticipationDecisionError("missing_target")
-        if intent == "continue" and action != "silence":
-            # ``continue`` means social continuity with a delivered Arvid message. A
-            # silent verdict that mislabels its intent changes nothing observable, so
-            # it is accepted; anything that would speak must be grounded.
+        if intent == "continue" and action == "comment":
+            # Only *prose* acts on continuity: a comment that continues an exchange must
+            # be grounded in a delivered Arvid message. A reaction is a gesture anchored
+            # on the inbound message it targets - it does not need, and cannot use, a
+            # prior delivered statement - and a silent verdict changes nothing
+            # observable, so neither is discarded over this label.
             if anchor is None:
                 raise ParticipationDecisionError(
                     "missing_target", detail="continuation_without_anchor"
