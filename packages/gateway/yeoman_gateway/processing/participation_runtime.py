@@ -61,7 +61,12 @@ class SnapshotProvider(Protocol):
     """Resolves the effective participation snapshot for one exact target."""
 
     def __call__(
-        self, channel: str, chat_id: str, *, epoch: int
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        epoch: int,
+        opportunity: "ParticipationOpportunity | None" = None,
     ) -> Mapping[str, Any]: ...
 
 
@@ -141,6 +146,7 @@ class ParticipationRuntime:
                     opportunity.channel,
                     opportunity.chat_id,
                     epoch=int(opportunity.activation_epoch),
+                    opportunity=opportunity,
                 )
             )
         except ParticipationBlockedError as blocked:
