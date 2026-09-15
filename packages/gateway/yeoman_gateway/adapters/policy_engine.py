@@ -397,6 +397,36 @@ class EnginePolicyAdapter(PolicyPort):
             self._save_pause_state()
         return changed
 
+    def participation_policy(self, channel: str, chat_id: str) -> bool:
+        """Whether the participation lane owns this chat's social decisions.
+
+        True only for a valid activation: the global switch is on and the chat opted in.
+        The processing shadow set is deliberately not consulted here - processing shadow
+        forbids *live participation*, and in that case the new lane is not the production
+        owner either, so the legacy path keeps its existing behaviour.
+        """
+        engine = self._engine
+        if engine is None:
+            return False
+        # Accept either the whole Config or a ProcessingConfig: the adapter is wired with
+        # the processing block, and reading one level too deep would silently disable the
+        # cutover.
+        holder = self._processing_config
+        participation = getattr(holder, "participation", None)
+        if participation is None:
+            participation = getattr(getattr(holder, "processing", None), "participation", None)
+        if participation is None or not bool(getattr(participation, "enabled", False)):
+            return False
+        if bool(getattr(participation, "shadow", True)):
+            # Global shadow: nothing may produce effects in the new lane, so it is not a
+            # production owner and the legacy path stays exactly as it was.
+            return False
+        try:
+            resolved = engine.resolve_participation(channel, chat_id)
+        except Exception:
+            return False
+        return bool(getattr(resolved, "enabled", False))
+
     def participation_pause_reason(self, channel: str, chat_id: str) -> str | None:
         """The owner's hard stop for autonomous participation in one chat, or ``None``.
 

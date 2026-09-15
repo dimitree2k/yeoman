@@ -1230,6 +1230,11 @@ class ConsciousnessTools:
                     continue
                 if override.spontaneity is None or override.spontaneity.enabled is not True:
                     continue
+                if self._participation_owns(channel, chat_id):
+                    # The participation lane is this chat's production owner for social
+                    # decisions, so the independent full-draft planner stands down rather
+                    # than producing a second answer to the same material (spec 3.1).
+                    continue
                 resolved = self.policy_engine.resolve_policy(channel, chat_id)
                 if self._in_quiet_hours(
                     resolved.spontaneity_quiet_hours_start,
@@ -1266,6 +1271,23 @@ class ConsciousnessTools:
                     )
                 )
         return eligible
+
+    def _participation_owns(self, channel: str, chat_id: str) -> bool:
+        """Whether the participation lane owns this chat's social decisions.
+
+        Requires the global switch, the chat's explicit opt-in and a valid activation
+        candidate: a chat that merely opted in while participation is globally off keeps
+        its existing legacy behaviour. Any failure means "legacy keeps owning it", which
+        is the conservative direction.
+        """
+        participation = getattr(getattr(self.config, "processing", None), "participation", None)
+        if participation is None or not bool(getattr(participation, "enabled", False)):
+            return False
+        try:
+            resolved = self.policy_engine.resolve_participation(channel, chat_id)
+        except Exception:  # noqa: BLE001 - an unreadable policy must not silence legacy
+            return False
+        return bool(getattr(resolved, "enabled", False))
 
     def _explicit_chat_disabled(self, channel: str, chat_id: str) -> bool:
         channel_policy = self.policy_engine.policy.channels.get(channel)

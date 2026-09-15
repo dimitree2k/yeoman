@@ -615,3 +615,148 @@ def _admin_event(command: str, *, chat_id: str = OWNER, is_group: bool = False):
         message_id="m1",
         is_group=is_group,
     )
+
+
+# -- legacy production ownership stands down for an activated chat (spec 3.1) ---------
+
+
+def _activation_engine(*, shadow: bool, opted_in: bool = True):
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_shared.config.schema import ProcessingConfig
+
+    policy = PolicyConfig.model_validate(
+        {
+            "channels": {
+                "whatsapp": {
+                    "chats": {
+                        GROUP: {"participation": {"enabled": opted_in}},
+                        OTHER_GROUP: {},
+                    }
+                }
+            }
+        }
+    )
+    engine = PolicyEngine(policy, workspace=Path("/tmp"))
+    config = ProcessingConfig.model_validate(
+        {
+            "participation": {
+                "enabled": True,
+                "shadow": shadow,
+                "judgeRoute": "participation.judge",
+            }
+        }
+    )
+    return engine, config
+
+
+@pytest.mark.parametrize(
+    "shadow,opted_in,expected",
+    [
+        (False, True, True),    # live activation: the new lane owns it
+        (True, True, False),    # global shadow produces no effects: legacy stays
+        (False, False, False),  # chat did not opt in
+    ],
+)
+def test_participation_ownership_requires_a_valid_live_activation(
+    tmp_path: Path, shadow: bool, opted_in: bool, expected: bool
+) -> None:
+    """The legacy ambient planner stands down only for a fully valid live activation."""
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+
+    engine, config = _activation_engine(shadow=shadow, opted_in=opted_in)
+    adapter = EnginePolicyAdapter(
+        engine=engine,
+        known_tools=set(),
+        policy_path=None,
+        workspace=tmp_path,
+        processing_config=config,
+    )
+    assert adapter.participation_policy("whatsapp", GROUP) is expected
+    # A chat that did not opt in is never owned, whatever the global switch says.
+    assert adapter.participation_policy("whatsapp", OTHER_GROUP) is False
+
+
+def test_ingest_gate_stands_down_only_for_an_owned_chat(tmp_path: Path) -> None:
+    """The ambient brake must not run as a second opinion for an owned chat."""
+    from yeoman_gateway.processing.policy import IngestGate
+
+    owned: list[tuple[str, str]] = []
+    gate = IngestGate(
+        config=type("C", (), {"enabled": True})(),
+        store=None,
+        snapshots=lambda: {},
+        evaluate=lambda request: None,
+        participation=lambda channel, chat_id: (channel, chat_id) in owned,
+    )
+    assert gate._legacy_owner_stood_down("whatsapp", GROUP) is False  # noqa: SLF001
+    owned.append(("whatsapp", GROUP))
+    assert gate._legacy_owner_stood_down("whatsapp", GROUP) is True  # noqa: SLF001
+    assert gate._legacy_owner_stood_down("whatsapp", "other@g.us") is False  # noqa: SLF001
+
+
+def test_ingest_gate_keeps_legacy_answering_when_the_check_breaks(tmp_path: Path) -> None:
+    """A broken ownership check must not silence the legacy path."""
+    from yeoman_gateway.processing.policy import IngestGate
+
+    def _boom(channel: str, chat_id: str) -> bool:
+        raise RuntimeError("policy engine unavailable")
+
+    gate = IngestGate(
+        config=type("C", (), {"enabled": True})(),
+        store=None,
+        snapshots=lambda: {},
+        evaluate=lambda request: None,
+        participation=_boom,
+    )
+    assert gate._legacy_owner_stood_down("whatsapp", GROUP) is False  # noqa: SLF001
+
+
+def test_consciousness_planner_skips_an_owned_chat(tmp_path: Path) -> None:
+    """The independent full-draft planner is not a second production owner."""
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.tools import ConsciousnessTools
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_shared.config.schema import Config, ConsciousnessConfig
+
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": [OWNER]},
+            "channels": {
+                "whatsapp": {
+                    "chats": {
+                        OWNER: {"spontaneity": {"enabled": True, "profile": "helpful"}},
+                        GROUP: {
+                            "whoCanTalk": {"mode": "everyone"},
+                            "spontaneity": {"enabled": True, "profile": "balanced"},
+                            "participation": {"enabled": True},
+                        },
+                    }
+                }
+            },
+        }
+    )
+    config = Config(
+        consciousness=ConsciousnessConfig.model_validate(
+            {"enabled": True, "ownerDmDefaultEnabled": True, "defaultDailyCap": 3}
+        )
+    )
+    from yeoman_shared.config.schema import ProcessingConfig
+
+    config.processing = ProcessingConfig.model_validate(
+        {"participation": {"enabled": True, "shadow": False, "judgeRoute": "r"}}
+    )
+    tools = ConsciousnessTools(
+        config=config,
+        policy_engine=PolicyEngine(policy, workspace=tmp_path),
+        bus=MessageBus(),
+        log=SpeakupLog(tmp_path / "speakups.db"),
+        inbound_archive=InboundArchive(tmp_path / "inbound.db"),
+        memory=None,
+        security=None,
+    )
+    eligible = {chat.chat_id for chat in tools._eligible_chats()}  # noqa: SLF001
+    assert GROUP not in eligible                      # owned by the participation lane
+    assert OWNER in eligible or eligible == {OWNER}   # legacy scope keeps working
+    tools.log.close()

@@ -170,6 +170,7 @@ class IngestGate:
         evaluate: Callable[[IngestRequest], PolicyDecision],
         threads: Any = None,
         clock: Callable[[], int] | None = None,
+        participation: Callable[[str, str], bool] | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -177,6 +178,10 @@ class IngestGate:
         self._evaluate = evaluate
         self._threads = threads
         self._clock = clock or _now_ms
+        #: True for a chat the participation lane owns in production. The legacy ambient
+        #: brake is not a second opinion for those chats: exactly one production owner may
+        #: decide, so the legacy path stands down (spec section 3.1).
+        self._participation_owns = participation
         #: Ambient brake state, per chat: when the last unaddressed answer went out and how
         #: much the chat has moved since. In memory on purpose - after a restart the brake
         #: simply starts cold, which is the conservative direction.
@@ -259,7 +264,11 @@ class IngestGate:
         )
         reply_action = self._reply_action(request)
         ambient_candidate = False
-        if outcome is FastGateOutcome.REACT and self._is_ambient_chat(event.channel, event.chat_id):
+        if (
+            outcome is FastGateOutcome.REACT
+            and self._is_ambient_chat(event.channel, event.chat_id)
+            and not self._legacy_owner_stood_down(event.channel, event.chat_id)
+        ):
             # An unaddressed message in a chat the owner released for ambient answers. Ask
             # the thread engine what it *would* decide, without persisting anything: only
             # the ambient fallback is subject to the brake, a real continuation is not.
@@ -383,6 +392,21 @@ class IngestGate:
         return self._reply_action_for(channel, chat_id)
 
     # -- ambient brake ---------------------------------------------------------------
+
+    def _legacy_owner_stood_down(self, channel: str, chat_id: str) -> bool:
+        """Whether the participation lane owns this chat's social decisions.
+
+        Only the social (unaddressed) legacy path stands down here. Direct requests,
+        commands, access checks and every hard policy restriction keep working exactly
+        as before - the participation lane owns *participation*, nothing else.
+        """
+        if self._participation_owns is None:
+            return False
+        try:
+            return bool(self._participation_owns(channel, chat_id))
+        except Exception:  # noqa: BLE001 - a broken check must not disable legacy answering
+            logger.warning("participation ownership check failed chat={}", str(chat_id)[:24])
+            return False
 
     def _ambient_settings(self) -> Any:
         return getattr(self._config, "ambient", None)
