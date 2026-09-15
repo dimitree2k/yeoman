@@ -986,14 +986,40 @@ class MemoryService:
         channel: str,
         chat_id: str,
         limit: int = 5,
+        require_meta: dict[str, object] | None = None,
     ) -> list[MemoryHit]:
-        """Return tactical proactive speakup taste learned for one chat."""
-        return self.recent_chat_preferences(
+        """Return tactical proactive speakup taste learned for one chat.
+
+        ``require_meta`` filters on owned metadata keys: the participation lane asks
+        for entries that carry its provenance, so an unverified historical pattern is
+        never served as authoritative new guidance. Old records stay intact and are
+        simply not selected.
+        """
+        hits = self.recent_chat_preferences(
             channel=channel,
             chat_id=chat_id,
-            limit=limit,
+            limit=max(1, int(limit)) * 4 if require_meta else limit,
             content_prefix="Proactive speakup taste pattern:",
         )
+        if not require_meta:
+            return hits[: max(1, int(limit))]
+        filtered: list[MemoryHit] = []
+        for hit in hits:
+            meta = self._entry_meta(hit.entry)
+            if all(meta.get(str(key)) == value for key, value in require_meta.items()):
+                filtered.append(hit)
+            if len(filtered) >= max(1, int(limit)):
+                break
+        return filtered
+
+    @staticmethod
+    def _entry_meta(entry: object) -> dict[str, object]:
+        raw = getattr(entry, "meta_json", "{}")
+        try:
+            parsed = json.loads(str(raw or "{}"))
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _rank_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:
         if not hits:
@@ -1350,6 +1376,7 @@ class MemoryService:
         sensitivity: str | None = None,
         disclosure_mode: str | None = None,
         subjects: list[str] | str | None = None,
+        extra_meta: dict[str, object] | None = None,
     ) -> tuple[MemoryEntry, bool]:
         sector_map = {
             "preference": "semantic",
@@ -1366,6 +1393,16 @@ class MemoryService:
             scope_key = self.global_scope_key()
         now_iso = datetime.now(UTC).isoformat()
         compact = self._normalize_content(text)
+        meta = metadata_to_json_dict(
+            topics=topics,
+            sensitivity=sensitivity,
+            disclosure_mode=disclosure_mode,
+            subjects=subjects,
+        )
+        for key, value in (extra_meta or {}).items():
+            # Machine-readable provenance travels in the owned metadata field, never
+            # hidden inside user-facing prose.
+            meta[str(key)] = value
         entry = MemoryEntry(
             id="",
             workspace_id=self.workspace_id,
@@ -1384,15 +1421,7 @@ class MemoryService:
             source="manual",
             source_message_id=source_message_id,
             source_role="user",
-            meta_json=json.dumps(
-                metadata_to_json_dict(
-                    topics=topics,
-                    sensitivity=sensitivity,
-                    disclosure_mode=disclosure_mode,
-                    subjects=subjects,
-                ),
-                ensure_ascii=False,
-            ),
+            meta_json=json.dumps(meta, ensure_ascii=False),
             created_at=now_iso,
             updated_at=now_iso,
             valid_from=now_iso,
