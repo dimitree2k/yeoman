@@ -367,6 +367,26 @@ class SpeakupLog:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS source_claims (
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    claim_key TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    lane TEXT NOT NULL DEFAULT 'production',
+                    activation_epoch INTEGER NOT NULL,
+                    claimed_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (channel, chat_id, claim_key)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_source_claims_owner
+                ON source_claims(channel, chat_id, owner, claimed_at_ms)
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS activation_state (
                     scope TEXT PRIMARY KEY,
                     activation_epoch INTEGER NOT NULL DEFAULT 1,
@@ -643,6 +663,135 @@ class SpeakupLog:
                 (str(channel), str(chat_id), int(since_ms)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def next_chat_revision_sync(self, *, channel: str, chat_id: str) -> int:
+        """Monotonic per-chat revision for a new trigger (never a wall-clock value).
+
+        The revision is derived from the durable identity of what has already been
+        recorded for the chat, so a restart cannot hand out a smaller number and a
+        clock change cannot invent a newer revision.
+        """
+        with self._write() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM source_claims
+                WHERE channel = ? AND chat_id = ? AND lane = 'production'
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            claims = int(row["c"] if row else 0)
+            disposition_row = conn.execute(
+                """
+                SELECT COALESCE(MAX(observed_revision), 0) AS r FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ?
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            considered = int(disposition_row["r"] if disposition_row else 0)
+        return max(claims, considered) + 1
+
+    def activation_epoch_sync(self, scope: str = "participation") -> int:
+        """Synchronous read of the persisted activation epoch (schema-safe)."""
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT activation_epoch FROM activation_state WHERE scope = ?",
+                (str(scope),),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO activation_state (scope, activation_epoch, updated_at_ms)
+                    VALUES (?, 1, CAST(strftime('%s','now') AS INTEGER) * 1000)
+                    """,
+                    (str(scope),),
+                )
+                return 1
+            return int(row["activation_epoch"])
+
+    def claim_source_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        source_event_id: str,
+        activation_epoch: int,
+        lane: str,
+        owner: str,
+        now_ms: int,
+    ) -> tuple[bool, str]:
+        """Claim one source for one owner. The first claim wins, across restarts.
+
+        The ledger key is the chat plus the source identity. A source the legacy path
+        already produced can never be replayed by the participation lane, even after
+        a later activation epoch - that is what makes a cutover safe rather than
+        merely ordered.
+        """
+        key = str(source_event_id)
+        if str(lane) == "shadow":
+            # Shadow is a separate observational lane: it must never consume a
+            # production source id, so it claims under its own namespace.
+            key = f"shadow:{key}"
+        with self._write() as conn:
+            row = conn.execute(
+                """
+                SELECT owner FROM source_claims
+                WHERE channel = ? AND chat_id = ? AND claim_key = ?
+                """,
+                (str(channel), str(chat_id), key),
+            ).fetchone()
+            if row is not None:
+                # Second value is informational: a repeated claim by the same owner is
+                # granted but is not a new claim.
+                return (False, str(row["owner"]))
+            conn.execute(
+                """
+                INSERT INTO source_claims (
+                    channel, chat_id, claim_key, owner, lane, activation_epoch, claimed_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(channel),
+                    str(chat_id),
+                    key,
+                    str(owner),
+                    str(lane),
+                    int(activation_epoch),
+                    int(now_ms),
+                ),
+            )
+        return True, str(owner)
+
+    async def source_claims(
+        self, *, channel: str, chat_id: str, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM source_claims
+                WHERE channel = ? AND chat_id = ?
+                ORDER BY claimed_at_ms ASC, claim_key ASC
+                LIMIT ?
+                """,
+                (str(channel), str(chat_id), max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def release_source_claims(
+        self, *, channel: str, chat_id: str, owner: str | None = None
+    ) -> int:
+        """Drop claims for rollback preparation. Never used to replay old sources."""
+        with self._write() as conn:
+            if owner is None:
+                cursor = conn.execute(
+                    "DELETE FROM source_claims WHERE channel = ? AND chat_id = ?",
+                    (str(channel), str(chat_id)),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM source_claims WHERE channel = ? AND chat_id = ? AND owner = ?",
+                    (str(channel), str(chat_id), str(owner)),
+                )
+        return int(cursor.rowcount or 0)
 
     async def record_approval_claim(
         self,

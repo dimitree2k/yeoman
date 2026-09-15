@@ -202,8 +202,17 @@ class ConsciousnessAgent:
                 "standalone thought, callback, or fun fact, but do not pretend an old "
                 "message is the current thread."
             )
-        profile = str(chat.get("profile") or "").strip()
-        profile_rules = self._profile_rules(profile)
+        # Use the profile of the *selected* target, never the loop variable of an
+        # earlier pass: a multi-chat run must not mix one chat's profile into another
+        # chat's prompt (A26).
+        selected_profile = ""
+        for candidate in eligible:
+            if str(candidate.get("chat_id") or "") == chat_id and str(
+                candidate.get("channel") or ""
+            ) == str(channel):
+                selected_profile = str(candidate.get("profile") or "").strip()
+                break
+        profile_rules = self._profile_rules(selected_profile)
         return json.dumps(
             {
                 "instruction": (

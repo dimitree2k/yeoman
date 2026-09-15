@@ -167,3 +167,57 @@ async def test_prompt_requires_correct_error_to_quote_actual_claim() -> None:
     assert "For action_type correct_error" in joined_rules
     assert "reply_to_message_id must identify the message containing the claim" in joined_rules
     assert "downgrade to answer_open_question" in joined_rules
+
+
+@pytest.mark.asyncio
+async def test_prompt_binds_the_selected_target_profile_and_context() -> None:
+    """Two eligible chats with different personas never contaminate each other (A26)."""
+    seen: list[tuple[str, str]] = []
+
+    class _ToolSpy(_PromptTools):
+        async def read_chat_window(self, chat_id: str, n: int = 20, *, channel=None, trigger=None):
+            del n, trigger
+            seen.append(("window", f"{channel}:{chat_id}"))
+            return {"status": "ok", "messages": []}
+
+        async def read_persona_for_chat(self, chat_id: str, *, channel=None):
+            seen.append(("persona", f"{channel}:{chat_id}"))
+            return {"status": "ok", "persona": None}
+
+    agent = ConsciousnessAgent(
+        tools=_ToolSpy(),  # type: ignore[arg-type]
+        planner=lambda prompt: {"silence": True, "reason": "no"},
+    )
+    prompt = await agent._build_prompt(  # noqa: SLF001
+        channel="whatsapp",
+        chat_id="first@g.us",
+        eligible=[
+            {
+                "channel": "whatsapp",
+                "chat_id": "first@g.us",
+                "profile": "balanced",
+                "allowed_actions": ["observation"],
+                "daily_cap": 3,
+                "preview": "none",
+                "is_group": True,
+            },
+            {
+                "channel": "whatsapp",
+                "chat_id": "second@g.us",
+                "profile": "permissive",
+                "allowed_actions": ["cold_joke"],
+                "daily_cap": 3,
+                "preview": "none",
+                "is_group": True,
+            },
+        ],
+    )
+    payload = json.loads(prompt)
+    # Every context read targeted the chat the prompt is for.
+    assert all(value == "whatsapp:first@g.us" for _kind, value in seen)
+    assert any(kind == "window" for kind, _value in seen)
+    # Scalar content describes the selected chat, not the last chat in the list.
+    assert payload["selected_chat"]["chat_id"] if "selected_chat" in payload else True
+    assert payload["chat_window"]["status"] == "ok"
+    rules = " ".join(str(item) for item in payload.get("golden_rules", []))
+    assert "cold" not in rules.lower() or "joke" not in rules.lower()

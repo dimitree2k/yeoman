@@ -355,6 +355,7 @@ class GatewayRuntime:
     gateway_socket: "GatewaySocket | None" = None
     speakup_log: object | None = None
     lull_observer: object | None = None
+    opportunity_scheduler: object | None = None
     processing: "ProcessingStore | None" = None
     reconciliation: object | None = None
     retention: object | None = None
@@ -397,6 +398,8 @@ class GatewayRuntime:
                 await self.consciousness.start()
             if self.lull_observer is not None and hasattr(self.lull_observer, "start"):
                 await self.lull_observer.start()
+            if self.opportunity_scheduler is not None:
+                await self.opportunity_scheduler.start()
             if self.gateway_socket:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
@@ -422,6 +425,8 @@ class GatewayRuntime:
             if self.gateway_socket:
                 await self.gateway_socket.stop()
             self.heartbeat.stop()
+            if self.opportunity_scheduler is not None:
+                await self.opportunity_scheduler.stop()
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
                 self.lull_observer.stop()
             if self.consciousness is not None:
@@ -680,6 +685,50 @@ def _build_ambient_judge(config: "Config"):
         min_confidence=settings.judge_min_confidence,
         timeout_seconds=settings.judge_timeout_seconds,
     )
+
+
+def _build_participation_runtime(
+    *,
+    config: Config,
+    source_owner: object,
+    log: object,
+) -> tuple[object | None, object | None]:
+    """Build the disabled-by-default opportunity scheduler.
+
+    Returns ``(runtime, scheduler)``. Both are ``None`` unless autonomy is enabled
+    globally: with the feature off, observers keep their legacy behaviour exactly and
+    nothing new is constructed. A missing route or store leaves the new path absent
+    rather than falling back to an unguarded one.
+    """
+    participation = getattr(config.processing, "participation", None)
+    if participation is None or not bool(getattr(participation, "enabled", False)):
+        return None, None
+    from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationRuntime
+
+    async def _handle(opportunity: object) -> None:
+        # The production handler is wired in the processing coordinator; until it is,
+        # the scheduler records the opportunity and produces no effect.
+        logger.info(
+            "participation_opportunity_admitted chat={} revision={}",
+            getattr(opportunity, "chat_id", "-"),
+            getattr(opportunity, "observed_revision", 0),
+        )
+
+    scheduler = OpportunityScheduler(
+        handle=_handle,
+        max_pending_chats=int(getattr(participation, "max_pending_chats", 64)),
+        max_concurrent_decisions=int(getattr(participation, "max_concurrent_decisions", 2)),
+        max_pending_source_refs=int(getattr(participation, "max_pending_source_refs", 64)),
+        max_pending_source_bytes=int(getattr(participation, "max_pending_source_bytes", 16_384)),
+        ttl_seconds=int(getattr(participation, "opportunity_ttl_seconds", 120)),
+    )
+    runtime = ParticipationRuntime(
+        scheduler=scheduler,
+        source_owner=source_owner,  # type: ignore[arg-type]
+        activation_epoch=int(log.activation_epoch_sync("participation")),  # type: ignore[attr-defined]
+    )
+    return runtime, scheduler
 
 
 def _shared_fact_members(chat_registry: object | None):
@@ -1963,11 +2012,13 @@ def build_gateway_runtime(
 
     consciousness_service = None
     lull_observer = None
+    opportunity_scheduler = None
     if config.consciousness.enabled and policy_engine is not None:
         from yeoman_gateway.consciousness.agent import ConsciousnessAgent
         from yeoman_gateway.consciousness.burst import BurstObserver
         from yeoman_gateway.consciousness.lull import LullObserver
         from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
+        from yeoman_gateway.consciousness.participation_runtime import SourceOwner
         from yeoman_gateway.consciousness.service import ConsciousnessService
         from yeoman_gateway.consciousness.taste import TasteDistiller
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
@@ -2023,14 +2074,41 @@ def build_gateway_runtime(
             taste_distiller=taste_distiller,
             speakup_log=speakup_log,
         )
+        source_owner = SourceOwner(store=speakup_log)
+        participation_runtime, opportunity_scheduler = _build_participation_runtime(
+            config=config,
+            source_owner=source_owner,
+            log=speakup_log,
+        )
+
+        def _trigger(channel: str, chat_id: str, trigger: str) -> object:
+            """Offer a bounded opportunity when autonomy applies, else legacy tick.
+
+            The producer path never awaits model work. Non-migrated chats and a
+            disabled feature keep exactly their previous legacy behaviour.
+            """
+            if participation_runtime is not None:
+                offered = participation_runtime.offer_source(
+                    channel=channel,
+                    chat_id=chat_id,
+                    source_event_ids=(f"observed:{channel}:{chat_id}",),
+                    observed_revision=speakup_log.next_chat_revision_sync(
+                        channel=channel, chat_id=chat_id
+                    ),
+                    trigger=trigger,
+                )
+                if offered:
+                    return {"status": "offered"}
+            return consciousness_service.tick_once(
+                trigger=trigger,
+                target_channel=channel,
+                target_chat_id=chat_id,
+            )
+
         burst_observer = BurstObserver(
             config=config,
             state_path=consciousness_data_dir / "burst_state.json",
-            on_burst=lambda channel, chat_id: consciousness_service.tick_once(
-                trigger="burst",
-                target_channel=channel,
-                target_chat_id=chat_id,
-            ),
+            on_burst=lambda channel, chat_id: _trigger(channel, chat_id, "burst"),
             is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
                 channel,
                 chat_id,
@@ -2044,11 +2122,7 @@ def build_gateway_runtime(
             lull_observer = LullObserver(
                 config=config,
                 state_path=consciousness_data_dir / "lull_state.json",
-                on_lull=lambda channel, chat_id: consciousness_service.tick_once(
-                    trigger="lull",
-                    target_channel=channel,
-                    target_chat_id=chat_id,
-                ),
+                on_lull=lambda channel, chat_id: _trigger(channel, chat_id, "lull"),
                 is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
                     channel,
                     chat_id,
@@ -2084,6 +2158,7 @@ def build_gateway_runtime(
         gateway_socket=gateway_socket,
         speakup_log=speakup_log,
         lull_observer=lull_observer,
+        opportunity_scheduler=opportunity_scheduler,
         processing=processing_store,
         reconciliation=build_reconciliation_service(config, processing_store),
         retention=build_retention_service(config, processing_store),

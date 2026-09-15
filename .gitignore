@@ -54,6 +54,7 @@ tests/gateway/*
 !tests/gateway/test_participation_maintenance.py
 !tests/gateway/test_participation_policy.py
 !tests/gateway/test_participation_scheduling.py
+!tests/gateway/test_participation_observers.py
 !tests/gateway/fixtures/participation_scenarios.json
 !tests/gateway/test_v1_only_runtime.py
 !tests/gateway/test_lazy_document_media.py
