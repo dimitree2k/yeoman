@@ -332,3 +332,76 @@ async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) 
     assert await rt["log"].pending_delivery_reservations() == []
     rt["log"].close()
     rt["store"].close()
+
+
+# -- the real participant-authorization predicate (found broken by the live probe) ------
+
+
+def _pilot_engine(tmp_path: Path):
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.policy.schema import PolicyConfig
+
+    policy = PolicyConfig.model_validate(
+        {
+            "channels": {
+                CHANNEL: {
+                    "chats": {
+                        CHAT: {
+                            "whoCanTalk": {"mode": "everyone"},
+                            "whenToReply": {"mode": "all"},
+                            "participation": {"enabled": True},
+                        },
+                        "closed@g.us": {
+                            "whoCanTalk": {"mode": "allowlist", "senders": ["vip@s.whatsapp.net"]},
+                            "participation": {"enabled": True},
+                        },
+                    }
+                }
+            }
+        }
+    )
+    return PolicyEngine(policy, workspace=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "chat,sender,allowed",
+    [
+        (CHAT, "anna@s.whatsapp.net", True),
+        (CHAT, "ben@s.whatsapp.net", True),
+        ("closed@g.us", "vip@s.whatsapp.net", True),
+        ("closed@g.us", "stranger@s.whatsapp.net", False),
+    ],
+)
+def test_participant_is_allowed_matches_real_policy(
+    tmp_path: Path, chat: str, sender: str, allowed: bool
+) -> None:
+    """The live predicate must call the policy engine correctly and fail closed."""
+    from yeoman_gateway.app.bootstrap import participant_is_allowed
+
+    engine = _pilot_engine(tmp_path)
+    assert (
+        participant_is_allowed(engine=engine, channel=CHANNEL, chat_id=chat, sender=sender)
+        is allowed
+    )
+
+
+def test_participant_is_allowed_fails_closed_on_a_broken_check(tmp_path: Path) -> None:
+    from yeoman_gateway.app.bootstrap import participant_is_allowed
+
+    class _Broken:
+        def evaluate(self, *args, **kwargs):
+            raise RuntimeError("engine unavailable")
+
+    assert (
+        participant_is_allowed(
+            engine=_Broken(), channel=CHANNEL, chat_id=CHAT, sender="anna@s.whatsapp.net"
+        )
+        is False
+    )
+    assert (
+        participant_is_allowed(engine=None, channel=CHANNEL, chat_id=CHAT, sender="anna@x") is False
+    )
+    assert (
+        participant_is_allowed(engine=_pilot_engine(tmp_path), channel=CHANNEL, chat_id=CHAT, sender="")
+        is False
+    )
