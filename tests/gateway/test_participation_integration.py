@@ -574,7 +574,11 @@ async def test_unsolicited_generation_has_no_executable_tools(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_private_records_never_enter_the_participation_context(tmp_path: Path) -> None:
     """Owner/contact/other-channel records stay out of judge and generator input (A39)."""
-    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+    from yeoman_gateway.processing.participation_context import (
+        ParticipationContextBounds,
+        ParticipationContextBuilder,
+        ParticipationDecisionInputs,
+    )
     from yeoman_gateway.storage.inbound_archive import InboundArchive
 
     archive = InboundArchive(tmp_path / "inbound.db")
@@ -611,8 +615,24 @@ async def test_private_records_never_enter_the_participation_context(tmp_path: P
     builder = ParticipationContextBuilder(
         archive=archive,
         policy=PolicyEngine(_policy(), workspace=tmp_path),
+        source_authorizer=lambda row: True,
     )
-    context = await builder.build(_opportunity("group-1"), now_ms=NOW_MS)
+    context = await builder.build(
+        _opportunity("group-1"),
+        inputs=ParticipationDecisionInputs(
+            snapshot={},
+            bounds=ParticipationContextBounds(),
+            allowed_actions=("silence",),
+            allowed_intents=frozenset(("initiate",)),
+            remaining_budgets=(),
+            reservation_limits_by_intent=(),
+            approval_required=False,
+            arbitration_revision=0,
+            current_source_ids=("group-1",),
+            continuation_candidate=False,
+        ),
+        now_ms=NOW_MS,
+    )
     rendered = json.dumps(context)
     assert "private owner note" not in rendered
     assert "same chat id, other channel" not in rendered

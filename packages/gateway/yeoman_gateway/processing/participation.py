@@ -53,6 +53,9 @@ DECISION_ERROR_REASONS: tuple[str, ...] = (
     "unknown_evidence",
     "context_too_large",
     "missing_target",
+    "source_unavailable",
+    "source_expired",
+    "source_not_authorized",
 )
 
 #: Actions the judge may choose, in the model's own vocabulary.
@@ -355,14 +358,19 @@ class ParticipationJudge:
         anchor = _bounded_id(payload.get("anchor_message_id")) if speaks else None
         target = _bounded_id(payload.get("target_message_id")) if speaks else None
         if speaks and target is None and action == "react":
-            # Trusted default: a reaction with no explicit target replies to the newest
-            # material in this opportunity, the same convention the rest of the gateway
-            # uses for an unaddressed reply. The model still cannot name a recipient.
-            target = view.newest_message_id
+            # Trusted default: only the newest current source is targetable. Older
+            # optional history must never become a silent reaction target.
+            target = view.newest_current_source_id
         if anchor is not None and anchor not in view.anchor_ids:
             raise ParticipationDecisionError("unknown_evidence", detail="anchor_not_supplied")
         if target is not None and target not in view.message_ids:
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_supplied")
+        if (
+            target is not None
+            and view.has_current_source_ids
+            and target not in view.current_source_ids
+        ):
+            raise ParticipationDecisionError("unknown_evidence", detail="target_not_current")
         if action == "react" and target is None:
             raise ParticipationDecisionError("missing_target")
         if intent == "continue" and action == "comment":
@@ -427,6 +435,9 @@ class _JudgeContext:
     allowed_actions: tuple[str, ...]
     allowed_contribution_types: frozenset[str]
     newest_message_id: str | None
+    newest_current_source_id: str | None
+    current_source_ids: frozenset[str]
+    has_current_source_ids: bool
     guidance: str
     direct_addressed: bool
     allows_continuation: bool
@@ -445,14 +456,12 @@ class _JudgeContext:
 
         evidence: set[str] = set()
         message_ids: set[str] = set()
-        ordered_ids: list[str] = []
         lines: list[str] = []
         for item in messages:
             event_id = str(item.get("event_id") or item.get("message_id") or "").strip()
             if event_id:
                 evidence.add(event_id)
                 message_ids.add(event_id)
-                ordered_ids.append(event_id)
             sender = str(item.get("sender") or item.get("speaker") or "?").strip() or "?"
             text = str(item.get("text") or "").strip()
             media = str(item.get("media_summary") or "").strip()
@@ -460,6 +469,15 @@ class _JudgeContext:
             # The id is labelled explicitly: a bare bracketed prefix invites the model
             # to copy the brackets into evidence_ids, which then fails validation.
             lines.append(f'id="{event_id or "?"}" from={sender}: {body}')
+        raw_current_ids = context.get("current_source_ids")
+        if raw_current_ids is None:
+            raw_current_ids = context.get("source_event_ids")
+        has_current_source_ids = isinstance(raw_current_ids, (list, tuple, set, frozenset))
+        current_source_ids = frozenset(
+            str(item).strip()
+            for item in (raw_current_ids if has_current_source_ids else ())
+            if str(item).strip()
+        )
         anchor_ids: set[str] = set()
         for item in anchors:
             provider_id = str(item.get("provider_message_id") or "").strip()
@@ -478,6 +496,24 @@ class _JudgeContext:
             for item in (context.get("allowed_actions") or ("silence",))
             if str(item).strip() in {"silence", "react", "comment"}
         ) or ("silence",)
+        current_rows = [
+            item for item in messages if str(item.get("event_id") or item.get("message_id") or "").strip()
+            in current_source_ids
+        ]
+        target_rows = current_rows if has_current_source_ids else messages
+        newest_current_source_id = (
+            max(target_rows, key=_message_sort_key).get("event_id")
+            or max(target_rows, key=_message_sort_key).get("message_id")
+            if target_rows
+            else None
+        )
+        newest_message_id = (
+            str(max(messages, key=_message_sort_key).get("event_id")
+                or max(messages, key=_message_sort_key).get("message_id")
+            ).strip()
+            if messages
+            else None
+        )
         contribution_types = frozenset(
             str(item).strip()
             for item in (context.get("allowed_contribution_types") or ())
@@ -486,7 +522,12 @@ class _JudgeContext:
         return cls(
             evidence_ids=frozenset(evidence),
             message_ids=frozenset(message_ids),
-            newest_message_id=(ordered_ids[-1] if ordered_ids else None),
+            newest_message_id=newest_message_id,
+            newest_current_source_id=(
+                str(newest_current_source_id).strip() if newest_current_source_id else None
+            ),
+            current_source_ids=current_source_ids,
+            has_current_source_ids=has_current_source_ids,
             anchor_ids=frozenset(anchor_ids),
             allowed_actions=allowed_actions,
             allowed_contribution_types=contribution_types,
@@ -498,6 +539,15 @@ class _JudgeContext:
 
     def render(self) -> str:
         return self.rendered
+
+
+def _message_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:
+    timestamp = message.get("timestamp")
+    try:
+        value = float(timestamp) if timestamp is not None else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    return value, str(message.get("event_id") or message.get("message_id") or "")
 
 
 def _bounded_id(value: Any) -> str | None:

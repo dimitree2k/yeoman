@@ -567,6 +567,26 @@ async def test_reaction_without_an_explicit_target_replies_to_the_newest_message
 
 
 @pytest.mark.asyncio
+async def test_reaction_default_uses_newest_current_source_not_history_position() -> None:
+    """A current source id prevents stale optional history becoming the target."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="react", intent="initiate", emoji=EMOJI, target_message_id=None
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(
+        _opportunity(),
+        _context(
+            messages=[
+                {"event_id": "new", "sender": "anna", "text": "new", "timestamp": 3},
+                {"event_id": "old", "sender": "anna", "text": "old", "timestamp": 1},
+                {"event_id": "middle", "sender": "anna", "text": "middle", "timestamp": 2},
+            ],
+            current_source_ids=["new"],
+        ),
+    )
+    assert decision.target_message_id == "new"
+
+
+@pytest.mark.asyncio
 async def test_comment_without_a_category_defaults_to_observation() -> None:
     judge = ParticipationJudge(client=_Client(_payload(
         action="comment", intent="initiate", purpose="answer briefly", contribution_type=None
