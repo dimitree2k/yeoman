@@ -786,8 +786,21 @@ def _build_participation_runtime(
         taste=_taste_hits,
     )
 
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    epoch_tracker = ActivationEpochTracker(store=log)
+
     def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
-        persisted = int(log.activation_epoch_sync("participation"))  # type: ignore[attr-defined]
+        # An activation-affecting change (enable/disable, shadow/live, judge route)
+        # advances the persisted epoch here, so stale unsubmitted work is fenced out
+        # without ever advancing the epoch merely because the process restarted.
+        persisted = epoch_tracker.observe(
+            channel=channel,
+            chat_id=chat_id,
+            enabled=bool(getattr(participation, "enabled", False)),
+            shadow=bool(getattr(participation, "shadow", True)),
+            judge_route=str(getattr(participation, "judge_route", "") or ""),
+        )
         resolved = policy_engine.resolve_participation_snapshot(  # type: ignore[attr-defined]
             channel,
             chat_id,

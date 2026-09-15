@@ -787,3 +787,242 @@ async def test_emoji_traffic_does_not_reset_the_comment_window(tmp_path) -> None
         now_ms=3_000, limits=limits,
     )
     log.close()
+
+
+# -- exclusive source ownership and cutover (03.3, A36) --------------------------------
+
+
+def _source_owner(tmp_path):
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import SourceOwner
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    return SourceOwner(store=log), log
+
+
+def test_one_production_owner_per_source_across_epochs(tmp_path) -> None:
+    """The same source can never start both producers, before or after cutover."""
+    from yeoman_gateway.consciousness.participation_runtime import (
+        OWNER_LEGACY,
+        OWNER_PARTICIPATION,
+    )
+
+    owner, log = _source_owner(tmp_path)
+    legacy = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner=OWNER_LEGACY,
+    )
+    assert legacy.granted is True
+    # A later epoch does not hand the retained source to the new lane.
+    participation = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=2,
+        owner=OWNER_PARTICIPATION,
+    )
+    assert participation.granted is False
+    assert participation.reason == "owned_by_other"
+    assert participation.is_legacy is True
+    log.close()
+
+
+def test_claim_is_idempotent_for_the_same_owner_and_survives_restart(tmp_path) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        OWNER_PARTICIPATION,
+        SourceOwner,
+    )
+
+    db_path = tmp_path / "speakups.db"
+    log = SpeakupLog(db_path)
+    owner = SourceOwner(store=log)
+    first = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner=OWNER_PARTICIPATION,
+    )
+    again = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner=OWNER_PARTICIPATION,
+    )
+    assert first.granted and again.granted and again.reason == "already_owned"
+    log.close()
+
+    reopened = SpeakupLog(db_path)
+    restarted = SourceOwner(store=reopened)
+    duplicate = restarted.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=3,
+        owner=OWNER_PARTICIPATION,
+    )
+    assert duplicate.granted is True and duplicate.reason == "already_owned"
+    reopened.close()
+
+
+def test_shadow_lane_never_consumes_a_production_source_id(tmp_path) -> None:
+    from yeoman_gateway.consciousness.participation_runtime import (
+        LANE_SHADOW,
+        OWNER_LEGACY,
+        OWNER_PARTICIPATION,
+    )
+
+    owner, log = _source_owner(tmp_path)
+    shadow = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner=OWNER_PARTICIPATION,
+        lane=LANE_SHADOW,
+    )
+    assert shadow.granted is True
+    # The production lane still owns the same source independently.
+    production = owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m1",
+        activation_epoch=1,
+        owner=OWNER_LEGACY,
+    )
+    assert production.granted is True
+    log.close()
+
+
+def test_missing_source_id_is_never_claimed(tmp_path) -> None:
+    owner, log = _source_owner(tmp_path)
+    decision = owner.claim(
+        channel="whatsapp", chat_id=CHAT, source_event_id="   ", activation_epoch=1, owner="legacy"
+    )
+    assert decision.granted is False
+    assert decision.reason == "missing_source_id"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_offer_is_bounded_local_work(tmp_path) -> None:
+    """The observer-facing entry point claims, offers and returns."""
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationRuntime
+
+    owner, log = _source_owner(tmp_path)
+    handled: list[tuple[str, ...]] = []
+    release = asyncio.Event()
+
+    async def handle(opportunity):
+        handled.append(tuple(opportunity.source_event_ids))
+        await release.wait()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1)
+    await scheduler.start()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler, source_owner=owner, activation_epoch=1
+    )
+    try:
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m1",),
+            observed_revision=1,
+            trigger="burst",
+        )
+        # Replaying the same sources from another trigger yields no second evaluation.
+        assert (
+            runtime.offer_source(
+                channel="whatsapp",
+                chat_id=CHAT,
+                source_event_ids=("m1",),
+                observed_revision=1,
+                trigger="lull",
+            )
+            is False
+        )
+    finally:
+        release.set()
+        await scheduler.stop()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_refuses_when_the_chat_is_not_enabled(tmp_path) -> None:
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationRuntime
+
+    owner, log = _source_owner(tmp_path)
+
+    async def handle(opportunity):
+        raise AssertionError("must not run")
+
+    scheduler = OpportunityScheduler(handle=handle)
+    await scheduler.start()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler,
+        source_owner=owner,
+        activation_epoch=1,
+        is_enabled=lambda channel, chat_id: False,
+    )
+    try:
+        assert (
+            runtime.offer_source(
+                channel="whatsapp",
+                chat_id=CHAT,
+                source_event_ids=("m1",),
+                observed_revision=1,
+                trigger="inbound",
+            )
+            is False
+        )
+    finally:
+        await scheduler.stop()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_epoch_advances_only_on_real_transitions(tmp_path) -> None:
+    """A restart keeps the epoch; enable/shadow/route changes advance it (02.1/02.3)."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    tracker = ActivationEpochTracker(store=log)
+
+    first = tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+    )
+    assert first == 1
+    # The same inputs are not a transition, however often they are observed.
+    again = tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+    )
+    assert again == 1
+    # Leaving shadow is a transition.
+    live = tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=False, judge_route="r"
+    )
+    assert live == 2
+    # Disabling is a transition; re-enabling advances again.
+    off = tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=False, shadow=False, judge_route="r"
+    )
+    assert off == 3
+    back = tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+    )
+    assert back == 4
+    # A restart is not a transition: a fresh tracker seeing the same inputs keeps it.
+    restarted = ActivationEpochTracker(store=log)
+    assert (
+        restarted.observe(
+            channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+        )
+        == 4
+    )
+    log.close()

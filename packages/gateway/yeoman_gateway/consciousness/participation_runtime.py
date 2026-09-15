@@ -232,3 +232,69 @@ __all__ = [
     "ParticipationRuntime",
     "SourceOwner",
 ]
+
+
+#: Inputs whose change is an activation transition (spec section 3.1).
+ACTIVATION_INPUTS: tuple[str, ...] = ("enabled", "shadow", "judge_route")
+
+
+def activation_fingerprint(
+    *, enabled: bool, shadow: bool, judge_route: str
+) -> str:
+    """Stable fingerprint of the activation-affecting settings."""
+    return "|".join(
+        [f"enabled={bool(enabled)}", f"shadow={bool(shadow)}", f"route={str(judge_route)}"]
+    )
+
+
+class ActivationEpochTracker:
+    """Advances the persisted activation epoch when activation settings change.
+
+    The epoch is the fence that makes stale workers harmless: it advances on
+    enable/disable, shadow/live transitions and activation-affecting reloads, is
+    persisted so a restart preserves it, and is never advanced just because the
+    process restarted (spec section 3.1).
+    """
+
+    def __init__(self, *, store: object, scope: str = "participation") -> None:
+        self._store = store
+        self._scope = str(scope)
+        self._last: dict[str, str] = {}
+
+    def observe(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        enabled: bool,
+        shadow: bool,
+        judge_route: str,
+        now_ms: int | None = None,
+    ) -> int:
+        """Record the current activation inputs and advance the epoch on change."""
+        key = f"{channel}:{chat_id}"
+        fingerprint = activation_fingerprint(
+            enabled=enabled, shadow=shadow, judge_route=judge_route
+        )
+        previous = self._last.get(key)
+        self._last[key] = fingerprint
+        current = int(self._store.activation_epoch_sync(self._scope))  # type: ignore[attr-defined]
+        if previous is None or previous == fingerprint:
+            return current
+        advanced = int(
+            self._store.advance_activation_epoch_sync(  # type: ignore[attr-defined]
+                self._scope
+            )
+        )
+        logger.info(
+            "participation activation epoch advanced chat={} previous={} current={} change={}->{}",
+            chat_id,
+            current,
+            advanced,
+            previous,
+            fingerprint,
+        )
+        return advanced
+
+    def current(self) -> int:
+        return int(self._store.activation_epoch_sync(self._scope))  # type: ignore[attr-defined]

@@ -1385,6 +1385,13 @@ class SpeakupLog:
     async def advance_activation_epoch(
         self, scope: str = "participation", *, now_ms: int | None = None
     ) -> int:
+        """Async wrapper around :meth:`advance_activation_epoch_sync`."""
+        return self.advance_activation_epoch_sync(scope, now_ms=now_ms)
+
+    def advance_activation_epoch_sync(
+        self, scope: str = "participation", *, now_ms: int | None = None
+    ) -> int:
+        """Atomically advance the persisted activation epoch and return the new value."""
         ts = int(now_ms if now_ms is not None else time.time() * 1000)
         with self._write() as conn:
             conn.execute(

@@ -2869,11 +2869,11 @@ class LLMResponder(ResponderPort):
         id; this call only performs the managed effect submission. A missing managed
         path is reported as a non-success instead of falling back to raw outbound.
         """
-        producer = self._service_effect_sender
-        if producer is None:
+        send = getattr(self._service_effect_sender, "send", None)
+        if send is None:
             return _ParticipationSubmitOutcome(status="no_managed_path")
         try:
-            receipt = await producer.send(
+            receipt = await send(
                 source="speakup",
                 operation_ref=f"participation:{effect_id}",
                 channel=str(getattr(admission, "channel", "")),
@@ -2899,10 +2899,7 @@ class LLMResponder(ResponderPort):
         chat_id: str,
     ) -> object | None:
         """Submit one autonomous reaction through the managed reaction effect path."""
-        producer = self._service_effect_sender
-        if producer is None:
-            return None
-        sender = getattr(producer, "send_reaction", None)
+        sender = getattr(self._service_effect_sender, "send_reaction", None)
         if sender is None:
             return None
         try:
