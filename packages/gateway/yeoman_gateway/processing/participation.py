@@ -136,6 +136,17 @@ class ParticipationOpportunity:
     created_at_ms: int
     lane: str = "production"
 
+    def __post_init__(self) -> None:
+        """Revisions and epochs are durable integers, not strings or floats.
+
+        They are identity inputs for the opportunity hash, so a sloppy value would
+        silently create a second identity for the same material.
+        """
+        for name in ("observed_revision", "activation_epoch", "created_at_ms"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"ParticipationOpportunity.{name} must be a non-negative int")
+
 
 @dataclass(frozen=True, slots=True)
 class ParticipationDecision:
