@@ -397,6 +397,15 @@ class EnginePolicyAdapter(PolicyPort):
             self._save_pause_state()
         return changed
 
+    def participation_pause_reason(self, channel: str, chat_id: str) -> str | None:
+        """The owner's hard stop for autonomous participation in one chat, or ``None``.
+
+        This is the string reason (``paused_global``/``paused_chat``), not a boolean,
+        so logs and inspection can say *why* an effect was suppressed. Off/pause is a
+        hard veto for autonomous effects; it never blocks owner commands.
+        """
+        return self._pause_reason_for_chat(channel, chat_id)
+
     def _pause_reason_for_chat(self, channel: str, chat_id: str) -> str | None:
         now = self._now_ms()
         changed = self._prune_expired_pauses(persist=False, now_ms=now)
