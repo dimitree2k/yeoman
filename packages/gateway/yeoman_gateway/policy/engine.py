@@ -12,6 +12,8 @@ from yeoman_gateway.policy.schema import (
     ChatPolicy,
     ChatPolicyOverride,
     MemoryNotesMode,
+    ParticipationPolicy,
+    ParticipationPolicyOverride,
     PolicyConfig,
 )
 
@@ -116,6 +118,99 @@ class EffectivePolicy:
     spontaneity_quiet_hours_end: str | None
     contacts_disclosure: bool
     session_history_limit: int | None
+    participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
+
+
+#: Per-chat participation settings and the layer each value came from.
+_PARTICIPATION_FIELDS: tuple[str, ...] = (
+    "enabled",
+    "guidance",
+    "allow_initiation",
+    "allow_continuation",
+    "allow_reactions",
+    "max_unaddressed_judge_calls_per_hour",
+    "continuation_judge_reserve",
+    "min_unaddressed_judge_gap_seconds",
+    "max_unsolicited_comments_per_window",
+    "comment_window_minutes",
+    "max_reactions_per_window",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ParticipationSnapshot:
+    """One resolved participation configuration for one target (spec section 6.1).
+
+    This is the single consumer-facing snapshot for admission, bootstrap and
+    inspection: policy values, global resource limits, the activation epoch and the
+    origin layer of every policy value. ``live`` is the runtime permission derived
+    from the feature switch, the workspace shadow switch and the per-chat opt-in;
+    it is never inferred from a model output.
+    """
+
+    channel: str
+    chat_id: str
+    enabled: bool
+    shadow: bool
+    judge_route: str
+    judge_timeout_seconds: float
+    judge_max_input_tokens: int
+    judge_max_output_tokens: int
+    context_window_minutes: int
+    context_max_messages: int
+    max_pending_chats: int
+    max_pending_source_refs: int
+    max_pending_source_bytes: int
+    max_concurrent_decisions: int
+    max_reevaluations: int
+    opportunity_ttl_seconds: int
+    participation: ParticipationPolicy
+    policy_version: str
+    activation_epoch: int
+    sources: dict[str, str]
+    invalid_reason: str = ""
+
+    @property
+    def opted_in(self) -> bool:
+        """Whether this chat explicitly opted in, independently of the global switch."""
+        return bool(self.participation.enabled)
+
+    @property
+    def valid(self) -> bool:
+        """Whether this activation candidate passed every dependency check."""
+        return not self.invalid_reason
+
+    @property
+    def live(self) -> bool:
+        """Whether production participation may act. Requires opt-in and no shadow."""
+        return self.valid and self.enabled and self.opted_in and not self.shadow
+
+    @property
+    def observing(self) -> bool:
+        """Whether the shadow lane may evaluate (and record) without any effect."""
+        return self.valid and self.enabled and self.opted_in and self.shadow
+
+    def limits_for(self, category: str) -> tuple[int, int, str]:
+        """``(limit, window_ms, window_kind)`` for one reservation category."""
+        if category == "initiation":
+            return (
+                int(self.participation.max_unsolicited_comments_per_window),
+                int(self.participation.comment_window_minutes) * 60_000,
+                "rolling",
+            )
+        if category == "comment":
+            return (
+                int(self.participation.max_unsolicited_comments_per_window),
+                int(self.participation.comment_window_minutes) * 60_000,
+                "rolling",
+            )
+        if category == "reaction":
+            return (
+                int(self.participation.max_reactions_per_window),
+                int(self.participation.comment_window_minutes) * 60_000,
+                "rolling",
+            )
+        raise ValueError(f"unknown participation category: {category}")
 
 
 @dataclass(slots=True)
@@ -183,6 +278,7 @@ class _CompiledPolicy:
     spontaneity_quiet_hours_end: str | None
     contacts_disclosure: bool
     session_history_limit: int | None
+    participation: ParticipationPolicy = field(default_factory=ParticipationPolicy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +442,9 @@ class PolicyEngine:
             spontaneity_quiet_hours_end=resolved.spontaneity.quiet_hours_end,
             contacts_disclosure=bool(resolved.contacts_disclosure),
             session_history_limit=resolved.session_history_limit,
+            participation=ParticipationPolicy.model_validate(
+                resolved.participation.model_dump()
+            ),
         )
 
     def resolve_compiled_policy(self, channel: str, chat_id: str) -> _CompiledPolicy:
@@ -520,6 +619,125 @@ class PolicyEngine:
             spontaneity_quiet_hours_end=resolved.spontaneity_quiet_hours_end,
             contacts_disclosure=resolved.contacts_disclosure,
             session_history_limit=resolved.session_history_limit,
+            participation=ParticipationPolicy.model_validate(
+                resolved.participation.model_dump()
+            ),
+        )
+
+    def resolve_participation(self, channel: str, chat_id: str) -> ParticipationPolicy:
+        """Resolved participation policy: defaults -> channel default -> chat override."""
+        value, _sources = self._participation_with_sources(channel, chat_id)
+        return value
+
+    def participation_sources(self, channel: str, chat_id: str) -> dict[str, str]:
+        """Origin layer of every resolved participation field (inspection output)."""
+        _value, sources = self._participation_with_sources(channel, chat_id)
+        return sources
+
+    def _participation_with_sources(
+        self, channel: str, chat_id: str
+    ) -> tuple[ParticipationPolicy, dict[str, str]]:
+        """One validated merge path. Unvalidated dicts never become effective settings."""
+        layers: list[tuple[str, ParticipationPolicyOverride]] = []
+        channel_policy = self.policy.channels.get(channel)
+        if channel_policy is not None:
+            layers.append(
+                (f"channels.{channel}.default.participation", channel_policy.default.participation)
+                if channel_policy.default.participation is not None
+                else (f"channels.{channel}.default.participation", ParticipationPolicyOverride())
+            )
+            chat_override = channel_policy.chats.get(chat_id)
+            if chat_override is not None and chat_override.participation is not None:
+                layers.append(
+                    (
+                        f"channels.{channel}.chats.{chat_id}.participation",
+                        chat_override.participation,
+                    )
+                )
+        current = self.policy.defaults.participation
+        values: dict[str, Any] = {
+            field_name: getattr(current, field_name) for field_name in _PARTICIPATION_FIELDS
+        }
+        sources: dict[str, str] = {
+            field_name: "defaults.participation" for field_name in _PARTICIPATION_FIELDS
+        }
+        for layer_name, override in layers:
+            for field_name in _PARTICIPATION_FIELDS:
+                candidate = getattr(override, field_name)
+                if candidate is None:
+                    continue
+                values[field_name] = candidate
+                sources[field_name] = layer_name
+        return ParticipationPolicy.model_validate(values), sources
+
+    def resolve_participation_snapshot(
+        self,
+        channel: str,
+        chat_id: str,
+        *,
+        processing_config: Any,
+        activation_epoch: int = 1,
+        policy_version: str = "",
+        managed: bool = True,
+        processing_shadowed: bool = False,
+    ) -> ParticipationSnapshot:
+        """Resolve the activation matrix into one snapshot (spec section 6.1).
+
+        The snapshot reports ``invalid_reason`` instead of silently enabling a target
+        whose dependencies (feature switch, opt-in, judge route, managed target,
+        processing shadow, shadow lane) do not support it.
+        """
+        participation_config = getattr(processing_config, "participation", None)
+        resolved = self.resolve_participation(channel, chat_id)
+        sources = self.participation_sources(channel, chat_id)
+        enabled = bool(getattr(participation_config, "enabled", False))
+        shadow = bool(getattr(participation_config, "shadow", True))
+        judge_route = str(getattr(participation_config, "judge_route", "") or "")
+        invalid_reason = ""
+        if enabled and not judge_route.strip():
+            invalid_reason = "missing_judge_route"
+        elif enabled and resolved.enabled and not managed:
+            invalid_reason = "target_not_managed"
+        elif enabled and resolved.enabled and processing_shadowed:
+            invalid_reason = "processing_shadow_conflict"
+        return ParticipationSnapshot(
+            channel=str(channel),
+            chat_id=str(chat_id),
+            enabled=enabled,
+            shadow=shadow,
+            judge_route=judge_route,
+            judge_timeout_seconds=float(
+                getattr(participation_config, "judge_timeout_seconds", 12.0)
+            ),
+            judge_max_input_tokens=int(
+                getattr(participation_config, "judge_max_input_tokens", 4000)
+            ),
+            judge_max_output_tokens=int(
+                getattr(participation_config, "judge_max_output_tokens", 256)
+            ),
+            context_window_minutes=int(
+                getattr(participation_config, "context_window_minutes", 120)
+            ),
+            context_max_messages=int(getattr(participation_config, "context_max_messages", 40)),
+            max_pending_chats=int(getattr(participation_config, "max_pending_chats", 64)),
+            max_pending_source_refs=int(
+                getattr(participation_config, "max_pending_source_refs", 64)
+            ),
+            max_pending_source_bytes=int(
+                getattr(participation_config, "max_pending_source_bytes", 16_384)
+            ),
+            max_concurrent_decisions=int(
+                getattr(participation_config, "max_concurrent_decisions", 2)
+            ),
+            max_reevaluations=int(getattr(participation_config, "max_reevaluations", 1)),
+            opportunity_ttl_seconds=int(
+                getattr(participation_config, "opportunity_ttl_seconds", 120)
+            ),
+            participation=resolved,
+            policy_version=str(policy_version),
+            activation_epoch=int(activation_epoch),
+            sources=sources,
+            invalid_reason=invalid_reason,
         )
 
     @staticmethod

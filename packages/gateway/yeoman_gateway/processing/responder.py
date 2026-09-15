@@ -52,6 +52,57 @@ class ThreadActorResponder:
         self._authority = authority or TurnAuthority()
         self._clock = clock or _now_ms
         self._router = router
+        self._participation_ctx: Any | None = None
+
+    def attach_participation(self, ctx: Any | None) -> None:
+        """Wire the participation channel/react effect boundary (disabled by default)."""
+        self._participation_ctx = ctx
+
+    @property
+    def participation(self) -> Any | None:
+        return self._participation_ctx
+
+    async def generate_participation_draft(
+        self,
+        event: Any,
+        decision: Any,
+        *,
+        purpose: str,
+        context: dict[str, object],
+    ) -> str | None:
+        """Draft-only generation for unsolicited participation (spec section 8.1).
+
+        Declared on the actor wrapper so actor/source binding and cancellation stay
+        with the existing actor; the inner responder performs the provider call with
+        an empty executable tool set and no persistent assistant writes. Callers
+        cannot opt into the tool-capable direct path through prompt text.
+        """
+        inner = self._inner
+        generator = getattr(inner, "generate_participation_draft", None)
+        if generator is None:
+            logger.warning("participation draft requested but the responder has no draft path")
+            return None
+        return await generator(event, decision, purpose=purpose, context=context)
+
+    async def react_to_participation(
+        self, *, target_message_id: str, emoji: str, channel: str, chat_id: str
+    ) -> object | None:
+        """Submit one autonomous reaction through the existing reaction effect path.
+
+        Returns the structured receipt (or effect reference), never a handled boolean.
+        """
+        ctx = self._participation_ctx
+        if ctx is None:
+            return None
+        submitter = getattr(ctx, "submit_participation_reaction", None)
+        if submitter is None:
+            return None
+        return await submitter(
+            target_message_id=str(target_message_id),
+            emoji=str(emoji),
+            channel=str(channel),
+            chat_id=str(chat_id),
+        )
 
     def __getattr__(self, name: str) -> Any:
         """Everything else (tool access, close, telemetry) stays the inner responder's."""

@@ -232,6 +232,135 @@ class SpontaneityPolicyOverride(PolicyModel):
     quiet_hours_end: str | None = Field(default=None, alias="quietHoursEnd")
 
 
+#: Owner-authored default participation guidance (participation spec section 6). The
+#: spec default lives in one place so policy inspection and the judge cannot drift.
+DEFAULT_PARTICIPATION_GUIDANCE = (
+    "Join when you can add a specific, relevant contribution or fitting brief social "
+    "response. Consider whether a reply is actually useful even when it relates to you. "
+    "Prefer a reaction for acknowledgment when appropriate. Do not chase unanswered "
+    "posts, explain jokes after laughter, or interrupt an exchange directed at another "
+    "person without a good reason. Yield when the exchange closes or moves on."
+)
+
+#: Bounds enforced on the owner-authored guidance string.
+MAX_PARTICIPATION_GUIDANCE_CHARS = 4000
+
+
+class ParticipationPolicy(PolicyModel):
+    """Resolved per-chat autonomous participation policy (participation spec section 6).
+
+    ``enabled`` is the explicit per-chat opt-in. ``all``/``mention_only`` no longer
+    determine participation for an opted-in autonomous chat; they stay meaningful for
+    every non-migrated chat. Off, who-can-talk, blocked senders, reply-action vetoes
+    and tool permissions remain hard constraints everywhere.
+    """
+
+    enabled: bool = False
+    guidance: str = DEFAULT_PARTICIPATION_GUIDANCE
+    allow_initiation: bool = Field(default=True, alias="allowInitiation")
+    allow_continuation: bool = Field(default=True, alias="allowContinuation")
+    allow_reactions: bool = Field(default=True, alias="allowReactions")
+    max_unaddressed_judge_calls_per_hour: int = Field(
+        default=12, alias="maxUnaddressedJudgeCallsPerHour", ge=0, le=120
+    )
+    continuation_judge_reserve: int = Field(
+        default=4, alias="continuationJudgeReserve", ge=0
+    )
+    min_unaddressed_judge_gap_seconds: int = Field(
+        default=30, alias="minUnaddressedJudgeGapSeconds", ge=0, le=3600
+    )
+    max_unsolicited_comments_per_window: int = Field(
+        default=3, alias="maxUnsolicitedCommentsPerWindow", ge=0, le=20
+    )
+    comment_window_minutes: int = Field(
+        default=30, alias="commentWindowMinutes", ge=1, le=1440
+    )
+    max_reactions_per_window: int = Field(
+        default=6, alias="maxReactionsPerWindow", ge=0, le=60
+    )
+
+    @field_validator("guidance")
+    @classmethod
+    def _validate_guidance(cls, value: str) -> str:
+        text = str(value or "")
+        if len(text) > MAX_PARTICIPATION_GUIDANCE_CHARS:
+            raise ValueError(
+                "participation.guidance must not exceed "
+                f"{MAX_PARTICIPATION_GUIDANCE_CHARS} characters"
+            )
+        return text
+
+    @model_validator(mode="after")
+    def _validate_reserve(self) -> "ParticipationPolicy":
+        if self.continuation_judge_reserve > self.max_unaddressed_judge_calls_per_hour:
+            raise ValueError(
+                "participation.continuationJudgeReserve must not exceed "
+                "maxUnaddressedJudgeCallsPerHour"
+            )
+        return self
+
+
+class ParticipationPolicyOverride(PolicyModel):
+    """Partial override at channel-default or specific-chat level.
+
+    An absent field inherits; an explicit empty list clears. Guidance inherits as one
+    string and is never concatenated with the layer below it.
+    """
+
+    enabled: bool | None = None
+    guidance: str | None = None
+    allow_initiation: bool | None = Field(default=None, alias="allowInitiation")
+    allow_continuation: bool | None = Field(default=None, alias="allowContinuation")
+    allow_reactions: bool | None = Field(default=None, alias="allowReactions")
+    max_unaddressed_judge_calls_per_hour: int | None = Field(
+        default=None, alias="maxUnaddressedJudgeCallsPerHour", ge=0, le=120
+    )
+    continuation_judge_reserve: int | None = Field(
+        default=None, alias="continuationJudgeReserve", ge=0
+    )
+    min_unaddressed_judge_gap_seconds: int | None = Field(
+        default=None, alias="minUnaddressedJudgeGapSeconds", ge=0, le=3600
+    )
+    max_unsolicited_comments_per_window: int | None = Field(
+        default=None, alias="maxUnsolicitedCommentsPerWindow", ge=0, le=20
+    )
+    comment_window_minutes: int | None = Field(
+        default=None, alias="commentWindowMinutes", ge=1, le=1440
+    )
+    max_reactions_per_window: int | None = Field(
+        default=None, alias="maxReactionsPerWindow", ge=0, le=60
+    )
+
+    @field_validator("guidance")
+    @classmethod
+    def _validate_guidance(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value)
+        if len(text) > MAX_PARTICIPATION_GUIDANCE_CHARS:
+            raise ValueError(
+                "participation.guidance must not exceed "
+                f"{MAX_PARTICIPATION_GUIDANCE_CHARS} characters"
+            )
+        return text
+
+    @model_validator(mode="after")
+    def _validate_reserve_within_quota(self) -> "ParticipationPolicyOverride":
+        """Reject a candidate whose reserve exceeds the quota it protects.
+
+        Checked on the candidate itself so an invalid reload is refused even when a
+        different layer would have supplied the missing half of the pair.
+        """
+        quota = self.max_unaddressed_judge_calls_per_hour
+        reserve = self.continuation_judge_reserve
+        if quota is not None and reserve is not None and reserve > quota:
+            raise ValueError(
+                "participation.continuationJudgeReserve must not exceed "
+                "maxUnaddressedJudgeCallsPerHour"
+            )
+        return self
+
+
 class ChatPolicy(PolicyModel):
     """Resolved chat policy (no optional fields)."""
 
@@ -253,6 +382,7 @@ class ChatPolicy(PolicyModel):
     )
     reply_budget: ReplyBudgetPolicy = Field(default_factory=ReplyBudgetPolicy, alias="replyBudget")
     spontaneity: SpontaneityPolicy = Field(default_factory=SpontaneityPolicy)
+    participation: ParticipationPolicy = Field(default_factory=ParticipationPolicy)
     contacts_disclosure: bool = Field(default=False, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit")
 
@@ -277,6 +407,7 @@ class ChatPolicyOverride(PolicyModel):
     )
     reply_budget: ReplyBudgetPolicyOverride | None = Field(default=None, alias="replyBudget")
     spontaneity: SpontaneityPolicyOverride | None = None
+    participation: ParticipationPolicyOverride | None = None
     contacts_disclosure: bool | None = Field(default=None, alias="contactsDisclosure")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
 

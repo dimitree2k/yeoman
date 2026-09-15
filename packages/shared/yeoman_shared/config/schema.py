@@ -718,6 +718,83 @@ class ProcessingRetentionConfig(BaseModel):
         return self
 
 
+#: Owner-authored default participation guidance. Trusted input: it is written by the
+#: owner, never by a chat participant or a model.
+DEFAULT_PARTICIPATION_GUIDANCE = (
+    "Join when you can add a specific, relevant contribution or fitting brief social "
+    "response. Consider whether a reply is actually useful even when it relates to you. "
+    "Prefer a reaction for acknowledgment when appropriate. Do not chase unanswered "
+    "posts, explain jokes after laughter, or interrupt an exchange directed at another "
+    "person without a good reason. Yield when the exchange closes or moves on."
+)
+
+
+class ProcessingParticipationConfig(BaseModel):
+    """Autonomous conversation participation (participation spec section 6).
+
+    Disabled and shadow-only by default. This block owns *resource* limits and the
+    judge route; access, sender restrictions and tool permissions stay with policy.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    #: Global feature switch. It cannot enable a single chat by itself.
+    enabled: bool = False
+    #: Evaluate and record only: no generation, typing, approval, effect or taste write.
+    shadow: bool = True
+    #: Explicit existing model-route key. There is no hidden model fallback.
+    judge_route: str = Field(default="", alias="judgeRoute")
+    judge_timeout_seconds: float = Field(default=12.0, alias="judgeTimeoutSeconds", gt=0, le=60)
+    judge_max_input_tokens: int = Field(
+        default=4000, alias="judgeMaxInputTokens", ge=512, le=16_000
+    )
+    judge_max_output_tokens: int = Field(
+        default=256, alias="judgeMaxOutputTokens", ge=64, le=1024
+    )
+    #: Candidate search horizon. It bounds work and retention; it is not permission.
+    context_window_minutes: int = Field(default=120, alias="contextWindowMinutes", ge=1, le=1440)
+    context_max_messages: int = Field(default=40, alias="contextMaxMessages", ge=5, le=100)
+    max_pending_chats: int = Field(default=64, alias="maxPendingChats", ge=1, le=1024)
+    max_pending_source_refs: int = Field(
+        default=64, alias="maxPendingSourceRefs", ge=1, le=256
+    )
+    max_pending_source_bytes: int = Field(
+        default=16_384, alias="maxPendingSourceBytes", ge=1024, le=65_536
+    )
+    max_concurrent_decisions: int = Field(
+        default=2, alias="maxConcurrentDecisions", ge=1, le=8
+    )
+    max_reevaluations: int = Field(default=1, alias="maxReevaluations", ge=0, le=2)
+    opportunity_ttl_seconds: int = Field(
+        default=120, alias="opportunityTtlSeconds", ge=10, le=600
+    )
+
+    @model_validator(mode="after")
+    def _validate_activation(self) -> "ProcessingParticipationConfig":
+        if self.enabled and not str(self.judge_route).strip():
+            raise ValueError(
+                "processing.participation.judgeRoute is required when participation is enabled"
+            )
+        return self
+
+
+class ProcessingParticipationMaintenanceConfig(BaseModel):
+    """Advisory learning and receipt reconciliation scheduling (spec section 10).
+
+    Maintenance is independent of judging: disabling participation must not lose
+    receipt reconciliation.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    enabled: bool = False
+    interval_seconds: int = Field(default=900, alias="intervalSeconds", gt=0)
+    observation_window_minutes: int = Field(
+        default=120, alias="observationWindowMinutes", gt=0
+    )
+    batch_size: int = Field(default=20, alias="batchSize", gt=0, le=100)
+
+
 class ProcessingConfig(BaseModel):
     """State-aware message processing (spec section 4).
 
@@ -749,6 +826,12 @@ class ProcessingConfig(BaseModel):
     reaction_route: str = ""
     #: Joining a conversation unaddressed: how often, and how sure the judge must be.
     ambient: ProcessingAmbientConfig = Field(default_factory=ProcessingAmbientConfig)
+    participation: ProcessingParticipationConfig = Field(
+        default_factory=ProcessingParticipationConfig
+    )
+    participation_maintenance: ProcessingParticipationMaintenanceConfig = Field(
+        default_factory=ProcessingParticipationMaintenanceConfig
+    )
     db_path: str = "data/processing/processing.db"
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)

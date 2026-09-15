@@ -246,6 +246,34 @@ class InboundArchive:
 
         return [dict(row) for row in rows]
 
+    def senders_for_messages(
+        self, channel: str, chat_id: str, message_ids: tuple[str, ...]
+    ) -> dict[str, str]:
+        """Sender id for each retained message id in one exact chat.
+
+        Used to revalidate the *originating principals* of an admitted batch: a
+        service principal may transport an effect, but it can never stand in for the
+        authorization of the participants whose material is being answered.
+        """
+        wanted = [str(item) for item in message_ids if str(item or "").strip()]
+        if not channel or not chat_id or not wanted:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT message_id, sender_id, participant FROM inbound_messages
+                WHERE channel = ? AND chat_id = ? AND message_id IN ({placeholders})
+                """,
+                (str(channel), str(chat_id), *wanted),
+            ).fetchall()
+        senders: dict[str, str] = {}
+        for row in rows:
+            sender = str(row["sender_id"] or row["participant"] or "")
+            if sender:
+                senders[str(row["message_id"])] = sender
+        return senders
+
     def lookup_messages_in_range(
         self,
         channel: str,

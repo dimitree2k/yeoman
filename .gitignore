@@ -47,6 +47,15 @@ tests/*
 !tests/conftest.py
 !tests/gateway/
 tests/gateway/*
+!tests/gateway/test_participation_delivery.py
+!tests/gateway/test_participation_context.py
+!tests/gateway/test_participation_integration.py
+!tests/gateway/test_participation_judge.py
+!tests/gateway/test_participation_maintenance.py
+!tests/gateway/test_participation_policy.py
+!tests/gateway/test_participation_scheduling.py
+!tests/gateway/test_participation_observers.py
+!tests/gateway/fixtures/participation_scenarios.json
 !tests/gateway/test_v1_only_runtime.py
 !tests/gateway/test_lazy_document_media.py
 !tests/gateway/test_consciousness_phase1.py

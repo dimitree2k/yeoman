@@ -125,10 +125,12 @@ class EnginePolicyAdapter(PolicyPort):
         processing_store: Any | None = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
+        processing_config: Any | None = None,
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
         self._policy_path = policy_path
+        self._processing_config = processing_config
         self._session_manager = session_manager
         self._processing_store = processing_store
         self._private_handoff_store = private_handoff_store
@@ -192,6 +194,7 @@ class EnginePolicyAdapter(PolicyPort):
                 apply_channels=apply_channels,
                 on_policy_applied=self._on_policy_applied,
                 group_subject_resolver=lambda ids: self._list_group_subjects_from_bridge(ids),
+                processing_config=self._processing_config,
             )
 
     def _active_private_handoff(self, event: InboundEvent) -> "PrivateHandoff | None":
@@ -393,6 +396,15 @@ class EnginePolicyAdapter(PolicyPort):
         if changed and persist:
             self._save_pause_state()
         return changed
+
+    def participation_pause_reason(self, channel: str, chat_id: str) -> str | None:
+        """The owner's hard stop for autonomous participation in one chat, or ``None``.
+
+        This is the string reason (``paused_global``/``paused_chat``), not a boolean,
+        so logs and inspection can say *why* an effect was suppressed. Off/pause is a
+        hard veto for autonomous effects; it never blocks owner commands.
+        """
+        return self._pause_reason_for_chat(channel, chat_id)
 
     def _pause_reason_for_chat(self, channel: str, chat_id: str) -> str | None:
         now = self._now_ms()

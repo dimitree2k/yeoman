@@ -151,6 +151,7 @@ def policy_cmd(
         known_tools=_policy_known_tools(),
         apply_channels=apply_channels,
         on_policy_applied=None,
+        processing_config=config.processing,
     )
     result = service.execute_from_text(
         command,

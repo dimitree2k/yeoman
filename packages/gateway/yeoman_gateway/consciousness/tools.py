@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable
 
@@ -13,7 +15,7 @@ from yeoman_shared.config.schema import Config
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.consciousness.approval import PendingSpeakupApproval, SpeakupApprovalStore
-from yeoman_gateway.consciousness.log import SpeakupLog
+from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -34,6 +36,66 @@ DEFAULT_PERMISSIVE_ACTIONS = DEFAULT_BALANCED_ACTIONS | {
 }
 MIN_CONFIDENCE = 0.75
 
+#: Ledger proposal states that mean "this proposal can no longer be submitted".
+#: A durable row in one of these states is never re-sent, even when an in-memory
+#: copy was evicted by a restart or by ``begin_run``.
+TERMINAL_PROPOSAL_STATES: frozenset[str] = frozenset(
+    {
+        "sent",
+        "transport_accepted",
+        "delivered",
+        "delivery_unknown",
+        "failed",
+        "cancelled",
+        "expired",
+        "denied",
+        "rejected",
+    }
+)
+
+#: Fallback reservation dimensions for a proposal when no explicit participation
+#: policy resolves for the chat. Phase 02 replaces these with validated
+#: ``processing.participation`` values from the effective policy; the ledger
+#: transaction and the accounting semantics are already final.
+DEFAULT_PROPOSAL_RESERVATION_LIMITS: dict[str, tuple[int, int]] = {
+    "initiation": (3, 86_400_000),
+    "comment": (3, 1_800_000),
+    "reaction": (6, 1_800_000),
+}
+
+
+def canonical_payload_hash(
+    *,
+    channel: str,
+    chat_id: str,
+    content: str,
+    action_type: str,
+    reply_to_message_id: str | None,
+    revision: int = 1,
+) -> str:
+    """Canonical hash over the exact normalized payload an approval authorizes.
+
+    A changed draft, quote, target, action or proposal revision produces a
+    different hash, so the old approval can never submit the new payload
+    (spec section 9).
+    """
+    material = json.dumps(
+        {
+            "channel": str(channel),
+            "chat_id": str(chat_id),
+            "content": str(content),
+            "action_type": str(action_type),
+            "reply_to_message_id": (
+                None if reply_to_message_id is None else str(reply_to_message_id)
+            ),
+            "revision": int(revision),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class SpeakupProposal:
@@ -47,6 +109,24 @@ class SpeakupProposal:
     trigger: str
     context_snapshot: dict[str, object]
     reply_to_message_id: str | None = None
+    proposal_revision: int = 1
+    payload_hash: str = ""
+
+
+def with_proposal_revision(proposal: SpeakupProposal, revision: int) -> SpeakupProposal:
+    """Return the proposal at a new revision with its payload hash recomputed."""
+    updated = replace(proposal, proposal_revision=int(revision))
+    return replace(
+        updated,
+        payload_hash=canonical_payload_hash(
+            channel=updated.channel,
+            chat_id=updated.chat_id,
+            content=updated.message,
+            action_type=updated.action_type,
+            reply_to_message_id=updated.reply_to_message_id,
+            revision=updated.proposal_revision,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +140,14 @@ class EligibleChat:
     owner_chat_id: str
     preview: str
     is_group: bool
+
+
+def _receipt_provider_message_id(receipt: object) -> str | None:
+    """Provider message id from a transport receipt, when the transport reported one."""
+    transport = getattr(receipt, "transport_receipt", None)
+    value = getattr(transport, "provider_message_id", None) if transport else None
+    text = str(value or "").strip()
+    return text or None
 
 
 class ConsciousnessTools:
@@ -362,6 +450,14 @@ class ConsciousnessTools:
                     validated_reply_to = candidate
 
         proposal_id = uuid.uuid4().hex
+        payload_hash = canonical_payload_hash(
+            channel=eligible.channel,
+            chat_id=eligible.chat_id,
+            content=content,
+            action_type=action_type,
+            reply_to_message_id=validated_reply_to,
+            revision=1,
+        )
         proposal = SpeakupProposal(
             proposal_id=proposal_id,
             channel=eligible.channel,
@@ -371,8 +467,15 @@ class ConsciousnessTools:
             profile=eligible.profile,
             confidence=float(confidence),
             trigger=self._trigger,
-            context_snapshot={"confidence": float(confidence)},
+            context_snapshot={
+                "confidence": float(confidence),
+                "reply_to_message_id": validated_reply_to,
+                "payload_hash": payload_hash,
+                "proposal_revision": 1,
+            },
             reply_to_message_id=validated_reply_to,
+            proposal_revision=1,
+            payload_hash=payload_hash,
         )
         self._proposals[proposal_id] = proposal
         await self.log.record_proposed(
@@ -389,12 +492,16 @@ class ConsciousnessTools:
         return {"status": "proposed", "proposal_id": proposal_id}
 
     async def commit_speakup(self, proposal_id: str) -> dict[str, object]:
+        """Stage a proposal: preview it to the owner, or submit it through the one
+        final validation path. Every submission decision lives in
+        :meth:`submit_proposal`; this method only decides whether an owner approval
+        is required first."""
+        proposal = await self._load_proposal(proposal_id)
+        if proposal is None:
+            return {"status": "rejected", "reason": "proposal_not_found"}
         if not self.config.consciousness.enabled:
             return {"status": "rejected", "reason": "consciousness_disabled"}
         async with self._commit_lock:
-            proposal = self._proposals.get(str(proposal_id))
-            if proposal is None:
-                return {"status": "rejected", "reason": "proposal_not_found"}
             eligible = self._resolve_eligible(proposal.chat_id, channel=proposal.channel)
             if eligible is None:
                 await self.log.mark_rejected(proposal.proposal_id, reason="chat_not_eligible")
@@ -434,6 +541,8 @@ class ConsciousnessTools:
                     trigger=proposal.trigger,
                     daily_cap=eligible.daily_cap,
                     reply_to_message_id=proposal.reply_to_message_id,
+                    payload_hash=proposal.payload_hash,
+                    proposal_revision=proposal.proposal_revision,
                 )
                 await self.approval_store.add(approval)
                 await self.log.mark_status(
@@ -455,17 +564,39 @@ class ConsciousnessTools:
                 )
                 preview_content = "\n".join(preview_lines)
                 if self._service_effects is not None:
-                    await self._service_effects.send(
+                    preview_ref = f"speakup-preview:{proposal.proposal_id}"
+                    preview_effect_id = deterministic_effect_id(
+                        channel=approval.owner_channel,
+                        chat_id=approval.owner_chat_id,
+                        operation="preview",
+                        proposal_id=proposal.proposal_id,
+                    )
+                    receipt = await self._service_effects.send(
                         source="speakup",
-                        operation_ref=f"speakup-preview:{proposal.proposal_id}",
+                        operation_ref=preview_ref,
                         channel=approval.owner_channel,
                         chat_id=approval.owner_chat_id,
                         content=preview_content,
+                        effect_id=preview_effect_id,
                     )
-                    await self.log.mark_sent(
-                        proposal.proposal_id, now=self._now().timestamp()
+                    # A preview is an owner-destination effect. It never touches the
+                    # target chat and therefore never consumes a target send allowance
+                    # (spec section 9). The proposal stays queued for approval; the
+                    # owner-destination effect is recorded separately from target truth.
+                    await self.log.record_preview_effect(
+                        proposal.proposal_id,
+                        preview_effect_id=preview_effect_id,
+                        preview_operation_ref=preview_ref,
+                        accepted=bool(getattr(receipt, "accepted", False)),
+                        now=self._now().timestamp(),
                     )
-                    return {"status": "sent", "proposal_id": proposal.proposal_id}
+                    await self.log.mark_status(
+                        proposal.proposal_id, status="awaiting_approval"
+                    )
+                    return {
+                        "status": "queued_for_approval",
+                        "proposal_id": proposal.proposal_id,
+                    }
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=approval.owner_channel,
@@ -486,10 +617,122 @@ class ConsciousnessTools:
                 self._proposals.pop(proposal.proposal_id, None)
                 return {"status": "queued_for_approval", "proposal_id": proposal.proposal_id}
 
+        return await self.submit_proposal(proposal_id)
+
+    async def submit_proposal(self, proposal_id: str) -> dict[str, object]:
+        """The single final validation and submission path for a proposal.
+
+        Order (spec section 9): load durable proposal/approval -> current
+        eligibility, access and pause -> approval validity -> freshness/quote ->
+        action/budget reservation -> output security -> stable managed effect ->
+        record the evidenced ledger state. A caller-supplied boolean is never
+        approval authority, and a changed payload under an old approval is refused.
+        """
+        async with self._commit_lock:
+            key = str(proposal_id)
+            # A repeated code for an already-submitted proposal returns the same
+            # claim/effect status instead of "not found" or a second send.
+            repeated = await self.log.approval_claim(key)
+            if repeated is not None and str(repeated["state"]) == "terminal":
+                resolution = str(repeated["resolution"] or "")
+                if resolution in {"submitted", "legacy_passthrough"}:
+                    return {
+                        "status": "transport_accepted",
+                        "proposal_id": key,
+                        "effect_id": str(repeated["target_effect_id"] or ""),
+                        "duplicate": True,
+                    }
+                return {"status": "rejected", "reason": f"approval_{resolution}"}
+
+            proposal = await self._load_proposal(key)
+            if proposal is None:
+                return {"status": "rejected", "reason": "proposal_not_found"}
+            if not self.config.consciousness.enabled:
+                return {"status": "rejected", "reason": "consciousness_disabled"}
+
+            approval_claim = repeated
+
+            eligible = self._resolve_eligible(proposal.chat_id, channel=proposal.channel)
+            if eligible is None:
+                await self.log.mark_rejected(proposal.proposal_id, reason="chat_not_eligible")
+                return {"status": "rejected", "reason": "chat_not_eligible"}
+            if eligible.is_group and eligible.preview == "owner_dm":
+                needs_approval = True
+            else:
+                needs_approval = False
+            if needs_approval and approval_claim is None:
+                return {"status": "rejected", "reason": "approval_required"}
+
+            # A durable approval binds one exact payload and revision.
+            effect_id = deterministic_effect_id(
+                channel=proposal.channel,
+                chat_id=proposal.chat_id,
+                operation=proposal.action_type,
+                proposal_id=proposal.proposal_id,
+                revision=proposal.proposal_revision,
+            )
+            if needs_approval and approval_claim is not None:
+                if str(approval_claim["payload_hash"]) != proposal.payload_hash:
+                    await self.log.mark_rejected(
+                        proposal.proposal_id, reason="approval_payload_changed"
+                    )
+                    return {"status": "rejected", "reason": "approval_payload_changed"}
+                if int(approval_claim["proposal_revision"]) != proposal.proposal_revision:
+                    await self.log.mark_rejected(
+                        proposal.proposal_id, reason="approval_revision_changed"
+                    )
+                    return {"status": "rejected", "reason": "approval_revision_changed"}
+                if str(approval_claim["target_effect_id"]) not in {"", effect_id}:
+                    await self.log.mark_rejected(
+                        proposal.proposal_id, reason="approval_target_changed"
+                    )
+                    return {"status": "rejected", "reason": "approval_target_changed"}
+
+            budget = await self._evaluate_opportunity_budget(
+                eligible,
+                trigger=proposal.trigger,
+                confidence=proposal.confidence,
+            )
+            if not budget["allowed"]:
+                reason = str(budget["reason"])
+                await self.log.mark_rejected(proposal.proposal_id, reason=reason)
+                return {"status": "rejected", "reason": reason}
+
+            if proposal.reply_to_message_id:
+                row = self.inbound_archive.lookup_message(
+                    proposal.channel, proposal.chat_id, proposal.reply_to_message_id
+                )
+                if row is None:
+                    await self.log.mark_rejected(
+                        proposal.proposal_id, reason="stale_quote"
+                    )
+                    return {"status": "rejected", "reason": "stale_quote"}
+
+            reservation_limits = self._reservation_limits(proposal)
+            reserved = await self.log.reserve_delivery(
+                proposal_id=proposal.proposal_id,
+                effect_id=effect_id,
+                channel=proposal.channel,
+                chat_id=proposal.chat_id,
+                now_ms=int(self._now().timestamp() * 1000),
+                limits=reservation_limits,
+                proposal_revision=proposal.proposal_revision,
+            )
+            if not reserved:
+                await self.log.mark_rejected(
+                    proposal.proposal_id, reason="delivery_budget_exhausted"
+                )
+                return {"status": "rejected", "reason": "delivery_budget_exhausted"}
+            await self.log.record_send_attempt(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                now_ms=int(self._now().timestamp() * 1000),
+            )
+
             output = self.security.check_output(
                 proposal.message,
                 context={
-                    "path": "consciousness.commit_speakup",
+                    "path": "consciousness.submit_proposal",
                     "channel": proposal.channel,
                     "chat_id": proposal.chat_id,
                 },
@@ -505,36 +748,265 @@ class ConsciousnessTools:
                 if output.decision.action == "sanitize" and output.sanitized_text
                 else proposal.message
             )
-            if self._service_effects is not None:
-                await self._service_effects.send(
-                    source="speakup",
-                    operation_ref=f"speakup:{proposal.proposal_id}",
-                    channel=proposal.channel,
-                    chat_id=proposal.chat_id,
-                    content=content,
-                    reply_to=proposal.reply_to_message_id,
+            if content != proposal.message:
+                # A sanitizer that changes the payload invalidates the approval.
+                await self.log.mark_rejected(
+                    proposal.proposal_id, reason="sanitized_payload_changed"
                 )
-                await self.log.mark_sent(proposal.proposal_id, now=self._now().timestamp())
+                return {"status": "rejected", "reason": "sanitized_payload_changed"}
+
+            if self._service_effects is None:
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=proposal.channel,
+                        chat_id=proposal.chat_id,
+                        content=content,
+                        reply_to=proposal.reply_to_message_id,
+                        metadata={
+                            "spontaneous": True,
+                            "proposal_id": proposal.proposal_id,
+                            "action_type": proposal.action_type,
+                            "profile": proposal.profile,
+                            "trigger": proposal.trigger,
+                        },
+                    )
+                )
+                await self.log.mark_sent(
+                    proposal.proposal_id, now=self._now().timestamp()
+                )
                 self._proposals.pop(proposal.proposal_id, None)
                 return {"status": "sent", "proposal_id": proposal.proposal_id}
-            await self.bus.publish_outbound(
-                OutboundMessage(
+
+            # Exactly one target effect per proposal revision, fixed target,
+            # managed delivery only: no raw outbound fallback and no None receipt
+            # accepted as success.
+            try:
+                receipt = await self._service_effects.send(
+                    source="speakup",
+                    operation_ref=f"speakup:{proposal.proposal_id}:{proposal.proposal_revision}",
                     channel=proposal.channel,
                     chat_id=proposal.chat_id,
                     content=content,
                     reply_to=proposal.reply_to_message_id,
-                    metadata={
-                        "spontaneous": True,
-                        "proposal_id": proposal.proposal_id,
-                        "action_type": proposal.action_type,
-                        "profile": proposal.profile,
-                        "trigger": proposal.trigger,
-                    },
+                    effect_id=effect_id,
+                    require_managed=True,
                 )
+            except Exception:
+                # A refused/errored transport leaves the pending authorization
+                # recoverable: the claim stays claimed and can be retried.
+                await self.log.mark_status(proposal.proposal_id, status="submitted")
+                raise
+            if receipt is None:
+                await self.log.mark_status(proposal.proposal_id, status="submitted")
+                return {"status": "rejected", "reason": "managed_delivery_required"}
+
+            state = str(getattr(receipt, "state", "") or "")
+            if state == "sent":
+                await self.log.project_transport_accepted(
+                    proposal.proposal_id,
+                    effect_id=effect_id,
+                    provider_message_id=_receipt_provider_message_id(receipt),
+                    evidence_kind="transport_receipt",
+                    evidence_ref=str(getattr(receipt, "attempt_id", "") or effect_id),
+                    now_ms=int(self._now().timestamp() * 1000),
+                )
+                await self.log.resolve_approval_claim(
+                    proposal.proposal_id,
+                    resolution="submitted",
+                    now_ms=int(self._now().timestamp() * 1000),
+                )
+                self._proposals.pop(proposal.proposal_id, None)
+                return {
+                    "status": "transport_accepted",
+                    "proposal_id": proposal.proposal_id,
+                    "effect_id": effect_id,
+                }
+            if state in {"failed", "cancelled", "expired", "blocked"}:
+                await self.log.mark_status(proposal.proposal_id, status=state)
+                self._proposals.pop(proposal.proposal_id, None)
+                return {"status": state, "proposal_id": proposal.proposal_id}
+            await self.log.mark_status(proposal.proposal_id, status="submitted")
+            return {
+                "status": "submitted",
+                "proposal_id": proposal.proposal_id,
+                "effect_id": effect_id,
+            }
+
+    def _reservation_limits(
+        self, proposal: SpeakupProposal
+    ) -> tuple[tuple[str, int, int, str], ...]:
+        """Every capacity dimension one proposal must acquire before sending.
+
+        An unsolicited initiating comment consumes both initiation and comment
+        capacity; a reaction consumes its own dimension. Authority to *try* is
+        enforced by the ledger transaction, so a zero limit denies the action
+        rather than silently skipping the check.
+        """
+        categories = self._reservation_categories(proposal)
+        limits: list[tuple[str, int, int, str]] = []
+        for category in categories:
+            window_limit, window_ms, window_kind = self.participation_limits_for(
+                channel=proposal.channel,
+                chat_id=proposal.chat_id,
+                category=category,
             )
-            await self.log.mark_sent(proposal.proposal_id, now=self._now().timestamp())
-            self._proposals.pop(proposal.proposal_id, None)
-            return {"status": "sent", "proposal_id": proposal.proposal_id}
+            limits.append((category, window_limit, window_ms, window_kind))
+        return tuple(limits)
+
+    @staticmethod
+    def _reservation_categories(proposal: SpeakupProposal) -> list[str]:
+        if proposal.action_type in {"reaction", "react"}:
+            return ["reaction"]
+        if proposal.trigger in {"continuation", "reply"}:
+            return ["comment"]
+        return ["initiation", "comment"]
+
+    def participation_limits_for(
+        self, *, channel: str, chat_id: str, category: str
+    ) -> tuple[int, int, str]:
+        """Effective reservation limits for one chat, from resolved policy.
+
+        The values come from the chat's participation policy; the module fallbacks
+        keep the legacy single-owner path working while participation is disabled.
+        """
+        try:
+            resolved = self.policy_engine.resolve_participation(channel, chat_id)
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            if category == "reaction":
+                return (
+                    int(resolved.max_reactions_per_window),
+                    int(resolved.comment_window_minutes) * 60_000,
+                    "rolling",
+                )
+            return (
+                int(resolved.max_unsolicited_comments_per_window),
+                int(resolved.comment_window_minutes) * 60_000,
+                "rolling",
+            )
+        fallback_limit, fallback_window = DEFAULT_PROPOSAL_RESERVATION_LIMITS[category]
+        window_kind = "calendar_day" if category == "initiation" else "rolling"
+        return (fallback_limit, fallback_window, window_kind)
+
+    async def available_actions_for(
+        self, *, channel: str, chat_id: str, now_ms: int
+    ) -> tuple[str, ...]:
+        """The action set the judge may choose from, after hard policy and budgets.
+
+        Silence is always possible. An action with zero remaining capacity is not
+        offered, so the provider is never asked a question whose answer is already
+        refused. This is a preflight, not an authorization: the ledger transaction
+        still decides at reservation time.
+        """
+        resolved = self.policy_engine.resolve_participation(channel, chat_id)
+        actions: list[str] = ["silence"]
+        if resolved.allow_reactions:
+            limit, window_ms, window_kind = self.participation_limits_for(
+                channel=channel, chat_id=chat_id, category="reaction"
+            )
+            if limit > 0 and await self._has_capacity(
+                channel=channel,
+                chat_id=chat_id,
+                category="reaction",
+                limit=limit,
+                window_ms=window_ms,
+                window_kind=window_kind,
+                now_ms=now_ms,
+            ):
+                actions.append("react")
+        if resolved.allow_continuation or resolved.allow_initiation:
+            limit, window_ms, window_kind = self.participation_limits_for(
+                channel=channel, chat_id=chat_id, category="comment"
+            )
+            if limit > 0 and await self._has_capacity(
+                channel=channel,
+                chat_id=chat_id,
+                category="comment",
+                limit=limit,
+                window_ms=window_ms,
+                window_kind=window_kind,
+                now_ms=now_ms,
+            ):
+                actions.append("comment")
+        return tuple(actions)
+
+    async def _has_capacity(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        category: str,
+        limit: int,
+        window_ms: int,
+        window_kind: str,
+        now_ms: int,
+    ) -> bool:
+        used = await self.log.consumed_slots(
+            channel=channel,
+            chat_id=chat_id,
+            category=category,
+            now_ms=now_ms,
+            window_ms=window_ms,
+            window_kind=window_kind,
+        )
+        return used < int(limit)
+
+    async def _load_proposal(self, proposal_id: str) -> SpeakupProposal | None:
+        """Rehydrate a proposal from durable storage (survives a restart).
+
+        A proposal whose durable row is already terminal is not reloaded as if it
+        were fresh: without this check a repeated commit of a long-sent proposal
+        would publish again from the ledger copy.
+        """
+        key = str(proposal_id)
+        cached = self._proposals.get(key)
+        if cached is not None:
+            return cached
+        row = await self.log.proposal_row(key)
+        if row is None:
+            return None
+        if str(row.get("status") or "") in TERMINAL_PROPOSAL_STATES:
+            return None
+        snapshot = row.get("context_snapshot_json") or "{}"
+        try:
+            parsed = json.loads(str(snapshot))
+        except ValueError:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        message = str(row.get("message") or "")
+        action_type = str(row.get("action_type") or "")
+        channel = str(row.get("channel") or "")
+        chat_id = str(row.get("chat_id") or "")
+        reply_to = parsed.get("reply_to_message_id")
+        revision = int(parsed.get("proposal_revision") or 1)
+        proposal = SpeakupProposal(
+            proposal_id=key,
+            channel=channel,
+            chat_id=chat_id,
+            message=message,
+            action_type=action_type,
+            profile=str(row.get("profile") or ""),
+            confidence=float(parsed.get("confidence") or 0.0),
+            trigger=str(row.get("trigger") or ""),
+            context_snapshot=parsed,
+            reply_to_message_id=str(reply_to) if reply_to else None,
+            proposal_revision=revision,
+            payload_hash=str(
+                parsed.get("payload_hash")
+                or canonical_payload_hash(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=message,
+                    action_type=action_type,
+                    reply_to_message_id=str(reply_to) if reply_to else None,
+                    revision=revision,
+                )
+            ),
+        )
+        self._proposals[key] = proposal
+        return proposal
 
     async def record_silent_pass(
         self,
