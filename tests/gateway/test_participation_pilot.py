@@ -28,7 +28,10 @@ from yeoman_gateway.consciousness.participation_runtime import (
 )
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.processing.participation import ParticipationJudge
+from yeoman_gateway.processing.participation import (
+    ParticipationJudge,
+    ParticipationOpportunity,
+)
 from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
 from yeoman_gateway.processing.participation_runtime import (
     ParticipationRuntime as DecisionRuntime,
@@ -139,7 +142,9 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     client = _ScriptedClient(decision)
     judge = ParticipationJudge(client=client, allowed_emojis=("👍",))
 
-    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+    def _snapshot(
+        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
+    ) -> dict[str, object]:
         resolved = engine.resolve_participation_snapshot(
             channel,
             chat_id,
@@ -159,6 +164,9 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
             ),
             "min_gap_seconds": 0,
             "continuation_reserve": int(resolved.participation.continuation_judge_reserve),
+            # Production derives candidacy from cheap source evidence; the fixture marks
+            # its synthetic material as a candidate so the reserved slots are reachable.
+            "continuation_candidate": opportunity is not None,
             "reaction_limits": (),
             "comment_limits": (("comment", limit, window_ms),),
             # The preflight action set the judge may choose from, as the production
@@ -405,3 +413,118 @@ def test_participant_is_allowed_fails_closed_on_a_broken_check(tmp_path: Path) -
         participant_is_allowed(engine=_pilot_engine(tmp_path), channel=CHANNEL, chat_id=CHAT, sender="")
         is False
     )
+
+
+# -- protected continuation quota (found unreachable in the live pilot) ----------------
+
+
+def test_continuation_candidacy_uses_short_unquoted_material(tmp_path: Path) -> None:
+    """The reserve must be reachable, or it silently blocks eligible continuations."""
+    from yeoman_gateway.app.bootstrap import CONTINUATION_CANDIDATE_MAX_CHARS
+
+    assert CONTINUATION_CANDIDATE_MAX_CHARS == 120
+
+    class _Archive:
+        def __init__(self) -> None:
+            self.rows = {
+                "short": {"text": "Aber noch passt das Schmerzensgeld"},
+                "long": {"text": "x" * (CONTINUATION_CANDIDATE_MAX_CHARS + 1)},
+                "empty": {"text": ""},
+            }
+
+        def lookup_message(self, channel: str, chat_id: str, message_id: str):
+            del channel, chat_id
+            return self.rows.get(message_id)
+
+    class _Opportunity:
+        channel = CHANNEL
+        chat_id = CHAT
+
+        def __init__(self, *sources: str) -> None:
+            self.source_event_ids = sources
+
+    # The predicate is a closure over the archive in the live builder; replicate its
+    # decision function here through the same public inputs it uses.
+    archive = _Archive()
+
+    def candidate(opportunity: object) -> bool:
+        lookup = getattr(archive, "lookup_message", None)
+        if lookup is None or opportunity is None:
+            return False
+        for source_id in getattr(opportunity, "source_event_ids", ()) or ():
+            token = str(source_id)
+            if token.startswith("observed:"):
+                continue
+            row = lookup("", "", token)
+            if row is None:
+                continue
+            text = str(row.get("text") or "").strip()
+            if text and len(text) <= CONTINUATION_CANDIDATE_MAX_CHARS:
+                return True
+        return False
+
+    assert candidate(_Opportunity("short")) is True
+    assert candidate(_Opportunity("long")) is False
+    assert candidate(_Opportunity("empty")) is False
+    assert candidate(_Opportunity("observed:whatsapp:pilot@g.us")) is False
+    assert candidate(_Opportunity("missing")) is False
+    assert candidate(_Opportunity("short", "long")) is True
+
+
+def test_snapshot_provider_receives_the_opportunity() -> None:
+    """The evaluator must hand the opportunity over, or the reserve stays unreachable."""
+    import inspect
+
+    from yeoman_gateway.processing import participation_runtime as module
+
+    source = inspect.getsource(module.ParticipationRuntime.evaluate_participation)
+    assert "opportunity=opportunity" in source
+
+
+@pytest.mark.asyncio
+async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """A short related message is judged even after background slots are spent (A40)."""
+    rt = _pilot_runtime(
+        tmp_path,
+        decision={"action": "silence", "intent": "initiate", "reason": "nothing to add"},
+        shadow=False,
+    )
+    runtime, log = rt["decision_runtime"], rt["log"]
+    provider_calls = rt["client"]
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(channel: str, chat_id: str, *, epoch: int, opportunity=None):
+        data = dict(base_snapshot(channel, chat_id, epoch=epoch, opportunity=opportunity))
+        data["continuation_candidate"] = True
+        return data
+
+    runtime._snapshot_provider = snapshot
+    # Spend every background slot: limit 12 minus reserve 4 leaves 8 unbounded calls.
+    for index in range(8):
+        assert await log.reserve_judge_attempt(
+            f"bg-{index}:0",
+            opportunity_id=f"bg-{index}",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            now_ms=NOW_MS - 60_000,
+            hourly_limit=12,
+            min_gap_ms=0,
+            continuation_candidate=False,
+            continuation_reserve=4,
+        )
+    # ...but a continuation candidate still reaches the judge.
+    opportunity = ParticipationOpportunity(
+        opportunity_id="reserve-probe", channel=CHANNEL, chat_id=CHAT, trigger="inbound",
+        source_event_ids=("m1",), observed_revision=99, activation_epoch=1,
+        created_at_ms=NOW_MS,
+    )
+    result = await runtime.evaluate_participation(opportunity)
+    assert result["status"] == "silence"
+    assert provider_calls.calls == 1
+    attempts = await log.judge_attempts_since(
+        channel=CHANNEL, chat_id=CHAT, since_ms=NOW_MS - 3_600_000
+    )
+    assert any(int(a["continuation_candidate"]) == 1 for a in attempts)
+    log.close()

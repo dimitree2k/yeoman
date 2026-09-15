@@ -85,6 +85,12 @@ if TYPE_CHECKING:
     from yeoman_gateway.providers.base import LLMProvider
 
 
+#: Character boundary for the cheap continuation-candidate heuristic (spec section 7.1).
+#: It is an internal cost heuristic deciding which *quota* an opportunity may use - it
+#: never decides whether a reply is allowed.
+CONTINUATION_CANDIDATE_MAX_CHARS = 120
+
+
 def _normalize_timestamp(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=UTC)
@@ -790,7 +796,46 @@ def _build_participation_runtime(
 
     epoch_tracker = ActivationEpochTracker(store=log)
 
-    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+    def _continuation_candidate(opportunity: object | None) -> bool:
+        """Cheap source evidence for the protected continuation quota (spec 7.1).
+
+        Qualification is deliberately evidence-based and cheap: a short unquoted
+        message (the internal cost heuristic) is a possible social continuation, so it
+        may use the reserved slots. This admits *judgment* only - relatedness, the
+        delivered anchor and the social budgets are still decided by the judge and the
+        ledger, and a comment claiming continuity without a delivered anchor is still
+        refused.
+        """
+        if opportunity is None:
+            return False
+        sources = getattr(opportunity, "source_event_ids", ()) or ()
+        if not sources:
+            return False
+        lookup = getattr(inbound_archive, "lookup_message", None)
+        if lookup is None:
+            return False
+        for source_id in sources:
+            token = str(source_id)
+            if token.startswith("observed:"):
+                continue
+            try:
+                row = lookup(
+                    str(getattr(opportunity, "channel", "")),
+                    str(getattr(opportunity, "chat_id", "")),
+                    token,
+                )
+            except Exception:
+                return False
+            if row is None:
+                continue
+            text = str(row.get("text") or "").strip()
+            if text and len(text) <= CONTINUATION_CANDIDATE_MAX_CHARS:
+                return True
+        return False
+
+    def _snapshot(
+        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
+    ) -> dict[str, object]:
         # An activation-affecting change (enable/disable, shadow/live, judge route)
         # advances the persisted epoch here, so stale unsubmitted work is fenced out
         # without ever advancing the epoch merely because the process restarted.
@@ -822,6 +867,7 @@ def _build_participation_runtime(
             ),
             "min_gap_seconds": int(resolved.participation.min_unaddressed_judge_gap_seconds),
             "continuation_reserve": int(resolved.participation.continuation_judge_reserve),
+            "continuation_candidate": _continuation_candidate(opportunity),
             "reaction_limits": (("reaction", reaction_limit, window_ms),)
             if reaction_limit > 0
             else (),

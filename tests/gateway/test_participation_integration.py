@@ -158,7 +158,9 @@ def _runtime(
     )
     config = _processing(enabled=enabled, shadow=shadow)
 
-    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+    def _snapshot(
+        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
+    ) -> dict[str, object]:
         resolved = engine.resolve_participation_snapshot(
             channel,
             chat_id,
@@ -384,7 +386,9 @@ async def test_zero_budget_chat_does_not_spend_a_provider_call(tmp_path: Path) -
 
 
 def _zero_action_snapshot(inner):
-    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+    def _snapshot(
+        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
+    ) -> dict[str, object]:
         snapshot = dict(inner(channel, chat_id, epoch=epoch))
         snapshot["allowed_actions"] = ["silence"]
         return snapshot
@@ -407,7 +411,9 @@ async def test_duplicate_opportunity_is_not_judged_twice(tmp_path: Path) -> None
 async def test_snapshot_failure_skips_without_a_provider_call(tmp_path: Path) -> None:
     runtime, judge, _context, log = _runtime(tmp_path, decision=SILENCE)
 
-    def _boom(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+    def _boom(
+        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
+    ) -> dict[str, object]:
         raise RuntimeError("store unavailable")
 
     runtime._snapshot_provider = _boom
