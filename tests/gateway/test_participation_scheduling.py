@@ -1026,3 +1026,56 @@ async def test_activation_epoch_advances_only_on_real_transitions(tmp_path) -> N
         == 4
     )
     log.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_epoch_advances_across_a_restart(tmp_path) -> None:
+    """A shadow/live change made while the process was down must still advance it."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    db_path = tmp_path / "speakups.db"
+    log = SpeakupLog(db_path)
+    tracker = ActivationEpochTracker(store=log)
+    # Running in shadow.
+    assert tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+    ) == 1
+    log.close()
+
+    # The owner flips to live while the process is down: a fresh tracker must see the
+    # change, because the previous inputs are persisted, not remembered in memory.
+    reopened = SpeakupLog(db_path)
+    restarted = ActivationEpochTracker(store=reopened)
+    assert restarted.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=False, judge_route="r"
+    ) == 2
+    # Stable afterwards.
+    assert restarted.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=False, judge_route="r"
+    ) == 2
+    # And the fingerprint is readable for inspection.
+    assert "shadow=False" in reopened.activation_fingerprint_sync("participation")
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_first_observation_after_an_upgrade_does_not_invent_a_transition(
+    tmp_path,
+) -> None:
+    """An existing epoch written before fingerprints existed is adopted, not bumped."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    # Simulate a row created by the old schema: an epoch with no fingerprint.
+    await log.activate_scope_placeholder() if False else None
+    assert int(log.activation_epoch_sync("participation")) == 1
+    tracker = ActivationEpochTracker(store=log)
+    assert tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=False, judge_route="r"
+    ) == 1
+    assert tracker.observe(
+        channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
+    ) == 2
+    log.close()

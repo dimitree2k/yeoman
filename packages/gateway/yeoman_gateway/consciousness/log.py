@@ -407,8 +407,19 @@ class SpeakupLog:
                 CREATE TABLE IF NOT EXISTS activation_state (
                     scope TEXT PRIMARY KEY,
                     activation_epoch INTEGER NOT NULL DEFAULT 1,
-                    updated_at_ms INTEGER NOT NULL
+                    updated_at_ms INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL DEFAULT ''
                 )
+                """
+            )
+            # Databases created before ``fingerprint`` existed get the column here, and
+            # the marker row below tells a later run that no transition has happened yet.
+            self._apply_activation_columns()
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO activation_state (
+                    scope, activation_epoch, updated_at_ms, fingerprint
+                ) VALUES ('participation', 1, CAST(strftime('%s','now') AS INTEGER) * 1000, '')
                 """
             )
             self._conn.commit()
@@ -430,6 +441,38 @@ class SpeakupLog:
             self._conn.execute(
                 f"ALTER TABLE delivery_reservations ADD COLUMN {name} {ddl}"
             )
+
+    def _apply_activation_columns(self) -> None:
+        """Additive, idempotent migration for existing activation state rows."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(activation_state)")
+        }
+        if existing and "fingerprint" not in existing:
+            self._conn.execute(
+                "ALTER TABLE activation_state ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"
+            )
+            # The row predates the column: record that its inputs are unknown, so the
+            # first observation adopts the current state instead of faking a transition.
+            self._conn.execute(
+                "UPDATE activation_state SET fingerprint = '' WHERE fingerprint IS NULL"
+            )
+
+    def _set_activation_fingerprint(
+        self, conn: sqlite3.Connection, scope: str, fingerprint: str
+    ) -> None:
+        """Record the inputs behind the current epoch, on databases old and new."""
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(activation_state)")
+        }
+        if not columns or "fingerprint" not in columns:
+            # A database created before this column existed: migrate it here, inside the
+            # caller's transaction, so the write and the migration cannot diverge.
+            self._apply_activation_columns()
+        conn.execute(
+            "UPDATE activation_state SET fingerprint = ? WHERE scope = ?",
+            (str(fingerprint), str(scope)),
+        )
 
     # -- transactions ------------------------------------------------------------------
 
@@ -750,8 +793,16 @@ class SpeakupLog:
             ).fetchone()
         return int(row["revision"]) if row is not None else 1
 
-    def activation_epoch_sync(self, scope: str = "participation") -> int:
-        """Synchronous read of the persisted activation epoch (schema-safe)."""
+    def activation_epoch_sync(
+        self, scope: str = "participation", *, fingerprint: str | None = None
+    ) -> int:
+        """Synchronous read of the persisted activation epoch (schema-safe).
+
+        Passing ``fingerprint`` also records the activation inputs that produced this
+        epoch. That record has to be durable: an in-process memory of "the last inputs
+        I saw" is empty after a restart, so a shadow/live change made while the process
+        was down would otherwise never advance the epoch.
+        """
         with self._write() as conn:
             row = conn.execute(
                 "SELECT activation_epoch FROM activation_state WHERE scope = ?",
@@ -765,8 +816,26 @@ class SpeakupLog:
                     """,
                     (str(scope),),
                 )
-                return 1
-            return int(row["activation_epoch"])
+                current = 1
+            else:
+                current = int(row["activation_epoch"])
+            if fingerprint is not None:
+                self._set_activation_fingerprint(conn, str(scope), str(fingerprint))
+            return current
+
+    def activation_fingerprint_sync(self, scope: str = "participation") -> str:
+        """The activation inputs recorded with the current epoch, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fingerprint FROM activation_state WHERE scope = ?",
+                (str(scope),),
+            ).fetchone()
+        if row is None:
+            return ""
+        try:
+            return str(row["fingerprint"] or "")
+        except (IndexError, KeyError):
+            return ""
 
     def claim_source_sync(
         self,
@@ -1440,7 +1509,11 @@ class SpeakupLog:
         return self.advance_activation_epoch_sync(scope, now_ms=now_ms)
 
     def advance_activation_epoch_sync(
-        self, scope: str = "participation", *, now_ms: int | None = None
+        self,
+        scope: str = "participation",
+        *,
+        now_ms: int | None = None,
+        fingerprint: str | None = None,
     ) -> int:
         """Atomically advance the persisted activation epoch and return the new value."""
         ts = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -1455,6 +1528,8 @@ class SpeakupLog:
                 """,
                 (str(scope), ts),
             )
+            if fingerprint is not None:
+                self._set_activation_fingerprint(conn, str(scope), str(fingerprint))
             row = conn.execute(
                 "SELECT activation_epoch FROM activation_state WHERE scope = ?",
                 (str(scope),),
