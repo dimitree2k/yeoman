@@ -354,6 +354,11 @@ class ParticipationJudge:
         # discard a correct "do not speak" decision over an unused field.
         anchor = _bounded_id(payload.get("anchor_message_id")) if speaks else None
         target = _bounded_id(payload.get("target_message_id")) if speaks else None
+        if speaks and target is None and action == "react":
+            # Trusted default: a reaction with no explicit target replies to the newest
+            # material in this opportunity, the same convention the rest of the gateway
+            # uses for an unaddressed reply. The model still cannot name a recipient.
+            target = view.newest_message_id
         if anchor is not None and anchor not in view.anchor_ids:
             raise ParticipationDecisionError("unknown_evidence", detail="anchor_not_supplied")
         if target is not None and target not in view.message_ids:
@@ -380,13 +385,15 @@ class ParticipationJudge:
             raise ParticipationDecisionError(
                 "invalid_response", detail="contribution_type_not_allowed"
             )
-        if (
-            action == "comment"
-            and intent == "initiate"
-            and view.allowed_contribution_types
-            and contribution is None
-        ):
-            raise ParticipationDecisionError("invalid_response", detail="contribution_type_required")
+        if action == "comment" and contribution is None:
+            # The category is an existing policy vocabulary value, not model authority.
+            # An unsolicited comment that adds information is an observation; the model
+            # may name a more specific one, but omitting it is not a failed decision.
+            contribution = (
+                "observation"
+                if "observation" in view.allowed_contribution_types
+                else next(iter(sorted(view.allowed_contribution_types)), None)
+            )
         if action == "comment" and not purpose:
             raise ParticipationDecisionError("invalid_response", detail="purpose_required")
 
@@ -419,6 +426,7 @@ class _JudgeContext:
     anchor_ids: frozenset[str]
     allowed_actions: tuple[str, ...]
     allowed_contribution_types: frozenset[str]
+    newest_message_id: str | None
     guidance: str
     direct_addressed: bool
     allows_continuation: bool
@@ -437,12 +445,14 @@ class _JudgeContext:
 
         evidence: set[str] = set()
         message_ids: set[str] = set()
+        ordered_ids: list[str] = []
         lines: list[str] = []
         for item in messages:
             event_id = str(item.get("event_id") or item.get("message_id") or "").strip()
             if event_id:
                 evidence.add(event_id)
                 message_ids.add(event_id)
+                ordered_ids.append(event_id)
             sender = str(item.get("sender") or item.get("speaker") or "?").strip() or "?"
             text = str(item.get("text") or "").strip()
             media = str(item.get("media_summary") or "").strip()
@@ -476,6 +486,7 @@ class _JudgeContext:
         return cls(
             evidence_ids=frozenset(evidence),
             message_ids=frozenset(message_ids),
+            newest_message_id=(ordered_ids[-1] if ordered_ids else None),
             anchor_ids=frozenset(anchor_ids),
             allowed_actions=allowed_actions,
             allowed_contribution_types=contribution_types,

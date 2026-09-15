@@ -183,8 +183,7 @@ async def test_empty_response_raises_a_classified_failure() -> None:
         ("not json at all", "invalid_response"),
         (json.dumps({"action": "shout", "intent": "initiate"}), "invalid_response"),
         (json.dumps({"action": "silence", "intent": "mindread"}), "invalid_response"),
-        (json.dumps({"action": "comment", "intent": "initiate", "purpose": "x", "extra": 1}),
-         "invalid_response"),
+        ('{"action": "comment", "intent": "initiate"}', "invalid_response"),
     ],
 )
 async def test_malformed_or_unknown_responses_fail_closed(answer: str, reason: str) -> None:
@@ -261,12 +260,13 @@ async def test_unapproved_emoji_is_refused() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reaction_without_target_is_refused() -> None:
+async def test_reaction_without_a_target_needs_some_retained_message() -> None:
+    """With no retained message there is nothing to react to, so it fails closed."""
     judge = ParticipationJudge(client=_Client(_payload(
         action="react", intent="initiate", emoji=EMOJI
     )), allowed_emojis=(EMOJI,))
     with pytest.raises(ParticipationDecisionError) as error:
-        await judge.decide(_opportunity(), _context())
+        await judge.decide(_opportunity(), _context(messages=[], anchors=[]))
     assert error.value.reason == "missing_target"
 
 
@@ -492,14 +492,14 @@ async def test_bracketed_evidence_is_still_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initiate_comment_without_contribution_type_is_rejected() -> None:
+async def test_unknown_response_fields_are_ignored_not_trusted() -> None:
+    """An extra field is ignored; the decision still has to satisfy the contract."""
     judge = ParticipationJudge(client=_Client(_payload(
-        action="comment", intent="initiate", purpose="x", contribution_type=None
+        action="comment", intent="initiate", purpose="x", contribution_type=None, extra=1
     )), allowed_emojis=(EMOJI,))
-    with pytest.raises(ParticipationDecisionError) as error:
-        await judge.decide(_opportunity(), _context())
-    assert error.value.reason == "invalid_response"
-    assert error.value.detail == "contribution_type_required"
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.action == "comment"
+    assert decision.contribution_type == "observation"
 
 
 def test_opportunity_identity_has_no_control_characters() -> None:
@@ -551,3 +551,43 @@ async def test_speaking_decisions_still_validate_every_relevant_field() -> None:
         with pytest.raises(ParticipationDecisionError) as error:
             await judge.decide(_opportunity(), _context())
         assert error.value.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_reaction_without_an_explicit_target_replies_to_the_newest_message() -> None:
+    """A trusted default, not model authority: the newest retained source message."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="react", intent="initiate", emoji=EMOJI, target_message_id=None
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.action == "react"
+    assert decision.target_message_id == "m2"  # the newest of m1, m2
+
+
+@pytest.mark.asyncio
+async def test_comment_without_a_category_defaults_to_observation() -> None:
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="initiate", purpose="answer briefly", contribution_type=None
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.contribution_type == "observation"
+
+
+@pytest.mark.asyncio
+async def test_comment_without_a_category_and_no_observation_in_vocabulary() -> None:
+    """The fallback never invents a category outside the effective vocabulary."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="initiate", purpose="answer briefly", contribution_type=None
+    )), allowed_emojis=(EMOJI,))
+    decision = await judge.decide(
+        _opportunity(), _context(allowed_contribution_types=["light_humor"])
+    )
+    assert decision.contribution_type == "light_humor"
+
+
+@pytest.mark.asyncio
+async def test_model_can_still_name_a_specific_category() -> None:
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="initiate", purpose="x", contribution_type="light_humor"
+    )), allowed_emojis=(EMOJI,))
+    assert (await judge.decide(_opportunity(), _context())).contribution_type == "light_humor"
