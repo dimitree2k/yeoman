@@ -861,22 +861,9 @@ def _build_participation_runtime(
         return tuple(sorted(set(senders.values())))
 
     def _is_participant_allowed(channel: str, chat_id: str, sender: str) -> bool:
-        if policy_engine is None or not sender:
-            return False
-        from yeoman_gateway.policy.engine import ActorContext
-
-        try:
-            decision = policy_engine.evaluate(  # type: ignore[attr-defined]
-                ActorContext(
-                    channel=channel,
-                    chat_id=chat_id,
-                    sender_primary=str(sender),
-                    sender_aliases=[str(sender)],
-                )
-            )
-        except Exception:
-            return False
-        return bool(getattr(decision, "accept_message", False))
+        return participant_is_allowed(
+            engine=policy_engine, channel=channel, chat_id=chat_id, sender=sender
+        )
 
     submission = _ParticipationSubmission(responder=responder)
     reactor = _ParticipationReactor(responder=responder)
@@ -1022,6 +1009,44 @@ def _participation_event(opportunity: object, decision: object) -> tuple[object,
         persona_text=None,
     )
     return event, policy_decision
+
+
+def participant_is_allowed(
+    *, engine: object | None, channel: str, chat_id: str, sender: str
+) -> bool:
+    """Whether one originating participant may be answered in this exact chat.
+
+    A failure here is a *denial*: the check exists so that a permitted service
+    principal can never stand in for the authorization of the person whose material
+    is being answered. It therefore fails closed, but it also has to be correct - a
+    call-signature mistake would otherwise masquerade as "the sender is not allowed"
+    and silently disable participation for every chat.
+    """
+    if engine is None or not str(sender or "").strip():
+        return False
+    from yeoman_gateway.policy.engine import ActorContext
+
+    try:
+        decision = engine.evaluate(  # type: ignore[attr-defined]
+            ActorContext(
+                channel=str(channel),
+                chat_id=str(chat_id),
+                sender_primary=str(sender),
+                sender_aliases=[str(sender)],
+                is_group=str(chat_id).endswith("@g.us"),
+                mentioned_bot=False,
+                reply_to_bot=False,
+            ),
+            all_tools=set(),
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken check must not authorise
+        logger.warning(
+            "participation participant check failed chat={} error_type={}",
+            str(chat_id)[:24],
+            type(exc).__name__,
+        )
+        return False
+    return bool(getattr(decision, "accept_message", False))
 
 
 def _archive_feedback_reader(archive: object | None, reconciler: object | None):
