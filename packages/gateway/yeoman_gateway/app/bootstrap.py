@@ -2483,10 +2483,22 @@ def build_gateway_runtime(
                     policy_engine.resolve_participation(channel, chat_id).enabled
                 ),
             )
-            bus.subscribe_event(
-                "InboundObservedEvent",
-                lambda event: _ingress.handle_event(event),  # type: ignore[arg-type,return-value]
-            )
+
+            async def _on_observed_inbound(event: object) -> None:
+                """Event-bus adapter: the bus awaits every handler, so this one awaits.
+
+                The ingress itself stays synchronous and bounded: it claims the source,
+                computes the durable revision and offers to the scheduler without
+                awaiting a judge, generator or transport.
+                """
+                try:
+                    _ingress.handle_event(event)
+                except Exception as exc:  # noqa: BLE001 - one producer must not fail dispatch
+                    logger.warning(
+                        "participation_ingress_failed error_type={}", type(exc).__name__
+                    )
+
+            bus.subscribe_event("InboundObservedEvent", _on_observed_inbound)
 
         def _trigger(channel: str, chat_id: str, trigger: str) -> object:
             """Offer a bounded opportunity when autonomy applies, else legacy tick.
