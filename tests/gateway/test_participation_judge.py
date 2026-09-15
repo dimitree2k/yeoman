@@ -466,3 +466,48 @@ async def test_prompt_offers_only_coherent_intents() -> None:
 
     with_anchor = _JudgeContext.from_mapping(_context())
     assert "continue" in judge._allowed_intents(with_anchor)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_evidence_ids_are_labelled_so_the_model_cannot_copy_brackets() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    await judge.decide(_opportunity(), _context())
+    prompt = client.calls[0][1]["content"]
+    # The id is explicitly labelled, not presented as a bracketed prefix.
+    assert 'id="m1" from=anna' in prompt
+    assert "[m1]" not in prompt
+    assert "without quotes, brackets" in client.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_bracketed_evidence_is_still_rejected() -> None:
+    """A display-decorated id is not a trusted id: it fails rather than being repaired."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="initiate", purpose="x", evidence_ids=["[m1]"]
+    )), allowed_emojis=(EMOJI,))
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context())
+    assert error.value.reason == "unknown_evidence"
+
+
+@pytest.mark.asyncio
+async def test_initiate_comment_without_contribution_type_is_rejected() -> None:
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment", intent="initiate", purpose="x", contribution_type=None
+    )), allowed_emojis=(EMOJI,))
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context())
+    assert error.value.reason == "invalid_response"
+    assert error.value.detail == "contribution_type_required"
+
+
+def test_opportunity_identity_has_no_control_characters() -> None:
+    """A control character in the hash input would be JSON-escaped in prompts."""
+    from yeoman_gateway.consciousness.opportunities import opportunity_id_for
+
+    value = opportunity_id_for(
+        channel="whatsapp", chat_id="c@g.us", activation_epoch=1, lane="production",
+        source_event_ids=("m1",), observed_revision=1,
+    )
+    assert value.isprintable()
