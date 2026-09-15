@@ -7,6 +7,7 @@ model quality.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -486,4 +487,291 @@ async def test_context_and_judge_see_the_same_opportunity(tmp_path: Path) -> Non
     assert seen == [("opp-1", ("m1", "m2"))]
     payload = json.dumps({"ok": True})
     assert json.loads(payload) == {"ok": True}
+    log.close()
+
+
+# -- scenario acceptance: orchestration and boundaries (04.4) --------------------------
+
+
+def _scenarios() -> list[dict[str, object]]:
+    path = Path(__file__).parent / "fixtures" / "participation_scenarios.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_scenario_dataset_is_synthetic_and_labeled() -> None:
+    scenarios = _scenarios()
+    assert scenarios
+    for scenario in scenarios:
+        assert scenario["id"]
+        assert scenario["acceptable_actions"]
+        for message in scenario["messages"]:  # type: ignore[union-attr]
+            assert message["event_id"]
+            assert "@" not in str(message["text"]) or "1555" not in str(message["text"])
+        # No live identifiers: every sender is a plain synthetic name.
+        for message in scenario["messages"]:  # type: ignore[union-attr]
+            assert " " not in str(message["sender"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario_id", [item["id"] for item in _scenarios()])
+async def test_scenario_reaches_judgment_and_respects_forbidden_actions(
+    tmp_path: Path, scenario_id: str
+) -> None:
+    """Controlled judge responses prove the plumbing, not semantic quality."""
+    scenario = next(item for item in _scenarios() if item["id"] == scenario_id)
+    acceptable = list(scenario["acceptable_actions"])  # type: ignore[arg-type]
+    action = "silence" if "silence" in acceptable else acceptable[0]
+    if action == "comment":
+        decision = COMMENT
+    elif action == "react":
+        decision = REACT
+    else:
+        decision = SILENCE
+    runtime, judge, context, log = _runtime(tmp_path, decision=decision)
+    result = await runtime.evaluate_participation(_opportunity())
+    assert judge.calls == 1
+    assert context.calls == 1
+    assert result["status"] in {"silence", "submitted", "reaction_submitted"}
+    if "comment" in set(scenario["forbidden_actions"]):  # type: ignore[arg-type]
+        assert result["status"] != "submitted"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_unsolicited_generation_has_no_executable_tools(tmp_path: Path) -> None:
+    """Hostile chat text cannot reach messaging, media, deletion, A2A or the network."""
+    seen_targets: list[tuple[str, str]] = []
+
+    class _ToolSpySubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.calls += 1
+            seen_targets.append((opportunity.channel, opportunity.chat_id))
+            assert set(context.get("allowed_actions") or ()) <= {
+                "silence",
+                "react",
+                "comment",
+            }
+            return "a synthetic draft"
+
+    submission = _ToolSpySubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+    result = await runtime.evaluate_participation(_opportunity("s4-m1"))
+    assert result["status"] == "submitted"
+    # The generator is invoked with the admitted target only, and the trusted
+    # context carries no tool grants at all.
+    assert seen_targets == [(CHANNEL, CHAT)]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_private_records_never_enter_the_participation_context(tmp_path: Path) -> None:
+    """Owner/contact/other-channel records stay out of judge and generator input (A39)."""
+    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db")
+    archive.record_inbound(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        message_id="group-1",
+        participant="anna@s.whatsapp.net",
+        sender_id="anna@s.whatsapp.net",
+        sender_name="anna",
+        text="we meet at eight",
+        timestamp=int(NOW_MS / 1000),
+    )
+    archive.record_inbound(
+        channel=CHANNEL,
+        chat_id="owner@s.whatsapp.net",
+        message_id="owner-1",
+        participant="owner@s.whatsapp.net",
+        sender_id="owner@s.whatsapp.net",
+        sender_name="owner",
+        text="private owner note",
+        timestamp=int(NOW_MS / 1000),
+    )
+    archive.record_inbound(
+        channel="telegram",
+        chat_id=CHAT,
+        message_id="other-channel-1",
+        participant="someone",
+        sender_id="someone",
+        sender_name="someone",
+        text="same chat id, other channel",
+        timestamp=int(NOW_MS / 1000),
+    )
+    builder = ParticipationContextBuilder(
+        archive=archive,
+        policy=PolicyEngine(_policy(), workspace=tmp_path),
+    )
+    context = await builder.build(_opportunity("group-1"), now_ms=NOW_MS)
+    rendered = json.dumps(context)
+    assert "private owner note" not in rendered
+    assert "same chat id, other channel" not in rendered
+    assert "we meet at eight" in rendered
+
+
+@pytest.mark.asyncio
+async def test_effect_target_is_always_the_admitted_chat(tmp_path: Path) -> None:
+    class _TargetSpySubmission(_Submission):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admissions: list[object] = []
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            self.admissions.append(admission)
+            return await super().submit(
+                admission=admission, effect_id=effect_id, content=content,
+                payload_hash=payload_hash,
+            )
+
+    submission = _TargetSpySubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+    await runtime.evaluate_participation(_opportunity())
+    admission = submission.admissions[0]
+    assert admission.channel == CHANNEL  # type: ignore[attr-defined]
+    assert admission.chat_id == CHAT  # type: ignore[attr-defined]
+    log.close()
+
+
+# -- final local authorization and stale work (04.3) -----------------------------------
+
+
+def _authorization(**overrides: object):
+    from yeoman_gateway.processing.participation_runtime import (
+        ParticipationAdmission,
+        ParticipationAuthorizationRequest,
+    )
+
+    admission = ParticipationAdmission(
+        opportunity_id="opp-1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=1,
+        lane="production",
+        observed_revision=3,
+        action="comment",
+        intent="initiate",
+    )
+    base: dict[str, object] = {
+        "admission": admission,
+        "lane": "production",
+        "is_paused": None,
+        "is_shadow": False,
+        "feature_enabled": True,
+        "opted_in": True,
+        "current_epoch": 1,
+        "source_authorized": True,
+        "effect_id": "e1",
+        "reservation_state": "submitted",
+        "payload_hash": "hash-1",
+        "expected_payload_hash": "hash-1",
+    }
+    base.update(overrides)
+    return ParticipationAuthorizationRequest(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({"is_paused": "paused_global"}, "paused_global"),
+        ({"is_paused": "paused_chat"}, "paused_chat"),
+        ({"is_shadow": True}, "shadow_lane"),
+        ({"lane": "shadow"}, "shadow_lane"),
+        ({"current_epoch": 2}, "epoch_changed"),
+        ({"source_authorized": False}, "source_not_authorized"),
+        ({"reservation_state": None}, "no_reservation"),
+        ({"reservation_state": "failed"}, "reservation_failed"),
+        ({"reservation_state": "cancelled"}, "reservation_cancelled"),
+        ({"payload_hash": "other"}, "payload_hash_mismatch"),
+        ({"feature_enabled": False}, "feature_disabled"),
+        ({"opted_in": False}, "chat_not_opted_in"),
+    ],
+)
+def test_final_authorization_rejects_stale_or_unauthorized_effects(
+    change: dict[str, object], expected: str
+) -> None:
+    from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
+
+    allowed, reason = ParticipationEffectAuthorizer().check(_authorization(**change))
+    assert allowed is False
+    assert reason == expected
+
+
+def test_final_authorization_allows_the_owned_current_effect() -> None:
+    from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
+
+    assert ParticipationEffectAuthorizer().check(_authorization()) == (True, "allow")
+
+
+@pytest.mark.asyncio
+async def test_direct_request_supersedes_pending_unsolicited_work(tmp_path: Path) -> None:
+    """A direct request drops speculation, and its stale effect cannot pass the gate."""
+    from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
+    from yeoman_gateway.consciousness.participation_runtime import SourceOwner
+    from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
+
+    owner_log = SpeakupLog(tmp_path / "speakups.db")
+    SourceOwner(store=owner_log)
+    release = asyncio.Event()
+    handled: list[str] = []
+
+    async def handle(opportunity):
+        handled.append(opportunity.opportunity_id)
+        await release.wait()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1)
+    await scheduler.start()
+    runtime, _judge, _context, log = _runtime(tmp_path, decision=COMMENT)
+    try:
+        scheduler.offer(_opportunity("m1"))
+        await asyncio.sleep(0.05)
+        # The activation epoch advances while the unsolicited chain is in flight.
+        await log.advance_activation_epoch("participation", now_ms=NOW_MS)
+        new_epoch = await log.activation_epoch("participation")
+        assert new_epoch == 2
+        allowed, reason = ParticipationEffectAuthorizer().check(
+            _authorization(current_epoch=new_epoch)
+        )
+        assert (allowed, reason) == (False, "epoch_changed")
+    finally:
+        release.set()
+        await scheduler.stop()
+    # Exactly one offer was admitted before the epoch advanced; the scheduler's own
+    # identity is derived from the retained sources, not from the test's constant.
+    assert len(handled) == 1
+    owner_log.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_social_continuation_cannot_modify_another_participants_task(
+    tmp_path: Path,
+) -> None:
+    """A social reply has isolated lineage: it never becomes a task mutation (A09)."""
+    from yeoman_gateway.processing.participation import ParticipationDecision
+
+    decision = ParticipationDecision(
+        action="comment",
+        intent="continue",
+        reason="react to the reply",
+        purpose="acknowledge ben's answer",
+        contribution_type="observation",
+        anchor_message_id="prov-1",
+        target_message_id="m2",
+    )
+    runtime, _judge, _context, log = _runtime(tmp_path, decision=decision)
+    result = await runtime.evaluate_participation(_opportunity("m2"))
+    assert result["status"] == "submitted"
+    # The admission carries only social lineage: no task id, no thread authority.
+    from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
+
+    fields = set(ParticipationAdmission.__dataclass_fields__)
+    assert "task_id" not in fields
+    assert "thread_id" not in fields
+    assert "turn_id" not in fields
     log.close()

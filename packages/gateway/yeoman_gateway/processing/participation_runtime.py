@@ -438,10 +438,63 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+@dataclass(frozen=True, slots=True)
+class ParticipationAuthorizationRequest:
+    """Everything the local final check needs, resolved without awaiting anything."""
+
+    admission: ParticipationAdmission
+    lane: str
+    is_paused: str | None
+    is_shadow: bool
+    feature_enabled: bool
+    opted_in: bool
+    current_epoch: int
+    source_authorized: bool
+    effect_id: str
+    reservation_state: str | None
+    payload_hash: str
+    expected_payload_hash: str
+
+
+class ParticipationEffectAuthorizer:
+    """The last local gate before transport for a participation-origin effect.
+
+    The check is deliberately synchronous and must be called with no intervening
+    ``await`` before the transport hand-off: a pause that lands between the check and
+    the hand-off cannot retroactively stop a request that has already started, and
+    pretending otherwise would be a false promise.
+    """
+
+    def check(self, request: ParticipationAuthorizationRequest) -> tuple[bool, str]:
+        if request.is_shadow or request.lane == "shadow":
+            return False, "shadow_lane"
+        if not request.feature_enabled:
+            return False, "feature_disabled"
+        if not request.opted_in:
+            return False, "chat_not_opted_in"
+        if request.current_epoch != request.admission.activation_epoch:
+            return False, "epoch_changed"
+        if request.is_paused:
+            return False, str(request.is_paused)
+        if not request.source_authorized:
+            return False, "source_not_authorized"
+        if request.reservation_state is None:
+            return False, "no_reservation"
+        if request.reservation_state in {"failed", "cancelled", "expired"}:
+            return False, f"reservation_{request.reservation_state}"
+        if request.expected_payload_hash and (
+            request.payload_hash != request.expected_payload_hash
+        ):
+            return False, "payload_hash_mismatch"
+        return True, "allow"
+
+
 __all__ = [
     "COUNTERS",
     "ParticipationAdmission",
+    "ParticipationAuthorizationRequest",
     "ParticipationBlockedError",
+    "ParticipationEffectAuthorizer",
     "ParticipationRuntime",
     "SnapshotProvider",
 ]
