@@ -1208,12 +1208,29 @@ def build_processing_gate(
 
     from yeoman_gateway.processing.policy import AdapterSnapshotProvider, IngestGate
 
+    def _participation_owns(channel: str, chat_id: str) -> bool:
+        """Whether the participation lane is this chat's production owner.
+
+        Only a fully valid activation counts: the global switch on, the chat explicitly
+        opted in, and a resolvable participant-safe policy. Anything else leaves the
+        legacy ambient path in charge, which is the safe direction.
+        """
+        participation = getattr(config.processing, "participation", None)
+        if participation is None or not bool(getattr(participation, "enabled", False)):
+            return False
+        try:
+            resolved = policy_adapter.participation_policy(channel, chat_id)
+        except Exception:  # noqa: BLE001 - an unreadable policy keeps legacy ownership
+            return False
+        return bool(resolved)
+
     return IngestGate(
         config=config.processing,
         store=store,
         snapshots=AdapterSnapshotProvider(policy_adapter),
         evaluate=lambda request: policy_adapter.evaluate(request.event),
         threads=threads if threads is not None else build_thread_registry(config, store),
+        participation=_participation_owns,
     )
 
 
