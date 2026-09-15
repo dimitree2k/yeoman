@@ -138,7 +138,9 @@ class ParticipationContextBuilder:
                     continue
                 anchors.append(dict(anchor))
 
-        resolved_actions = tuple(allowed_actions or ("silence",))
+        resolved_actions = (
+            tuple(allowed_actions) if allowed_actions else self._default_actions(opportunity)
+        )
         context: dict[str, object] = {
             "channel": opportunity.channel,
             "chat_id": opportunity.chat_id,
@@ -195,6 +197,26 @@ class ParticipationContextBuilder:
             profile = str(getattr(resolved, "spontaneity_profile", "") or "").strip()
             return tuple(sorted(ConsciousnessTools._default_allowed_actions(profile)))  # noqa: SLF001
         return tuple(str(item) for item in actions)
+
+    def _default_actions(self, opportunity: ParticipationOpportunity) -> tuple[str, ...]:
+        """The action set when the caller does not supply one.
+
+        Silence is always possible; a reaction and a comment are offered only when the
+        resolved participation policy for this chat allows them. An empty set here
+        would make every judgment fail as ``action_not_allowed`` instead of letting a
+        permitted comment through.
+        """
+        resolved = self._resolved(opportunity)
+        if resolved is None:
+            return ("silence",)
+        actions = ["silence"]
+        if bool(getattr(resolved, "allow_reactions", True)):
+            actions.append("react")
+        if bool(getattr(resolved, "allow_initiation", True)) or bool(
+            getattr(resolved, "allow_continuation", True)
+        ):
+            actions.append("comment")
+        return tuple(actions)
 
     def _budgets(self, opportunity: ParticipationOpportunity) -> dict[str, int]:
         resolved = self._resolved(opportunity)
