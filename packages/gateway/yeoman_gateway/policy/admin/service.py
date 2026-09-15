@@ -50,8 +50,10 @@ class PolicyAdminService:
         apply_channels: set[str],
         on_policy_applied: Callable[[PolicyConfig], None] | None = None,
         group_subject_resolver: Callable[[list[str]], dict[str, str]] | None = None,
+        processing_config: object | None = None,
     ) -> None:
         self._policy_path = policy_path
+        self._processing_config = processing_config
         self._workspace = workspace
         self._known_tools = set(known_tools)
         self._apply_channels = set(apply_channels)
@@ -649,6 +651,74 @@ class PolicyAdminService:
             source = "chat"
         return source
 
+    def _participation_lines(
+        self, engine: object, effective: object, chat_id: str
+    ) -> list[str]:
+        """Effective autonomous-participation settings with their origin layers.
+
+        Shown for every chat so an operator can see why a chat is (or is not)
+        participating: the per-chat opt-in, the global switch and shadow lane, the
+        model route, the initiation/comment/reaction budgets and their UTC
+        accounting semantics.
+        """
+        resolved = getattr(effective, "participation", None)
+        if resolved is None:
+            return []
+        sources = (
+            engine.participation_sources("whatsapp", chat_id)
+            if hasattr(engine, "participation_sources")
+            else {}
+        )
+        global_config = getattr(self._processing_config, "participation", None)
+        global_enabled = bool(getattr(global_config, "enabled", False))
+        shadow = bool(getattr(global_config, "shadow", True))
+        judge_route = str(getattr(global_config, "judge_route", "") or "")
+        opted_in = bool(getattr(resolved, "enabled", False))
+        state = "live" if (opted_in and global_enabled and not shadow) else "off"
+        if opted_in and global_enabled and shadow:
+            state = "shadow"
+        if opted_in and not global_enabled:
+            state = "opted_in_globally_disabled"
+        lines = [
+            f"participation={state} optIn={opted_in} "
+            f"(source={sources.get('enabled', 'default')})",
+            f"participation.global.enabled={global_enabled} shadow={shadow} "
+            f"judgeRoute={judge_route or '-'}",
+            "participation.allowInitiation="
+            f"{getattr(resolved, 'allow_initiation', True)} "
+            "(source="
+            f"{sources.get('allow_initiation', 'default')})"
+            " allowContinuation="
+            f"{getattr(resolved, 'allow_continuation', True)}"
+            " allowReactions="
+            f"{getattr(resolved, 'allow_reactions', True)}",
+            "participation.judgeCallsPerHour="
+            f"{getattr(resolved, 'max_unaddressed_judge_calls_per_hour', 0)}"
+            " reserve="
+            f"{getattr(resolved, 'continuation_judge_reserve', 0)}"
+            " minGapSeconds="
+            f"{getattr(resolved, 'min_unaddressed_judge_gap_seconds', 0)}",
+            "participation.unsolicitedComments="
+            f"{getattr(resolved, 'max_unsolicited_comments_per_window', 0)}"
+            " per "
+            f"{getattr(resolved, 'comment_window_minutes', 0)}min "
+            "reactionsPerWindow="
+            f"{getattr(resolved, 'max_reactions_per_window', 0)}",
+            "participation.accounting=UTC calendar day (initiation) "
+            "and rolling windows (comment/reaction); "
+            "quietHours keep their existing UTC interpretation",
+            f"participation.guidance (source={sources.get('guidance', 'default')}): "
+            f"{self._truncate_guidance(getattr(resolved, 'guidance', ''))}",
+        ]
+        return lines
+
+    @staticmethod
+    def _truncate_guidance(value: object, limit: int = 160) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            return "-"
+        return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
     def _handle_help(
         self,
         policy: PolicyConfig,
@@ -885,6 +955,7 @@ class PolicyAdminService:
             f"allowedTools.tools={','.join(effective.allowed_tools_tools)}",
             f"allowedTools.deny={','.join(effective.allowed_tools_deny)}",
         ]
+        lines.extend(self._participation_lines(engine, effective, chat_id))
         return self._result(
             outcome="noop",
             actor=actor,

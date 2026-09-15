@@ -125,10 +125,12 @@ class EnginePolicyAdapter(PolicyPort):
         processing_store: Any | None = None,
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
+        processing_config: Any | None = None,
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
         self._policy_path = policy_path
+        self._processing_config = processing_config
         self._session_manager = session_manager
         self._processing_store = processing_store
         self._private_handoff_store = private_handoff_store
@@ -192,6 +194,7 @@ class EnginePolicyAdapter(PolicyPort):
                 apply_channels=apply_channels,
                 on_policy_applied=self._on_policy_applied,
                 group_subject_resolver=lambda ids: self._list_group_subjects_from_bridge(ids),
+                processing_config=self._processing_config,
             )
 
     def _active_private_handoff(self, event: InboundEvent) -> "PrivateHandoff | None":

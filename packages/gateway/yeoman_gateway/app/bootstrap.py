@@ -964,6 +964,7 @@ def build_gateway_runtime(
         processing_store=processing_store,
         private_handoff_store=private_handoffs,
         workspace=workspace,
+        processing_config=config.processing,
     )
     from yeoman_gateway.processing.quota import CapabilityQuotaGovernance
 
