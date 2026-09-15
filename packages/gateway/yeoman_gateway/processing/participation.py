@@ -381,14 +381,12 @@ class ParticipationJudge:
         purpose = _bounded_text(payload.get("purpose"), MAX_PURPOSE_CHARS)
         reason = _bounded_text(payload.get("reason"), MAX_REASON_CHARS)
         contribution = _bounded_id(payload.get("contribution_type")) if speaks else None
-        if contribution is not None and contribution not in view.allowed_contribution_types:
-            raise ParticipationDecisionError(
-                "invalid_response", detail="contribution_type_not_allowed"
-            )
-        if action == "comment" and contribution is None:
-            # The category is an existing policy vocabulary value, not model authority.
-            # An unsolicited comment that adds information is an observation; the model
-            # may name a more specific one, but omitting it is not a failed decision.
+        if action == "comment" and contribution not in view.allowed_contribution_types:
+            # The category is an existing policy vocabulary value, never model authority.
+            # A model that omits it, or names one the owner did not configure, gets the
+            # neutral configured category rather than losing an otherwise useful
+            # decision: the field selects how the comment is labelled, it does not grant
+            # anything and it is not a safety property.
             contribution = (
                 "observation"
                 if "observation" in view.allowed_contribution_types
