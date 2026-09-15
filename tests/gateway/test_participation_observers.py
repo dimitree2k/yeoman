@@ -342,3 +342,121 @@ async def test_inbound_ingress_revisions_are_durable_and_monotonic(tmp_path: Pat
     # A restart never hands out a smaller revision for the same chat.
     assert reopened.next_source_revision_sync(channel="whatsapp", chat_id=CHAT) == 3
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_ingress_event_handler_is_awaitable_and_never_breaks_dispatch(
+    tmp_path: Path,
+) -> None:
+    """The bus awaits every handler: a non-coroutine handler aborts the whole dispatch.
+
+    This is not hypothetical - a synchronous handler in this position raised
+    "'bool' object can't be awaited" in the live gateway and skipped every handler
+    registered after it (the legacy observers).
+    """
+    import inspect
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationIngress,
+        ParticipationRuntime,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    seen: list[str] = []
+
+    async def handle(opportunity) -> None:
+        seen.append(opportunity.trigger)
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1, ttl_seconds=600)
+    await scheduler.start()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler, source_owner=owner, activation_epoch=1, is_enabled=lambda c, i: True
+    )
+    ingress = ParticipationIngress(runtime=runtime, ledger=log, is_active=lambda c, i: True)
+
+    async def on_observed(event: object) -> None:
+        ingress.handle_event(event)
+
+    bus = MessageBus()
+    bus.subscribe_event("InboundObservedEvent", on_observed)
+    later: list[str] = []
+
+    async def after(event: object) -> None:
+        del event
+        later.append("ran")
+
+    bus.subscribe_event("InboundObservedEvent", after)
+    try:
+        assert inspect.iscoroutinefunction(on_observed)
+        dispatcher = asyncio.create_task(bus.dispatch_events())
+        try:
+            await bus.publish_event(_observed(100.0, message_id="m1"))
+            for _ in range(100):
+                if later:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            bus.stop()
+            dispatcher.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher
+        # Both the producer and every later handler ran.
+        assert later == ["ran"]
+        assert seen == ["inbound"]
+    finally:
+        await scheduler.stop()
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_ingress_failure_does_not_abort_event_dispatch(tmp_path: Path) -> None:
+    """A producer that raises is logged, not allowed to break other handlers."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationIngress,
+        ParticipationRuntime,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+
+    class _ExplodingRuntime:
+        def offer_source(self, **kwargs: object) -> bool:
+            raise RuntimeError("scheduler unavailable")
+
+    ingress = ParticipationIngress(
+        runtime=_ExplodingRuntime(),  # type: ignore[arg-type]
+        ledger=log,
+        is_active=lambda c, i: True,
+    )
+
+    async def on_observed(event: object) -> None:
+        try:
+            ingress.handle_event(event)
+        except Exception:  # noqa: BLE001 - mirrors the bootstrap adapter
+            pass
+
+    bus = MessageBus()
+    bus.subscribe_event("InboundObservedEvent", on_observed)
+    ran: list[str] = []
+
+    async def after(event: object) -> None:
+        del event
+        ran.append("yes")
+
+    bus.subscribe_event("InboundObservedEvent", after)
+    dispatcher = asyncio.create_task(bus.dispatch_events())
+    try:
+        await bus.publish_event(_observed(100.0, message_id="m1"))
+        for _ in range(100):
+            if ran:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        bus.stop()
+        dispatcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher
+    assert ran == ["yes"]
+    log.close()
