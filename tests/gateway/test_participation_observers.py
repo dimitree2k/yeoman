@@ -414,10 +414,7 @@ async def test_ingress_event_handler_is_awaitable_and_never_breaks_dispatch(
 async def test_ingress_failure_does_not_abort_event_dispatch(tmp_path: Path) -> None:
     """A producer that raises is logged, not allowed to break other handlers."""
     from yeoman_gateway.consciousness.log import SpeakupLog
-    from yeoman_gateway.consciousness.participation_runtime import (
-        ParticipationIngress,
-        ParticipationRuntime,
-    )
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationIngress
 
     log = SpeakupLog(tmp_path / "speakups.db")
 
