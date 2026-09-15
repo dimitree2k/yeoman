@@ -583,6 +583,13 @@ class _NeverCalledExecutor:
         raise AssertionError(f"must not execute {envelope.effect_id}")
 
 
+class _ExplodingExecutor:
+    """A transport that raised after dispatch: the effect outcome is unproven."""
+
+    async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
+        raise RuntimeError(f"connection reset while sending {envelope.effect_id}")
+
+
 # -- approval binding and recovery (A02, A34, A35) -------------------------------------
 
 OWNER = "owner@s.whatsapp.net"
@@ -972,3 +979,309 @@ async def test_wrong_owner_claim_is_refused(tmp_path: Path) -> None:
         now_ms=1_100,
     )
     log.close()
+
+
+# -- delivered anchors (A18, A23, A32) -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delivered_anchors_require_recipient_evidence(tmp_path: Path) -> None:
+    """Only confirmed recipient deliveries become conversational anchors."""
+    from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    reader = DeliveryAnchorReader(log=log, store=store)
+
+    # A real text effect in the processing store, one per proposal state.
+    for index, effect_id in enumerate([f"e{number}" for number in range(6)]):
+        gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+        gateway.submit(_envelope(effect_id))
+        await gateway.execute_ready(effect_id)
+        await _proposal(log, f"p{index}")
+        await log.reserve_delivery(
+            proposal_id=f"p{index}",
+            effect_id=effect_id,
+            channel=CHANNEL,
+            chat_id=CHAT,
+            now_ms=1000,
+            limits=(("comment", 10, HOUR_MS),),
+        )
+        if index >= 1:  # every state except the first is given recipient evidence
+            await log.project_transport_accepted(
+                f"p{index}",
+                effect_id=effect_id,
+                provider_message_id=f"prov-{index}",
+                evidence_kind="transport_receipt",
+                evidence_ref=f"receipt-{index}",
+                now_ms=1100,
+            )
+    # Only p1 has authenticated recipient evidence.
+    await log.project_recipient_delivery(
+        "p1",
+        effect_id="e1",
+        provider_message_id="prov-1",
+        evidence_kind="recipient_delivery",
+        evidence_ref="signal-1",
+        now_ms=1200,
+    )
+    anchors = await reader.delivered_anchors(CHANNEL, CHAT, since_ms=0, limit=10)
+    assert [anchor["effect_id"] for anchor in anchors] == ["e1"]
+    anchor = anchors[0]
+    assert anchor["provider_message_id"] == "prov-1"
+    assert anchor["delivered_at_ms"] == 1200
+    assert anchor["channel"] == CHANNEL and anchor["chat_id"] == CHAT
+    assert anchor["evidence_kind"] == "recipient_delivery"
+    assert anchor["evidence_ref"] == "signal-1"
+    assert anchor["message"] == "Synthetic contribution."
+    assert anchor["delivery_state"] == "delivered"
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_delivered_anchors_survive_restart_and_do_not_leak_chats(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+    gateway.submit(_envelope("e1"))
+    await gateway.execute_ready("e1")
+    await _proposal(log, "p1")
+    await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="e1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 10, HOUR_MS),),
+    )
+    await log.project_recipient_delivery(
+        "p1",
+        effect_id="e1",
+        provider_message_id="prov-1",
+        evidence_kind="recipient_delivery",
+        evidence_ref="signal-1",
+        now_ms=1200,
+    )
+    log.close()
+    store.close()
+
+    reopened_log = SpeakupLog(tmp_path / "speakups.db")
+    reopened_store = ProcessingStore(tmp_path / "processing.db")
+    reader = DeliveryAnchorReader(log=reopened_log, store=reopened_store)
+    anchors = await reader.delivered_anchors(CHANNEL, CHAT, since_ms=0, limit=10)
+    assert len(anchors) == 1
+    assert await reader.delivered_anchors(
+        CHANNEL, "other@g.us", since_ms=0, limit=10
+    ) == []
+    assert await reader.delivered_anchors(
+        "telegram", CHAT, since_ms=0, limit=10
+    ) == []
+    reopened_store.close()
+    reopened_log.close()
+
+
+@pytest.mark.asyncio
+async def test_delivered_anchors_deduplicate_repeated_callbacks(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+    gateway.submit(_envelope("e1"))
+    await gateway.execute_ready("e1")
+    await _proposal(log, "p1")
+    await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="e1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 10, HOUR_MS),),
+    )
+    for _ in range(3):
+        await log.project_recipient_delivery(
+            "p1",
+            effect_id="e1",
+            provider_message_id="prov-1",
+            evidence_kind="recipient_read",
+            evidence_ref="signal-1",
+            now_ms=1200,
+        )
+    reader = DeliveryAnchorReader(log=log, store=store)
+    anchors = await reader.delivered_anchors(CHANNEL, CHAT, since_ms=0, limit=10)
+    assert len(anchors) == 1
+    store.close()
+    log.close()
+
+
+# -- receipt reconciliation (A17, A34) -------------------------------------------------
+
+
+async def _reserved_effect(
+    log: SpeakupLog,
+    store: ProcessingStore,
+    *,
+    proposal_id: str,
+    effect_id: str,
+    execute: bool = False,
+) -> "_RecordingExecutor":
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+    executor = gateway._executor
+    gateway.submit(_envelope(effect_id))
+    await _proposal(log, proposal_id)
+    await log.reserve_delivery(
+        proposal_id=proposal_id,
+        effect_id=effect_id,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 10, HOUR_MS),),
+    )
+    await log.record_send_attempt(proposal_id, effect_id=effect_id, now_ms=1000)
+    if execute:
+        await gateway.execute_ready(effect_id)
+    assert isinstance(executor, _RecordingExecutor)
+    return executor
+
+
+@pytest.mark.asyncio
+async def test_reconciler_projects_acceptance_and_then_delivery(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    await _reserved_effect(
+        log, store, proposal_id="p1", effect_id="e1", execute=True
+    )
+    reconciler = ParticipationReceiptReconciler(log=log, store=store)
+    first = await reconciler.reconcile(now_ms=5000)
+    assert first["accepted"] == 1
+    assert await log.delivery_state(proposal_id="p1", effect_id="e1") == "transport_accepted"
+    assert await log.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=5100, window_ms=HOUR_MS
+    ) == 1
+
+    # A later delivery signal advances the same reservation once.
+    _append_receipt(store, chat_id=CHAT, provider_message_id="prov-1")
+    second = await reconciler.reconcile(now_ms=6000)
+    assert second["delivered"] == 1
+    assert await log.delivery_state(proposal_id="p1", effect_id="e1") == "delivered"
+    third = await reconciler.reconcile(now_ms=7000)
+    assert third["delivered"] == 0
+    assert await log.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=7100, window_ms=HOUR_MS
+    ) == 1
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_releases_definite_effect_failure(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+    gateway.submit(_envelope("e1"))
+    await _proposal(log, "p1")
+    await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="e1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 1, HOUR_MS),),
+    )
+    await log.record_send_attempt("p1", effect_id="e1", now_ms=1000)
+    store.transition(
+        "e1", expected="queued", target="failed", now_ms=1100,
+        evidence={"kind": "not_executed", "detail": "synthetic refusal"},
+    )
+    reconciler = ParticipationReceiptReconciler(log=log, store=store)
+    counters = await reconciler.reconcile(now_ms=5000)
+    assert counters["released"] == 1
+    assert await log.delivery_state(proposal_id="p1", effect_id="e1") == "failed"
+    assert await log.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=5100, window_ms=HOUR_MS
+    ) == 0
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_retains_unknown_and_missing_effects(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    # Reservations saved with no processing effect at all (crash between stores).
+    await _proposal(log, "p1")
+    await log.reserve_delivery(
+        proposal_id="p1",
+        effect_id="missing",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 1, HOUR_MS),),
+    )
+    # Reservations whose effect outcome is unproven: the transport raised after the
+    # frame may already have been written, so the effect store records ``unknown``.
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_ExplodingExecutor())
+    gateway.submit(_envelope("e2"))
+    await _proposal(log, "p2")
+    await log.reserve_delivery(
+        proposal_id="p2",
+        effect_id="e2",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 2, HOUR_MS),),
+    )
+    await log.record_send_attempt("p2", effect_id="e2", now_ms=1000)
+    receipt = await gateway.execute_ready("e2")
+    assert receipt.state == "unknown"
+    reconciler = ParticipationReceiptReconciler(log=log, store=store)
+    counters = await reconciler.reconcile(now_ms=5000)
+    assert counters["skipped"] == 1
+    assert counters["retained"] == 1
+    assert await log.delivery_state(proposal_id="p1", effect_id="missing") == "reserved"
+    assert await log.delivery_state(proposal_id="p2", effect_id="e2") == "delivery_unknown"
+    # Both holds survive a window boundary.
+    assert await log.consumed_slots(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        category="comment",
+        now_ms=1000 + 2 * HOUR_MS,
+        window_ms=HOUR_MS,
+    ) == 2
+    store.close()
+    log.close()
+
+
+def _append_receipt(
+    store: ProcessingStore,
+    *,
+    chat_id: str,
+    provider_message_id: str,
+    status: str = "delivered",
+) -> str:
+    payload = {"status": status, "recipient_token": "sha256:synthetic"}
+    return store.append_event(
+        event_key=f"whatsapp:{chat_id}:receipt:{provider_message_id}:synthetic:{status}",
+        event_id=f"receipt-{provider_message_id}-{status}",
+        trace_id=f"trace-{provider_message_id}",
+        payload={
+            "kind": "receipt",
+            "channel": CHANNEL,
+            "chat_id": chat_id,
+            "principal": "participant@s.whatsapp.net",
+            "source_message_id": provider_message_id,
+            "target_message_id": provider_message_id,
+            "occurred_ms": 1200,
+            **payload,
+        },
+        now_ms=1200,
+    )

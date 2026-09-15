@@ -18,6 +18,7 @@ archives and the memory database keep their own settings.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -1850,6 +1851,67 @@ class ProcessingStore:
         """Newest receipt of an effect (by confirmed_ms, then receipt id)."""
         receipts = self.transport_receipts(effect_id)
         return receipts[-1] if receipts else None
+
+    def delivered_text_effects(
+        self, *, channel: str, chat_id: str, since_ms: int, limit: int = 50
+    ) -> tuple[dict[str, Any], ...]:
+        """Text effects that a provider *accepted* for one exact channel/chat.
+
+        Owned query for the participation anchor projection: it joins the effect's
+        payload with its transport receipt and reports the effect's current state,
+        so a caller can require ``state='sent'`` instead of inventing delivery. A
+        payload that retention purged is returned with ``text=None``; nothing is
+        guessed from a hash.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT e.effect_id AS effect_id,
+                       e.state AS state,
+                       e.payload_kind AS payload_kind,
+                       e.payload_json AS payload_json,
+                       r.provider_message_id AS provider_message_id,
+                       r.confirmed_ms AS confirmed_ms,
+                       r.receipt_id AS receipt_id
+                FROM effects AS e
+                JOIN transport_receipts AS r ON r.effect_id = e.effect_id
+                WHERE r.channel = ? AND r.chat_id = ? AND r.confirmed_ms >= ?
+                  AND e.payload_kind IN ('text', 'reaction')
+                ORDER BY r.confirmed_ms ASC, e.effect_id ASC
+                LIMIT ?
+                """,
+                (str(channel), str(chat_id), int(since_ms), max(1, int(limit))),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            text: str | None = None
+            payload_kind = str(row["payload_kind"] or "")
+            if payload_kind == "text" and row["payload_json"]:
+                try:
+                    parsed = json.loads(str(row["payload_json"]))
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    value = parsed.get("text")
+                    text = str(value) if value is not None else None
+            results.append(
+                {
+                    "effect_id": str(row["effect_id"]),
+                    "state": str(row["state"]),
+                    "payload_kind": payload_kind,
+                    "text": text,
+                    "provider_message_id": (
+                        None
+                        if row["provider_message_id"] is None
+                        else str(row["provider_message_id"])
+                    ),
+                    "confirmed_ms": int(row["confirmed_ms"]),
+                    "provider_receipt_id": (
+                        None if row["receipt_id"] is None else str(row["receipt_id"])
+                    ),
+                }
+            )
+        return tuple(results)
 
     def effects_by_provider_message(
         self, channel: str, chat_id: str, provider_message_id: str
