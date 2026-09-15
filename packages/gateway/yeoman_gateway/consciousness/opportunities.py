@@ -56,7 +56,7 @@ def opportunity_id_for(
     Trigger type is deliberately excluded: the same sources must not run once as
     ``inbound`` and again as ``burst``/``lull`` (spec section 7.1).
     """
-    material = "\x1f".join(
+    material = "|".join(
         [
             OPPORTUNITY_ID_VERSION,
             str(channel),

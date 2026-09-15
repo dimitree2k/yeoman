@@ -106,7 +106,10 @@ JUDGE_SYSTEM_PROMPT = (
     "current material still relates to.\n"
     "- intent=direct is only valid when the context says the material is addressed to "
     "Arvid. Never claim it otherwise.\n"
-    "- Use only ids that appear in the context. Never invent an id, a chat or a person.\n"
+    "- Copy ids exactly as they appear after id=, without quotes, brackets or "
+    "whitespace. Use only ids from the context and never invent one.\n"
+    "- When action=comment and intent=initiate, contribution_type is required and must "
+    "be one of the allowed action types.\n"
     "- purpose is an internal instruction, never the finished message.\n"
     "- closes_exchange=true only retires the social association; it never closes "
     "another person's task."
@@ -439,7 +442,9 @@ class _JudgeContext:
             text = str(item.get("text") or "").strip()
             media = str(item.get("media_summary") or "").strip()
             body = text if text else (f"[{media}]" if media else "[no text]")
-            lines.append(f"[{event_id or '-'}] {sender}: {body}")
+            # The id is labelled explicitly: a bare bracketed prefix invites the model
+            # to copy the brackets into evidence_ids, which then fails validation.
+            lines.append(f'id="{event_id or "?"}" from={sender}: {body}')
         anchor_ids: set[str] = set()
         for item in anchors:
             provider_id = str(item.get("provider_message_id") or "").strip()
@@ -450,7 +455,9 @@ class _JudgeContext:
                 anchor_ids.add(effect_id)
                 evidence.add(effect_id)
             text = str(item.get("message") or "").strip()
-            lines.append(f"[delivered by Arvid {provider_id or effect_id or '-'}] {text}")
+            lines.append(
+                f'id="{provider_id or effect_id or "?"}" from=Arvid (delivered): {text}'
+            )
         allowed_actions = tuple(
             str(item).strip()
             for item in (context.get("allowed_actions") or ("silence",))
