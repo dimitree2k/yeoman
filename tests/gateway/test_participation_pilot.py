@@ -1,0 +1,334 @@
+"""Pilot composition: the real runtime driven by synthetic traffic.
+
+This exercises the exact composition the live gateway builds (policy engine +
+participation snapshot + context builder + judge + scheduler + ingress + responder
+draft path), with synthetic credentials and a controlled provider. It proves the
+wiring and the shadow lane's zero-effect property; it does not claim model quality
+and it never contacts a chat.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import pytest
+from yeoman_gateway.bus.events import InboundObservedEvent
+from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
+from yeoman_gateway.consciousness.log import SpeakupLog
+from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
+from yeoman_gateway.consciousness.participation_runtime import (
+    ParticipationIngress,
+    SourceOwner,
+)
+from yeoman_gateway.consciousness.participation_runtime import (
+    ParticipationRuntime as OfferRuntime,
+)
+from yeoman_gateway.policy.engine import PolicyEngine
+from yeoman_gateway.policy.schema import PolicyConfig
+from yeoman_gateway.processing.participation import ParticipationJudge
+from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+from yeoman_gateway.processing.participation_runtime import (
+    ParticipationRuntime as DecisionRuntime,
+)
+from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_gateway.storage.inbound_archive import InboundArchive
+from yeoman_shared.config.schema import ProcessingConfig
+
+CHANNEL = "whatsapp"
+CHAT = "pilot@g.us"
+#: The context window is built from the local clock, so the synthetic traffic uses
+#: "now" rather than a fixed epoch that could fall outside the horizon.
+NOW_MS = int(time.time() * 1000)
+
+
+class _ScriptedClient:
+    """Speaks the existing async ``chat(messages, max_tokens=...)`` interface."""
+
+    route_key = "participation.judge"
+
+    def __init__(self, answer: dict[str, object]) -> None:
+        self._answer = answer
+        self.calls = 0
+
+    async def chat(self, messages, *, max_tokens: int = 0) -> str:
+        del messages, max_tokens
+        self.calls += 1
+        return json.dumps(self._answer)
+
+
+class _Submission:
+    def __init__(self) -> None:
+        self.drafts = 0
+        self.submissions: list[dict[str, object]] = []
+
+    async def generate_draft(self, *, opportunity, decision, context):
+        del opportunity, decision, context
+        self.drafts += 1
+        return "a synthetic draft"
+
+    async def submit(self, *, admission, effect_id, content, payload_hash):
+        del payload_hash
+        self.submissions.append(
+            {
+                "channel": admission.channel,
+                "chat_id": admission.chat_id,
+                "effect_id": effect_id,
+                "content": content,
+            }
+        )
+
+        class _Receipt:
+            status = "submitted"
+
+        return _Receipt()
+
+
+class _Reactor:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, **kwargs: object):
+        self.calls.append(dict(kwargs))
+        return None
+
+
+def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool):
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "channels": {
+                CHANNEL: {
+                    "chats": {
+                        CHAT: {
+                            "whoCanTalk": {"mode": "everyone"},
+                            "whenToReply": {"mode": "all"},
+                            "participation": {"enabled": True},
+                        }
+                    }
+                }
+            },
+        }
+    )
+    config = ProcessingConfig.model_validate(
+        {
+            "participation": {
+                "enabled": True,
+                "shadow": shadow,
+                "judgeRoute": "participation.judge",
+            }
+        }
+    )
+    engine = PolicyEngine(policy, workspace=tmp_path)
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    archive = InboundArchive(tmp_path / "inbound.db")
+    archive.record_inbound(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        message_id="m1",
+        participant="anna@s.whatsapp.net",
+        sender_id="anna@s.whatsapp.net",
+        sender_name="anna",
+        text="Wer steht heute im Tor?",
+        timestamp=int(NOW_MS / 1000),
+    )
+
+    client = _ScriptedClient(decision)
+    judge = ParticipationJudge(client=client, allowed_emojis=("👍",))
+
+    def _snapshot(channel: str, chat_id: str, *, epoch: int) -> dict[str, object]:
+        resolved = engine.resolve_participation_snapshot(
+            channel,
+            chat_id,
+            processing_config=config,
+            activation_epoch=int(log.activation_epoch_sync("participation")),
+        )
+        limit = int(resolved.participation.max_unsolicited_comments_per_window)
+        window_ms = int(resolved.participation.comment_window_minutes) * 60_000
+        return {
+            "enabled": resolved.enabled,
+            "opted_in": resolved.opted_in,
+            "invalid_reason": resolved.invalid_reason,
+            "activation_epoch": resolved.activation_epoch,
+            "lane": "shadow" if resolved.shadow else "production",
+            "judge_calls_per_hour": int(
+                resolved.participation.max_unaddressed_judge_calls_per_hour
+            ),
+            "min_gap_seconds": 0,
+            "continuation_reserve": int(resolved.participation.continuation_judge_reserve),
+            "reaction_limits": (),
+            "comment_limits": (("comment", limit, window_ms),),
+            # The preflight action set the judge may choose from, as the production
+            # builder supplies it after hard policy and remaining budgets.
+            "allowed_actions": ["silence", "react", "comment"],
+            "payload_hash": "",
+        }
+
+    builder = ParticipationContextBuilder(
+        archive=archive,
+        policy=engine,
+        anchors=DeliveryAnchorReader(log=log, store=store),
+    )
+    submission = _Submission()
+    reactor = _Reactor()
+    decision_runtime = DecisionRuntime(
+        judge=judge,
+        context_builder=builder,
+        ledger=log,
+        snapshot_provider=_snapshot,
+        is_paused=lambda channel, chat_id: None,
+        is_source_allowed=lambda channel, chat_id, sources: True,
+        source_principals=lambda channel, chat_id, sources: ("anna@s.whatsapp.net",),
+        is_participant_allowed=lambda channel, chat_id, sender: True,
+        submission=submission,
+        reactor=reactor,
+        clock_ms=lambda: NOW_MS,
+    )
+    scheduler = OpportunityScheduler(
+        handle=decision_runtime.evaluate_participation,
+        max_concurrent_decisions=1,
+        ttl_seconds=600,
+    )
+    offer = OfferRuntime(
+        scheduler=scheduler,
+        source_owner=SourceOwner(store=log),
+        activation_epoch=int(log.activation_epoch_sync("participation")),
+    )
+    ingress = ParticipationIngress(runtime=offer, ledger=log, is_active=lambda c, i: True)
+    return {
+        "engine": engine,
+        "log": log,
+        "store": store,
+        "archive": archive,
+        "client": client,
+        "scheduler": scheduler,
+        "ingress": ingress,
+        "decision_runtime": decision_runtime,
+        "submission": submission,
+        "reactor": reactor,
+    }
+
+
+def _event(message_id: str = "m1") -> InboundObservedEvent:
+    return InboundObservedEvent(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        sender_id="anna@s.whatsapp.net",
+        content="Wer steht heute im Tor?",
+        timestamp=NOW_MS / 1000,
+        message_id=message_id,
+        is_group=True,
+        metadata={"message_id": message_id},
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_pilot_admits_and_decides_without_any_effect(tmp_path: Path) -> None:
+    """The live shadow configuration produces a decision and zero effects."""
+    rt = _pilot_runtime(
+        tmp_path,
+        decision={
+            "action": "comment",
+            "intent": "initiate",
+            "reason": "open question to the group",
+            "purpose": "answer the goalkeeper question",
+            "contribution_type": "observation",
+            "evidence_ids": ["m1"],
+            "target_message_id": "m1",
+        },
+        shadow=True,
+    )
+    await rt["scheduler"].start()
+    try:
+        assert rt["ingress"].handle_event(_event()) is True
+        for _ in range(100):
+            disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+            if disposition:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await rt["scheduler"].stop()
+
+    # The judge ran, and the decision was recorded as a shadow decision.
+    assert rt["client"].calls == 1
+    disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+    assert disposition is not None
+    assert disposition["disposition"] == "shadow_comment"
+    # Zero new-lane effects in shadow.
+    assert rt["submission"].drafts == 0
+    assert rt["submission"].submissions == []
+    assert rt["reactor"].calls == []
+    assert await rt["log"].pending_delivery_reservations() == []
+    assert await rt["log"].delivered_reservation_rows(
+        channel=CHANNEL, chat_id=CHAT, since_ms=0, limit=10
+    ) == []
+    rt["log"].close()
+    rt["store"].close()
+
+
+@pytest.mark.asyncio
+async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path: Path) -> None:
+    """With shadow off the same composition reserves once and submits one effect."""
+    rt = _pilot_runtime(
+        tmp_path,
+        decision={
+            "action": "comment",
+            "intent": "initiate",
+            "reason": "open question to the group",
+            "purpose": "answer the goalkeeper question",
+            "contribution_type": "observation",
+            "evidence_ids": ["m1"],
+            "target_message_id": "m1",
+        },
+        shadow=False,
+    )
+    await rt["scheduler"].start()
+    try:
+        assert rt["ingress"].handle_event(_event()) is True
+        for _ in range(100):
+            if rt["submission"].submissions:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await rt["scheduler"].stop()
+
+    assert rt["client"].calls == 1
+    assert rt["submission"].drafts == 1
+    assert len(rt["submission"].submissions) == 1
+    call = rt["submission"].submissions[0]
+    assert (call["channel"], call["chat_id"]) == (CHANNEL, CHAT)
+    held = await rt["log"].pending_delivery_reservations()
+    assert len(held) == 1
+    assert held[0]["delivery_state"] == "submitted"
+    assert held[0]["effect_id"] == call["effect_id"]
+    rt["log"].close()
+    rt["store"].close()
+
+
+@pytest.mark.asyncio
+async def test_silence_pilot_records_silence_and_spends_nothing(tmp_path: Path) -> None:
+    rt = _pilot_runtime(
+        tmp_path,
+        decision={"action": "silence", "intent": "initiate", "reason": "nothing to add"},
+        shadow=False,
+    )
+    await rt["scheduler"].start()
+    try:
+        assert rt["ingress"].handle_event(_event()) is True
+        for _ in range(100):
+            disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+            if disposition:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await rt["scheduler"].stop()
+    assert rt["client"].calls == 1
+    disposition = await rt["log"].disposition_by_chat(CHANNEL, CHAT)
+    assert disposition is not None and disposition["disposition"] == "decided_silence"
+    assert rt["submission"].drafts == 0
+    assert await rt["log"].pending_delivery_reservations() == []
+    rt["log"].close()
+    rt["store"].close()

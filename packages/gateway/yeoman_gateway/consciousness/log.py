@@ -1380,6 +1380,21 @@ class SpeakupLog:
                 ),
             )
 
+    async def disposition_by_chat(
+        self, channel: str, chat_id: str
+    ) -> dict[str, Any] | None:
+        """Most recent recorded disposition for one chat (inspection and tests)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ?
+                ORDER BY updated_at_ms DESC LIMIT 1
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     async def disposition(self, opportunity_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
