@@ -2446,6 +2446,23 @@ def build_gateway_runtime(
                 interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
             )
 
+        if participation_runtime is not None:
+            from yeoman_gateway.consciousness.participation_runtime import (
+                ParticipationIngress,
+            )
+
+            _ingress = ParticipationIngress(
+                runtime=participation_runtime,
+                ledger=speakup_log,
+                is_active=lambda channel, chat_id: bool(
+                    policy_engine.resolve_participation(channel, chat_id).enabled
+                ),
+            )
+            bus.subscribe_event(
+                "InboundObservedEvent",
+                lambda event: _ingress.handle_event(event),  # type: ignore[arg-type,return-value]
+            )
+
         def _trigger(channel: str, chat_id: str, trigger: str) -> object:
             """Offer a bounded opportunity when autonomy applies, else legacy tick.
 

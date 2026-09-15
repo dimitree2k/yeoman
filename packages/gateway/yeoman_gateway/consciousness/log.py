@@ -373,6 +373,17 @@ class SpeakupLog:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS chat_revisions (
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (channel, chat_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS source_claims (
                     channel TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
@@ -713,6 +724,31 @@ class SpeakupLog:
             ).fetchone()
             considered = int(disposition_row["r"] if disposition_row else 0)
         return max(claims, considered) + 1
+
+    def next_source_revision_sync(self, *, channel: str, chat_id: str) -> int:
+        """Atomically advance and return the durable per-chat source revision.
+
+        This is the monotonic watermark the opportunity identity and the restart
+        duplicate guard both use. It is not a hash of message text and not wall time,
+        so a clock change cannot invent a newer revision and a restart cannot hand out
+        a smaller one.
+        """
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_revisions (channel, chat_id, revision, updated_at_ms)
+                VALUES (?, ?, 1, CAST(strftime('%s','now') AS INTEGER) * 1000)
+                ON CONFLICT(channel, chat_id) DO UPDATE SET
+                    revision = chat_revisions.revision + 1,
+                    updated_at_ms = excluded.updated_at_ms
+                """,
+                (str(channel), str(chat_id)),
+            )
+            row = conn.execute(
+                "SELECT revision FROM chat_revisions WHERE channel = ? AND chat_id = ?",
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return int(row["revision"]) if row is not None else 1
 
     def activation_epoch_sync(self, scope: str = "participation") -> int:
         """Synchronous read of the persisted activation epoch (schema-safe)."""
