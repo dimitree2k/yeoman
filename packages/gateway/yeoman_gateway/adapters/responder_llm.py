@@ -2092,6 +2092,7 @@ class LLMResponder(ResponderPort):
         model_profile: str | None = None,
         session_history_limit: int | None = None,
         private_handoff_id: str | None = None,
+        draft_only: bool = False,
     ) -> str | None:
         # Serialize concurrent calls for the same session to prevent session
         # state corruption (lost messages, overwritten saves).
@@ -2117,7 +2118,107 @@ class LLMResponder(ResponderPort):
                 model_profile=model_profile,
                 session_history_limit=session_history_limit,
                 private_handoff_id=private_handoff_id,
+                draft_only=draft_only,
             )
+
+    async def _generate_draft_only(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        content: str,
+        sender_id: str | None,
+        media: tuple[str, ...],
+        metadata: dict[str, object],
+        persona_text: str | None,
+        is_owner: bool = False,
+        model_profile: str | None = None,
+    ) -> str | None:
+        """One unsolicited draft with no executable tools and no persistent writes.
+
+        This is the only generator an unsolicited participation comment may use. It
+        reuses the provider/profile plumbing but suppresses every side effect of a
+        normal turn: no session history insertion, no assistant-state write, no
+        memory capture, no shared-fact extraction, no delivery tool. The transcript
+        the caller supplies is the whole context, so disclosure stays with the
+        caller's ACL filtering. The returned text is a draft, not a message.
+        """
+        trace = lf.start_trace(
+            name="generate_draft",
+            metadata={
+                "channel": channel,
+                "chat_id": chat_id,
+                "session_key": session_key,
+                "draft_only": True,
+            },
+            tags=[channel, "participation-draft"],
+            session_id=session_key,
+            input={"content_chars": len(content), "media_count": len(media)},
+        )
+        try:
+            messages = self.context.build_messages(
+                history=[],
+                current_message=content,
+                current_metadata=dict(metadata),
+                retrieved_memory_text=None,
+                persona_text=persona_text,
+                media=list(media),
+                channel=channel,
+                chat_id=chat_id,
+                allowed_tools=set(),
+            )
+            resolved_profile = self._profile_for_name(model_profile)
+            try:
+                draft = await self._chat_loop(
+                    messages=messages,
+                    allowed_tools=set(),
+                    security_context={
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "sender_id": sender_id or "",
+                        "session_key": session_key,
+                        "draft_only": True,
+                    },
+                    is_owner=bool(is_owner),
+                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
+                    provider=self._provider_for_profile(resolved_profile),
+                    max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
+                    temperature=(
+                        float(getattr(resolved_profile, "temperature"))
+                        if getattr(resolved_profile, "temperature", None) is not None
+                        else None
+                    ),
+                    reasoning=(
+                        getattr(resolved_profile, "reasoning", None)
+                        if isinstance(getattr(resolved_profile, "reasoning", None), dict)
+                        else None
+                    ),
+                    current_user_message=content,
+                    current_channel=channel,
+                    current_chat_id=chat_id,
+                    current_sender_id=sender_id or "",
+                    current_is_group=bool(metadata.get("is_group", False)),
+                    current_origin_label=str(
+                        metadata.get("group_name")
+                        or metadata.get("subject")
+                        or metadata.get("chat_name")
+                        or chat_id
+                    ),
+                    current_metadata=dict(metadata),
+                    trace=trace,
+                )
+            except LLMProviderError:
+                logger.warning(
+                    "Provider-error draft dropped channel={} chat={}", channel, chat_id
+                )
+                draft = None
+            lf.end_span(trace, output={"outcome": "draft" if draft else "empty"})
+            return draft
+        finally:
+            self._current_trace = None
+            self._current_session = None
+            self._pending_hidden_assistant_messages = []
 
     async def _generate_locked(
         self,
@@ -2141,7 +2242,21 @@ class LLMResponder(ResponderPort):
         model_profile: str | None = None,
         session_history_limit: int | None = None,
         private_handoff_id: str | None = None,
+        draft_only: bool = False,
     ) -> str | None:
+        if draft_only:
+            return await self._generate_draft_only(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                sender_id=sender_id,
+                media=media,
+                metadata=metadata,
+                persona_text=persona_text,
+                is_owner=is_owner,
+                model_profile=model_profile,
+            )
         trace = lf.start_trace(
             name="generate",
             metadata={
