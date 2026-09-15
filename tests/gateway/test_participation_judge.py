@@ -332,13 +332,14 @@ async def test_continuation_is_refused_when_policy_disables_it() -> None:
 
 
 @pytest.mark.asyncio
-async def test_contribution_type_must_be_in_the_allowed_vocabulary() -> None:
+async def test_out_of_vocabulary_contribution_type_is_clamped_to_a_configured_one() -> None:
+    """The category is editorial metadata: clamp it, do not discard the decision."""
     judge = ParticipationJudge(client=_Client(_payload(
         action="comment", intent="initiate", purpose="x", contribution_type="cold_joke"
     )), allowed_emojis=(EMOJI,))
-    with pytest.raises(ParticipationDecisionError) as error:
-        await judge.decide(_opportunity(), _context())
-    assert error.value.reason == "invalid_response"
+    decision = await judge.decide(_opportunity(), _context())
+    assert decision.action == "comment"
+    assert decision.contribution_type in {"observation", "light_humor"}
 
 
 @pytest.mark.asyncio
@@ -532,10 +533,11 @@ async def test_silence_ignores_irrelevant_stray_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_speaking_decisions_still_validate_every_relevant_field() -> None:
-    """The leniency stops at silence: anything that speaks is validated strictly."""
+async def test_speaking_decisions_still_validate_their_evidence() -> None:
+    """The leniency stops at evidence: a foreign id is never repaired."""
     for payload_overrides, reason in (
-        ({"contribution_type": "cold_joke"}, "invalid_response"),
+        ({"contribution_type": "cold_joke", "target_message_id": "m-not-in-context"},
+         "unknown_evidence"),
         ({"target_message_id": "m-not-in-context"}, "unknown_evidence"),
     ):
         fields: dict[str, object] = {
