@@ -201,6 +201,7 @@ class SpeakupLog:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._explicit_feedback_reader: Any | None = None
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -266,6 +267,10 @@ class SpeakupLog:
                     activation_epoch INTEGER,
                     lane TEXT NOT NULL DEFAULT 'production',
                     proposal_revision INTEGER NOT NULL DEFAULT 1,
+                    outcome TEXT,
+                    outcome_kind TEXT,
+                    outcome_evidence_json TEXT,
+                    outcome_at_ms INTEGER,
                     PRIMARY KEY (effect_id, category)
                 )
                 """
@@ -288,6 +293,7 @@ class SpeakupLog:
                 ON delivery_reservations(channel, chat_id, category, accepted_at_ms)
                 """
             )
+            self._apply_delivery_columns()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS judge_attempts (
@@ -395,6 +401,24 @@ class SpeakupLog:
                 """
             )
             self._conn.commit()
+
+    def _apply_delivery_columns(self) -> None:
+        """Additive, idempotent column migration for existing ledger databases."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(delivery_reservations)")
+        }
+        for name, ddl in (
+            ("outcome", "TEXT"),
+            ("outcome_kind", "TEXT"),
+            ("outcome_evidence_json", "TEXT"),
+            ("outcome_at_ms", "INTEGER"),
+        ):
+            if name in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE delivery_reservations ADD COLUMN {name} {ddl}"
+            )
 
     # -- transactions ------------------------------------------------------------------
 
@@ -1378,6 +1402,122 @@ class SpeakupLog:
                 (str(scope),),
             ).fetchone()
         return int(row["activation_epoch"]) if row is not None else 1
+
+    async def pending_outcome_deliveries(
+        self, *, before_ms: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Confirmed, recipient-evidenced deliveries whose observation window elapsed.
+
+        Only ``delivered`` rows are eligible: previews, transport-accepted-only,
+        unknown, failed and historical-unverified rows are excluded by construction
+        (spec section 10).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM delivery_reservations
+                WHERE delivery_state = 'delivered'
+                  AND delivered_at_ms IS NOT NULL
+                  AND delivered_at_ms <= ?
+                ORDER BY delivered_at_ms ASC
+                LIMIT ?
+                """,
+                (int(before_ms), max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def explicit_feedback(
+        self, *, channel: str, chat_id: str, provider_message_id: str
+    ) -> dict[str, Any] | None:
+        """Exact quoted reply or reaction for one delivered bot message, if retained.
+
+        Exact feedback is strong evidence and needs no classifier call. When the
+        archive holds no such record this returns ``None``; nothing is inferred from
+        emoji text.
+        """
+        token = str(provider_message_id or "").strip()
+        if not token:
+            return None
+        reader = self._explicit_feedback_reader
+        if reader is None:
+            return None
+        try:
+            found = reader(channel=str(channel), chat_id=str(chat_id), message_id=token)
+            if hasattr(found, "__await__"):
+                found = await found
+        except Exception:
+            return None
+        return found if isinstance(found, dict) else None
+
+    def set_explicit_feedback_reader(self, reader: Any | None) -> None:
+        """Inject the archive-backed lookup for exact quotes/reactions."""
+        self._explicit_feedback_reader = reader
+
+    async def mark_delivery_outcome(
+        self,
+        *,
+        effect_id: str,
+        outcome: str,
+        evidence_kind: str,
+        evidence_ids: tuple[str, ...] = (),
+        now_ms: int | None = None,
+    ) -> None:
+        """Record the classified outcome with its evidence provenance.
+
+        ``evidence_kind`` is one of ``explicit``, ``inferred``, ``none`` or
+        ``uncertain``; the sample only becomes learning input once it carries that
+        provenance (spec section 10).
+        """
+        ts = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE delivery_reservations SET outcome = ?, outcome_kind = ?, "
+                "outcome_evidence_json = ?, outcome_at_ms = ? WHERE effect_id = ?",
+                (
+                    str(outcome),
+                    str(evidence_kind),
+                    json.dumps(list(evidence_ids)),
+                    ts,
+                    str(effect_id),
+                ),
+            )
+
+    async def participation_outcome_samples(
+        self, *, channel: str, chat_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Delivered, provenance-tagged participation samples for one chat.
+
+        Untagged historical records and unverified deliveries are excluded, so old
+        patterns are never promoted to authoritative new guidance.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM delivery_reservations
+                WHERE channel = ? AND chat_id = ? AND delivery_state = 'delivered'
+                  AND outcome IS NOT NULL AND outcome_kind IS NOT NULL
+                ORDER BY outcome_at_ms DESC, delivered_at_ms DESC
+                LIMIT ?
+                """,
+                (str(channel), str(chat_id), max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def participation_outcome_chats(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT channel, chat_id, MAX(outcome_at_ms) AS latest_at
+                FROM delivery_reservations
+                WHERE delivery_state = 'delivered' AND outcome IS NOT NULL
+                  AND outcome_kind IS NOT NULL
+                GROUP BY channel, chat_id
+                ORDER BY latest_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     async def delivered_reservation_rows(
         self,
