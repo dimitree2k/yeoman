@@ -278,12 +278,28 @@ class ActivationEpochTracker:
         )
         previous = self._last.get(key)
         self._last[key] = fingerprint
-        current = int(self._store.activation_epoch_sync(self._scope))  # type: ignore[attr-defined]
-        if previous is None or previous == fingerprint:
+        # The comparison must survive a restart: read the fingerprint recorded with the
+        # current epoch, so a shadow/live change made while the process was down still
+        # advances the epoch instead of being mistaken for "no change seen yet".
+        persisted = str(
+            self._store.activation_fingerprint_sync(self._scope)  # type: ignore[attr-defined]
+        )
+        current = int(
+            self._store.activation_epoch_sync(  # type: ignore[attr-defined]
+                self._scope, fingerprint=fingerprint
+            )
+        )
+        if not persisted:
+            # No recorded inputs yet - a fresh database, or one whose row predates the
+            # fingerprint column. Adopt the current state at the current epoch and record
+            # it, rather than inventing a transition that never happened.
+            self._last[key] = fingerprint
+            return current
+        if persisted == fingerprint:
             return current
         advanced = int(
             self._store.advance_activation_epoch_sync(  # type: ignore[attr-defined]
-                self._scope
+                self._scope, fingerprint=fingerprint
             )
         )
         logger.info(
