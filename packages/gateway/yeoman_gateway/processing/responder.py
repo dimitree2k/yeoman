@@ -55,18 +55,9 @@ class ThreadActorResponder:
         self._authority = authority or TurnAuthority()
         self._clock = clock or _now_ms
         self._router = router
-        self._participation_ctx: Any | None = None
         self._finish_direct_admission = finish_direct_admission
         self._direct_work_active = direct_work_active
         self._release_chat = release_chat
-
-    def attach_participation(self, ctx: Any | None) -> None:
-        """Wire the participation channel/react effect boundary (disabled by default)."""
-        self._participation_ctx = ctx
-
-    @property
-    def participation(self) -> Any | None:
-        return self._participation_ctx
 
     async def generate_participation_draft(
         self,
@@ -97,35 +88,27 @@ class ThreadActorResponder:
         emoji: str,
         channel: str,
         chat_id: str,
-        effect_id: str | None = None,
-        admission: object | None = None,
-    ) -> object | None:
+        effect_id: str,
+        admission: object,
+    ) -> object:
         """Submit one autonomous reaction through the existing reaction effect path.
 
         Returns the structured receipt (or effect reference), never a handled boolean.
         """
-        ctx = self._participation_ctx
-        if ctx is None:
-            if admission is not None or effect_id is not None:
-                raise EffectNotDeliveredError("participation reaction path is not composed")
-            return None
-        submitter = getattr(ctx, "submit_participation_reaction", None)
-        if submitter is None:
-            if admission is not None or effect_id is not None:
-                raise EffectNotDeliveredError("participation reaction submitter is not composed")
-            return None
-        kwargs: dict[str, object] = {
-            "target_message_id": str(target_message_id),
-            "emoji": str(emoji),
-            "channel": str(channel),
-            "chat_id": str(chat_id),
-        }
-        if effect_id is not None:
-            kwargs["effect_id"] = str(effect_id)
-        if admission is not None:
-            kwargs["admission"] = admission
-        return await submitter(
-            **kwargs,
+        if not isinstance(effect_id, str) or not effect_id.strip() or admission is None:
+            raise EffectNotDeliveredError(
+                "participation reaction requires an effect id and admission"
+            )
+        reactor = getattr(self._inner, "react_to_participation", None)
+        if not callable(reactor):
+            raise EffectNotDeliveredError("participation reaction path is not composed")
+        return await reactor(
+            target_message_id=str(target_message_id),
+            emoji=str(emoji),
+            channel=str(channel),
+            chat_id=str(chat_id),
+            effect_id=effect_id,
+            admission=admission,
         )
 
     def __getattr__(self, name: str) -> Any:

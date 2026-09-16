@@ -1069,7 +1069,12 @@ def _build_participation_runtime(
         )
 
     submission = _ParticipationSubmission(responder=responder)
-    reactor = _ParticipationReactor(responder=responder)
+    reactor = (
+        _ParticipationReactor(responder=responder)
+        if callable(getattr(responder, "react_to_participation", None))
+        and bool(getattr(responder, "participation_reaction_available", False))
+        else None
+    )
     decision_runtime = ParticipationDecisionRuntime(
         judge=judge,
         context_builder=context_builder,
@@ -3045,10 +3050,6 @@ def build_gateway_runtime(
             _decision_runtime, _reconciler = participation_decision
         else:
             _decision_runtime, _reconciler = None, None
-        if _decision_runtime is not None:
-            attach = getattr(responder, "attach_participation", None)
-            if attach is not None:
-                attach(_decision_runtime)
         if _reconciler is not None:
             # Receipt reconciliation keeps running even when judging is disabled.
             speakup_log.set_explicit_feedback_reader(

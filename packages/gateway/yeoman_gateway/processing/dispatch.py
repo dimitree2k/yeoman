@@ -287,7 +287,12 @@ class BusEffectExecutor:
                     else "queued to transport; delivery unconfirmed"
                 ),
             )
-        if self._direct_sender is not None or self._direct_reaction_sender is not None:
+        direct_sender = (
+            self._direct_reaction_sender
+            if isinstance(payload, ReactionPayload)
+            else self._direct_sender
+        )
+        if direct_sender is not None:
             return EffectReceipt(
                 effect_id=envelope.effect_id,
                 state="sent",
@@ -544,11 +549,17 @@ class ServiceEffectProducer:
         receives the receipt, and only a ``sent`` state with a provider record counts
         as transport acceptance (spec section 9).
         """
-        if source == "speakup" and admission is None:
-            raise EffectNotDeliveredError(
-                "managed speakup reaction requires a participation admission"
-            )
-        if require_managed and not effect_id:
+        if source == "speakup":
+            if admission is None:
+                raise EffectNotDeliveredError(
+                    "managed speakup reaction requires a participation admission"
+                )
+            if not isinstance(effect_id, str) or not effect_id.strip():
+                raise EffectNotDeliveredError(
+                    "managed speakup reaction requires a caller effect id"
+                )
+            require_managed = True
+        if require_managed and (not isinstance(effect_id, str) or not effect_id.strip()):
             raise EffectNotDeliveredError("managed reaction effect requires a caller effect id")
         if not self._router.manages(channel, chat_id):
             raise EffectNotDeliveredError("target is not enabled for the managed effect path")

@@ -2904,17 +2904,19 @@ class LLMResponder(ResponderPort):
         emoji: str,
         channel: str,
         chat_id: str,
-        effect_id: str | None = None,
-        admission: object | None = None,
-    ) -> object | None:
+        effect_id: str,
+        admission: object,
+    ) -> object:
         """Submit one autonomous reaction through the managed reaction effect path."""
-        sender = getattr(self._service_effect_sender, "send_reaction", None)
-        if sender is None:
-            if admission is not None or effect_id:
-                from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
+        from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
 
-                raise EffectNotDeliveredError("participation reaction path is not composed")
-            return None
+        if not isinstance(effect_id, str) or not effect_id.strip() or admission is None:
+            raise EffectNotDeliveredError(
+                "participation reaction requires an effect id and admission"
+            )
+        sender = getattr(self._service_effect_sender, "send_reaction", None)
+        if not callable(sender):
+            raise EffectNotDeliveredError("participation reaction path is not composed")
         try:
             return await sender(
                 source="speakup",
@@ -2923,17 +2925,20 @@ class LLMResponder(ResponderPort):
                 chat_id=str(chat_id),
                 message_id=str(target_message_id),
                 emoji=str(emoji),
-                effect_id=str(effect_id) if effect_id else None,
-                require_managed=bool(effect_id),
+                effect_id=effect_id,
+                require_managed=True,
                 admission=admission,
             )
         except Exception as exc:
             logger.warning(
                 "participation_reaction_failed error_type={}", type(exc).__name__
             )
-            if admission is not None or effect_id:
-                raise
-            return None
+            raise
+
+    @property
+    def participation_reaction_available(self) -> bool:
+        """Whether the managed reaction sender is composed before any reservation."""
+        return callable(getattr(self._service_effect_sender, "send_reaction", None))
 
     async def execute_delivery(
         self,

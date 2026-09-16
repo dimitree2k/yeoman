@@ -650,6 +650,177 @@ async def test_managed_speakup_reaction_requires_admission() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_managed_speakup_reaction_requires_effect_id_before_router() -> None:
+    class _ManagedRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def manages(self, channel: str, chat_id: str) -> bool:
+            del channel, chat_id
+            return True
+
+        async def submit_message(self, _message: object, **kwargs: object) -> object:
+            del kwargs
+            self.calls += 1
+            raise AssertionError("unbound managed reaction reached the router")
+
+    router = _ManagedRouter()
+    producer = ServiceEffectProducer(router=router, bus=_Bus())
+
+    with pytest.raises(EffectNotDeliveredError, match="effect id"):
+        await producer.send_reaction(
+            source="speakup",
+            operation_ref="reaction-without-effect-id",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            message_id="inbound-1",
+            emoji="👍",
+            admission=SimpleNamespace(admission_id="admission-1"),
+        )
+
+    assert router.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_reaction_binds_managed_identity_and_exact_target() -> None:
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    class _Sender:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def send_reaction(self, **kwargs: object) -> EffectReceipt:
+            self.calls.append(kwargs)
+            return EffectReceipt(
+                effect_id=str(kwargs["effect_id"]), state="sent", accepted=True
+            )
+
+    sender = _Sender()
+    responder = object.__new__(LLMResponder)
+    responder._service_effect_sender = sender
+    assert responder.participation_reaction_available
+    admission = SimpleNamespace(admission_id="admission-1")
+    call = {
+        "target_message_id": "target-1",
+        "emoji": "👍",
+        "channel": CHANNEL,
+        "chat_id": CHAT,
+    }
+
+    with pytest.raises(EffectNotDeliveredError, match="effect id"):
+        await responder.react_to_participation(
+            **call, effect_id="", admission=admission
+        )
+    with pytest.raises(EffectNotDeliveredError, match="admission"):
+        await responder.react_to_participation(
+            **call, effect_id="effect-1", admission=None
+        )
+    assert sender.calls == []
+
+    receipt = await responder.react_to_participation(
+        **call, effect_id="effect-1", admission=admission
+    )
+
+    assert isinstance(receipt, EffectReceipt)
+    assert sender.calls == [
+        {
+            "source": "speakup",
+            "operation_ref": "participation-reaction:target-1",
+            "channel": CHANNEL,
+            "chat_id": CHAT,
+            "message_id": "target-1",
+            "emoji": "👍",
+            "effect_id": "effect-1",
+            "require_managed": True,
+            "admission": admission,
+        }
+    ]
+
+    responder._service_effect_sender = None
+    assert not responder.participation_reaction_available
+
+
+@pytest.mark.asyncio
+async def test_thread_actor_reaction_delegates_to_inner_sender() -> None:
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    class _Inner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def react_to_participation(self, **kwargs: object) -> EffectReceipt:
+            self.calls.append(kwargs)
+            return EffectReceipt(
+                effect_id=str(kwargs["effect_id"]), state="sent", accepted=True
+            )
+
+    class _DecisionRuntime:
+        async def submit_participation_reaction(self, **kwargs: object) -> object:
+            del kwargs
+            raise AssertionError("reaction must not delegate back to decision runtime")
+
+    inner = _Inner()
+    wrapper = object.__new__(ThreadActorResponder)
+    wrapper._inner = inner
+    wrapper._participation_ctx = _DecisionRuntime()
+    admission = SimpleNamespace(admission_id="admission-1")
+
+    receipt = await wrapper.react_to_participation(
+        target_message_id="target-1",
+        emoji="👍",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        effect_id="effect-1",
+        admission=admission,
+    )
+
+    assert isinstance(receipt, EffectReceipt)
+    assert inner.calls == [
+        {
+            "target_message_id": "target-1",
+            "emoji": "👍",
+            "channel": CHANNEL,
+            "chat_id": CHAT,
+            "effect_id": "effect-1",
+            "admission": admission,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_sender_does_not_confirm_bus_reaction() -> None:
+    class Bus:
+        reaction_calls = 0
+
+        async def publish_outbound(self, message: object) -> None:
+            del message
+
+        async def publish_reaction(self, message: object) -> None:
+            del message
+            self.reaction_calls += 1
+
+    async def send_text(message: object) -> None:
+        del message
+        raise AssertionError("reaction used the text sender")
+
+    bus = Bus()
+    executor = BusEffectExecutor(bus=bus, direct_sender=send_text)
+    envelope = EffectEnvelope(
+        effect_id="reaction-without-direct-reaction-sender",
+        operation_key="reaction:one",
+        payload=ReactionPayload(message_id="target-1", emoji="👍"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_reaction",
+    )
+
+    receipt = await executor.execute(envelope)
+
+    assert receipt.state == "unknown"
+    assert bus.reaction_calls == 1
+
+
 def test_dispatch_preflight_denial_is_before_bus_handoff(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     envelope = EffectEnvelope(
