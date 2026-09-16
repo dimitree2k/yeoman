@@ -47,6 +47,209 @@ DAY_MS = 86_400_000
 HOUR_MS = 3_600_000
 
 
+@pytest.mark.asyncio
+async def test_participation_recovery_filters_origin_and_lane_and_supports_log_only(
+    tmp_path: Path,
+) -> None:
+    """Only production Participation holds may be projected or released."""
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    assert await log.reserve_delivery(
+        proposal_id="participation-production",
+        effect_id="participation-production-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1_000,
+        limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
+        lane="production",
+    )
+    assert await log.reserve_delivery(
+        proposal_id="legacy-production",
+        effect_id="legacy-production-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1_000,
+        limits=(("comment", 2, HOUR_MS),),
+    )
+    assert await log.reserve_delivery(
+        proposal_id="participation-shadow",
+        effect_id="participation-shadow-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1_000,
+        limits=(("reaction", 2, HOUR_MS),),
+        origin="participation",
+        lane="shadow",
+    )
+
+    reconciler = ParticipationReceiptReconciler(
+        log=log, store=None, unsubmitted_ttl_ms=100
+    )
+    result = await reconciler.reconcile(now_ms=1_101)
+
+    assert result["released"] == 1
+    assert await log.delivery_state(
+        proposal_id="participation-production", effect_id="participation-production-effect"
+    ) == "expired"
+    assert await log.delivery_state(
+        proposal_id="legacy-production", effect_id="legacy-production-effect"
+    ) == "reserved"
+    assert await log.delivery_state(
+        proposal_id="participation-shadow", effect_id="participation-shadow-effect"
+    ) == "reserved"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_holds_valid_approval_then_releases_it_at_expiry(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    proposal_id = "pending-participation-approval"
+    effect_id = "pending-participation-effect"
+    await log.record_proposed(
+        proposal_id=proposal_id,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        action_type="comment",
+        profile="helpful",
+        message="prepared",
+        trigger="inbound",
+        context_snapshot={
+            "origin": "participation",
+            "approval_expires_at_ms": 5_000,
+        },
+        now=1.0,
+    )
+    await log.mark_status(proposal_id, status="awaiting_approval")
+    assert await log.reserve_delivery(
+        proposal_id=proposal_id,
+        effect_id=effect_id,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1_000,
+        limits=(("comment", 1, HOUR_MS),),
+        origin="participation",
+    )
+    reconciler = ParticipationReceiptReconciler(
+        log=log, store=None, unsubmitted_ttl_ms=100
+    )
+
+    assert (await reconciler.reconcile(now_ms=1_101))["released"] == 0
+    assert await log.delivery_state(
+        proposal_id=proposal_id, effect_id=effect_id
+    ) == "reserved"
+    assert (await reconciler.reconcile(now_ms=5_000))["released"] == 1
+    assert await log.delivery_state(
+        proposal_id=proposal_id, effect_id=effect_id
+    ) == "expired"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_participation_reconciler_retains_mismatched_effect_origin(
+    tmp_path: Path,
+) -> None:
+    """A legacy ProcessingStore effect cannot be projected as Participation."""
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    effect_id = "participation-with-legacy-effect"
+    assert await log.reserve_delivery(
+        proposal_id="participation-with-legacy-effect-proposal",
+        effect_id=effect_id,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1_000,
+        limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
+        lane="production",
+    )
+    await log.record_send_attempt(
+        "participation-with-legacy-effect-proposal", effect_id=effect_id, now_ms=1_001
+    )
+    store = ProcessingStore(tmp_path / "processing.db")
+    store.enqueue_effect(
+        effect_id=effect_id,
+        operation_key="legacy:participation-with-legacy-effect",
+        payload=TextPayload(text="legacy"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        origin="legacy",
+        state="failed",
+        now_ms=1_002,
+    )
+
+    result = await ParticipationReceiptReconciler(log=log, store=store).reconcile(
+        now_ms=1_101
+    )
+
+    assert result["skipped"] == 1
+    assert await log.delivery_state(
+        proposal_id="participation-with-legacy-effect-proposal", effect_id=effect_id
+    ) == "submitted"
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_delivery_reservations_migrate_to_legacy_origin(tmp_path: Path) -> None:
+    """Old reservation rows remain non-Participation after the additive migration."""
+    db_path = tmp_path / "legacy-speakups.db"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute(
+        """
+        CREATE TABLE delivery_reservations (
+            proposal_id TEXT NOT NULL,
+            effect_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            limit_value INTEGER NOT NULL,
+            window_ms INTEGER NOT NULL,
+            window_kind TEXT NOT NULL DEFAULT 'rolling',
+            created_at_ms INTEGER NOT NULL,
+            submitted_at_ms INTEGER,
+            accepted_at_ms INTEGER,
+            delivered_at_ms INTEGER,
+            released_at_ms INTEGER,
+            delivery_state TEXT NOT NULL,
+            provider_message_id TEXT,
+            evidence_kind TEXT,
+            evidence_ref TEXT,
+            attempt_state TEXT NOT NULL DEFAULT 'unsubmitted',
+            observed_revision INTEGER,
+            activation_epoch INTEGER,
+            lane TEXT NOT NULL DEFAULT 'production',
+            proposal_revision INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (effect_id, category)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO delivery_reservations (
+            proposal_id, effect_id, channel, chat_id, category,
+            limit_value, window_ms, created_at_ms, delivery_state
+        ) VALUES ('legacy-proposal', 'legacy-effect', 'whatsapp', 'group@g.us',
+                  'comment', 1, 1000, 1, 'reserved')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    log = SpeakupLog(db_path)
+    record = await log.delivery_record(
+        proposal_id="legacy-proposal", effect_id="legacy-effect"
+    )
+    assert record is not None
+    assert record["origin"] == "legacy"
+    log.close()
+
+
 def test_participation_effect_binds_admission_and_origin_atomically(tmp_path: Path) -> None:
     """The outbox must persist a trusted admission link with the queued effect."""
     store = ProcessingStore(tmp_path / "processing.db")
@@ -344,17 +547,29 @@ class _StaticPolicy:
 
 
 class _TransportSpy:
-    def __init__(self, ledger: object | None = None) -> None:
+    def __init__(self, ledger: object | None = None, *, receipt: bool = True) -> None:
         self.calls = 0
         self.ledger = ledger
+        self.receipt = receipt
 
     async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
         self.calls += 1
         if self.ledger is not None:
-            assert getattr(self.ledger, "calls", []) == [
-                ("opportunity-router", envelope.effect_id)
-            ]
-        return EffectReceipt(effect_id=envelope.effect_id, state="sent")
+            assert getattr(self.ledger, "calls", [])[-1][1] == envelope.effect_id
+        return EffectReceipt(
+            effect_id=envelope.effect_id,
+            state="sent",
+            transport_receipt=(
+                TransportReceipt(
+                    channel=CHANNEL,
+                    chat_id=CHAT,
+                    provider_message_id=f"provider-{envelope.effect_id}",
+                    confirmed_ms=2,
+                )
+                if self.receipt
+                else None
+            ),
+        )
 
 
 class _Bus:
@@ -375,6 +590,7 @@ class _LedgerAttemptSpy:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.release_calls: list[tuple[str, str, str]] = []
+        self.accepted_calls: list[tuple[str, str]] = []
         self.reservation_state = "reserved"
 
     async def record_send_attempt(self, opportunity_id: str, *, effect_id: str, now_ms: int) -> None:
@@ -395,6 +611,21 @@ class _LedgerAttemptSpy:
         self.release_calls.append((proposal_id, effect_id, state))
         self.reservation_state = state
         return True
+
+    async def project_transport_accepted(
+        self,
+        proposal_id: str,
+        *,
+        effect_id: str,
+        provider_message_id: str | None,
+        evidence_kind: str,
+        evidence_ref: str,
+        now_ms: int,
+    ) -> str:
+        del provider_message_id, evidence_kind, evidence_ref, now_ms
+        self.accepted_calls.append((proposal_id, effect_id))
+        self.reservation_state = "transport_accepted"
+        return self.reservation_state
 
 
 def test_real_effect_gateway_rechecks_persisted_participation_before_transport(
@@ -428,7 +659,7 @@ def test_real_effect_gateway_rechecks_persisted_participation_before_transport(
         payload_hash=payload_hash(TextPayload(text="prepared")),
     )
     store.enqueue_participation_effect(envelope, admission)
-    transport = _TransportSpy()
+    transport = _TransportSpy(receipt=False)
     allowed = {"value": True}
     authorizer = SnapshotEffectAuthorizer(
         snapshots=_StaticPolicy(),
@@ -448,7 +679,8 @@ def test_real_effect_gateway_rechecks_persisted_participation_before_transport(
     )
 
     first = asyncio.run(gateway.execute_ready(envelope.effect_id))
-    assert first.state == "sent"
+    assert first.state == "unknown"
+    assert first.transport_receipt is None
     assert transport.calls == 1
 
     # A newly queued effect is denied by the fresh participation check after a pause.
@@ -538,11 +770,34 @@ def test_service_producer_carries_admission_through_real_effect_gateway(tmp_path
     assert receipt is not None
     assert receipt.state == "sent"
     assert ledger.calls == [("opportunity-router", "effect-router")]
+    assert ledger.accepted_calls == [("opportunity-router", "effect-router")]
+    transport.receipt = False
+    second_admission = SimpleNamespace(
+        **{
+            **vars(admission),
+            "admission_id": "admission-router-without-receipt",
+            "payload_hash": payload_hash(TextPayload(text="prepared again")),
+        }
+    )
+    second = asyncio.run(
+        producer.send(
+            source="speakup",
+            operation_ref="opportunity-router-without-receipt",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            content="prepared again",
+            effect_id="effect-router-without-receipt",
+            require_managed=True,
+            admission=second_admission,
+        )
+    )
+    assert second is not None and second.state == "unknown"
+    assert ledger.accepted_calls == [("opportunity-router", "effect-router")]
     stored = store.get_effect("effect-router")
     assert stored is not None
     assert stored.origin == "participation"
     assert stored.admission_id == "admission-router"
-    assert transport.calls == 1
+    assert transport.calls == 2
     store.close()
 
 
@@ -1131,6 +1386,8 @@ async def test_provider_id_is_accepted_not_delivered(tmp_path: Path) -> None:
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
+        lane="production",
     )
     await log.project_transport_accepted(
         "p1",
@@ -1163,6 +1420,8 @@ async def test_recipient_signal_advances_after_restart(tmp_path: Path) -> None:
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
+        lane="production",
     )
     await log.project_transport_accepted(
         "p1",
@@ -1383,7 +1642,9 @@ async def test_reaction_reservation_routed_but_failed_creates_no_success_metric(
 # -- helpers ---------------------------------------------------------------------------
 
 
-def _envelope(effect_id: str, *, reaction: bool = False) -> EffectEnvelope:
+def _envelope(
+    effect_id: str, *, reaction: bool = False, origin: str = "legacy"
+) -> EffectEnvelope:
     payload = (
         ReactionPayload(message_id="inbound-1", emoji="\N{THUMBS UP SIGN}")
         if reaction
@@ -1393,12 +1654,33 @@ def _envelope(effect_id: str, *, reaction: bool = False) -> EffectEnvelope:
         effect_id=effect_id,
         operation_key=f"test:{effect_id}",
         payload=payload,
-        target={"channel": CHANNEL, "chat_id": CHAT},
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
         trace_id=effect_id,
         turn_id="turn-1",
         turn_revision=1,
         principal="service:speakup",
         capability="send_reaction" if reaction else "send_text",
+        origin=origin,
+        admission_id=f"admission:{effect_id}" if origin == "participation" else None,
+    )
+
+
+def _admission(envelope: EffectEnvelope) -> SimpleNamespace:
+    return SimpleNamespace(
+        admission_id=envelope.admission_id,
+        opportunity_id=f"opportunity:{envelope.effect_id}",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=1,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        emoji=None,
+        target_message_id=None,
+        anchor_message_id=None,
+        payload_hash=envelope.payload_hash,
     )
 
 
@@ -1863,7 +2145,8 @@ async def test_delivered_anchors_require_recipient_evidence(tmp_path: Path) -> N
     # A real text effect in the processing store, one per proposal state.
     for index, effect_id in enumerate([f"e{number}" for number in range(6)]):
         gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
-        gateway.submit(_envelope(effect_id))
+        envelope = _envelope(effect_id, origin="participation")
+        gateway.submit_participation(envelope, _admission(envelope))
         await gateway.execute_ready(effect_id)
         await _proposal(log, f"p{index}")
         await log.reserve_delivery(
@@ -1873,6 +2156,7 @@ async def test_delivered_anchors_require_recipient_evidence(tmp_path: Path) -> N
             chat_id=CHAT,
             now_ms=1000,
             limits=(("comment", 10, HOUR_MS),),
+            origin="participation",
         )
         if index >= 1:  # every state except the first is given recipient evidence
             await log.project_transport_accepted(
@@ -1890,6 +2174,26 @@ async def test_delivered_anchors_require_recipient_evidence(tmp_path: Path) -> N
         provider_message_id="prov-1",
         evidence_kind="recipient_delivery",
         evidence_ref="signal-1",
+        now_ms=1200,
+    )
+    legacy = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
+    legacy.submit(_envelope("legacy-delivered"))
+    await legacy.execute_ready("legacy-delivered")
+    await _proposal(log, "legacy-proposal")
+    await log.reserve_delivery(
+        proposal_id="legacy-proposal",
+        effect_id="legacy-delivered",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 10, HOUR_MS),),
+    )
+    await log.project_recipient_delivery(
+        "legacy-proposal",
+        effect_id="legacy-delivered",
+        provider_message_id="prov-legacy",
+        evidence_kind="recipient_delivery",
+        evidence_ref="signal-legacy",
         now_ms=1200,
     )
     anchors = await reader.delivered_anchors(CHANNEL, CHAT, since_ms=0, limit=10)
@@ -1913,7 +2217,8 @@ async def test_delivered_anchors_survive_restart_and_do_not_leak_chats(tmp_path:
     log = SpeakupLog(tmp_path / "speakups.db")
     store = ProcessingStore(tmp_path / "processing.db")
     gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
-    gateway.submit(_envelope("e1"))
+    envelope = _envelope("e1", origin="participation")
+    gateway.submit_participation(envelope, _admission(envelope))
     await gateway.execute_ready("e1")
     await _proposal(log, "p1")
     await log.reserve_delivery(
@@ -1923,6 +2228,7 @@ async def test_delivered_anchors_survive_restart_and_do_not_leak_chats(tmp_path:
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 10, HOUR_MS),),
+        origin="participation",
     )
     await log.project_recipient_delivery(
         "p1",
@@ -1961,7 +2267,8 @@ async def test_delivered_anchors_deduplicate_repeated_callbacks(tmp_path: Path) 
     log = SpeakupLog(tmp_path / "speakups.db")
     store = ProcessingStore(tmp_path / "processing.db")
     gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
-    gateway.submit(_envelope("e1"))
+    envelope = _envelope("e1", origin="participation")
+    gateway.submit_participation(envelope, _admission(envelope))
     await gateway.execute_ready("e1")
     await _proposal(log, "p1")
     await log.reserve_delivery(
@@ -1971,6 +2278,7 @@ async def test_delivered_anchors_deduplicate_repeated_callbacks(tmp_path: Path) 
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 10, HOUR_MS),),
+        origin="participation",
     )
     for _ in range(3):
         await log.project_recipient_delivery(
@@ -2001,7 +2309,8 @@ async def _reserved_effect(
 ) -> "_RecordingExecutor":
     gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
     executor = gateway._executor
-    gateway.submit(_envelope(effect_id))
+    envelope = _envelope(effect_id, origin="participation")
+    gateway.submit_participation(envelope, _admission(envelope))
     await _proposal(log, proposal_id)
     await log.reserve_delivery(
         proposal_id=proposal_id,
@@ -2010,6 +2319,7 @@ async def _reserved_effect(
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 10, HOUR_MS),),
+        origin="participation",
     )
     await log.record_send_attempt(proposal_id, effect_id=effect_id, now_ms=1000)
     if execute:
@@ -2084,7 +2394,8 @@ async def test_reconciler_releases_definite_effect_failure(tmp_path: Path) -> No
     log = SpeakupLog(tmp_path / "speakups.db")
     store = ProcessingStore(tmp_path / "processing.db")
     gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_RecordingExecutor())
-    gateway.submit(_envelope("e1"))
+    envelope = _envelope("e1", origin="participation")
+    gateway.submit_participation(envelope, _admission(envelope))
     await _proposal(log, "p1")
     await log.reserve_delivery(
         proposal_id="p1",
@@ -2093,6 +2404,7 @@ async def test_reconciler_releases_definite_effect_failure(tmp_path: Path) -> No
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 1, HOUR_MS),),
+        origin="participation",
     )
     await log.record_send_attempt("p1", effect_id="e1", now_ms=1000)
     store.transition(
@@ -2125,11 +2437,13 @@ async def test_reconciler_retains_unknown_and_missing_effects(tmp_path: Path) ->
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 1, HOUR_MS),),
+        origin="participation",
     )
     # Reservations whose effect outcome is unproven: the transport raised after the
     # frame may already have been written, so the effect store records ``unknown``.
     gateway = EffectGateway(store, authorizer=_AllowAll(), executor=_ExplodingExecutor())
-    gateway.submit(_envelope("e2"))
+    envelope = _envelope("e2", origin="participation")
+    gateway.submit_participation(envelope, _admission(envelope))
     await _proposal(log, "p2")
     await log.reserve_delivery(
         proposal_id="p2",
@@ -2138,6 +2452,7 @@ async def test_reconciler_retains_unknown_and_missing_effects(tmp_path: Path) ->
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
     )
     await log.record_send_attempt("p2", effect_id="e2", now_ms=1000)
     receipt = await gateway.execute_ready("e2")
@@ -2176,6 +2491,7 @@ async def test_reconciler_expires_stale_unsubmitted_reservation_without_effect(
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 1, HOUR_MS),),
+        origin="participation",
     )
     reconciler = ParticipationReceiptReconciler(
         log=log, store=store, unsubmitted_ttl_ms=100
@@ -2210,6 +2526,7 @@ async def test_reconciler_prioritizes_newer_actionable_rows_over_old_unknown_bat
         chat_id=CHAT,
         now_ms=1000,
         limits=(("comment", 1, HOUR_MS),),
+        origin="participation",
     )
     await log.record_send_attempt("old", effect_id=old_effect, now_ms=1000)
     await log.note_delivery_unknown(
@@ -2230,15 +2547,17 @@ async def test_reconciler_prioritizes_newer_actionable_rows_over_old_unknown_bat
         chat_id=CHAT,
         now_ms=2000,
         limits=(("comment", 2, HOUR_MS),),
+        origin="participation",
     )
     await log.record_send_attempt("new", effect_id=new_effect, now_ms=2000)
-    store.enqueue_effect(
-        effect_id=new_effect,
-        operation_key=f"failed:{new_effect}",
-        payload=TextPayload(text="Synthetic contribution."),
-        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
-        state="failed",
+    envelope = _envelope(new_effect, origin="participation")
+    store.enqueue_participation_effect(envelope, _admission(envelope))
+    store.transition(
+        new_effect,
+        expected="queued",
+        target="failed",
         now_ms=2100,
+        evidence={"kind": "not_executed", "detail": "synthetic refusal"},
     )
 
     reconciler = ParticipationReceiptReconciler(log=log, store=store)

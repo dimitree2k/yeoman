@@ -286,27 +286,43 @@ class EffectGateway:
         match reported:
             case "sent":
                 transport_receipt = getattr(result, "transport_receipt", None)
-                if transport_receipt is not None:
+                if envelope.origin == "participation" and transport_receipt is None:
+                    self._store.transition(
+                        effect_id,
+                        expected="executing",
+                        target="unknown",
+                        now_ms=self._clock(),
+                        evidence={
+                            "kind": "dispatch_unknown",
+                            "detail": "executor reported sent without a transport receipt",
+                        },
+                        worker_id=self._worker_id,
+                    )
+                else:
                     # Receipt first, then the state: "sent" always has its provider
                     # evidence recorded before it becomes visible.
-                    self._store.record_transport_receipt(
+                    if transport_receipt is not None:
+                        self._store.record_transport_receipt(
+                            effect_id,
+                            attempt_id=attempt_id,
+                            channel=transport_receipt.channel,
+                            chat_id=transport_receipt.chat_id,
+                            provider_message_id=transport_receipt.provider_message_id,
+                            client_message_id=transport_receipt.client_message_id,
+                            detail=transport_receipt.detail,
+                            now_ms=self._clock(),
+                        )
+                    self._store.transition(
                         effect_id,
-                        attempt_id=attempt_id,
-                        channel=transport_receipt.channel,
-                        chat_id=transport_receipt.chat_id,
-                        provider_message_id=transport_receipt.provider_message_id,
-                        client_message_id=transport_receipt.client_message_id,
-                        detail=transport_receipt.detail,
+                        expected="executing",
+                        target="sent",
                         now_ms=self._clock(),
+                        evidence={
+                            "kind": "transport",
+                            "detail": detail or "accepted by transport",
+                        },
+                        worker_id=self._worker_id,
                     )
-                self._store.transition(
-                    effect_id,
-                    expected="executing",
-                    target="sent",
-                    now_ms=self._clock(),
-                    evidence={"kind": "transport", "detail": detail or "accepted by transport"},
-                    worker_id=self._worker_id,
-                )
             case "not_executed":
                 self._store.transition(
                     effect_id,
@@ -375,4 +391,5 @@ class EffectGateway:
             detail=detail,
             accepted=True,
             updated_ms=stored.updated_ms if stored is not None else None,
+            transport_receipt=self._store.effect_transport_receipt(effect_id),
         )

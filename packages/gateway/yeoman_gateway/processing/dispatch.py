@@ -1017,6 +1017,29 @@ class IntentEffectRouter:
                 )
             return blocked
         result = await self._gateway.execute_ready(receipt.effect_id)
+        if admission is not None:
+            proposal_id = str(getattr(admission, "opportunity_id", ""))
+            state = str(getattr(result, "state", "") or "")
+            transport = getattr(result, "transport_receipt", None)
+            if state == "sent" and transport is not None:
+                await self._participation_ledger.project_transport_accepted(
+                    proposal_id,
+                    effect_id=receipt.effect_id,
+                    provider_message_id=(
+                        str(getattr(transport, "provider_message_id", "") or "") or None
+                    ),
+                    evidence_kind="transport_receipt",
+                    evidence_ref=str(getattr(result, "attempt_id", "") or receipt.effect_id),
+                    now_ms=self._clock(),
+                )
+            elif state in {"failed", "not_executed", "blocked", "cancelled", "expired"}:
+                await self._participation_ledger.release_delivery(
+                    proposal_id,
+                    effect_id=receipt.effect_id,
+                    state="failed",
+                    reason=f"effect_{state}",
+                    now_ms=self._clock(),
+                )
         self._confirm_quotable_message(envelope, result, now=now)
         logger.info(
             "routing_effect effect_id={} state={} chat={} turn_id={} revision={} detail={}",

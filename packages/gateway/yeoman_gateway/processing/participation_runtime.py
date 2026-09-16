@@ -340,16 +340,6 @@ class ParticipationRuntime:
                 "intent": decision.intent,
             }
 
-        if (
-            inputs.approval_required
-            and decision.action == "comment"
-            and decision.intent == "initiate"
-        ):
-            # Approval persistence/admission belongs to the next wave. Never turn a
-            # required approval into an unapproved direct submission here.
-            await self._record(opportunity, "comment_skipped", "approval_required")
-            return {"status": "comment_skipped", "reason": "approval_required"}
-
         if decision.action == "silence":
             self._count("deliberate_silence")
             await self._record(opportunity, "decided_silence", decision.reason)
@@ -894,6 +884,8 @@ class ParticipationRuntime:
             limits=_snapshot_limits(inputs.snapshot, "reaction_limits", "reaction"),
             observed_revision=opportunity.observed_revision,
             activation_epoch=opportunity.activation_epoch,
+            origin="participation",
+            lane=str(opportunity.lane),
         )
         if not reserved:
             await self._record(opportunity, "skipped", "reaction_budget_exhausted")
@@ -927,7 +919,11 @@ class ParticipationRuntime:
         # A routed-but-failed reaction is not success: the receipt decides.
         accepted = bool(getattr(receipt, "accepted", False))
         state = str(getattr(receipt, "state", "") or "")
-        if accepted and state == "sent":
+        if (
+            accepted
+            and state == "sent"
+            and getattr(receipt, "transport_receipt", None) is not None
+        ):
             await self._ledger.project_transport_accepted(
                 opportunity.opportunity_id,
                 effect_id=effect_id,
@@ -993,6 +989,8 @@ class ParticipationRuntime:
             limits=reservation,
             observed_revision=opportunity.observed_revision,
             activation_epoch=opportunity.activation_epoch,
+            origin="participation",
+            lane=str(opportunity.lane),
         )
         if not reserved:
             await self._record(opportunity, "comment_skipped", "comment_budget_exhausted")
@@ -1100,10 +1098,23 @@ class ParticipationRuntime:
             await self._record(opportunity, "stale_discarded", "deadline_expired")
             return {"status": "comment_skipped", "reason": "deadline_expired"}
         payload = TextPayload(text=text)
+        approval_required = bool(
+            _snapshot_bool(snapshot, "approval_required", default=False)
+            and decision.intent == "initiate"
+        )
+        admission_snapshot = snapshot
+        if approval_required:
+            admission_snapshot = dict(snapshot)
+            admission_snapshot["approval_revision"] = max(
+                1,
+                _snapshot_nonnegative_int(
+                    snapshot, "approval_revision", default=0
+                ),
+            )
         try:
             admission = self._build_admission(
                 opportunity=opportunity,
-                snapshot=snapshot,
+                snapshot=admission_snapshot,
                 decision=decision,
                 effect_id=effect_id,
                 payload=payload,
@@ -1121,6 +1132,45 @@ class ParticipationRuntime:
             await self._release_comment(opportunity, effect_id, veto)
             await self._record(opportunity, "stale_discarded", veto)
             return {"status": "comment_skipped", "reason": veto}
+        if approval_required:
+            queue_approval = getattr(self._submission, "queue_approval", None)
+            if not callable(queue_approval):
+                await self._release_comment(
+                    opportunity, effect_id, "approval_path_unavailable"
+                )
+                await self._record(
+                    opportunity, "comment_skipped", "approval_path_unavailable"
+                )
+                return {
+                    "status": "comment_skipped",
+                    "reason": "approval_path_unavailable",
+                }
+            outcome = await queue_approval(
+                opportunity=opportunity,
+                decision=decision,
+                admission=admission,
+                effect_id=effect_id,
+                content=text,
+                snapshot=admission_snapshot,
+            )
+            status = str(getattr(outcome, "status", "") or "")
+            if isinstance(outcome, Mapping):
+                status = str(outcome.get("status") or status)
+            if status != "awaiting_approval":
+                await self._release_comment(
+                    opportunity, effect_id, status or "approval_queue_failed"
+                )
+                await self._record(
+                    opportunity,
+                    "comment_skipped",
+                    status or "approval_queue_failed",
+                )
+                return {
+                    "status": "comment_skipped",
+                    "reason": status or "approval_queue_failed",
+                }
+            await self._record(opportunity, "awaiting_approval", decision.reason)
+            return {"status": status, "effect_id": effect_id}
         outcome = await self._submission.submit(
             admission=admission,
             effect_id=effect_id,

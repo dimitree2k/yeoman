@@ -2284,6 +2284,7 @@ class ProcessingStore:
                 FROM effects AS e
                 JOIN transport_receipts AS r ON r.effect_id = e.effect_id
                 WHERE r.channel = ? AND r.chat_id = ? AND r.confirmed_ms >= ?
+                  AND e.origin = 'participation'
                   AND e.payload_kind IN ('text', 'reaction')
                 ORDER BY r.confirmed_ms ASC, e.effect_id ASC
                 LIMIT ?

@@ -331,9 +331,9 @@ class ReconciliationService:
 
     def __init__(
         self,
-        store: Any,
+        store: Any | None,
         *,
-        probe: ReconciliationProbe,
+        probe: ReconciliationProbe | None,
         config: Any,
         worker_id: str = "reconciler",
         clock: Callable[[], int] | None = None,
@@ -412,6 +412,16 @@ class ReconciliationService:
     # -- work --------------------------------------------------------------------------
 
     async def tick_once(self) -> tuple[ReconciliationResult, ...]:
+        """Run one tolerant background pass."""
+        return await self._tick_once(fail_fast_projection=False)
+
+    async def recover_once(self) -> tuple[ReconciliationResult, ...]:
+        """Run the startup recovery fence, propagating projection failures."""
+        return await self._tick_once(fail_fast_projection=True)
+
+    async def _tick_once(
+        self, *, fail_fast_projection: bool
+    ) -> tuple[ReconciliationResult, ...]:
         import asyncio
 
         now = self._clock()
@@ -424,6 +434,8 @@ class ReconciliationService:
             try:
                 await self._project_participation_receipts()
             except Exception as exc:  # a ledger write must not starve effect recovery
+                if fail_fast_projection:
+                    raise
                 logger.warning(
                     "participation receipt projection failed error_type={}",
                     type(exc).__name__,
@@ -431,6 +443,9 @@ class ReconciliationService:
             else:
                 self._last_projection_ms = now
                 self._counters["participation_projections"] += 1
+
+        if self._store is None:
+            return ()
 
         recovered = self._store.recover_executing(now)
         self._counters["recovered"] += len(recovered)
@@ -475,6 +490,8 @@ class ReconciliationService:
     ) -> ReconciliationResult | None:
         import asyncio
 
+        if self._store is None or self._probe is None:
+            return None
         effect = self._effect_meta(effect_id)
         if effect is None:
             return None
@@ -578,6 +595,7 @@ class ReconciliationService:
         return reconciled
 
     def _escalate(self, effect_id: str, now: int, *, reason: str) -> ReconciliationResult:
+        assert self._store is not None
         state = self._store.effect_state(effect_id)
         if state in ("unknown", "unknown_nonrepeatable"):
             if state == "unknown":
@@ -597,6 +615,8 @@ class ReconciliationService:
         )
 
     def _effect_meta(self, effect_id: str) -> RetainedEffectMeta | None:
+        if self._store is None:
+            return None
         return self._store.effect_meta(effect_id)
 
 

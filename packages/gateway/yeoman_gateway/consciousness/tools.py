@@ -6,9 +6,9 @@ import asyncio
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from yeoman_shared.config.schema import Config
 
@@ -179,6 +179,7 @@ class ConsciousnessTools:
         self.approval_store = approval_store
         self._now = now or (lambda: datetime.now(UTC))
         self._activation_provider = activation_provider
+        self._participation_submission: object | None = None
         self._proposals: dict[str, SpeakupProposal] = {}
         self._commit_lock = asyncio.Lock()
         self._trigger = "cron"
@@ -189,6 +190,10 @@ class ConsciousnessTools:
 
     def current_trigger(self) -> str:
         return self._trigger
+
+    def set_participation_submission(self, submission: object) -> None:
+        """Bind approvals to the same admission-aware submission used by runtime."""
+        self._participation_submission = submission
 
     async def is_chat_within_opportunity_budget(
         self,
@@ -503,6 +508,176 @@ class ConsciousnessTools:
         )
         return {"status": "proposed", "proposal_id": proposal_id}
 
+    async def stage_participation_approval(
+        self,
+        *,
+        opportunity: object,
+        decision: object,
+        admission: object,
+        effect_id: str,
+        content: str,
+        snapshot: object,
+    ) -> dict[str, object]:
+        """Persist and preview one exact Participation draft for owner approval."""
+        del decision, snapshot
+        from yeoman_gateway.processing.models import (
+            TextPayload,
+            canonical_hash,
+            payload_to_mapping,
+        )
+        from yeoman_gateway.processing.participation_runtime import (
+            ParticipationAdmission,
+        )
+
+        if not isinstance(admission, ParticipationAdmission):
+            return {"status": "approval_queue_failed", "reason": "invalid_admission"}
+        proposal_id = str(getattr(opportunity, "opportunity_id", "") or "")
+        channel = str(getattr(opportunity, "channel", "") or "")
+        chat_id = str(getattr(opportunity, "chat_id", "") or "")
+        expected_effect_id = deterministic_effect_id(
+            channel=channel,
+            chat_id=chat_id,
+            operation="comment",
+            proposal_id=proposal_id,
+        )
+        if not proposal_id or str(effect_id) != expected_effect_id:
+            return {"status": "approval_queue_failed", "reason": "effect_id_mismatch"}
+        if self._service_effects is None:
+            return {
+                "status": "approval_queue_failed",
+                "reason": "approval_path_unavailable",
+            }
+
+        output = self.security.check_output(
+            str(content),
+            context={
+                "path": "participation.approval_preview",
+                "channel": channel,
+                "chat_id": chat_id,
+            },
+        )
+        if output.decision.action == "block":
+            return {"status": "approval_queue_failed", "reason": "security_output_blocked"}
+        normalized = (
+            output.sanitized_text
+            if output.decision.action == "sanitize" and output.sanitized_text
+            else str(content)
+        )
+        normalized = str(normalized or "").strip()
+        if not normalized:
+            return {"status": "approval_queue_failed", "reason": "empty_message"}
+        payload_hash = canonical_hash(payload_to_mapping(TextPayload(text=normalized)))
+        prepared_admission = replace(
+            admission,
+            payload_hash=payload_hash,
+            approval_revision=max(1, int(admission.approval_revision or 0)),
+        )
+
+        try:
+            resolved = self.policy_engine.resolve_policy(channel, chat_id)
+        except Exception:
+            return {"status": "approval_queue_failed", "reason": "policy_unavailable"}
+        if str(resolved.spontaneity_preview or "") != "owner_dm":
+            return {"status": "approval_queue_failed", "reason": "approval_not_required"}
+        owner_chat_id = next(
+            (
+                candidate
+                for owner in self.policy_engine.policy.owners.get(channel, [])
+                if (candidate := self._owner_dm_chat_id(channel, owner))
+                and not self._is_group_chat(channel, candidate)
+            ),
+            "",
+        )
+        if not owner_chat_id:
+            return {"status": "approval_queue_failed", "reason": "owner_unavailable"}
+
+        revision = max(1, int(prepared_admission.approval_revision))
+        approval_hash = canonical_payload_hash(
+            channel=channel,
+            chat_id=chat_id,
+            content=normalized,
+            action_type="comment",
+            reply_to_message_id=None,
+            revision=revision,
+        )
+        now = self._now()
+        expires_at = now.timestamp() + float(
+            self.config.consciousness.approval_timeout_seconds
+        )
+        context_snapshot: dict[str, object] = {
+            "origin": "participation",
+            "effect_id": str(effect_id),
+            "payload_hash": approval_hash,
+            "proposal_revision": revision,
+            "participation_admission": asdict(prepared_admission),
+            "approval_expires_at_ms": int(expires_at * 1000),
+            "approval_owner_channel": channel,
+            "approval_owner_chat_id": owner_chat_id,
+        }
+        await self.log.record_proposed(
+            proposal_id=proposal_id,
+            channel=channel,
+            chat_id=chat_id,
+            action_type="comment",
+            profile=str(resolved.spontaneity_profile or "helpful"),
+            message=normalized,
+            trigger=str(getattr(opportunity, "trigger", "inbound") or "inbound"),
+            context_snapshot=context_snapshot,
+            now=now.timestamp(),
+        )
+        approval = PendingSpeakupApproval(
+            proposal_id=proposal_id,
+            target_channel=channel,
+            target_chat_id=chat_id,
+            owner_channel=channel,
+            owner_chat_id=owner_chat_id,
+            message=normalized,
+            action_type="comment",
+            profile=str(resolved.spontaneity_profile or "helpful"),
+            created_at=now.timestamp(),
+            expires_at=expires_at,
+            context_snapshot=context_snapshot,
+            trigger=str(getattr(opportunity, "trigger", "inbound") or "inbound"),
+            daily_cap=max(0, int(resolved.spontaneity_daily_cap or 0)),
+            payload_hash=approval_hash,
+            proposal_revision=revision,
+        )
+        preview_content = "\n".join(
+            (
+                f"Proposed spontaneous message for {chat_id}",
+                f"Message: {normalized}",
+                f"Approve: {approval.approve_code}",
+                f"Deny: {approval.deny_code}",
+            )
+        )
+        preview_ref = f"participation-preview:{proposal_id}"
+        preview_effect_id = deterministic_effect_id(
+            channel=channel,
+            chat_id=owner_chat_id,
+            operation="preview",
+            proposal_id=proposal_id,
+        )
+        try:
+            receipt = await self._service_effects.send(
+                source="speakup",
+                operation_ref=preview_ref,
+                channel=channel,
+                chat_id=owner_chat_id,
+                content=preview_content,
+                effect_id=preview_effect_id,
+            )
+        except Exception:
+            await self.log.mark_rejected(proposal_id, reason="preview_failed")
+            return {"status": "approval_queue_failed", "reason": "preview_failed"}
+        await self.log.record_preview_effect(
+            proposal_id,
+            preview_effect_id=preview_effect_id,
+            preview_operation_ref=preview_ref,
+            accepted=bool(getattr(receipt, "accepted", False)),
+            now=now.timestamp(),
+        )
+        return {"status": "awaiting_approval", "effect_id": str(effect_id)}
+
     async def commit_speakup(self, proposal_id: str) -> dict[str, object]:
         """Stage a proposal: preview it to the owner, or submit it through the one
         final validation path. Every submission decision lives in
@@ -659,6 +834,10 @@ class ConsciousnessTools:
             proposal = await self._load_proposal(key)
             if proposal is None:
                 return {"status": "rejected", "reason": "proposal_not_found"}
+            if str(proposal.context_snapshot.get("origin") or "") == "participation":
+                return await self._submit_participation_proposal(
+                    proposal, approval_claim=repeated
+                )
             if not self.config.consciousness.enabled:
                 return {"status": "rejected", "reason": "consciousness_disabled"}
 
@@ -735,12 +914,6 @@ class ConsciousnessTools:
                     proposal.proposal_id, reason="delivery_budget_exhausted"
                 )
                 return {"status": "rejected", "reason": "delivery_budget_exhausted"}
-            await self.log.record_send_attempt(
-                proposal.proposal_id,
-                effect_id=effect_id,
-                now_ms=int(self._now().timestamp() * 1000),
-            )
-
             output = self.security.check_output(
                 proposal.message,
                 context={
@@ -750,6 +923,13 @@ class ConsciousnessTools:
                 },
             )
             if output.decision.action == "block":
+                await self.log.release_delivery(
+                    proposal.proposal_id,
+                    effect_id=effect_id,
+                    state="failed",
+                    reason="security_output_blocked",
+                    now_ms=int(self._now().timestamp() * 1000),
+                )
                 await self.log.mark_rejected(
                     proposal.proposal_id,
                     reason="security_output_blocked",
@@ -762,10 +942,23 @@ class ConsciousnessTools:
             )
             if content != proposal.message:
                 # A sanitizer that changes the payload invalidates the approval.
+                await self.log.release_delivery(
+                    proposal.proposal_id,
+                    effect_id=effect_id,
+                    state="failed",
+                    reason="sanitized_payload_changed",
+                    now_ms=int(self._now().timestamp() * 1000),
+                )
                 await self.log.mark_rejected(
                     proposal.proposal_id, reason="sanitized_payload_changed"
                 )
                 return {"status": "rejected", "reason": "sanitized_payload_changed"}
+
+            await self.log.record_send_attempt(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                now_ms=int(self._now().timestamp() * 1000),
+            )
 
             if self._service_effects is None:
                 await self.bus.publish_outbound(
@@ -843,6 +1036,188 @@ class ConsciousnessTools:
                 "proposal_id": proposal.proposal_id,
                 "effect_id": effect_id,
             }
+
+    async def _submit_participation_proposal(
+        self,
+        proposal: SpeakupProposal,
+        *,
+        approval_claim: dict[str, Any] | None,
+    ) -> dict[str, object]:
+        """Submit one approved new-lane proposal through its bound managed effect."""
+        from yeoman_gateway.processing.models import (
+            TextPayload,
+            canonical_hash,
+            payload_to_mapping,
+        )
+        from yeoman_gateway.processing.participation_runtime import (
+            ParticipationAdmission,
+        )
+
+        if approval_claim is None:
+            return {"status": "rejected", "reason": "approval_required"}
+        snapshot = proposal.context_snapshot
+        effect_id = str(snapshot.get("effect_id") or "")
+        now_ms = int(self._now().timestamp() * 1000)
+        if int(snapshot.get("approval_expires_at_ms") or 0) <= now_ms:
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="expired",
+                reason="approval_expired",
+                now_ms=now_ms,
+            )
+            await self.log.resolve_approval_claim(
+                proposal.proposal_id,
+                resolution="expired",
+                now_ms=now_ms,
+            )
+            await self.log.mark_status(proposal.proposal_id, status="expired")
+            return {"status": "expired", "reason": "approval_expired"}
+        if (
+            str(approval_claim.get("state") or "") != "claimed"
+            or str(approval_claim.get("payload_hash") or "") != proposal.payload_hash
+            or int(approval_claim.get("proposal_revision") or 0)
+            != int(proposal.proposal_revision)
+            or str(approval_claim.get("target_effect_id") or "") != effect_id
+            or str(approval_claim.get("owner_channel") or "")
+            != str(snapshot.get("approval_owner_channel") or "")
+            or str(approval_claim.get("owner_chat_id") or "")
+            != str(snapshot.get("approval_owner_chat_id") or "")
+        ):
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="approval_binding_changed",
+                now_ms=now_ms,
+            )
+            await self.log.mark_rejected(
+                proposal.proposal_id, reason="approval_binding_changed"
+            )
+            return {"status": "rejected", "reason": "approval_binding_changed"}
+        raw_admission = snapshot.get("participation_admission")
+        if not isinstance(raw_admission, dict):
+            return {"status": "rejected", "reason": "approval_admission_missing"}
+        values = dict(raw_admission)
+        values["source_event_ids"] = tuple(values.get("source_event_ids") or ())
+        values["source_principals"] = tuple(
+            (str(pair[0]), str(pair[1]))
+            for pair in (values.get("source_principals") or ())
+            if isinstance(pair, (tuple, list)) and len(pair) == 2
+        )
+        try:
+            admission = ParticipationAdmission(**values)
+        except (TypeError, ValueError):
+            return {"status": "rejected", "reason": "approval_admission_invalid"}
+        expected_effect_id = deterministic_effect_id(
+            channel=proposal.channel,
+            chat_id=proposal.chat_id,
+            operation="comment",
+            proposal_id=proposal.proposal_id,
+        )
+        expected_payload_hash = canonical_hash(
+            payload_to_mapping(TextPayload(text=proposal.message))
+        )
+        if (
+            effect_id != expected_effect_id
+            or admission.opportunity_id != proposal.proposal_id
+            or admission.channel != proposal.channel
+            or admission.chat_id != proposal.chat_id
+            or admission.payload_hash != expected_payload_hash
+            or int(admission.approval_revision) != int(proposal.proposal_revision)
+        ):
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="approval_admission_changed",
+                now_ms=int(self._now().timestamp() * 1000),
+            )
+            return {"status": "rejected", "reason": "approval_admission_changed"}
+
+        output = self.security.check_output(
+            proposal.message,
+            context={
+                "path": "participation.approval_submit",
+                "channel": proposal.channel,
+                "chat_id": proposal.chat_id,
+            },
+        )
+        content = (
+            output.sanitized_text
+            if output.decision.action == "sanitize" and output.sanitized_text
+            else proposal.message
+        )
+        if output.decision.action == "block" or content != proposal.message:
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="approved_payload_changed",
+                now_ms=int(self._now().timestamp() * 1000),
+            )
+            await self.log.mark_rejected(
+                proposal.proposal_id, reason="approved_payload_changed"
+            )
+            return {"status": "rejected", "reason": "approved_payload_changed"}
+        submit = getattr(self._participation_submission, "submit", None)
+        if not callable(submit):
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="participation_submission_unavailable",
+                now_ms=int(self._now().timestamp() * 1000),
+            )
+            return {
+                "status": "rejected",
+                "reason": "participation_submission_unavailable",
+            }
+
+        try:
+            outcome = await submit(
+                admission=admission,
+                effect_id=effect_id,
+                content=proposal.message,
+                payload_hash=admission.payload_hash,
+            )
+        except Exception:
+            # The effect path owns possible-dispatch classification. Keep the hold
+            # until the same deterministic effect is reconciled.
+            await self.log.mark_status(proposal.proposal_id, status="submitted")
+            raise
+        state = str(getattr(outcome, "status", "") or "submitted")
+        if state == "sent":
+            await self.log.resolve_approval_claim(
+                proposal.proposal_id,
+                resolution="submitted",
+                now_ms=now_ms,
+            )
+            await self.log.mark_status(
+                proposal.proposal_id, status="transport_accepted"
+            )
+            self._proposals.pop(proposal.proposal_id, None)
+            return {
+                "status": "transport_accepted",
+                "proposal_id": proposal.proposal_id,
+                "effect_id": effect_id,
+            }
+        if state in {"failed", "cancelled", "expired", "blocked", "not_executed"}:
+            await self.log.release_delivery(
+                proposal.proposal_id,
+                effect_id=effect_id,
+                state="failed",
+                reason=f"effect_{state}",
+                now_ms=now_ms,
+            )
+            await self.log.mark_status(proposal.proposal_id, status=state)
+            return {"status": state, "proposal_id": proposal.proposal_id}
+        await self.log.mark_status(proposal.proposal_id, status="submitted")
+        return {
+            "status": "submitted",
+            "proposal_id": proposal.proposal_id,
+            "effect_id": effect_id,
+        }
 
     def _reservation_limits(
         self, proposal: SpeakupProposal

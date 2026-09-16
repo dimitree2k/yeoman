@@ -16,6 +16,7 @@ import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
+from yeoman_gateway.processing.models import TransportReceipt
 from yeoman_gateway.processing.participation import (
     ParticipationDecision,
     ParticipationDecisionError,
@@ -130,6 +131,33 @@ class _Submission:
         return _Receipt(effect_id="e1", state=self.status)
 
 
+@dataclass
+class _ApprovalSubmission(_Submission):
+    approval_calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def queue_approval(
+        self,
+        *,
+        opportunity,
+        decision,
+        admission,
+        effect_id,
+        content,
+        snapshot,
+    ):
+        self.approval_calls.append(
+            {
+                "opportunity": opportunity,
+                "decision": decision,
+                "admission": admission,
+                "effect_id": effect_id,
+                "content": content,
+                "snapshot": snapshot,
+            }
+        )
+        return {"status": "awaiting_approval", "effect_id": effect_id}
+
+
 class _Reactor:
     def __init__(self, *, state: str = "sent") -> None:
         self.calls: list[dict[str, object]] = []
@@ -141,6 +169,16 @@ class _Reactor:
             effect_id=str(kwargs.get("effect_id") or ""),
             state=self._state,
             accepted=self._state == "sent",
+            transport_receipt=(
+                TransportReceipt(
+                    channel=CHANNEL,
+                    chat_id=CHAT,
+                    provider_message_id="reaction-provider-1",
+                    confirmed_ms=NOW_MS,
+                )
+                if self._state == "sent"
+                else None
+            ),
         )
 
 
@@ -1472,7 +1510,7 @@ async def test_continuation_reserves_only_comment_window(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_approval_required_initiation_never_bypasses_approval_path(tmp_path: Path) -> None:
-    submission = _Submission()
+    submission = _ApprovalSubmission()
     runtime, judge, _context, log = _runtime(
         tmp_path,
         decision=COMMENT,
@@ -1480,10 +1518,17 @@ async def test_approval_required_initiation_never_bypasses_approval_path(tmp_pat
         approval_required=True,
     )
     result = await runtime.evaluate_participation(_opportunity())
-    assert result == {"status": "comment_skipped", "reason": "approval_required"}
+    assert result["status"] == "awaiting_approval"
+    assert result["effect_id"] == submission.approval_calls[0]["effect_id"]
     assert judge.calls == 1
-    assert submission.calls == 0
-    assert await log.pending_delivery_reservations() == []
+    assert submission.calls == 1
+    assert len(submission.approval_calls) == 1
+    admission = submission.approval_calls[0]["admission"]
+    assert getattr(admission, "payload_hash", "")
+    rows = await log.pending_delivery_reservations(origin="participation", lane="production")
+    assert {row["category"] for row in rows} == {"initiation", "comment"}
+    assert {row["effect_id"] for row in rows} == {result["effect_id"]}
+    assert {row["attempt_state"] for row in rows} == {"unsubmitted"}
     log.close()
 
 

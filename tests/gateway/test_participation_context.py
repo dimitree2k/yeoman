@@ -465,9 +465,13 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
     from yeoman_gateway.processing.models import (
         EffectEnvelope,
         EffectReceipt,
+        EffectTarget,
         TextPayload,
         TransportReceipt,
+        canonical_hash,
+        payload_to_mapping,
     )
+    from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
 
     class _Allow:
         def check(self, envelope, current_turn):
@@ -510,16 +514,34 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
         channel=CHANNEL, chat_id=CHAT, operation="observation", proposal_id="p1"
     )
     gateway = EffectGateway(store, authorizer=_Allow(), executor=_Executor())
-    gateway.submit(
+    payload = TextPayload(text="Arvid: I can play in goal.")
+    admission = ParticipationAdmission(
+        opportunity_id="p1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=1,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="initiate",
+        admission_id="adm-p1",
+        source_event_ids=("source-1",),
+        source_principals=(("source-1", "participant@s.whatsapp.net"),),
+        payload_hash=canonical_hash(payload_to_mapping(payload)),
+    )
+    store.enqueue_participation_effect(
         EffectEnvelope(
             effect_id=effect_id,
             operation_key=f"test:{effect_id}",
-            payload=TextPayload(text="Arvid: I can play in goal."),
-            target={"channel": CHANNEL, "chat_id": CHAT},
+            payload=payload,
+            target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
             trace_id=effect_id,
             principal="service:speakup",
             capability="send_text",
-        )
+            origin="participation",
+            admission_id=admission.admission_id,
+        ),
+        admission,
     )
     await gateway.execute_ready(effect_id)
     await log.record_proposed(
@@ -540,6 +562,8 @@ async def test_delivered_anchor_is_included_and_nothing_else_is(tmp_path: Path) 
         chat_id=CHAT,
         now_ms=NOW_MS,
         limits=(("comment", 5, 3_600_000),),
+        origin="participation",
+        lane="production",
     )
     # Accepted but not delivered: still not something Arvid said.
     await log.project_transport_accepted(

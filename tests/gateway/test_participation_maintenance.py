@@ -63,6 +63,8 @@ async def _delivered(
         chat_id=CHAT,
         now_ms=delivered_at_ms - 1000,
         limits=(("comment", 10, 3_600_000),),
+        origin="participation",
+        lane="production",
     )
     await log.project_transport_accepted(
         proposal_id,

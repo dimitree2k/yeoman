@@ -9,6 +9,7 @@ delivery and never produce an anchor (spec section 9).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from yeoman_gateway.consciousness.log import SpeakupLog
@@ -152,7 +153,7 @@ class ParticipationReceiptReconciler:
         self,
         *,
         log: SpeakupLog,
-        store: ProcessingStore,
+        store: ProcessingStore | None,
         unsubmitted_ttl_ms: int = 120_000,
     ) -> None:
         self._log = log
@@ -165,10 +166,36 @@ class ParticipationReceiptReconciler:
 
         moment = int(now_ms if now_ms is not None else _time.time() * 1000)
         counters = {"accepted": 0, "delivered": 0, "released": 0, "retained": 0, "skipped": 0}
-        for row in await self._log.pending_delivery_reservations(limit=limit):
+        for row in await self._log.pending_delivery_reservations(
+            limit=limit, origin="participation", lane="production"
+        ):
             effect_id = str(row["effect_id"])
             proposal_id = str(row["proposal_id"])
             state = str(row["delivery_state"])
+            if self._store is None:
+                if (
+                    str(row.get("attempt_state") or "") == "unsubmitted"
+                    and not await self._valid_pending_approval(proposal_id, moment)
+                    and moment
+                    >= int(row.get("created_at_ms") or moment) + self._unsubmitted_ttl_ms
+                    and await self._log.release_delivery(
+                        proposal_id,
+                        effect_id=effect_id,
+                        state="expired",
+                        reason="unsubmitted_intent_expired",
+                        now_ms=moment,
+                    )
+                ):
+                    counters["released"] += 1
+                else:
+                    counters["skipped"] += 1
+                continue
+            effect = self._store.get_effect(effect_id)
+            if effect is not None and str(getattr(effect, "origin", "legacy")) != "participation":
+                # The reservation may be old or corrupted, but a legacy effect is
+                # never upgraded into Participation evidence by this projector.
+                counters["skipped"] += 1
+                continue
             if state in {"transport_accepted", "delivery_unknown"}:
                 if await self._project_recipient_evidence(
                     proposal_id=proposal_id,
@@ -181,13 +208,13 @@ class ParticipationReceiptReconciler:
                 else:
                     counters["retained"] += 1
                 continue
-            effect = self._store.get_effect(effect_id)
             if effect is None:
                 # No durable effect exists for this reservation: the crash-recovery
                 # case "reservation saved, effect absent". It is never sent from
                 # here; the submitting path revalidates and reuses the same id.
                 if (
                     str(row.get("attempt_state") or "") == "unsubmitted"
+                    and not await self._valid_pending_approval(proposal_id, moment)
                     and moment
                     >= int(row.get("created_at_ms") or moment) + self._unsubmitted_ttl_ms
                     and await self._log.release_delivery(
@@ -204,6 +231,9 @@ class ParticipationReceiptReconciler:
                 continue
             if effect.state == "sent":
                 transport = self._store.effect_transport_receipt(effect_id)
+                if transport is None:
+                    counters["retained"] += 1
+                    continue
                 await self._log.project_transport_accepted(
                     proposal_id,
                     effect_id=effect_id,
@@ -249,6 +279,25 @@ class ParticipationReceiptReconciler:
             counters["skipped"] += 1
         return counters
 
+    async def _valid_pending_approval(
+        self, proposal_id: str, now_ms: int
+    ) -> bool:
+        row = await self._log.proposal_row(proposal_id)
+        if row is None or str(row.get("status") or "") not in {
+            "queued_for_approval",
+            "awaiting_approval",
+        }:
+            return False
+        try:
+            snapshot = json.loads(str(row.get("context_snapshot_json") or "{}"))
+            expires_at_ms = int(snapshot.get("approval_expires_at_ms") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return bool(
+            snapshot.get("origin") == "participation"
+            and expires_at_ms > int(now_ms)
+        )
+
     async def _project_recipient_evidence(
         self,
         *,
@@ -258,6 +307,7 @@ class ParticipationReceiptReconciler:
         chat_id: str,
         now_ms: int,
     ) -> bool:
+        assert self._store is not None
         transport = self._store.effect_transport_receipt(effect_id)
         provider_id = None if transport is None else transport.provider_message_id
         if not provider_id:

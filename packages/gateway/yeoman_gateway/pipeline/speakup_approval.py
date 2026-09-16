@@ -9,11 +9,17 @@ payload changed since the preview is refused.
 
 from __future__ import annotations
 
+import json
+
 from loguru import logger
 
 from yeoman_gateway.bus.events import OutboundMessage  # noqa: F401  (public re-export)
 from yeoman_gateway.bus.queue import MessageBus
-from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+from yeoman_gateway.consciousness.approval import (
+    PendingSpeakupApproval,
+    SpeakupApprovalMatch,
+    SpeakupApprovalStore,
+)
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.consciousness.tools import ConsciousnessTools, deterministic_effect_id
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
@@ -54,19 +60,25 @@ class SpeakupApprovalMiddleware:
         if not is_speakup_code:
             expired = await self._store.purge_expired()
             for approval in expired:
+                await self._release_unsubmitted_participation(
+                    approval, state="expired", reason="approval_expired"
+                )
                 await self._log.mark_status(approval.proposal_id, status="expired")
             await next(ctx)
             return
 
-        matched = None
-        for owner_chat_id in self._owner_chat_candidates(ctx):
-            matched = await self._store.match_and_consume(
-                content,
-                owner_channel=ctx.event.channel,
-                owner_chat_id=owner_chat_id,
-            )
-            if matched is not None:
-                break
+        participation_code, matched = await self._match_participation(
+            content, ctx
+        )
+        if not participation_code:
+            for owner_chat_id in self._owner_chat_candidates(ctx):
+                matched = await self._store.match_and_consume(
+                    content,
+                    owner_channel=ctx.event.channel,
+                    owner_chat_id=owner_chat_id,
+                )
+                if matched is not None:
+                    break
         if matched is None:
             ctx.halt()
             return
@@ -74,6 +86,9 @@ class SpeakupApprovalMiddleware:
         action = matched.action
         approval = matched.approval
         if matched.expired:
+            await self._release_unsubmitted_participation(
+                approval, state="expired", reason="approval_expired"
+            )
             await self._log.mark_status(approval.proposal_id, status="expired")
             ctx.halt()
             return
@@ -87,9 +102,68 @@ class SpeakupApprovalMiddleware:
             await self._approve(ctx, approval)
         else:
             logger.info("Speakup denied: {}", approval.proposal_id)
+            await self._release_unsubmitted_participation(
+                approval, state="cancelled", reason="approval_denied"
+            )
             await self._log.mark_status(approval.proposal_id, status="denied")
 
         ctx.halt()
+
+    async def _match_participation(
+        self, content: str, ctx: PipelineContext
+    ) -> tuple[bool, SpeakupApprovalMatch | None]:
+        """Resolve new-lane approvals from SpeakupLog, never the legacy JSON store."""
+        if content.startswith("spk-approve-"):
+            action = "approve"
+            proposal_id = content.removeprefix("spk-approve-").strip()
+        elif content.startswith("spk-deny-"):
+            action = "deny"
+            proposal_id = content.removeprefix("spk-deny-").strip()
+        else:
+            return False, None
+        row = await self._log.proposal_row(proposal_id)
+        if row is None:
+            return False, None
+        try:
+            snapshot = json.loads(str(row.get("context_snapshot_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False, None
+        if not isinstance(snapshot, dict) or snapshot.get("origin") != "participation":
+            return False, None
+        if str(row.get("status") or "") not in {
+            "queued_for_approval",
+            "awaiting_approval",
+        }:
+            return True, None
+        owner_channel = str(snapshot.get("approval_owner_channel") or "")
+        owner_chat_id = str(snapshot.get("approval_owner_chat_id") or "")
+        if (
+            owner_channel != ctx.event.channel
+            or owner_chat_id not in self._owner_chat_candidates(ctx)
+        ):
+            return True, None
+        expires_at_ms = int(snapshot.get("approval_expires_at_ms") or 0)
+        approval = PendingSpeakupApproval(
+            proposal_id=proposal_id,
+            target_channel=str(row.get("channel") or ""),
+            target_chat_id=str(row.get("chat_id") or ""),
+            owner_channel=owner_channel,
+            owner_chat_id=owner_chat_id,
+            message=str(row.get("message") or ""),
+            action_type=str(row.get("action_type") or "comment"),
+            profile=str(row.get("profile") or ""),
+            created_at=float(row.get("created_at") or 0.0),
+            expires_at=expires_at_ms / 1000,
+            context_snapshot=snapshot,
+            trigger=str(row.get("trigger") or "inbound"),
+            payload_hash=str(snapshot.get("payload_hash") or ""),
+            proposal_revision=int(snapshot.get("proposal_revision") or 1),
+        )
+        return True, SpeakupApprovalMatch(
+            action=action,
+            approval=approval,
+            expired=expires_at_ms <= self._now_ms(),
+        )
 
     async def _approve(self, ctx: PipelineContext, approval: object) -> None:
         """Authenticate the owner code into durable CAS state, then submit once.
@@ -115,8 +189,12 @@ class SpeakupApprovalMiddleware:
         )
         claimed = await self._log.record_approval_claim(
             proposal_id,
-            owner_channel=ctx.event.channel,
-            owner_chat_id=ctx.event.chat_id,
+            owner_channel=str(
+                getattr(approval, "owner_channel", "") or ctx.event.channel
+            ),
+            owner_chat_id=str(
+                getattr(approval, "owner_chat_id", "") or ctx.event.chat_id
+            ),
             owner_id=owner_id,
             payload_hash=payload_hash,
             proposal_revision=revision,
@@ -201,6 +279,27 @@ class SpeakupApprovalMiddleware:
             )
         )
         await self._log.mark_sent(str(getattr(approval, "proposal_id")))
+
+    async def _release_unsubmitted_participation(
+        self, approval: object, *, state: str, reason: str
+    ) -> None:
+        snapshot = getattr(approval, "context_snapshot", None)
+        if not isinstance(snapshot, dict) or snapshot.get("origin") != "participation":
+            return
+        proposal_id = str(getattr(approval, "proposal_id", "") or "")
+        effect_id = str(snapshot.get("effect_id") or "")
+        record = await self._log.delivery_record(
+            proposal_id=proposal_id, effect_id=effect_id
+        )
+        if record is None or str(record.get("attempt_state") or "") != "unsubmitted":
+            return
+        await self._log.release_delivery(
+            proposal_id,
+            effect_id=effect_id,
+            state=state,
+            reason=reason,
+            now_ms=self._now_ms(),
+        )
 
     @staticmethod
     def _now_ms() -> int:

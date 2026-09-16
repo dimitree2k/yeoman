@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from yeoman_gateway.app.bootstrap import participant_is_allowed
 from yeoman_gateway.bus.events import InboundObservedEvent
 from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
 from yeoman_gateway.consciousness.log import SpeakupLog
@@ -108,6 +109,12 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
                         CHAT: {
                             "whoCanTalk": {"mode": "everyone"},
                             "whenToReply": {"mode": "all"},
+                            "spontaneity": {
+                                "enabled": True,
+                                "profile": "helpful",
+                                "dailyCap": 2,
+                                "allowedActions": ["observation"],
+                            },
                             "participation": {"enabled": True},
                         }
                     }
@@ -117,6 +124,8 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
     )
     config = ProcessingConfig.model_validate(
         {
+            "enabled": True,
+            "chats": [f"{CHANNEL}:{CHAT}"],
             "participation": {
                 "enabled": True,
                 "shadow": shadow,
@@ -159,6 +168,27 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
             "invalid_reason": resolved.invalid_reason,
             "activation_epoch": resolved.activation_epoch,
             "lane": "shadow" if resolved.shadow else "production",
+            "policy_version": resolved.policy_version,
+            "allow_initiation": bool(resolved.participation.allow_initiation),
+            "allow_continuation": bool(resolved.participation.allow_continuation),
+            "allow_reactions": bool(resolved.participation.allow_reactions),
+            "spontaneity_enabled": True,
+            "spontaneity_daily_cap": 2,
+            "spontaneity_allowed_actions": ("observation",),
+            "reply_action": "answer",
+            "approval_required": False,
+            "arbitration_revision": 0,
+            "context_window_minutes": int(resolved.context_window_minutes),
+            "context_max_messages": int(resolved.context_max_messages),
+            "context_revision": int(
+                getattr(opportunity, "observed_revision", 0) or 0
+            ),
+            "current_source_ids": tuple(
+                str(item)
+                for item in (getattr(opportunity, "source_event_ids", ()) or ())
+            ),
+            "max_reevaluations": int(resolved.max_reevaluations),
+            "opportunity_ttl_seconds": int(resolved.opportunity_ttl_seconds),
             "judge_calls_per_hour": int(
                 resolved.participation.max_unaddressed_judge_calls_per_hour
             ),
@@ -179,6 +209,12 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         archive=archive,
         policy=engine,
         anchors=DeliveryAnchorReader(log=log, store=store),
+        source_authorizer=lambda row: participant_is_allowed(
+            engine=engine,
+            channel=str(row.get("channel") or ""),
+            chat_id=str(row.get("chat_id") or ""),
+            sender=str(row.get("sender_id") or row.get("participant") or ""),
+        ),
     )
     submission = _Submission()
     reactor = _Reactor()
@@ -207,7 +243,30 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         source_owner=SourceOwner(store=log),
         activation_epoch=int(log.activation_epoch_sync("participation")),
     )
-    ingress = ParticipationIngress(runtime=offer, ledger=log, is_active=lambda c, i: True)
+
+    def _material(
+        channel: str, chat_id: str, source_ids: tuple[str, ...] | None
+    ) -> tuple[tuple[str, ...], int]:
+        resolved_sources = archive.resolve_source_ids(channel, chat_id, source_ids)
+        log.ensure_source_revisions_sync(
+            channel=channel,
+            chat_id=chat_id,
+            source_ids=resolved_sources,
+            now_ms=NOW_MS,
+        )
+        return log.material_for_opportunity(
+            channel,
+            chat_id,
+            resolved_sources,
+            lane="shadow" if shadow else "production",
+        )
+
+    ingress = ParticipationIngress(
+        runtime=offer,
+        ledger=log,
+        is_active=lambda c, i: True,
+        material_provider=_material,
+    )
     return {
         "engine": engine,
         "log": log,
@@ -311,8 +370,10 @@ async def test_live_pilot_path_produces_one_comment_and_one_reservation(tmp_path
     call = rt["submission"].submissions[0]
     assert (call["channel"], call["chat_id"]) == (CHANNEL, CHAT)
     held = await rt["log"].pending_delivery_reservations()
-    assert len(held) == 1
-    assert held[0]["delivery_state"] == "submitted"
+    assert {row["category"] for row in held} == {"initiation", "comment"}
+    assert {row["effect_id"] for row in held} == {call["effect_id"]}
+    assert {row["delivery_state"] for row in held} == {"reserved"}
+    assert {row["attempt_state"] for row in held} == {"unsubmitted"}
     assert held[0]["effect_id"] == call["effect_id"]
     rt["log"].close()
     rt["store"].close()
@@ -494,6 +555,7 @@ async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
         shadow=False,
     )
     runtime, log = rt["decision_runtime"], rt["log"]
+    store = rt["store"]
     provider_calls = rt["client"]
     base_snapshot = runtime._snapshot_provider
 
@@ -503,6 +565,88 @@ async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
         return data
 
     runtime._snapshot_provider = snapshot
+    from yeoman_gateway.processing.models import (
+        EffectEnvelope,
+        EffectEvidence,
+        EffectTarget,
+        TextPayload,
+        canonical_hash,
+        payload_to_mapping,
+    )
+    from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
+
+    anchor_payload = TextPayload(text="Earlier bot contribution")
+    anchor_admission = ParticipationAdmission(
+        opportunity_id="anchor-proposal",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=1,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="initiate",
+        admission_id="adm-anchor",
+        source_event_ids=("source-anchor",),
+        source_principals=(("source-anchor", "participant@s.whatsapp.net"),),
+        payload_hash=canonical_hash(payload_to_mapping(anchor_payload)),
+    )
+    store.enqueue_participation_effect(
+        EffectEnvelope(
+            effect_id="anchor-effect",
+            operation_key="pilot:anchor",
+            payload=anchor_payload,
+            target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+            origin="participation",
+            admission_id=anchor_admission.admission_id,
+            created_ms=NOW_MS - 120_000,
+        ),
+        anchor_admission,
+    )
+    assert store.claim_effect("anchor-effect", "test", NOW_MS - 119_500, 30_000)
+    assert store.transition(
+        effect_id="anchor-effect",
+        expected="executing",
+        target="sent",
+        now_ms=NOW_MS - 119_000,
+        worker_id="test",
+        evidence=EffectEvidence(kind="transport_receipt", detail="accepted"),
+    )
+    store.record_transport_receipt(
+        "anchor-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        provider_message_id="bot-anchor",
+        now_ms=NOW_MS - 119_000,
+    )
+    assert await log.reserve_delivery(
+        proposal_id="anchor-proposal",
+        effect_id="anchor-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=NOW_MS - 120_000,
+        limits=(("comment", 20, 3_600_000),),
+        origin="participation",
+        lane="production",
+    )
+    await log.record_send_attempt(
+        "anchor-proposal", effect_id="anchor-effect", now_ms=NOW_MS - 119_000
+    )
+    await log.project_transport_accepted(
+        "anchor-proposal",
+        effect_id="anchor-effect",
+        provider_message_id="bot-anchor",
+        evidence_kind="transport_receipt",
+        evidence_ref="anchor-receipt",
+        now_ms=NOW_MS - 118_000,
+    )
+    assert await log.project_recipient_delivery(
+        "anchor-proposal",
+        effect_id="anchor-effect",
+        provider_message_id="bot-anchor",
+        evidence_kind="recipient_delivery",
+        evidence_ref="anchor-delivery",
+        now_ms=NOW_MS - 117_000,
+    )
     # Spend every background slot: limit 12 minus reserve 4 leaves 8 unbounded calls.
     for index in range(8):
         assert await log.reserve_judge_attempt(

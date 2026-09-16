@@ -266,6 +266,7 @@ class SpeakupLog:
                     observed_revision INTEGER,
                     activation_epoch INTEGER,
                     lane TEXT NOT NULL DEFAULT 'production',
+                    origin TEXT NOT NULL DEFAULT 'legacy',
                     proposal_revision INTEGER NOT NULL DEFAULT 1,
                     outcome TEXT,
                     outcome_kind TEXT,
@@ -466,6 +467,7 @@ class SpeakupLog:
             for row in self._conn.execute("PRAGMA table_info(delivery_reservations)")
         }
         for name, ddl in (
+            ("origin", "TEXT NOT NULL DEFAULT 'legacy'"),
             ("outcome", "TEXT"),
             ("outcome_kind", "TEXT"),
             ("outcome_evidence_json", "TEXT"),
@@ -809,6 +811,7 @@ class SpeakupLog:
         observed_revision: int | None = None,
         activation_epoch: int | None = None,
         lane: str = "production",
+        origin: str = "legacy",
     ) -> bool:
         """Synchronous reservation core: one transaction, no check-then-send race.
 
@@ -825,6 +828,12 @@ class SpeakupLog:
             raise ValueError("proposal_id and effect_id are required")
         if not limits:
             return False
+        reservation_origin = str(origin or "legacy").strip()
+        if reservation_origin not in {"legacy", "participation"}:
+            raise ValueError(f"unknown delivery origin: {reservation_origin}")
+        reservation_lane = str(lane or "production").strip()
+        if reservation_lane not in {"production", "shadow"}:
+            raise ValueError(f"unknown participation lane: {reservation_lane}")
         checked: list[tuple[str, int, int, str]] = []
         for entry in limits:
             category, limit, window_ms = str(entry[0]), int(entry[1]), int(entry[2])
@@ -840,12 +849,20 @@ class SpeakupLog:
             # of that effect and is always written for all of them together.
             existing = conn.execute(
                 """
-                SELECT delivery_state FROM delivery_reservations
+                SELECT delivery_state, channel, chat_id, lane, origin
+                FROM delivery_reservations
                 WHERE effect_id = ? LIMIT 1
                 """,
                 (effect,),
             ).fetchone()
             if existing is not None:
+                if (
+                    str(existing["channel"]) != str(channel)
+                    or str(existing["chat_id"]) != str(chat_id)
+                    or str(existing["lane"]) != reservation_lane
+                    or str(existing["origin"]) != reservation_origin
+                ):
+                    return False
                 state = str(existing["delivery_state"])
                 if state in RELEASED_DELIVERY_STATES:
                     return False
@@ -881,8 +898,8 @@ class SpeakupLog:
                         proposal_id, effect_id, channel, chat_id, category,
                         limit_value, window_ms, window_kind, created_at_ms,
                         delivery_state, attempt_state, observed_revision,
-                        activation_epoch, lane, proposal_revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 'unsubmitted', ?, ?, ?, ?)
+                        activation_epoch, lane, origin, proposal_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 'unsubmitted', ?, ?, ?, ?, ?)
                     ON CONFLICT(effect_id, category) DO NOTHING
                     """,
                     (
@@ -897,7 +914,8 @@ class SpeakupLog:
                         int(now_ms),
                         observed_revision,
                         activation_epoch,
-                        str(lane),
+                        reservation_lane,
+                        reservation_origin,
                         int(proposal_revision),
                     ),
                 )
@@ -916,6 +934,7 @@ class SpeakupLog:
         observed_revision: int | None = None,
         activation_epoch: int | None = None,
         lane: str = "production",
+        origin: str = "legacy",
     ) -> bool:
         """Async wrapper around :meth:`reserve_delivery_sync`."""
         return self.reserve_delivery_sync(
@@ -929,6 +948,7 @@ class SpeakupLog:
             observed_revision=observed_revision,
             activation_epoch=activation_epoch,
             lane=lane,
+            origin=origin,
         )
 
     async def reserve_judge_attempt(
@@ -2066,17 +2086,34 @@ class SpeakupLog:
                 accepted_since_ms=int(now_ms) - max(1, int(window_ms)) + 1,
             )
 
-    async def pending_delivery_reservations(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    async def pending_delivery_reservations(
+        self,
+        *,
+        limit: int = 200,
+        origin: str | None = None,
+        lane: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Holds that are not terminally released, oldest first.
 
         ``attempt_state='unsubmitted'`` rows are cancellable speculation; rows that
         were already handed to transport need reconciliation, never a blind resend.
         """
+        clauses = [
+            "delivery_state IN ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')"
+        ]
+        params: list[Any] = []
+        if origin is not None:
+            clauses.append("origin = ?")
+            params.append(str(origin))
+        if lane is not None:
+            clauses.append("lane = ?")
+            params.append(str(lane))
+        params.append(max(1, int(limit)))
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM delivery_reservations
-                WHERE delivery_state IN ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')
+                WHERE {' AND '.join(clauses)}
                 ORDER BY CASE delivery_state
                     WHEN 'submitted' THEN 0
                     WHEN 'transport_accepted' THEN 0
@@ -2085,7 +2122,7 @@ class SpeakupLog:
                 END, created_at_ms ASC
                 LIMIT ?
                 """,
-                (max(1, int(limit)),),
+                tuple(params),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2254,7 +2291,8 @@ class SpeakupLog:
             rows = self._conn.execute(
                 """
                 SELECT * FROM delivery_reservations
-                WHERE delivery_state = 'delivered'
+                WHERE origin = 'participation' AND lane = 'production'
+                  AND delivery_state = 'delivered'
                   AND delivered_at_ms IS NOT NULL
                   AND delivered_at_ms <= ?
                 ORDER BY delivered_at_ms ASC
@@ -2332,7 +2370,8 @@ class SpeakupLog:
             rows = self._conn.execute(
                 """
                 SELECT * FROM delivery_reservations
-                WHERE channel = ? AND chat_id = ? AND delivery_state = 'delivered'
+                WHERE origin = 'participation' AND lane = 'production'
+                  AND channel = ? AND chat_id = ? AND delivery_state = 'delivered'
                   AND outcome IS NOT NULL AND outcome_kind IS NOT NULL
                 ORDER BY outcome_at_ms DESC, delivered_at_ms DESC
                 LIMIT ?
@@ -2347,7 +2386,8 @@ class SpeakupLog:
                 """
                 SELECT channel, chat_id, MAX(outcome_at_ms) AS latest_at
                 FROM delivery_reservations
-                WHERE delivery_state = 'delivered' AND outcome IS NOT NULL
+                WHERE origin = 'participation' AND lane = 'production'
+                  AND delivery_state = 'delivered' AND outcome IS NOT NULL
                   AND outcome_kind IS NOT NULL
                 GROUP BY channel, chat_id
                 ORDER BY latest_at DESC
@@ -2371,6 +2411,7 @@ class SpeakupLog:
                 """
                 SELECT * FROM delivery_reservations
                 WHERE channel = ? AND chat_id = ? AND delivery_state = 'delivered'
+                  AND origin = 'participation' AND lane = 'production'
                   AND delivered_at_ms IS NOT NULL AND delivered_at_ms >= ?
                 ORDER BY delivered_at_ms DESC, effect_id ASC
                 LIMIT ?

@@ -408,12 +408,13 @@ class GatewayRuntime:
         ``channels.start_all()``. Disabled mode has neither service and stays inert.
         """
         if self.reconciliation is not None:
-            try:
+            # Recovery is a startup fence: if its first deterministic pass fails,
+            # no socket, channel or producer may begin new work on stale state.
+            recover_once = getattr(self.reconciliation, "recover_once", None)
+            if callable(recover_once):
+                await recover_once()
+            else:
                 await self.reconciliation.tick_once()
-            except Exception:
-                # A failed recovery must not stop the gateway from starting; the loop
-                # retries on its next tick.
-                logger.exception("First reconciliation tick failed")
             await self.reconciliation.start()
         if self.retention is not None:
             await self.retention.start()
@@ -429,6 +430,7 @@ class GatewayRuntime:
     async def run(self) -> None:
         tracing.init()
         try:
+            await self._start_processing_services()
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
@@ -446,7 +448,6 @@ class GatewayRuntime:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
                 self.shared_facts.start()
-            await self._start_processing_services()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -514,23 +515,38 @@ def _has_pending_participation_recovery(
     *, speakup_path: Path, processing_path: Path
 ) -> bool:
     """Inspect existing ledgers read-only; never create a database for discovery."""
-    if not speakup_path.is_file() or not processing_path.is_file():
-        return False
     import sqlite3
 
-    try:
-        connection = sqlite3.connect(f"file:{speakup_path}?mode=ro", uri=True)
+    def _contains(path: Path, table: str, columns: set[str], query: str) -> bool:
+        if not path.is_file():
+            return False
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            row = connection.execute(
-                "SELECT 1 FROM delivery_reservations "
-                "WHERE delivery_state IN "
-                "('reserved','submitted','transport_accepted','delivery_unknown') LIMIT 1"
-            ).fetchone()
+            present = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not columns.issubset(present):
+                return False
+            return connection.execute(query).fetchone() is not None
         finally:
             connection.close()
-        return row is not None
-    except sqlite3.Error:
-        return False
+
+    return _contains(
+        speakup_path,
+        "delivery_reservations",
+        {"origin", "lane", "delivery_state"},
+        "SELECT 1 FROM delivery_reservations "
+        "WHERE origin = 'participation' AND lane = 'production' AND delivery_state IN "
+        "('reserved','submitted','transport_accepted','delivery_unknown') LIMIT 1",
+    ) or _contains(
+        processing_path,
+        "effects",
+        {"origin", "state"},
+        "SELECT 1 FROM effects WHERE origin = 'participation' AND state IN "
+        "('queued','executing','sent','blocked','expired','failed','cancelled','unknown') "
+        "LIMIT 1",
+    )
 
 
 def build_processing_store(
@@ -819,6 +835,7 @@ def _build_participation_runtime(
     processing_store: object | None,
     responder: object | None,
     policy_adapter: object | None,
+    approval_tools: object | None = None,
 ) -> tuple[object | None, object | None, object | None]:
     """Build the disabled-by-default participation runtime and scheduler.
 
@@ -1093,7 +1110,14 @@ def _build_participation_runtime(
             engine=policy_engine, channel=channel, chat_id=chat_id, sender=sender
         )
 
-    submission = _ParticipationSubmission(responder=responder)
+    submission = _ParticipationSubmission(
+        responder=responder, approval_tools=approval_tools
+    )
+    bind_submission = getattr(
+        approval_tools, "set_participation_submission", None
+    )
+    if callable(bind_submission):
+        bind_submission(submission)
     reactor = (
         _ParticipationReactor(responder=responder)
         if callable(getattr(responder, "react_to_participation", None))
@@ -1160,8 +1184,11 @@ def _build_participation_runtime(
 class _ParticipationSubmission:
     """Adapter from a selected comment to the draft-only generator and effect path."""
 
-    def __init__(self, *, responder: object | None) -> None:
+    def __init__(
+        self, *, responder: object | None, approval_tools: object | None = None
+    ) -> None:
         self._responder = responder
+        self._approval_tools = approval_tools
 
     async def generate_draft(
         self, *, opportunity: object, decision: object, context: object
@@ -1191,6 +1218,30 @@ class _ParticipationSubmission:
             return _ParticipationOutcome(status="no_submission_path")
         return await submitter(
             admission=admission, effect_id=effect_id, content=content
+        )
+
+    async def queue_approval(
+        self,
+        *,
+        opportunity: object,
+        decision: object,
+        admission: object,
+        effect_id: str,
+        content: str,
+        snapshot: object,
+    ) -> object:
+        queue = getattr(
+            self._approval_tools, "stage_participation_approval", None
+        )
+        if not callable(queue):
+            return _ParticipationOutcome(status="approval_path_unavailable")
+        return await queue(
+            opportunity=opportunity,
+            decision=decision,
+            admission=admission,
+            effect_id=effect_id,
+            content=content,
+            snapshot=snapshot,
         )
 
 
@@ -1357,18 +1408,18 @@ def build_reconciliation_service(
 
     Disabled mode stays inert: no store, no database and no background task.
     """
-    if store is None or (
-        not config.processing.enabled and project_participation_receipts is None
-    ):
+    if store is None and project_participation_receipts is None:
         return None
 
     from yeoman_gateway.processing.reconcile import LocalEvidenceProbe, ReconciliationService
 
     reconciliation = config.processing.reconciliation
-    evidence = probe or LocalEvidenceProbe(
-        store,
-        provider_lookup_enabled=bool(reconciliation.provider_lookup_enabled),
-    )
+    evidence = probe
+    if evidence is None and store is not None:
+        evidence = LocalEvidenceProbe(
+            store,
+            provider_lookup_enabled=bool(reconciliation.provider_lookup_enabled),
+        )
     maintenance = config.processing.participation_maintenance
     return ReconciliationService(
         store,
@@ -1386,7 +1437,7 @@ def _build_participation_receipt_projection(
     store: "ProcessingStore | None",
     inbound_archive: object,
 ) -> tuple[object | None, Callable[[], Awaitable[object]] | None]:
-    if log is None or store is None:
+    if log is None:
         return None, None
     from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
 
@@ -1802,12 +1853,13 @@ def build_gateway_runtime(
 
     consciousness_data_dir = get_operational_data_path() / "consciousness"
     speakup_path = consciousness_data_dir / "speakups.db"
+    processing_path = _processing_store_path(config)
     pending_participation_recovery = _has_pending_participation_recovery(
-        speakup_path=speakup_path,
-        processing_path=_processing_store_path(config),
+        speakup_path=speakup_path, processing_path=processing_path
     )
     processing_store = build_processing_store(
-        config, recover_pending=pending_participation_recovery
+        config,
+        recover_pending=(pending_participation_recovery and processing_path.is_file()),
     )
     participation_enabled = bool(
         config.processing.enabled
@@ -1819,7 +1871,9 @@ def build_gateway_runtime(
     speakup_log = None
     speakup_approval_store = None
     activation_tracker = None
-    if social_runtime_enabled or pending_participation_recovery:
+    if social_runtime_enabled or (
+        pending_participation_recovery and speakup_path.is_file()
+    ):
         from yeoman_gateway.consciousness.log import SpeakupLog
         from yeoman_gateway.consciousness.participation_runtime import (
             ActivationEpochTracker,
@@ -1828,7 +1882,7 @@ def build_gateway_runtime(
         speakup_log = SpeakupLog(speakup_path)
         if participation_enabled:
             activation_tracker = ActivationEpochTracker(store=speakup_log)
-        if config.consciousness.enabled:
+        if config.consciousness.enabled or participation_enabled:
             from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
 
             speakup_approval_store = SpeakupApprovalStore(
@@ -3107,6 +3161,7 @@ def build_gateway_runtime(
                     processing_store=processing_store,
                     responder=responder,
                     policy_adapter=policy_adapter,
+                    approval_tools=consciousness_tools,
                 )
             )
         else:
@@ -3154,7 +3209,9 @@ def build_gateway_runtime(
 
             participation_maintenance = ParticipationMaintenance(
                 ledger=speakup_log,
-                reconciler=participation_receipt_reconciler,
+                # Receipt projection is owned by ReconciliationService. Maintenance
+                # only classifies already-delivered outcomes.
+                reconciler=None,
                 archive=inbound_archive,
                 classifier=None,
                 observation_window_minutes=int(

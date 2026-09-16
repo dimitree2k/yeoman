@@ -356,6 +356,47 @@ async def test_valid_approval_submits_exactly_one_bound_target_effect(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_approval_security_rejection_releases_unsubmitted_reservation(
+    tmp_path: Path,
+) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    proposal = await tools.propose_speakup(
+        chat_id="group@g.us",
+        message="blocked output",
+        action_type="observation",
+        confidence=0.9,
+    )
+    await tools.commit_speakup(str(proposal["proposal_id"]))
+    preview = await tools.bus.consume_outbound()
+    code = preview.content.split("Approve: ", 1)[1].splitlines()[0].strip()
+
+    class BlockSecurity:
+        def check_output(self, text: str, context: object = None) -> object:
+            del text, context
+            from yeoman_gateway.core.models import SecurityDecision, SecurityResult
+
+            return SecurityResult(
+                stage="output",
+                decision=SecurityDecision(action="block", reason="test"),
+            )
+
+    tools.security = BlockSecurity()
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+        tools=tools,
+    )
+
+    await middleware(_owner_ctx(code), AsyncMock())
+
+    assert await log.pending_delivery_reservations() == []
+    row = await log.proposal_row(str(proposal["proposal_id"]))
+    assert row is not None and row["status"] == "rejected"
+
+
+@pytest.mark.asyncio
 async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_path: Path) -> None:
     tools, store, log = _tools(tmp_path, opt_in_group=True)
     proposal = await tools.propose_speakup(
