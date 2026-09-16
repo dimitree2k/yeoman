@@ -656,6 +656,25 @@ async def test_short_ack_reply_to_bot_gets_reaction_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quoted_full_report_request_is_answered_not_reacted_to() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Langfassung bitte.",
+            reply_to_bot=True,
+            reply_to_message_id="bot-report-1",
+            raw_metadata={"reply_to_text": "Apple-Analyse. Langfassung auf Abruf."},
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.halted is False
+    assert ctx.reply == "downstream reached"
+    assert not any(isinstance(intent, SendReactionIntent) for intent in ctx.intents)
+
+
+@pytest.mark.asyncio
 async def test_hesitation_reply_to_bot_gets_reaction_only() -> None:
     ctx = PipelineContext(
         event=_event(

@@ -17,7 +17,7 @@ _QUESTION_OR_REQUEST_RE = re.compile(
     r"check(?:st)?|pruef(?:st)?|prüf(?:st)?|such(?:st)?|"
     r"mach(?:e|st)?(?:\s+mal)?|gib|geb|"
     r"erklaer(?:st)?|erklär(?:st)?|rechne|bewert(?:e|est)?|analysier(?:e|st)?|"
-    r"bewertung|analyse|review|einschaetzung|einschätzung|"
+    r"bewertung|analyse|review|einschaetzung|einschätzung|langfassung|vollbericht|"
     r"sag\s+mal|hilf"
     r")\b"
 )

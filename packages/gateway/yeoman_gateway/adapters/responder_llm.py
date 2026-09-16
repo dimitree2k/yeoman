@@ -711,6 +711,7 @@ class LLMResponder(ResponderPort):
         canonical_user_id: str = "",
         is_owner: bool = False,
         reply_to_message_id: str | None = None,
+        request_text: str = "",
     ) -> None:
         from yeoman_gateway.processing.tool_context import (
             ToolInvocationContext,
@@ -725,6 +726,7 @@ class LLMResponder(ResponderPort):
                 canonical_user_id=canonical_user_id,
                 is_owner=is_owner,
                 reply_to_message_id=reply_to_message_id,
+                request_text=request_text,
             )
         )
         message_tool = self.tools.get("message")
@@ -2340,6 +2342,7 @@ class LLMResponder(ResponderPort):
             reply_to_message_id=(
                 str(metadata.get("reply_to_message_id") or "").strip() or None
             ),
+            request_text=content,
         )
 
         if await self._maybe_complete_pending_delivery(

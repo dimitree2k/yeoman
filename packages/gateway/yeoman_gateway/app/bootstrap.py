@@ -2307,6 +2307,32 @@ def build_gateway_runtime(
         _release_participation_chat,
     )
 
+    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
+
+    research_path = sibling_path(processing_store)
+    research_reports = A2AResearchStore(research_path) if research_path else None
+
+    def _lookup_quoted_report(event: InboundEvent) -> str | None:
+        if research_reports is None:
+            return None
+        full_request = event.content.strip().lower().rstrip(".!?").strip() in {
+            "langfassung", "langfassung bitte", "vollbericht", "vollbericht bitte",
+        }
+        if full_request and event.reply_to_bot and event.reply_to_message_id:
+            return research_reports.report_for_quote(
+                processing_store,
+                channel=event.channel,
+                chat_id=event.chat_id,
+                provider_message_id=event.reply_to_message_id,
+            )
+        from yeoman_gateway.agent.tools.a2a import _ticker
+        from yeoman_gateway.policy.identity import canonical_user_id
+
+        symbol = _ticker(event.content)
+        user_id = canonical_user_id(event.channel, event.sender_id, event.raw_metadata)
+        card = research_reports.cached_card(user_id, symbol)
+        return f"Gespeicherte TradingGuru-Analyse für {symbol} (maximal 24 Stunden alt; keine neue Marktabfrage):\n\n{card}" if card else None
+
     orchestrator = Orchestrator(
         policy=policy_adapter,
         responder=thread_responder or responder,
@@ -2321,6 +2347,7 @@ def build_gateway_runtime(
             if processing_gate is not None
             else None
         ),
+        report_lookup=_lookup_quoted_report,
         security=security,
         security_classifier=security_classifier,
         security_block_message=config.security.block_user_message,

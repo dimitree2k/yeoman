@@ -71,6 +71,7 @@ class Orchestrator:
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: "Callable[[str, str, bool], Awaitable[None]] | None" = None,
         reply_admission: "Callable[[InboundEvent], bool] | None" = None,
+        report_lookup: "Callable[[InboundEvent], str | None] | None" = None,
         security: SecurityPort | None = None,
         security_classifier: "InputClassifier | None" = None,
         security_block_message: str = "😂",
@@ -149,6 +150,7 @@ class Orchestrator:
                 responder=responder,
                 typing_notifier=typing_notifier,
                 reply_admission=reply_admission,
+                report_lookup=report_lookup,
             ),
             OutboundMiddleware(
                 contacts=contacts,

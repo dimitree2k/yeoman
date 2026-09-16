@@ -29,6 +29,7 @@ class ToolInvocationContext:
     turn_id: str | None = None
     turn_revision: int | None = None
     canonical_user_id: str = ""
+    request_text: str = ""
 
 
 CURRENT_TOOL_CONTEXT: ContextVar[ToolInvocationContext | None] = ContextVar(

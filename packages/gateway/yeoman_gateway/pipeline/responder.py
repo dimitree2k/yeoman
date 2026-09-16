@@ -25,10 +25,12 @@ class ResponderMiddleware:
         responder: ResponderPort,
         typing_notifier: Callable[[str, str, bool], Awaitable[None]] | None = None,
         reply_admission: Callable[[InboundEvent], bool] | None = None,
+        report_lookup: Callable[[InboundEvent], str | None] | None = None,
     ) -> None:
         self._responder = responder
         self._typing_notifier = typing_notifier
         self._reply_admission = reply_admission
+        self._report_lookup = report_lookup
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         if ctx.decision is None:
@@ -62,7 +64,23 @@ class ResponderMiddleware:
                     )
                 typing_started = True
 
-            reply = await self._responder.generate_reply(ctx.event, ctx.decision)
+            report = None
+            quoted_full = bool(
+                ctx.event.reply_to_bot
+                and ctx.event.reply_to_message_id
+                and re.fullmatch(r"(?i)\s*(?:langfassung|vollbericht)(?:\s+bitte)?[.!?]?\s*", ctx.event.content)
+            )
+            stock_summary = bool(
+                re.search(r"\([A-Z]{1,5}\)|\$[A-Z]{1,5}\b", ctx.event.content)
+                and re.search(r"(?i)\b(?:aktie|stock|tradingguru|tradingagents|analyse)\b", ctx.event.content)
+            )
+            if self._report_lookup is not None and ctx.decision.is_owner and ctx.event.channel == "whatsapp" and (quoted_full or stock_summary):
+                report = self._report_lookup(ctx.event)
+            reply = (
+                report or "Die Langfassung zu dieser Nachricht wurde leider nicht gespeichert."
+                if report is not None
+                else await self._responder.generate_reply(ctx.event, ctx.decision)
+            )
 
             if not reply:
                 ctx.metric("responder_empty", labels=(("channel", ctx.event.channel),))

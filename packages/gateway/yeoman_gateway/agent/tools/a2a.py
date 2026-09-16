@@ -62,10 +62,16 @@ _CARD_DECISION_HEADINGS = (
     "take",
 )
 _CARD_HEADING_RE = re.compile(r"^#{2,4}\s*(.+?)\s*$")
-_CARD_DECISION_RE = re.compile(r"\*{1,2}(buy|sell|hold|underweight|overweight|neutral|reduzieren|kaufen|verkaufen|halten)\*{1,2}", re.IGNORECASE)
+_CARD_DECISION_RE = re.compile(r"\b(buy|sell|hold|underweight|overweight|neutral|reduzieren|kaufen|verkaufen|halten)\b", re.IGNORECASE)
 _CARD_BULLET_LIMIT = 4
 _CARD_FALLBACK_CHARS = 700
 _CARD_NOTE = "Langfassung auf Abruf."
+_TICKER_RE = re.compile(r"\(([A-Z]{1,5})\)|\$([A-Z]{1,5})\b")
+
+
+def _ticker(text: str) -> str:
+    match = _TICKER_RE.search(text)
+    return next((group for group in match.groups() if group), "") if match else ""
 
 
 def _strip_reasoning(text: str) -> str:
@@ -126,11 +132,10 @@ def _card_body(text: str) -> str:
     lead = " ".join(title.split())
 
     decision_row = next(
-        (
-            (index, title)
-            for index, title in heading_rows
-            if any(token in title.lower() for token in _CARD_DECISION_HEADINGS)
-        ),
+        ((index, title) for index, title in heading_rows if "entscheidung" in title.lower() or "decision" in title.lower()),
+        None,
+    ) or next(
+        ((index, title) for index, title in heading_rows if any(token in title.lower() for token in _CARD_DECISION_HEADINGS)),
         None,
     )
     decision = ""
@@ -154,14 +159,20 @@ def _card_body(text: str) -> str:
                 continue
             if not decision:
                 decision = stripped
-    if not decision and not bullets:
+    signal = next(
+        (line.strip() for line in lines if _CARD_DECISION_RE.search(line) and not line.lstrip().startswith("#")),
+        "",
+    )
+    if signal and _CARD_DECISION_RE.search(decision):
+        signal = ""
+    if not decision and not bullets and not signal:
         return " ".join(text.split())[:_CARD_FALLBACK_CHARS]
 
-    parts = [part for part in (lead, decision, *bullets) if part]
+    parts = [part for part in (lead, decision, signal, *bullets) if part]
     return "\n\n".join(parts)
 
 
-def render_research_output(payload: Any, *, mode: str = "card") -> str:
+def render_research_output(payload: Any, *, mode: str = "card", offer_full: bool = True) -> str:
     """Render a research result as chat text.
 
     The structured payload is ``{"report": ..., "sources": [...]}`` where the report carries a
@@ -183,7 +194,7 @@ def render_research_output(payload: Any, *, mode: str = "card") -> str:
         cleaned = _strip_markdown_line_breaks(_strip_server_paths(_strip_reasoning(text))).strip()
         body = _card_body(cleaned) if mode == "card" else cleaned
         body = _to_chat_markup(body).strip()
-        if mode == "card" and body and body != cleaned:
+        if mode == "card" and offer_full and body and body != cleaned:
             body = f"{body}\n\n{_CARD_NOTE}"
         if sources:
             return f"{body}\n\n{sources}" if body else sources
@@ -447,6 +458,8 @@ class A2ADelegateTool(Tool):
                 pending.chat_id,
                 pending.question,
                 pending.created_ms,
+                pending.canonical_user_id,
+                pending.symbol,
             )
         )
         self._background.add(task)
@@ -480,8 +493,25 @@ class A2ADelegateTool(Tool):
             raise ValueError("a2a_delegate supports only search.web, research.deep and trading.analyze")
         if worker not in self._registry.names:
             raise ValueError(f"unknown A2A worker '{worker}'")
+        context = current_tool_context()
+        question = self._question_text(input)
+        ticker = _ticker(question) or (_ticker(context.request_text) if context is not None else "")
+        if (
+            worker == "hermes"
+            and skill == "research.deep"
+            and context is not None
+            and (
+                re.search(r"(?i)\btrading[\s-]?(?:guru|agents)\b", context.request_text)
+                or ticker
+            )
+        ):
+            skill = "trading.analyze"
         if skill == "trading.analyze" and worker != "hermes":
             return f"[{worker} | not-sent | worker-binding]"
+        if skill == "trading.analyze" and self._research_store is not None and context is not None:
+            cached = self._research_store.cached_card(context.canonical_user_id, ticker)
+            if cached:
+                return f"[hermes | trading.analyze | CACHED | {ticker}]\n{cached}\n\nBereits vorhandene Analyse; kein neuer A2A-Auftrag."
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
             return f"[{worker} | not-sent | {note}]"
@@ -557,6 +587,8 @@ class A2ADelegateTool(Tool):
                 effect_id=effect_id,
                 question=self._question_text(input),
                 created_ms=int(time.time() * 1000),
+                canonical_user_id=turn.canonical_user_id if turn is not None else "",
+                symbol=ticker if skill == "trading.analyze" else "",
             )
             if self._research_store is not None:
                 self._research_store.put(pending)
@@ -594,6 +626,8 @@ class A2ADelegateTool(Tool):
         chat_id: str,
         question: str = "",
         created_ms: int = 0,
+        canonical_user_id: str = "",
+        symbol: str = "",
     ) -> None:
         final_content: str
         extensions = 0
@@ -632,7 +666,32 @@ class A2ADelegateTool(Tool):
                 )
                 final_content = "error=POLL_FAILURE retryable=False"
             else:
-                final_content = render_research_output(result.output) or (
+                report_saved = False
+                card = render_research_output(result.output, offer_full=False)
+                if (
+                    self._research_store is not None
+                    and channel
+                    and chat_id
+                    and isinstance(result.output, dict)
+                    and isinstance(result.output.get("report"), str)
+                    and result.output["report"].strip()
+                    and result.state == "TASK_STATE_COMPLETED"
+                ):
+                    try:
+                        self._research_store.save_report(
+                            effect_id,
+                            channel=channel,
+                            chat_id=chat_id,
+                            content=render_research_output(result.output, mode="full"),
+                            canonical_user_id=canonical_user_id if skill == "trading.analyze" else "",
+                            symbol=symbol if skill == "trading.analyze" else "",
+                            card=card if skill == "trading.analyze" else "",
+                        )
+                    except Exception as exc:
+                        logger.warning("A2A full report was not stored error_type={}", type(exc).__name__)
+                    else:
+                        report_saved = True
+                final_content = render_research_output(result.output, offer_full=report_saved) or (
                     f"error={result.error_code} retryable={result.retryable}"
                 )
             break

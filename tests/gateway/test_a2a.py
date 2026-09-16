@@ -452,6 +452,98 @@ async def test_research_poll_resumes_from_store_after_tool_restart(tmp_path: Pat
     assert A2AResearchStore(path).pending() == ()
 
 
+def test_completed_report_is_durable_and_chat_scoped(tmp_path: Path) -> None:
+    path = tmp_path / "research.db"
+    A2AResearchStore(path).save_report(
+        "a2a-effect-1", channel="whatsapp", chat_id="owners@g.us", content="Vollbericht mit Risiken"
+    )
+
+    reopened = A2AResearchStore(path)
+    assert reopened.report("a2a-effect-1", channel="whatsapp", chat_id="owners@g.us") == "Vollbericht mit Risiken"
+    assert reopened.report("a2a-effect-1", channel="whatsapp", chat_id="other@g.us") is None
+
+
+def test_quoted_card_finds_only_its_chat_scoped_full_report(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    store = A2AResearchStore(tmp_path / "research.db")
+    effect_id = "a2a-" + "a" * 32
+    store.save_report(effect_id, channel="whatsapp", chat_id="first@g.us", content="Full report")
+
+    class Processing:
+        def effects_by_provider_message(self, channel, chat_id, message_id):
+            return ("outbound-1",) if (channel, chat_id, message_id) == ("whatsapp", "first@g.us", "card-1") else ()
+
+        def get_effect(self, effect_id):
+            return SimpleNamespace(operation_key=f"send_text:whatsapp:first@g.us:a2a-result:a2a-{'a' * 32}:suffix")
+
+    assert store.report_for_quote(Processing(), channel="whatsapp", chat_id="first@g.us", provider_message_id="card-1") == "Full report"
+    assert store.report_for_quote(Processing(), channel="whatsapp", chat_id="other@g.us", provider_message_id="card-1") is None
+
+
+@pytest.mark.asyncio
+async def test_cached_trading_card_skips_new_a2a_and_quota_across_chats(tmp_path: Path) -> None:
+    class Registry:
+        names = ("hermes",)
+
+        async def invoke_skill(self, *args, **kwargs):
+            raise AssertionError("cache hit must not invoke Hermes")
+
+    class Quota:
+        def claim(self, *args, **kwargs):
+            raise AssertionError("cache hit must not claim paid quota")
+
+    store = A2AResearchStore(tmp_path / "research.db")
+    store.save_report(
+        "a2a-" + "b" * 32,
+        channel="whatsapp", chat_id="first@g.us", content="Long report",
+        canonical_user_id="owner-1", symbol="AAPL", card="*Hold*; valuation high",
+    )
+    tool = A2ADelegateTool(Registry(), pending_store=store, quota_governance=Quota())
+    token = set_tool_context(ToolInvocationContext(
+        channel="whatsapp", chat_id="second@g.us", canonical_user_id="owner-1",
+        request_text="Apple (AAPL) noch mal kurz?",
+    ))
+    try:
+        result = await tool.execute(worker="hermes", skill="research.deep", input={"question": "Apple (AAPL)", "idempotency_key": "second"})
+    finally:
+        reset_tool_context(token)
+    assert "CACHED" in result and "*Hold*" in result
+    assert store.cached_card("other-user", "AAPL") is None
+    assert store.cached_card("owner-1", "MSFT") is None
+
+
+@pytest.mark.asyncio
+async def test_poll_persists_full_report_before_offering_it_in_card(tmp_path: Path) -> None:
+    path = tmp_path / "research.db"
+    store = A2AResearchStore(path)
+
+    class Registry:
+        async def poll_task(self, worker, task_id, *, skill, context_id, reference_task_ids=()):
+            return A2AWorkerResult(
+                worker, task_id, context_id, "TASK_STATE_COMPLETED", skill,
+                {"report": "# Apple\n\n## Entscheidung\n\n**Hold**.\n\n## Risiken\n\nHohe Bewertung.", "sources": []},
+            )
+
+    class Delivery:
+        async def send(self, **kwargs):
+            assert store.report("a2a-effect-1", channel="whatsapp", chat_id="owners@g.us") is not None
+            assert "*Hold*" in kwargs["content"]
+            assert "Langfassung auf Abruf" in kwargs["content"]
+            assert "Hohe Bewertung" not in kwargs["content"]
+            return None
+
+    tool = A2ADelegateTool(Registry(), delivery=Delivery(), pending_store=store)
+    await tool._poll_research(
+        "hermes", "task-1", "trading.analyze", "ctx-1", (), "a2a-effect-1", "whatsapp", "owners@g.us",
+        canonical_user_id="owner-1", symbol="AAPL",
+    )
+    assert "Hohe Bewertung" in A2AResearchStore(path).report(
+        "a2a-effect-1", channel="whatsapp", chat_id="owners@g.us"
+    )
+    assert "*Hold*" in A2AResearchStore(path).cached_card("owner-1", "AAPL")
+
+
 @pytest.mark.asyncio
 async def test_research_pending_state_survives_an_unknown_delivery_outcome(
     tmp_path: Path,
@@ -568,6 +660,26 @@ def _delegate_tool(processing: ProcessingStore, client: object) -> A2ADelegateTo
         ),
         store=processing,
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_trading_guru_request_uses_trading_analyze(tmp_path: Path) -> None:
+    processing = ProcessingStore(tmp_path / "processing.db")
+    calls: list[str] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(skill)
+            return A2AWorkerResult("hermes", "task-1", context_id or "ctx", "TASK_STATE_COMPLETED", skill, {"report": "ok"})
+
+    tool = _delegate_tool(processing, Client())
+    token = set_tool_context(ToolInvocationContext(channel="whatsapp", chat_id="chat@g.us", is_owner=True, request_text="Bitte Apple an TradingGuru delegieren"))
+    try:
+        await tool.execute(worker="hermes", skill="research.deep", input={"question": "Apple analysieren", "idempotency_key": "apple-1"})
+    finally:
+        reset_tool_context(token)
+
+    assert calls == ["trading.analyze"]
 
 
 @pytest.mark.asyncio
@@ -812,6 +924,30 @@ def test_card_mode_is_a_short_summary_of_a_long_report() -> None:
     assert "https://oracle.com/ir" in card
     assert len(card) <= 1400, len(card)
     assert "Langfassung" in card
+
+
+def test_card_prioritizes_trading_decision_over_earlier_market_summary() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    report = (
+        "# Apple\n\n## Kurzfazit\n\nKurs 331 USD.\n- 52-Wochen-Spanne 236 bis 344 USD.\n\n"
+        "## Entscheidung\n\n**Hold** – kein neuer Kauf.\n\n## Begründung\n\n"
+        "- Bewertung ist hoch.\n- Cashflow bleibt stark.\n"
+    )
+
+    card = render_research_output({"report": report})
+
+    assert "*Hold*" in card
+    assert "Bewertung ist hoch" in card
+    assert "52-Wochen-Spanne" not in card
+
+
+def test_card_includes_signal_even_when_report_has_no_decision_heading() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    report = "# Apple\n\n## Kurzfazit\n\nKurs 331 USD.\n\n## Trade Signal\n\n**SELL** wegen Bewertung."
+    card = render_research_output({"report": report})
+    assert "*SELL*" in card
 
 
 def test_card_mode_falls_back_to_a_short_excerpt_without_a_decision_heading() -> None:
