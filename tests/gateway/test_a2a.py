@@ -608,7 +608,10 @@ async def test_recent_report_without_clear_signal_does_not_start_another_job(tmp
         })
     finally:
         reset_tool_context(token)
-    assert "not-sent" in result and "signal_unavailable" in result
+    assert "not-sent" in result
+    assert "recent_report_without_clear_signal" in result
+    assert "Für AAPL liegt bereits eine aktuelle Analyse vor" in result
+    assert "kein eindeutiges Buy/Hold/Sell-Signal" in result
 
 
 @pytest.mark.asyncio

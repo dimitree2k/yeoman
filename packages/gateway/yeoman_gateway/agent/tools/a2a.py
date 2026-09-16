@@ -532,7 +532,11 @@ class A2ADelegateTool(Tool):
             if cached:
                 return f"[hermes | trading.analyze | CACHED | {ticker}]\n{cached}\n\nBereits vorhandene Analyse; kein neuer A2A-Auftrag."
             if self._research_store.has_recent_report(context.canonical_user_id, ticker):
-                return f"[hermes | trading.analyze | not-sent | signal_unavailable] Analyse für {ticker} liegt vor, aber ein eindeutiges Signal fehlt. Kein neuer A2A-Auftrag."
+                return (
+                    f"[hermes | trading.analyze | not-sent | recent_report_without_clear_signal] "
+                    f"Für {ticker} liegt bereits eine aktuelle Analyse vor, aber sie enthält kein eindeutiges "
+                    "Buy/Hold/Sell-Signal. Deshalb wurde kein neuer Auftrag an Trading Guru gesendet."
+                )
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
             return f"[{worker} | not-sent | {note}]"
