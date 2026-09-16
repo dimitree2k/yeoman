@@ -27,6 +27,7 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
             sender_id=event.sender_id,
             text=event.content,
             timestamp=int(event.timestamp.timestamp()),
+            reply_to_message_id=event.reply_to_message_id,
         )
 
     @override
@@ -90,4 +91,9 @@ class SqliteReplyArchiveAdapter(ReplyArchivePort):
             timestamp=timestamp,
             created_at=str(row.get("created_at") or ""),
             sender_name=str(row.get("sender_name")) if row.get("sender_name") else None,
+            reply_to_message_id=(
+                str(row.get("reply_to_message_id"))
+                if row.get("reply_to_message_id")
+                else None
+            ),
         )

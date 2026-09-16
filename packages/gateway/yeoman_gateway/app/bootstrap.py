@@ -959,6 +959,27 @@ def _build_participation_runtime(
             else "answer"
         ).strip().lower()
         policy_state = policy_adapter.policy_snapshot()
+        current_source_ids = tuple(
+            str(item)
+            for item in (getattr(opportunity, "source_event_ids", ()) or ())
+            if str(item)
+        )
+        context_revision = int(getattr(opportunity, "observed_revision", 0) or 0)
+        material_reader = getattr(log, "material_for_opportunity", None)
+        if callable(material_reader):
+            try:
+                pending_ids, latest_revision = material_reader(
+                    channel,
+                    chat_id,
+                    None,
+                    lane=str(resolved.lane),
+                )
+                current_source_ids = tuple(
+                    dict.fromkeys((*current_source_ids, *(str(item) for item in pending_ids)))
+                )
+                context_revision = max(context_revision, int(latest_revision))
+            except Exception as exc:
+                raise RuntimeError("participation material unavailable") from exc
         return {
             "enabled": resolved.enabled,
             "opted_in": resolved.opted_in,
@@ -989,6 +1010,10 @@ def _build_participation_runtime(
             ),
             "context_window_minutes": int(resolved.context_window_minutes),
             "context_max_messages": int(resolved.context_max_messages),
+            "context_revision": context_revision,
+            "current_source_ids": current_source_ids,
+            "max_reevaluations": int(resolved.max_reevaluations),
+            "opportunity_ttl_seconds": int(resolved.opportunity_ttl_seconds),
             "judge_calls_per_hour": int(
                 resolved.participation.max_unaddressed_judge_calls_per_hour
             ),

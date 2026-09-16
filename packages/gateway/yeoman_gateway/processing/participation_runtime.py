@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, TypeAlias
 
@@ -58,6 +58,7 @@ COUNTERS: tuple[str, ...] = (
     "shadow_decision",
     "duplicate_suppressed",
     "direct_superseded",
+    "stale_discarded",
 )
 
 _ACTIONS: tuple[str, ...] = ("silence", "react", "comment")
@@ -113,6 +114,16 @@ class ParticipationAdmission:
     contribution_type: str = ""
     payload_hash: str = ""
     approval_revision: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshCommentState:
+    """Fresh trusted state observed while an already-reserved draft is pending."""
+
+    opportunity: ParticipationOpportunity
+    snapshot: Mapping[str, Any]
+    inputs: ParticipationDecisionInputs
+    context: Mapping[str, Any]
 
 
 class ParticipationRuntime:
@@ -226,6 +237,14 @@ class ParticipationRuntime:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "context_error")
             return {"status": "skipped", "reason": "context_error"}
+        context = await self._hydrate_social_anchor_closures(context)
+        inputs, context = self._apply_continuation_candidate(
+            opportunity, inputs, context
+        )
+        if not any(action != "silence" for action in inputs.allowed_actions):
+            self._count("preflight_skipped")
+            await self._record(opportunity, "preflight_skipped", "no_feasible_action")
+            return {"status": "skipped", "reason": "no_feasible_action"}
         if self._direct_active(opportunity):
             return self._direct_superseded()
         attempt_id = f"{opportunity.opportunity_id}:0"
@@ -249,11 +268,12 @@ class ParticipationRuntime:
                     default=0,
                 )
                 * 1000,
-                continuation_candidate=_snapshot_bool(
-                    snapshot, "continuation_candidate", default=False
-                ),
+                # The snapshot value is only a producer hint.  The context pass
+                # above has already checked the exact same-chat anchor/source
+                # relation, so reserve protection must use that verified result.
+                continuation_candidate=bool(inputs.continuation_candidate),
                 continuation_reserve=_snapshot_int(
-                    snapshot,
+                    inputs.snapshot,
                     "continuation_reserve",
                     "continuation_judge_reserve",
                     default=0,
@@ -296,7 +316,12 @@ class ParticipationRuntime:
             return self._direct_superseded()
 
         try:
-            self._validate_decision(decision, inputs=inputs, context=context)
+            self._validate_decision(
+                decision,
+                opportunity=opportunity,
+                inputs=inputs,
+                context=context,
+            )
         except ParticipationDecisionError as failure:
             self._count("judge_failed")
             await self._ledger.record_judge_outcome(attempt_id, outcome=failure.reason)
@@ -385,6 +410,81 @@ class ParticipationRuntime:
     def _direct_superseded(self) -> dict[str, object]:
         self._count("direct_superseded")
         return {"status": "skipped", "reason": "direct_request"}
+
+    async def _hydrate_social_anchor_closures(
+        self, context: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Overlay durable social-anchor closure state onto retained anchors."""
+        anchors = context.get("anchors")
+        checker = getattr(self._ledger, "social_anchor_closed", None)
+        if not isinstance(anchors, (tuple, list)) or not callable(checker):
+            return context
+        channel, chat_id = _context_target(context)
+        if not channel or not chat_id:
+            return context
+        hydrated: list[object] = []
+        changed = False
+        for raw_anchor in anchors:
+            if not isinstance(raw_anchor, Mapping):
+                hydrated.append(raw_anchor)
+                continue
+            anchor = dict(raw_anchor)
+            if _anchor_is_closed(anchor):
+                hydrated.append(anchor)
+                continue
+            closed = False
+            for anchor_id in _anchor_tokens(anchor):
+                try:
+                    closed = bool(
+                        await checker(
+                            channel=channel,
+                            chat_id=chat_id,
+                            anchor_message_id=anchor_id,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - unknown closure fails closed
+                    closed = True
+                if closed:
+                    break
+            if closed:
+                anchor["social_closed"] = True
+                changed = True
+            hydrated.append(anchor)
+        if not changed:
+            return context
+        result = dict(context)
+        result["anchors"] = hydrated
+        return result
+
+    def _final_submission_veto(
+        self, opportunity: ParticipationOpportunity, snapshot: Mapping[str, Any]
+    ) -> str | None:
+        """Recheck mutable fences immediately before handing off to submission."""
+        if self._direct_active(opportunity):
+            return "direct_request"
+        try:
+            pause = self._is_paused(opportunity.channel, opportunity.chat_id)
+        except Exception:  # noqa: BLE001 - unreadable pause state fails closed
+            return "pause_state_unavailable"
+        if pause:
+            return str(pause)
+        try:
+            source_allowed = self._is_source_allowed(
+                opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
+            )
+        except Exception:  # noqa: BLE001 - unreadable source ACL fails closed
+            return "source_not_authorized"
+        if not source_allowed:
+            return "source_not_authorized"
+        try:
+            epoch = int(snapshot.get("activation_epoch", opportunity.activation_epoch))
+        except (TypeError, ValueError):
+            return "epoch_changed"
+        if epoch != int(opportunity.activation_epoch):
+            return "epoch_changed"
+        if str(snapshot.get("lane") or opportunity.lane) == "shadow":
+            return "shadow_lane"
+        return None
 
     async def _decision_inputs(
         self,
@@ -615,10 +715,100 @@ class ParticipationRuntime:
             raise ParticipationBlockedError("capacity_unavailable") from exc
         return max(0, int(limit) - count)
 
+    def _apply_continuation_candidate(
+        self,
+        opportunity: ParticipationOpportunity,
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> tuple[ParticipationDecisionInputs, Mapping[str, Any]]:
+        """Derive continuation eligibility from retained, exact context evidence.
+
+        The activation snapshot may carry a producer hint, but it cannot turn an
+        unrelated source into a protected continuation slot.  This check is local and
+        deliberately happens after context construction but before the judge attempt
+        is charged.
+        """
+        candidate_hint = _snapshot_bool(
+            inputs.snapshot, "continuation_candidate", default=False
+        )
+        candidate = candidate_hint and _is_continuation_candidate(
+            opportunity,
+            context,
+        )
+        allow_continuation = _snapshot_bool(
+            inputs.snapshot, "allow_continuation", default=False
+        )
+        comment_intents = {
+            str(item)
+            for item in (
+                _snapshot_value(inputs.snapshot, "comment_allowed_intents", ()) or ()
+            )
+        }
+        if candidate and allow_continuation:
+            comment_intents.add("continue")
+        else:
+            comment_intents.discard("continue")
+
+        allowed_intents = set(inputs.allowed_intents)
+        if not (candidate and allow_continuation):
+            # A reaction may still use ``continue`` as its neutral bookkeeping label;
+            # the comment-specific set above remains the authoritative veto.
+            if "comment" in inputs.allowed_actions:
+                allowed_intents.discard("continue")
+        else:
+            allowed_intents.add("continue")
+
+        allowed_actions = tuple(inputs.allowed_actions)
+        if "comment" in allowed_actions and not comment_intents:
+            allowed_actions = tuple(item for item in allowed_actions if item != "comment")
+        elif "comment" not in allowed_actions and comment_intents:
+            requested = _snapshot_tokens(inputs.snapshot, "allowed_actions")
+            reply_action = _snapshot_value(inputs.snapshot, "reply_action")
+            if (requested is None or "comment" in requested) and reply_action not in {
+                "react",
+                "silence",
+            }:
+                allowed_actions = tuple(
+                    sorted({*allowed_actions, "comment"}, key=_ACTIONS.index)
+                )
+
+        reservations = [
+            (intent, tuple(limits))
+            for intent, limits in inputs.reservation_limits_by_intent
+            if intent != "continue"
+        ]
+        if candidate and allow_continuation:
+            limits = _snapshot_limits(inputs.snapshot, "comment_limits", "comment")
+            if limits:
+                reservations.append(("continue", limits))
+
+        trusted_snapshot = _snapshot_mapping(inputs.snapshot)
+        trusted_snapshot["continuation_candidate"] = candidate
+        trusted_snapshot["comment_allowed_intents"] = tuple(sorted(comment_intents))
+        updated_inputs = replace(
+            inputs,
+            snapshot=trusted_snapshot,
+            allowed_actions=allowed_actions,
+            allowed_intents=frozenset(allowed_intents),
+            reservation_limits_by_intent=tuple(reservations),
+            continuation_candidate=candidate,
+        )
+        updated_context = dict(context)
+        updated_context.update(
+            {
+                "continuation_candidate": candidate,
+                "allows_continuation": "continue" in comment_intents,
+                "allowed_actions": list(allowed_actions),
+                "allowed_intents": sorted(allowed_intents),
+            }
+        )
+        return updated_inputs, updated_context
+
     def _validate_decision(
         self,
         decision: ParticipationDecision,
         *,
+        opportunity: ParticipationOpportunity,
         inputs: ParticipationDecisionInputs,
         context: Mapping[str, Any],
     ) -> None:
@@ -646,10 +836,25 @@ class ParticipationRuntime:
             raise ParticipationDecisionError(
                 "invalid_response", detail="contribution_type_not_allowed"
             )
-        if intent == "continue" and not _has_delivered_anchor(context):
-            raise ParticipationDecisionError(
-                "invalid_response", detail="continuation_without_delivered_anchor"
-            )
+        if intent == "continue":
+            if not _has_delivered_anchor(context):
+                raise ParticipationDecisionError(
+                    "invalid_response", detail="continuation_without_delivered_anchor"
+                )
+            if not _is_continuation_candidate(
+                opportunity,
+                context,
+            ):
+                raise ParticipationDecisionError(
+                    "invalid_response", detail="continuation_not_candidate"
+                )
+            if not _anchor_is_eligible(
+                context,
+                decision.anchor_message_id,
+            ):
+                raise ParticipationDecisionError(
+                    "invalid_response", detail="continuation_anchor_closed"
+                )
 
     async def _run_reaction(
         self,
@@ -747,6 +952,7 @@ class ParticipationRuntime:
             # a later retry double-send the same reaction.
             await self._record(opportunity, "reaction_unknown", state or "no_receipt")
             return {"status": "reaction_unknown", "reason": state or "no_receipt"}
+        self._close_social_association(opportunity, decision)
         await self._record(opportunity, "reaction_submitted", decision.reason)
         return {"status": "reaction_submitted", "effect_id": effect_id}
 
@@ -765,6 +971,11 @@ class ParticipationRuntime:
         if not reservation:
             await self._record(opportunity, "comment_skipped", "no_comment_limits")
             return {"status": "comment_skipped", "reason": "no_comment_limits"}
+        try:
+            _max_reevaluations(snapshot)
+        except ParticipationBlockedError as blocked:
+            await self._record(opportunity, "comment_skipped", blocked.reason)
+            return {"status": "comment_skipped", "reason": blocked.reason}
         effect_id = deterministic_effect_id(
             channel=opportunity.channel,
             chat_id=opportunity.chat_id,
@@ -786,6 +997,12 @@ class ParticipationRuntime:
         if not reserved:
             await self._record(opportunity, "comment_skipped", "comment_budget_exhausted")
             return {"status": "comment_skipped", "reason": "comment_budget_exhausted"}
+        if not _within_opportunity_deadline(
+            opportunity, snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._release_comment(opportunity, effect_id, "stale_context")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "comment_skipped", "reason": "deadline_expired"}
         try:
             draft = await self._submission.generate_draft(
                 opportunity=opportunity,
@@ -819,15 +1036,69 @@ class ParticipationRuntime:
             await self._record(opportunity, "generation_failed", "empty_draft")
             return {"status": "generation_failed", "reason": "empty_draft"}
         if self._direct_active(opportunity):
-            await self._ledger.release_delivery(
-                opportunity.opportunity_id,
-                effect_id=effect_id,
-                state="failed",
-                reason="direct_superseded",
-                now_ms=int(self._clock_ms()),
-            )
+            await self._release_comment(opportunity, effect_id, "direct_superseded")
             return self._direct_superseded()
         self._count("generated")
+        try:
+            fresh = await self._fresh_comment_state(
+                opportunity,
+                snapshot=snapshot,
+                inputs=inputs,
+                context=context,
+            )
+        except ParticipationBlockedError as blocked:
+            await self._release_comment(opportunity, effect_id, blocked.reason)
+            await self._record(opportunity, "stale_discarded", blocked.reason)
+            return {"status": "comment_skipped", "reason": blocked.reason}
+        if fresh is not None:
+            return await self._reconsider_comment(
+                initial_opportunity=opportunity,
+                initial_snapshot=snapshot,
+                initial_inputs=inputs,
+                initial_context=context,
+                initial_decision=decision,
+                effect_id=effect_id,
+                text=text,
+                fresh=fresh,
+            )
+        return await self._submit_comment(
+            opportunity=opportunity,
+            snapshot=snapshot,
+            inputs=inputs,
+            decision=decision,
+            text=text,
+            effect_id=effect_id,
+            evaluation_index=0,
+        )
+
+    async def _release_comment(self, opportunity: ParticipationOpportunity, effect_id: str, reason: str) -> None:
+        await self._ledger.release_delivery(
+            opportunity.opportunity_id,
+            effect_id=effect_id,
+            state="failed",
+            reason=str(reason),
+            now_ms=int(self._clock_ms()),
+        )
+
+    async def _submit_comment(
+        self,
+        *,
+        opportunity: ParticipationOpportunity,
+        snapshot: Mapping[str, Any],
+        inputs: ParticipationDecisionInputs,
+        decision: ParticipationDecision,
+        text: str,
+        effect_id: str,
+        evaluation_index: int,
+        deadline_snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, object]:
+        deadline_source = snapshot if deadline_snapshot is None else deadline_snapshot
+        if not _within_opportunity_deadline(
+            opportunity, deadline_source, now_ms=int(self._clock_ms())
+        ):
+            await self._release_comment(opportunity, effect_id, "deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "comment_skipped", "reason": "deadline_expired"}
         payload = TextPayload(text=text)
         try:
             admission = self._build_admission(
@@ -836,26 +1107,20 @@ class ParticipationRuntime:
                 decision=decision,
                 effect_id=effect_id,
                 payload=payload,
+                evaluation_index=evaluation_index,
             )
         except ParticipationBlockedError as blocked:
-            await self._ledger.release_delivery(
-                opportunity.opportunity_id,
-                effect_id=effect_id,
-                state="failed",
-                reason=blocked.reason,
-                now_ms=int(self._clock_ms()),
-            )
+            await self._release_comment(opportunity, effect_id, blocked.reason)
             await self._record(opportunity, "comment_skipped", blocked.reason)
             return {"status": "comment_skipped", "reason": blocked.reason}
-        if self._direct_active(opportunity):
-            await self._ledger.release_delivery(
-                opportunity.opportunity_id,
-                effect_id=effect_id,
-                state="failed",
-                reason="direct_superseded",
-                now_ms=int(self._clock_ms()),
-            )
+        veto = self._final_submission_veto(opportunity, snapshot)
+        if veto == "direct_request":
+            await self._release_comment(opportunity, effect_id, "direct_superseded")
             return self._direct_superseded()
+        if veto is not None:
+            await self._release_comment(opportunity, effect_id, veto)
+            await self._record(opportunity, "stale_discarded", veto)
+            return {"status": "comment_skipped", "reason": veto}
         outcome = await self._submission.submit(
             admission=admission,
             effect_id=effect_id,
@@ -863,8 +1128,405 @@ class ParticipationRuntime:
             payload_hash=admission.payload_hash,
         )
         status = str(getattr(outcome, "status", "") or "submitted")
+        if status in {"submitted", "transport_accepted", "sent", "delivered"}:
+            self._close_social_association(opportunity, decision)
         await self._record(opportunity, f"comment_{status}", decision.reason)
         return {"status": status, "effect_id": effect_id}
+
+    def _close_social_association(
+        self,
+        opportunity: ParticipationOpportunity,
+        decision: ParticipationDecision,
+    ) -> None:
+        """Retire only the anchor named by the judge, never a task or whole chat."""
+        if not decision.closes_exchange or not decision.anchor_message_id:
+            return
+        token = str(decision.anchor_message_id).strip()
+        if not token:
+            return
+        closer = getattr(self._ledger, "close_social_anchor_sync", None)
+        if not callable(closer):
+            logger.warning(
+                "participation_social_closure_unavailable chat={}", opportunity.chat_id
+            )
+            return
+        try:
+            closer(
+                channel=str(opportunity.channel),
+                chat_id=str(opportunity.chat_id),
+                anchor_message_id=token,
+                now_ms=int(self._clock_ms()),
+            )
+        except Exception as exc:  # noqa: BLE001 - delivery already happened; retain evidence
+            logger.warning(
+                "participation_social_closure_failed chat={} error_type={}",
+                opportunity.chat_id,
+                type(exc).__name__,
+            )
+
+    async def _reconsider_comment(
+        self,
+        *,
+        initial_opportunity: ParticipationOpportunity,
+        initial_snapshot: Mapping[str, Any],
+        initial_inputs: ParticipationDecisionInputs,
+        initial_context: Mapping[str, Any],
+        initial_decision: ParticipationDecision,
+        effect_id: str,
+        text: str,
+        fresh: _FreshCommentState,
+    ) -> dict[str, object]:
+        """Bound stale-draft rejudgement while retaining one delivery reservation."""
+        del initial_inputs, initial_context
+        # Re-evaluation is bounded by the admission's original setting.  A live
+        # policy refresh may reduce that bound, but must not retroactively buy
+        # extra provider calls for work that was already admitted.
+        max_reevaluations = min(
+            _max_reevaluations(initial_snapshot),
+            _max_reevaluations(fresh.snapshot),
+        )
+        original_judge_limit = _snapshot_int(
+            initial_snapshot,
+            "judge_calls_per_hour",
+            "max_unaddressed_judge_calls_per_hour",
+            default=0,
+        )
+        original_min_gap_ms = _snapshot_int(
+            initial_snapshot,
+            "min_gap_seconds",
+            "min_unaddressed_judge_gap_seconds",
+            default=0,
+        ) * 1000
+        original_continuation_reserve = _snapshot_int(
+            initial_snapshot,
+            "continuation_reserve",
+            "continuation_judge_reserve",
+            default=0,
+        )
+        current = fresh
+        current_text = text
+        current_decision = initial_decision
+        initial_signature = _decision_signature(initial_decision)
+        replacement_generated = False
+        evaluation_index = 1
+
+        while True:
+            if evaluation_index > max_reevaluations:
+                await self._release_comment(
+                    initial_opportunity, effect_id, "context_changed"
+                )
+                await self._record(
+                    current.opportunity, "stale_discarded", "reevaluation_limit"
+                )
+                return {"status": "comment_skipped", "reason": "context_changed"}
+            if not _within_opportunity_deadline(
+                initial_opportunity,
+                initial_snapshot,
+                now_ms=int(self._clock_ms()),
+            ):
+                await self._release_comment(
+                    initial_opportunity, effect_id, "deadline_expired"
+                )
+                await self._record(
+                    current.opportunity, "stale_discarded", "deadline_expired"
+                )
+                return {"status": "comment_skipped", "reason": "deadline_expired"}
+            if self._direct_active(current.opportunity):
+                await self._release_comment(
+                    initial_opportunity, effect_id, "direct_superseded"
+                )
+                return self._direct_superseded()
+
+            attempt_id = f"{initial_opportunity.opportunity_id}:{evaluation_index}"
+            try:
+                charged = await self._ledger.reserve_judge_attempt(
+                    attempt_id,
+                    opportunity_id=initial_opportunity.opportunity_id,
+                    channel=current.opportunity.channel,
+                    chat_id=current.opportunity.chat_id,
+                    now_ms=int(self._clock_ms()),
+                    hourly_limit=min(
+                        original_judge_limit,
+                        _snapshot_int(
+                            current.snapshot,
+                            "judge_calls_per_hour",
+                            "max_unaddressed_judge_calls_per_hour",
+                            default=0,
+                        ),
+                    ),
+                    min_gap_ms=max(
+                        original_min_gap_ms,
+                        _snapshot_int(
+                            current.snapshot,
+                            "min_gap_seconds",
+                            "min_unaddressed_judge_gap_seconds",
+                            default=0,
+                        )
+                        * 1000,
+                    ),
+                    continuation_candidate=bool(current.inputs.continuation_candidate),
+                    continuation_reserve=min(
+                        original_continuation_reserve,
+                        _snapshot_int(
+                            current.snapshot,
+                            "continuation_reserve",
+                            "continuation_judge_reserve",
+                            default=0,
+                        ),
+                    ),
+                )
+            except ParticipationBlockedError as blocked:
+                await self._release_comment(initial_opportunity, effect_id, blocked.reason)
+                await self._record(
+                    current.opportunity, "stale_discarded", blocked.reason
+                )
+                return {"status": "comment_skipped", "reason": blocked.reason}
+            if not charged:
+                await self._release_comment(
+                    initial_opportunity, effect_id, "reevaluation_budget_exhausted"
+                )
+                await self._record(
+                    current.opportunity,
+                    "stale_discarded",
+                    "reevaluation_budget_exhausted",
+                )
+                return {
+                    "status": "comment_skipped",
+                    "reason": "reevaluation_budget_exhausted",
+                }
+            self._count("judge_attempted")
+            if self._direct_active(current.opportunity):
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="direct_superseded"
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, "direct_superseded"
+                )
+                return self._direct_superseded()
+
+            try:
+                reevaluated = await self._judge.decide(
+                    current.opportunity, current.context
+                )
+            except ParticipationDecisionError as failure:
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome=failure.reason
+                )
+                self._count("judge_failed")
+                await self._release_comment(initial_opportunity, effect_id, failure.reason)
+                await self._record(current.opportunity, "judge_failed", failure.reason)
+                return {"status": "judge_failed", "reason": failure.reason}
+            except Exception as exc:  # noqa: BLE001 - one chat must not stop the queue
+                logger.warning(
+                    "participation_rejudge_error chat={} error_type={}",
+                    current.opportunity.chat_id,
+                    type(exc).__name__,
+                )
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="provider_error"
+                )
+                self._count("judge_failed")
+                await self._release_comment(
+                    initial_opportunity, effect_id, "provider_error"
+                )
+                await self._record(current.opportunity, "judge_failed", "provider_error")
+                return {"status": "judge_failed", "reason": "provider_error"}
+
+            if self._direct_active(current.opportunity):
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="direct_superseded"
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, "direct_superseded"
+                )
+                return self._direct_superseded()
+            try:
+                self._validate_decision(
+                    reevaluated,
+                    opportunity=current.opportunity,
+                    inputs=current.inputs,
+                    context=current.context,
+                )
+            except ParticipationDecisionError as failure:
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome=failure.reason
+                )
+                self._count("judge_failed")
+                await self._release_comment(initial_opportunity, effect_id, failure.reason)
+                await self._record(current.opportunity, "judge_failed", failure.reason)
+                return {"status": "judge_failed", "reason": failure.reason}
+            await self._ledger.record_judge_outcome(
+                attempt_id, outcome=reevaluated.action
+            )
+            if reevaluated.action == "silence":
+                self._count("deliberate_silence")
+                await self._release_comment(
+                    initial_opportunity, effect_id, "reevaluated_silence"
+                )
+                await self._record(
+                    current.opportunity, "stale_discarded", "reevaluated_silence"
+                )
+                return {"status": "silence", "intent": reevaluated.intent}
+            if reevaluated.action != "comment":
+                await self._release_comment(
+                    initial_opportunity, effect_id, "reevaluated_action_changed"
+                )
+                await self._record(
+                    current.opportunity, "stale_discarded", "reevaluated_action_changed"
+                )
+                return {"status": "comment_skipped", "reason": "context_changed"}
+            if reevaluated.intent != initial_decision.intent:
+                # The held categories belong to the original intent. Releasing is the
+                # safe atomic transition; a later opportunity may reserve the new set.
+                await self._release_comment(
+                    initial_opportunity, effect_id, "reservation_intent_changed"
+                )
+                await self._record(
+                    current.opportunity, "stale_discarded", "reservation_intent_changed"
+                )
+                return {"status": "comment_skipped", "reason": "context_changed"}
+
+            signature = _decision_signature(reevaluated)
+            if signature != initial_signature:
+                if replacement_generated:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "decision_changed_again"
+                    )
+                    await self._record(
+                        current.opportunity, "stale_discarded", "decision_changed_again"
+                    )
+                    return {"status": "comment_skipped", "reason": "context_changed"}
+                try:
+                    self._preflight(current.opportunity, current.snapshot)
+                except ParticipationBlockedError as blocked:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, blocked.reason
+                    )
+                    await self._record(
+                        current.opportunity, "stale_discarded", blocked.reason
+                    )
+                    return {"status": "comment_skipped", "reason": blocked.reason}
+                if self._direct_active(current.opportunity):
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "direct_superseded"
+                    )
+                    return self._direct_superseded()
+                try:
+                    replacement = await self._submission.generate_draft(
+                        opportunity=current.opportunity,
+                        decision=reevaluated,
+                        context=current.context,
+                    )
+                except Exception as exc:  # noqa: BLE001 - release definite failure
+                    logger.warning(
+                        "participation_replacement_failed chat={} error_type={}",
+                        current.opportunity.chat_id,
+                        type(exc).__name__,
+                    )
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "generation_failed"
+                    )
+                    await self._record(
+                        current.opportunity, "generation_failed", "generation_failed"
+                    )
+                    return {"status": "generation_failed", "reason": "generation_failed"}
+                current_text = str(replacement or "").strip()
+                if not current_text:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "empty_draft"
+                    )
+                    await self._record(current.opportunity, "generation_failed", "empty_draft")
+                    return {"status": "generation_failed", "reason": "empty_draft"}
+                self._count("generated")
+                if self._direct_active(current.opportunity):
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "direct_superseded"
+                    )
+                    return self._direct_superseded()
+                replacement_generated = True
+            current_decision = reevaluated
+
+            try:
+                newer = await self._fresh_comment_state(
+                    current.opportunity,
+                    snapshot=current.snapshot,
+                    inputs=current.inputs,
+                    context=current.context,
+                )
+            except ParticipationBlockedError as blocked:
+                await self._release_comment(initial_opportunity, effect_id, blocked.reason)
+                await self._record(current.opportunity, "stale_discarded", blocked.reason)
+                return {"status": "comment_skipped", "reason": blocked.reason}
+            if newer is not None:
+                if replacement_generated:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "context_changed_again"
+                    )
+                    await self._record(
+                        newer.opportunity, "stale_discarded", "context_changed_again"
+                    )
+                    return {"status": "comment_skipped", "reason": "context_changed"}
+                max_reevaluations = min(
+                    max_reevaluations, _max_reevaluations(newer.snapshot)
+                )
+                current = newer
+                evaluation_index += 1
+                continue
+            return await self._submit_comment(
+                opportunity=current.opportunity,
+                snapshot=current.snapshot,
+                inputs=current.inputs,
+                decision=current_decision,
+                text=current_text,
+                effect_id=effect_id,
+                evaluation_index=evaluation_index,
+                deadline_snapshot=initial_snapshot,
+            )
+
+    async def _fresh_comment_state(
+        self,
+        opportunity: ParticipationOpportunity,
+        *,
+        snapshot: Mapping[str, Any],
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> _FreshCommentState | None:
+        """Read current activation and context revision without opening a new judge."""
+        try:
+            raw = self._snapshot_provider(
+                opportunity.channel,
+                opportunity.chat_id,
+                epoch=int(opportunity.activation_epoch),
+                opportunity=opportunity,
+            )
+        except Exception as exc:  # noqa: BLE001 - final freshness is fail-closed
+            raise ParticipationBlockedError("freshness_unavailable") from exc
+        fresh_snapshot = _snapshot_mapping(raw)
+        fresh_opportunity = _opportunity_from_snapshot(opportunity, fresh_snapshot)
+        self._preflight(fresh_opportunity, fresh_snapshot)
+        _max_reevaluations(fresh_snapshot)
+        if str(fresh_snapshot.get("lane") or fresh_opportunity.lane) == "shadow":
+            raise ParticipationBlockedError("shadow_lane")
+        baseline = _revision_token(snapshot, opportunity, context)
+        observed = _revision_token(fresh_snapshot, fresh_opportunity, None)
+        if not _revision_token_changed(baseline, observed):
+            return None
+        fresh_inputs = await self._decision_inputs(fresh_opportunity, fresh_snapshot)
+        fresh_context = await self._context_builder.build(
+            fresh_opportunity, inputs=fresh_inputs
+        )
+        fresh_context = await self._hydrate_social_anchor_closures(fresh_context)
+        fresh_inputs, fresh_context = self._apply_continuation_candidate(
+            fresh_opportunity, fresh_inputs, fresh_context
+        )
+        if not any(action != "silence" for action in fresh_inputs.allowed_actions):
+            raise ParticipationBlockedError("no_feasible_action")
+        return _FreshCommentState(
+            opportunity=fresh_opportunity,
+            snapshot=fresh_inputs.snapshot,
+            inputs=fresh_inputs,
+            context=fresh_context,
+        )
 
     def _source_principal_values(
         self, opportunity: ParticipationOpportunity
@@ -908,6 +1570,7 @@ class ParticipationRuntime:
         decision: ParticipationDecision,
         effect_id: str,
         payload: object,
+        evaluation_index: int = 0,
     ) -> ParticipationAdmission:
         source_event_ids = tuple(
             str(item or "").strip() for item in opportunity.source_event_ids
@@ -940,6 +1603,9 @@ class ParticipationRuntime:
         intent = str(decision.intent or "").strip()
         if action not in _ACTIONS or not intent:
             raise ParticipationBlockedError("invalid_admission_decision")
+        admission_id = f"adm-{effect_id}"
+        if int(evaluation_index) > 0:
+            admission_id = f"{admission_id}-r{opportunity.observed_revision}-e{int(evaluation_index)}"
         return ParticipationAdmission(
             opportunity_id=opportunity.opportunity_id,
             channel=opportunity.channel,
@@ -953,7 +1619,7 @@ class ParticipationRuntime:
             emoji=decision.emoji,
             target_message_id=decision.target_message_id,
             anchor_message_id=decision.anchor_message_id,
-            admission_id=f"adm-{effect_id}",
+            admission_id=admission_id,
             source_event_ids=source_event_ids,
             source_principals=source_principals,
             policy_version=policy_version,
@@ -1005,6 +1671,8 @@ def _snapshot_value(snapshot: Any, name: str, default: Any = _MISSING) -> Any:
             "allow_continuation": "allowContinuation",
             "allow_reactions": "allowReactions",
             "max_unaddressed_judge_calls_per_hour": "maxUnaddressedJudgeCallsPerHour",
+            "max_reevaluations": "maxReevaluations",
+            "opportunity_ttl_seconds": "opportunityTtlSeconds",
         }
         alias = aliases.get(name)
         if alias and alias in nested:
@@ -1026,9 +1694,121 @@ def _snapshot_mapping(snapshot: Any) -> dict[str, Any]:
         "policy_version",
         "context_window_minutes",
         "context_max_messages",
+        "max_reevaluations",
+        "opportunity_ttl_seconds",
         "participation",
     )
     return {name: getattr(snapshot, name) for name in fields if hasattr(snapshot, name)}
+
+
+def _snapshot_sequence(snapshot: Mapping[str, Any], *names: str) -> tuple[str, ...] | None:
+    for name in names:
+        value = _snapshot_value(snapshot, name)
+        if value is _MISSING or value is None:
+            continue
+        if not isinstance(value, (tuple, list, set, frozenset)):
+            return None
+        result = tuple(
+            str(item).strip() for item in value if str(item).strip()
+        )
+        return tuple(dict.fromkeys(result))
+    return None
+
+
+def _opportunity_from_snapshot(
+    opportunity: ParticipationOpportunity, snapshot: Mapping[str, Any]
+) -> ParticipationOpportunity:
+    source_ids = _snapshot_sequence(
+        snapshot, "current_source_ids", "source_event_ids", "material_source_ids"
+    )
+    revision = _revision_value(snapshot, default=opportunity.observed_revision)
+    if not source_ids:
+        source_ids = tuple(opportunity.source_event_ids)
+    if revision < opportunity.observed_revision:
+        revision = opportunity.observed_revision
+    if source_ids == opportunity.source_event_ids and revision == opportunity.observed_revision:
+        return opportunity
+    return replace(
+        opportunity,
+        source_event_ids=source_ids,
+        observed_revision=revision,
+    )
+
+
+def _revision_value(value: Any, *, default: int) -> int:
+    for name in (
+        "context_revision",
+        "observed_revision",
+        "material_revision",
+        "source_revision",
+        "latest_revision",
+    ):
+        item = _snapshot_value(value, name)
+        if item is _MISSING or item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return int(default)
+        return int(item)
+    return int(default)
+
+
+def _revision_token(
+    snapshot: Mapping[str, Any] | None,
+    opportunity: ParticipationOpportunity,
+    context: Mapping[str, Any] | None,
+) -> tuple[int, tuple[str, ...]]:
+    revision = int(opportunity.observed_revision)
+    source_ids = tuple(opportunity.source_event_ids)
+    for value in (snapshot, context):
+        if value is None:
+            continue
+        revision = max(revision, _revision_value(value, default=revision))
+        supplied = _snapshot_sequence(
+            value, "current_source_ids", "source_event_ids", "material_source_ids"
+        )
+        if supplied:
+            source_ids = supplied
+    return revision, source_ids
+
+
+def _revision_token_changed(
+    baseline: tuple[int, tuple[str, ...]], observed: tuple[int, tuple[str, ...]]
+) -> bool:
+    return observed[0] > baseline[0] or observed[1] != baseline[1]
+
+
+def _max_reevaluations(snapshot: Mapping[str, Any]) -> int:
+    value = _snapshot_int(
+        snapshot, "max_reevaluations", "maxReevaluations", default=1
+    )
+    if value > 2:
+        raise ParticipationBlockedError("invalid_snapshot")
+    return value
+
+
+def _decision_signature(decision: ParticipationDecision) -> tuple[object, ...]:
+    return (
+        str(decision.action),
+        str(decision.intent),
+        str(decision.purpose or ""),
+        str(decision.contribution_type or ""),
+        str(decision.anchor_message_id or ""),
+        str(decision.target_message_id or ""),
+    )
+
+
+def _within_opportunity_deadline(
+    opportunity: ParticipationOpportunity,
+    snapshot: Mapping[str, Any],
+    *,
+    now_ms: int,
+) -> bool:
+    ttl_seconds = _snapshot_int(
+        snapshot, "opportunity_ttl_seconds", "ttl_seconds", default=120
+    )
+    if ttl_seconds <= 0:
+        return False
+    return int(now_ms) <= int(opportunity.created_at_ms) + ttl_seconds * 1000
 
 
 def _snapshot_tokens(snapshot: Any, name: str) -> tuple[str, ...] | None:
@@ -1163,16 +1943,261 @@ def _clock_minutes(value: str) -> int:
     return hours * 60 + minutes
 
 
-def _has_delivered_anchor(context: Mapping[str, Any]) -> bool:
+_REFERENCE_KEYS: tuple[str, ...] = (
+    "reply_to_message_id",
+    "reply_to",
+    "replyToMessageId",
+    "quoted_message_id",
+    "quoted_provider_message_id",
+    "reference_message_id",
+    "referenced_message_id",
+    "anchor_message_id",
+    "reply_to_effect_id",
+    "quoted_effect_id",
+)
+
+
+def _context_target(context: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(context.get("channel") or "").strip(),
+        str(context.get("chat_id") or "").strip(),
+    )
+
+
+def _anchor_tokens(anchor: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in (
+            str(anchor.get("provider_message_id") or "").strip(),
+            str(anchor.get("effect_id") or "").strip(),
+        )
+        if token
+    )
+
+
+def _anchor_is_closed(anchor: Mapping[str, Any]) -> bool:
+    for name in (
+        "closed",
+        "exchange_closed",
+        "association_closed",
+        "social_closed",
+        "retired",
+        "replaced",
+    ):
+        if anchor.get(name) is True:
+            return True
+    return any(
+        str(anchor.get(name) or "").strip()
+        for name in ("closed_at_ms", "closed_at", "replaced_by")
+    )
+
+
+def _anchor_is_same_target(
+    anchor: Mapping[str, Any], context: Mapping[str, Any]
+) -> bool:
+    target_channel, target_chat = _context_target(context)
+    anchor_channel = str(anchor.get("channel") or "").strip()
+    anchor_chat = str(anchor.get("chat_id") or "").strip()
+    if anchor_channel or anchor_chat:
+        return bool(
+            target_channel
+            and target_chat
+            and anchor_channel == target_channel
+            and anchor_chat == target_chat
+        )
+    # A context builder that returned an anchor without its repeated target still
+    # carries exact query provenance in its top-level target.  Without either proof,
+    # an arbitrary anchor is not eligible for a protected continuation.
+    return bool(target_channel and target_chat)
+
+
+def _anchor_is_eligible(
+    context: Mapping[str, Any],
+    anchor_id: str | None,
+) -> bool:
     anchors = context.get("anchors")
     if not isinstance(anchors, (tuple, list)):
         return False
-    return any(
-        isinstance(anchor, Mapping)
-        and str(anchor.get("delivery_state") or "") == "delivered"
-        and bool(str(anchor.get("provider_message_id") or "").strip())
-        for anchor in anchors
+    requested = str(anchor_id or "").strip()
+    for raw_anchor in anchors:
+        if not isinstance(raw_anchor, Mapping):
+            continue
+        anchor = raw_anchor
+        tokens = _anchor_tokens(anchor)
+        if (
+            str(anchor.get("delivery_state") or "") != "delivered"
+            or not tokens
+            or (requested and requested not in tokens)
+            or not _anchor_is_same_target(anchor, context)
+            or _anchor_is_closed(anchor)
+        ):
+            continue
+        return True
+    return False
+
+
+def _has_delivered_anchor(context: Mapping[str, Any]) -> bool:
+    return _anchor_is_eligible(context, None)
+
+
+def _reference_tokens(source: Mapping[str, Any]) -> frozenset[str]:
+    values: set[str] = set()
+    for key in _REFERENCE_KEYS:
+        value = source.get(key)
+        if isinstance(value, Mapping):
+            value = value.get("message_id") or value.get("provider_message_id") or value.get(
+                "id"
+            )
+        token = str(value or "").strip()
+        if token:
+            values.add(token)
+    metadata = source.get("metadata")
+    if isinstance(metadata, Mapping):
+        values.update(_reference_tokens(metadata))
+    return frozenset(values)
+
+
+def _source_id(row: Mapping[str, Any]) -> str:
+    return str(row.get("event_id") or row.get("message_id") or "").strip()
+
+
+def _source_sender(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("sender_id") or row.get("sender") or row.get("speaker") or ""
+    ).strip()
+
+
+def _is_bot_sender(sender: str) -> bool:
+    token = str(sender or "").strip().casefold()
+    return token in {"assistant", "arvid", "bot", "service:speakup"} or token.endswith(
+        ":bot"
     )
+
+
+def _context_time_ms(row: Mapping[str, Any]) -> int | None:
+    value = row.get("timestamp")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        return int(number * 1000 if abs(number) < 100_000_000_000 else number)
+    value = row.get("delivered_at_ms")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+def _has_replacing_foreign_exchange(
+    source: Mapping[str, Any],
+    anchor: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    source_sender: str,
+) -> bool:
+    markers = (
+        "foreign_exchange",
+        "intervening_foreign_exchange",
+        "replacing_foreign_exchange",
+        "exchange_replaced",
+        "replaced_exchange",
+        "replaces_anchor",
+    )
+    if any(item.get(name) is True for item in (source, anchor, context) for name in markers):
+        return True
+    messages = context.get("messages")
+    if isinstance(messages, (tuple, list)):
+        if any(
+            isinstance(item, Mapping)
+            and any(item.get(name) is True for name in markers)
+            for item in messages
+        ):
+            return True
+    anchor_time = _context_time_ms(anchor)
+    source_time = _context_time_ms(source)
+    if anchor_time is None or source_time is None or source_time < anchor_time:
+        return False
+    messages = context.get("messages")
+    if not isinstance(messages, (tuple, list)):
+        return False
+    for raw_message in messages:
+        if not isinstance(raw_message, Mapping) or _source_id(raw_message) == _source_id(source):
+            continue
+        message_time = _context_time_ms(raw_message)
+        if message_time is None or not anchor_time < message_time <= source_time:
+            continue
+        sender = _source_sender(raw_message)
+        if sender and sender != source_sender and not _is_bot_sender(sender):
+            return True
+    return False
+
+
+def _is_continuation_candidate(
+    opportunity: ParticipationOpportunity,
+    context: Mapping[str, Any],
+) -> bool:
+    """Return whether this source has cheap, exact evidence for protected reserve use."""
+    anchors = context.get("anchors")
+    messages = context.get("messages")
+    if not isinstance(anchors, (tuple, list)) or not isinstance(messages, (tuple, list)):
+        return False
+    eligible_anchors = [
+        anchor
+        for anchor in anchors
+        if isinstance(anchor, Mapping)
+        and _anchor_is_eligible(
+            {**context, "anchors": [anchor]},
+            None,
+        )
+    ]
+    if not eligible_anchors:
+        return False
+    source_ids = {str(item).strip() for item in opportunity.source_event_ids if str(item).strip()}
+    source_rows = [
+        row
+        for row in messages
+        if isinstance(row, Mapping) and _source_id(row) in source_ids
+    ]
+    if not source_rows:
+        return False
+    target_channel, target_chat = _context_target(context)
+    for source in source_rows:
+        source_channel = str(source.get("channel") or "").strip()
+        source_chat = str(source.get("chat_id") or "").strip()
+        if source_channel or source_chat:
+            if not (
+                target_channel
+                and target_chat
+                and source_channel == target_channel
+                and source_chat == target_chat
+            ):
+                continue
+        sender = _source_sender(source)
+        if not sender or _is_bot_sender(sender):
+            continue
+        references = _reference_tokens(source)
+        for anchor in eligible_anchors:
+            if references & _anchor_tokens(anchor):
+                # An exact same-chat bot reference is sufficient even when the text is
+                # longer than the short-message heuristic.
+                return True
+        text = str(source.get("text") or "").strip()
+        if not text or len(text) > 120 or references:
+            continue
+        for anchor in eligible_anchors:
+            anchor_time = _context_time_ms(anchor)
+            source_time = _context_time_ms(source)
+            if (
+                anchor_time is not None
+                and source_time is not None
+                and source_time < anchor_time
+            ):
+                continue
+            if not _has_replacing_foreign_exchange(
+                source,
+                anchor,
+                context,
+                source_sender=sender,
+            ):
+                return True
+    return False
 
 
 def _reservation_for_intent(

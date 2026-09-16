@@ -1321,6 +1321,7 @@ class WhatsAppChannel(BaseChannel):
                 sender_name=event.sender_name,
                 text=event.text,
                 timestamp=event.timestamp,
+                reply_to_message_id=event.reply_to_message_id,
             )
             # Seed quoted target text when available so reply lookups can work
             # even if the original inbound message was not captured by this runtime.

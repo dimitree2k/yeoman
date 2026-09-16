@@ -1761,6 +1761,9 @@ async def test_delivered_anchors_survive_restart_and_do_not_leak_chats(tmp_path:
         evidence_ref="signal-1",
         now_ms=1200,
     )
+    assert await log.close_social_anchor(
+        channel=CHANNEL, chat_id=CHAT, anchor_message_id="prov-1", now_ms=1300
+    )
     log.close()
     store.close()
 
@@ -1769,6 +1772,7 @@ async def test_delivered_anchors_survive_restart_and_do_not_leak_chats(tmp_path:
     reader = DeliveryAnchorReader(log=reopened_log, store=reopened_store)
     anchors = await reader.delivered_anchors(CHANNEL, CHAT, since_ms=0, limit=10)
     assert len(anchors) == 1
+    assert anchors[0]["social_closed"] is True
     assert await reader.delivered_anchors(
         CHANNEL, "other@g.us", since_ms=0, limit=10
     ) == []

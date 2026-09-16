@@ -81,6 +81,21 @@ class DeliveryAnchorReader:
             text = effect.get("text")
             if text is None:
                 continue
+            provider_message_id = str(row["provider_message_id"] or "").strip()
+            social_closed = False
+            for anchor_id in (provider_message_id, effect_id):
+                if not anchor_id:
+                    continue
+                try:
+                    social_closed = await self._log.social_anchor_closed(
+                        channel=str(row["channel"]),
+                        chat_id=str(row["chat_id"]),
+                        anchor_message_id=anchor_id,
+                    )
+                except Exception:  # noqa: BLE001 - unknown closure fails closed
+                    social_closed = True
+                if social_closed:
+                    break
             anchors.append(
                 {
                     "effect_id": effect_id,
@@ -97,6 +112,7 @@ class DeliveryAnchorReader:
                         else "exact_target"
                     ),
                     "delivery_state": "delivered",
+                    "social_closed": social_closed,
                     "source_ids": (),
                 }
             )

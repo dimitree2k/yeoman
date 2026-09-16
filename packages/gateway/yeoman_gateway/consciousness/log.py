@@ -349,6 +349,17 @@ class SpeakupLog:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS social_anchor_closures (
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    anchor_message_id TEXT NOT NULL,
+                    closed_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (channel, chat_id, anchor_message_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS approval_claims (
                     proposal_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL,
@@ -1320,6 +1331,78 @@ class SpeakupLog:
                     now_ms=moment,
                 )
             return highest
+
+    def close_social_anchor_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        anchor_message_id: str,
+        now_ms: int | None = None,
+    ) -> bool:
+        """Durably close one exact social anchor, idempotently.
+
+        This projection is intentionally narrower than a task/thread closure: it
+        only retires the supplied delivered-message association in this chat.
+        """
+        target = (str(channel).strip(), str(chat_id).strip(), str(anchor_message_id).strip())
+        if not all(target):
+            return False
+        moment = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO social_anchor_closures (
+                    channel, chat_id, anchor_message_id, closed_at_ms
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (*target, moment),
+            )
+        return bool(cursor.rowcount)
+
+    async def close_social_anchor(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        anchor_message_id: str,
+        now_ms: int | None = None,
+    ) -> bool:
+        """Async facade for :meth:`close_social_anchor_sync`."""
+        return self.close_social_anchor_sync(
+            channel=channel,
+            chat_id=chat_id,
+            anchor_message_id=anchor_message_id,
+            now_ms=now_ms,
+        )
+
+    def social_anchor_closed_sync(
+        self, *, channel: str, chat_id: str, anchor_message_id: str
+    ) -> bool:
+        """Read the durable closure for one exact social anchor."""
+        target = (str(channel).strip(), str(chat_id).strip(), str(anchor_message_id).strip())
+        if not all(target):
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM social_anchor_closures
+                WHERE channel = ? AND chat_id = ? AND anchor_message_id = ?
+                LIMIT 1
+                """,
+                target,
+            ).fetchone()
+        return row is not None
+
+    async def social_anchor_closed(
+        self, *, channel: str, chat_id: str, anchor_message_id: str
+    ) -> bool:
+        """Async facade for :meth:`social_anchor_closed_sync`."""
+        return self.social_anchor_closed_sync(
+            channel=channel,
+            chat_id=chat_id,
+            anchor_message_id=anchor_message_id,
+        )
 
     def activation_epoch_sync(
         self, scope: str = "participation", *, fingerprint: str | None = None

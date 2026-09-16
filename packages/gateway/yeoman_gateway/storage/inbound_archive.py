@@ -61,6 +61,7 @@ class InboundArchive:
                     timestamp INTEGER,
                     created_at TEXT NOT NULL,
                     sender_name TEXT,
+                    reply_to_message_id TEXT,
                     PRIMARY KEY (channel, chat_id, message_id)
                 )
                 """
@@ -84,6 +85,12 @@ class InboundArchive:
                 )
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            try:
+                self._conn.execute(
+                    "ALTER TABLE inbound_messages ADD COLUMN reply_to_message_id TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             self._conn.commit()
 
     def record_inbound(
@@ -97,6 +104,7 @@ class InboundArchive:
         text: str,
         timestamp: int | None,
         sender_name: str | None = None,
+        reply_to_message_id: str | None = None,
     ) -> None:
         """Record one inbound message if it has not been archived yet."""
         if not channel or not chat_id or not message_id or text is None:
@@ -108,15 +116,19 @@ class InboundArchive:
                 """
                 INSERT INTO inbound_messages (
                     channel, chat_id, message_id, participant, sender_id, text,
-                    timestamp, created_at, sender_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamp, created_at, sender_name, reply_to_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, chat_id, message_id) DO UPDATE SET
                     text = CASE
                         WHEN instr(excluded.text, '[image_description]') > 0
                              AND instr(inbound_messages.text, '[image_description]') = 0
                         THEN excluded.text
                         ELSE inbound_messages.text
-                    END
+                    END,
+                    reply_to_message_id = COALESCE(
+                        inbound_messages.reply_to_message_id,
+                        excluded.reply_to_message_id
+                    )
                 """,
                 (
                     str(channel),
@@ -128,6 +140,7 @@ class InboundArchive:
                     int(timestamp) if isinstance(timestamp, (int, float)) else None,
                     created_at,
                     str(sender_name) if sender_name else None,
+                    str(reply_to_message_id) if reply_to_message_id else None,
                 ),
             )
             self._conn.commit()
@@ -140,7 +153,8 @@ class InboundArchive:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at, sender_name
+                SELECT channel, chat_id, message_id, participant, sender_id, text,
+                       timestamp, created_at, sender_name, reply_to_message_id
                 FROM inbound_messages
                 WHERE channel = ? AND chat_id = ? AND message_id = ?
                 LIMIT 1
@@ -166,7 +180,8 @@ class InboundArchive:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at, sender_name
+                SELECT channel, chat_id, message_id, participant, sender_id, text,
+                       timestamp, created_at, sender_name, reply_to_message_id
                 FROM inbound_messages
                 WHERE channel = ? AND message_id = ?
                 ORDER BY
@@ -213,7 +228,8 @@ class InboundArchive:
             if isinstance(anchor_timestamp, int):
                 rows = self._conn.execute(
                     """
-                    SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at, sender_name
+                    SELECT channel, chat_id, message_id, participant, sender_id, text,
+                           timestamp, created_at, sender_name, reply_to_message_id
                     FROM inbound_messages
                     WHERE channel = ? AND chat_id = ?
                       AND (
@@ -235,7 +251,8 @@ class InboundArchive:
             else:
                 rows = self._conn.execute(
                     """
-                    SELECT channel, chat_id, message_id, participant, sender_id, text, timestamp, created_at, sender_name
+                    SELECT channel, chat_id, message_id, participant, sender_id, text,
+                           timestamp, created_at, sender_name, reply_to_message_id
                     FROM inbound_messages
                     WHERE channel = ? AND chat_id = ? AND created_at < ?
                     ORDER BY created_at DESC
@@ -348,7 +365,7 @@ class InboundArchive:
                 SELECT *
                 FROM (
                     SELECT channel, chat_id, message_id, participant, sender_id,
-                           text, timestamp, created_at, sender_name,
+                           text, timestamp, created_at, sender_name, reply_to_message_id,
                            {order_expr} AS sort_ts
                     FROM inbound_messages
                     WHERE channel = ? AND chat_id = ?
@@ -365,7 +382,7 @@ class InboundArchive:
         else:
             sql = f"""
                 SELECT channel, chat_id, message_id, participant, sender_id,
-                       text, timestamp, created_at, sender_name
+                       text, timestamp, created_at, sender_name, reply_to_message_id
                 FROM inbound_messages
                 WHERE channel = ? AND chat_id = ?
                   AND (

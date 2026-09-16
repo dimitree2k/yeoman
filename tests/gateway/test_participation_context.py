@@ -65,6 +65,7 @@ def _record(
     sender: str = "anna",
     chat_id: str = CHAT,
     channel: str = CHANNEL,
+    reply_to_message_id: str | None = None,
 ) -> None:
     archive.record_inbound(
         channel=channel,
@@ -75,6 +76,7 @@ def _record(
         sender_name=sender,
         text=text,
         timestamp=int((NOW - timedelta(minutes=minutes_ago)).timestamp()),
+        reply_to_message_id=reply_to_message_id,
     )
 
 
@@ -207,6 +209,23 @@ async def test_intervening_participants_are_retained(tmp_path: Path) -> None:
     context = await _build_context(builder, _opportunity("m1"))
     speakers = [row["sender"] for row in context["messages"]]  # type: ignore[index]
     assert speakers == ["anna", "ben", "cara"]
+
+
+@pytest.mark.asyncio
+async def test_exact_reply_reference_reaches_participation_context(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    archive = builder._archive
+    _record(
+        archive,
+        message_id="reply",
+        text="yes, exactly",
+        minutes_ago=1,
+        reply_to_message_id="bot-anchor-1",
+    )
+
+    context = await _build_context(builder, _opportunity("reply"))
+
+    assert context["messages"][0]["reply_to_message_id"] == "bot-anchor-1"  # type: ignore[index]
 
 
 @pytest.mark.asyncio

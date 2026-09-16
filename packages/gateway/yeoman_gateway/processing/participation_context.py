@@ -491,6 +491,7 @@ def _render_message(row: Mapping[str, Any]) -> dict[str, object]:
         "timestamp": row.get("timestamp"),
         "channel": str(row.get("channel") or ""),
         "chat_id": str(row.get("chat_id") or ""),
+        "reply_to_message_id": str(row.get("reply_to_message_id") or ""),
     }
 
 

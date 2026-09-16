@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -63,9 +63,13 @@ class _Context:
         self.inputs = None
 
     async def build(self, opportunity, *, inputs):
-        del opportunity
         self.calls += 1
         self.inputs = inputs
+        source_id = (
+            str(opportunity.source_event_ids[-1])
+            if opportunity.source_event_ids
+            else "m1"
+        )
         snapshot = inputs.snapshot
         contribution_types = (
             snapshot.get("allowed_contribution_types", ())
@@ -73,11 +77,26 @@ class _Context:
             else ()
         )
         return {
-            "messages": [],
+            "channel": CHANNEL,
+            "chat_id": CHAT,
+            "messages": [
+                {
+                    "event_id": source_id,
+                    "sender_id": "anna@s.whatsapp.net",
+                    "text": "a short synthetic reply",
+                    "timestamp": NOW_MS,
+                    "channel": CHANNEL,
+                    "chat_id": CHAT,
+                }
+            ],
             "anchors": [
                 {
                     "provider_message_id": "prov-1",
                     "delivery_state": "delivered",
+                    "delivered_at_ms": NOW_MS - 1_000,
+                    "channel": CHANNEL,
+                    "chat_id": CHAT,
+                    "closed": False,
                 }
             ],
             "allowed_actions": list(inputs.allowed_actions),
@@ -531,6 +550,757 @@ async def test_continuation_requires_trusted_candidate_evidence(tmp_path: Path) 
     assert context.inputs is not None
     assert context.inputs.continuation_candidate is False
     assert "continue" not in context.inputs.snapshot["comment_allowed_intents"]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_long_unquoted_source_cannot_use_continuation_candidate_reserve(
+    tmp_path: Path,
+) -> None:
+    """A retained anchor alone does not make unrelated long chatter continuation."""
+    decision = ParticipationDecision(
+        action="comment",
+        intent="continue",
+        reason="follow up",
+        purpose="acknowledge the answer",
+        contribution_type="observation",
+        anchor_message_id="prov-1",
+        target_message_id="m1",
+    )
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=decision,
+        snapshot_overrides={"continuation_candidate": True},
+    )
+    original_build = context.build
+
+    async def build_with_unrelated_source(*args, **kwargs):
+        rendered = await original_build(*args, **kwargs)
+        rendered["channel"] = CHANNEL
+        rendered["chat_id"] = CHAT
+        rendered["messages"] = [
+            {
+                "event_id": "m1",
+                "sender_id": "anna@s.whatsapp.net",
+                "text": "x" * 121,
+                "timestamp": NOW_MS,
+                "channel": CHANNEL,
+                "chat_id": CHAT,
+            }
+        ]
+        rendered["anchors"] = [
+            {
+                "provider_message_id": "prov-1",
+                "delivery_state": "delivered",
+                "delivered_at_ms": NOW_MS - 1_000,
+                "channel": CHANNEL,
+                "chat_id": CHAT,
+                "closed": False,
+            }
+        ]
+        return rendered
+
+    context.build = build_with_unrelated_source  # type: ignore[method-assign]
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
+    assert judge.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    attempts = await log.judge_attempts_since(
+        channel=CHANNEL, chat_id=CHAT, since_ms=0
+    )
+    assert len(attempts) == 1
+    assert attempts[0]["continuation_candidate"] == 0
+    log.close()
+
+
+@pytest.mark.parametrize(
+    ("source", "anchor", "intervening", "expected"),
+    [
+        (
+            {
+                "event_id": "m1",
+                "sender_id": "anna@s.whatsapp.net",
+                "text": "x" * 121,
+                "reply_to_message_id": "prov-1",
+                "timestamp": NOW_MS,
+            },
+            {"closed": False},
+            [],
+            True,
+        ),
+        (
+            {
+                "event_id": "m1",
+                "sender_id": "anna@s.whatsapp.net",
+                "text": "short answer",
+                "timestamp": NOW_MS,
+            },
+            {"closed": False},
+            [
+                {
+                    "event_id": "m2",
+                    "sender_id": "ben@s.whatsapp.net",
+                    "text": "a foreign exchange",
+                    "timestamp": NOW_MS - 500,
+                }
+            ],
+            False,
+        ),
+        (
+            {
+                "event_id": "m1",
+                "sender_id": "anna@s.whatsapp.net",
+                "text": "short answer",
+                "timestamp": NOW_MS,
+            },
+            {"closed": True},
+            [],
+            False,
+        ),
+    ],
+)
+def test_continuation_candidate_requires_current_social_relation(
+    source: dict[str, object],
+    anchor: dict[str, object],
+    intervening: list[dict[str, object]],
+    expected: bool,
+) -> None:
+    from yeoman_gateway.processing.participation_runtime import _is_continuation_candidate
+
+    context = {
+        "channel": CHANNEL,
+        "chat_id": CHAT,
+        "messages": [*intervening, {"channel": CHANNEL, "chat_id": CHAT, **source}],
+        "anchors": [
+            {
+                "provider_message_id": "prov-1",
+                "delivery_state": "delivered",
+                "delivered_at_ms": NOW_MS - 1_000,
+                "channel": CHANNEL,
+                "chat_id": CHAT,
+                **anchor,
+            }
+        ],
+    }
+    assert _is_continuation_candidate(_opportunity("m1"), context) is expected
+
+
+@pytest.mark.asyncio
+async def test_closes_exchange_survives_runtime_restart(tmp_path: Path) -> None:
+    decision = ParticipationDecision(
+        action="comment",
+        intent="continue",
+        reason="close one social exchange",
+        purpose="acknowledge",
+        contribution_type="observation",
+        anchor_message_id="prov-1",
+        target_message_id="m1",
+        closes_exchange=True,
+    )
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=decision,
+        policy_participation={
+            "enabled": True,
+            "allowInitiation": False,
+            "allowContinuation": True,
+        },
+        snapshot_overrides={
+            "continuation_candidate": True,
+            "judge_calls_per_hour": 3,
+            "continuation_reserve": 0,
+            "min_gap_seconds": 0,
+        },
+    )
+    first = await runtime.evaluate_participation(_opportunity("m1"))
+    assert first["status"] == "submitted"
+    assert await log.social_anchor_closed(
+        channel=CHANNEL, chat_id=CHAT, anchor_message_id="prov-1"
+    ) is True
+    log.close()
+
+    restarted, judge, context, reopened_log = _runtime(
+        tmp_path,
+        decision=decision,
+        policy_participation={
+            "enabled": True,
+            "allowInitiation": False,
+            "allowContinuation": True,
+        },
+        snapshot_overrides={
+            "continuation_candidate": True,
+            "judge_calls_per_hour": 3,
+            "continuation_reserve": 0,
+            "min_gap_seconds": 0,
+        },
+    )
+    result = await restarted.evaluate_participation(
+        replace(_opportunity("m1"), opportunity_id="opp-2")
+    )
+
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
+    assert judge.calls == 1
+    assert context.calls == 1
+    assert await reopened_log.social_anchor_closed(
+        channel=CHANNEL, chat_id=CHAT, anchor_message_id="prov-1"
+    ) is True
+    attempts = await reopened_log.judge_attempts_since(
+        channel=CHANNEL, chat_id=CHAT, since_ms=0
+    )
+    assert len(attempts) == 2
+    assert attempts[0]["continuation_candidate"] == 1
+    assert attempts[1]["continuation_candidate"] == 0
+    reopened_log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("veto", "expected"),
+    [("pause", "paused_last_moment"), ("revoke", "source_not_authorized")],
+)
+async def test_last_pause_or_revocation_race_blocks_submission(
+    tmp_path: Path, veto: str, expected: str
+) -> None:
+    """A state change observed while binding admission prevents the hand-off."""
+    race_observed = asyncio.Event()
+    state: dict[str, object] = {"paused": None, "allowed": True}
+
+    class SubmissionSpy(_Submission):
+        submit_calls = 0
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            self.submit_calls += 1
+            return await super().submit(
+                admission=admission,
+                effect_id=effect_id,
+                content=content,
+                payload_hash=payload_hash,
+            )
+
+    submission = SubmissionSpy()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+    principal_calls = 0
+
+    def principals(channel: str, chat_id: str, sources: object):
+        nonlocal principal_calls
+        principal_calls += 1
+        if principal_calls == 2:
+            state["paused"] = "paused_last_moment" if veto == "pause" else None
+            state["allowed"] = veto != "revoke"
+            race_observed.set()
+        return tuple((str(source), "anna@s.whatsapp.net") for source in sources)
+
+    runtime._source_principals = principals  # type: ignore[assignment]
+    runtime._is_paused = lambda channel, chat_id: state["paused"]  # type: ignore[return-value]
+    runtime._is_source_allowed = lambda channel, chat_id, sources: bool(
+        state["allowed"]
+    )
+
+    result = await runtime.evaluate_participation(_opportunity("m1"))
+
+    assert race_observed.is_set()
+    assert result == {"status": "comment_skipped", "reason": expected}
+    assert submission.calls == 1
+    assert submission.submit_calls == 0
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_context_rejudges_and_reuses_unchanged_draft(tmp_path: Path) -> None:
+    """One fresh same-signature admission may reuse a draft after one rejudge."""
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+
+    class SequenceJudge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            self.calls += 1
+            return COMMENT
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            revision["value"] = 4
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 1},
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        current["max_reevaluations"] = 1
+        return current
+
+    judge = SequenceJudge()
+    runtime._snapshot_provider = snapshot
+    runtime._judge = judge  # type: ignore[assignment]
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result["status"] == "submitted"
+    assert judge.calls == 2
+    assert submission.calls == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_context_with_zero_reevaluations_discards_draft(tmp_path: Path) -> None:
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            revision["value"] = 4
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 0},
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        current["max_reevaluations"] = 0
+        return current
+
+    runtime._snapshot_provider = snapshot
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result == {"status": "comment_skipped", "reason": "context_changed"}
+    assert judge.calls == 1
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    attempts = await log.judge_attempts_since(
+        channel=CHANNEL, chat_id=CHAT, since_ms=0
+    )
+    assert len(attempts) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_decision_replaces_draft_at_most_once(tmp_path: Path) -> None:
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+    first = COMMENT
+    second = ParticipationDecision(
+        action="comment",
+        intent="initiate",
+        reason="new reason",
+        purpose="a changed purpose",
+        contribution_type="observation",
+        target_message_id="m1",
+    )
+
+    class SequenceJudge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            self.calls += 1
+            return first if self.calls == 1 else second
+
+    class ReplacementSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.calls += 1
+            if self.calls == 1:
+                draft_started.set()
+                revision["value"] = 4
+                await release_draft.wait()
+                return "old draft"
+            return "replacement draft"
+
+    submission = ReplacementSubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=first,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 1},
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        current["max_reevaluations"] = 1
+        return current
+
+    judge = SequenceJudge()
+    runtime._snapshot_provider = snapshot
+    runtime._judge = judge  # type: ignore[assignment]
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result["status"] == "submitted"
+    assert judge.calls == 2
+    assert submission.calls == 2
+    assert result["effect_id"]
+    assert await log.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=NOW_MS, window_ms=1_800_000
+    ) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_intent", "reevaluated_intent"),
+    [("continue", "initiate"), ("initiate", "continue")],
+)
+async def test_reevaluation_cannot_change_reserved_intent(
+    tmp_path: Path, initial_intent: str, reevaluated_intent: str
+) -> None:
+    revision = {"value": 3}
+    first = replace(
+        COMMENT,
+        intent=initial_intent,
+        anchor_message_id="prov-1" if initial_intent == "continue" else None,
+    )
+    second = replace(
+        first,
+        intent=reevaluated_intent,
+        purpose="changed intent",
+        anchor_message_id="prov-1" if reevaluated_intent == "continue" else None,
+    )
+
+    class SequenceJudge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            self.calls += 1
+            return first if self.calls == 1 else second
+
+    class StaleSubmission(_Submission):
+        submit_calls = 0
+
+        async def generate_draft(self, *, opportunity, decision, context):
+            revision["value"] = 4
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            self.submit_calls += 1
+            return await super().submit(
+                admission=admission,
+                effect_id=effect_id,
+                content=content,
+                payload_hash=payload_hash,
+            )
+
+    submission = StaleSubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=first,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 1},
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        return current
+
+    judge = SequenceJudge()
+    runtime._snapshot_provider = snapshot
+    runtime._judge = judge  # type: ignore[assignment]
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "comment_skipped", "reason": "context_changed"}
+    assert judge.calls == 2
+    assert submission.calls == 1
+    assert submission.submit_calls == 0
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reevaluation_bound_stays_at_original_activation_limit(tmp_path: Path) -> None:
+    """A policy increase while stale work is pending cannot buy extra rejudges."""
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+    snapshot_calls = {"value": 0}
+
+    class SequenceJudge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            self.calls += 1
+            if self.calls == 2:
+                revision["value"] = 5
+            return COMMENT
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            revision["value"] = 4
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 1},
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        snapshot_calls["value"] += 1
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        # The fresh policy says two, but the admitted work was limited to one.
+        current["max_reevaluations"] = 1 if snapshot_calls["value"] == 1 else 2
+        return current
+
+    judge = SequenceJudge()
+    runtime._snapshot_provider = snapshot
+    runtime._judge = judge  # type: ignore[assignment]
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result == {"status": "comment_skipped", "reason": "context_changed"}
+    assert judge.calls == 2
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reevaluation_cannot_extend_the_original_opportunity_deadline(
+    tmp_path: Path,
+) -> None:
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+    now = {"value": NOW_MS}
+    snapshot_calls = {"value": 0}
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            revision["value"] = 4
+            now["value"] = NOW_MS + 2_000
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={
+            "opportunity_ttl_seconds": 1,
+            "max_reevaluations": 1,
+        },
+    )
+    runtime._clock_ms = lambda: now["value"]
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        snapshot_calls["value"] += 1
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        # A fresh policy must not extend an already admitted deadline.
+        current["opportunity_ttl_seconds"] = (
+            1 if snapshot_calls["value"] == 1 else 1_000
+        )
+        current["max_reevaluations"] = 1
+        return current
+
+    runtime._snapshot_provider = snapshot
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result == {"status": "comment_skipped", "reason": "deadline_expired"}
+    assert judge.calls == 1
+    assert submission.calls == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reevaluation_stays_within_the_original_judge_budget(tmp_path: Path) -> None:
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    revision = {"value": 3}
+    snapshot_calls = {"value": 0}
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            revision["value"] = 4
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={
+            "judge_calls_per_hour": 1,
+            "max_reevaluations": 1,
+        },
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        snapshot_calls["value"] += 1
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        # A refreshed policy cannot buy a second call for this admission.
+        current["judge_calls_per_hour"] = (
+            1 if snapshot_calls["value"] == 1 else 2
+        )
+        current["max_reevaluations"] = 1
+        return current
+
+    runtime._snapshot_provider = snapshot
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result == {
+        "status": "comment_skipped",
+        "reason": "reevaluation_budget_exhausted",
+    }
+    assert judge.calls == 1
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("veto", "expected"),
+    [("pause", "paused_chat"), ("revoke", "source_not_authorized")],
+)
+async def test_fresh_pause_or_revocation_discards_waiting_draft(
+    tmp_path: Path, veto: str, expected: str
+) -> None:
+    """A post-generation policy veto releases the draft before any rejudge/send."""
+    draft_started = asyncio.Event()
+    release_draft = asyncio.Event()
+    state: dict[str, object] = {"revision": 3, "paused": None, "allowed": True}
+
+    class WaitingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            draft_started.set()
+            state["revision"] = 4
+            state["paused"] = "paused_chat" if veto == "pause" else None
+            state["allowed"] = veto != "revoke"
+            await release_draft.wait()
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = WaitingSubmission()
+    runtime, judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 1},
+    )
+    runtime._is_paused = lambda channel, chat_id: state["paused"]  # type: ignore[return-value]
+    runtime._is_source_allowed = lambda channel, chat_id, sources: bool(
+        state["allowed"]
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = state["revision"]
+        current["max_reevaluations"] = 1
+        return current
+
+    runtime._snapshot_provider = snapshot
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=2)
+    finally:
+        release_draft.set()
+        if not task.done():
+            await task
+    assert result == {"status": "comment_skipped", "reason": expected}
+    assert judge.calls == 1
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
     log.close()
 
 
