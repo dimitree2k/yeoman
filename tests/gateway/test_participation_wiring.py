@@ -245,6 +245,49 @@ def test_pending_recovery_probe_fails_closed_on_corrupt_existing_ledger(
         )
 
 
+def test_pending_recovery_probe_recovers_hot_speakup_journal(tmp_path: Path) -> None:
+    import sqlite3
+    import subprocess
+    import sys
+
+    speakup_path = tmp_path / "speakups.db"
+    with sqlite3.connect(speakup_path) as connection:
+        connection.execute(
+            "CREATE TABLE delivery_reservations "
+            "(origin TEXT, lane TEXT, delivery_state TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO delivery_reservations VALUES "
+            "('participation', 'production', 'reserved')"
+        )
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sqlite3, sys; "
+            "db = sqlite3.connect(sys.argv[1]); "
+            "db.execute(\"UPDATE delivery_reservations SET delivery_state='sent'\"); "
+            "os._exit(0)",
+            str(speakup_path),
+        ],
+        check=True,
+    )
+    journal_path = speakup_path.with_name("speakups.db-journal")
+    assert journal_path.exists()
+    # A crash during commit leaves SQLite's valid rollback-journal magic.
+    with journal_path.open("r+b") as journal:
+        journal.write(bytes.fromhex("d9d505f920a163d7"))
+    with sqlite3.connect(f"file:{speakup_path}?mode=ro", uri=True) as connection:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("PRAGMA table_info(delivery_reservations)").fetchall()
+
+    assert _has_pending_participation_recovery(
+        speakup_path=speakup_path,
+        processing_path=tmp_path / "missing-processing.db",
+    )
+
+
 @pytest.mark.asyncio
 async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

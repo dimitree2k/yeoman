@@ -514,13 +514,13 @@ def _processing_store_path(config: "Config") -> Path:
 def _has_pending_participation_recovery(
     *, speakup_path: Path, processing_path: Path
 ) -> bool:
-    """Inspect existing ledgers read-only; never create a database for discovery."""
+    """Inspect existing ledgers, allowing SQLite to recover a hot journal."""
     import sqlite3
 
     def _contains(path: Path, table: str, columns: set[str], query: str) -> bool:
         if not path.is_file():
             return False
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
         try:
             present = {
                 str(row[1])
