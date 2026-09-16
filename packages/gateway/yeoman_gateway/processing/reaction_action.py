@@ -135,6 +135,7 @@ class ReactionAction:
         message_id: str,
         text: str,
         principal: str,
+        participant_jid: str | None = None,
     ) -> str | None:
         """Choose and send one reaction. Returns the emoji, or ``None`` for silence."""
         emoji = await self._chooser.choose(text, allowed=self._allowed_emojis)
@@ -146,6 +147,7 @@ class ReactionAction:
             chat_id=chat_id,
             message_id=message_id,
             principal=principal,
+            participant_jid=participant_jid,
         )
 
     async def send(
@@ -156,6 +158,7 @@ class ReactionAction:
         chat_id: str,
         message_id: str,
         principal: str,
+        participant_jid: str | None = None,
     ) -> str | None:
         """Send one already-chosen reaction. Returns the emoji, or ``None`` if refused.
 
@@ -176,6 +179,7 @@ class ReactionAction:
                 chat_id=chat_id,
                 message_id=message_id,
                 emoji=chosen,
+                participant_jid=participant_jid,
             ),
             principal=principal,
         )

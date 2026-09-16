@@ -245,6 +245,7 @@ class BusEffectExecutor:
                 chat_id=target.chat_id,
                 message_id=payload.message_id,
                 emoji=payload.emoji,
+                participant_jid=payload.participant_jid,
                 metadata=dict(provenance),
             )
             self._check_participation_pre_dispatch(envelope)
@@ -822,7 +823,11 @@ class IntentEffectRouter:
             channel=intent.channel,
             chat_id=intent.chat_id,
             principal=principal,
-            payload=ReactionPayload(message_id=intent.message_id, emoji=emoji),
+            payload=ReactionPayload(
+                message_id=intent.message_id,
+                emoji=emoji,
+                participant_jid=intent.participant_jid,
+            ),
             operation_key=f"reaction:{intent.channel}:{intent.chat_id}:{intent.message_id}:{emoji}",
             trace_id=intent.message_id,
             deadline_key="semantic_reaction_ms",

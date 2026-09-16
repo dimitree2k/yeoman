@@ -53,6 +53,7 @@ class _Transport:
     """
 
     sent: list[str] = field(default_factory=list)
+    reaction_participants: list[str | None] = field(default_factory=list)
     fail: bool = False
     counter: int = 0
 
@@ -74,6 +75,7 @@ class _Transport:
 
     async def send_reaction_now(self, message) -> dict[str, object] | None:
         self.sent.append(message.emoji)
+        self.reaction_participants.append(message.participant_jid)
         from yeoman_gateway.channels.whatsapp import _receipt_from_bridge
 
         return _receipt_from_bridge(
@@ -967,6 +969,21 @@ async def test_criterion_8_a_reaction_has_its_own_lineage(runtime) -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_reaction_keeps_participant_at_transport(runtime) -> None:
+    from yeoman_gateway.core.intents import SendReactionIntent
+
+    _admit(runtime, message_id="group-reaction")
+    assert await runtime.router.submit_reaction(
+        SendReactionIntent(
+            channel="whatsapp", chat_id=CHAT, message_id="group-reaction",
+            emoji="👍", participant_jid="orderer@s.whatsapp.net",
+        ),
+        principal="orderer@s.whatsapp.net",
+    )
+    assert runtime.transport.reaction_participants == ["orderer@s.whatsapp.net"]
+
+
+@pytest.mark.asyncio
 async def test_an_unapproved_emoji_never_becomes_an_effect(runtime) -> None:
     """One decision point for every reaction, whoever produced it.
 
@@ -1171,10 +1188,12 @@ async def test_an_ambient_reaction_needs_no_turn_and_no_text(tmp_path: Path) -> 
             chat_id=CHAT,
             message_id="m1",
             principal="orderer@s.whatsapp.net",
+            participant_jid="orderer@s.whatsapp.net",
         )
 
         assert sent == "👍"
         assert runtime.transport.sent == ["👍"], "the face reaches the transport"
+        assert runtime.transport.reaction_participants == ["orderer@s.whatsapp.net"]
         assert runtime.store.list_effects(), "and it does so as a real effect"
     finally:
         runtime.store.close()

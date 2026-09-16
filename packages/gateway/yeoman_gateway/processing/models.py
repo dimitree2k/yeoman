@@ -144,11 +144,15 @@ class ReactionPayload:
 
     message_id: str
     emoji: str
+    participant_jid: str | None = None
 
     kind: ClassVar[str] = "reaction"
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "message_id": self.message_id, "emoji": self.emoji}
+        data = {"kind": self.kind, "message_id": self.message_id, "emoji": self.emoji}
+        if self.participant_jid:
+            data["participant_jid"] = self.participant_jid
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +230,7 @@ def payload_from_mapping(data: Mapping[str, Any]) -> EffectPayload:
             return ReactionPayload(
                 message_id=str(data.get("message_id") or ""),
                 emoji=str(data.get("emoji") or ""),
+                participant_jid=_opt_str(data.get("participant_jid")),
             )
         case "delete":
             return DeletePayload(message_id=str(data.get("message_id") or ""))

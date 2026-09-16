@@ -361,6 +361,35 @@ async def test_one_chat_never_has_overlapping_handlers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_active_chat_followup_waits_without_busy_requeue() -> None:
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    seen: list[tuple[str, ...]] = []
+
+    async def handle(opportunity):
+        seen.append(opportunity.source_event_ids)
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()
+        else:
+            finished.set()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=2)
+    await scheduler.start()
+    try:
+        scheduler.offer(_opportunity(sources=("m1",), revision=1))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        scheduler.offer(_opportunity(sources=("m2",), revision=2))
+        await asyncio.sleep(0)
+        assert not scheduler._ready, "active chat must not spin in the ready queue"
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        assert seen == [("m1",), ("m2",)]
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_awaits_running_handlers() -> None:
     cancelled = asyncio.Event()
 

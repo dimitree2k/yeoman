@@ -456,7 +456,7 @@ class ReconciliationService:
         candidates = [
             effect.effect_id
             for effect in self._store.list_effects(
-                states=("unknown", "unknown_nonrepeatable"), limit=200
+                states=("unknown",), limit=200
             )
         ]
         if not candidates:

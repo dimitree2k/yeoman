@@ -407,11 +407,7 @@ class OpportunityScheduler:
                 continue
             record.queued = False
             if key in self._active:
-                # One active handler per chat; requeue the merged follow-up instead.
-                record.queued = True
-                self._ready.append(key)
-                self._wake.set()
-                await asyncio.sleep(0)
+                # The active handler's _retire() queues its merged follow-up.
                 continue
             self._active.add(key)
             try:

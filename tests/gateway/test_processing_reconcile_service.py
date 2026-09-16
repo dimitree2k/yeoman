@@ -288,14 +288,18 @@ async def test_deadline_escalates_without_further_probes(tmp_path: Path) -> None
     store = ProcessingStore(tmp_path / "p.db")
     effect_id = await _make_unknown(store)
     probe = _CountingProbe(ProbeOutcome.INCONCLUSIVE)
+    clock = _Clock(T0 + 700_000)
     service = ReconciliationService(
-        store, probe=probe, config=_Config(), clock=_Clock(T0 + 700_000)
+        store, probe=probe, config=_Config(), clock=clock
     )
 
     await service.tick_once()
 
     assert store.effect_state(effect_id) == "unknown_nonrepeatable"
     assert probe.calls == 0  # past the deadline no probe is planned
+    clock.value += 700_000
+    assert await service.tick_once() == ()  # escalated work is no longer automatic work
+    assert sum(e.kind == "operator" for e in store.effect_meta(effect_id).evidence) == 1
     store.close()
 
 
