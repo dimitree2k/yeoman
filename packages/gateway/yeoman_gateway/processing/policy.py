@@ -815,11 +815,17 @@ class SnapshotEffectAuthorizer:
         capabilities: CapabilityResolver | None = None,
         turn_lookup: Callable[[str], TurnRef | None] | None = None,
         clock: Callable[[], int] | None = None,
+        participation_authorizer: Callable[[EffectEnvelope, Any], tuple[bool, str]] | Any | None = None,
+        admission_loader: Callable[[str], Any | None] | None = None,
+        participation_request_builder: Callable[[EffectEnvelope, Any], Any] | None = None,
     ) -> None:
         self._snapshots = snapshots
         self._capabilities: CapabilityResolver = capabilities or DenyAllCapabilities()
         self._turn_lookup = turn_lookup
         self._clock = clock or _now_ms
+        self._participation_authorizer = participation_authorizer
+        self._admission_loader = admission_loader
+        self._participation_request_builder = participation_request_builder
 
     def check(
         self, envelope: EffectEnvelope, current_turn: TurnRef | None
@@ -848,6 +854,8 @@ class SnapshotEffectAuthorizer:
             unexpired=unexpired,
         )
         if reason == "allow":
+            reason = self._participation_reason(envelope)
+        if reason == "allow":
             detail = "allow"
         elif reason == "permission_denied":
             detail = f"{reason}:{permission_reason}"
@@ -871,6 +879,109 @@ class SnapshotEffectAuthorizer:
             stage="final",
             effect_id=envelope.effect_id,
         )
+
+    def _participation_reason(self, envelope: EffectEnvelope) -> str:
+        """Apply the persisted admission check only to participation-origin effects."""
+        if envelope.origin not in {"legacy", "participation"}:
+            return "unsupported_effect_origin"
+        if envelope.origin == "legacy":
+            return "allow" if envelope.admission_id is None else "participation_admission_mismatch"
+        if not envelope.admission_id:
+            return "participation_admission_missing"
+        if self._admission_loader is None or self._participation_authorizer is None:
+            return "participation_authorizer_unwired"
+        try:
+            admission = self._admission_loader(envelope.admission_id)
+        except Exception:  # noqa: BLE001 - a failed admission read denies the effect
+            return "participation_admission_unavailable"
+        if admission is None:
+            return "participation_admission_missing"
+        stored_id = getattr(admission, "admission_id", None)
+        if not stored_id:
+            return "participation_admission_identity_missing"
+        if str(stored_id) != envelope.admission_id:
+            return "participation_admission_mismatch"
+        if (
+            str(getattr(admission, "channel", "") or "") != envelope.target.channel
+            or str(getattr(admission, "chat_id", "") or "") != envelope.target.chat_id
+        ):
+            return "participation_target_mismatch"
+        expected_payload_hash = str(getattr(admission, "payload_hash", "") or "")
+        if not expected_payload_hash:
+            return "participation_payload_hash_missing"
+        if expected_payload_hash != envelope.payload_hash:
+            return "participation_payload_mismatch"
+        action = str(getattr(admission, "action", "") or "")
+        intent = str(getattr(admission, "intent", "") or "")
+        if not action:
+            return "participation_action_missing"
+        if not intent:
+            return "participation_intent_missing"
+        expected_action = "react" if envelope.payload.kind == "reaction" else "comment"
+        if action != expected_action:
+            return "participation_action_mismatch"
+        if envelope.payload.kind == "reaction":
+            target_message_id = str(getattr(admission, "target_message_id", "") or "")
+            payload_message_id = str(getattr(envelope.payload, "message_id", "") or "")
+            if not target_message_id or target_message_id != payload_message_id:
+                return "participation_reaction_target_mismatch"
+            if str(getattr(admission, "emoji", "") or "") != str(
+                getattr(envelope.payload, "emoji", "") or ""
+            ):
+                return "participation_reaction_emoji_mismatch"
+        checker = self._participation_authorizer
+        try:
+            if self._participation_request_builder is not None:
+                request = self._participation_request_builder(envelope, admission)
+                request_reason = self._participation_request_reason(envelope, admission, request)
+                if request_reason != "allow":
+                    return request_reason
+                result = checker.check(request)
+            elif callable(checker):
+                result = checker(envelope, admission)
+            else:
+                return "participation_authorizer_unwired"
+        except Exception as exc:  # noqa: BLE001 - final participation checks fail closed
+            return f"participation_denied:{str(exc)[:160]}"
+        if isinstance(result, tuple):
+            allowed, detail = result
+            return "allow" if bool(allowed) else f"participation_denied:{detail}"
+        if isinstance(result, bool):
+            return "allow" if result else "participation_denied"
+        return "participation_authorizer_invalid"
+
+    @staticmethod
+    def _participation_request_reason(
+        envelope: EffectEnvelope, admission: Any, request: Any
+    ) -> str:
+        """Reject a request that cannot carry complete final-gate evidence."""
+        required = (
+            "admission",
+            "effect_id",
+            "reservation_state",
+            "payload_hash",
+            "expected_payload_hash",
+            "source_principals_authorized",
+        )
+        if any(not hasattr(request, name) for name in required):
+            return "participation_request_evidence_missing"
+        request_admission = getattr(request, "admission", None)
+        request_admission_id = str(getattr(request_admission, "admission_id", "") or "")
+        if request_admission is None or request_admission_id != envelope.admission_id:
+            return "participation_request_admission_mismatch"
+        if str(getattr(request, "effect_id", "") or "") != envelope.effect_id:
+            return "participation_request_effect_mismatch"
+        request_hash = str(getattr(request, "payload_hash", "") or "")
+        expected_hash = str(getattr(request, "expected_payload_hash", "") or "")
+        if not request_hash or not expected_hash:
+            return "participation_request_payload_hash_missing"
+        if request_hash != expected_hash or request_hash != envelope.payload_hash:
+            return "participation_request_payload_mismatch"
+        if getattr(request, "source_principals_authorized", None) is not True:
+            return "participation_source_principal_not_authorized"
+        if str(getattr(request, "reservation_state", "") or "") != "submitted":
+            return "participation_reservation_not_submitted"
+        return "allow"
 
     def _revision_matches(
         self, envelope: EffectEnvelope, current_turn: TurnRef | None

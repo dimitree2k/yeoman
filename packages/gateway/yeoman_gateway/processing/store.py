@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.processing.models import (
     CLAIMABLE_EFFECT_STATES,
@@ -63,6 +63,9 @@ from yeoman_gateway.processing.models import (
     payload_to_mapping,
     validate_transition,
 )
+
+if TYPE_CHECKING:
+    from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
 from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
@@ -154,6 +157,8 @@ _SCHEMA = (
       policy_hash TEXT,
       lease_owner TEXT,
       lease_until_ms INTEGER,
+      origin TEXT NOT NULL DEFAULT 'legacy',
+      admission_id TEXT,
       created_ms INTEGER NOT NULL,
       updated_ms INTEGER NOT NULL
     )
@@ -186,6 +191,13 @@ _SCHEMA = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_evidence_effect ON effect_evidence(effect_id, observed_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS participation_admissions (
+      admission_id TEXT PRIMARY KEY,
+      payload_json TEXT NOT NULL,
+      created_ms INTEGER NOT NULL
+    )
+    """,
 )
 
 
@@ -459,6 +471,7 @@ class ProcessingStore:
                     for statement in _MIGRATIONS.get(version, ()):
                         self._conn.execute(statement)
                     version += 1
+                self._ensure_participation_schema(self._conn)
                 self._conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -468,6 +481,28 @@ class ProcessingStore:
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
+
+    @staticmethod
+    def _ensure_participation_schema(conn: sqlite3.Connection) -> None:
+        """Add the participation provenance columns to pre-existing schema-7 stores."""
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(effects)").fetchall()
+        }
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE effects ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'"
+            )
+        if "admission_id" not in columns:
+            conn.execute("ALTER TABLE effects ADD COLUMN admission_id TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS participation_admissions (
+              admission_id TEXT PRIMARY KEY,
+              payload_json TEXT NOT NULL,
+              created_ms INTEGER NOT NULL
+            )
+            """
+        )
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -765,6 +800,8 @@ class ProcessingStore:
         policy_version: str | None = None,
         policy_hash: str | None = None,
         state: str = "queued",
+        origin: str = "legacy",
+        admission_id: str | None = None,
     ) -> str:
         """Durably accept one effect. Returns the original id for an identical retry.
 
@@ -781,9 +818,136 @@ class ProcessingStore:
             raise ValueError(f"unknown effect state: {state}")
         if turn_revision < 1:
             raise ValueError("turn revision must be a positive integer")
+        if origin not in {"legacy", "participation"}:
+            raise ValueError(f"unknown effect origin: {origin}")
+        with self._write() as conn:
+            return self._enqueue_effect_in_connection(
+                conn,
+                effect_id=effect_id,
+                operation_key=operation_key,
+                payload=payload,
+                now_ms=now_ms,
+                trace_id=trace_id,
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                principal=principal,
+                capability=capability,
+                target=target,
+                expires_at_ms=expires_at_ms,
+                policy_version=policy_version,
+                policy_hash=policy_hash,
+                state=state,
+                origin=origin,
+                admission_id=admission_id,
+            )
+
+    def enqueue_participation_effect(
+        self, envelope: EffectEnvelope, admission: "ParticipationAdmission"
+    ) -> str:
+        """Persist one trusted admission and its effect in one transaction."""
+        if envelope.origin != "participation":
+            raise ProcessingError("participation effect requires origin='participation'")
+        admission_id = str(getattr(admission, "admission_id", "") or "")
+        if not admission_id or envelope.admission_id != admission_id:
+            raise ProcessingError("participation effect requires a matching admission id")
+        admission_data = _admission_mapping(admission, admission_id=admission_id)
+        expected_payload_hash = str(admission_data.get("payload_hash") or "")
+        if not expected_payload_hash:
+            raise ProcessingError("participation admission requires a payload hash")
+        if expected_payload_hash != envelope.payload_hash:
+            raise EffectConflictError("participation admission payload hash does not match effect")
+        target = envelope.target
+        if (
+            admission_data.get("channel") != target.channel
+            or admission_data.get("chat_id") != target.chat_id
+        ):
+            raise EffectConflictError("participation admission target does not match effect")
+        admission_json = canonical_json(admission_data)
+        created = self._now(envelope.created_ms)
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT payload_json FROM participation_admissions WHERE admission_id = ?",
+                (admission_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO participation_admissions "
+                    "(admission_id, payload_json, created_ms) VALUES (?,?,?)",
+                    (admission_id, admission_json, created),
+                )
+            elif str(existing["payload_json"]) != admission_json:
+                raise EffectConflictError(
+                    f"admission_id {admission_id!r} already exists with different content"
+                )
+            return self._enqueue_effect_in_connection(
+                conn,
+                effect_id=envelope.effect_id,
+                operation_key=envelope.operation_key,
+                payload=envelope.payload,
+                now_ms=created,
+                trace_id=envelope.trace_id,
+                turn_id=envelope.turn_id,
+                turn_revision=envelope.turn_revision,
+                principal=envelope.principal,
+                capability=envelope.capability,
+                target=envelope.target,
+                expires_at_ms=envelope.expires_at_ms,
+                policy_version=envelope.policy_version,
+                policy_hash=envelope.policy_hash,
+                state="queued",
+                origin="participation",
+                admission_id=admission_id,
+            )
+
+    def get_participation_admission(self, admission_id: str) -> "ParticipationAdmission | None":
+        """Read one persisted admission, reconstructing the current domain model."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM participation_admissions WHERE admission_id = ?",
+                (str(admission_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        data = json.loads(str(row["payload_json"]))
+        if not isinstance(data, Mapping):
+            raise ProcessingError("stored participation admission is not an object")
+        from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
+
+        values = dict(data)
+        if isinstance(values.get("source_event_ids"), list):
+            values["source_event_ids"] = tuple(values["source_event_ids"])
+        if isinstance(values.get("source_principals"), list):
+            values["source_principals"] = tuple(
+                tuple(item) if isinstance(item, list) else item
+                for item in values["source_principals"]
+            )
+        return ParticipationAdmission(**values)
+
+    def _enqueue_effect_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        effect_id: str,
+        operation_key: str,
+        payload: Any,
+        now_ms: int,
+        trace_id: str,
+        turn_id: str,
+        turn_revision: int,
+        principal: str,
+        capability: str,
+        target: EffectTarget | Mapping[str, Any] | None,
+        expires_at_ms: int | None,
+        policy_version: str | None,
+        policy_hash: str | None,
+        state: str,
+        origin: str,
+        admission_id: str | None,
+    ) -> str:
         created = self._now(now_ms)
         body = payload_to_mapping(payload)
         payload_hash = canonical_hash(body)
+        resolved_target: EffectTarget | None = None
         if target is None:
             target_json = "{}"
             target_hash = canonical_hash({})
@@ -796,72 +960,120 @@ class ProcessingStore:
         effective_state = state
         if state == "queued" and expires_at_ms is not None and expires_at_ms <= created:
             effective_state = "expired"
-
-        with self._write() as conn:
-            row = conn.execute(
-                "SELECT * FROM effects WHERE operation_key = ?", (operation_key,)
+        if origin == "participation":
+            if not admission_id:
+                raise ProcessingError("participation effect requires an admission")
+            admission = conn.execute(
+                "SELECT payload_json FROM participation_admissions WHERE admission_id = ?",
+                (admission_id,),
             ).fetchone()
-            if row is not None:
-                if row["payload_json"] is None:
-                    return str(row["effect_id"])
+            if admission is None:
+                raise ProcessingError("participation effect admission is not persisted")
+            stored_admission = json.loads(str(admission["payload_json"]))
+            if isinstance(stored_admission, Mapping):
+                expected_hash = str(stored_admission.get("payload_hash") or "")
+                if not expected_hash:
+                    raise ProcessingError("participation admission payload hash is missing")
+                if expected_hash != payload_hash:
+                    raise EffectConflictError(
+                        "participation admission payload hash does not match effect"
+                    )
+                if resolved_target is None:
+                    raise ProcessingError("participation effect target is required")
                 if (
-                    row["payload_hash"] == payload_hash
-                    and row["target_hash"] == target_hash
-                    and str(row["turn_id"]) == turn_id
-                    and int(row["turn_revision"]) == turn_revision
-                    and str(row["principal"]) == principal
-                    and str(row["capability"]) == capability
+                    stored_admission.get("channel") != resolved_target.channel
+                    or stored_admission.get("chat_id") != resolved_target.chat_id
                 ):
-                    return str(row["effect_id"])
+                    raise EffectConflictError(
+                        "participation admission target does not match effect"
+                    )
+        elif admission_id is not None:
+            raise EffectConflictError("legacy effect cannot carry a participation admission")
+
+        row = conn.execute(
+            "SELECT * FROM effects WHERE operation_key = ?", (operation_key,)
+        ).fetchone()
+        if row is not None:
+            stored_origin = str(row["origin"] or "legacy")
+            stored_admission = str(row["admission_id"]) if row["admission_id"] is not None else None
+            if stored_origin != origin or stored_admission != admission_id:
                 raise EffectConflictError(
-                    f"operation_key {operation_key!r} already exists with a different effect"
+                    f"operation_key {operation_key!r} already exists with different provenance"
                 )
-            clash = conn.execute(
-                "SELECT operation_key FROM effects WHERE effect_id = ?", (effect_id,)
+            if row["payload_json"] is None:
+                return str(row["effect_id"])
+            if (
+                row["payload_hash"] == payload_hash
+                and row["target_hash"] == target_hash
+                and str(row["turn_id"]) == turn_id
+                and int(row["turn_revision"]) == turn_revision
+                and str(row["principal"]) == principal
+                and str(row["capability"]) == capability
+            ):
+                return str(row["effect_id"])
+            raise EffectConflictError(
+                f"operation_key {operation_key!r} already exists with a different effect"
+            )
+        if origin == "participation":
+            admission_effect = conn.execute(
+                "SELECT effect_id, operation_key FROM effects "
+                "WHERE origin = 'participation' AND admission_id = ? LIMIT 1",
+                (admission_id,),
             ).fetchone()
-            if clash is not None:
+            if admission_effect is not None:
                 raise EffectConflictError(
-                    f"effect_id {effect_id!r} already belongs to {clash['operation_key']!r}"
+                    f"admission_id {admission_id!r} is already bound to effect "
+                    f"{admission_effect['effect_id']!r}"
                 )
-            conn.execute(
-                """
-                INSERT INTO effects (
-                  effect_id, operation_key, trace_id, turn_id, turn_revision, principal,
-                  capability, target_json, target_hash, payload_kind, payload_hash,
-                  payload_json, payload_purged_ms, state, expires_at_ms, policy_version,
-                  policy_hash, lease_owner, lease_until_ms, created_ms, updated_ms
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,NULL,?,?)
-                """,
-                (
-                    effect_id,
-                    operation_key,
-                    trace_id,
-                    turn_id,
-                    turn_revision,
-                    principal,
-                    capability,
-                    target_json,
-                    target_hash,
-                    str(body.get("kind") or "text"),
-                    payload_hash,
-                    canonical_json(body),
-                    effective_state,
-                    expires_at_ms,
-                    policy_version,
-                    policy_hash,
-                    created,
-                    created,
-                ),
+        clash = conn.execute(
+            "SELECT operation_key FROM effects WHERE effect_id = ?", (effect_id,)
+        ).fetchone()
+        if clash is not None:
+            raise EffectConflictError(
+                f"effect_id {effect_id!r} already belongs to {clash['operation_key']!r}"
             )
-            self._append_evidence(
-                conn,
-                effect_id=effect_id,
-                kind="submitted",
-                state=effective_state,
-                detail=None,
-                observed_ms=created,
-                worker_id=None,
-            )
+        conn.execute(
+            """
+            INSERT INTO effects (
+              effect_id, operation_key, trace_id, turn_id, turn_revision, principal,
+              capability, target_json, target_hash, payload_kind, payload_hash,
+              payload_json, payload_purged_ms, state, expires_at_ms, policy_version,
+              policy_hash, lease_owner, lease_until_ms, origin, admission_id,
+              created_ms, updated_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,NULL,?,?,?,?)
+            """,
+            (
+                effect_id,
+                operation_key,
+                trace_id,
+                turn_id,
+                turn_revision,
+                principal,
+                capability,
+                target_json,
+                target_hash,
+                str(body.get("kind") or "text"),
+                payload_hash,
+                canonical_json(body),
+                effective_state,
+                expires_at_ms,
+                policy_version,
+                policy_hash,
+                origin,
+                admission_id,
+                created,
+                created,
+            ),
+        )
+        self._append_evidence(
+            conn,
+            effect_id=effect_id,
+            kind="submitted",
+            state=effective_state,
+            detail=None,
+            observed_ms=created,
+            worker_id=None,
+        )
         return effect_id
 
     def get_effect(self, effect_id: str) -> StoredEffect | None:
@@ -2729,6 +2941,55 @@ def _event_meta_from_row(
     )
 
 
+def _admission_mapping(admission: Any, *, admission_id: str) -> dict[str, Any]:
+    """Convert the trusted admission to a stable, additive JSON record."""
+    field_names = (
+        "admission_id",
+        "opportunity_id",
+        "channel",
+        "chat_id",
+        "activation_epoch",
+        "lane",
+        "observed_revision",
+        "action",
+        "intent",
+        "purpose",
+        "emoji",
+        "target_message_id",
+        "anchor_message_id",
+        "source_event_ids",
+        "source_principals",
+        "policy_version",
+        "policy_hash",
+        "arbitration_revision",
+        "contribution_type",
+        "payload_hash",
+        "approval_revision",
+    )
+    result: dict[str, Any] = {}
+    for name in field_names:
+        value = getattr(admission, name, None)
+        if isinstance(value, Mapping):
+            value = {str(key): _admission_json_value(item) for key, item in value.items()}
+        elif isinstance(value, (tuple, list)):
+            value = [_admission_json_value(item) for item in value]
+        elif value is not None and not isinstance(value, (str, int, float, bool)):
+            value = str(value)
+        result[name] = value
+    result["admission_id"] = admission_id
+    return result
+
+
+def _admission_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _admission_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_admission_json_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _effect_from_row(row: sqlite3.Row) -> StoredEffect:
     import json
 
@@ -2770,6 +3031,8 @@ def _effect_from_row(row: sqlite3.Row) -> StoredEffect:
         ),
         created_ms=int(row["created_ms"]),
         updated_ms=int(row["updated_ms"]),
+        origin=str(row["origin"] or "legacy"),
+        admission_id=str(row["admission_id"]) if row["admission_id"] is not None else None,
     )
 
 
@@ -2806,6 +3069,8 @@ def _effect_meta_from_row(
         updated_ms=int(row["updated_ms"]),
         attempts=attempts,
         evidence=evidence,
+        origin=str(row["origin"] or "legacy"),
+        admission_id=str(row["admission_id"]) if row["admission_id"] is not None else None,
     )
 
 

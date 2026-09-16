@@ -70,6 +70,10 @@ class ProcessingError(RuntimeError):
     """Base class for processing-core failures."""
 
 
+class ParticipationPreDispatchDenied(ProcessingError):  # noqa: N818 - contract name is fixed
+    """A participation effect was denied immediately before transport dispatch."""
+
+
 class JournalConflictError(ProcessingError, ValueError):
     """Same provider identity (or event id) with a different payload."""
 
@@ -486,6 +490,8 @@ class EffectEnvelope:
     policy_version: str | None = None
     policy_hash: str | None = None
     created_ms: int | None = None
+    origin: str = "legacy"
+    admission_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.effect_id:
@@ -538,6 +544,8 @@ class StoredEffect:
     policy_hash: str | None = None
     lease_owner: str | None = None
     lease_until_ms: int | None = None
+    origin: str = "legacy"
+    admission_id: str | None = None
 
     @property
     def payload_available(self) -> bool:
@@ -564,6 +572,8 @@ class StoredEffect:
             policy_version=self.policy_version,
             policy_hash=self.policy_hash,
             created_ms=self.created_ms,
+            origin=self.origin,
+            admission_id=self.admission_id,
         )
 
 
@@ -684,6 +694,8 @@ class RetainedEffectMeta:
     updated_ms: int
     attempts: tuple[RetainedAttemptMeta, ...] = ()
     evidence: tuple[RetainedEvidenceMeta, ...] = ()
+    origin: str = "legacy"
+    admission_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

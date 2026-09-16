@@ -2871,6 +2871,10 @@ class LLMResponder(ResponderPort):
         """
         send = getattr(self._service_effect_sender, "send", None)
         if send is None:
+            if admission is not None or effect_id:
+                from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
+
+                raise EffectNotDeliveredError("participation comment path is not composed")
             return _ParticipationSubmitOutcome(status="no_managed_path")
         try:
             receipt = await send(
@@ -2881,11 +2885,14 @@ class LLMResponder(ResponderPort):
                 content=str(content),
                 effect_id=str(effect_id),
                 require_managed=True,
+                admission=admission,
             )
         except Exception as exc:
             logger.warning(
                 "participation_submission_failed error_type={}", type(exc).__name__
             )
+            if admission is not None or effect_id:
+                raise
             return _ParticipationSubmitOutcome(status="submission_failed")
         state = str(getattr(receipt, "state", "") or "submitted")
         return _ParticipationSubmitOutcome(status=state, receipt=receipt)
@@ -2897,10 +2904,16 @@ class LLMResponder(ResponderPort):
         emoji: str,
         channel: str,
         chat_id: str,
+        effect_id: str | None = None,
+        admission: object | None = None,
     ) -> object | None:
         """Submit one autonomous reaction through the managed reaction effect path."""
         sender = getattr(self._service_effect_sender, "send_reaction", None)
         if sender is None:
+            if admission is not None or effect_id:
+                from yeoman_gateway.processing.dispatch import EffectNotDeliveredError
+
+                raise EffectNotDeliveredError("participation reaction path is not composed")
             return None
         try:
             return await sender(
@@ -2910,11 +2923,16 @@ class LLMResponder(ResponderPort):
                 chat_id=str(chat_id),
                 message_id=str(target_message_id),
                 emoji=str(emoji),
+                effect_id=str(effect_id) if effect_id else None,
+                require_managed=bool(effect_id),
+                admission=admission,
             )
         except Exception as exc:
             logger.warning(
                 "participation_reaction_failed error_type={}", type(exc).__name__
             )
+            if admission is not None or effect_id:
+                raise
             return None
 
     async def execute_delivery(

@@ -897,12 +897,64 @@ def _build_participation_runtime(
         reaction_limit = int(resolved.participation.max_reactions_per_window)
         comment_limit = int(resolved.participation.max_unsolicited_comments_per_window)
         window_ms = int(resolved.participation.comment_window_minutes) * 60_000
+        try:
+            effective = policy_engine.resolve_policy(channel, chat_id)  # type: ignore[union-attr]
+        except Exception as exc:
+            raise RuntimeError("participation policy unavailable") from exc
+        daily_cap = (
+            effective.spontaneity_daily_cap
+            if effective.spontaneity_daily_cap is not None
+            else int(config.consciousness.default_daily_cap)
+        )
+        allowed_contribution_types = effective.spontaneity_allowed_actions
+        if allowed_contribution_types is None:
+            from yeoman_gateway.consciousness.tools import (
+                DEFAULT_BALANCED_ACTIONS,
+                DEFAULT_HELPFUL_ACTIONS,
+                DEFAULT_PERMISSIVE_ACTIONS,
+            )
+
+            allowed_contribution_types = list(
+                DEFAULT_PERMISSIVE_ACTIONS
+                if effective.spontaneity_profile == "permissive"
+                else DEFAULT_BALANCED_ACTIONS
+                if effective.spontaneity_profile == "balanced"
+                else DEFAULT_HELPFUL_ACTIONS
+            )
+        reply_actions = config.processing.reply_actions or {}
+        reply_action = str(
+            reply_actions.get(f"{channel}:{chat_id}", "answer")
+            if isinstance(reply_actions, Mapping)
+            else "answer"
+        ).strip().lower()
+        policy_state = policy_adapter.policy_snapshot()
         return {
             "enabled": resolved.enabled,
             "opted_in": resolved.opted_in,
             "invalid_reason": resolved.invalid_reason,
             "activation_epoch": resolved.activation_epoch,
-            "lane": "shadow" if resolved.shadow else "production",
+            "lane": resolved.lane,
+            "policy_version": resolved.policy_version,
+            "policy_hash": policy_state.policy_hash,
+            "allow_initiation": bool(resolved.participation.allow_initiation),
+            "allow_continuation": bool(resolved.participation.allow_continuation),
+            "allow_reactions": bool(resolved.participation.allow_reactions),
+            "spontaneity_enabled": bool(effective.spontaneity_enabled),
+            "spontaneity_daily_cap": max(0, int(daily_cap or 0)),
+            "spontaneity_allowed_actions": tuple(
+                sorted(str(item) for item in allowed_contribution_types)
+            ),
+            "spontaneity_quiet_hours_start": effective.spontaneity_quiet_hours_start,
+            "spontaneity_quiet_hours_end": effective.spontaneity_quiet_hours_end,
+            "reply_action": reply_action,
+            "direct_addressed": False,
+            "approval_required": effective.spontaneity_preview == "owner_dm",
+            "approval_revision": 0,
+            "arbitration_revision": int(
+                getattr(opportunity, "observed_revision", 0) or 0
+            ),
+            "context_window_minutes": int(resolved.context_window_minutes),
+            "context_max_messages": int(resolved.context_max_messages),
             "judge_calls_per_hour": int(
                 resolved.participation.max_unaddressed_judge_calls_per_hour
             ),
@@ -915,7 +967,6 @@ def _build_participation_runtime(
             "comment_limits": (("comment", comment_limit, window_ms),)
             if comment_limit > 0
             else (),
-            "payload_hash": "",
         }
 
     def _is_paused(channel: str, chat_id: str) -> str | None:
@@ -936,7 +987,7 @@ def _build_participation_runtime(
 
     def _source_principals(
         channel: str, chat_id: str, sources: object
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, str], ...]:
         if inbound_archive is None or not hasattr(inbound_archive, "senders_for_messages"):
             return ()
         try:
@@ -945,7 +996,13 @@ def _build_participation_runtime(
             )
         except Exception:
             return ()
-        return tuple(sorted(set(senders.values())))
+        return tuple(
+            sorted(
+                (str(source_id), str(sender))
+                for source_id, sender in senders.items()
+                if str(source_id) and str(sender)
+            )
+        )
 
     def _is_participant_allowed(channel: str, chat_id: str, sender: str) -> bool:
         return participant_is_allowed(
@@ -1055,16 +1112,18 @@ class _ParticipationReactor:
         channel: str,
         chat_id: str,
         effect_id: str,
+        admission: object,
     ) -> object | None:
         reactor = getattr(self._responder, "react_to_participation", None)
         if reactor is None:
             return None
-        del effect_id
         return await reactor(
             target_message_id=target_message_id,
             emoji=emoji,
             channel=channel,
             chat_id=chat_id,
+            effect_id=effect_id,
+            admission=admission,
         )
 
 
@@ -1319,6 +1378,8 @@ def build_effect_router(
     bus: MessageBus,
     security: object | None = None,
     threads: object | None = None,
+    participation_ledger: object | None = None,
+    inbound_archive: object | None = None,
 ):
     """Effect gateway plus transport executor for the new mode.
 
@@ -1330,6 +1391,10 @@ def build_effect_router(
 
     from yeoman_gateway.processing.dispatch import BusEffectExecutor, IntentEffectRouter
     from yeoman_gateway.processing.effects import EffectGateway
+    from yeoman_gateway.processing.participation_runtime import (
+        ParticipationAuthorizationRequest,
+        ParticipationEffectAuthorizer,
+    )
     from yeoman_gateway.processing.policy import (
         AdapterSnapshotProvider,
         PolicyCapabilityResolver,
@@ -1337,27 +1402,239 @@ def build_effect_router(
     )
 
     snapshots = AdapterSnapshotProvider(policy_adapter)
+    participation_checker = ParticipationEffectAuthorizer()
+
+    def _participation_request(envelope: object, admission: object):
+        current = policy_adapter.current_activation(
+            str(getattr(getattr(envelope, "target", None), "channel", "")),
+            str(getattr(getattr(envelope, "target", None), "chat_id", "")),
+        )
+        channel = str(getattr(admission, "channel", "") or "")
+        chat_id = str(getattr(admission, "chat_id", "") or "")
+        effect_id = str(getattr(envelope, "effect_id", "") or "")
+        row_reader = getattr(participation_ledger, "_delivery_row_for_effect", None)
+        reservation = row_reader(effect_id) if callable(row_reader) else None
+        reservation_matches = bool(
+            reservation is not None
+            and str(reservation.get("proposal_id") or "")
+            == str(getattr(admission, "opportunity_id", "") or "")
+        )
+
+        source_ids = tuple(str(item) for item in getattr(admission, "source_event_ids", ()))
+        pairs = getattr(admission, "source_principals", ())
+        expected_senders = {
+            str(item[0]): str(item[1])
+            for item in pairs
+            if isinstance(item, (tuple, list)) and len(item) == 2
+        }
+        current_senders: dict[str, str] = {}
+        if inbound_archive is not None and hasattr(inbound_archive, "senders_for_messages"):
+            try:
+                current_senders = {
+                    str(key): str(value)
+                    for key, value in inbound_archive.senders_for_messages(
+                        channel, chat_id, source_ids
+                    ).items()
+                }
+            except Exception:
+                current_senders = {}
+        exact_sources = bool(
+            source_ids
+            and len(expected_senders) == len(source_ids)
+            and set(expected_senders) == set(source_ids)
+            and current_senders == expected_senders
+        )
+
+        engine = policy_adapter.policy_engine()
+        try:
+            effective = engine.resolve_policy(channel, chat_id) if engine is not None else None
+        except Exception:
+            effective = None
+        principals_allowed = bool(
+            exact_sources
+            and engine is not None
+            and all(
+                participant_is_allowed(
+                    engine=engine,
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender=sender,
+                )
+                for sender in expected_senders.values()
+            )
+        )
+        current_policy = policy_adapter.policy_snapshot()
+        policy_matches = bool(
+            current is not None
+            and str(getattr(admission, "policy_version", "") or "")
+            == str(getattr(current, "policy_version", "") or "")
+            and str(getattr(admission, "policy_hash", "") or "")
+            == str(getattr(current_policy, "policy_hash", "") or "")
+        )
+
+        action = str(getattr(admission, "action", "") or "")
+        intent = str(getattr(admission, "intent", "") or "")
+        contribution = str(getattr(admission, "contribution_type", "") or "")
+        reply_actions = config.processing.reply_actions or {}
+        reply_action = str(
+            reply_actions.get(f"{channel}:{chat_id}", "answer")
+            if isinstance(reply_actions, Mapping)
+            else "answer"
+        ).strip().lower()
+        current_rights = False
+        if current is not None and effective is not None:
+            participation = current.participation
+            current_daily_cap = (
+                effective.spontaneity_daily_cap
+                if effective.spontaneity_daily_cap is not None
+                else int(config.consciousness.default_daily_cap)
+            )
+            if effective.spontaneity_allowed_actions is not None:
+                permitted_contributions = set(effective.spontaneity_allowed_actions)
+            else:
+                from yeoman_gateway.consciousness.tools import (
+                    DEFAULT_BALANCED_ACTIONS,
+                    DEFAULT_HELPFUL_ACTIONS,
+                    DEFAULT_PERMISSIVE_ACTIONS,
+                )
+
+                permitted_contributions = set(
+                    DEFAULT_PERMISSIVE_ACTIONS
+                    if effective.spontaneity_profile == "permissive"
+                    else DEFAULT_BALANCED_ACTIONS
+                    if effective.spontaneity_profile == "balanced"
+                    else DEFAULT_HELPFUL_ACTIONS
+                )
+            quiet = False
+            quiet_start = effective.spontaneity_quiet_hours_start
+            quiet_end = effective.spontaneity_quiet_hours_end
+            if quiet_start and quiet_end:
+                try:
+                    start_hour, start_minute = (int(part) for part in quiet_start.split(":"))
+                    end_hour, end_minute = (int(part) for part in quiet_end.split(":"))
+                    start = start_hour * 60 + start_minute
+                    end = end_hour * 60 + end_minute
+                    now = datetime.now(UTC)
+                    minute = now.hour * 60 + now.minute
+                    quiet = (
+                        True
+                        if start == end
+                        else start <= minute < end
+                        if start < end
+                        else minute >= start or minute < end
+                    )
+                except (TypeError, ValueError):
+                    quiet = True
+            current_rights = bool(
+                (action == "react" and reply_action == "react" and participation.allow_reactions)
+                or (
+                    action == "comment"
+                    and reply_action == "answer"
+                    and (
+                        (
+                            intent == "continue"
+                            and participation.allow_continuation
+                            and contribution in permitted_contributions
+                        )
+                        or (
+                            intent == "initiate"
+                            and participation.allow_initiation
+                            and effective.spontaneity_enabled
+                            and int(current_daily_cap or 0) > 0
+                            and contribution in permitted_contributions
+                            and not quiet
+                            and (
+                                effective.spontaneity_preview != "owner_dm"
+                                or int(getattr(admission, "approval_revision", 0) or 0) > 0
+                            )
+                        )
+                    )
+                )
+            )
+        stale = True
+        material_reader = getattr(participation_ledger, "material_for_opportunity", None)
+        if callable(material_reader) and current is not None:
+            try:
+                pending, revision = material_reader(
+                    channel,
+                    chat_id,
+                    None,
+                    lane=str(getattr(current, "lane", "production")),
+                )
+                stale = bool(
+                    pending
+                    and int(revision) > int(getattr(admission, "observed_revision", 0) or 0)
+                )
+            except Exception:
+                stale = True
+
+        return ParticipationAuthorizationRequest(
+            admission=admission,
+            lane=str(getattr(current, "lane", "shadow") if current is not None else "shadow"),
+            is_paused=policy_adapter.participation_pause_reason(channel, chat_id),
+            is_shadow=bool(getattr(current, "shadow", True)),
+            feature_enabled=bool(
+                getattr(current, "enabled", False)
+                and getattr(current, "valid", False)
+            ),
+            opted_in=bool(getattr(current, "opted_in", False)),
+            current_epoch=int(getattr(current, "activation_epoch", -1)),
+            source_authorized=bool(
+                exact_sources
+                and policy_matches
+                and reservation_matches
+                and current_rights
+                and not stale
+                and effective is not None
+                and str(effective.when_to_reply_mode) != "off"
+            ),
+            source_principals_authorized=principals_allowed,
+            effect_id=effect_id,
+            reservation_state=(
+                str(reservation.get("attempt_state") or "") if reservation is not None else None
+            ),
+            payload_hash=str(getattr(envelope, "payload_hash", "") or ""),
+            expected_payload_hash=str(getattr(admission, "payload_hash", "") or ""),
+        )
+
+    def _participation_pre_dispatch(envelope: object) -> tuple[bool, str]:
+        admission_id = str(getattr(envelope, "admission_id", "") or "")
+        admission = store.get_participation_admission(admission_id) if admission_id else None
+        if admission is None:
+            return False, "participation_admission_missing"
+        try:
+            return participation_checker.check(_participation_request(envelope, admission))
+        except Exception as exc:
+            return False, f"participation_check_failed:{type(exc).__name__}"
+
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=snapshots,
+        capabilities=PolicyCapabilityResolver(
+            engine_provider=policy_adapter.policy_engine,
+            known_tools=lambda: set(policy_adapter.known_tools),
+        ),
+        turn_lookup=getattr(threads, "turn_lookup", None),
+        admission_loader=store.get_participation_admission,
+        participation_authorizer=participation_checker,
+        participation_request_builder=_participation_request,
+    )
+    executor = BusEffectExecutor(
+        bus=bus,
+        mark_provenance=True,
+        security=security,
+        security_block_message=config.security.block_user_message,
+        participation_pre_dispatch=_participation_pre_dispatch,
+    )
     gateway = EffectGateway(
         store,
-        authorizer=SnapshotEffectAuthorizer(
-            snapshots=snapshots,
-            capabilities=PolicyCapabilityResolver(
-                engine_provider=policy_adapter.policy_engine,
-                known_tools=lambda: set(policy_adapter.known_tools),
-            ),
-            turn_lookup=getattr(threads, "turn_lookup", None),
-        ),
-        executor=BusEffectExecutor(
-            bus=bus,
-            mark_provenance=True,
-            security=security,
-            security_block_message=config.security.block_user_message,
-        ),
+        authorizer=authorizer,
+        executor=executor,
     )
     return IntentEffectRouter(
         gateway=gateway,
         config=config,
         turn_provider=getattr(threads, "active_turn", None),
+        participation_ledger=participation_ledger,
     )
 
 
@@ -1554,6 +1831,8 @@ def build_gateway_runtime(
         bus,
         security=security,
         threads=thread_registry,
+        participation_ledger=speakup_log,
+        inbound_archive=inbound_archive,
     )
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard

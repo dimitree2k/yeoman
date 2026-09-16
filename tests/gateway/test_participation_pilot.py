@@ -189,7 +189,9 @@ def _pilot_runtime(tmp_path: Path, *, decision: dict[str, object], shadow: bool)
         snapshot_provider=_snapshot,
         is_paused=lambda channel, chat_id: None,
         is_source_allowed=lambda channel, chat_id, sources: True,
-        source_principals=lambda channel, chat_id, sources: ("anna@s.whatsapp.net",),
+        source_principals=lambda channel, chat_id, sources: tuple(
+            (str(source), "anna@s.whatsapp.net") for source in sources
+        ),
         is_participant_allowed=lambda channel, chat_id, sender: True,
         submission=submission,
         reactor=reactor,

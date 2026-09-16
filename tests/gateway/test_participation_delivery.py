@@ -9,26 +9,722 @@ never regains capacity by crossing a window boundary (spec section 9).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
-from yeoman_gateway.processing.effects import EffectGateway
+from yeoman_gateway.processing.dispatch import (
+    BusEffectExecutor,
+    EffectNotDeliveredError,
+    IntentEffectRouter,
+    SendBudget,
+    ServiceEffectProducer,
+)
+from yeoman_gateway.processing.effects import EffectGateway, is_pre_dispatch_error
 from yeoman_gateway.processing.models import (
+    EffectConflictError,
     EffectEnvelope,
     EffectReceipt,
+    EffectTarget,
+    ParticipationPreDispatchDenied,
+    PolicySnapshot,
+    ProcessingError,
     ReactionPayload,
     TextPayload,
     TransportReceipt,
     TurnRef,
+    payload_hash,
 )
+from yeoman_gateway.processing.policy import SnapshotEffectAuthorizer
 from yeoman_gateway.processing.store import ProcessingStore
 
 CHAT = "synthetic@g.us"
 CHANNEL = "whatsapp"
 DAY_MS = 86_400_000
 HOUR_MS = 3_600_000
+
+
+def test_participation_effect_binds_admission_and_origin_atomically(tmp_path: Path) -> None:
+    """The outbox must persist a trusted admission link with the queued effect."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    envelope = EffectEnvelope(
+        effect_id="effect-admission-1",
+        operation_key="participation:admission-1",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-1",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-1",
+        opportunity_id="opportunity-1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=3,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        emoji=None,
+        target_message_id=None,
+        anchor_message_id=None,
+        payload_hash=envelope.payload_hash,
+    )
+
+    effect_id = store.enqueue_participation_effect(envelope, admission)
+
+    assert effect_id == "effect-admission-1"
+    stored = store.get_effect(effect_id)
+    assert stored is not None
+    assert stored.origin == "participation"
+    assert stored.admission_id == "admission-1"
+    assert store.get_participation_admission("admission-1") is not None
+    assert store.enqueue_participation_effect(envelope, admission) == effect_id
+    duplicate_admission = EffectEnvelope(
+        effect_id="effect-admission-duplicate",
+        operation_key="participation:admission-duplicate",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-1",
+    )
+    with pytest.raises(EffectConflictError, match="admission_id"):
+        store.enqueue_participation_effect(duplicate_admission, admission)
+    changed = EffectEnvelope(
+        effect_id="effect-admission-1",
+        operation_key="participation:admission-1",
+        payload=TextPayload(text="changed"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-1",
+    )
+    with pytest.raises(EffectConflictError):
+        store.enqueue_participation_effect(changed, admission)
+    with pytest.raises(EffectConflictError, match="target"):
+        store.enqueue_effect(
+            effect_id="effect-foreign-target",
+            operation_key="participation:foreign-target",
+            payload=TextPayload(text="prepared"),
+            target=EffectTarget(channel=CHANNEL, chat_id="other@g.us"),
+            origin="participation",
+            admission_id="admission-1",
+            now_ms=1,
+        )
+    with pytest.raises(EffectConflictError, match="payload hash"):
+        store.enqueue_effect(
+            effect_id="effect-foreign-payload",
+            operation_key="participation:foreign-payload",
+            payload=TextPayload(text="foreign"),
+            target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+            origin="participation",
+            admission_id="admission-1",
+            now_ms=1,
+        )
+    assert store.get_effect("effect-foreign-target") is None
+    assert store.get_effect("effect-foreign-payload") is None
+    store.close()
+    reopened = ProcessingStore(tmp_path / "processing.db")
+    persisted = reopened.get_effect(effect_id)
+    assert persisted is not None
+    assert persisted.origin == "participation"
+    assert persisted.admission_id == "admission-1"
+    assert reopened.get_participation_admission("admission-1") is not None
+    reopened.close()
+
+
+def test_generic_enqueue_cannot_create_unbound_participation_effect(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    with pytest.raises(ProcessingError, match="admission"):
+        store.enqueue_effect(
+            effect_id="effect-unbound",
+            operation_key="participation:unbound",
+            payload=TextPayload(text="prepared"),
+            target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+            origin="participation",
+            admission_id="missing",
+            now_ms=1,
+        )
+    assert store.get_effect("effect-unbound") is None
+    envelope = EffectEnvelope(
+        effect_id="effect-missing-hash",
+        operation_key="participation:missing-hash",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        origin="participation",
+        admission_id="admission-missing-hash",
+    )
+    with pytest.raises(ProcessingError, match="payload hash"):
+        store.enqueue_participation_effect(
+            envelope,
+            SimpleNamespace(
+                admission_id="admission-missing-hash",
+                channel=CHANNEL,
+                chat_id=CHAT,
+                payload_hash="",
+            ),
+        )
+    assert store.get_effect("effect-missing-hash") is None
+    store.close()
+
+
+def test_snapshot_authorizer_rejects_missing_participation_hash_and_action() -> None:
+    envelope = EffectEnvelope(
+        effect_id="effect-incomplete-admission",
+        operation_key="participation:incomplete-admission",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-incomplete",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-incomplete",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        payload_hash="",
+        action="",
+        intent="observation",
+    )
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticPolicy(),
+        capabilities=_TargetCapabilities(),
+        admission_loader=lambda _admission_id: admission,
+        participation_authorizer=lambda _envelope, _admission: (True, "allow"),
+        clock=lambda: 2,
+    )
+
+    decision = authorizer.check(envelope, None)
+
+    assert decision.outcome == "deny"
+    assert decision.reason == "participation_payload_hash_missing"
+
+
+@pytest.mark.parametrize(
+    ("reservation_state", "source_principals_authorized", "expected"),
+    [
+        ("reserved", True, "participation_reservation_not_submitted"),
+        ("submitted", False, "participation_source_principal_not_authorized"),
+    ],
+)
+def test_snapshot_authorizer_requires_submitted_reservation_and_source_acl(
+    reservation_state: str,
+    source_principals_authorized: bool,
+    expected: str,
+) -> None:
+    envelope = EffectEnvelope(
+        effect_id="effect-request-evidence",
+        operation_key="participation:request-evidence",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-request-evidence",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-request-evidence",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        payload_hash=envelope.payload_hash,
+        action="comment",
+        intent="observation",
+        activation_epoch=3,
+    )
+    request = SimpleNamespace(
+        admission=admission,
+        lane="production",
+        is_paused=None,
+        is_shadow=False,
+        feature_enabled=True,
+        opted_in=True,
+        current_epoch=3,
+        source_authorized=True,
+        effect_id=envelope.effect_id,
+        reservation_state=reservation_state,
+        payload_hash=envelope.payload_hash,
+        expected_payload_hash=envelope.payload_hash,
+        source_principals_authorized=source_principals_authorized,
+    )
+
+    class _Checker:
+        def check(self, _request: object) -> tuple[bool, str]:
+            return True, "allow"
+
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticPolicy(),
+        capabilities=_TargetCapabilities(),
+        admission_loader=lambda _admission_id: admission,
+        participation_authorizer=_Checker(),
+        participation_request_builder=lambda _envelope, _admission: request,
+        clock=lambda: 2,
+    )
+
+    decision = authorizer.check(envelope, None)
+
+    assert decision.outcome == "deny"
+    assert decision.reason == expected
+
+
+def test_legacy_effect_rows_get_legacy_provenance_on_store_open(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-processing.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+        CREATE TABLE effects (
+          effect_id TEXT PRIMARY KEY,
+          operation_key TEXT NOT NULL UNIQUE,
+          trace_id TEXT NOT NULL DEFAULT '',
+          turn_id TEXT NOT NULL DEFAULT '',
+          turn_revision INTEGER NOT NULL DEFAULT 1,
+          principal TEXT NOT NULL DEFAULT '',
+          capability TEXT NOT NULL DEFAULT '',
+          target_json TEXT NOT NULL DEFAULT '{}',
+          target_hash TEXT NOT NULL DEFAULT '',
+          payload_kind TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          payload_json TEXT,
+          payload_purged_ms INTEGER,
+          state TEXT NOT NULL,
+          expires_at_ms INTEGER,
+          policy_version TEXT,
+          policy_hash TEXT,
+          lease_owner TEXT,
+          lease_until_ms INTEGER,
+          created_ms INTEGER NOT NULL,
+          updated_ms INTEGER NOT NULL
+        );
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO effects (
+          effect_id, operation_key, payload_kind, payload_hash, payload_json,
+          state, created_ms, updated_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("legacy-effect", "legacy-operation", "text", "hash", '{"kind":"text","text":"x"}', "queued", 1, 1),
+    )
+    connection.commit()
+    connection.close()
+
+    store = ProcessingStore(path)
+    stored = store.get_effect("legacy-effect")
+    assert stored is not None
+    assert stored.origin == "legacy"
+    assert stored.admission_id is None
+    store.close()
+
+
+def test_participation_pre_dispatch_denial_is_classified_by_type() -> None:
+    assert is_pre_dispatch_error(ParticipationPreDispatchDenied("paused_chat"))
+
+
+class _TargetCapabilities:
+    def resolve(self, *, principal: str, target: EffectTarget, capability: str):
+        del capability
+        return (principal == "service:speakup" and target.chat_id == CHAT, "allow")
+
+
+class _StaticPolicy:
+    def snapshot(self) -> PolicySnapshot:
+        return PolicySnapshot(version="policy-v1", policy_hash="hash-v1", loaded_ms=1)
+
+
+class _TransportSpy:
+    def __init__(self, ledger: object | None = None) -> None:
+        self.calls = 0
+        self.ledger = ledger
+
+    async def execute(self, envelope: EffectEnvelope) -> EffectReceipt:
+        self.calls += 1
+        if self.ledger is not None:
+            assert getattr(self.ledger, "calls", []) == [
+                ("opportunity-router", envelope.effect_id)
+            ]
+        return EffectReceipt(effect_id=envelope.effect_id, state="sent")
+
+
+class _Bus:
+    def __init__(self) -> None:
+        self.outbound_calls = 0
+        self.reaction_calls = 0
+
+    async def publish_outbound(self, _message: object) -> None:
+        self.outbound_calls += 1
+        raise AssertionError("participation must not use the legacy bus")
+
+    async def publish_reaction(self, _message: object) -> None:
+        self.reaction_calls += 1
+        raise AssertionError("participation must not use the legacy bus")
+
+
+class _LedgerAttemptSpy:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.release_calls: list[tuple[str, str, str]] = []
+        self.reservation_state = "reserved"
+
+    async def record_send_attempt(self, opportunity_id: str, *, effect_id: str, now_ms: int) -> None:
+        del now_ms
+        self.calls.append((opportunity_id, effect_id))
+        self.reservation_state = "submitted"
+
+    async def release_delivery(
+        self,
+        proposal_id: str,
+        *,
+        effect_id: str,
+        state: str,
+        reason: str,
+        now_ms: int,
+    ) -> bool:
+        del reason, now_ms
+        self.release_calls.append((proposal_id, effect_id, state))
+        self.reservation_state = state
+        return True
+
+
+def test_real_effect_gateway_rechecks_persisted_participation_before_transport(
+    tmp_path: Path,
+) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    envelope = EffectEnvelope(
+        effect_id="effect-final-check",
+        operation_key="participation:final-check",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-final-check",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-final-check",
+        opportunity_id="opportunity-final-check",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=3,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        emoji=None,
+        target_message_id=None,
+        anchor_message_id=None,
+        payload_hash=payload_hash(TextPayload(text="prepared")),
+    )
+    store.enqueue_participation_effect(envelope, admission)
+    transport = _TransportSpy()
+    allowed = {"value": True}
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticPolicy(),
+        capabilities=_TargetCapabilities(),
+        admission_loader=store.get_participation_admission,
+        participation_authorizer=lambda _envelope, _admission: (
+            allowed["value"],
+            "paused_chat" if not allowed["value"] else "allow",
+        ),
+        clock=lambda: 2,
+    )
+    gateway = EffectGateway(
+        store,
+        authorizer=authorizer,
+        executor=transport,
+        clock=lambda: 2,
+    )
+
+    first = asyncio.run(gateway.execute_ready(envelope.effect_id))
+    assert first.state == "sent"
+    assert transport.calls == 1
+
+    # A newly queued effect is denied by the fresh participation check after a pause.
+    paused_envelope = EffectEnvelope(
+        effect_id="effect-final-check-paused",
+        operation_key="participation:final-check-paused",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-final-check-paused",
+    )
+    paused_data = vars(admission).copy()
+    paused_data["admission_id"] = "admission-final-check-paused"
+    paused_admission = SimpleNamespace(**paused_data)
+    store.enqueue_participation_effect(paused_envelope, paused_admission)
+    allowed["value"] = False
+    denied = asyncio.run(gateway.execute_ready(paused_envelope.effect_id))
+    assert denied.state == "blocked"
+    assert transport.calls == 1
+    store.close()
+
+
+def test_service_producer_carries_admission_through_real_effect_gateway(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    admission = SimpleNamespace(
+        admission_id="admission-router",
+        opportunity_id="opportunity-router",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=3,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        emoji=None,
+        target_message_id=None,
+        anchor_message_id=None,
+        payload_hash=payload_hash(TextPayload(text="prepared")),
+    )
+    ledger = _LedgerAttemptSpy()
+    transport = _TransportSpy(ledger)
+    authorizer = SnapshotEffectAuthorizer(
+        snapshots=_StaticPolicy(),
+        capabilities=_TargetCapabilities(),
+        admission_loader=store.get_participation_admission,
+        participation_authorizer=lambda _envelope, _admission: (True, "allow"),
+        clock=lambda: 2,
+    )
+    gateway = EffectGateway(
+        store,
+        authorizer=authorizer,
+        executor=transport,
+        clock=lambda: 2,
+    )
+    config = SimpleNamespace(
+        processing=SimpleNamespace(
+            enabled=True,
+            is_chat_enabled=lambda channel, chat_id: channel == CHANNEL and chat_id == CHAT,
+            budgets=None,
+            deadlines=SimpleNamespace(reactive_ms=60_000, proactive_ms=60_000),
+        )
+    )
+    router = IntentEffectRouter(
+        gateway=gateway,
+        config=config,
+        clock=lambda: 2,
+        participation_ledger=ledger,
+    )
+    producer = ServiceEffectProducer(router=router, bus=_Bus())
+
+    receipt = asyncio.run(
+        producer.send(
+            source="speakup",
+            operation_ref="opportunity-router",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            content="prepared",
+            effect_id="effect-router",
+            require_managed=True,
+            admission=admission,
+        )
+    )
+
+    assert receipt is not None
+    assert receipt.state == "sent"
+    assert ledger.calls == [("opportunity-router", "effect-router")]
+    stored = store.get_effect("effect-router")
+    assert stored is not None
+    assert stored.origin == "participation"
+    assert stored.admission_id == "admission-router"
+    assert transport.calls == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_participation_capacity_block_releases_submitted_reservation(
+    tmp_path: Path,
+) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await _proposal(log, "opportunity-capacity")
+    effect_id = "effect-capacity"
+    assert await log.reserve_delivery(
+        proposal_id="opportunity-capacity",
+        effect_id=effect_id,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 1, HOUR_MS),),
+    )
+    store = ProcessingStore(tmp_path / "processing.db")
+    transport = _TransportSpy()
+    gateway = EffectGateway(store, authorizer=_AllowAll(), executor=transport, clock=lambda: 2)
+    config = SimpleNamespace(
+        processing=SimpleNamespace(
+            enabled=True,
+            is_chat_enabled=lambda channel, chat_id: channel == CHANNEL and chat_id == CHAT,
+            budgets=None,
+            deadlines=SimpleNamespace(reactive_ms=60_000, proactive_ms=60_000),
+        )
+    )
+    router = IntentEffectRouter(
+        gateway=gateway,
+        config=config,
+        clock=lambda: 2,
+        budget=SendBudget(units=1, window_seconds=60, waiting_cap=0),
+        participation_ledger=log,
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-capacity",
+        opportunity_id="opportunity-capacity",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=3,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        emoji=None,
+        target_message_id=None,
+        anchor_message_id=None,
+        payload_hash=payload_hash(TextPayload(text="prepared")),
+    )
+    producer = ServiceEffectProducer(router=router, bus=_Bus())
+
+    receipt = await producer.send(
+        source="speakup",
+        operation_ref="opportunity-capacity",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        content="prepared",
+        effect_id=effect_id,
+        require_managed=True,
+        admission=admission,
+    )
+
+    assert receipt is not None and receipt.state == "blocked"
+    assert transport.calls == 0
+    assert await log.delivery_state(
+        proposal_id="opportunity-capacity", effect_id=effect_id
+    ) == "failed"
+    assert await log.consumed_slots(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        category="comment",
+        now_ms=1000,
+        window_ms=HOUR_MS,
+    ) == 0
+    log.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_managed_speakup_reaction_requires_admission() -> None:
+    class _ManagedRouter:
+        def manages(self, channel: str, chat_id: str) -> bool:
+            del channel, chat_id
+            return True
+
+        async def submit_message(self, _message: object, **kwargs: object) -> object:
+            del kwargs
+            raise AssertionError("unbound managed reaction reached the router")
+
+    producer = ServiceEffectProducer(router=_ManagedRouter(), bus=_Bus())
+
+    with pytest.raises(EffectNotDeliveredError, match="admission"):
+        await producer.send_reaction(
+            source="speakup",
+            operation_ref="reaction-without-admission",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            message_id="inbound-1",
+            emoji="👍",
+            effect_id="effect-unbound-reaction",
+            require_managed=True,
+        )
+
+
+def test_dispatch_preflight_denial_is_before_bus_handoff(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    envelope = EffectEnvelope(
+        effect_id="effect-dispatch-check",
+        operation_key="participation:dispatch-check",
+        payload=TextPayload(text="prepared"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-dispatch-check",
+    )
+    admission = SimpleNamespace(
+        admission_id="admission-dispatch-check",
+        opportunity_id="opportunity-dispatch-check",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        activation_epoch=3,
+        lane="production",
+        observed_revision=1,
+        action="comment",
+        intent="observation",
+        purpose="synthetic",
+        payload_hash=envelope.payload_hash,
+    )
+    store.enqueue_participation_effect(envelope, admission)
+    bus = _Bus()
+    executor = BusEffectExecutor(
+        bus=bus,
+        participation_pre_dispatch=lambda _envelope: (False, "paused_chat"),
+    )
+    gateway = EffectGateway(
+        store,
+        authorizer=SnapshotEffectAuthorizer(
+            snapshots=_StaticPolicy(),
+            capabilities=_TargetCapabilities(),
+            admission_loader=store.get_participation_admission,
+            participation_authorizer=lambda _envelope, _admission: (True, "allow"),
+            clock=lambda: 2,
+        ),
+        executor=executor,
+        clock=lambda: 2,
+    )
+
+    result = asyncio.run(gateway.execute_ready(envelope.effect_id))
+
+    assert result.state == "failed"
+    assert bus.outbound_calls == 0
+    assert bus.reaction_calls == 0
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_participation_security_payload_change_is_denied_before_transport() -> None:
+    envelope = EffectEnvelope(
+        effect_id="effect-security-change",
+        operation_key="participation:security-change",
+        payload=TextPayload(text="secret"),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        principal="service:speakup",
+        capability="send_text",
+        origin="participation",
+        admission_id="admission-security-change",
+    )
+    executor = BusEffectExecutor(
+        bus=_Bus(),
+        security=_SanitizingSecurity(),
+        participation_pre_dispatch=lambda _envelope: (True, "allow"),
+    )
+
+    with pytest.raises(
+        ParticipationPreDispatchDenied,
+        match="participation_payload_changed_by_security",
+    ):
+        await executor.execute(envelope)
 
 
 async def _proposal(log: SpeakupLog, proposal_id: str) -> None:

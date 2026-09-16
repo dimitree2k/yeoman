@@ -253,6 +253,9 @@ def _runtime(
         snapshot_provider=_snapshot,
         is_paused=lambda channel, chat_id: paused,
         is_source_allowed=lambda channel, chat_id, sources: source_allowed,
+        source_principals=lambda channel, chat_id, sources: tuple(
+            (str(source), "anna@s.whatsapp.net") for source in sources
+        ),
         submission=submission if submission is not None else _Submission(),
         reactor=reactor if reactor is not None else _Reactor(),
         clock_ms=lambda: NOW_MS,
@@ -331,6 +334,11 @@ async def test_reaction_is_one_judge_and_one_reaction_effect(tmp_path: Path) -> 
     call = reactor.calls[0]
     assert call["target_message_id"] == "m1"
     assert call["emoji"] == EMOJI
+    admission = call["admission"]
+    assert admission.admission_id == f"adm-{call['effect_id']}"
+    assert admission.source_event_ids == ("m1",)
+    assert admission.source_principals == (("m1", "anna@s.whatsapp.net"),)
+    assert admission.payload_hash
     effect_id = str(call["effect_id"])
     assert effect_id == deterministic_effect_id(
         channel=CHANNEL, chat_id=CHAT, operation="reaction", proposal_id="opp-1"
@@ -374,7 +382,10 @@ async def test_comment_is_one_judge_one_generation_one_effect(tmp_path: Path) ->
     assert judge.calls == 1
     assert submission.calls == 1
     record = await log.delivery_record(proposal_id="opp-1", effect_id=str(result["effect_id"]))
-    assert record is not None and record["delivery_state"] == "submitted"
+    # The fake submission does not own the shared effect router, so no early runtime
+    # attempt projection is fabricated here; the real adapter records ``submitted``
+    # after its atomic effect enqueue.
+    assert record is not None and record["attempt_state"] == "unsubmitted"
     assert await log.consumed_slots(
         channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=NOW_MS, window_ms=1_800_000
     ) == 1
@@ -971,6 +982,10 @@ async def test_effect_target_is_always_the_admitted_chat(tmp_path: Path) -> None
     admission = submission.admissions[0]
     assert admission.channel == CHANNEL  # type: ignore[attr-defined]
     assert admission.chat_id == CHAT  # type: ignore[attr-defined]
+    assert admission.admission_id.startswith("adm-")  # type: ignore[attr-defined]
+    assert admission.source_event_ids == ("m1",)  # type: ignore[attr-defined]
+    assert admission.source_principals == (("m1", "anna@s.whatsapp.net"),)  # type: ignore[attr-defined]
+    assert admission.payload_hash  # type: ignore[attr-defined]
     log.close()
 
 
@@ -1006,6 +1021,7 @@ def _authorization(**overrides: object):
         "reservation_state": "submitted",
         "payload_hash": "hash-1",
         "expected_payload_hash": "hash-1",
+        "source_principals_authorized": True,
     }
     base.update(overrides)
     return ParticipationAuthorizationRequest(**base)  # type: ignore[arg-type]
@@ -1020,9 +1036,12 @@ def _authorization(**overrides: object):
         ({"lane": "shadow"}, "shadow_lane"),
         ({"current_epoch": 2}, "epoch_changed"),
         ({"source_authorized": False}, "source_not_authorized"),
+        ({"source_principals_authorized": False}, "source_principal_not_authorized"),
         ({"reservation_state": None}, "no_reservation"),
+        ({"reservation_state": "reserved"}, "reservation_not_submitted"),
         ({"reservation_state": "failed"}, "reservation_failed"),
         ({"reservation_state": "cancelled"}, "reservation_cancelled"),
+        ({"expected_payload_hash": ""}, "payload_hash_missing"),
         ({"payload_hash": "other"}, "payload_hash_mismatch"),
         ({"feature_enabled": False}, "feature_disabled"),
         ({"opted_in": False}, "chat_not_opted_in"),
@@ -1042,6 +1061,19 @@ def test_final_authorization_allows_the_owned_current_effect() -> None:
     from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
 
     assert ParticipationEffectAuthorizer().check(_authorization()) == (True, "allow")
+
+
+def test_final_authorization_rejects_admission_lane_mismatch() -> None:
+    from dataclasses import replace
+
+    from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
+
+    request = _authorization()
+    mismatched = replace(request, admission=replace(request.admission, lane="shadow"))
+    assert ParticipationEffectAuthorizer().check(mismatched) == (
+        False,
+        "admission_lane_mismatch",
+    )
 
 
 @pytest.mark.asyncio
@@ -1145,7 +1177,10 @@ async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> N
         tmp_path, decision=COMMENT, submission=_SpySubmission()
     )
     runtime._source_principals = lambda channel, chat_id, sources: tuple(
-        archive.senders_for_messages(channel, chat_id, tuple(sources)).values()
+        (source_id, sender)
+        for source_id, sender in archive.senders_for_messages(
+            channel, chat_id, tuple(sources)
+        ).items()
     )
     runtime._is_participant_allowed = lambda channel, chat_id, sender: False
     result = await runtime.evaluate_participation(_opportunity("m1"))
@@ -1158,7 +1193,9 @@ async def test_denied_source_principal_blocks_participation(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_allowed_source_principal_still_proceeds(tmp_path: Path) -> None:
     runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
-    runtime._source_principals = lambda channel, chat_id, sources: ("anna@s.whatsapp.net",)
+    runtime._source_principals = lambda channel, chat_id, sources: tuple(
+        (str(source), "anna@s.whatsapp.net") for source in sources
+    )
     runtime._is_participant_allowed = lambda channel, chat_id, sender: sender.endswith(
         "anna@s.whatsapp.net"
     )

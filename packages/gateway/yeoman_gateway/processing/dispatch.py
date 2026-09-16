@@ -19,6 +19,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from loguru import logger
@@ -34,6 +35,7 @@ from yeoman_gateway.processing.models import (
     EffectTarget,
     ExternalActionPayload,
     MediaPayload,
+    ParticipationPreDispatchDenied,
     ProcessingError,
     ReactionPayload,
     TextPayload,
@@ -117,6 +119,7 @@ class BusEffectExecutor:
         security_block_message: str = "\U0001f602",
         direct_sender: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         direct_reaction_sender: Callable[[ReactionMessage], Awaitable[None]] | None = None,
+        participation_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
@@ -124,6 +127,7 @@ class BusEffectExecutor:
         self._security_block_message = security_block_message
         self._direct_sender = direct_sender
         self._direct_reaction_sender = direct_reaction_sender
+        self._participation_pre_dispatch = participation_pre_dispatch
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
@@ -136,6 +140,12 @@ class BusEffectExecutor:
         """Install the channel transport adapter that can confirm a real send."""
         self._direct_sender = outbound
         self._direct_reaction_sender = reaction
+
+    def set_participation_pre_dispatch(
+        self, checker: Callable[[EffectEnvelope], tuple[bool, str]] | None
+    ) -> None:
+        """Install the synchronous participation check immediately before transport."""
+        self._participation_pre_dispatch = checker
 
     async def _deliver(self, message: OutboundMessage) -> "TransportReceipt | None":
         """Hand one message to the transport; return the provider receipt if it reported one.
@@ -190,39 +200,60 @@ class BusEffectExecutor:
         receipt: TransportReceipt | None = None
 
         if isinstance(payload, TextPayload):
-            receipt = await self._deliver(
-                OutboundMessage(
-                    channel=target.channel,
-                    chat_id=target.chat_id,
-                    content=self._guard_text(envelope, payload.text),
-                    reply_to=payload.reply_to,
-                    metadata=dict(provenance),
+            content = self._guard_text(envelope, payload.text)
+            dispatch_envelope = envelope
+            if content != payload.text:
+                if envelope.origin == "participation":
+                    raise ParticipationPreDispatchDenied(
+                        "participation_payload_changed_by_security"
+                    )
+                dispatch_envelope = replace(
+                    envelope, payload=TextPayload(text=content, reply_to=payload.reply_to)
                 )
+            message = OutboundMessage(
+                channel=target.channel,
+                chat_id=target.chat_id,
+                content=content,
+                reply_to=payload.reply_to,
+                metadata=dict(provenance),
             )
+            self._check_participation_pre_dispatch(dispatch_envelope)
+            receipt = await self._deliver(message)
         elif isinstance(payload, MediaPayload):
-            receipt = await self._deliver(
-                OutboundMessage(
-                    channel=target.channel,
-                    chat_id=target.chat_id,
-                    content=self._guard_text(envelope, payload.caption or ""),
-                    media=list(payload.media),
-                    metadata=dict(provenance),
+            caption = self._guard_text(envelope, payload.caption or "")
+            dispatch_envelope = envelope
+            if caption != (payload.caption or ""):
+                if envelope.origin == "participation":
+                    raise ParticipationPreDispatchDenied(
+                        "participation_payload_changed_by_security"
+                    )
+                dispatch_envelope = replace(
+                    envelope, payload=MediaPayload(media=payload.media, caption=caption)
                 )
+            message = OutboundMessage(
+                channel=target.channel,
+                chat_id=target.chat_id,
+                content=caption,
+                media=list(payload.media),
+                metadata=dict(provenance),
             )
+            self._check_participation_pre_dispatch(dispatch_envelope)
+            receipt = await self._deliver(message)
         elif isinstance(payload, ReactionPayload):
-            receipt = await self._deliver_reaction(
-                ReactionMessage(
-                    channel=target.channel,
-                    chat_id=target.chat_id,
-                    message_id=payload.message_id,
-                    emoji=payload.emoji,
-                    metadata=dict(provenance),
-                )
+            reaction_message = ReactionMessage(
+                channel=target.channel,
+                chat_id=target.chat_id,
+                message_id=payload.message_id,
+                emoji=payload.emoji,
+                metadata=dict(provenance),
             )
+            self._check_participation_pre_dispatch(envelope)
+            receipt = await self._deliver_reaction(reaction_message)
         elif isinstance(payload, DeletePayload):
             handler = self._delete_handler
             if handler is None:
                 raise EffectPayloadRejectedError("no delete transport registered")
+            self._check_participation_pre_dispatch(envelope)
             if not await handler(envelope):
                 return EffectReceipt(
                     effect_id=envelope.effect_id,
@@ -235,6 +266,7 @@ class BusEffectExecutor:
                 raise EffectPayloadRejectedError(
                     f"no external transport registered for action {payload.action!r}"
                 )
+            self._check_participation_pre_dispatch(envelope)
             if not await handler(envelope):
                 return EffectReceipt(
                     effect_id=envelope.effect_id,
@@ -267,6 +299,17 @@ class BusEffectExecutor:
             state="unknown",
             detail="accepted by the outbound queue; transport outcome unproven",
         )
+
+    def _check_participation_pre_dispatch(self, envelope: EffectEnvelope) -> None:
+        if envelope.origin != "participation":
+            return
+        checker = self._participation_pre_dispatch
+        if checker is None:
+            raise ParticipationPreDispatchDenied("participation pre-dispatch checker unwired")
+        result = checker(envelope)
+        if not isinstance(result, tuple) or len(result) != 2 or not bool(result[0]):
+            reason = result[1] if isinstance(result, tuple) and len(result) > 1 else "denied"
+            raise ParticipationPreDispatchDenied(str(reason))
 
 
 class EffectNotDeliveredError(ProcessingError):
@@ -493,6 +536,7 @@ class ServiceEffectProducer:
         emoji: str,
         effect_id: str | None = None,
         require_managed: bool = False,
+        admission: Any | None = None,
     ) -> EffectReceipt:
         """Submit one managed reaction effect and return its structured receipt.
 
@@ -500,6 +544,10 @@ class ServiceEffectProducer:
         receives the receipt, and only a ``sent`` state with a provider record counts
         as transport acceptance (spec section 9).
         """
+        if source == "speakup" and admission is None:
+            raise EffectNotDeliveredError(
+                "managed speakup reaction requires a participation admission"
+            )
         if require_managed and not effect_id:
             raise EffectNotDeliveredError("managed reaction effect requires a caller effect id")
         if not self._router.manages(channel, chat_id):
@@ -521,6 +569,7 @@ class ServiceEffectProducer:
             capability="send_reaction",
             payload=payload,
             effect_id=effect_id,
+            admission=admission,
         )
 
     async def send(
@@ -535,6 +584,7 @@ class ServiceEffectProducer:
         reply_to: str | None = None,
         effect_id: str | None = None,
         require_managed: bool = False,
+        admission: Any | None = None,
     ) -> EffectReceipt | None:
         """Submit one system-produced effect. ``None`` means the legacy path was used."""
         if require_managed and not effect_id:
@@ -542,7 +592,7 @@ class ServiceEffectProducer:
                 "managed service effect requires a caller effect id"
             )
         if not self._router.manages(channel, chat_id):
-            if require_managed:
+            if require_managed or admission is not None:
                 raise EffectNotDeliveredError(
                     "target is not enabled for the managed effect path"
                 )
@@ -575,6 +625,7 @@ class ServiceEffectProducer:
             capability=capability,
             payload=payload,
             effect_id=effect_id,
+            admission=admission,
         )
 
 
@@ -620,12 +671,14 @@ class IntentEffectRouter:
         worker_id: str = "effect-gateway",
         budget: SendBudget | None = None,
         turn_provider: Callable[[str, str], Any] | None = None,
+        participation_ledger: Any | None = None,
     ) -> None:
         self._gateway = gateway
         self._config = config
         self._clock = clock or _now_ms
         self._worker_id = worker_id
         self._turn_provider = turn_provider
+        self._participation_ledger = participation_ledger
         # Review F02: a final reply is dispatched after the generation scope closed, so the
         # chat's *active* turn may already belong to a newer thread. The turn a generation
         # was frozen with is remembered per source message and preferred over that heuristic.
@@ -775,6 +828,7 @@ class IntentEffectRouter:
         capability: str,
         payload: Any,
         effect_id: str | None = None,
+        admission: Any | None = None,
     ) -> EffectReceipt:
         """One entry point for tool/turn producers that used to publish directly."""
         metadata = dict(message.metadata or {})
@@ -794,6 +848,7 @@ class IntentEffectRouter:
                 "semantic_reaction_ms" if capability == "send_reaction" else "reactive_ms"
             ),
             effect_id=effect_id,
+            admission=admission,
         )
 
     def remember_turn_for_source(self, source_message_id: str, binding: Any) -> None:
@@ -828,6 +883,7 @@ class IntentEffectRouter:
         deadline_key: str,
         effect_id: str | None = None,
         own_lineage: bool = False,
+        admission: Any | None = None,
     ) -> EffectReceipt:
         now = self._clock()
         processing = self._config.processing
@@ -897,9 +953,39 @@ class IntentEffectRouter:
             capability=CAPABILITY_BY_KIND[payload.kind],
             expires_at_ms=now + deadline_ms,
             created_ms=now,
+            origin="participation" if admission is not None else "legacy",
+            admission_id=(
+                str(getattr(admission, "admission_id", "") or "")
+                if admission is not None
+                else None
+            ),
         )
-        receipt = self._gateway.submit(envelope)
-        self._plan_quotable_message(envelope, turn=turn, now=now)
+        if admission is not None:
+            if self._participation_ledger is None:
+                raise EffectNotDeliveredError(
+                    "participation ledger is required before effect enqueue"
+                )
+            if not envelope.admission_id:
+                raise EffectNotDeliveredError(
+                    "participation admission requires a stable admission id"
+                )
+            receipt = self._gateway.submit_participation(envelope, admission)
+        else:
+            receipt = self._gateway.submit(envelope)
+
+        if admission is not None:
+            # The participation ledger owns the durable reservation transition. No
+            # quotability or generic-capacity branch may return after the atomic
+            # enqueue but before this projection, otherwise a blocked effect would
+            # leave an ambiguous reservation behind.
+            await self._participation_ledger.record_send_attempt(
+                str(getattr(admission, "opportunity_id", "")),
+                effect_id=receipt.effect_id,
+                now_ms=self._clock(),
+            )
+            self._plan_quotable_message(envelope, turn=turn, now=now)
+        else:
+            self._plan_quotable_message(envelope, turn=turn, now=now)
 
         log_chat = (
             "[a2a-target]"
@@ -910,8 +996,15 @@ class IntentEffectRouter:
             channel, chat_id, payload, receipt.effect_id, log_chat=log_chat
         )
         if blocked is not None:
+            if admission is not None:
+                await self._participation_ledger.release_delivery(
+                    str(getattr(admission, "opportunity_id", "")),
+                    effect_id=receipt.effect_id,
+                    state="failed",
+                    reason=str(blocked.detail or "capacity_denied"),
+                    now_ms=self._clock(),
+                )
             return blocked
-
         result = await self._gateway.execute_ready(receipt.effect_id)
         self._confirm_quotable_message(envelope, result, now=now)
         logger.info(

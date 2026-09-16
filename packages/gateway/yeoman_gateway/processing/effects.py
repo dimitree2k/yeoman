@@ -15,6 +15,7 @@ from yeoman_gateway.processing.models import (
     DecisionRecord,
     EffectEnvelope,
     EffectReceipt,
+    ParticipationPreDispatchDenied,
     ProcessingError,
     TurnRef,
 )
@@ -37,6 +38,8 @@ PRE_DISPATCH_ERROR_MARKERS: tuple[str, ...] = (
 
 def is_pre_dispatch_error(exc: BaseException) -> bool:
     """True when the transport clearly refused before dispatching."""
+    if isinstance(exc, ParticipationPreDispatchDenied):
+        return True
     text = str(exc).lower()
     return any(marker in text for marker in PRE_DISPATCH_ERROR_MARKERS)
 
@@ -135,7 +138,22 @@ class EffectGateway:
             policy_hash=envelope.policy_hash,
             now_ms=now,
             state="queued",
+            origin=envelope.origin,
+            admission_id=envelope.admission_id,
         )
+        state = self._store.effect_state(effect_id) or "queued"
+        return EffectReceipt(
+            effect_id=effect_id,
+            state=state,
+            operation_key=envelope.operation_key,
+            accepted=effect_id == envelope.effect_id,
+            updated_ms=now,
+        )
+
+    def submit_participation(self, envelope: EffectEnvelope, admission: Any) -> EffectReceipt:
+        """Atomically persist a participation admission and its queued effect."""
+        now = self._clock()
+        effect_id = self._store.enqueue_participation_effect(envelope, admission)
         state = self._store.effect_state(effect_id) or "queued"
         return EffectReceipt(
             effect_id=effect_id,

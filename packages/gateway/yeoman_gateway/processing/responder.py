@@ -21,7 +21,7 @@ from yeoman_gateway.processing.actor import (
     ThreadActorRegistry,
     thread_session_key,
 )
-from yeoman_gateway.processing.dispatch import CURRENT_TURN
+from yeoman_gateway.processing.dispatch import CURRENT_TURN, EffectNotDeliveredError
 from yeoman_gateway.processing.models import TurnBinding
 from yeoman_gateway.processing.models import now_ms as _now_ms
 from yeoman_gateway.processing.threads import TurnAuthority
@@ -85,7 +85,14 @@ class ThreadActorResponder:
         return await generator(event, decision, purpose=purpose, context=context)
 
     async def react_to_participation(
-        self, *, target_message_id: str, emoji: str, channel: str, chat_id: str
+        self,
+        *,
+        target_message_id: str,
+        emoji: str,
+        channel: str,
+        chat_id: str,
+        effect_id: str | None = None,
+        admission: object | None = None,
     ) -> object | None:
         """Submit one autonomous reaction through the existing reaction effect path.
 
@@ -93,15 +100,26 @@ class ThreadActorResponder:
         """
         ctx = self._participation_ctx
         if ctx is None:
+            if admission is not None or effect_id is not None:
+                raise EffectNotDeliveredError("participation reaction path is not composed")
             return None
         submitter = getattr(ctx, "submit_participation_reaction", None)
         if submitter is None:
+            if admission is not None or effect_id is not None:
+                raise EffectNotDeliveredError("participation reaction submitter is not composed")
             return None
+        kwargs: dict[str, object] = {
+            "target_message_id": str(target_message_id),
+            "emoji": str(emoji),
+            "channel": str(channel),
+            "chat_id": str(chat_id),
+        }
+        if effect_id is not None:
+            kwargs["effect_id"] = str(effect_id)
+        if admission is not None:
+            kwargs["admission"] = admission
         return await submitter(
-            target_message_id=str(target_message_id),
-            emoji=str(emoji),
-            channel=str(channel),
-            chat_id=str(chat_id),
+            **kwargs,
         )
 
     def __getattr__(self, name: str) -> Any:

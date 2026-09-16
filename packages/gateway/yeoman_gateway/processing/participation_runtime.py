@@ -28,6 +28,12 @@ from typing import Any, Protocol, TypeAlias
 from loguru import logger
 
 from yeoman_gateway.consciousness.log import deterministic_effect_id
+from yeoman_gateway.processing.models import (
+    ReactionPayload,
+    TextPayload,
+    canonical_hash,
+    payload_to_mapping,
+)
 from yeoman_gateway.processing.participation import (
     ParticipationDecision,
     ParticipationDecisionError,
@@ -97,6 +103,15 @@ class ParticipationAdmission:
     emoji: str | None = None
     target_message_id: str | None = None
     anchor_message_id: str | None = None
+    admission_id: str = ""
+    source_event_ids: tuple[str, ...] = ()
+    source_principals: tuple[tuple[str, str], ...] = ()
+    policy_version: str = ""
+    policy_hash: str = ""
+    arbitration_revision: int = 0
+    contribution_type: str = ""
+    payload_hash: str = ""
+    approval_revision: int = 0
 
 
 class ParticipationRuntime:
@@ -326,10 +341,9 @@ class ParticipationRuntime:
             raise ParticipationBlockedError("source_not_authorized")
         # The originating participants must still be authorized *themselves*: a
         # service principal that may transport an effect is not a substitute for the
-        # sender's access (spec section 3.1).
-        for sender in self._source_principals(
-            opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
-        ):
+        # sender's access (spec section 3.1). Missing source evidence is not an allow.
+        principals = self._source_principal_values(opportunity)
+        for _source_id, sender in principals:
             if not self._is_participant_allowed(opportunity.channel, opportunity.chat_id, sender):
                 raise ParticipationBlockedError("source_principal_not_authorized")
         actions = snapshot.get("allowed_actions")
@@ -617,6 +631,20 @@ class ParticipationRuntime:
             operation="reaction",
             proposal_id=opportunity.opportunity_id,
         )
+        try:
+            admission = self._build_admission(
+                opportunity=opportunity,
+                snapshot=inputs.snapshot,
+                decision=decision,
+                effect_id=effect_id,
+                payload=ReactionPayload(
+                    message_id=str(decision.target_message_id),
+                    emoji=str(decision.emoji),
+                ),
+            )
+        except ParticipationBlockedError as blocked:
+            await self._record(opportunity, "reaction_skipped", blocked.reason)
+            return {"status": "reaction_skipped", "reason": blocked.reason}
         reserved = await self._ledger.reserve_delivery(
             proposal_id=opportunity.opportunity_id,
             effect_id=effect_id,
@@ -630,13 +658,23 @@ class ParticipationRuntime:
         if not reserved:
             await self._record(opportunity, "skipped", "reaction_budget_exhausted")
             return {"status": "skipped", "reason": "reaction_budget_exhausted"}
-        receipt = await self._reactor(
-            target_message_id=str(decision.target_message_id),
-            emoji=str(decision.emoji),
-            channel=opportunity.channel,
-            chat_id=opportunity.chat_id,
-            effect_id=effect_id,
-        )
+        try:
+            receipt = await self._reactor(
+                target_message_id=str(decision.target_message_id),
+                emoji=str(decision.emoji),
+                channel=opportunity.channel,
+                chat_id=opportunity.chat_id,
+                effect_id=effect_id,
+                admission=admission,
+            )
+        except BaseException as exc:  # noqa: BLE001 - unknown transport work keeps hold
+            logger.warning(
+                "participation_reaction_unknown chat={} error_type={}",
+                opportunity.chat_id,
+                type(exc).__name__,
+            )
+            await self._record(opportunity, "reaction_unknown", type(exc).__name__)
+            return {"status": "reaction_unknown", "reason": type(exc).__name__}
         # A routed-but-failed reaction is not success: the receipt decides.
         accepted = bool(getattr(receipt, "accepted", False))
         state = str(getattr(receipt, "state", "") or "")
@@ -649,7 +687,7 @@ class ParticipationRuntime:
                 evidence_ref=str(getattr(receipt, "attempt_id", "") or effect_id),
                 now_ms=int(self._clock_ms()),
             )
-        else:
+        elif state in {"failed", "not_executed", "blocked", "cancelled", "expired"}:
             await self._ledger.release_delivery(
                 opportunity.opportunity_id,
                 effect_id=effect_id,
@@ -659,6 +697,12 @@ class ParticipationRuntime:
             )
             await self._record(opportunity, "reaction_failed", state or "no_receipt")
             return {"status": "reaction_failed", "reason": state or "no_receipt"}
+        else:
+            # A missing/unknown/in-flight outcome is not evidence that no transport
+            # work happened. Keep the reservation for reconciliation instead of making
+            # a later retry double-send the same reaction.
+            await self._record(opportunity, "reaction_unknown", state or "no_receipt")
+            return {"status": "reaction_unknown", "reason": state or "no_receipt"}
         await self._record(opportunity, "reaction_submitted", decision.reason)
         return {"status": "reaction_submitted", "effect_id": effect_id}
 
@@ -673,7 +717,6 @@ class ParticipationRuntime:
         if self._submission is None:
             await self._record(opportunity, "comment_skipped", "no_submission_path")
             return {"status": "comment_skipped", "reason": "no_submission_path"}
-        payload_hash = str(snapshot.get("payload_hash") or "")
         reservation = _reservation_for_intent(inputs, decision.intent)
         if not reservation:
             await self._record(opportunity, "comment_skipped", "no_comment_limits")
@@ -732,34 +775,132 @@ class ParticipationRuntime:
             await self._record(opportunity, "generation_failed", "empty_draft")
             return {"status": "generation_failed", "reason": "empty_draft"}
         self._count("generated")
-        admission = ParticipationAdmission(
-            opportunity_id=opportunity.opportunity_id,
-            channel=opportunity.channel,
-            chat_id=opportunity.chat_id,
-            activation_epoch=opportunity.activation_epoch,
-            lane=str(snapshot.get("lane") or opportunity.lane),
-            observed_revision=opportunity.observed_revision,
-            action=decision.action,
-            intent=decision.intent,
-            purpose=decision.purpose,
-            emoji=decision.emoji,
-            target_message_id=decision.target_message_id,
-            anchor_message_id=decision.anchor_message_id,
-        )
-        # The reservation now belongs to a submitted effect: local submission alone
-        # holds capacity and produces no statement (spec section 9).
-        await self._ledger.record_send_attempt(
-            opportunity.opportunity_id, effect_id=effect_id, now_ms=int(self._clock_ms())
-        )
+        payload = TextPayload(text=text)
+        try:
+            admission = self._build_admission(
+                opportunity=opportunity,
+                snapshot=snapshot,
+                decision=decision,
+                effect_id=effect_id,
+                payload=payload,
+            )
+        except ParticipationBlockedError as blocked:
+            await self._ledger.release_delivery(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                state="failed",
+                reason=blocked.reason,
+                now_ms=int(self._clock_ms()),
+            )
+            await self._record(opportunity, "comment_skipped", blocked.reason)
+            return {"status": "comment_skipped", "reason": blocked.reason}
         outcome = await self._submission.submit(
             admission=admission,
             effect_id=effect_id,
             content=text,
-            payload_hash=payload_hash,
+            payload_hash=admission.payload_hash,
         )
         status = str(getattr(outcome, "status", "") or "submitted")
         await self._record(opportunity, f"comment_{status}", decision.reason)
         return {"status": status, "effect_id": effect_id}
+
+    def _source_principal_values(
+        self, opportunity: ParticipationOpportunity
+    ) -> tuple[tuple[str, str], ...]:
+        """Resolve and freeze source principals for the immutable admission."""
+        try:
+            values = self._source_principals(
+                opportunity.channel, opportunity.chat_id, opportunity.source_event_ids
+            )
+        except Exception as exc:  # noqa: BLE001 - source ACL evidence is mandatory
+            raise ParticipationBlockedError("source_principals_unavailable") from exc
+        if values is None:
+            raise ParticipationBlockedError("source_principals_unavailable")
+        source_ids = tuple(
+            str(item or "").strip() for item in opportunity.source_event_ids
+        )
+        if not source_ids or any(not item for item in source_ids):
+            raise ParticipationBlockedError("source_events_missing")
+        if len(set(source_ids)) != len(source_ids):
+            raise ParticipationBlockedError("source_principals_unavailable")
+        frozen: list[tuple[str, str]] = []
+        for value in values:
+            if not isinstance(value, (tuple, list)) or len(value) != 2:
+                raise ParticipationBlockedError("source_principals_unavailable")
+            source_id = str(value[0] or "").strip()
+            sender = str(value[1] or "").strip()
+            if not source_id or not sender or source_id not in source_ids:
+                raise ParticipationBlockedError("source_principals_unavailable")
+            if any(existing[0] == source_id for existing in frozen):
+                raise ParticipationBlockedError("source_principals_unavailable")
+            frozen.append((source_id, sender))
+        if len(frozen) != len(source_ids) or {item[0] for item in frozen} != set(source_ids):
+            raise ParticipationBlockedError("source_principals_unavailable")
+        return tuple(frozen)
+
+    def _build_admission(
+        self,
+        *,
+        opportunity: ParticipationOpportunity,
+        snapshot: Mapping[str, Any],
+        decision: ParticipationDecision,
+        effect_id: str,
+        payload: object,
+    ) -> ParticipationAdmission:
+        source_event_ids = tuple(
+            str(item or "").strip() for item in opportunity.source_event_ids
+        )
+        if not source_event_ids or any(not item for item in source_event_ids):
+            raise ParticipationBlockedError("source_events_missing")
+        source_principals = self._source_principal_values(opportunity)
+        payload_hash = canonical_hash(payload_to_mapping(payload))
+        if not payload_hash:
+            raise ParticipationBlockedError("payload_hash_missing")
+        policy_hash = str(snapshot.get("policy_hash") or "").strip()
+        if not policy_hash:
+            policy_hash = canonical_hash(dict(snapshot))
+        policy_version = str(snapshot.get("policy_version") or "").strip()
+        if not policy_version:
+            policy_version = f"snapshot:{policy_hash[:16]}"
+        try:
+            activation_epoch = int(snapshot.get("activation_epoch", opportunity.activation_epoch))
+            arbitration_revision = _snapshot_nonnegative_int(
+                snapshot, "arbitration_revision", default=0
+            )
+            approval_revision = _snapshot_nonnegative_int(
+                snapshot, "approval_revision", default=0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ParticipationBlockedError("invalid_admission_revision") from exc
+        if activation_epoch != int(opportunity.activation_epoch):
+            raise ParticipationBlockedError("epoch_changed")
+        action = str(decision.action or "").strip()
+        intent = str(decision.intent or "").strip()
+        if action not in _ACTIONS or not intent:
+            raise ParticipationBlockedError("invalid_admission_decision")
+        return ParticipationAdmission(
+            opportunity_id=opportunity.opportunity_id,
+            channel=opportunity.channel,
+            chat_id=opportunity.chat_id,
+            activation_epoch=activation_epoch,
+            lane=str(snapshot.get("lane") or opportunity.lane),
+            observed_revision=opportunity.observed_revision,
+            action=action,
+            intent=intent,
+            purpose=str(decision.purpose or ""),
+            emoji=decision.emoji,
+            target_message_id=decision.target_message_id,
+            anchor_message_id=decision.anchor_message_id,
+            admission_id=f"adm-{effect_id}",
+            source_event_ids=source_event_ids,
+            source_principals=source_principals,
+            policy_version=policy_version,
+            policy_hash=policy_hash,
+            arbitration_revision=arbitration_revision,
+            contribution_type=str(decision.contribution_type or ""),
+            payload_hash=payload_hash,
+            approval_revision=approval_revision,
+        )
 
     # -- recording ---------------------------------------------------------------------
 
@@ -1008,7 +1149,7 @@ class ParticipationAuthorizationRequest:
     reservation_state: str | None
     payload_hash: str
     expected_payload_hash: str
-    source_principals_authorized: bool = True
+    source_principals_authorized: bool = False
 
 
 class ParticipationEffectAuthorizer:
@@ -1023,6 +1164,8 @@ class ParticipationEffectAuthorizer:
     def check(self, request: ParticipationAuthorizationRequest) -> tuple[bool, str]:
         if request.is_shadow or request.lane == "shadow":
             return False, "shadow_lane"
+        if request.lane != "production" or getattr(request.admission, "lane", None) != "production":
+            return False, "admission_lane_mismatch"
         if not request.feature_enabled:
             return False, "feature_disabled"
         if not request.opted_in:
@@ -1033,15 +1176,17 @@ class ParticipationEffectAuthorizer:
             return False, str(request.is_paused)
         if not request.source_authorized:
             return False, "source_not_authorized"
-        if not request.source_principals_authorized:
+        if request.source_principals_authorized is not True:
             return False, "source_principal_not_authorized"
         if request.reservation_state is None:
             return False, "no_reservation"
-        if request.reservation_state in {"failed", "cancelled", "expired"}:
+        if request.reservation_state != "submitted":
+            if request.reservation_state not in {"failed", "cancelled", "expired"}:
+                return False, "reservation_not_submitted"
             return False, f"reservation_{request.reservation_state}"
-        if request.expected_payload_hash and (
-            request.payload_hash != request.expected_payload_hash
-        ):
+        if not request.payload_hash or not request.expected_payload_hash:
+            return False, "payload_hash_missing"
+        if request.payload_hash != request.expected_payload_hash:
             return False, "payload_hash_mismatch"
         return True, "allow"
 
