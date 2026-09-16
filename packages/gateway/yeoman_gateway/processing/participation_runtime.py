@@ -22,7 +22,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from datetime import UTC, datetime
+from typing import Any, Protocol, TypeAlias
 
 from loguru import logger
 
@@ -32,6 +33,10 @@ from yeoman_gateway.processing.participation import (
     ParticipationDecisionError,
     ParticipationJudge,
     ParticipationOpportunity,
+)
+from yeoman_gateway.processing.participation_context import (
+    ParticipationContextBounds,
+    ParticipationDecisionInputs,
 )
 
 #: Counters that must stay distinguishable in operational traces (spec section 12).
@@ -47,6 +52,12 @@ COUNTERS: tuple[str, ...] = (
     "shadow_decision",
     "duplicate_suppressed",
 )
+
+_ACTIONS: tuple[str, ...] = ("silence", "react", "comment")
+_INTENTS: frozenset[str] = frozenset(("direct", "continue", "initiate"))
+_LIMIT_KINDS: frozenset[str] = frozenset(("rolling", "calendar_day"))
+_MISSING = object()
+_LedgerLimit: TypeAlias = tuple[str, int, int] | tuple[str, int, int, str]
 
 
 class ParticipationBlockedError(RuntimeError):
@@ -112,7 +123,7 @@ class ParticipationRuntime:
         self._snapshot_provider = snapshot_provider
         self._is_paused = is_paused or (lambda channel, chat_id: None)
         self._is_source_allowed = is_source_allowed or (
-            lambda channel, chat_id, sources: True
+            lambda channel, chat_id, sources: False
         )
         self._source_principals = source_principals or (
             lambda channel, chat_id, sources: ()
@@ -141,14 +152,13 @@ class ParticipationRuntime:
         """Evaluate one admitted opportunity. Never raises for a decision failure."""
         self._count("admitted")
         try:
-            snapshot = dict(
-                self._snapshot_provider(
-                    opportunity.channel,
-                    opportunity.chat_id,
-                    epoch=int(opportunity.activation_epoch),
-                    opportunity=opportunity,
-                )
+            raw_snapshot = self._snapshot_provider(
+                opportunity.channel,
+                opportunity.chat_id,
+                epoch=int(opportunity.activation_epoch),
+                opportunity=opportunity,
             )
+            snapshot = _snapshot_mapping(raw_snapshot)
         except ParticipationBlockedError as blocked:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", blocked.reason)
@@ -171,19 +181,60 @@ class ParticipationRuntime:
             await self._record(opportunity, "preflight_skipped", "no_judge")
             return {"status": "skipped", "reason": "no_judge"}
 
-        context = await self._context_builder.build(opportunity)
+        try:
+            inputs = await self._decision_inputs(opportunity, snapshot)
+            if not any(action != "silence" for action in inputs.allowed_actions):
+                raise ParticipationBlockedError("no_feasible_action")
+        except ParticipationBlockedError as blocked:
+            self._count("preflight_skipped")
+            await self._record(opportunity, "preflight_skipped", blocked.reason)
+            return {"status": "skipped", "reason": blocked.reason}
+
+        try:
+            context = await self._context_builder.build(opportunity, inputs=inputs)
+        except ParticipationDecisionError as failure:
+            self._count("preflight_skipped")
+            await self._record(opportunity, "preflight_skipped", failure.reason)
+            return {"status": "skipped", "reason": failure.reason}
+        except Exception:
+            self._count("preflight_skipped")
+            await self._record(opportunity, "preflight_skipped", "context_error")
+            return {"status": "skipped", "reason": "context_error"}
         attempt_id = f"{opportunity.opportunity_id}:0"
-        charged = await self._ledger.reserve_judge_attempt(
-            attempt_id,
-            opportunity_id=opportunity.opportunity_id,
-            channel=opportunity.channel,
-            chat_id=opportunity.chat_id,
-            now_ms=int(self._clock_ms()),
-            hourly_limit=int(snapshot.get("judge_calls_per_hour", 0)),
-            min_gap_ms=int(snapshot.get("min_gap_seconds", 0)) * 1000,
-            continuation_candidate=bool(snapshot.get("continuation_candidate", False)),
-            continuation_reserve=int(snapshot.get("continuation_reserve", 0)),
-        )
+        try:
+            charged = await self._ledger.reserve_judge_attempt(
+                attempt_id,
+                opportunity_id=opportunity.opportunity_id,
+                channel=opportunity.channel,
+                chat_id=opportunity.chat_id,
+                now_ms=int(self._clock_ms()),
+                hourly_limit=_snapshot_int(
+                    snapshot,
+                    "judge_calls_per_hour",
+                    "max_unaddressed_judge_calls_per_hour",
+                    default=0,
+                ),
+                min_gap_ms=_snapshot_int(
+                    snapshot,
+                    "min_gap_seconds",
+                    "min_unaddressed_judge_gap_seconds",
+                    default=0,
+                )
+                * 1000,
+                continuation_candidate=_snapshot_bool(
+                    snapshot, "continuation_candidate", default=False
+                ),
+                continuation_reserve=_snapshot_int(
+                    snapshot,
+                    "continuation_reserve",
+                    "continuation_judge_reserve",
+                    default=0,
+                ),
+            )
+        except ParticipationBlockedError as blocked:
+            self._count("preflight_skipped")
+            await self._record(opportunity, "preflight_skipped", blocked.reason)
+            return {"status": "skipped", "reason": blocked.reason}
         if not charged:
             self._count("duplicate_suppressed")
             await self._record(opportunity, "skipped", "attempt_not_available")
@@ -207,6 +258,14 @@ class ParticipationRuntime:
             await self._ledger.record_judge_outcome(attempt_id, outcome="provider_error")
             await self._record(opportunity, "judge_failed", "provider_error")
             return {"status": "judge_failed", "reason": "provider_error"}
+
+        try:
+            self._validate_decision(decision, inputs=inputs, context=context)
+        except ParticipationDecisionError as failure:
+            self._count("judge_failed")
+            await self._ledger.record_judge_outcome(attempt_id, outcome=failure.reason)
+            await self._record(opportunity, "judge_failed", failure.reason)
+            return {"status": "judge_failed", "reason": failure.reason}
         await self._ledger.record_judge_outcome(attempt_id, outcome=decision.action)
 
         if lane == "shadow":
@@ -220,6 +279,16 @@ class ParticipationRuntime:
                 "intent": decision.intent,
             }
 
+        if (
+            inputs.approval_required
+            and decision.action == "comment"
+            and decision.intent == "initiate"
+        ):
+            # Approval persistence/admission belongs to the next wave. Never turn a
+            # required approval into an unapproved direct submission here.
+            await self._record(opportunity, "comment_skipped", "approval_required")
+            return {"status": "comment_skipped", "reason": "approval_required"}
+
         if decision.action == "silence":
             self._count("deliberate_silence")
             await self._record(opportunity, "decided_silence", decision.reason)
@@ -227,19 +296,19 @@ class ParticipationRuntime:
 
         if decision.action == "react":
             self._count("reaction_selected")
-            return await self._run_reaction(opportunity, snapshot, decision)
+            return await self._run_reaction(opportunity, decision, inputs)
 
         self._count("comment_selected")
-        return await self._run_comment(opportunity, snapshot, decision, context)
+        return await self._run_comment(opportunity, snapshot, decision, context, inputs)
 
     # -- boundaries --------------------------------------------------------------------
 
     def _preflight(
         self, opportunity: ParticipationOpportunity, snapshot: Mapping[str, Any]
     ) -> None:
-        if not bool(snapshot.get("enabled", False)):
+        if not _snapshot_bool(snapshot, "enabled", default=False):
             raise ParticipationBlockedError("feature_disabled")
-        if not bool(snapshot.get("opted_in", False)):
+        if not _snapshot_bool(snapshot, "opted_in", default=False):
             raise ParticipationBlockedError("chat_not_opted_in")
         if str(snapshot.get("invalid_reason") or ""):
             raise ParticipationBlockedError(str(snapshot["invalid_reason"]))
@@ -268,11 +337,276 @@ class ParticipationRuntime:
             # Only silence is feasible: do not spend a provider call to be told that.
             raise ParticipationBlockedError("no_feasible_action")
 
-    async def _run_reaction(
+    async def _decision_inputs(
         self,
         opportunity: ParticipationOpportunity,
         snapshot: Mapping[str, Any],
+    ) -> ParticipationDecisionInputs:
+        """Build one trusted input bundle from the activation snapshot and ledger.
+
+        The snapshot is the only policy source here. The ledger is consulted only for
+        current capacity; it remains authoritative when the reservation is acquired.
+        Missing or malformed capacity evidence fails closed instead of becoming an
+        implicit allow.
+        """
+        now_ms = int(self._clock_ms())
+        comment_limits = _snapshot_limits(snapshot, "comment_limits", "comment")
+        reaction_limits = _snapshot_limits(snapshot, "reaction_limits", "reaction")
+        initiation_limits = _snapshot_limits(snapshot, "initiation_limits", "initiation")
+        if not initiation_limits:
+            daily_cap = _snapshot_int(
+                snapshot,
+                "spontaneity_daily_cap",
+                "initiation_daily_cap",
+                "daily_cap",
+                default=0,
+            )
+            if daily_cap > 0:
+                initiation_limits = (("initiation", daily_cap, 86_400_000, "calendar_day"),)
+
+        comment_remaining = await self._remaining_capacity(
+            opportunity, comment_limits, now_ms=now_ms
+        )
+        reaction_remaining = await self._remaining_capacity(
+            opportunity, reaction_limits, now_ms=now_ms
+        )
+        initiation_remaining = await self._remaining_capacity(
+            opportunity, initiation_limits, now_ms=now_ms
+        )
+        judge_limit = _snapshot_int(
+            snapshot,
+            "judge_calls_per_hour",
+            "max_unaddressed_judge_calls_per_hour",
+            default=0,
+        )
+        judge_remaining = await self._remaining_judge_capacity(
+            opportunity, judge_limit, now_ms=now_ms
+        )
+
+        allow_initiation = _snapshot_bool(snapshot, "allow_initiation", default=False)
+        allow_continuation = _snapshot_bool(snapshot, "allow_continuation", default=False)
+        allow_reactions = _snapshot_bool(snapshot, "allow_reactions", default=False)
+        spontaneity_enabled = _snapshot_bool(snapshot, "spontaneity_enabled", default=False)
+        daily_cap = _snapshot_int(
+            snapshot,
+            "spontaneity_daily_cap",
+            "initiation_daily_cap",
+            "daily_cap",
+            default=0,
+        )
+        in_quiet_hours = _in_quiet_hours(snapshot, now_ms)
+        contribution_types = _contribution_types(snapshot)
+        comment_intents: set[str] = set()
+        if (
+            allow_continuation
+            and _snapshot_bool(snapshot, "continuation_candidate", default=False)
+            and comment_remaining > 0
+            and contribution_types
+        ):
+            comment_intents.add("continue")
+        if (
+            allow_initiation
+            and spontaneity_enabled
+            and daily_cap > 0
+            and initiation_remaining > 0
+            and comment_remaining > 0
+            and contribution_types
+            and not in_quiet_hours
+        ):
+            comment_intents.add("initiate")
+        direct_addressed = _snapshot_bool(snapshot, "direct_addressed", default=False)
+        if direct_addressed and comment_remaining > 0:
+            comment_intents.add("direct")
+
+        reaction_allowed = allow_reactions and reaction_remaining > 0
+        candidate_actions: set[str] = {"silence"}
+        if judge_remaining > 0:
+            if reaction_allowed:
+                candidate_actions.add("react")
+            if comment_intents:
+                candidate_actions.add("comment")
+        requested_actions = _snapshot_tokens(snapshot, "allowed_actions")
+        if requested_actions is not None:
+            candidate_actions &= set(requested_actions)
+        reply_action = _snapshot_value(snapshot, "reply_action")
+        if reply_action is not _MISSING and reply_action is not None:
+            if reply_action not in {"answer", "react", "silence"}:
+                raise ParticipationBlockedError("invalid_snapshot")
+            reply_allowed = {
+                "answer": {"silence", "comment"},
+                "react": {"silence", "react"},
+                "silence": {"silence"},
+            }[str(reply_action)]
+            candidate_actions &= reply_allowed
+        candidate_actions.add("silence")
+        allowed_actions = tuple(action for action in _ACTIONS if action in candidate_actions)
+
+        requested_intents = _snapshot_tokens(snapshot, "allowed_intents")
+        allowed_intents = set(comment_intents)
+        if reaction_allowed:
+            # Reactions carry a neutral label for model bookkeeping. This label does
+            # not grant the corresponding comment intent (checked below).
+            allowed_intents.add("continue" if allow_continuation else "initiate")
+        if direct_addressed and "direct" in comment_intents:
+            allowed_intents.add("direct")
+        if requested_intents is not None:
+            allowed_intents &= set(requested_intents)
+
+        trusted_snapshot = _snapshot_mapping(snapshot)
+        trusted_snapshot.update(
+            {
+                "allow_initiation": allow_initiation,
+                "allow_continuation": allow_continuation,
+                "allow_reactions": allow_reactions,
+                "spontaneity_enabled": spontaneity_enabled,
+                "spontaneity_daily_cap": daily_cap,
+                "allowed_contribution_types": _contribution_types(snapshot),
+                "comment_allowed_intents": tuple(sorted(comment_intents)),
+                "reaction_limits": reaction_limits,
+                "comment_limits": comment_limits,
+                "initiation_limits": initiation_limits,
+            }
+        )
+        bounds = ParticipationContextBounds(
+            window_minutes=_snapshot_positive_int(
+                snapshot, "context_window_minutes", default=120
+            ),
+            max_messages=_snapshot_positive_int(
+                snapshot, "context_max_messages", default=40
+            ),
+            max_anchors=_snapshot_positive_int(
+                snapshot, "context_max_anchors", default=10
+            ),
+        )
+        remaining_budgets = (
+            ("judge_calls_per_hour", judge_remaining),
+            ("initiation_per_day", initiation_remaining),
+            ("comments_per_window", comment_remaining),
+            ("reactions_per_window", reaction_remaining),
+        )
+        reservations: list[tuple[str, tuple[_LedgerLimit, ...]]] = []
+        if "initiate" in comment_intents:
+            reservations.append(("initiate", (*initiation_limits, *comment_limits)))
+        if "continue" in comment_intents:
+            reservations.append(("continue", comment_limits))
+        if "direct" in comment_intents:
+            reservations.append(("direct", comment_limits))
+        return ParticipationDecisionInputs(
+            snapshot=trusted_snapshot,
+            bounds=bounds,
+            allowed_actions=allowed_actions,
+            allowed_intents=frozenset(allowed_intents),
+            remaining_budgets=remaining_budgets,
+            reservation_limits_by_intent=tuple(reservations),
+            approval_required=_snapshot_bool(snapshot, "approval_required", default=False),
+            arbitration_revision=_snapshot_nonnegative_int(
+                snapshot, "arbitration_revision", default=0
+            ),
+            current_source_ids=tuple(str(item) for item in opportunity.source_event_ids),
+            continuation_candidate=_snapshot_bool(
+                snapshot, "continuation_candidate", default=False
+            ),
+        )
+
+    async def _remaining_capacity(
+        self,
+        opportunity: ParticipationOpportunity,
+        limits: tuple[_LedgerLimit, ...],
+        *,
+        now_ms: int,
+    ) -> int:
+        if not limits:
+            return 0
+        consumed = getattr(self._ledger, "consumed_slots", None)
+        if not callable(consumed):
+            raise ParticipationBlockedError("capacity_unavailable")
+        remaining: list[int] = []
+        for category, limit, window_ms, *kind in limits:
+            window_kind = kind[0] if kind else "rolling"
+            try:
+                used = await consumed(
+                    channel=opportunity.channel,
+                    chat_id=opportunity.chat_id,
+                    category=category,
+                    now_ms=now_ms,
+                    window_ms=window_ms,
+                    window_kind=window_kind,
+                )
+            except Exception as exc:  # noqa: BLE001 - capacity evidence is fail-closed
+                raise ParticipationBlockedError("capacity_unavailable") from exc
+            try:
+                remaining.append(max(0, int(limit) - int(used)))
+            except (TypeError, ValueError) as exc:
+                raise ParticipationBlockedError("capacity_unavailable") from exc
+        return min(remaining)
+
+    async def _remaining_judge_capacity(
+        self,
+        opportunity: ParticipationOpportunity,
+        limit: int,
+        *,
+        now_ms: int,
+    ) -> int:
+        if limit <= 0:
+            return 0
+        attempts_since = getattr(self._ledger, "judge_attempts_since", None)
+        if not callable(attempts_since):
+            raise ParticipationBlockedError("capacity_unavailable")
+        try:
+            attempts = await attempts_since(
+                channel=opportunity.channel,
+                chat_id=opportunity.chat_id,
+                since_ms=now_ms - 3_600_000,
+            )
+        except Exception as exc:  # noqa: BLE001 - capacity evidence is fail-closed
+            raise ParticipationBlockedError("capacity_unavailable") from exc
+        try:
+            count = len(attempts)
+        except TypeError as exc:
+            raise ParticipationBlockedError("capacity_unavailable") from exc
+        return max(0, int(limit) - count)
+
+    def _validate_decision(
+        self,
         decision: ParticipationDecision,
+        *,
+        inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
+    ) -> None:
+        """Re-check the selected action/intent before any reservation or draft."""
+        action = str(decision.action)
+        intent = str(decision.intent)
+        if action == "silence":
+            return
+        if action not in set(inputs.allowed_actions):
+            raise ParticipationDecisionError("invalid_response", detail="action_not_allowed")
+        if action == "react":
+            if not decision.target_message_id or not decision.emoji:
+                raise ParticipationDecisionError("missing_target")
+            return
+        if intent not in set(inputs.allowed_intents):
+            raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
+        comment_intents = set(
+            str(item)
+            for item in (_snapshot_value(inputs.snapshot, "comment_allowed_intents", ()) or ())
+        )
+        if intent not in comment_intents:
+            raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
+        contribution = str(decision.contribution_type or "").strip()
+        if contribution not in set(_contribution_types(inputs.snapshot)):
+            raise ParticipationDecisionError(
+                "invalid_response", detail="contribution_type_not_allowed"
+            )
+        if intent == "continue" and not _has_delivered_anchor(context):
+            raise ParticipationDecisionError(
+                "invalid_response", detail="continuation_without_delivered_anchor"
+            )
+
+    async def _run_reaction(
+        self,
+        opportunity: ParticipationOpportunity,
+        decision: ParticipationDecision,
+        inputs: ParticipationDecisionInputs,
     ) -> dict[str, object]:
         if self._reactor is None or not decision.target_message_id or not decision.emoji:
             await self._record(opportunity, "reaction_skipped", "no_reaction_path")
@@ -289,7 +623,7 @@ class ParticipationRuntime:
             channel=opportunity.channel,
             chat_id=opportunity.chat_id,
             now_ms=int(self._clock_ms()),
-            limits=tuple(snapshot.get("reaction_limits") or ()),
+            limits=_snapshot_limits(inputs.snapshot, "reaction_limits", "reaction"),
             observed_revision=opportunity.observed_revision,
             activation_epoch=opportunity.activation_epoch,
         )
@@ -334,12 +668,13 @@ class ParticipationRuntime:
         snapshot: Mapping[str, Any],
         decision: ParticipationDecision,
         context: Mapping[str, Any],
+        inputs: ParticipationDecisionInputs,
     ) -> dict[str, object]:
         if self._submission is None:
             await self._record(opportunity, "comment_skipped", "no_submission_path")
             return {"status": "comment_skipped", "reason": "no_submission_path"}
         payload_hash = str(snapshot.get("payload_hash") or "")
-        reservation = tuple(snapshot.get("comment_limits") or ())
+        reservation = _reservation_for_intent(inputs, decision.intent)
         if not reservation:
             await self._record(opportunity, "comment_skipped", "no_comment_limits")
             return {"status": "comment_skipped", "reason": "no_comment_limits"}
@@ -447,6 +782,203 @@ class ParticipationRuntime:
             )
         except Exception as exc:  # noqa: BLE001 - recording must not break decisions
             logger.warning("participation_record_failed error_type={}", type(exc).__name__)
+
+
+def _snapshot_value(snapshot: Any, name: str, default: Any = _MISSING) -> Any:
+    """Read one canonical snapshot field, including its nested policy object."""
+    if isinstance(snapshot, Mapping):
+        if name in snapshot:
+            return snapshot[name]
+        nested = snapshot.get("participation")
+    else:
+        if hasattr(snapshot, name):
+            return getattr(snapshot, name)
+        nested = getattr(snapshot, "participation", None)
+    if isinstance(nested, Mapping):
+        if name in nested:
+            return nested[name]
+        aliases = {
+            "allow_initiation": "allowInitiation",
+            "allow_continuation": "allowContinuation",
+            "allow_reactions": "allowReactions",
+            "max_unaddressed_judge_calls_per_hour": "maxUnaddressedJudgeCallsPerHour",
+        }
+        alias = aliases.get(name)
+        if alias and alias in nested:
+            return nested[alias]
+    elif nested is not None and hasattr(nested, name):
+        return getattr(nested, name)
+    return default
+
+
+def _snapshot_mapping(snapshot: Any) -> dict[str, Any]:
+    if isinstance(snapshot, Mapping):
+        return dict(snapshot)
+    fields = (
+        "enabled",
+        "opted_in",
+        "invalid_reason",
+        "activation_epoch",
+        "lane",
+        "policy_version",
+        "context_window_minutes",
+        "context_max_messages",
+        "participation",
+    )
+    return {name: getattr(snapshot, name) for name in fields if hasattr(snapshot, name)}
+
+
+def _snapshot_tokens(snapshot: Any, name: str) -> tuple[str, ...] | None:
+    value = _snapshot_value(snapshot, name)
+    if value is _MISSING or value is None:
+        return None
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        raise ParticipationBlockedError("invalid_snapshot")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ParticipationBlockedError("invalid_snapshot")
+        token = item.strip()
+        if token not in _ACTIONS and token not in _INTENTS:
+            raise ParticipationBlockedError("invalid_snapshot")
+        if token not in result:
+            result.append(token)
+    return tuple(result)
+
+
+def _snapshot_limits(
+    snapshot: Any, name: str, category: str
+) -> tuple[_LedgerLimit, ...]:
+    value = _snapshot_value(snapshot, name)
+    if value is _MISSING or value is None:
+        return ()
+    if not isinstance(value, tuple):
+        raise ParticipationBlockedError("invalid_reservation_limits")
+    result: list[_LedgerLimit] = []
+    for entry in value:
+        if not isinstance(entry, tuple) or len(entry) not in (3, 4):
+            raise ParticipationBlockedError("invalid_reservation_limits")
+        if entry[0] != category:
+            raise ParticipationBlockedError("invalid_reservation_limits")
+        if (
+            not isinstance(entry[1], int)
+            or isinstance(entry[1], bool)
+            or not isinstance(entry[2], int)
+            or isinstance(entry[2], bool)
+            or int(entry[1]) <= 0
+            or int(entry[2]) <= 0
+        ):
+            raise ParticipationBlockedError("invalid_reservation_limits")
+        if category == "initiation":
+            if len(entry) != 4 or entry[3] != "calendar_day":
+                raise ParticipationBlockedError("invalid_reservation_limits")
+            result.append((entry[0], int(entry[1]), int(entry[2]), entry[3]))
+            continue
+        if len(entry) == 4 and entry[3] != "rolling":
+            raise ParticipationBlockedError("invalid_reservation_limits")
+        if len(entry) == 3:
+            result.append((entry[0], int(entry[1]), int(entry[2])))
+        else:
+            result.append((entry[0], int(entry[1]), int(entry[2]), entry[3]))
+    return tuple(result)
+
+
+def _snapshot_int(snapshot: Any, *names: str, default: int) -> int:
+    for name in names:
+        value = _snapshot_value(snapshot, name)
+        if value is _MISSING or value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ParticipationBlockedError("invalid_snapshot")
+        return int(value)
+    return int(default)
+
+
+def _snapshot_positive_int(snapshot: Any, name: str, *, default: int) -> int:
+    value = _snapshot_int(snapshot, name, default=default)
+    if value <= 0:
+        raise ParticipationBlockedError("invalid_snapshot")
+    return value
+
+
+def _snapshot_nonnegative_int(snapshot: Any, name: str, *, default: int) -> int:
+    return _snapshot_int(snapshot, name, default=default)
+
+
+def _snapshot_bool(snapshot: Any, name: str, *, default: bool) -> bool:
+    value = _snapshot_value(snapshot, name)
+    if value is _MISSING or value is None:
+        return bool(default)
+    if not isinstance(value, bool):
+        raise ParticipationBlockedError("invalid_snapshot")
+    return value
+
+
+def _contribution_types(snapshot: Any) -> tuple[str, ...]:
+    value = _snapshot_value(snapshot, "allowed_contribution_types")
+    if value is _MISSING or value is None:
+        value = _snapshot_value(snapshot, "spontaneity_allowed_actions")
+    if value is _MISSING or value is None:
+        return ()
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        raise ParticipationBlockedError("invalid_snapshot")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ParticipationBlockedError("invalid_snapshot")
+        if item.strip() not in result:
+            result.append(item.strip())
+    return tuple(result)
+
+
+def _in_quiet_hours(snapshot: Any, now_ms: int) -> bool:
+    start = _snapshot_value(snapshot, "spontaneity_quiet_hours_start")
+    end = _snapshot_value(snapshot, "spontaneity_quiet_hours_end")
+    if start in (_MISSING, None, "") or end in (_MISSING, None, ""):
+        return False
+    try:
+        start_minutes = _clock_minutes(str(start))
+        end_minutes = _clock_minutes(str(end))
+    except ValueError:
+        return True
+    current = datetime.fromtimestamp(int(now_ms) / 1000, UTC)
+    current_minutes = current.hour * 60 + current.minute
+    if start_minutes == end_minutes:
+        return True
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+def _clock_minutes(value: str) -> int:
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(value)
+    hours, minutes = (int(part) for part in parts)
+    if not 0 <= hours <= 23 or not 0 <= minutes <= 59:
+        raise ValueError(value)
+    return hours * 60 + minutes
+
+
+def _has_delivered_anchor(context: Mapping[str, Any]) -> bool:
+    anchors = context.get("anchors")
+    if not isinstance(anchors, (tuple, list)):
+        return False
+    return any(
+        isinstance(anchor, Mapping)
+        and str(anchor.get("delivery_state") or "") == "delivered"
+        and bool(str(anchor.get("provider_message_id") or "").strip())
+        for anchor in anchors
+    )
+
+
+def _reservation_for_intent(
+    inputs: ParticipationDecisionInputs, intent: str
+) -> tuple[_LedgerLimit, ...]:
+    for candidate, limits in inputs.reservation_limits_by_intent:
+        if candidate == intent:
+            return tuple(limits)
+    return ()
 
 
 def _provider_message_id(receipt: object) -> str | None:

@@ -573,6 +573,33 @@ async def test_context_carries_trusted_inputs_not_a_verdict(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_context_renders_trusted_intents_and_remaining_budgets(tmp_path: Path) -> None:
+    builder = await _builder(tmp_path)
+    context = await builder.build(
+        _opportunity(),
+        inputs=ParticipationDecisionInputs(
+            snapshot={
+                "guidance": "Join only for football.",
+                "allowed_contribution_types": ("observation",),
+            },
+            bounds=ParticipationContextBounds(),
+            allowed_actions=("silence", "comment"),
+            allowed_intents=frozenset(("continue",)),
+            remaining_budgets=(("comments_per_window", 2),),
+            reservation_limits_by_intent=(("continue", (("comment", 3, 1_800_000),)),),
+            approval_required=False,
+            arbitration_revision=4,
+            current_source_ids=("required",),
+            continuation_candidate=True,
+        ),
+        now_ms=NOW_MS,
+    )
+    assert context["allowed_actions"] == ["silence", "comment"]
+    assert context["allowed_intents"] == ["continue"]
+    assert context["remaining_budgets"] == {"comments_per_window": 2}
+
+
+@pytest.mark.asyncio
 async def test_advisory_taste_requires_provenance(tmp_path: Path) -> None:
     def _taste(channel: str, chat_id: str):
         del channel, chat_id

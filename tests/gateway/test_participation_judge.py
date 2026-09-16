@@ -49,6 +49,7 @@ def _context(**overrides: object) -> dict[str, object]:
             }
         ],
         "allowed_actions": ["silence", "react", "comment"],
+        "allowed_intents": ["initiate", "continue", "direct"],
         "allowed_contribution_types": ["observation", "light_humor"],
         "guidance": "Join only for football.",
         "direct_addressed": False,
@@ -553,6 +554,41 @@ async def test_speaking_decisions_still_validate_their_evidence() -> None:
         with pytest.raises(ParticipationDecisionError) as error:
             await judge.decide(_opportunity(), _context())
         assert error.value.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_comment_intent_must_be_in_the_trusted_input_set() -> None:
+    judge = ParticipationJudge(
+        client=_Client(_payload(
+            action="comment",
+            intent="initiate",
+            purpose="answer briefly",
+            contribution_type="observation",
+        )),
+        allowed_emojis=(EMOJI,),
+    )
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context(allowed_intents=["continue"]))
+    assert error.value.reason == "invalid_response"
+    assert error.value.detail == "intent_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_missing_allowed_intents_fail_closed_for_speaking() -> None:
+    judge = ParticipationJudge(
+        client=_Client(_payload(
+            action="comment",
+            intent="initiate",
+            purpose="answer briefly",
+            contribution_type="observation",
+        )),
+        allowed_emojis=(EMOJI,),
+    )
+    context = _context()
+    context.pop("allowed_intents")
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), context)
+    assert error.value.detail == "intent_not_allowed"
 
 
 @pytest.mark.asyncio

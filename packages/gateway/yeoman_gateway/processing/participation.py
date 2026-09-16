@@ -288,10 +288,12 @@ class ParticipationJudge:
         ``continue`` requires a delivered Arvid message to continue from, so offering
         it when there is none invites a rejection the model cannot see coming.
         """
-        intents = ["initiate"]
-        if view.anchor_ids:
+        intents: list[str] = []
+        if "initiate" in view.allowed_intents:
+            intents.append("initiate")
+        if "continue" in view.allowed_intents and view.anchor_ids:
             intents.append("continue")
-        if view.direct_addressed:
+        if "direct" in view.allowed_intents and view.direct_addressed:
             intents.append("direct")
         return tuple(intents)
 
@@ -325,7 +327,13 @@ class ParticipationJudge:
         if intent == "direct" and not view.direct_addressed:
             # A model may not promote ambient material into the tool-capable direct path.
             raise ParticipationDecisionError("untrusted_intent", detail="direct_not_admitted")
-        if intent == "continue" and not view.allows_continuation:
+        if (
+            action != "silence"
+            and intent not in view.allowed_intents
+            and not (action == "react" and intent in {"initiate", "continue"})
+        ):
+            raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
+        if intent == "continue" and action != "react" and not view.allows_continuation:
             raise ParticipationDecisionError("invalid_response", detail="continuation_not_allowed")
 
         evidence = payload.get("evidence_ids")
@@ -412,8 +420,8 @@ class ParticipationJudge:
                 raise ParticipationDecisionError("unknown_emoji")
         closes = bool(payload.get("closes_exchange") is True)
         return ParticipationDecision(
-            action=action,  # type: ignore[arg-type]
-            intent=intent,  # type: ignore[arg-type]
+            action=action,
+            intent=intent,
             reason=reason,
             evidence_ids=evidence_ids,
             anchor_message_id=anchor,
@@ -433,6 +441,7 @@ class _JudgeContext:
     message_ids: frozenset[str]
     anchor_ids: frozenset[str]
     allowed_actions: tuple[str, ...]
+    allowed_intents: frozenset[str]
     allowed_contribution_types: frozenset[str]
     newest_message_id: str | None
     newest_current_source_id: str | None
@@ -496,6 +505,16 @@ class _JudgeContext:
             for item in (context.get("allowed_actions") or ("silence",))
             if str(item).strip() in {"silence", "react", "comment"}
         ) or ("silence",)
+        raw_intents = context.get("allowed_intents")
+        allowed_intents = frozenset(
+            str(item).strip()
+            for item in (
+                raw_intents
+                if isinstance(raw_intents, (list, tuple, set, frozenset))
+                else ()
+            )
+            if str(item).strip() in {"direct", "continue", "initiate"}
+        )
         current_rows = [
             item for item in messages if str(item.get("event_id") or item.get("message_id") or "").strip()
             in current_source_ids
@@ -530,10 +549,11 @@ class _JudgeContext:
             has_current_source_ids=has_current_source_ids,
             anchor_ids=frozenset(anchor_ids),
             allowed_actions=allowed_actions,
+            allowed_intents=allowed_intents,
             allowed_contribution_types=contribution_types,
             guidance=str(context.get("guidance") or ""),
             direct_addressed=bool(context.get("direct_addressed")),
-            allows_continuation=bool(context.get("allows_continuation", True)),
+            allows_continuation=bool(context.get("allows_continuation", False)),
             rendered="\n".join(lines) if lines else "(no retained context)",
         )
 
@@ -627,6 +647,7 @@ class AmbientJudgeAdapter:
             "messages": [{"event_id": "ambient", "sender": "?", "text": text}],
             "anchors": [],
             "allowed_actions": ["silence", "react", "comment"],
+            "allowed_intents": ["initiate"],
         }
         if context:
             view["guidance"] = ""

@@ -60,11 +60,30 @@ class _Judge:
 class _Context:
     def __init__(self) -> None:
         self.calls = 0
+        self.inputs = None
 
-    async def build(self, opportunity):
+    async def build(self, opportunity, *, inputs):
         del opportunity
         self.calls += 1
-        return {"messages": [], "anchors": [], "allowed_actions": ["silence"]}
+        self.inputs = inputs
+        snapshot = inputs.snapshot
+        contribution_types = (
+            snapshot.get("allowed_contribution_types", ())
+            if isinstance(snapshot, dict)
+            else ()
+        )
+        return {
+            "messages": [],
+            "anchors": [
+                {
+                    "provider_message_id": "prov-1",
+                    "delivery_state": "delivered",
+                }
+            ],
+            "allowed_actions": list(inputs.allowed_actions),
+            "allowed_intents": list(inputs.allowed_intents),
+            "allowed_contribution_types": list(contribution_types),
+        }
 
 
 @dataclass
@@ -118,6 +137,12 @@ def _policy(*, opted_in: bool = True, participation: dict | None = None) -> Poli
                         CHAT: {
                             "whoCanTalk": {"mode": "everyone"},
                             "participation": block,
+                            "spontaneity": {
+                                "enabled": True,
+                                "profile": "balanced",
+                                "dailyCap": 10,
+                                "allowedActions": ["observation", "light_humor"],
+                            },
                         }
                     }
                 }
@@ -129,6 +154,7 @@ def _policy(*, opted_in: bool = True, participation: dict | None = None) -> Poli
 def _processing(*, enabled: bool = True, shadow: bool = False) -> ProcessingConfig:
     return ProcessingConfig.model_validate(
         {
+            "enabled": enabled,
             "participation": {
                 "enabled": enabled,
                 "shadow": shadow,
@@ -151,6 +177,9 @@ def _runtime(
     submission: _Submission | None = None,
     policy_participation: dict | None = None,
     processing_shadowed: bool = False,
+    approval_required: bool = False,
+    reply_action: str | None = None,
+    snapshot_overrides: dict[str, object] | None = None,
 ):
     log = SpeakupLog(tmp_path / "speakups.db")
     engine = PolicyEngine(
@@ -172,6 +201,8 @@ def _runtime(
         reaction_limit = int(resolved.participation.max_reactions_per_window)
         comment_limit = int(resolved.participation.max_unsolicited_comments_per_window)
         window_ms = int(resolved.participation.comment_window_minutes) * 60_000
+        policy = engine.resolve_policy(channel, chat_id)
+        initiation_daily_cap = int(policy.spontaneity_daily_cap or 0)
         return {
             "enabled": resolved.enabled,
             "opted_in": resolved.opted_in,
@@ -185,6 +216,24 @@ def _runtime(
                 resolved.participation.min_unaddressed_judge_gap_seconds
             ),
             "continuation_reserve": int(resolved.participation.continuation_judge_reserve),
+            "context_window_minutes": int(resolved.context_window_minutes),
+            "context_max_messages": int(resolved.context_max_messages),
+            "allow_initiation": bool(resolved.participation.allow_initiation),
+            "allow_continuation": bool(resolved.participation.allow_continuation),
+            "allow_reactions": bool(resolved.participation.allow_reactions),
+            "spontaneity_enabled": bool(policy.spontaneity_enabled),
+            "spontaneity_daily_cap": initiation_daily_cap,
+            "spontaneity_allowed_actions": tuple(policy.spontaneity_allowed_actions or ()),
+            "initiation_limits": (
+                ("initiation", initiation_daily_cap, 86_400_000, "calendar_day"),
+            ) if initiation_daily_cap > 0 else (),
+            "allowed_contribution_types": tuple(policy.spontaneity_allowed_actions or ()),
+            "approval_required": approval_required,
+            "arbitration_revision": 0,
+            **({"reply_action": reply_action} if reply_action is not None else {}),
+            "continuation_candidate": bool(
+                opportunity and getattr(opportunity, "source_event_ids", ())
+            ),
             "reaction_limits": (("reaction", reaction_limit, window_ms),)
             if reaction_limit > 0
             else (),
@@ -192,6 +241,7 @@ def _runtime(
             if comment_limit > 0
             else (),
             "payload_hash": "hash-1",
+            **(snapshot_overrides or {}),
         }
 
     judge = _Judge(decision)
@@ -377,7 +427,6 @@ async def test_zero_budget_chat_does_not_spend_a_provider_call(tmp_path: Path) -
             "maxReactionsPerWindow": 0,
         },
     )
-    runtime._snapshot_provider = _zero_action_snapshot(runtime._snapshot_provider)
     result = await runtime.evaluate_participation(_opportunity())
     assert result["reason"] == "no_feasible_action"
     assert judge.calls == 0
@@ -385,15 +434,276 @@ async def test_zero_budget_chat_does_not_spend_a_provider_call(tmp_path: Path) -
     log.close()
 
 
-def _zero_action_snapshot(inner):
-    def _snapshot(
-        channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
-    ) -> dict[str, object]:
-        snapshot = dict(inner(channel, chat_id, epoch=epoch))
-        snapshot["allowed_actions"] = ["silence"]
-        return snapshot
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy_participation,decision",
+    [
+        (
+            {"enabled": True, "allowInitiation": False, "allowContinuation": True},
+            COMMENT,
+        ),
+        (
+            {"enabled": True, "allowInitiation": True, "allowContinuation": False},
+            ParticipationDecision(
+                action="comment",
+                intent="continue",
+                reason="continuation",
+                purpose="acknowledge the answer",
+                contribution_type="observation",
+                anchor_message_id="prov-1",
+                target_message_id="m1",
+            ),
+        ),
+    ],
+)
+async def test_comment_intent_rights_are_independent(
+    tmp_path: Path,
+    policy_participation: dict[str, object],
+    decision: ParticipationDecision,
+) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path, decision=decision, policy_participation=policy_participation
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
+    assert judge.calls == 1
+    assert context.inputs is not None
+    assert "comment" in context.inputs.allowed_actions
+    assert decision.intent not in context.inputs.allowed_intents
+    log.close()
 
-    return _snapshot
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("enabled", "false"), ("opted_in", 1)],
+)
+async def test_malformed_activation_bools_fail_closed(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        snapshot_overrides={field: value},
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "skipped", "reason": "invalid_snapshot"}
+    assert judge.calls == 0
+    assert context.calls == 0
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_continuation_requires_trusted_candidate_evidence(tmp_path: Path) -> None:
+    decision = ParticipationDecision(
+        action="comment",
+        intent="continue",
+        reason="follow up",
+        purpose="acknowledge the answer",
+        contribution_type="observation",
+        anchor_message_id="prov-1",
+        target_message_id="m1",
+    )
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=decision,
+        policy_participation={"enabled": True, "allowInitiation": False},
+        snapshot_overrides={"continuation_candidate": False},
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
+    assert judge.calls == 1
+    assert context.inputs is not None
+    assert context.inputs.continuation_candidate is False
+    assert "continue" not in context.inputs.snapshot["comment_allowed_intents"]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_permission_is_independent_of_comment_intents(tmp_path: Path) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=ParticipationDecision(
+            action="react",
+            intent="initiate",
+            reason="ack",
+            emoji=EMOJI,
+            target_message_id="m1",
+        ),
+        policy_participation={
+            "enabled": True,
+            "allowInitiation": False,
+            "allowContinuation": False,
+            "allowReactions": True,
+        },
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "reaction_submitted"
+    assert judge.calls == 1
+    assert context.inputs is not None
+    assert context.inputs.allowed_actions == ("silence", "react")
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_permission_is_a_hard_veto(tmp_path: Path) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=REACT,
+        policy_participation={"enabled": True, "allowReactions": False},
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
+    assert judge.calls == 1
+    assert context.inputs is not None
+    assert context.inputs.allowed_actions == ("silence", "comment")
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_action,decision",
+    [("silence", COMMENT), ("react", COMMENT)],
+)
+async def test_reply_action_caps_autonomous_effect_type(
+    tmp_path: Path, reply_action: str, decision: ParticipationDecision
+) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path, decision=decision, reply_action=reply_action
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    if reply_action == "silence":
+        assert result == {"status": "skipped", "reason": "no_feasible_action"}
+        assert judge.calls == 0
+    else:
+        assert result == {"status": "judge_failed", "reason": "invalid_response"}
+        assert judge.calls == 1
+    if reply_action == "silence":
+        assert context.inputs is None
+    else:
+        assert context.inputs is not None
+        assert context.inputs.allowed_actions == ("silence", "react")
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_positive_but_fully_occupied_capacity_spends_no_judge_call(tmp_path: Path) -> None:
+    runtime, judge, context, log = _runtime(tmp_path, decision=COMMENT)
+    for index in range(3):
+        await log.reserve_delivery(
+            proposal_id=f"comment-holder-{index}",
+            effect_id=f"comment-holder-effect-{index}",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            now_ms=NOW_MS,
+            limits=(("comment", 3, 1_800_000),),
+        )
+    for index in range(6):
+        await log.reserve_delivery(
+            proposal_id=f"reaction-holder-{index}",
+            effect_id=f"reaction-holder-effect-{index}",
+            channel=CHANNEL,
+            chat_id=CHAT,
+            now_ms=NOW_MS,
+            limits=(("reaction", 6, 1_800_000),),
+        )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result == {"status": "skipped", "reason": "no_feasible_action"}
+    assert judge.calls == 0
+    assert context.calls == 0
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_context_receives_actual_remaining_budgets(tmp_path: Path) -> None:
+    runtime, _judge, context, log = _runtime(tmp_path, decision=SILENCE)
+    await log.reserve_delivery(
+        proposal_id="comment-holder",
+        effect_id="comment-holder-effect",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=NOW_MS,
+        limits=(("comment", 3, 1_800_000),),
+    )
+    await runtime.evaluate_participation(_opportunity())
+    assert context.inputs is not None
+    budgets = dict(context.inputs.remaining_budgets)
+    assert budgets["comments_per_window"] == 2
+    assert budgets["reactions_per_window"] == 6
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_initiation_reserves_calendar_day_and_comment_window(tmp_path: Path) -> None:
+    runtime, _judge, _context, log = _runtime(tmp_path, decision=COMMENT)
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "submitted"
+    record = await log.delivery_record(
+        proposal_id="opp-1", effect_id=str(result["effect_id"])
+    )
+    assert record is not None
+    with log._lock:  # noqa: SLF001
+        rows = [
+            dict(row)
+            for row in log._conn.execute(  # noqa: SLF001
+                "SELECT category, window_kind FROM delivery_reservations WHERE effect_id = ?",
+                (str(result["effect_id"]),),
+            ).fetchall()
+        ]
+    assert {str(row["category"]) for row in rows} == {"comment", "initiation"}
+    assert {
+        str(row["category"]): str(row["window_kind"])
+        for row in rows
+    }["initiation"] == "calendar_day"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_continuation_reserves_only_comment_window(tmp_path: Path) -> None:
+    decision = ParticipationDecision(
+        action="comment",
+        intent="continue",
+        reason="follow up",
+        purpose="acknowledge the answer",
+        contribution_type="observation",
+        anchor_message_id="prov-1",
+        target_message_id="m1",
+    )
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=decision,
+        policy_participation={"enabled": True, "allowInitiation": False},
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "submitted"
+    with log._lock:  # noqa: SLF001
+        rows = log._conn.execute(  # noqa: SLF001
+            "SELECT category FROM delivery_reservations WHERE effect_id = ?",
+            (str(result["effect_id"]),),
+        ).fetchall()
+    assert [str(row["category"]) for row in rows] == ["comment"]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_required_initiation_never_bypasses_approval_path(tmp_path: Path) -> None:
+    submission = _Submission()
+    runtime, judge, _context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        approval_required=True,
+    )
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result == {"status": "comment_skipped", "reason": "approval_required"}
+    assert judge.calls == 1
+    assert submission.calls == 0
+    assert await log.pending_delivery_reservations() == []
+    log.close()
 
 
 @pytest.mark.asyncio
@@ -442,7 +752,7 @@ async def test_comment_budget_exhaustion_skips_generation(tmp_path: Path) -> Non
         limits=(("comment", 1, 1_800_000),),
     )
     result = await runtime.evaluate_participation(_opportunity())
-    assert result["reason"] == "comment_budget_exhausted"
+    assert result == {"status": "judge_failed", "reason": "invalid_response"}
     assert judge.calls == 1
     assert submission.calls == 0
     log.close()
