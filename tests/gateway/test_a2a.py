@@ -494,7 +494,7 @@ def test_legacy_quoted_card_finds_full_report_by_card_text(tmp_path: Path) -> No
 
     assert store.report_for_quote(
         NoManagedReceipts(), channel="whatsapp", chat_id="first@g.us", provider_message_id="legacy-1",
-        quoted_text="Nachtrag zur Trading-Recherche\n\n*Apple*: *HOLD* wegen teurer Bewertung.\n\nLangfassung auf Abruf.",
+        quoted_text="Nachtrag zur Trading-Recherche\n\n*Apple*: *HOLD* wegen teurer Bewertung.",
     ) == "Full report"
 
 
@@ -503,7 +503,7 @@ def test_cross_chat_cached_card_omits_private_report_details(tmp_path: Path) -> 
     store.save_report(
         "a2a-" + "d" * 32, channel="whatsapp", chat_id="private@s.whatsapp.net",
         content="My private portfolio details", canonical_user_id="owner-1", symbol="AAPL",
-        card="*HOLD* based on my private portfolio details",
+        card="*HOLD* based on my private portfolio details", signal="HOLD",
     )
     card = store.cached_card("owner-1", "AAPL")
     assert card is not None and "HOLD" in card
@@ -527,6 +527,7 @@ async def test_cached_trading_card_skips_new_a2a_and_quota_across_chats(tmp_path
         "a2a-" + "b" * 32,
         channel="whatsapp", chat_id="first@g.us", content="Long report",
         canonical_user_id="owner-1", symbol="AAPL", card="*Hold*; valuation high",
+        signal="HOLD",
     )
     tool = A2ADelegateTool(Registry(), pending_store=store, quota_governance=Quota())
     token = set_tool_context(ToolInvocationContext(
@@ -540,6 +541,32 @@ async def test_cached_trading_card_skips_new_a2a_and_quota_across_chats(tmp_path
     assert "CACHED" in result and "HOLD" in result
     assert store.cached_card("other-user", "AAPL") is None
     assert store.cached_card("owner-1", "MSFT") is None
+
+
+@pytest.mark.asyncio
+async def test_recent_report_without_clear_signal_does_not_start_another_job(tmp_path: Path) -> None:
+    class Registry:
+        names = ("hermes",)
+
+        async def invoke_skill(self, *args, **kwargs):
+            raise AssertionError("no second paid run for an already completed report")
+
+    store = A2AResearchStore(tmp_path / "research.db")
+    store.save_report(
+        "a2a-" + "e" * 32, channel="whatsapp", chat_id="first@g.us", content="Full report",
+        canonical_user_id="owner-1", symbol="AAPL", card="Apple analysis without verdict",
+    )
+    tool = A2ADelegateTool(Registry(), pending_store=store)
+    token = set_tool_context(ToolInvocationContext(
+        channel="whatsapp", chat_id="second@g.us", canonical_user_id="owner-1",
+    ))
+    try:
+        result = await tool.execute(worker="hermes", skill="trading.analyze", input={
+            "question": "Apple (AAPL)", "idempotency_key": "second",
+        })
+    finally:
+        reset_tool_context(token)
+    assert "not-sent" in result and "signal_unavailable" in result
 
 
 @pytest.mark.asyncio
@@ -1001,6 +1028,14 @@ def test_card_includes_signal_even_when_report_has_no_decision_heading() -> None
     report = "# Apple\n\n## Kurzfazit\n\nKurs 331 USD.\n\n## Trade Signal\n\n**SELL** wegen Bewertung."
     card = render_research_output({"report": report})
     assert "*SELL*" in card
+
+
+def test_cached_signal_comes_from_decision_not_title() -> None:
+    from yeoman_gateway.agent.tools.a2a import _trading_signal
+
+    report = "# Should I BUY, SELL or HOLD AAPL?\n\n## Entscheidung\n\n**HOLD** wegen Bewertung."
+    assert _trading_signal(report) == "HOLD"
+    assert _trading_signal("# Should I BUY, SELL or HOLD AAPL?\n\nNo decision yet.") == ""
 
 
 def test_card_mode_falls_back_to_a_short_excerpt_without_a_decision_heading() -> None:

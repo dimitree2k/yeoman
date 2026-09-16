@@ -82,6 +82,7 @@ class A2AResearchStore:
                     canonical_user_id TEXT NOT NULL DEFAULT '',
                     symbol TEXT NOT NULL DEFAULT '',
                     card TEXT NOT NULL DEFAULT '',
+                    signal TEXT NOT NULL DEFAULT '',
                     completed_ms INTEGER NOT NULL DEFAULT 0
                 )
                 """
@@ -105,6 +106,7 @@ class A2AResearchStore:
                 ("canonical_user_id", "TEXT NOT NULL DEFAULT ''"),
                 ("symbol", "TEXT NOT NULL DEFAULT ''"),
                 ("card", "TEXT NOT NULL DEFAULT ''"),
+                ("signal", "TEXT NOT NULL DEFAULT ''"),
                 ("completed_ms", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in report_columns:
@@ -196,14 +198,14 @@ class A2AResearchStore:
             return cursor.rowcount == 1
 
     def save_report(self, effect_id: str, *, channel: str, chat_id: str, content: str,
-                    canonical_user_id: str = "", symbol: str = "", card: str = "") -> None:
+                    canonical_user_id: str = "", symbol: str = "", card: str = "", signal: str = "") -> None:
         if not effect_id or not channel or not chat_id or not content:
             raise ValueError("completed report correlation and content are required")
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO completed_reports(effect_id, channel, chat_id, content, canonical_user_id, symbol, card, completed_ms) "
-                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(effect_id) DO NOTHING",
-                (effect_id, channel, chat_id, content, canonical_user_id, symbol, card, int(time.time() * 1000)),
+                "INSERT INTO completed_reports(effect_id, channel, chat_id, content, canonical_user_id, symbol, card, signal, completed_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(effect_id) DO NOTHING",
+                (effect_id, channel, chat_id, content, canonical_user_id, symbol, card, signal, int(time.time() * 1000)),
             )
 
     def report(self, effect_id: str, *, channel: str, chat_id: str) -> str | None:
@@ -219,14 +221,25 @@ class A2AResearchStore:
             return None
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT card FROM completed_reports WHERE canonical_user_id=? AND symbol=? AND card<>'' "
+                "SELECT signal FROM completed_reports WHERE canonical_user_id=? AND symbol=? AND signal<>'' "
                 "AND completed_ms>=? ORDER BY completed_ms DESC LIMIT 1",
                 (canonical_user_id, symbol, int(time.time() * 1000) - max_age_ms),
             ).fetchone()
         if row is None:
             return None
-        signal = re.search(r"\b(BUY|HOLD|SELL|KAUFEN|HALTEN|VERKAUFEN)\b", str(row["card"]), re.IGNORECASE)
-        return f"{symbol}: {signal.group(1).upper()} (Signal aus der letzten Analyse)" if signal else None
+        signal = str(row["signal"])
+        return f"{symbol}: {signal} (Signal aus der letzten Analyse)" if signal in {"BUY", "HOLD", "SELL", "KAUFEN", "HALTEN", "VERKAUFEN"} else None
+
+    def has_recent_report(self, canonical_user_id: str, symbol: str, *, max_age_ms: int = 86_400_000) -> bool:
+        if not canonical_user_id or not symbol:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM completed_reports WHERE canonical_user_id=? AND symbol=? "
+                "AND completed_ms>=? LIMIT 1",
+                (canonical_user_id, symbol, int(time.time() * 1000) - max_age_ms),
+            ).fetchone()
+        return row is not None
 
     def report_for_quote(self, processing_store: Any, *, channel: str, chat_id: str,
                          provider_message_id: str, quoted_text: str = "") -> str | None:
@@ -236,7 +249,7 @@ class A2AResearchStore:
             match = re.search(r"a2a-result:(a2a-[0-9a-f]{32})(?::|$)", operation_key)
             if match:
                 return self.report(match.group(1), channel=channel, chat_id=chat_id) or ""
-        if quoted_text and "Langfassung auf Abruf" in quoted_text:
+        if quoted_text:
             with self._connect() as connection:
                 rows = connection.execute(
                     "SELECT content, card FROM completed_reports WHERE channel=? AND chat_id=? AND card<>''",

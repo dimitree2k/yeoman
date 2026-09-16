@@ -74,6 +74,26 @@ def _ticker(text: str) -> str:
     return next((group for group in match.groups() if group), "") if match else ""
 
 
+def _trading_signal(report: str) -> str:
+    """Cache only a verdict from a labelled decision section, never a title or risk quote."""
+    lines = report.splitlines()
+    headings = [
+        (index, match.group(1).lower())
+        for index, line in enumerate(lines)
+        if (match := _CARD_HEADING_RE.match(line.strip()))
+    ]
+    for wanted in ("entscheidung|decision|signal|empfehlung", "kurzfazit|fazit"):
+        for position, (start, heading) in enumerate(headings):
+            if not re.search(wanted, heading):
+                continue
+            end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+            for line in lines[start + 1 : end]:
+                match = re.search(r"\*{1,2}(BUY|HOLD|SELL|KAUFEN|HALTEN|VERKAUFEN)\*{1,2}", line, re.IGNORECASE)
+                if match:
+                    return match.group(1).upper()
+    return ""
+
+
 def _strip_reasoning(text: str) -> str:
     """Drop the model's planning preamble: a chat reader wants the answer, not the plan."""
     stripped = _REASONING_FENCE_RE.sub("", text, count=1)
@@ -509,6 +529,8 @@ class A2ADelegateTool(Tool):
             cached = self._research_store.cached_card(context.canonical_user_id, ticker)
             if cached:
                 return f"[hermes | trading.analyze | CACHED | {ticker}]\n{cached}\n\nBereits vorhandene Analyse; kein neuer A2A-Auftrag."
+            if self._research_store.has_recent_report(context.canonical_user_id, ticker):
+                return f"[hermes | trading.analyze | not-sent | signal_unavailable] Analyse für {ticker} liegt vor, aber ein eindeutiges Signal fehlt. Kein neuer A2A-Auftrag."
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
             return f"[{worker} | not-sent | {note}]"
@@ -683,6 +705,7 @@ class A2ADelegateTool(Tool):
                             canonical_user_id=canonical_user_id if skill == "trading.analyze" else "",
                             symbol=symbol if skill == "trading.analyze" else "",
                             card=card,
+                            signal=_trading_signal(result.output["report"]) if skill == "trading.analyze" else "",
                         )
                     except Exception as exc:
                         logger.warning("A2A full report was not stored error_type={}", type(exc).__name__)

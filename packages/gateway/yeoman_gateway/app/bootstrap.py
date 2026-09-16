@@ -2332,7 +2332,11 @@ def build_gateway_runtime(
         symbol = _ticker(event.content)
         user_id = canonical_user_id(event.channel, event.sender_id, event.raw_metadata)
         card = research_reports.cached_card(user_id, symbol)
-        return f"Gespeicherte TradingGuru-Analyse für {symbol} (maximal 24 Stunden alt; keine neue Marktabfrage):\n\n{card}" if card else None
+        if card:
+            return f"Gespeicherte TradingGuru-Analyse für {symbol} (maximal 24 Stunden alt; keine neue Marktabfrage):\n\n{card}"
+        if research_reports.has_recent_report(user_id, symbol):
+            return f"Eine Analyse zu {symbol} liegt bereits vor, aber kein eindeutiges Buy/Hold/Sell-Signal. Bitte frage im ursprünglichen Chat nach der Langfassung; ich starte hier keinen zweiten Auftrag."
+        return None
 
     orchestrator = Orchestrator(
         policy=policy_adapter,

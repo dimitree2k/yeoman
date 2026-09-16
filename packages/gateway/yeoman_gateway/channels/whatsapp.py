@@ -994,6 +994,7 @@ class WhatsAppChannel(BaseChannel):
                 message_id=event.message_id,
                 text=event.text,
                 principal=event.sender_id,
+                participant_jid=event.participant_jid or event.sender_phone_jid,
             )
         except Exception as exc:
             logger.warning(

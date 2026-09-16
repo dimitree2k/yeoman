@@ -7,6 +7,7 @@ treated it as ambient. These tests pin the channel-side marking that closes that
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -243,3 +244,23 @@ async def test_the_channel_marks_a_message_the_core_reacted_to(monkeypatch, tmp_
     assert metadata.get("processing_reacted") is True, (
         "the classic acknowledgement would send a second reaction"
     )
+
+
+@pytest.mark.asyncio
+async def test_fast_react_preserves_original_lid_participant(monkeypatch, tmp_path) -> None:
+    channel, _gate = _channel(monkeypatch, tmp_path)
+    calls: list[dict[str, object]] = []
+
+    class _Reaction:
+        async def __call__(self, **kwargs):
+            calls.append(kwargs)
+            return "👍"
+
+    channel.set_reaction_action(_Reaction())
+    event = replace(
+        _event(content="hallo"),
+        participant_jid="12345@lid",
+        sender_phone_jid="491700000001@s.whatsapp.net",
+    )
+    await channel._maybe_react(event)
+    assert calls[0]["participant_jid"] == "12345@lid"
