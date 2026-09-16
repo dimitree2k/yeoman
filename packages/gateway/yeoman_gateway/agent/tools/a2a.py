@@ -525,6 +525,8 @@ class A2ADelegateTool(Tool):
             skill = "trading.analyze"
         if skill == "trading.analyze" and worker != "hermes":
             return f"[{worker} | not-sent | worker-binding]"
+        if skill == "trading.analyze":
+            input = {**input, "output_format": "markdown"}
         if skill == "trading.analyze" and self._research_store is not None and context is not None:
             cached = self._research_store.cached_card(context.canonical_user_id, ticker)
             if cached:

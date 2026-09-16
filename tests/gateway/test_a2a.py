@@ -53,6 +53,48 @@ async def test_registry_and_delegate_use_structured_skill_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trading_delegation_requests_markdown_output() -> None:
+    calls: list[tuple[str, dict[str, object], str | None]] = []
+
+    class FakeClient:
+        async def invoke_skill(
+            self,
+            skill: str,
+            input: dict[str, object],
+            *,
+            context_id: str | None = None,
+            reference_task_ids=(),
+        ) -> A2AWorkerResult:
+            del reference_task_ids
+            calls.append((skill, input, context_id))
+            return A2AWorkerResult(
+                "hermes", "task-markdown", "ctx-markdown", "TASK_STATE_COMPLETED", skill,
+                {"report": "# Report", "sources": []},
+            )
+
+    tool = A2ADelegateTool(
+        A2AWorkerRegistry(
+            [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+            client_factory=lambda _: FakeClient(),
+        )
+    )
+
+    await tool.execute(
+        worker="hermes",
+        skill="trading.analyze",
+        input={"question": "Analyse KO", "idempotency_key": "ko-1"},
+    )
+
+    assert calls == [
+        (
+            "trading.analyze",
+            {"question": "Analyse KO", "idempotency_key": "ko-1", "output_format": "markdown"},
+            None,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_registry_rejects_unknown_worker() -> None:
     with pytest.raises(KeyError, match="unknown A2A worker 'missing'"):
         await A2AWorkerRegistry([]).invoke_skill("missing", "search.web", {"query": "q"})
