@@ -198,6 +198,25 @@ _SCHEMA = (
       created_ms INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS direct_admissions (
+      binding_id TEXT PRIMARY KEY,
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      arbitration_revision INTEGER NOT NULL,
+      state TEXT NOT NULL DEFAULT 'active',
+      created_ms INTEGER NOT NULL,
+      finished_ms INTEGER,
+      UNIQUE (channel, chat_id, event_id),
+      UNIQUE (turn_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_direct_admissions_chat "
+    "ON direct_admissions(channel, chat_id, state, created_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_direct_admissions_turn "
+    "ON direct_admissions(turn_id, state)",
 )
 
 
@@ -436,6 +455,183 @@ class ProcessingStore:
     @property
     def retention(self) -> RetentionSettings:
         return self._retention
+
+    # -- direct admission fencing -----------------------------------------------------
+
+    def note_direct_admission(
+        self,
+        channel: str,
+        chat_id: str,
+        event_id: str,
+        turn_id: str,
+        *,
+        now_ms: int | None = None,
+    ) -> int:
+        """Durably fence autonomous work for one directly admitted turn.
+
+        The event identity is the idempotency key.  A duplicate delivery therefore
+        returns the original per-chat arbitration revision and never creates a second
+        binding.  This is deliberately kept in the existing processing store: the
+        direct fence is processing lineage, not a second queue or database.
+        """
+        channel_value = str(channel or "").strip()
+        chat_value = str(chat_id or "").strip()
+        event_value = str(event_id or "").strip()
+        turn_value = str(turn_id or "").strip()
+        if not channel_value or not chat_value or not event_value or not turn_value:
+            raise ValueError("channel, chat_id, event_id and turn_id are required")
+        moment = self._now(now_ms)
+        with self._write() as conn:
+            existing = conn.execute(
+                "SELECT arbitration_revision FROM direct_admissions "
+                "WHERE channel = ? AND chat_id = ? AND event_id = ?",
+                (channel_value, chat_value, event_value),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["arbitration_revision"])
+            row = conn.execute(
+                "SELECT COALESCE(MAX(arbitration_revision), 0) + 1 AS next_revision "
+                "FROM direct_admissions WHERE channel = ? AND chat_id = ?",
+                (channel_value, chat_value),
+            ).fetchone()
+            revision = int(row["next_revision"]) if row is not None else 1
+            binding_id = "direct-" + canonical_hash(
+                [channel_value, chat_value, event_value, turn_value]
+            )[:32]
+            try:
+                conn.execute(
+                    "INSERT INTO direct_admissions "
+                    "(binding_id, channel, chat_id, event_id, turn_id, "
+                    "arbitration_revision, state, created_ms) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        binding_id,
+                        channel_value,
+                        chat_value,
+                        event_value,
+                        turn_value,
+                        revision,
+                        "active",
+                        moment,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # The write transaction serializes normal callers.  Keep retries
+                # idempotent if a pre-existing turn binding wins a concurrent race.
+                existing = conn.execute(
+                    "SELECT arbitration_revision FROM direct_admissions "
+                    "WHERE channel = ? AND chat_id = ? AND event_id = ?",
+                    (channel_value, chat_value, event_value),
+                ).fetchone()
+                if existing is None:
+                    raise
+                return int(existing["arbitration_revision"])
+        return revision
+
+    def finish_direct_admission(
+        self, turn_id: str, *, now_ms: int | None = None
+    ) -> None:
+        """Finish only the active binding for this exact direct turn."""
+        turn_value = str(turn_id or "").strip()
+        if not turn_value:
+            return
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE direct_admissions SET state = 'finished', finished_ms = ? "
+                "WHERE turn_id = ? AND state = 'active'",
+                (self._now(now_ms), turn_value),
+            )
+
+    def direct_admission_for_event(
+        self,
+        event_id: str,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> tuple[str, str, str, int, str] | None:
+        """Read the direct binding for one canonical event, if it was admitted."""
+        token = str(event_id or "").strip()
+        if not token:
+            return None
+        conditions = ["event_id = ?"]
+        params: list[str] = [token]
+        if channel is not None:
+            conditions.append("channel = ?")
+            params.append(str(channel))
+        if chat_id is not None:
+            conditions.append("chat_id = ?")
+            params.append(str(chat_id))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT channel, chat_id, turn_id, arbitration_revision, state "
+                "FROM direct_admissions WHERE " + " AND ".join(conditions) + " "
+                "ORDER BY created_ms DESC, binding_id DESC LIMIT 1",
+                tuple(params),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row["channel"]),
+            str(row["chat_id"]),
+            str(row["turn_id"]),
+            int(row["arbitration_revision"]),
+            str(row["state"]),
+        )
+
+    def direct_arbitration_revision(self, channel: str, chat_id: str) -> int:
+        """Return the durable per-chat direct-arbitration high-water mark."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(arbitration_revision), 0) AS revision "
+                "FROM direct_admissions WHERE channel = ? AND chat_id = ?",
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return int(row["revision"]) if row is not None else 0
+
+    # Keep the shorter name available to snapshot providers that use the plan's field
+    # name directly; both methods read the same durable projection.
+    def arbitration_revision(self, channel: str, chat_id: str) -> int:
+        return self.direct_arbitration_revision(channel, chat_id)
+
+    def direct_work_active(self, channel: str, chat_id: str) -> bool:
+        """Whether a direct binding is still active for this exact chat.
+
+        A turn that was durably closed is no longer active even if a crash happened
+        before the terminal cleanup callback.  ``recover_direct_admissions`` removes
+        those rows at startup; this read-side check keeps the fence conservative in
+        the meantime.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM direct_admissions d "
+                "LEFT JOIN turns t ON t.turn_id = d.turn_id "
+                "WHERE d.channel = ? AND d.chat_id = ? AND d.state = 'active' "
+                "AND (t.turn_id IS NULL OR t.state IN ('open', 'awaiting')) LIMIT 1",
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return row is not None
+
+    def recover_direct_admissions(self, *, now_ms: int | None = None) -> tuple[str, ...]:
+        """End all bindings left by the previous processing process.
+
+        This method is a startup operation, before observers are registered.  The
+        persisted processing projections have no process lease to distinguish an old
+        in-flight generation from a live one, so retaining an ``active`` row here could
+        permanently mute the chat after a crash.  Current work is recorded only after
+        this recovery point and is therefore unaffected.
+        """
+        moment = self._now(now_ms)
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT binding_id FROM direct_admissions WHERE state = 'active'"
+            ).fetchall()
+            binding_ids = tuple(str(row["binding_id"]) for row in rows)
+            for binding_id in binding_ids:
+                conn.execute(
+                    "UPDATE direct_admissions SET state = 'recovered', finished_ms = ? "
+                    "WHERE binding_id = ? AND state = 'active'",
+                    (moment, binding_id),
+                )
+        return binding_ids
 
     @property
     def schema_version(self) -> int:

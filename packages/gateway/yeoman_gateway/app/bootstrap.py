@@ -202,6 +202,8 @@ class OrchestratorService:
         telemetry: InMemoryTelemetry,
         memory: MemoryService,
         effect_router: "IntentEffectRouter | None" = None,
+        processing_store: object | None = None,
+        release_participation_chat: Callable[[str, str], None] | None = None,
         max_concurrent_messages: int = 4,
     ) -> None:
         self._bus = bus
@@ -210,6 +212,8 @@ class OrchestratorService:
         self._telemetry = telemetry
         self._memory = memory
         self._effect_router = effect_router
+        self._processing_store = processing_store
+        self._release_participation_chat = release_participation_chat
         self._running = False
         # Review F03: ingest must not wait for a running generation. Generations stay
         # bounded by the actor registry (one by default), so a second message can be
@@ -264,6 +268,33 @@ class OrchestratorService:
                     getattr(e, "state", "-"),
                     getattr(e, "detail", None) or str(e)[:200],
                 )
+            finally:
+                self._finish_direct_event(event)
+
+    def _finish_direct_event(self, event: object) -> None:
+        """Finish a direct binding after terminal intent dispatch, including admin commands."""
+        store = self._processing_store
+        lookup = getattr(store, "direct_admission_for_event", None)
+        finish = getattr(store, "finish_direct_admission", None)
+        active = getattr(store, "direct_work_active", None)
+        if not callable(lookup) or not callable(finish) or not callable(active):
+            return
+        channel = str(getattr(event, "channel", "") or "")
+        chat_id = str(getattr(event, "chat_id", "") or "")
+        event_id = str(getattr(event, "message_id", "") or "")
+        try:
+            binding = lookup(event_id, channel=channel, chat_id=chat_id)
+            if not binding or len(binding) < 5 or str(binding[4]) != "active":
+                return
+            finish(str(binding[2]))
+            if not active(channel, chat_id) and self._release_participation_chat is not None:
+                self._release_participation_chat(channel, chat_id)
+        except Exception as exc:  # noqa: BLE001 - terminal cleanup cannot fail dispatch
+            logger.warning(
+                "direct_terminal_cleanup_failed chat={} error_type={}",
+                chat_id,
+                type(exc).__name__,
+            )
 
     def stop(self) -> None:
         self._running = False
@@ -951,7 +982,10 @@ def _build_participation_runtime(
             "approval_required": effective.spontaneity_preview == "owner_dm",
             "approval_revision": 0,
             "arbitration_revision": int(
-                getattr(opportunity, "observed_revision", 0) or 0
+                processing_store.arbitration_revision(channel, chat_id)
+                if processing_store is not None
+                and hasattr(processing_store, "arbitration_revision")
+                else 0
             ),
             "context_window_minutes": int(resolved.context_window_minutes),
             "context_max_messages": int(resolved.context_max_messages),
@@ -1022,6 +1056,12 @@ def _build_participation_runtime(
         is_participant_allowed=_is_participant_allowed,
         submission=submission,
         reactor=reactor,
+        direct_work_active=(
+            processing_store.direct_work_active
+            if processing_store is not None
+            and hasattr(processing_store, "direct_work_active")
+            else None
+        ),
     )
 
     async def _handle(opportunity: object) -> None:
@@ -1044,6 +1084,12 @@ def _build_participation_runtime(
         is_enabled=lambda channel, chat_id: _is_paused(channel, chat_id) is None,
         considered_revision_provider=getattr(
             log, "highest_considered_revision_sync", None
+        ),
+        direct_work_active=(
+            processing_store.direct_work_active
+            if processing_store is not None
+            and hasattr(processing_store, "direct_work_active")
+            else None
         ),
     )
     reconciler = (
@@ -1347,6 +1393,7 @@ def build_thread_responder(
     responder: object,
     policy_adapter: "EnginePolicyAdapter | None" = None,
     router: object | None = None,
+    release_participation_chat: Callable[[str, str], None] | None = None,
 ):
     """Responder wrapper that drives the thread actor. ``None`` keeps the legacy path."""
     if store is None or threads is None or not config.processing.enabled:
@@ -1367,7 +1414,13 @@ def build_thread_responder(
         ),
     )
     return ThreadActorResponder(
-        inner=responder, actors=actor_registry, store=store, router=router
+        inner=responder,
+        actors=actor_registry,
+        store=store,
+        router=router,
+        finish_direct_admission=store.finish_direct_admission,
+        direct_work_active=store.direct_work_active,
+        release_chat=release_participation_chat,
     )
 
 
@@ -1470,6 +1523,11 @@ def build_effect_router(
             == str(getattr(current, "policy_version", "") or "")
             and str(getattr(admission, "policy_hash", "") or "")
             == str(getattr(current_policy, "policy_hash", "") or "")
+        )
+        arbitration_matches = bool(
+            hasattr(store, "arbitration_revision")
+            and int(store.arbitration_revision(channel, chat_id))
+            == int(getattr(admission, "arbitration_revision", -1))
         )
 
         action = str(getattr(admission, "action", "") or "")
@@ -1582,6 +1640,7 @@ def build_effect_router(
             source_authorized=bool(
                 exact_sources
                 and policy_matches
+                and arbitration_matches
                 and reservation_matches
                 and current_rights
                 and not stale
@@ -2050,6 +2109,13 @@ def build_gateway_runtime(
             await _handle_chain(next_job, response, run_id)
 
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
+    opportunity_scheduler: object | None = None
+
+    def _release_participation_chat(channel: str, chat_id: str) -> None:
+        release = getattr(opportunity_scheduler, "release_chat", None)
+        if callable(release):
+            release(channel, chat_id)
+
     thread_responder = build_thread_responder(
         config,
         processing_store,
@@ -2057,6 +2123,7 @@ def build_gateway_runtime(
         responder,
         policy_adapter,
         effect_router,
+        _release_participation_chat,
     )
 
     orchestrator = Orchestrator(
@@ -2528,6 +2595,8 @@ def build_gateway_runtime(
         telemetry=telemetry,
         memory=memory_service,
         effect_router=effect_router,
+        processing_store=processing_store,
+        release_participation_chat=_release_participation_chat,
     )
 
     # IPC socket for overseer commands
@@ -2763,7 +2832,6 @@ def build_gateway_runtime(
 
     consciousness_service = None
     lull_observer = None
-    opportunity_scheduler = None
     participation_maintenance = None
     if speakup_log is not None and policy_engine is not None:
         from yeoman_gateway.consciousness.burst import BurstObserver
@@ -2924,6 +2992,30 @@ def build_gateway_runtime(
                 policy_adapter=policy_adapter,
             )
         )
+        direct_fence_setter = getattr(processing_gate, "set_direct_fence_callbacks", None)
+        cancel_participation = getattr(opportunity_scheduler, "cancel_chat", None)
+        if (
+            callable(direct_fence_setter)
+            and processing_store is not None
+            and callable(cancel_participation)
+        ):
+
+            def _trusted_direct_assignment(
+                request: object, decision: object, assignment: object
+            ) -> bool:
+                del request
+                return bool(
+                    getattr(decision, "accept_message", False)
+                    and getattr(decision, "should_respond", False)
+                    and str(getattr(assignment, "turn_id", "") or "")
+                    and str(getattr(assignment, "rule", "") or "") != "ambient"
+                )
+
+            direct_fence_setter(
+                classifier=_trusted_direct_assignment,
+                note=processing_store.note_direct_admission,
+                cancel=cancel_participation,
+            )
         if isinstance(participation_decision, tuple):
             _decision_runtime, _reconciler = participation_decision
         else:
@@ -2977,10 +3069,32 @@ def build_gateway_runtime(
                     )
                 )
 
+            def _canonical_direct_source(event: object) -> bool:
+                if processing_store is None:
+                    return False
+                channel = str(getattr(event, "channel", "") or "")
+                chat_id = str(getattr(event, "chat_id", "") or "")
+                source_ids = tuple(
+                    str(item)
+                    for item in (getattr(event, "source_event_ids", ()) or ())
+                    if str(item)
+                )
+                if not source_ids:
+                    message_id = str(getattr(event, "message_id", "") or "")
+                    source_ids = (message_id,) if message_id else ()
+                return any(
+                    processing_store.direct_admission_for_event(
+                        source_id, channel=channel, chat_id=chat_id
+                    )
+                    is not None
+                    for source_id in source_ids
+                )
+
             _ingress = ParticipationIngress(
                 runtime=participation_runtime,
                 ledger=speakup_log,
                 is_active=_participation_active,
+                is_direct=_canonical_direct_source,
                 material_provider=participation_material,
             )
 

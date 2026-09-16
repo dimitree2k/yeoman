@@ -685,6 +685,126 @@ async def test_unmanaged_event_passes_through_unchanged(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_admission_finishes_in_responder_terminal_path(tmp_path: Path) -> None:
+    """Responder completion releases only the direct binding it actually owns."""
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    _assign_event(
+        store,
+        event_id="m1",
+        thread_id=str(decision.thread_id),
+        turn_id=str(decision.turn_id),
+    )
+    store.note_direct_admission(
+        "whatsapp", CHAT, "m1", str(decision.turn_id), now_ms=T0
+    )
+    released: list[tuple[str, str]] = []
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+    wrapper = ThreadActorResponder(
+        inner=_InnerResponder(["direct answer"]),
+        actors=actors,
+        store=store,
+        clock=_Clock(),
+        finish_direct_admission=store.finish_direct_admission,
+        direct_work_active=store.direct_work_active,
+        release_chat=lambda channel, chat_id: released.append((channel, chat_id)),
+    )
+    try:
+        assert await wrapper.generate_reply(_event_model(message_id="m1"), object()) == (
+            "direct answer"
+        )
+        assert store.direct_work_active("whatsapp", CHAT) is False
+        assert released == [("whatsapp", CHAT)]
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_admission_finishes_when_generation_is_cancelled(tmp_path: Path) -> None:
+    """Cancellation cannot leave the chat permanently fenced."""
+    import asyncio
+
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    _assign_event(
+        store,
+        event_id="m1",
+        thread_id=str(decision.thread_id),
+        turn_id=str(decision.turn_id),
+    )
+    store.note_direct_admission("whatsapp", CHAT, "m1", str(decision.turn_id), now_ms=T0)
+    started, release = asyncio.Event(), asyncio.Event()
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+    wrapper = ThreadActorResponder(
+        inner=_InnerResponder(["never"], barrier=release, started=started),
+        actors=actors,
+        store=store,
+        clock=_Clock(),
+        finish_direct_admission=store.finish_direct_admission,
+        direct_work_active=store.direct_work_active,
+        release_chat=lambda channel, chat_id: None,
+    )
+    task = asyncio.create_task(wrapper.generate_reply(_event_model(message_id="m1"), object()))
+    try:
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert store.direct_work_active("whatsapp", CHAT) is False
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_admission_finishes_on_generation_error(tmp_path: Path) -> None:
+    """A provider error also releases the exact direct binding."""
+    from yeoman_gateway.processing.actor import ThreadActorRegistry
+    from yeoman_gateway.processing.responder import ThreadActorResponder
+
+    class BrokenInner:
+        async def generate_reply(self, event, decision, *, session_key=None):
+            del event, decision, session_key
+            raise RuntimeError("provider down")
+
+    store = _store(tmp_path)
+    registry = ThreadRegistry(store=store, config=_Config())
+    decision = _turn(store, registry)
+    _assign_event(
+        store,
+        event_id="m1",
+        thread_id=str(decision.thread_id),
+        turn_id=str(decision.turn_id),
+    )
+    store.note_direct_admission("whatsapp", CHAT, "m1", str(decision.turn_id), now_ms=T0)
+    actors = ThreadActorRegistry(store=store, config=_Config(), clock=_Clock())
+    wrapper = ThreadActorResponder(
+        inner=BrokenInner(),
+        actors=actors,
+        store=store,
+        clock=_Clock(),
+        finish_direct_admission=store.finish_direct_admission,
+        direct_work_active=store.direct_work_active,
+        release_chat=lambda channel, chat_id: None,
+    )
+    try:
+        assert await wrapper.generate_reply(_event_model(message_id="m1"), object()) is None
+        assert store.direct_work_active("whatsapp", CHAT) is False
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_followup_during_generation_produces_no_second_answer(tmp_path: Path) -> None:
     import asyncio
 

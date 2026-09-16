@@ -45,6 +45,9 @@ class ThreadActorResponder:
         authority: TurnAuthority | None = None,
         clock: Callable[[], int] | None = None,
         router: Any | None = None,
+        finish_direct_admission: Callable[..., None] | None = None,
+        direct_work_active: Callable[[str, str], bool] | None = None,
+        release_chat: Callable[[str, str], None] | None = None,
     ) -> None:
         self._inner = inner
         self._actors = actors
@@ -53,6 +56,9 @@ class ThreadActorResponder:
         self._clock = clock or _now_ms
         self._router = router
         self._participation_ctx: Any | None = None
+        self._finish_direct_admission = finish_direct_admission
+        self._direct_work_active = direct_work_active
+        self._release_chat = release_chat
 
     def attach_participation(self, ctx: Any | None) -> None:
         """Wire the participation channel/react effect boundary (disabled by default)."""
@@ -129,39 +135,43 @@ class ThreadActorResponder:
     # -- port --------------------------------------------------------------------------
 
     async def generate_reply(self, event: Any, decision: Any) -> str | None:
-        thread_id = self.thread_for_event(event)
-        if thread_id is None:
-            return await self._inner.generate_reply(event, decision)
-
-        actor = self._actors.actor_for(thread_id)
-        if actor.generation_in_flight:
-            metadata = dict(getattr(event, "raw_metadata", {}) or {})
-            admission = actor.accept(
-                event_id=self._event_id(event),
-                principal=str(getattr(event, "sender_id", "") or ""),
-                kind=str(metadata.get("processing_kind") or "message"),
-                explicit_correction=bool(metadata.get("explicit_correction")),
-                authorized=self._is_orderer(actor, event),
-            )
-            logger.debug(
-                "follow-up accepted during generation thread={} state={} waiting={}",
-                thread_id,
-                admission.state,
-                admission.waiting,
-            )
-            # The running generation answers with the wider snapshot: no second answer path.
-            return None
-
+        direct_binding = self._direct_binding_for_event(event)
         try:
-            return await self._run_loop(actor, event, decision)
-        except Exception as exc:
-            # The actor must never cost a reply: degrade to the plain path and say so.
-            logger.warning(
-                "threads_degraded thread_id={} error_type={}",
-                thread_id,
-                type(exc).__name__,
-            )
-            return await self._inner.generate_reply(event, decision)
+            thread_id = self.thread_for_event(event)
+            if thread_id is None:
+                return await self._inner.generate_reply(event, decision)
+
+            actor = self._actors.actor_for(thread_id)
+            if actor.generation_in_flight:
+                metadata = dict(getattr(event, "raw_metadata", {}) or {})
+                admission = actor.accept(
+                    event_id=self._event_id(event),
+                    principal=str(getattr(event, "sender_id", "") or ""),
+                    kind=str(metadata.get("processing_kind") or "message"),
+                    explicit_correction=bool(metadata.get("explicit_correction")),
+                    authorized=self._is_orderer(actor, event),
+                )
+                logger.debug(
+                    "follow-up accepted during generation thread={} state={} waiting={}",
+                    thread_id,
+                    admission.state,
+                    admission.waiting,
+                )
+                # The running generation answers with the wider snapshot: no second answer path.
+                return None
+
+            try:
+                return await self._run_loop(actor, event, decision)
+            except Exception as exc:
+                # The actor must never cost a reply: degrade to the plain path and say so.
+                logger.warning(
+                    "threads_degraded thread_id={} error_type={}",
+                    thread_id,
+                    type(exc).__name__,
+                )
+                return await self._inner.generate_reply(event, decision)
+        finally:
+            self._finish_direct_binding(direct_binding)
 
     # -- loop --------------------------------------------------------------------------
 
@@ -292,6 +302,46 @@ class ThreadActorResponder:
             )
             return None
         return thread_id
+
+    def _direct_binding_for_event(self, event: Any) -> tuple[str, str, str] | None:
+        """Return the persisted direct binding owned by this exact source event."""
+        if self._finish_direct_admission is None:
+            return None
+        loader = getattr(self._store, "direct_admission_for_event", None)
+        if not callable(loader):
+            return None
+        try:
+            binding = loader(
+                self._event_id(event),
+                channel=str(getattr(event, "channel", "") or ""),
+                chat_id=str(getattr(event, "chat_id", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup cannot grant authority
+            logger.warning(
+                "direct_binding_lookup_failed event_id={} error_type={}",
+                self._event_id(event),
+                type(exc).__name__,
+            )
+            return None
+        if not binding or len(binding) < 5 or str(binding[4]) != "active":
+            return None
+        return str(binding[0]), str(binding[1]), str(binding[2])
+
+    def _finish_direct_binding(self, binding: tuple[str, str, str] | None) -> None:
+        if binding is None or self._finish_direct_admission is None:
+            return
+        channel, chat_id, turn_id = binding
+        try:
+            self._finish_direct_admission(turn_id, now_ms=self._clock())
+            if self._release_chat is not None and self._direct_work_active is not None:
+                if not self._direct_work_active(channel, chat_id):
+                    self._release_chat(channel, chat_id)
+        except Exception as exc:  # noqa: BLE001 - terminal cleanup is best effort
+            logger.warning(
+                "direct_binding_finish_failed chat={} error_type={}",
+                chat_id,
+                type(exc).__name__,
+            )
 
     def session_key_for(self, event: Any, *, thread_id: str) -> str:
         """Thread-scoped session key, for groups and DMs alike (spec R03)."""

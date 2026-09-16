@@ -144,6 +144,12 @@ class FastGateResult:
     #: True when this unaddressed message passed the ambient brake and now waits for the
     #: judge's verdict. Nothing is generated until that verdict is a yes.
     ambient_candidate: bool = False
+    #: True when a trusted direct classification created a durable processing fence.
+    direct_admitted: bool = False
+    #: The exact turn bound to the direct admission, if one was created.
+    direct_turn_id: str | None = None
+    #: Per-chat arbitration revision returned by the durable direct fence.
+    arbitration_revision: int = 0
 
     @property
     def denied(self) -> bool:
@@ -171,6 +177,9 @@ class IngestGate:
         threads: Any = None,
         clock: Callable[[], int] | None = None,
         participation: Callable[[str, str], bool] | None = None,
+        direct_classifier: Callable[[IngestRequest, PolicyDecision, Any], bool] | None = None,
+        note_direct_admission: Callable[..., int] | None = None,
+        cancel_chat: Callable[..., bool] | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -182,12 +191,25 @@ class IngestGate:
         #: brake is not a second opinion for those chats: exactly one production owner may
         #: decide, so the legacy path stands down (spec section 3.1).
         self._participation_owns = participation
+        #: Trusted direct classification is supplied by the canonical processing route.
+        #: The fallback below only uses fields already on the canonical event and is
+        #: enabled when a durable note callback is composed; arbitrary observer metadata
+        #: never grants direct authority.
+        self._direct_classifier = direct_classifier
+        self._note_direct_admission = note_direct_admission
+        self._cancel_chat = cancel_chat
         #: Ambient brake state, per chat: when the last unaddressed answer went out and how
         #: much the chat has moved since. In memory on purpose - after a restart the brake
         #: simply starts cold, which is the conservative direction.
         self._ambient_state: dict[str, dict[str, int]] = {}
         #: Ambient messages waiting for the judge: observed, not answerable until cleared.
         self._ambient_pending: dict[str, int] = {}
+        recover = getattr(self._store, "recover_direct_admissions", None)
+        if callable(recover):
+            try:
+                recover()
+            except Exception as exc:  # noqa: BLE001 - startup stays conservative
+                logger.error("direct_fence_recovery_failed error_type={}", type(exc).__name__)
 
     def enabled_for(self, channel: str, chat_id: str) -> bool:
         """True when the new mode owns this chat; unmanaged chats stay on legacy."""
@@ -202,6 +224,23 @@ class IngestGate:
         if checker is None:
             return False
         return bool(checker(channel, chat_id))
+
+    def set_direct_fence_callbacks(
+        self,
+        *,
+        classifier: Callable[[IngestRequest, PolicyDecision, Any], bool] | None = None,
+        note: Callable[..., int] | None = None,
+        cancel: Callable[..., bool] | None = None,
+    ) -> None:
+        """Attach the canonical direct classifier and scheduler callbacks after startup.
+
+        The processing gate is often built before the participation scheduler.  This
+        small setter lets Bootstrap compose the callbacks once, without a second gate
+        or a mutable policy source; all calls remain synchronous at ingress.
+        """
+        self._direct_classifier = classifier
+        self._note_direct_admission = note
+        self._cancel_chat = cancel
 
     def admit(self, request: IngestRequest) -> FastGateResult | None:
         """Journal the event and decide before any enrichment. ``None`` = not managed.
@@ -328,6 +367,11 @@ class IngestGate:
             )
             outcome = FastGateOutcome.OBSERVE
         assignment = self._assign(request, now=now, allow_turn=outcome is FastGateOutcome.REACT)
+        direct_admitted, direct_turn_id, arbitration_revision = self._fence_direct(
+            request=request,
+            decision=decision,
+            assignment=assignment,
+        )
         if assignment is not None:
             # One observation line per message (routing spec, criterion 12): what the
             # message was classified as, how many candidates existed, which continuity
@@ -363,6 +407,9 @@ class IngestGate:
             reply_action=reply_action,
             react=react,
             ambient_candidate=ambient_candidate,
+            direct_admitted=direct_admitted,
+            direct_turn_id=direct_turn_id,
+            arbitration_revision=arbitration_revision,
         )
 
     # -- internals ---------------------------------------------------------------------
@@ -539,6 +586,68 @@ class IngestGate:
             )
             return None
 
+    def _fence_direct(
+        self,
+        *,
+        request: IngestRequest,
+        decision: PolicyDecision,
+        assignment: Any,
+    ) -> tuple[bool, str | None, int]:
+        """Fence a trusted direct turn before returning control to the channel.
+
+        ``note_direct_admission`` and ``cancel_chat`` are synchronous callbacks by
+        contract.  The note is committed first, then pending autonomous work is
+        cancelled, so an in-flight worker sees a durable arbitration revision even when
+        the scheduler cancellation races its next await.
+        """
+        if self._note_direct_admission is None or assignment is None:
+            return False, None, 0
+        turn_id = str(getattr(assignment, "turn_id", None) or "").strip()
+        if not turn_id:
+            return False, None, 0
+        try:
+            if self._direct_classifier is not None:
+                direct = bool(self._direct_classifier(request, decision, assignment))
+            else:
+                event = request.event
+                direct = bool(
+                    getattr(event, "mentioned_bot", False)
+                    or getattr(event, "reply_to_bot", False)
+                )
+        except Exception as exc:  # noqa: BLE001 - classification failure is not authority
+            logger.warning(
+                "direct_classification_failed event_id={} error_type={}",
+                request.event_id,
+                type(exc).__name__,
+            )
+            raise ProcessingError("direct_classification_failed") from exc
+        if not direct:
+            return False, None, 0
+        try:
+            revision = int(
+                self._note_direct_admission(
+                    channel=request.event.channel,
+                    chat_id=request.event.chat_id,
+                    event_id=request.event_id,
+                    turn_id=turn_id,
+                    now_ms=self._clock(),
+                )
+            )
+            if self._cancel_chat is not None:
+                self._cancel_chat(
+                    request.event.channel,
+                    request.event.chat_id,
+                    reason="direct_request",
+                )
+        except Exception as exc:  # noqa: BLE001 - an unwired fence cannot grant a turn
+            logger.error(
+                "direct_fence_failed event_id={} error_type={}",
+                request.event_id,
+                type(exc).__name__,
+            )
+            raise ProcessingError("direct_fence_failed") from exc
+        return True, turn_id, revision
+
     def reconcile_reply(self, event: InboundEvent) -> Any:
         """Upgrade a permitted reply event to a durable thread and turn."""
         if self._store is None or self._threads is None:
@@ -671,6 +780,9 @@ class IngestGate:
         reply_action: str = "answer",
         react: bool = False,
         ambient_candidate: bool = False,
+        direct_admitted: bool = False,
+        direct_turn_id: str | None = None,
+        arbitration_revision: int = 0,
     ) -> FastGateResult:
         event = request.event
         decision = DecisionRecord(
@@ -701,6 +813,9 @@ class IngestGate:
             reply_action=reply_action,
             react=react,
             ambient_candidate=ambient_candidate,
+            direct_admitted=direct_admitted,
+            direct_turn_id=direct_turn_id,
+            arbitration_revision=arbitration_revision,
         )
 
 

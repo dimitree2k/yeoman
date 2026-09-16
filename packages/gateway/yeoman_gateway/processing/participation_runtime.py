@@ -57,6 +57,7 @@ COUNTERS: tuple[str, ...] = (
     "generated",
     "shadow_decision",
     "duplicate_suppressed",
+    "direct_superseded",
 )
 
 _ACTIONS: tuple[str, ...] = ("silence", "react", "comment")
@@ -131,6 +132,7 @@ class ParticipationRuntime:
         submission: Any | None = None,
         reactor: Any | None = None,
         clock_ms: Callable[[], int] | None = None,
+        direct_work_active: Callable[[str, str], bool] | None = None,
     ) -> None:
         self._judge = judge
         self._context_builder = context_builder
@@ -149,6 +151,7 @@ class ParticipationRuntime:
         self._submission = submission
         self._reactor = reactor
         self._clock_ms = clock_ms or _now_ms
+        self._direct_work_active = direct_work_active
         self._counters: dict[str, int] = {}
 
     # -- observability -----------------------------------------------------------------
@@ -166,6 +169,8 @@ class ParticipationRuntime:
     ) -> dict[str, object]:
         """Evaluate one admitted opportunity. Never raises for a decision failure."""
         self._count("admitted")
+        if self._direct_active(opportunity):
+            return self._direct_superseded()
         try:
             raw_snapshot = self._snapshot_provider(
                 opportunity.channel,
@@ -182,6 +187,9 @@ class ParticipationRuntime:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "snapshot_error")
             return {"status": "skipped", "reason": "snapshot_error"}
+
+        if self._direct_active(opportunity):
+            return self._direct_superseded()
 
         try:
             self._preflight(opportunity, snapshot)
@@ -205,6 +213,9 @@ class ParticipationRuntime:
             await self._record(opportunity, "preflight_skipped", blocked.reason)
             return {"status": "skipped", "reason": blocked.reason}
 
+        if self._direct_active(opportunity):
+            return self._direct_superseded()
+
         try:
             context = await self._context_builder.build(opportunity, inputs=inputs)
         except ParticipationDecisionError as failure:
@@ -215,6 +226,8 @@ class ParticipationRuntime:
             self._count("preflight_skipped")
             await self._record(opportunity, "preflight_skipped", "context_error")
             return {"status": "skipped", "reason": "context_error"}
+        if self._direct_active(opportunity):
+            return self._direct_superseded()
         attempt_id = f"{opportunity.opportunity_id}:0"
         try:
             charged = await self._ledger.reserve_judge_attempt(
@@ -256,6 +269,10 @@ class ParticipationRuntime:
             return {"status": "skipped", "reason": "attempt_not_available"}
         self._count("judge_attempted")
 
+        if self._direct_active(opportunity):
+            await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
+            return self._direct_superseded()
+
         try:
             decision = await self._judge.decide(opportunity, context)
         except ParticipationDecisionError as failure:
@@ -273,6 +290,10 @@ class ParticipationRuntime:
             await self._ledger.record_judge_outcome(attempt_id, outcome="provider_error")
             await self._record(opportunity, "judge_failed", "provider_error")
             return {"status": "judge_failed", "reason": "provider_error"}
+
+        if self._direct_active(opportunity):
+            await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
+            return self._direct_superseded()
 
         try:
             self._validate_decision(decision, inputs=inputs, context=context)
@@ -350,6 +371,20 @@ class ParticipationRuntime:
         if isinstance(actions, (list, tuple)) and not set(actions) - {"silence"}:
             # Only silence is feasible: do not spend a provider call to be told that.
             raise ParticipationBlockedError("no_feasible_action")
+
+    def _direct_active(self, opportunity: ParticipationOpportunity) -> bool:
+        """Read the durable direct fence without turning failures into an allow."""
+        checker = self._direct_work_active
+        if checker is None:
+            return False
+        try:
+            return bool(checker(opportunity.channel, opportunity.chat_id))
+        except Exception:  # noqa: BLE001 - an unreadable fence must stop work
+            return True
+
+    def _direct_superseded(self) -> dict[str, object]:
+        self._count("direct_superseded")
+        return {"status": "skipped", "reason": "direct_request"}
 
     async def _decision_inputs(
         self,
@@ -658,6 +693,15 @@ class ParticipationRuntime:
         if not reserved:
             await self._record(opportunity, "skipped", "reaction_budget_exhausted")
             return {"status": "skipped", "reason": "reaction_budget_exhausted"}
+        if self._direct_active(opportunity):
+            await self._ledger.release_delivery(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="direct_superseded",
+                now_ms=int(self._clock_ms()),
+            )
+            return self._direct_superseded()
         try:
             receipt = await self._reactor(
                 target_message_id=str(decision.target_message_id),
@@ -774,6 +818,15 @@ class ParticipationRuntime:
             )
             await self._record(opportunity, "generation_failed", "empty_draft")
             return {"status": "generation_failed", "reason": "empty_draft"}
+        if self._direct_active(opportunity):
+            await self._ledger.release_delivery(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="direct_superseded",
+                now_ms=int(self._clock_ms()),
+            )
+            return self._direct_superseded()
         self._count("generated")
         payload = TextPayload(text=text)
         try:
@@ -794,6 +847,15 @@ class ParticipationRuntime:
             )
             await self._record(opportunity, "comment_skipped", blocked.reason)
             return {"status": "comment_skipped", "reason": blocked.reason}
+        if self._direct_active(opportunity):
+            await self._ledger.release_delivery(
+                opportunity.opportunity_id,
+                effect_id=effect_id,
+                state="failed",
+                reason="direct_superseded",
+                now_ms=int(self._clock_ms()),
+            )
+            return self._direct_superseded()
         outcome = await self._submission.submit(
             admission=admission,
             effect_id=effect_id,

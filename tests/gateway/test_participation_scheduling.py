@@ -93,6 +93,156 @@ async def test_offer_returns_while_the_handler_is_blocked() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_fence_stops_processing_runtime_before_judge(tmp_path) -> None:
+    """A durable direct binding prevents an autonomous handler from spending a call."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.processing.participation_runtime import ParticipationRuntime
+
+    class Judge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            self.calls += 1
+            raise AssertionError("direct work must stop before the judge")
+
+    class Context:
+        calls = 0
+
+        async def build(self, opportunity, *, inputs):
+            del opportunity, inputs
+            self.calls += 1
+            raise AssertionError("direct work must stop before context")
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    judge = Judge()
+    context = Context()
+    runtime = ParticipationRuntime(
+        judge=judge,  # type: ignore[arg-type]
+        context_builder=context,
+        ledger=log,
+        snapshot_provider=lambda *args, **kwargs: {"enabled": True},
+        is_source_allowed=lambda *args: True,
+        source_principals=lambda channel, chat_id, sources: tuple(
+            (source, "person") for source in sources
+        ),
+        direct_work_active=lambda channel, chat_id: True,
+    )
+    try:
+        result = await runtime.evaluate_participation(_opportunity())
+        assert result == {"status": "skipped", "reason": "direct_request"}
+        assert judge.calls == 0
+        assert context.calls == 0
+        assert runtime.counters()["direct_superseded"] == 1
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_fence_discards_waiting_draft_before_transport(tmp_path) -> None:
+    """A direct request arriving during generation releases the autonomous hold."""
+    from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
+    from yeoman_gateway.processing.participation import ParticipationDecision
+    from yeoman_gateway.processing.participation_runtime import ParticipationRuntime
+
+    draft_started, release_draft = asyncio.Event(), asyncio.Event()
+    direct = False
+
+    class Judge:
+        async def decide(self, opportunity, context):
+            del opportunity, context
+            return ParticipationDecision(
+                action="comment",
+                intent="initiate",
+                reason="synthetic",
+                purpose="synthetic",
+                contribution_type="observation",
+            )
+
+    class Context:
+        async def build(self, opportunity, *, inputs):
+            del opportunity, inputs
+            return {"messages": [], "anchors": []}
+
+    class Submission:
+        submitted = 0
+
+        async def generate_draft(self, *, opportunity, decision, context):
+            del opportunity, decision, context
+            draft_started.set()
+            await release_draft.wait()
+            return "must not transport"
+
+        async def submit(self, **kwargs):
+            del kwargs
+            self.submitted += 1
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    submission = Submission()
+
+    def snapshot(*args, **kwargs):
+        del args, kwargs
+        return {
+            "enabled": True,
+            "opted_in": True,
+            "activation_epoch": 1,
+            "lane": "production",
+            "allowed_actions": ("comment", "silence"),
+            "allowed_intents": ("initiate",),
+            "comment_allowed_intents": ("initiate",),
+            "allowed_contribution_types": ("observation",),
+            "allow_initiation": True,
+            "allow_continuation": False,
+            "allow_reactions": False,
+            "spontaneity_enabled": True,
+            "spontaneity_daily_cap": 10,
+            "comment_limits": (("comment", 3, 1_800_000),),
+            "reaction_limits": (),
+            "continuation_candidate": False,
+            "judge_calls_per_hour": 12,
+            "min_gap_seconds": 0,
+            "continuation_reserve": 0,
+        }
+
+    runtime = ParticipationRuntime(
+        judge=Judge(),  # type: ignore[arg-type]
+        context_builder=Context(),
+        ledger=log,
+        snapshot_provider=snapshot,
+        is_source_allowed=lambda *args: True,
+        source_principals=lambda channel, chat_id, sources: tuple(
+            (source, "person") for source in sources
+        ),
+        submission=submission,
+        direct_work_active=lambda channel, chat_id: direct,
+    )
+    opportunity = _opportunity()
+    task = asyncio.create_task(runtime.evaluate_participation(opportunity))
+    try:
+        await asyncio.wait_for(draft_started.wait(), timeout=1)
+        direct = True
+        release_draft.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        assert result == {"status": "skipped", "reason": "direct_request"}
+        assert submission.submitted == 0
+        effect_id = deterministic_effect_id(
+            channel="whatsapp",
+            chat_id=CHAT,
+            operation="comment",
+            proposal_id=opportunity.opportunity_id,
+        )
+        rows = await log.delivery_record(
+            proposal_id=opportunity.opportunity_id, effect_id=effect_id
+        )
+        assert rows is not None and rows["delivery_state"] == "failed"
+    finally:
+        if not task.done():
+            release_draft.set()
+            await task
+        log.close()
+
+
+@pytest.mark.asyncio
 async def test_two_offers_for_one_chat_merge_into_one_handler_call() -> None:
     calls: list[tuple[str, ...]] = []
     done = asyncio.Event()

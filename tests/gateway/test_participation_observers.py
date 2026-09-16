@@ -432,6 +432,110 @@ def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revisi
     archive.close()
 
 
+def test_participation_ingress_rejects_trusted_direct_source_before_claim(
+    tmp_path: Path,
+) -> None:
+    """Direct processing entries never become autonomous source claims."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationIngress
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    offered: list[object] = []
+
+    class Runtime:
+        def offer_source(self, **kwargs: object) -> bool:
+            offered.append(kwargs)
+            return True
+
+    ingress = ParticipationIngress(
+        runtime=Runtime(),  # type: ignore[arg-type]
+        ledger=log,
+        material_provider=_synthetic_material_provider,
+        is_direct=lambda event: bool(
+            (getattr(event, "metadata", {}) or {}).get("canonical_direct")
+        ),
+    )
+    event = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="person",
+        content="direct",
+        timestamp=1.0,
+        message_id="m-direct",
+        source_event_ids=("m-direct",),
+        metadata={"canonical_direct": True, "direct": False},
+    )
+    assert ingress.handle_event(event) is False
+    assert offered == []
+    # An untrusted metadata claim is not direct authority and follows the normal lane.
+    allowed = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="person",
+        content="social",
+        timestamp=1.0,
+        message_id="m-social",
+        source_event_ids=("m-social",),
+        metadata={"direct": True},
+    )
+    assert ingress.handle_event(allowed) is True
+    assert len(offered) == 1
+    log.close()
+
+
+def test_participation_offer_is_fenced_while_direct_work_is_active(
+    tmp_path: Path,
+) -> None:
+    """A direct binding blocks claims until its own terminal callback releases it."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationRuntime,
+        SourceOwner,
+    )
+    from yeoman_gateway.processing.store import ProcessingStore
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=CHAT, source_ids=("m1",)
+    )
+    # The direct fence lives in the processing store in production; the Speakup ledger
+    # test double exposes the same callback for this observer-only regression.
+    direct_store = ProcessingStore(tmp_path / "processing.db")
+    direct_store.note_direct_admission(
+        channel="whatsapp", chat_id=CHAT, event_id="direct", turn_id="turn"
+    )
+
+    class Scheduler:
+        def offer(self, opportunity: object) -> bool:
+            del opportunity
+            return True
+
+    runtime = ParticipationRuntime(
+        scheduler=Scheduler(),  # type: ignore[arg-type]
+        source_owner=SourceOwner(store=log),
+        direct_work_active=direct_store.direct_work_active,
+    )
+    try:
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m1",),
+            observed_revision=1,
+            trigger="inbound",
+        ) is False
+        direct_store.finish_direct_admission("turn")
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m1",),
+            observed_revision=1,
+            trigger="inbound",
+        ) is True
+    finally:
+        direct_store.close()
+        log.close()
+
+
 @pytest.mark.asyncio
 async def test_duplicate_batch_material_reaches_one_real_runtime_evaluation(
     tmp_path: Path,

@@ -165,6 +165,7 @@ class ParticipationRuntime:
         is_enabled: Any | None = None,
         activation_provider: Callable[[str, str], object | None] | None = None,
         considered_revision_provider: Callable[..., int] | None = None,
+        direct_work_active: Callable[[str, str], bool] | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._source_owner = source_owner
@@ -173,6 +174,7 @@ class ParticipationRuntime:
         self._is_enabled = is_enabled or (lambda channel, chat_id: True)
         self._activation_provider = activation_provider
         self._considered_revision_provider = considered_revision_provider
+        self._direct_work_active = direct_work_active
         self._hydrated_chats: set[tuple[str, str, str]] = set()
 
     @property
@@ -206,6 +208,12 @@ class ParticipationRuntime:
 
     def _offer_activation(self, channel: str, chat_id: str) -> tuple[int, str, bool]:
         """Resolve epoch/lane/readiness once, immediately before claiming sources."""
+        if self._direct_work_active is not None:
+            try:
+                if bool(self._direct_work_active(str(channel), str(chat_id))):
+                    return self._activation_epoch, self._lane, False
+            except Exception:  # noqa: BLE001 - a failed fence must not admit work
+                return self._activation_epoch, self._lane, False
         snapshot = self.current_activation(channel, chat_id)
         if self._activation_provider is None:
             return self._activation_epoch, self._lane, bool(
@@ -595,6 +603,7 @@ class ParticipationIngress:
         runtime: ParticipationRuntime,
         ledger: object,
         is_active: Any | None = None,
+        is_direct: Callable[[object], bool] | None = None,
         material_provider: Callable[
             [str, str, tuple[str, ...] | None], tuple[tuple[str, ...], int]
         ]
@@ -603,6 +612,9 @@ class ParticipationIngress:
         self._runtime = runtime
         self._ledger = ledger
         self._is_active = is_active or (lambda channel, chat_id: True)
+        # This callback must consult the canonical processing entry.  Observer metadata
+        # alone is intentionally not treated as direct authority.
+        self._is_direct = is_direct
         self._material_provider = material_provider
 
     def handle_event(self, event: object) -> bool:
@@ -613,6 +625,12 @@ class ParticipationIngress:
             return False
         if not self._is_active(channel, chat_id):
             return False
+        if self._is_direct is not None:
+            try:
+                if bool(self._is_direct(event)):
+                    return False
+            except Exception:  # noqa: BLE001 - failed validation cannot create work
+                return False
         metadata = getattr(event, "metadata", None) or {}
         if not isinstance(metadata, dict):
             metadata = {}

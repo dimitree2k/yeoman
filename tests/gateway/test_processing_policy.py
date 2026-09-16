@@ -668,6 +668,98 @@ def test_live_cutover_keeps_a_direct_thread_continuation(tmp_path: Path) -> None
         store.close()
 
 
+def test_direct_admission_is_durable_idempotent_and_releases_only_its_turn(
+    tmp_path: Path,
+) -> None:
+    """A direct turn fences autonomous work across restart without broad release."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        first = store.note_direct_admission(
+            "whatsapp", "chat@g.us", "evt-direct", "turn-direct", now_ms=1
+        )
+        assert first == 1
+        assert store.direct_work_active("whatsapp", "chat@g.us") is True
+        # Duplicate delivery is the same durable admission, not a second fence revision.
+        assert (
+            store.note_direct_admission(
+                "whatsapp", "chat@g.us", "evt-direct", "turn-direct", now_ms=2
+            )
+            == first
+        )
+        assert store.direct_arbitration_revision("whatsapp", "chat@g.us") == 1
+        assert (
+            store.note_direct_admission(
+                "whatsapp", "chat@g.us", "evt-other", "turn-other", now_ms=3
+            )
+            == 2
+        )
+        assert store.direct_work_active("whatsapp", "chat@g.us") is True
+        assert store.direct_work_active("whatsapp", "other@g.us") is False
+        store.finish_direct_admission("turn-direct")
+        assert store.direct_work_active("whatsapp", "chat@g.us") is True
+        store.close()
+
+        reopened = ProcessingStore(tmp_path / "processing.db")
+        try:
+            assert reopened.direct_work_active("whatsapp", "chat@g.us") is True
+            recovered = reopened.recover_direct_admissions(now_ms=4)
+            assert len(recovered) == 1
+            assert reopened.direct_work_active("whatsapp", "chat@g.us") is False
+            reopened.finish_direct_admission("turn-other")
+            assert reopened.direct_work_active("whatsapp", "chat@g.us") is False
+        finally:
+            reopened.close()
+    finally:
+        # The first close is intentional for the restart assertion above.
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
+def test_direct_ingress_fences_and_cancels_before_gate_returns(tmp_path: Path) -> None:
+    """The durable direct fence and scheduler cancellation are synchronous at ingress."""
+    from yeoman_gateway.processing.threads import ThreadRegistry
+
+    store = ProcessingStore(tmp_path / "processing.db")
+    order: list[str] = []
+
+    def note(**kwargs: object) -> int:
+        order.append("note")
+        return store.note_direct_admission(**kwargs)  # type: ignore[arg-type]
+
+    def cancel(channel: str, chat_id: str, *, reason: str) -> bool:
+        order.append("cancel")
+        assert store.direct_work_active(channel, chat_id)
+        assert reason == "direct_request"
+        return True
+
+    gate = IngestGate(
+        config=_codec_config(),
+        store=store,
+        snapshots=_StaticSnapshots(),
+        threads=ThreadRegistry(store=store, config=_codec_config()),
+        evaluate=lambda request: PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"message"}),
+            reason="allow",
+        ),
+        direct_classifier=lambda request, decision, assignment: True,
+        note_direct_admission=note,
+        cancel_chat=cancel,
+    )
+    try:
+        result = gate.admit(_request())
+        assert result is not None
+        assert result.direct_admitted is True
+        assert result.direct_turn_id
+        assert result.arbitration_revision == 1
+        assert order == ["note", "cancel"]
+    finally:
+        store.close()
+
+
 def test_unmanaged_chat_is_not_touched_by_the_new_mode(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     gate = IngestGate(
