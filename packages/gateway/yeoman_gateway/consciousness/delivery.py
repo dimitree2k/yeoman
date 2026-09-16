@@ -148,9 +148,16 @@ class ParticipationReceiptReconciler:
     Nothing here invents evidence: no provider lookup, no timer assumption.
     """
 
-    def __init__(self, *, log: SpeakupLog, store: ProcessingStore) -> None:
+    def __init__(
+        self,
+        *,
+        log: SpeakupLog,
+        store: ProcessingStore,
+        unsubmitted_ttl_ms: int = 120_000,
+    ) -> None:
         self._log = log
         self._store = store
+        self._unsubmitted_ttl_ms = max(1, int(unsubmitted_ttl_ms))
 
     async def reconcile(self, *, limit: int = 50, now_ms: int | None = None) -> dict[str, int]:
         """One bounded reconciliation pass. Returns per-outcome counters."""
@@ -179,7 +186,21 @@ class ParticipationReceiptReconciler:
                 # No durable effect exists for this reservation: the crash-recovery
                 # case "reservation saved, effect absent". It is never sent from
                 # here; the submitting path revalidates and reuses the same id.
-                counters["skipped"] += 1
+                if (
+                    str(row.get("attempt_state") or "") == "unsubmitted"
+                    and moment
+                    >= int(row.get("created_at_ms") or moment) + self._unsubmitted_ttl_ms
+                    and await self._log.release_delivery(
+                        proposal_id,
+                        effect_id=effect_id,
+                        state="expired",
+                        reason="unsubmitted_intent_expired",
+                        now_ms=moment,
+                    )
+                ):
+                    counters["released"] += 1
+                else:
+                    counters["skipped"] += 1
                 continue
             if effect.state == "sent":
                 transport = self._store.effect_transport_receipt(effect_id)
@@ -243,7 +264,7 @@ class ParticipationReceiptReconciler:
             return False
         group = is_group_chat(channel, chat_id)
         for signal in self._store.delivery_signals(
-            chat_id=chat_id, message_id=provider_id, limit=20
+            channel=channel, chat_id=chat_id, message_id=provider_id, limit=20
         ):
             payload = dict(getattr(signal, "payload", None) or {})
             status = str(payload.get("status") or "").lower()

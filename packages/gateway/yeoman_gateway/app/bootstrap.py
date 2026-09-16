@@ -480,16 +480,16 @@ class GatewayRuntime:
             self.cron.stop()
             self.orchestrator.stop()
             await self.channels.stop_all()
+            if self.reconciliation is not None:
+                await self.reconciliation.stop()
+            if self.retention is not None:
+                await self.retention.stop()
             await self.responder.aclose()
             self.inbound_archive.close()
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
                 self.speakup_log.close()
             if hasattr(self.chat_registry, "close"):
                 self.chat_registry.close()
-            if self.reconciliation is not None:
-                await self.reconciliation.stop()
-            if self.retention is not None:
-                await self.retention.stop()
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
                 self.shared_facts.stop()
             self.contacts.close()
@@ -503,17 +503,47 @@ class ProcessingStoreUnavailableError(RuntimeError):
     """The new mode is enabled but its durable store cannot be opened (review F01)."""
 
 
-def build_processing_store(config: "Config") -> "ProcessingStore | None":
+def _processing_store_path(config: "Config") -> Path:
+    from yeoman_shared.utils.helpers import get_data_path
+
+    path = Path(config.processing.db_path).expanduser()
+    return path if path.is_absolute() else get_data_path() / path
+
+
+def _has_pending_participation_recovery(
+    *, speakup_path: Path, processing_path: Path
+) -> bool:
+    """Inspect existing ledgers read-only; never create a database for discovery."""
+    if not speakup_path.is_file() or not processing_path.is_file():
+        return False
+    import sqlite3
+
+    try:
+        connection = sqlite3.connect(f"file:{speakup_path}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM delivery_reservations "
+                "WHERE delivery_state IN "
+                "('reserved','submitted','transport_accepted','delivery_unknown') LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def build_processing_store(
+    config: "Config", *, recover_pending: bool = False
+) -> "ProcessingStore | None":
     """Open the durable processing store, but only when the new mode is enabled.
 
     Disabled mode stays byte-for-byte inert: no second database appears next to the
     archives. A store that cannot be opened leaves the new mode offline (fail closed)
     instead of degrading into an unaudited path.
     """
-    if not config.processing.enabled:
+    if not config.processing.enabled and not recover_pending:
         return None
-
-    from yeoman_shared.utils.helpers import get_data_path
 
     from yeoman_gateway.processing.models import DAY_MS, RetentionSettings
     from yeoman_gateway.processing.store import ProcessingStore
@@ -524,9 +554,7 @@ def build_processing_store(config: "Config") -> "ProcessingStore | None":
         metadata_ms=retention_cfg.lineage_metadata_days * DAY_MS,
         unresolved_ms=retention_cfg.unresolved_days * DAY_MS,
     )
-    path = Path(config.processing.db_path).expanduser()
-    if not path.is_absolute():
-        path = get_data_path() / path
+    path = _processing_store_path(config)
     try:
         return ProcessingStore(path, retention=retention)
     except Exception as exc:
@@ -802,10 +830,7 @@ def _build_participation_runtime(
     participation = getattr(config.processing, "participation", None)
     if participation is None or not bool(getattr(participation, "enabled", False)):
         return None, None, None
-    from yeoman_gateway.consciousness.delivery import (
-        DeliveryAnchorReader,
-        ParticipationReceiptReconciler,
-    )
+    from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
     from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
     from yeoman_gateway.consciousness.participation_runtime import (
         ParticipationRuntime as OpportunityOfferRuntime,
@@ -1122,11 +1147,6 @@ def _build_participation_runtime(
             else None
         ),
     )
-    reconciler = (
-        ParticipationReceiptReconciler(log=log, store=processing_store)  # type: ignore[arg-type]
-        if processing_store is not None
-        else None
-    )
     logger.info(
         "participation runtime built route={} shadow={} pending_chats={} concurrency={}",
         route_key,
@@ -1134,7 +1154,7 @@ def _build_participation_runtime(
         int(getattr(participation, "max_pending_chats", 64)),
         int(getattr(participation, "max_concurrent_decisions", 2)),
     )
-    return offer_runtime, scheduler, (decision_runtime, reconciler)
+    return offer_runtime, scheduler, (decision_runtime, None)
 
 
 class _ParticipationSubmission:
@@ -1331,12 +1351,15 @@ def build_reconciliation_service(
     store: "ProcessingStore | None",
     *,
     probe: object | None = None,
+    project_participation_receipts: Callable[[], Awaitable[object]] | None = None,
 ):
     """Reconciler for the new mode; ``None`` while processing is off or no store is open.
 
     Disabled mode stays inert: no store, no database and no background task.
     """
-    if store is None or not config.processing.enabled:
+    if store is None or (
+        not config.processing.enabled and project_participation_receipts is None
+    ):
         return None
 
     from yeoman_gateway.processing.reconcile import LocalEvidenceProbe, ReconciliationService
@@ -1346,7 +1369,44 @@ def build_reconciliation_service(
         store,
         provider_lookup_enabled=bool(reconciliation.provider_lookup_enabled),
     )
-    return ReconciliationService(store, probe=evidence, config=reconciliation)
+    maintenance = config.processing.participation_maintenance
+    return ReconciliationService(
+        store,
+        probe=evidence,
+        config=reconciliation,
+        project_participation_receipts=project_participation_receipts,
+        projection_interval_seconds=int(maintenance.interval_seconds),
+    )
+
+
+def _build_participation_receipt_projection(
+    config: "Config",
+    *,
+    log: object | None,
+    store: "ProcessingStore | None",
+    inbound_archive: object,
+) -> tuple[object | None, Callable[[], Awaitable[object]] | None]:
+    if log is None or store is None:
+        return None, None
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    reconciler = ParticipationReceiptReconciler(
+        log=log,  # type: ignore[arg-type]
+        store=store,
+        unsubmitted_ttl_ms=int(
+            config.processing.participation.opportunity_ttl_seconds
+        )
+        * 1000,
+    )
+    batch_size = int(config.processing.participation_maintenance.batch_size)
+
+    async def _project() -> object:
+        return await reconciler.reconcile(limit=batch_size)
+
+    feedback = getattr(log, "set_explicit_feedback_reader", None)
+    if callable(feedback):
+        feedback(_archive_feedback_reader(inbound_archive, reconciler))
+    return reconciler, _project
 
 
 def build_retention_service(
@@ -1740,21 +1800,32 @@ def build_gateway_runtime(
 
     from yeoman_shared.utils.helpers import get_operational_data_path
 
-    processing_store = build_processing_store(config)
     consciousness_data_dir = get_operational_data_path() / "consciousness"
+    speakup_path = consciousness_data_dir / "speakups.db"
+    pending_participation_recovery = _has_pending_participation_recovery(
+        speakup_path=speakup_path,
+        processing_path=_processing_store_path(config),
+    )
+    processing_store = build_processing_store(
+        config, recover_pending=pending_participation_recovery
+    )
     participation_enabled = bool(
-        getattr(getattr(config.processing, "participation", None), "enabled", False)
+        config.processing.enabled
+        and getattr(getattr(config.processing, "participation", None), "enabled", False)
+    )
+    social_runtime_enabled = policy_engine is not None and (
+        config.consciousness.enabled or participation_enabled
     )
     speakup_log = None
     speakup_approval_store = None
     activation_tracker = None
-    if policy_engine is not None and (config.consciousness.enabled or participation_enabled):
+    if social_runtime_enabled or pending_participation_recovery:
         from yeoman_gateway.consciousness.log import SpeakupLog
         from yeoman_gateway.consciousness.participation_runtime import (
             ActivationEpochTracker,
         )
 
-        speakup_log = SpeakupLog(consciousness_data_dir / "speakups.db")
+        speakup_log = SpeakupLog(speakup_path)
         if participation_enabled:
             activation_tracker = ActivationEpochTracker(store=speakup_log)
         if config.consciousness.enabled:
@@ -1939,6 +2010,32 @@ def build_gateway_runtime(
         ServiceEffectProducer(router=effect_router, bus=bus)
         if effect_router is not None
         else None
+    )
+    consciousness_tools = None
+    if social_runtime_enabled and speakup_log is not None:
+        from yeoman_gateway.consciousness.tools import ConsciousnessTools
+
+        assert policy_engine is not None
+        consciousness_tools = ConsciousnessTools(
+            config=config,
+            policy_engine=policy_engine,
+            bus=bus,
+            log=speakup_log,
+            inbound_archive=inbound_archive,
+            memory=memory_service,
+            security=security,
+            approval_store=speakup_approval_store,
+            service_effects=service_effects,
+            activation_provider=getattr(policy_adapter, "current_activation", None),
+        )
+
+    participation_receipt_reconciler, project_participation_receipts = (
+        _build_participation_receipt_projection(
+            config,
+            log=speakup_log,
+            store=processing_store,
+            inbound_archive=inbound_archive,
+        )
     )
 
     responder = LLMResponder(
@@ -2184,6 +2281,7 @@ def build_gateway_runtime(
         bus=bus,
         speakup_approval_store=speakup_approval_store,
         speakup_log=speakup_log,
+        speakup_tools=consciousness_tools,
         persona_evolution_workspace=Path(workspace),
         persona_evolution_state_db_path=persona_evolution_state_db_path,
         session_manager=session_manager,
@@ -2863,24 +2961,12 @@ def build_gateway_runtime(
     consciousness_service = None
     lull_observer = None
     participation_maintenance = None
-    if speakup_log is not None and policy_engine is not None:
+    if social_runtime_enabled and speakup_log is not None:
+        assert policy_engine is not None
         from yeoman_gateway.consciousness.burst import BurstObserver
         from yeoman_gateway.consciousness.lull import LullObserver
         from yeoman_gateway.consciousness.participation_runtime import SourceOwner
-        from yeoman_gateway.consciousness.tools import ConsciousnessTools
-
-        consciousness_tools = ConsciousnessTools(
-            config=config,
-            policy_engine=policy_engine,
-            bus=bus,
-            log=speakup_log,
-            inbound_archive=inbound_archive,
-            memory=memory_service,
-            security=security,
-            approval_store=speakup_approval_store,
-            service_effects=service_effects,
-            activation_provider=getattr(policy_adapter, "current_activation", None),
-        )
+        assert consciousness_tools is not None
 
         if config.consciousness.enabled:
             from yeoman_gateway.consciousness.agent import ConsciousnessAgent
@@ -3010,18 +3096,25 @@ def build_gateway_runtime(
                 participation_material = _participation_material
 
         source_owner = SourceOwner(store=speakup_log)
-        participation_runtime, opportunity_scheduler, participation_decision = (
-            _build_participation_runtime(
-                config=config,
-                source_owner=source_owner,
-                log=speakup_log,
-                policy_engine=policy_engine,
-                inbound_archive=inbound_archive,
-                processing_store=processing_store,
-                responder=responder,
-                policy_adapter=policy_adapter,
+        if participation_enabled:
+            participation_runtime, opportunity_scheduler, participation_decision = (
+                _build_participation_runtime(
+                    config=config,
+                    source_owner=source_owner,
+                    log=speakup_log,
+                    policy_engine=policy_engine,
+                    inbound_archive=inbound_archive,
+                    processing_store=processing_store,
+                    responder=responder,
+                    policy_adapter=policy_adapter,
+                )
             )
-        )
+        else:
+            participation_runtime, opportunity_scheduler, participation_decision = (
+                None,
+                None,
+                None,
+            )
         direct_fence_setter = getattr(processing_gate, "set_direct_fence_callbacks", None)
         cancel_participation = getattr(opportunity_scheduler, "cancel_chat", None)
         if (
@@ -3047,14 +3140,9 @@ def build_gateway_runtime(
                 cancel=cancel_participation,
             )
         if isinstance(participation_decision, tuple):
-            _decision_runtime, _reconciler = participation_decision
+            _decision_runtime, _unused_reconciler = participation_decision
         else:
-            _decision_runtime, _reconciler = None, None
-        if _reconciler is not None:
-            # Receipt reconciliation keeps running even when judging is disabled.
-            speakup_log.set_explicit_feedback_reader(
-                _archive_feedback_reader(inbound_archive, _reconciler)
-            )
+            _decision_runtime = None
         participation_maintenance = None
         maintenance_config = getattr(config.processing, "participation_maintenance", None)
         if maintenance_config is not None and bool(
@@ -3066,7 +3154,7 @@ def build_gateway_runtime(
 
             participation_maintenance = ParticipationMaintenance(
                 ledger=speakup_log,
-                reconciler=_reconciler,
+                reconciler=participation_receipt_reconciler,
                 archive=inbound_archive,
                 classifier=None,
                 observation_window_minutes=int(
@@ -3229,7 +3317,11 @@ def build_gateway_runtime(
         opportunity_scheduler=opportunity_scheduler,
         participation_maintenance=participation_maintenance,
         processing=processing_store,
-        reconciliation=build_reconciliation_service(config, processing_store),
+        reconciliation=build_reconciliation_service(
+            config,
+            processing_store,
+            project_participation_receipts=project_participation_receipts,
+        ),
         retention=build_retention_service(config, processing_store),
         shared_facts=shared_fact_runtime,
         startup_hook=_notify_pending_persona_evolution_reviews,

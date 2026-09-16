@@ -130,7 +130,10 @@ class _EffectStore:
             confirmed_ms=1,
         )
 
-    def delivery_signals(self, *, chat_id: str, message_id: str) -> tuple[object, ...]:
+    def delivery_signals(
+        self, *, channel: str, chat_id: str, message_id: str
+    ) -> tuple[object, ...]:
+        del channel
         if self.delivery_status is None:
             return ()
         return (SimpleNamespace(payload={"status": self.delivery_status}),)

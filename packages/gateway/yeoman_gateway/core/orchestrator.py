@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.bus.queue import MessageBus
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.media.router import ModelRouter
@@ -86,6 +87,7 @@ class Orchestrator:
         bus: "MessageBus | None" = None,
         speakup_approval_store: "SpeakupApprovalStore | None" = None,
         speakup_log: "SpeakupLog | None" = None,
+        speakup_tools: "ConsciousnessTools | None" = None,
         persona_evolution_workspace: Path | None = None,
         persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
@@ -119,6 +121,7 @@ class Orchestrator:
                     log=speakup_log,
                     security=security,
                     service_effects=service_effects,
+                    tools=speakup_tools,
                 )
             )
         if (

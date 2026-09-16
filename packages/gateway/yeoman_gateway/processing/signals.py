@@ -403,7 +403,9 @@ def attach_receipt_evidence(
     if receipt is None or not receipt.provider_message_id:
         return ()
     signals = store.delivery_signals(
-        chat_id=receipt.chat_id, message_id=receipt.provider_message_id
+        channel=receipt.channel,
+        chat_id=receipt.chat_id,
+        message_id=receipt.provider_message_id,
     )
     evidence = (mapper or WhatsAppSignalMapper()).receipt_evidence(receipt, signals)
     attached: list[ReceiptEvidence] = []

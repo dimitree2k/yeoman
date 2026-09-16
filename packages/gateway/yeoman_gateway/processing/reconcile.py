@@ -19,7 +19,7 @@ Absence of evidence is never proof: an empty result is ``inconclusive``, not
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
@@ -187,7 +187,9 @@ async def reconcile_effect(
     signals: tuple[Any, ...] = ()
     if transport is not None and transport.provider_message_id:
         signals = store.delivery_signals(
-            chat_id=transport.chat_id, message_id=transport.provider_message_id
+            channel=transport.channel,
+            chat_id=transport.chat_id,
+            message_id=transport.provider_message_id,
         )
     request = ProbeRequest(
         effect=effect,
@@ -336,6 +338,8 @@ class ReconciliationService:
         worker_id: str = "reconciler",
         clock: Callable[[], int] | None = None,
         tick_seconds: float = 1.0,
+        project_participation_receipts: Callable[[], Awaitable[object]] | None = None,
+        projection_interval_seconds: int = 900,
     ) -> None:
         self._store = store
         self._probe = probe
@@ -343,6 +347,9 @@ class ReconciliationService:
         self._worker_id = worker_id
         self._clock = clock or _now_ms
         self._tick_seconds = max(0.05, float(tick_seconds))
+        self._project_participation_receipts = project_participation_receipts
+        self._projection_interval_ms = max(1, int(projection_interval_seconds)) * 1000
+        self._last_projection_ms: int | None = None
         self._task: Any = None
         self._stopping = False
         self._counters: dict[str, int] = {
@@ -353,6 +360,7 @@ class ReconciliationService:
             "inconclusive": 0,
             "escalated": 0,
             "recovered": 0,
+            "participation_projections": 0,
         }
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -408,6 +416,21 @@ class ReconciliationService:
 
         now = self._clock()
         self._counters["ticks"] += 1
+
+        if self._project_participation_receipts is not None and (
+            self._last_projection_ms is None
+            or now - self._last_projection_ms >= self._projection_interval_ms
+        ):
+            try:
+                await self._project_participation_receipts()
+            except Exception as exc:  # a ledger write must not starve effect recovery
+                logger.warning(
+                    "participation receipt projection failed error_type={}",
+                    type(exc).__name__,
+                )
+            else:
+                self._last_projection_ms = now
+                self._counters["participation_projections"] += 1
 
         recovered = self._store.recover_executing(now)
         self._counters["recovered"] += len(recovered)
@@ -506,7 +529,9 @@ class ReconciliationService:
         signals = ()
         if transport is not None and transport.provider_message_id:
             signals = self._store.delivery_signals(
-                chat_id=transport.chat_id, message_id=transport.provider_message_id
+                channel=transport.channel,
+                chat_id=transport.chat_id,
+                message_id=transport.provider_message_id,
             )
         request = ProbeRequest(
             effect=effect,

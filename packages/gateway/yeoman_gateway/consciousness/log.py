@@ -2077,7 +2077,12 @@ class SpeakupLog:
                 """
                 SELECT * FROM delivery_reservations
                 WHERE delivery_state IN ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')
-                ORDER BY created_at_ms ASC
+                ORDER BY CASE delivery_state
+                    WHEN 'submitted' THEN 0
+                    WHEN 'transport_accepted' THEN 0
+                    WHEN 'reserved' THEN 1
+                    ELSE 2
+                END, created_at_ms ASC
                 LIMIT ?
                 """,
                 (max(1, int(limit)),),

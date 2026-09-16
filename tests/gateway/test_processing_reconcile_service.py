@@ -134,6 +134,64 @@ async def test_recovered_claim_is_probed_immediately(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tick_projects_participation_before_empty_return_and_is_rate_limited(
+    tmp_path: Path,
+) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    clock = _Clock(T0)
+    calls = 0
+
+    async def project_participation_receipts() -> None:
+        nonlocal calls
+        calls += 1
+
+    service = ReconciliationService(
+        store,
+        probe=_CountingProbe(),
+        config=_Config(),
+        clock=clock,
+        project_participation_receipts=project_participation_receipts,
+        projection_interval_seconds=60,
+    )
+
+    assert await service.tick_once() == ()
+    assert calls == 1
+    clock.value = T0 + 59_999
+    assert await service.tick_once() == ()
+    assert calls == 1
+    clock.value = T0 + 60_000
+    assert await service.tick_once() == ()
+    assert calls == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_participation_projection_retries_without_blocking_tick(
+    tmp_path: Path,
+) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    calls = 0
+
+    async def fail_projection() -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("synthetic ledger failure")
+
+    service = ReconciliationService(
+        store,
+        probe=_CountingProbe(),
+        config=_Config(),
+        clock=_Clock(T0),
+        project_participation_receipts=fail_projection,
+    )
+
+    assert await service.tick_once() == ()
+    assert await service.tick_once() == ()
+    assert calls == 2
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_probe_timeout_leaves_a_finished_inconclusive_probe(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     effect_id = await _make_unknown(store)

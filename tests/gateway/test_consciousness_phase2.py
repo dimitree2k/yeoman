@@ -281,6 +281,81 @@ async def test_approve_code_sends_to_target_chat(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_approval_after_consciousness_pause_does_not_send(tmp_path: Path) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+    proposal = await tools.propose_speakup(
+        chat_id="group@g.us",
+        message="hello group",
+        action_type="observation",
+        confidence=0.9,
+    )
+    await tools.commit_speakup(str(proposal["proposal_id"]))
+    preview = await tools.bus.consume_outbound()
+    code = preview.content.split("Approve: ", 1)[1].splitlines()[0].strip()
+    tools.config.consciousness.enabled = False
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+        tools=tools,
+    )
+
+    await middleware(_owner_ctx(code), AsyncMock())
+
+    assert tools.bus.outbound_size == 0
+    row = await log.proposal_row(str(proposal["proposal_id"]))
+    assert row is not None
+    assert row["status"] != "sent"
+
+
+@pytest.mark.asyncio
+async def test_valid_approval_submits_exactly_one_bound_target_effect(tmp_path: Path) -> None:
+    tools, store, log = _tools(tmp_path, opt_in_group=True)
+
+    class Effects:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def send(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+
+            class Receipt:
+                accepted = True
+                state = "sent"
+                attempt_id = "attempt-1"
+                transport_receipt = None
+
+            return Receipt()
+
+    effects = Effects()
+    tools._service_effects = effects
+    proposal = await tools.propose_speakup(
+        chat_id="group@g.us",
+        message="hello group",
+        action_type="observation",
+        confidence=0.9,
+    )
+    await tools.commit_speakup(str(proposal["proposal_id"]))
+    approval = (await store.list_pending())[0]
+    middleware = SpeakupApprovalMiddleware(
+        approval_store=store,
+        bus=tools.bus,
+        log=log,
+        security=tools.security,
+        tools=tools,
+    )
+
+    await middleware(_owner_ctx(approval.approve_code), AsyncMock())
+    await middleware(_owner_ctx(approval.approve_code), AsyncMock())
+
+    target_calls = [call for call in effects.calls if call["chat_id"] == "group@g.us"]
+    assert len(target_calls) == 1
+    assert target_calls[0]["effect_id"]
+    assert target_calls[0]["require_managed"] is True
+
+
+@pytest.mark.asyncio
 async def test_approve_code_accepts_owner_lid_chat_when_participant_matches(tmp_path: Path) -> None:
     tools, store, log = _tools(tmp_path, opt_in_group=True)
     proposal = await tools.propose_speakup(

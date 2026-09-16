@@ -47,7 +47,9 @@ class _EffectStore(Protocol):
 
     def effect_transport_receipt(self, effect_id: str) -> Any: ...
 
-    def delivery_signals(self, *, chat_id: str, message_id: str) -> tuple[Any, ...]: ...
+    def delivery_signals(
+        self, *, channel: str, chat_id: str, message_id: str
+    ) -> tuple[Any, ...]: ...
 
 
 _RecipientResolver = Callable[[str, str], tuple[str | None, str | None]]
@@ -143,7 +145,9 @@ def _business_status(store: _EffectStore, effect_id: str) -> tuple[str, str | No
     provider_id = str(getattr(receipt, "provider_message_id", "") or "") or None
     if receipt is None or provider_id is None:
         raise RuntimeError("sent effect has no durable transport receipt")
-    signals = store.delivery_signals(chat_id=receipt.chat_id, message_id=provider_id)
+    signals = store.delivery_signals(
+        channel=receipt.channel, chat_id=receipt.chat_id, message_id=provider_id
+    )
     delivered = any(
         str((getattr(signal, "payload", None) or {}).get("status", "")).lower()
         in DELIVERED_STATUSES_TUPLE

@@ -2050,6 +2050,34 @@ async def test_reconciler_projects_acceptance_and_then_delivery(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_reconciler_ignores_matching_recipient_signal_from_another_channel(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    await _reserved_effect(log, store, proposal_id="p1", effect_id="e1", execute=True)
+    reconciler = ParticipationReceiptReconciler(log=log, store=store)
+    await reconciler.reconcile(now_ms=5000)
+
+    _append_receipt(
+        store,
+        channel="signal",
+        chat_id=CHAT,
+        provider_message_id="prov-1",
+    )
+    counters = await reconciler.reconcile(now_ms=6000)
+
+    assert counters["delivered"] == 0
+    assert await log.delivery_state(
+        proposal_id="p1", effect_id="e1"
+    ) == "transport_accepted"
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
 async def test_reconciler_releases_definite_effect_failure(tmp_path: Path) -> None:
     from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
 
@@ -2132,21 +2160,117 @@ async def test_reconciler_retains_unknown_and_missing_effects(tmp_path: Path) ->
     log.close()
 
 
+@pytest.mark.asyncio
+async def test_reconciler_expires_stale_unsubmitted_reservation_without_effect(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+    await _proposal(log, "stale")
+    await log.reserve_delivery(
+        proposal_id="stale",
+        effect_id="missing",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 1, HOUR_MS),),
+    )
+    reconciler = ParticipationReceiptReconciler(
+        log=log, store=store, unsubmitted_ttl_ms=100
+    )
+
+    counters = await reconciler.reconcile(now_ms=1100)
+
+    assert counters["released"] == 1
+    assert await log.delivery_state(
+        proposal_id="stale", effect_id="missing"
+    ) == "expired"
+    store.close()
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_prioritizes_newer_actionable_rows_over_old_unknown_batch_head(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    store = ProcessingStore(tmp_path / "processing.db")
+
+    # The old row is already known to be in-flight and must remain held.
+    await _proposal(log, "old")
+    old_effect = _effect_id("old")
+    await log.reserve_delivery(
+        proposal_id="old",
+        effect_id=old_effect,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=1000,
+        limits=(("comment", 1, HOUR_MS),),
+    )
+    await log.record_send_attempt("old", effect_id=old_effect, now_ms=1000)
+    await log.note_delivery_unknown(
+        "old",
+        effect_id=old_effect,
+        evidence_kind="dispatch_unknown",
+        evidence_ref=old_effect,
+        now_ms=1100,
+    )
+
+    # A later effect is definitely failed, but is behind the old unknown row by age.
+    await _proposal(log, "new")
+    new_effect = _effect_id("new")
+    await log.reserve_delivery(
+        proposal_id="new",
+        effect_id=new_effect,
+        channel=CHANNEL,
+        chat_id=CHAT,
+        now_ms=2000,
+        limits=(("comment", 2, HOUR_MS),),
+    )
+    await log.record_send_attempt("new", effect_id=new_effect, now_ms=2000)
+    store.enqueue_effect(
+        effect_id=new_effect,
+        operation_key=f"failed:{new_effect}",
+        payload=TextPayload(text="Synthetic contribution."),
+        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        state="failed",
+        now_ms=2100,
+    )
+
+    reconciler = ParticipationReceiptReconciler(log=log, store=store)
+    first = await reconciler.reconcile(limit=1, now_ms=5000)
+
+    assert first["released"] == 1
+    assert await log.delivery_state(proposal_id="new", effect_id=new_effect) == "failed"
+    assert await log.delivery_state(proposal_id="old", effect_id=old_effect) == "delivery_unknown"
+
+    # A second bounded batch eventually revisits the retained unknown row.
+    second = await reconciler.reconcile(limit=1, now_ms=6000)
+    assert second["retained"] == 1
+    store.close()
+    log.close()
+
+
 def _append_receipt(
     store: ProcessingStore,
     *,
+    channel: str = CHANNEL,
     chat_id: str,
     provider_message_id: str,
     status: str = "delivered",
 ) -> str:
     payload = {"status": status, "recipient_token": "sha256:synthetic"}
     return store.append_event(
-        event_key=f"whatsapp:{chat_id}:receipt:{provider_message_id}:synthetic:{status}",
+        event_key=f"{channel}:{chat_id}:receipt:{provider_message_id}:synthetic:{status}",
         event_id=f"receipt-{provider_message_id}-{status}",
         trace_id=f"trace-{provider_message_id}",
         payload={
             "kind": "receipt",
-            "channel": CHANNEL,
+            "channel": channel,
             "chat_id": chat_id,
             "principal": "participant@s.whatsapp.net",
             "source_message_id": provider_message_id,

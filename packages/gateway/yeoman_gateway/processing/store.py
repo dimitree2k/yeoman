@@ -2444,20 +2444,21 @@ class ProcessingStore:
         return int(row["n"])
 
     def delivery_signals(
-        self, *, chat_id: str, message_id: str, limit: int = 20
+        self, *, channel: str, chat_id: str, message_id: str, limit: int = 20
     ) -> tuple[CanonicalEvent, ...]:
         """Receipt/reaction journal events that reference one provider message.
 
         A projection for reconciliation: it answers "did the provider tell us this message
         was delivered or read", without exposing raw text to the probe.
         """
-        if not chat_id or not message_id:
+        if not channel or not chat_id or not message_id:
             return ()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM events WHERE chat_id = ? AND target_message_id = ? "
+                "SELECT * FROM events WHERE channel = ? AND chat_id = ? "
+                "AND target_message_id = ? "
                 "AND kind IN ('receipt','reaction') ORDER BY created_ms, event_id LIMIT ?",
-                (chat_id, message_id, max(1, int(limit))),
+                (channel, chat_id, message_id, max(1, int(limit))),
             ).fetchall()
         return tuple(self._event_from_row(row) for row in rows)
 
