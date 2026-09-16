@@ -47,7 +47,12 @@ class BurstObserver:
     async def handle(self, event: GatewayEvent) -> None:
         if not isinstance(event, InboundObservedEvent):
             return
-        if not self._config.consciousness.enabled or not self._config.consciousness.burst_enabled:
+        participation_enabled = bool(
+            getattr(self._config.processing.participation, "enabled", False)
+        )
+        if not (
+            self._config.consciousness.enabled or participation_enabled
+        ) or not self._config.consciousness.burst_enabled:
             return
         channel = str(event.channel or "").strip()
         chat_id = str(event.chat_id or "").strip()

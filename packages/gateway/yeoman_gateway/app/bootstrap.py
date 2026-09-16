@@ -6,7 +6,7 @@ import asyncio
 import os
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -702,6 +702,54 @@ def _build_ambient_judge(config: "Config"):
     )
 
 
+def _offer_participation_trigger(
+    *,
+    channel: str,
+    chat_id: str,
+    trigger: str,
+    runtime: object | None,
+    policy_adapter: object,
+    material_provider: Callable[
+        [str, str, tuple[str, ...] | None], tuple[tuple[str, ...], int]
+    ]
+    | None,
+) -> dict[str, str] | None:
+    """Offer to Participation and return ``None`` only when Legacy still owns."""
+    current = getattr(policy_adapter, "current_activation", None)
+    snapshot = current(channel, chat_id) if callable(current) else None
+    live = bool(snapshot is not None and getattr(snapshot, "live", False))
+    observing = bool(snapshot is not None and getattr(snapshot, "observing", False))
+    if live and runtime is None:
+        return {"status": "skipped"}
+    if runtime is None or not (live or observing):
+        return None
+
+    pause_reason = getattr(policy_adapter, "participation_pause_reason", None)
+    if callable(pause_reason) and pause_reason(channel, chat_id):
+        return {"status": "skipped"} if live else None
+
+    sources, revision = (
+        material_provider(channel, chat_id, None)
+        if callable(material_provider)
+        else ((), 0)
+    )
+    offer = getattr(runtime, "offer_source", None)
+    offered = bool(
+        sources
+        and callable(offer)
+        and offer(
+            channel=channel,
+            chat_id=chat_id,
+            source_event_ids=tuple(sources),
+            observed_revision=int(revision),
+            trigger=trigger,
+        )
+    )
+    if live:
+        return {"status": "offered" if offered else "skipped"}
+    return None
+
+
 def _build_participation_runtime(
     *,
     config: Config,
@@ -785,16 +833,21 @@ def _build_participation_runtime(
             )
         return rendered
 
+    def _source_authorized(row: Mapping[str, object]) -> bool:
+        return participant_is_allowed(
+            engine=policy_engine,
+            channel=str(row.get("channel") or ""),
+            chat_id=str(row.get("chat_id") or ""),
+            sender=str(row.get("sender_id") or row.get("participant") or ""),
+        )
+
     context_builder = ParticipationContextBuilder(
         archive=inbound_archive,
         policy=policy_engine,
         anchors=anchors,
         taste=_taste_hits,
+        source_authorizer=_source_authorized,
     )
-
-    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
-
-    epoch_tracker = ActivationEpochTracker(store=log)
 
     def _continuation_candidate(opportunity: object | None) -> bool:
         """Cheap source evidence for the protected continuation quota (spec 7.1).
@@ -836,23 +889,11 @@ def _build_participation_runtime(
     def _snapshot(
         channel: str, chat_id: str, *, epoch: int, opportunity: object | None = None
     ) -> dict[str, object]:
-        # An activation-affecting change (enable/disable, shadow/live, judge route)
-        # advances the persisted epoch here, so stale unsubmitted work is fenced out
-        # without ever advancing the epoch merely because the process restarted.
-        persisted = epoch_tracker.observe(
-            channel=channel,
-            chat_id=chat_id,
-            enabled=bool(getattr(participation, "enabled", False)),
-            shadow=bool(getattr(participation, "shadow", True)),
-            judge_route=str(getattr(participation, "judge_route", "") or ""),
-        )
-        resolved = policy_engine.resolve_participation_snapshot(  # type: ignore[attr-defined]
-            channel,
-            chat_id,
-            processing_config=config.processing,
-            activation_epoch=persisted,
-            managed=True,
-        )
+        del epoch
+        current_activation = getattr(policy_adapter, "current_activation", None)
+        resolved = current_activation(channel, chat_id) if callable(current_activation) else None
+        if resolved is None:
+            raise RuntimeError("participation activation unavailable")
         reaction_limit = int(resolved.participation.max_reactions_per_window)
         comment_limit = int(resolved.participation.max_unsolicited_comments_per_window)
         window_ms = int(resolved.participation.comment_window_minutes) * 60_000
@@ -937,10 +978,16 @@ def _build_participation_runtime(
         max_pending_source_bytes=int(getattr(participation, "max_pending_source_bytes", 16_384)),
         ttl_seconds=int(getattr(participation, "opportunity_ttl_seconds", 120)),
     )
+    current_activation = getattr(policy_adapter, "current_activation", None)
     offer_runtime = OpportunityOfferRuntime(
         scheduler=scheduler,
         source_owner=source_owner,  # type: ignore[arg-type]
         activation_epoch=int(log.activation_epoch_sync("participation")),  # type: ignore[attr-defined]
+        activation_provider=(current_activation if callable(current_activation) else None),
+        is_enabled=lambda channel, chat_id: _is_paused(channel, chat_id) is None,
+        considered_revision_provider=getattr(
+            log, "highest_considered_revision_sync", None
+        ),
     )
     reconciler = (
         ParticipationReceiptReconciler(log=log, store=processing_store)  # type: ignore[arg-type]
@@ -1328,6 +1375,28 @@ def build_gateway_runtime(
     from yeoman_shared.utils.helpers import get_operational_data_path
 
     processing_store = build_processing_store(config)
+    consciousness_data_dir = get_operational_data_path() / "consciousness"
+    participation_enabled = bool(
+        getattr(getattr(config.processing, "participation", None), "enabled", False)
+    )
+    speakup_log = None
+    speakup_approval_store = None
+    activation_tracker = None
+    if policy_engine is not None and (config.consciousness.enabled or participation_enabled):
+        from yeoman_gateway.consciousness.log import SpeakupLog
+        from yeoman_gateway.consciousness.participation_runtime import (
+            ActivationEpochTracker,
+        )
+
+        speakup_log = SpeakupLog(consciousness_data_dir / "speakups.db")
+        if participation_enabled:
+            activation_tracker = ActivationEpochTracker(store=speakup_log)
+        if config.consciousness.enabled:
+            from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
+
+            speakup_approval_store = SpeakupApprovalStore(
+                consciousness_data_dir / "pending_approvals.json"
+            )
 
     session_manager = SessionManager(workspace)
     # The owner wants a complete inbound record: keep every message, purge nothing.
@@ -1425,7 +1494,10 @@ def build_gateway_runtime(
         private_handoff_store=private_handoffs,
         workspace=workspace,
         processing_config=config.processing,
+        activation_tracker=activation_tracker,
     )
+    if activation_tracker is not None:
+        activation_tracker.refresh_activation_sync()
     from yeoman_gateway.processing.quota import CapabilityQuotaGovernance
 
     quota_governance = CapabilityQuotaGovernance(
@@ -1697,18 +1769,6 @@ def build_gateway_runtime(
                 ))
         if next_job.payload.next_job_id and response and not is_chain_failure(response):
             await _handle_chain(next_job, response, run_id)
-
-    speakup_log = None
-    speakup_approval_store = None
-    if config.consciousness.enabled and policy_engine is not None:
-        from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
-        from yeoman_gateway.consciousness.log import SpeakupLog
-
-        consciousness_data_dir = get_operational_data_path() / "consciousness"
-        speakup_log = SpeakupLog(consciousness_data_dir / "speakups.db")
-        speakup_approval_store = SpeakupApprovalStore(
-            consciousness_data_dir / "pending_approvals.json"
-        )
 
     archive_adapter = SqliteReplyArchiveAdapter(inbound_archive)
     thread_responder = build_thread_responder(
@@ -2426,14 +2486,10 @@ def build_gateway_runtime(
     lull_observer = None
     opportunity_scheduler = None
     participation_maintenance = None
-    if config.consciousness.enabled and policy_engine is not None:
-        from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+    if speakup_log is not None and policy_engine is not None:
         from yeoman_gateway.consciousness.burst import BurstObserver
         from yeoman_gateway.consciousness.lull import LullObserver
-        from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
         from yeoman_gateway.consciousness.participation_runtime import SourceOwner
-        from yeoman_gateway.consciousness.service import ConsciousnessService
-        from yeoman_gateway.consciousness.taste import TasteDistiller
         from yeoman_gateway.consciousness.tools import ConsciousnessTools
 
         consciousness_tools = ConsciousnessTools(
@@ -2446,47 +2502,136 @@ def build_gateway_runtime(
             security=security,
             approval_store=speakup_approval_store,
             service_effects=service_effects,
+            activation_provider=getattr(policy_adapter, "current_activation", None),
         )
 
-        async def _consciousness_route_call(route: str, prompt: str) -> str:
-            profile = model_router.resolve(route)
-            if not profile.model:
-                raise RuntimeError(f"Consciousness route {route!r} has no model")
-            routed_provider = provider_factory.create_chat_provider(profile.model, profile.provider)
-            response = await routed_provider.chat(
-                [{"role": "user", "content": prompt}],
-                tools=[],
-                model=profile.model,
-                max_tokens=profile.max_tokens or 700,
-                temperature=profile.temperature if profile.temperature is not None else 0.1,
-                reasoning=profile.reasoning,
+        if config.consciousness.enabled:
+            from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+            from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
+            from yeoman_gateway.consciousness.service import ConsciousnessService
+            from yeoman_gateway.consciousness.taste import TasteDistiller
+
+            async def _consciousness_route_call(route: str, prompt: str) -> str:
+                profile = model_router.resolve(route)
+                if not profile.model:
+                    raise RuntimeError(f"Consciousness route {route!r} has no model")
+                routed_provider = provider_factory.create_chat_provider(
+                    profile.model, profile.provider
+                )
+                response = await routed_provider.chat(
+                    [{"role": "user", "content": prompt}],
+                    tools=[],
+                    model=profile.model,
+                    max_tokens=profile.max_tokens or 700,
+                    temperature=(
+                        profile.temperature if profile.temperature is not None else 0.1
+                    ),
+                    reasoning=profile.reasoning,
+                )
+                return response.content or "{}"
+
+            async def _consciousness_planner(prompt: str) -> str:
+                return await _consciousness_route_call("consciousness.agent", prompt)
+
+            consciousness_agent = ConsciousnessAgent(
+                tools=consciousness_tools,
+                planner=_consciousness_planner,
             )
-            return response.content or "{}"
+            outcome_enricher = OutcomeEnricher(
+                log=speakup_log,
+                inbound_archive=inbound_archive,
+                classifier=lambda prompt: _consciousness_route_call(
+                    "consciousness.outcome", prompt
+                ),
+            )
+            taste_distiller = TasteDistiller(
+                log=speakup_log,
+                memory=memory_service,
+                distiller=lambda prompt: _consciousness_route_call(
+                    "consciousness.taste", prompt
+                ),
+            )
+            consciousness_service = ConsciousnessService(
+                config=config,
+                agent=consciousness_agent,
+                outcome_enricher=outcome_enricher,
+                taste_distiller=taste_distiller,
+                speakup_log=speakup_log,
+            )
 
-        async def _consciousness_planner(prompt: str) -> str:
-            return await _consciousness_route_call("consciousness.agent", prompt)
+        participation_material = None
+        if participation_enabled:
+            resolve_sources = getattr(inbound_archive, "resolve_source_ids", None)
+            ensure_revisions = getattr(speakup_log, "ensure_source_revisions_sync", None)
+            read_material = getattr(speakup_log, "material_for_opportunity", None)
+            baseline_material = getattr(
+                speakup_log, "initialize_material_baseline_sync", None
+            )
+            if all(
+                callable(item)
+                for item in (
+                    resolve_sources,
+                    ensure_revisions,
+                    read_material,
+                    baseline_material,
+                )
+            ):
+                targets = {
+                    str(item).strip()
+                    for item in (
+                        *config.processing.chats,
+                        *config.processing.shadow_chats,
+                    )
+                    if str(item).strip()
+                }
+                for target in sorted(targets):
+                    channel, separator, chat_id = target.partition(":")
+                    if separator and channel and chat_id:
+                        baseline_material(
+                            channel=channel,
+                            chat_id=chat_id,
+                            source_ids=resolve_sources(channel, chat_id, None),
+                        )
 
-        consciousness_agent = ConsciousnessAgent(
-            tools=consciousness_tools,
-            planner=_consciousness_planner,
-        )
-        outcome_enricher = OutcomeEnricher(
-            log=speakup_log,
-            inbound_archive=inbound_archive,
-            classifier=lambda prompt: _consciousness_route_call("consciousness.outcome", prompt),
-        )
-        taste_distiller = TasteDistiller(
-            log=speakup_log,
-            memory=memory_service,
-            distiller=lambda prompt: _consciousness_route_call("consciousness.taste", prompt),
-        )
-        consciousness_service = ConsciousnessService(
-            config=config,
-            agent=consciousness_agent,
-            outcome_enricher=outcome_enricher,
-            taste_distiller=taste_distiller,
-            speakup_log=speakup_log,
-        )
+                def _participation_material(
+                    channel: str,
+                    chat_id: str,
+                    source_ids: tuple[str, ...] | None,
+                ) -> tuple[tuple[str, ...], int]:
+                    current = getattr(policy_adapter, "current_activation", None)
+                    snapshot = current(channel, chat_id) if callable(current) else None
+                    if snapshot is None:
+                        return (), 0
+                    lane = str(getattr(snapshot, "lane", "production"))
+                    resolved = resolve_sources(channel, chat_id, source_ids)
+                    senders = inbound_archive.senders_for_messages(
+                        channel, chat_id, tuple(resolved)
+                    )
+                    resolved = tuple(
+                        source_id
+                        for source_id in resolved
+                        if participant_is_allowed(
+                            engine=policy_engine,
+                            channel=channel,
+                            chat_id=chat_id,
+                            sender=str(senders.get(source_id) or ""),
+                        )
+                    )
+                    if resolved:
+                        ensure_revisions(
+                            channel=channel,
+                            chat_id=chat_id,
+                            source_ids=resolved,
+                        )
+                    return read_material(
+                        channel,
+                        chat_id,
+                        resolved,
+                        lane=lane,
+                    )
+
+                participation_material = _participation_material
+
         source_owner = SourceOwner(store=speakup_log)
         participation_runtime, opportunity_scheduler, participation_decision = (
             _build_participation_runtime(
@@ -2539,12 +2684,25 @@ def build_gateway_runtime(
                 ParticipationIngress,
             )
 
+            def _participation_active(channel: str, chat_id: str) -> bool:
+                current = getattr(policy_adapter, "current_activation", None)
+                snapshot = current(channel, chat_id) if callable(current) else None
+                pause_reason = getattr(
+                    policy_adapter, "participation_pause_reason", None
+                )
+                return bool(
+                    snapshot is not None
+                    and (getattr(snapshot, "live", False) or getattr(snapshot, "observing", False))
+                    and not (
+                        callable(pause_reason) and pause_reason(channel, chat_id)
+                    )
+                )
+
             _ingress = ParticipationIngress(
                 runtime=participation_runtime,
                 ledger=speakup_log,
-                is_active=lambda channel, chat_id: bool(
-                    policy_engine.resolve_participation(channel, chat_id).enabled
-                ),
+                is_active=_participation_active,
+                material_provider=participation_material,
             )
 
             async def _on_observed_inbound(event: object) -> None:
@@ -2563,24 +2721,37 @@ def build_gateway_runtime(
 
             bus.subscribe_event("InboundObservedEvent", _on_observed_inbound)
 
-        def _trigger(channel: str, chat_id: str, trigger: str) -> object:
-            """Offer a bounded opportunity when autonomy applies, else legacy tick.
-
-            The producer path never awaits model work. Non-migrated chats and a
-            disabled feature keep exactly their previous legacy behaviour.
-            """
-            if participation_runtime is not None:
-                offered = participation_runtime.offer_source(
-                    channel=channel,
-                    chat_id=chat_id,
-                    source_event_ids=(f"observed:{channel}:{chat_id}",),
-                    observed_revision=speakup_log.next_chat_revision_sync(
-                        channel=channel, chat_id=chat_id
-                    ),
-                    trigger=trigger,
+        async def _observer_eligible(channel: str, chat_id: str, *, trigger: str) -> bool:
+            current = getattr(policy_adapter, "current_activation", None)
+            snapshot = current(channel, chat_id) if callable(current) else None
+            pause_reason = getattr(policy_adapter, "participation_pause_reason", None)
+            if callable(pause_reason) and pause_reason(channel, chat_id):
+                return False
+            if participation_runtime is not None and snapshot is not None:
+                if getattr(snapshot, "live", False) or getattr(snapshot, "observing", False):
+                    return True
+            if consciousness_service is None:
+                return False
+            return bool(
+                await consciousness_tools.is_chat_within_opportunity_budget(
+                    channel, chat_id, trigger=trigger
                 )
-                if offered:
-                    return {"status": "offered"}
+            )
+
+        def _trigger(channel: str, chat_id: str, trigger: str) -> object:
+            """Route one observer trigger to its already-resolved social owner."""
+            result = _offer_participation_trigger(
+                channel=channel,
+                chat_id=chat_id,
+                trigger=trigger,
+                runtime=participation_runtime,
+                policy_adapter=policy_adapter,
+                material_provider=participation_material,
+            )
+            if result is not None:
+                return result
+            if consciousness_service is None:
+                return {"status": "skipped"}
             return consciousness_service.tick_once(
                 trigger=trigger,
                 target_channel=channel,
@@ -2591,10 +2762,8 @@ def build_gateway_runtime(
             config=config,
             state_path=consciousness_data_dir / "burst_state.json",
             on_burst=lambda channel, chat_id: _trigger(channel, chat_id, "burst"),
-            is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
-                channel,
-                chat_id,
-                trigger="burst",
+            is_eligible=lambda channel, chat_id: _observer_eligible(
+                channel, chat_id, trigger="burst"
             ),
             session_manager=session_manager,
         )
@@ -2605,10 +2774,8 @@ def build_gateway_runtime(
                 config=config,
                 state_path=consciousness_data_dir / "lull_state.json",
                 on_lull=lambda channel, chat_id: _trigger(channel, chat_id, "lull"),
-                is_eligible=lambda channel, chat_id: consciousness_tools.is_chat_within_opportunity_budget(
-                    channel,
-                    chat_id,
-                    trigger="lull",
+                is_eligible=lambda channel, chat_id: _observer_eligible(
+                    channel, chat_id, trigger="lull"
                 ),
                 session_manager=session_manager,
             )

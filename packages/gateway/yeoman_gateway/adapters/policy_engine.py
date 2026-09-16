@@ -126,6 +126,7 @@ class EnginePolicyAdapter(PolicyPort):
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
         processing_config: Any | None = None,
+        activation_tracker: Any | None = None,
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
@@ -134,6 +135,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._session_manager = session_manager
         self._processing_store = processing_store
         self._private_handoff_store = private_handoff_store
+        self._activation_tracker = activation_tracker
         if workspace is not None:
             self._workspace = workspace.expanduser().resolve()
         elif self._engine is not None:
@@ -162,6 +164,10 @@ class EnginePolicyAdapter(PolicyPort):
         self._policy_file_was_present = self._last_mtime_ns is not None
         self._policy_reload_error: tuple[int | None, str] | None = None
         self._policy_loaded_ms: int = self._now_ms()
+        if self._activation_tracker is not None:
+            setter = getattr(self._activation_tracker, "set_activation_state_provider", None)
+            if setter is not None:
+                setter(self._activation_state)
 
         if engine is None:
             self._reload_on_change = False
@@ -361,6 +367,17 @@ class EnginePolicyAdapter(PolicyPort):
             encoding="utf-8",
         )
 
+    def _refresh_activation_after_pause_change(self) -> None:
+        """Fence pause/resume immediately when the shared tracker is available."""
+        tracker = self._activation_tracker
+        refresh = getattr(tracker, "refresh_activation_sync", None)
+        if refresh is None:
+            return
+        try:
+            refresh()
+        except Exception as exc:  # noqa: BLE001 - owner controls remain usable
+            logger.warning("pause activation refresh failed: {}", type(exc).__name__)
+
     @staticmethod
     def _pause_key(channel: str, chat_id: str) -> str:
         return f"{channel}:{chat_id}"
@@ -404,8 +421,93 @@ class EnginePolicyAdapter(PolicyPort):
         management and shadow state are part of that snapshot, so every caller uses the
         same ownership matrix instead of independently inferring production ownership.
         """
-        snapshot = self.resolve_participation_snapshot(channel, chat_id)
+        snapshot = self.current_activation(channel, chat_id)
         return bool(snapshot is not None and snapshot.live)
+
+    def current_activation(self, channel: str, chat_id: str) -> ParticipationSnapshot | None:
+        """Refresh the global epoch, then resolve one real target snapshot."""
+        self._maybe_reload()
+        self._prune_expired_pauses(persist=True)
+        epoch = 1
+        if self._activation_tracker is not None:
+            try:
+                epoch = int(self._activation_tracker.refresh_activation_sync())
+            except Exception as exc:  # noqa: BLE001 - unreadable activation fails closed
+                logger.warning("participation activation refresh failed: {}", type(exc).__name__)
+                return None
+        return self.resolve_participation_snapshot(
+            channel,
+            chat_id,
+            activation_epoch=epoch,
+        )
+
+    def _activation_state(self) -> dict[str, object]:
+        """Build the complete activation input consumed by the global epoch tracker."""
+        holder = self._processing_config
+        processing = getattr(holder, "processing", None) or holder
+        participation = getattr(processing, "participation", None)
+        policy = getattr(self._engine, "policy", None)
+
+        known_targets: set[str] = set()
+        channels = getattr(policy, "channels", {}) if policy is not None else {}
+        for channel, channel_policy in (channels or {}).items():
+            for chat_id in (getattr(channel_policy, "chats", {}) or {}):
+                known_targets.add(f"{channel}:{chat_id}")
+        managed_targets = tuple(
+            sorted({str(item).strip() for item in (getattr(processing, "chats", ()) or ()) if str(item).strip()})
+        )
+        shadow_targets = tuple(
+            sorted(
+                {
+                    str(item).strip()
+                    for item in (getattr(processing, "shadow_chats", ()) or ())
+                    if str(item).strip()
+                }
+            )
+        )
+        known_targets.update(managed_targets)
+        known_targets.update(shadow_targets)
+
+        chat_opt_ins: dict[str, bool] = {}
+        for target in sorted(known_targets):
+            channel, separator, chat_id = target.partition(":")
+            if not separator or not channel or not chat_id or self._engine is None:
+                continue
+            try:
+                chat_opt_ins[target] = bool(
+                    self._engine.resolve_participation(channel, chat_id).enabled
+                )
+            except Exception:
+                chat_opt_ins[target] = False
+
+        self._prune_expired_pauses(persist=True)
+        active_chat_pauses = {
+            key: int(until)
+            for key, until in sorted(self._chat_pause_until_ms.items())
+            if self._is_pause_until_active(int(until), self._now_ms())
+        }
+        global_pause = (
+            int(self._global_pause_until_ms)
+            if self._is_global_pause_active()
+            else 0
+        )
+        return {
+            "global": {
+                "enabled": bool(getattr(participation, "enabled", False)),
+                "shadow": bool(getattr(participation, "shadow", True)),
+                "judge_route": str(getattr(participation, "judge_route", "") or ""),
+            },
+            "processing": {
+                "enabled": bool(getattr(processing, "enabled", False)),
+                "managed_targets": managed_targets,
+                "shadow_targets": shadow_targets,
+            },
+            "chat_opt_ins": chat_opt_ins,
+            "active_pauses": {
+                "global": global_pause,
+                "chats": active_chat_pauses,
+            },
+        }
 
     def resolve_participation_snapshot(
         self,
@@ -508,22 +610,30 @@ class EnginePolicyAdapter(PolicyPort):
 
     def _set_chat_pause(self, *, channel: str, chat_id: str, until_ms: int) -> None:
         normalized = self._normalize_pause_until(until_ms)
+        key = self._pause_key(channel, chat_id)
+        previous = self._chat_pause_until_ms.get(key, 0)
         if normalized == 0:
-            self._chat_pause_until_ms.pop(self._pause_key(channel, chat_id), None)
+            self._chat_pause_until_ms.pop(key, None)
         else:
-            self._chat_pause_until_ms[self._pause_key(channel, chat_id)] = normalized
+            self._chat_pause_until_ms[key] = normalized
         self._save_pause_state()
+        if previous != normalized:
+            self._refresh_activation_after_pause_change()
 
     def _clear_chat_pause(self, *, channel: str, chat_id: str) -> bool:
         removed = self._chat_pause_until_ms.pop(self._pause_key(channel, chat_id), None)
         if removed is None:
             return False
         self._save_pause_state()
+        self._refresh_activation_after_pause_change()
         return True
 
     def _set_global_pause(self, until_ms: int) -> None:
+        previous = self._global_pause_until_ms
         self._global_pause_until_ms = self._normalize_pause_until(until_ms)
         self._save_pause_state()
+        if previous != self._global_pause_until_ms:
+            self._refresh_activation_after_pause_change()
 
     def _clear_all_pauses(self) -> bool:
         changed = self._global_pause_until_ms != 0 or bool(self._chat_pause_until_ms)
@@ -532,6 +642,7 @@ class EnginePolicyAdapter(PolicyPort):
         self._global_pause_until_ms = 0
         self._chat_pause_until_ms.clear()
         self._save_pause_state()
+        self._refresh_activation_after_pause_change()
         return True
 
     def _maybe_reload(self) -> None:

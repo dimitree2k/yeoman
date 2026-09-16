@@ -64,7 +64,12 @@ class LullObserver:
 
         if not isinstance(event, InboundObservedEvent):
             return
-        if not self._config.consciousness.enabled or not self._config.consciousness.lull_enabled:
+        participation_enabled = bool(
+            getattr(self._config.processing.participation, "enabled", False)
+        )
+        if not (
+            self._config.consciousness.enabled or participation_enabled
+        ) or not self._config.consciousness.lull_enabled:
             return
         channel = str(event.channel or "").strip()
         chat_id = str(event.chat_id or "").strip()
@@ -90,7 +95,12 @@ class LullObserver:
         bucket.append(ts)
 
     async def start(self) -> None:
-        if not self._config.consciousness.enabled or not self._config.consciousness.lull_enabled:
+        participation_enabled = bool(
+            getattr(self._config.processing.participation, "enabled", False)
+        )
+        if not (
+            self._config.consciousness.enabled or participation_enabled
+        ) or not self._config.consciousness.lull_enabled:
             logger.info("Lull observer disabled (consciousness or lull flag off)")
             return
         if self._running:

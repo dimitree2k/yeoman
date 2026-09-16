@@ -101,6 +101,20 @@ class _PendingChat:
         return [item for item in self.source_event_ids if item not in self.reported]
 
 
+@dataclass(frozen=True, slots=True)
+class OfferResult:
+    """Synchronous admission details for the caller that owns source claims.
+
+    Dropped IDs are transient result data, not scheduler state. The pending record
+    retains only its bounded sources and an aggregate drop count.
+    """
+
+    accepted: bool
+    retained_source_event_ids: tuple[str, ...] = ()
+    dropped_source_event_ids: tuple[str, ...] = ()
+    dropped_source_count: int = 0
+
+
 class OpportunityScheduler:
     """A ready queue, a per-chat pending map, an active-chat set, fixed workers."""
 
@@ -137,9 +151,9 @@ class OpportunityScheduler:
         self._pending: dict[tuple[str, str], _PendingChat] = {}
         self._ready: deque[tuple[str, str]] = deque()
         self._active: set[tuple[str, str]] = set()
-        #: Highest chat revision already handed to the handler, per chat. It is the
-        #: in-process duplicate watermark; the ledger holds the durable one.
-        self._evaluated_revision: dict[tuple[str, str], int] = {}
+        #: Highest revision already handed to the handler, per lane and chat. It is
+        #: the in-process duplicate watermark; the ledger holds the durable one.
+        self._evaluated_revision: dict[tuple[str, str, str], int] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._wake = asyncio.Event()
         self._running = False
@@ -192,29 +206,36 @@ class OpportunityScheduler:
     # -- producer side -----------------------------------------------------------------
 
     def offer(self, opportunity: ParticipationOpportunity) -> bool:
+        """Merge one opportunity and return immediately without model work."""
+        return self.offer_with_result(opportunity).accepted
+
+    def offer_with_result(self, opportunity: ParticipationOpportunity) -> OfferResult:
         """Merge one opportunity and return immediately. Never awaits model work.
 
         Returns ``False`` when the offer was dropped (queue full, cancelled chat or a
-        revision already pending), after recording the reason.
+        revision already pending), after recording the reason. The detailed result is
+        used by the source owner to release only unreported references truncated by a
+        bound.
         """
         key = (str(opportunity.channel), str(opportunity.chat_id))
+        lane_key = (*key, str(opportunity.lane))
         if key in self._cancelled:
             self._dispose("cancelled", opportunity, {"stage": "offer"})
-            return False
+            return OfferResult(False)
         record = self._pending.get(key)
         if record is None:
             if not any(
                 str(item or "").strip() for item in opportunity.source_event_ids
             ):
                 self._dispose("empty", opportunity, {"reason": "no_source_refs"})
-                return False
-            if int(opportunity.observed_revision) <= self._evaluated_revision.get(key, -1):
+                return OfferResult(False)
+            if int(opportunity.observed_revision) <= self._evaluated_revision.get(lane_key, -1):
                 # Same watermark as the evaluation that already ran: no new material.
                 self._dispose("duplicate", opportunity, {"reason": "revision_considered"})
-                return False
+                return OfferResult(False)
             if len(self._pending) >= self._max_pending_chats:
                 self._dispose("queue_full", opportunity, {"reason": "max_pending_chats"})
-                return False
+                return OfferResult(False)
             record = _PendingChat(
                 channel=key[0],
                 chat_id=key[1],
@@ -246,14 +267,23 @@ class OpportunityScheduler:
             # Trigger labels are metadata; a trigger without material is not work.
             self._pending.pop(key, None)
             self._dispose("empty", opportunity, {"reason": "no_source_refs"})
-            return False
-        added = self._merge_sources(record, offered)
+            return OfferResult(False)
+        added, dropped_source_ids, dropped_source_count = self._merge_sources(record, offered)
         if not added:
             # Repeated trigger over the same watermark: no new material, no new decision.
-            self._dispose("duplicate", opportunity, {"reason": "no_new_sources"})
+            self._dispose(
+                "duplicate",
+                opportunity,
+                {"reason": "no_new_sources", "dropped_source_count": dropped_source_count},
+            )
             if key not in self._active and not record.unreported():
                 self._pending.pop(key, None)
-            return False
+            return OfferResult(
+                False,
+                tuple(record.source_event_ids),
+                tuple(dropped_source_ids),
+                dropped_source_count,
+            )
         record.observed_revision = max(record.observed_revision, int(opportunity.observed_revision))
         record.last_trigger_ms = int(opportunity.created_at_ms)
         record.trigger = str(opportunity.trigger)
@@ -262,7 +292,12 @@ class OpportunityScheduler:
             self._ready.append(key)
             self._wake.set()
             self._counters["coalesced"] = self._counters.get("coalesced", 0) + 1
-        return True
+        return OfferResult(
+            True,
+            tuple(record.source_event_ids),
+            tuple(dropped_source_ids),
+            dropped_source_count,
+        )
 
     def cancel_chat(self, channel: str, chat_id: str, *, reason: str = "cancelled") -> bool:
         """Cancel pending speculation for one chat (a direct request supersedes it).
@@ -287,48 +322,65 @@ class OpportunityScheduler:
         self._cancelled.discard((str(channel), str(chat_id)))
 
     def mark_considered(
-        self, channel: str, chat_id: str, *, observed_revision: int
+        self, channel: str, chat_id: str, *, observed_revision: int, lane: str = "production"
     ) -> None:
         """Record the durable watermark after a restart (ledger-backed by callers)."""
-        key = (str(channel), str(chat_id))
+        key = (str(channel), str(chat_id), str(lane))
         self._evaluated_revision[key] = max(
             self._evaluated_revision.get(key, -1), int(observed_revision)
         )
 
     def _merge_sources(
         self, record: _PendingChat, source_event_ids: Iterable[str]
-    ) -> int:
-        """Merge bounded source references, newest kept. Returns how many were added."""
+    ) -> tuple[int, tuple[str, ...], int]:
+        """Merge bounded source references, newest kept.
+
+        The returned IDs are only the unreported references dropped by this merge;
+        ``dropped_source_count`` includes every dropped reference for disposition
+        accounting, including references already handed to a handler.
+        """
         seen = set(record.source_event_ids)
         added = 0
+        dropped_source_ids: list[str] = []
+        dropped_source_count = 0
         for raw in source_event_ids:
             token = str(raw or "").strip()
             if not token or token in seen:
                 continue
             size = len(token.encode("utf-8"))
             if len(record.source_event_ids) >= self._max_refs:
-                self._drop_oldest(record)
+                dropped, was_reported = self._drop_oldest(record)
+                if dropped is not None and not was_reported:
+                    dropped_source_ids.append(dropped)
                 record.dropped_refs += 1
+                dropped_source_count += 1
             if record.source_bytes + size > self._max_bytes:
                 while record.source_bytes + size > self._max_bytes and record.source_event_ids:
-                    self._drop_oldest(record)
+                    dropped, was_reported = self._drop_oldest(record)
+                    if dropped is not None and not was_reported:
+                        dropped_source_ids.append(dropped)
                     record.dropped_refs += 1
+                    dropped_source_count += 1
                 if record.source_bytes + size > self._max_bytes:
+                    dropped_source_ids.append(token)
                     record.dropped_refs += 1
+                    dropped_source_count += 1
                     continue
             record.source_event_ids.append(token)
             record.source_bytes += size
             seen.add(token)
             added += 1
-        return added
+        return added, tuple(dropped_source_ids), dropped_source_count
 
     @staticmethod
-    def _drop_oldest(record: _PendingChat) -> None:
+    def _drop_oldest(record: _PendingChat) -> tuple[str | None, bool]:
         if not record.source_event_ids:
-            return
+            return None, False
         oldest = record.source_event_ids.pop(0)
+        was_reported = oldest in record.reported
         record.reported.discard(oldest)
         record.source_bytes = max(0, record.source_bytes - len(oldest.encode("utf-8")))
+        return oldest, was_reported
 
     # -- worker side -------------------------------------------------------------------
 
@@ -366,8 +418,9 @@ class OpportunityScheduler:
                 await self._run_one(record)
             finally:
                 self._active.discard(key)
-                self._evaluated_revision[key] = max(
-                    self._evaluated_revision.get(key, -1), int(record.observed_revision)
+                lane_key = (record.channel, record.chat_id, str(record.lane))
+                self._evaluated_revision[lane_key] = max(
+                    self._evaluated_revision.get(lane_key, -1), int(record.observed_revision)
                 )
                 self._retire(record)
 
@@ -396,7 +449,15 @@ class OpportunityScheduler:
             )
             return
         if self._on_disposition is not None:
-            self._on_disposition("started", opportunity, {"trigger": record.trigger})
+            self._on_disposition(
+                "started",
+                opportunity,
+                {
+                    "trigger": record.trigger,
+                    "dropped_source_count": record.dropped_refs,
+                    "source_high_watermark": int(record.observed_revision),
+                },
+            )
         try:
             await self._handle(opportunity)
         except asyncio.CancelledError:
@@ -428,7 +489,7 @@ class OpportunityScheduler:
             ),
             channel=record.channel,
             chat_id=record.chat_id,
-            trigger=record.trigger,  # type: ignore[arg-type]
+            trigger=record.trigger,
             source_event_ids=tuple(retained),
             observed_revision=int(record.observed_revision),
             activation_epoch=int(record.activation_epoch),
@@ -456,6 +517,7 @@ def _default_clock_ms() -> int:
 
 __all__ = [
     "OPPORTUNITY_ID_VERSION",
+    "OfferResult",
     "OpportunityScheduler",
     "opportunity_id_for",
 ]

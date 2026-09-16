@@ -768,6 +768,31 @@ async def test_live_participation_observer_budget_is_not_legacy_planner_only(
         archive.close()
 
 
+def test_consciousness_tools_prefers_shared_activation_provider() -> None:
+    """Observer/tool ownership uses the injected activation source first."""
+    from yeoman_gateway.consciousness.tools import ConsciousnessTools
+
+    shared = object()
+    raw = object()
+
+    class RawPolicy:
+        def current_activation(self, channel: str, chat_id: str) -> object:
+            del channel, chat_id
+            return raw
+
+    tools = ConsciousnessTools(
+        config=object(),
+        policy_engine=RawPolicy(),
+        bus=object(),
+        log=object(),
+        inbound_archive=object(),
+        memory=None,
+        security=None,
+        activation_provider=lambda channel, chat_id: shared,
+    )
+    assert tools._participation_snapshot("whatsapp", GROUP) is shared  # noqa: SLF001
+
+
 def test_ingest_gate_stands_down_only_for_an_owned_chat(tmp_path: Path) -> None:
     """The ambient brake must not run as a second opinion for an owned chat."""
     from yeoman_gateway.processing.policy import IngestGate

@@ -111,6 +111,30 @@ class MessageBus:
         return None
 
     @staticmethod
+    def _metadata_source_event_ids(
+        metadata: dict[str, object], message_id: str | None
+    ) -> tuple[str, ...]:
+        """Preserve the complete trusted batch provenance on the observation event."""
+        cleaned: list[str] = []
+        for key in ("source_event_ids", "source_ids", "batch_source_ids"):
+            raw = metadata.get(key)
+            if isinstance(raw, str):
+                values = (raw,)
+            elif isinstance(raw, (list, tuple, set, frozenset)):
+                values = tuple(str(item) for item in raw)
+            else:
+                values = ()
+            for value in values:
+                token = str(value).strip()
+                if token and token not in cleaned:
+                    cleaned.append(token)
+            if cleaned:
+                break
+        if not cleaned and message_id:
+            cleaned.append(str(message_id))
+        return tuple(cleaned)
+
+    @staticmethod
     def _metadata_is_group(msg: InboundMessage) -> bool:
         value = msg.metadata.get("is_group", msg.metadata.get("isGroup"))
         if value is not None:
@@ -135,6 +159,9 @@ class MessageBus:
                 content=msg.content,
                 timestamp=msg.timestamp.timestamp(),
                 message_id=self._metadata_message_id(msg.metadata),
+                source_event_ids=self._metadata_source_event_ids(
+                    msg.metadata, self._metadata_message_id(msg.metadata)
+                ),
                 is_group=self._metadata_is_group(msg),
                 metadata=dict(msg.metadata),
             )

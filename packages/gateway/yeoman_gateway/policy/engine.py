@@ -190,6 +190,11 @@ class ParticipationSnapshot:
         """Whether the shadow lane may evaluate (and record) without any effect."""
         return self.valid and self.enabled and self.opted_in and self.shadow
 
+    @property
+    def lane(self) -> str:
+        """The producer lane selected by this validated activation snapshot."""
+        return "shadow" if self.observing else "production"
+
     def limits_for(self, category: str) -> tuple[int, int, str]:
         """``(limit, window_ms, window_kind)`` for one reservation category."""
         if category == "initiation":

@@ -340,6 +340,7 @@ class SpeakupLog:
                 )
                 """
             )
+            self._apply_disposition_columns()
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_dispositions_revision
@@ -377,11 +378,14 @@ class SpeakupLog:
                     channel TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 0,
+                    considered_revision INTEGER NOT NULL DEFAULT 0,
+                    shadow_considered_revision INTEGER NOT NULL DEFAULT 0,
                     updated_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (channel, chat_id)
                 )
                 """
             )
+            self._apply_chat_revision_columns()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS source_claims (
@@ -396,12 +400,32 @@ class SpeakupLog:
                 )
                 """
             )
+            self._apply_source_claim_columns()
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_source_claims_owner
                 ON source_claims(channel, chat_id, owner, claimed_at_ms)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_revisions (
+                    channel TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    source_event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (channel, chat_id, source_event_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_source_revisions_chat
+                ON source_revisions(channel, chat_id, revision)
+                """
+            )
+            self._migrate_source_revisions()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS activation_state (
@@ -440,6 +464,277 @@ class SpeakupLog:
                 continue
             self._conn.execute(
                 f"ALTER TABLE delivery_reservations ADD COLUMN {name} {ddl}"
+            )
+
+    def _apply_chat_revision_columns(self) -> None:
+        """Additive migration for durable material watermarks on old ledgers."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(chat_revisions)")
+        }
+        for name in ("considered_revision", "shadow_considered_revision"):
+            if name in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE chat_revisions ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _apply_source_claim_columns(self) -> None:
+        """Keep old claim rows readable while adding lane metadata additively."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(source_claims)")
+        }
+        if "lane" not in existing:
+            self._conn.execute(
+                "ALTER TABLE source_claims ADD COLUMN lane TEXT NOT NULL DEFAULT 'production'"
+            )
+
+    def _apply_disposition_columns(self) -> None:
+        """Add fields needed to migrate legacy considered dispositions safely."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(opportunity_dispositions)")
+        }
+        for name, ddl in (
+            ("observed_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("activation_epoch", "INTEGER NOT NULL DEFAULT 0"),
+            ("lane", "TEXT NOT NULL DEFAULT 'production'"),
+            ("trigger", "TEXT NOT NULL DEFAULT 'inbound'"),
+            ("source_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("reason", "TEXT"),
+            ("created_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("updated_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE opportunity_dispositions ADD COLUMN {name} {ddl}"
+            )
+
+    @staticmethod
+    def _source_id(value: object) -> str | None:
+        token = str(value or "").strip()
+        if not token or token.startswith("observed:"):
+            return None
+        return token
+
+    @staticmethod
+    def _considered_column(lane: str) -> str:
+        if str(lane) == "shadow":
+            return "shadow_considered_revision"
+        if str(lane) == "production":
+            return "considered_revision"
+        raise ValueError(f"unknown participation lane: {lane}")
+
+    def _ensure_chat_revision_row(
+        self, conn: sqlite3.Connection, *, channel: str, chat_id: str, now_ms: int
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO chat_revisions (
+                channel, chat_id, revision, considered_revision,
+                shadow_considered_revision, updated_at_ms
+            ) VALUES (?, ?, 0, 0, 0, ?)
+            """,
+            (str(channel), str(chat_id), int(now_ms)),
+        )
+
+    def _set_revision_at_least(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        channel: str,
+        chat_id: str,
+        revision: int,
+        now_ms: int,
+    ) -> None:
+        self._ensure_chat_revision_row(
+            conn, channel=channel, chat_id=chat_id, now_ms=now_ms
+        )
+        conn.execute(
+            """
+            UPDATE chat_revisions
+            SET revision = MAX(revision, ?), updated_at_ms = ?
+            WHERE channel = ? AND chat_id = ?
+            """,
+            (max(0, int(revision)), int(now_ms), str(channel), str(chat_id)),
+        )
+
+    def _allocate_source_revision(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        channel: str,
+        chat_id: str,
+        minimum: int = 0,
+        now_ms: int,
+    ) -> int:
+        """Allocate one revision without consulting retained archive rows."""
+        self._ensure_chat_revision_row(
+            conn, channel=channel, chat_id=chat_id, now_ms=now_ms
+        )
+        row = conn.execute(
+            "SELECT revision FROM chat_revisions WHERE channel = ? AND chat_id = ?",
+            (str(channel), str(chat_id)),
+        ).fetchone()
+        current = int(row["revision"] if row is not None else 0)
+        revision = max(current + 1, int(minimum))
+        conn.execute(
+            """
+            UPDATE chat_revisions SET revision = ?, updated_at_ms = ?
+            WHERE channel = ? AND chat_id = ?
+            """,
+            (revision, int(now_ms), str(channel), str(chat_id)),
+        )
+        return revision
+
+    def _mark_considered_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        channel: str,
+        chat_id: str,
+        observed_revision: int,
+        lane: str,
+        now_ms: int,
+    ) -> None:
+        revision = int(observed_revision)
+        if revision <= 0:
+            return
+        column = self._considered_column(lane)
+        self._ensure_chat_revision_row(
+            conn, channel=channel, chat_id=chat_id, now_ms=now_ms
+        )
+        conn.execute(
+            f"""
+            UPDATE chat_revisions
+            SET {column} = MAX({column}, ?), updated_at_ms = ?
+            WHERE channel = ? AND chat_id = ?
+            """,
+            (revision, int(now_ms), str(channel), str(chat_id)),
+        )
+
+    def _migrate_source_revisions(self) -> None:
+        """Backfill source identity mappings and watermarks from legacy ledger rows."""
+        now_ms = int(time.time() * 1000)
+        dispositions = self._conn.execute(
+            """
+            SELECT channel, chat_id, observed_revision, lane, source_ids_json
+            FROM opportunity_dispositions
+            ORDER BY created_at_ms ASC, opportunity_id ASC
+            """
+        ).fetchall()
+        for row in dispositions:
+            channel = str(row["channel"])
+            chat_id = str(row["chat_id"])
+            lane = str(row["lane"] or "production")
+            if lane not in {"production", "shadow"}:
+                lane = "production"
+            observed = max(0, int(row["observed_revision"] or 0))
+            try:
+                parsed = json.loads(str(row["source_ids_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = []
+            raw_ids = parsed if isinstance(parsed, (list, tuple)) else []
+            source_ids = tuple(dict.fromkeys(filter(None, (self._source_id(item) for item in raw_ids))))
+            highest = observed
+            for material_source_id in source_ids:
+                mapped = self._conn.execute(
+                    """
+                    SELECT revision FROM source_revisions
+                    WHERE channel = ? AND chat_id = ? AND source_event_id = ?
+                    """,
+                    (channel, chat_id, material_source_id),
+                ).fetchone()
+                if mapped is None:
+                    revision = (
+                        observed
+                        if observed > 0
+                        else self._allocate_source_revision(
+                            self._conn,
+                            channel=channel,
+                            chat_id=chat_id,
+                            now_ms=now_ms,
+                        )
+                    )
+                    self._set_revision_at_least(
+                        self._conn,
+                        channel=channel,
+                        chat_id=chat_id,
+                        revision=revision,
+                        now_ms=now_ms,
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO source_revisions (
+                            channel, chat_id, source_event_id, revision, created_at_ms
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (channel, chat_id, material_source_id, revision, now_ms),
+                    )
+                else:
+                    revision = int(mapped["revision"])
+                highest = max(highest, revision)
+            self._mark_considered_in_connection(
+                self._conn,
+                channel=channel,
+                chat_id=chat_id,
+                observed_revision=highest,
+                lane=lane,
+                now_ms=now_ms,
+            )
+
+        claims = self._conn.execute(
+            """
+            SELECT channel, chat_id, claim_key, lane
+            FROM source_claims
+            ORDER BY claimed_at_ms ASC, claim_key ASC
+            """
+        ).fetchall()
+        for row in claims:
+            channel = str(row["channel"])
+            chat_id = str(row["chat_id"])
+            claim_key = str(row["claim_key"] or "").strip()
+            lane = str(row["lane"] or "production")
+            source_id: str | None
+            if claim_key.startswith("shadow:"):
+                lane = "shadow"
+                source_id = self._source_id(claim_key.removeprefix("shadow:"))
+            else:
+                source_id = self._source_id(claim_key)
+            if lane not in {"production", "shadow"} or source_id is None:
+                continue
+            mapped = self._conn.execute(
+                """
+                SELECT revision FROM source_revisions
+                WHERE channel = ? AND chat_id = ? AND source_event_id = ?
+                """,
+                (channel, chat_id, source_id),
+            ).fetchone()
+            revision = int(mapped["revision"]) if mapped is not None else 0
+            if mapped is None:
+                revision = self._allocate_source_revision(
+                    self._conn,
+                    channel=channel,
+                    chat_id=chat_id,
+                    now_ms=now_ms,
+                )
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO source_revisions (
+                        channel, chat_id, source_event_id, revision, created_at_ms
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (channel, chat_id, source_id, revision, now_ms),
+                )
+            self._mark_considered_in_connection(
+                self._conn,
+                channel=channel,
+                chat_id=chat_id,
+                observed_revision=revision,
+                lane=lane,
+                now_ms=now_ms,
             )
 
     def _apply_activation_columns(self) -> None:
@@ -793,6 +1088,239 @@ class SpeakupLog:
             ).fetchone()
         return int(row["revision"]) if row is not None else 1
 
+    def ensure_source_revisions_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        source_ids: tuple[str, ...] | list[str],
+        now_ms: int | None = None,
+    ) -> tuple[tuple[str, int], ...]:
+        """Register each new canonical source once and return its durable revision."""
+        normalized = tuple(
+            dict.fromkeys(
+                token
+                for token in (self._source_id(item) for item in source_ids)
+                if token is not None
+            )
+        )
+        if not channel or not chat_id or not normalized:
+            return ()
+        moment = int(now_ms if now_ms is not None else time.time() * 1000)
+        result: list[tuple[str, int]] = []
+        with self._write() as conn:
+            self._ensure_chat_revision_row(
+                conn, channel=channel, chat_id=chat_id, now_ms=moment
+            )
+            for source_id in normalized:
+                row = conn.execute(
+                    """
+                    SELECT revision FROM source_revisions
+                    WHERE channel = ? AND chat_id = ? AND source_event_id = ?
+                    """,
+                    (str(channel), str(chat_id), source_id),
+                ).fetchone()
+                if row is None:
+                    revision = self._allocate_source_revision(
+                        conn,
+                        channel=channel,
+                        chat_id=chat_id,
+                        now_ms=moment,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO source_revisions (
+                            channel, chat_id, source_event_id, revision, created_at_ms
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (str(channel), str(chat_id), source_id, revision, moment),
+                    )
+                else:
+                    revision = int(row["revision"])
+                result.append((source_id, revision))
+        return tuple(result)
+
+    def material_for_opportunity(
+        self,
+        channel: str,
+        chat_id: str,
+        source_ids: tuple[str, ...] | None,
+        *,
+        lane: str = "production",
+    ) -> tuple[tuple[str, ...], int]:
+        """Return registered source ids without advancing their considered watermark.
+
+        Explicit source ids are returned only after an archive/authorization layer has
+        registered them with :meth:`ensure_source_revisions_sync`.  ``None`` returns
+        only registered sources newer than the lane's durable considered watermark.
+        """
+        column = self._considered_column(lane)
+        if not channel or not chat_id:
+            return (), 0
+        normalized = tuple(
+            dict.fromkeys(
+                token
+                for token in (self._source_id(item) for item in (source_ids or ()))
+                if token is not None
+            )
+        )
+        with self._lock:
+            state = self._conn.execute(
+                f"""
+                SELECT {column} AS considered FROM chat_revisions
+                WHERE channel = ? AND chat_id = ?
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            considered = int(state["considered"] if state is not None else 0)
+            if source_ids is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT source_event_id, revision FROM source_revisions
+                    WHERE channel = ? AND chat_id = ? AND revision > ?
+                    ORDER BY revision ASC, source_event_id ASC
+                    """,
+                    (str(channel), str(chat_id), considered),
+                ).fetchall()
+            elif not normalized:
+                rows = []
+            else:
+                placeholders = ",".join("?" for _ in normalized)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT source_event_id, revision FROM source_revisions
+                    WHERE channel = ? AND chat_id = ?
+                      AND revision > ?
+                      AND source_event_id IN ({placeholders})
+                    ORDER BY revision ASC, source_event_id ASC
+                    """,
+                    (str(channel), str(chat_id), considered, *normalized),
+                ).fetchall()
+        material = tuple(str(row["source_event_id"]) for row in rows)
+        revision = max((int(row["revision"]) for row in rows), default=considered)
+        return material, revision
+
+    def mark_material_considered_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        observed_revision: int,
+        lane: str = "production",
+        now_ms: int | None = None,
+    ) -> None:
+        """Advance a lane watermark only after an offer was accepted by the queue."""
+        moment = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self._write() as conn:
+            self._mark_considered_in_connection(
+                conn,
+                channel=channel,
+                chat_id=chat_id,
+                observed_revision=int(observed_revision),
+                lane=lane,
+                now_ms=moment,
+            )
+
+    def initialize_material_baseline_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        source_ids: tuple[str, ...] | list[str] = (),
+        lane: str = "production",
+        now_ms: int | None = None,
+    ) -> int:
+        """Atomically baseline retained history for a never-seen chat.
+
+        A baseline is accepted only when this ledger has no chat row, source mapping,
+        claim, or disposition.  It is therefore safe for first enablement while a
+        restart with registered-but-unconsidered material remains visible to the
+        normal ``source_ids=None`` lookup.
+        """
+        column = self._considered_column(lane)
+        normalized = tuple(
+            dict.fromkeys(
+                token
+                for token in (self._source_id(item) for item in source_ids)
+                if token is not None
+            )
+        )
+        if not channel or not chat_id:
+            return 0
+        moment = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self._write() as conn:
+            existing_chat = conn.execute(
+                "SELECT 1 FROM chat_revisions WHERE channel = ? AND chat_id = ?",
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            existing_material = conn.execute(
+                """
+                SELECT 1 FROM source_revisions
+                WHERE channel = ? AND chat_id = ? LIMIT 1
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            existing_claim = conn.execute(
+                """
+                SELECT 1 FROM source_claims
+                WHERE channel = ? AND chat_id = ? LIMIT 1
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            existing_disposition = conn.execute(
+                """
+                SELECT 1 FROM opportunity_dispositions
+                WHERE channel = ? AND chat_id = ? LIMIT 1
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+            if any(
+                item is not None
+                for item in (existing_chat, existing_material, existing_claim, existing_disposition)
+            ):
+                row = conn.execute(
+                    f"""
+                    SELECT COALESCE({column}, 0) AS considered
+                    FROM chat_revisions WHERE channel = ? AND chat_id = ?
+                    """,
+                    (str(channel), str(chat_id)),
+                ).fetchone()
+                return int(row["considered"] if row is not None else 0)
+
+            self._ensure_chat_revision_row(
+                conn, channel=channel, chat_id=chat_id, now_ms=moment
+            )
+            highest = 0
+            for source_id in normalized:
+                revision = self._allocate_source_revision(
+                    conn,
+                    channel=channel,
+                    chat_id=chat_id,
+                    now_ms=moment,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO source_revisions (
+                        channel, chat_id, source_event_id, revision, created_at_ms
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(channel), str(chat_id), source_id, revision, moment),
+                )
+                highest = max(highest, revision)
+            # A first-enable baseline is administrative history, not an observation
+            # by one lane. Both lanes start after the same retained history so a later
+            # shadow/live switch cannot replay it as production work.
+            for baseline_lane in ("production", "shadow"):
+                self._mark_considered_in_connection(
+                    conn,
+                    channel=channel,
+                    chat_id=chat_id,
+                    observed_revision=highest,
+                    lane=baseline_lane,
+                    now_ms=moment,
+                )
+            return highest
+
     def activation_epoch_sync(
         self, scope: str = "participation", *, fingerprint: str | None = None
     ) -> int:
@@ -836,6 +1364,56 @@ class SpeakupLog:
             return str(row["fingerprint"] or "")
         except (IndexError, KeyError):
             return ""
+
+    def refresh_activation_sync(
+        self,
+        scope: str = "participation",
+        *,
+        fingerprint: str,
+        now_ms: int | None = None,
+    ) -> int:
+        """Persist one complete activation fingerprint and fence changes atomically.
+
+        The comparison and increment share the existing ledger transaction.  An empty
+        fingerprint row is adopted at its existing epoch (for databases created before
+        activation fingerprints existed); every later distinct fingerprint advances
+        exactly once.  A repeated refresh, including after a restart, is a read.
+        """
+        value = str(fingerprint)
+        ts = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT activation_epoch, fingerprint FROM activation_state WHERE scope = ?",
+                (str(scope),),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO activation_state (
+                        scope, activation_epoch, updated_at_ms, fingerprint
+                    ) VALUES (?, 1, ?, ?)
+                    """,
+                    (str(scope), ts, value),
+                )
+                return 1
+
+            current = int(row["activation_epoch"])
+            previous = str(row["fingerprint"] or "")
+            if not previous or previous == value:
+                if previous != value:
+                    self._set_activation_fingerprint(conn, str(scope), value)
+                return current
+
+            conn.execute(
+                """
+                UPDATE activation_state
+                SET activation_epoch = activation_epoch + 1,
+                    updated_at_ms = ?, fingerprint = ?
+                WHERE scope = ?
+                """,
+                (ts, value, str(scope)),
+            )
+            return current + 1
 
     def claim_source_sync(
         self,
@@ -889,6 +1467,29 @@ class SpeakupLog:
                 ),
             )
         return True, str(owner)
+
+    def release_source_claim_sync(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        source_event_id: str,
+        lane: str,
+        owner: str,
+    ) -> bool:
+        """Release only a just-created claim when queue admission is rejected."""
+        key = str(source_event_id)
+        if str(lane) == "shadow":
+            key = f"shadow:{key}"
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM source_claims
+                WHERE channel = ? AND chat_id = ? AND claim_key = ? AND owner = ?
+                """,
+                (str(channel), str(chat_id), key, str(owner)),
+            )
+        return bool(cursor.rowcount)
 
     async def source_claims(
         self, *, channel: str, chat_id: str, limit: int = 200
@@ -1475,13 +2076,29 @@ class SpeakupLog:
     async def highest_considered_revision(
         self, *, channel: str, chat_id: str, lane: str = "production"
     ) -> int:
+        column = self._considered_column(lane)
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT MAX(observed_revision) AS r FROM opportunity_dispositions
-                WHERE channel = ? AND chat_id = ? AND lane = ?
+                f"""
+                SELECT COALESCE({column}, 0) AS r FROM chat_revisions
+                WHERE channel = ? AND chat_id = ?
                 """,
-                (str(channel), str(chat_id), str(lane)),
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return int(row["r"]) if row is not None and row["r"] is not None else 0
+
+    def highest_considered_revision_sync(
+        self, *, channel: str, chat_id: str, lane: str = "production"
+    ) -> int:
+        """Synchronous startup read for the producer's durable replay watermark."""
+        column = self._considered_column(lane)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT COALESCE({column}, 0) AS r FROM chat_revisions
+                WHERE channel = ? AND chat_id = ?
+                """,
+                (str(channel), str(chat_id)),
             ).fetchone()
         return int(row["r"]) if row is not None and row["r"] is not None else 0
 

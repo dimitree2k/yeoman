@@ -166,6 +166,12 @@ class InboundEvent:
     reply_to_media_path: str | None = None
     reply_to_media_bytes: int | None = None
     lid_conflict: bool = False
+    source_event_ids: tuple[str, ...] = ()
+
+    @property
+    def source_ids(self) -> tuple[str, ...]:
+        """Ordered provider ids represented by this event, including debounced batches."""
+        return self.source_event_ids or ((self.message_id,) if self.message_id else ())
 
 
 #: Bridge frame types that only carry journal evidence (never a chat turn).
@@ -1246,6 +1252,14 @@ class WhatsAppChannel(BaseChannel):
             media_bytes=media_source.media_bytes,
             media_description=media_source.media_description,
             voice_transcript=media_source.voice_transcript,
+            source_event_ids=tuple(
+                dict.fromkeys(
+                    source_id
+                    for event in events
+                    for source_id in event.source_ids
+                    if source_id
+                )
+            ),
         )
 
         await self._publish_event(merged)
@@ -1740,6 +1754,7 @@ class WhatsAppChannel(BaseChannel):
                 "media_description": event.media_description,
                 "is_voice": is_voice,
                 "voice_transcript": event.voice_transcript,
+                "source_event_ids": list(event.source_ids),
                 **(event.thread_assignment or {}),
                 "thread_source_message_ids": list(
                     (event.thread_assignment or {}).get("source_message_ids") or []

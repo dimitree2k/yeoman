@@ -274,6 +274,45 @@ class InboundArchive:
                 senders[str(row["message_id"])] = sender
         return senders
 
+    def resolve_source_ids(
+        self,
+        channel: str,
+        chat_id: str,
+        source_ids: tuple[str, ...] | None,
+    ) -> tuple[str, ...]:
+        """Resolve retained human source ids in one exact channel and chat.
+
+        This is deliberately a pure archive lookup. Source sequencing and the
+        considered watermark belong to ``SpeakupLog``; retention or a process restart
+        must therefore never change the answer's revision or create archive state.
+        """
+        if not channel or not chat_id:
+            return ()
+        wanted = {
+            str(item).strip()
+            for item in (source_ids or ())
+            if str(item or "").strip() and not str(item).strip().startswith("observed:")
+        }
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT message_id, participant, sender_id
+                FROM inbound_messages
+                WHERE channel = ? AND chat_id = ?
+                ORDER BY created_at ASC, message_id ASC
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchall()
+        resolved: list[str] = []
+        for row in rows:
+            message_id = str(row["message_id"] or "").strip()
+            sender = str(row["sender_id"] or row["participant"] or "").strip()
+            if not message_id or not sender or message_id.startswith("observed:"):
+                continue
+            if source_ids is None or message_id in wanted:
+                resolved.append(message_id)
+        return tuple(resolved)
+
     def lookup_messages_in_range(
         self,
         channel: str,

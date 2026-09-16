@@ -57,6 +57,7 @@ class InboundObservedEvent:
     content: str
     timestamp: float
     message_id: str | None = None
+    source_event_ids: tuple[str, ...] = ()
     is_group: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 

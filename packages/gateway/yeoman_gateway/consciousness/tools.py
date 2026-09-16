@@ -166,6 +166,7 @@ class ConsciousnessTools:
         approval_store: SpeakupApprovalStore | None = None,
         service_effects: object | None = None,
         now: Callable[[], datetime] | None = None,
+        activation_provider: Callable[[str, str], object | None] | None = None,
     ) -> None:
         self.config = config
         self.policy_engine = policy_engine
@@ -177,6 +178,7 @@ class ConsciousnessTools:
         self.security = security
         self.approval_store = approval_store
         self._now = now or (lambda: datetime.now(UTC))
+        self._activation_provider = activation_provider
         self._proposals: dict[str, SpeakupProposal] = {}
         self._commit_lock = asyncio.Lock()
         self._trigger = "cron"
@@ -1295,6 +1297,14 @@ class ConsciousnessTools:
 
     def _participation_snapshot(self, channel: str, chat_id: str):
         """Resolve the canonical activation matrix from the real processing config."""
+        current = self._activation_provider
+        if current is None:
+            current = getattr(self.policy_engine, "current_activation", None)
+        if current is not None:
+            try:
+                return current(channel, chat_id)
+            except Exception:  # noqa: BLE001 - an unreadable activation cannot create work
+                return None
         processing = getattr(self.config, "processing", None)
         resolver = getattr(self.policy_engine, "resolve_participation_snapshot", None)
         if processing is None or resolver is None:

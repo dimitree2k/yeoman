@@ -66,6 +66,459 @@ def _observed(timestamp: float, *, message_id: str = "m1") -> InboundObservedEve
     )
 
 
+def _material_provider(archive, log):
+    """Compose pure archive ACL lookup with the durable ledger sequence."""
+
+    def provide(channel: str, chat_id: str, source_ids: tuple[str, ...] | None):
+        resolved = archive.resolve_source_ids(channel, chat_id, source_ids)
+        if resolved:
+            log.ensure_source_revisions_sync(
+                channel=channel, chat_id=chat_id, source_ids=resolved
+            )
+        return log.material_for_opportunity(channel, chat_id, None if source_ids is None else resolved)
+
+    return provide
+
+
+def _synthetic_material_provider(
+    channel: str, chat_id: str, source_ids: tuple[str, ...] | None
+) -> tuple[tuple[str, ...], int]:
+    """Explicit source composition for tests that do not construct an archive."""
+    del channel, chat_id
+    material = tuple(source_ids or ())
+    return material, len(material)
+
+
+def test_archive_material_resolution_is_pure_and_ledger_owns_revision(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    for index, message_id in enumerate(("m1", "m2"), start=1):
+        archive.record_inbound(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id=message_id,
+            participant=f"person{index}@s.whatsapp.net",
+            sender_id=f"person{index}",
+            text=message_id,
+            timestamp=index,
+        )
+
+    assert archive.resolve_source_ids(
+        "whatsapp", CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
+    ) == ("m1", "m2")
+    assert not archive._conn.execute(  # noqa: SLF001 - schema guard for the source owner
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'participation_material_state'"
+    ).fetchone()
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    provider = _material_provider(archive, log)
+    material, revision = provider(
+        "whatsapp", CHAT, ("m2", "missing", "observed:whatsapp:" + CHAT, "m1")
+    )
+    assert material == ("m1", "m2")
+    assert revision == 2
+    assert log.highest_considered_revision_sync(channel="whatsapp", chat_id=CHAT) == 0
+    log.mark_material_considered_sync(
+        channel="whatsapp", chat_id=CHAT, observed_revision=revision
+    )
+    # The same source sequence remains the same after a later source appears.
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="m3",
+        participant="person3@s.whatsapp.net",
+        sender_id="person3",
+        text="m3",
+        timestamp=3,
+    )
+    again, again_revision = provider("whatsapp", CHAT, ("m1",))
+    assert again == ()
+    assert again_revision == revision
+    new_material, new_revision = provider("whatsapp", CHAT, None)
+    assert new_material == ("m3",)
+    assert new_revision == 3
+    # Lookup alone does not advance the considered watermark, so an unaccepted
+    # repeat still returns the same source. The runtime marks it after queue accept.
+    assert provider("whatsapp", CHAT, None) == (("m3",), new_revision)
+    log.mark_material_considered_sync(
+        channel="whatsapp", chat_id=CHAT, observed_revision=new_revision
+    )
+    assert provider("whatsapp", CHAT, None) == ((), new_revision)
+    log.close()
+    archive.close()
+
+
+def test_explicit_material_is_new_only_with_root_authorized_source_set(tmp_path: Path) -> None:
+    """Explicit Root-authorized IDs cannot replay considered or add other ledger rows."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    log.ensure_source_revisions_sync(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_ids=("authorized-old", "authorized-new", "blocked"),
+    )
+    log.mark_material_considered_sync(
+        channel="whatsapp", chat_id=CHAT, observed_revision=1
+    )
+
+    assert log.material_for_opportunity(
+        "whatsapp", CHAT, ("authorized-old", "authorized-new")
+    ) == (("authorized-new",), 2)
+    # Root's ACL-filtered source set does not contain the pre-registered blocked row.
+    assert "blocked" not in log.material_for_opportunity(
+        "whatsapp", CHAT, ("authorized-old", "authorized-new")
+    )[0]
+    log.close()
+
+
+def test_first_enable_baselines_archive_history_but_restart_keeps_unconsidered_sources(
+    tmp_path: Path,
+) -> None:
+    """Only a truly uninitialized ledger chat may adopt retained history as baseline."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="historic",
+        participant="person@s.whatsapp.net",
+        sender_id="person",
+        text="historic",
+        timestamp=1,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    historic = archive.resolve_source_ids("whatsapp", CHAT, None)
+    assert log.initialize_material_baseline_sync(
+        channel="whatsapp", chat_id=CHAT, source_ids=historic
+    ) == 1
+    assert log.material_for_opportunity("whatsapp", CHAT, None) == ((), 1)
+    assert log.material_for_opportunity(
+        "whatsapp", CHAT, None, lane="shadow"
+    ) == ((), 1)
+
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="new",
+        participant="person@s.whatsapp.net",
+        sender_id="person",
+        text="new",
+        timestamp=2,
+    )
+    new_ids = archive.resolve_source_ids("whatsapp", CHAT, None)
+    log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=CHAT, source_ids=new_ids
+    )
+    assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
+
+    pending_chat = "pending@g.us"
+    log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=pending_chat, source_ids=("pending",)
+    )
+    # A restart/second baseline attempt cannot hide a registered but unconsidered id.
+    assert log.initialize_material_baseline_sync(
+        channel="whatsapp", chat_id=pending_chat, source_ids=("pending",)
+    ) == 0
+    log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=pending_chat, source_ids=("after-restart",)
+    )
+    assert log.material_for_opportunity("whatsapp", pending_chat, None) == (
+        ("pending", "after-restart"),
+        2,
+    )
+    log.close()
+    archive.close()
+
+
+def test_ledger_migrates_legacy_claims_and_dispositions_without_reallocating_on_restart(
+    tmp_path: Path,
+) -> None:
+    """Legacy rows seed the ledger watermark once; a reopen remains idempotent."""
+    import sqlite3
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    db_path = tmp_path / "legacy-speakups.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE chat_revisions (
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (channel, chat_id)
+        );
+        CREATE TABLE source_claims (
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            claim_key TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            activation_epoch INTEGER NOT NULL,
+            claimed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (channel, chat_id, claim_key)
+        );
+        CREATE TABLE opportunity_dispositions (
+            opportunity_id TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            observed_revision INTEGER NOT NULL DEFAULT 0,
+            source_ids_json TEXT NOT NULL DEFAULT '[]',
+            disposition TEXT NOT NULL,
+            reason TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        INSERT INTO chat_revisions VALUES ('whatsapp', 'legacy@g.us', 4, 1);
+        INSERT INTO source_claims VALUES (
+            'whatsapp', 'legacy@g.us', 'old-claim', 'legacy', 1, 2
+        );
+        INSERT INTO opportunity_dispositions VALUES (
+            'old-opportunity', 'whatsapp', 'legacy@g.us', 5,
+            '["old-disposition"]', 'decided_silence', 'legacy', 3, 3
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    log = SpeakupLog(db_path)
+    assert log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id="legacy@g.us"
+    ) >= 5
+    old_mapping = log.material_for_opportunity("whatsapp", "legacy@g.us", ("old-disposition",))
+    assert old_mapping == ((), 6)
+    created = log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id="legacy@g.us", source_ids=("new",)
+    )
+    assert created and created[0][1] > 5
+    highwater = log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id="legacy@g.us"
+    )
+    log.close()
+
+    reopened = SpeakupLog(db_path)
+    assert reopened.highest_considered_revision_sync(
+        channel="whatsapp", chat_id="legacy@g.us"
+    ) == highwater
+    assert reopened.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id="legacy@g.us", source_ids=("new",)
+    ) == tuple(created)
+    reopened.close()
+
+
+def test_archive_retention_does_not_renumber_ledger_source_revisions(tmp_path: Path) -> None:
+    """Purging retained rows cannot move the durable source sequence backwards."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db", retention_days=1)
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="old",
+        participant="person@s.whatsapp.net",
+        sender_id="person",
+        text="old",
+        timestamp=1,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=CHAT, source_ids=("old",)
+    )
+    log.mark_material_considered_sync(
+        channel="whatsapp", chat_id=CHAT, observed_revision=1
+    )
+    with archive._lock:  # noqa: SLF001 - deterministic synthetic retention setup
+        archive._conn.execute(  # noqa: SLF001
+            "UPDATE inbound_messages SET created_at = ? WHERE message_id = ?",
+            ("2000-01-01T00:00:00+00:00", "old"),
+        )
+        archive._conn.commit()  # noqa: SLF001
+    assert archive.purge_older_than(1) == 1
+
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="new",
+        participant="person@s.whatsapp.net",
+        sender_id="person",
+        text="new",
+        timestamp=2,
+    )
+    resolved = archive.resolve_source_ids("whatsapp", CHAT, None)
+    assert resolved == ("new",)
+    assert log.ensure_source_revisions_sync(
+        channel="whatsapp", chat_id=CHAT, source_ids=resolved
+    ) == (("new", 2),)
+    assert log.material_for_opportunity("whatsapp", CHAT, None) == (("new",), 2)
+    log.close()
+    archive.close()
+
+
+def test_ingress_uses_batch_material_provider_without_consuming_duplicate_revision(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ParticipationIngress
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    for index, message_id in enumerate(("m1", "m2"), start=1):
+        archive.record_inbound(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id=message_id,
+            participant=f"person{index}@s.whatsapp.net",
+            sender_id=f"person{index}",
+            text=message_id,
+            timestamp=index,
+        )
+    log = SpeakupLog(tmp_path / "speakups.db")
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.offers = []
+
+        def offer_source(self, **kwargs: object) -> bool:
+            self.offers.append(kwargs)
+            return True
+
+    runtime = Runtime()
+    ingress = ParticipationIngress(
+        runtime=runtime,  # type: ignore[arg-type]
+        ledger=log,
+        material_provider=_material_provider(archive, log),
+        is_active=lambda channel, chat_id: True,
+    )
+    event = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="person2",
+        content="m1 + m2",
+        timestamp=2.0,
+        message_id="m2",
+        source_event_ids=("m1", "m2"),
+        is_group=True,
+    )
+    assert ingress.handle_event(event)
+    assert ingress.handle_event(event)
+    assert [item["source_event_ids"] for item in runtime.offers] == [
+        ("m1", "m2"),
+        ("m1", "m2"),
+    ]
+    assert [item["observed_revision"] for item in runtime.offers] == [2, 2]
+    # A trigger with no source material never increments the legacy revision table.
+    empty = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="person2",
+        content="",
+        timestamp=2.0,
+        message_id=None,
+        source_event_ids=(),
+        is_group=True,
+    )
+    assert ingress.handle_event(empty) is False
+    assert log.activation_epoch_sync("participation") == 1
+    log.close()
+    archive.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_batch_material_reaches_one_real_runtime_evaluation(
+    tmp_path: Path,
+) -> None:
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationIngress,
+        ParticipationRuntime,
+    )
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    archive = InboundArchive(tmp_path / "inbound.db", retention_days=None)
+    for index, message_id in enumerate(("m1", "m2"), start=1):
+        archive.record_inbound(
+            channel="whatsapp",
+            chat_id=CHAT,
+            message_id=message_id,
+            participant=f"person{index}@s.whatsapp.net",
+            sender_id=f"person{index}",
+            text=message_id,
+            timestamp=index,
+        )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    handled: list[tuple[str, ...]] = []
+    release = asyncio.Event()
+
+    async def handle(opportunity: ParticipationOpportunity) -> None:
+        handled.append(tuple(opportunity.source_event_ids))
+        await release.wait()
+
+    scheduler = OpportunityScheduler(handle=handle, max_concurrent_decisions=1, ttl_seconds=600)
+    await scheduler.start()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler,
+        source_owner=owner,
+        activation_epoch=1,
+    )
+    ingress = ParticipationIngress(
+        runtime=runtime,
+        ledger=log,
+        material_provider=_material_provider(archive, log),
+        is_active=lambda channel, chat_id: True,
+    )
+    event = InboundObservedEvent(
+        channel="whatsapp",
+        chat_id=CHAT,
+        sender_id="person2",
+        content="m1 + m2",
+        timestamp=2.0,
+        message_id="m2",
+        source_event_ids=("m1", "m2"),
+        is_group=True,
+    )
+    try:
+        assert ingress.handle_event(event)
+        assert not ingress.handle_event(event)
+        for _ in range(100):
+            if handled:
+                break
+            await asyncio.sleep(0.01)
+        assert handled == [("m1", "m2")]
+    finally:
+        release.set()
+        await scheduler.stop()
+        log.close()
+        archive.close()
+
+
+@pytest.mark.asyncio
+async def test_message_bus_preserves_batch_source_event_ids(tmp_path: Path) -> None:
+    from yeoman_gateway.bus.events import InboundMessage
+
+    bus = MessageBus()
+    await bus.publish_inbound(
+        InboundMessage(
+            channel="whatsapp",
+            sender_id="person",
+            chat_id=CHAT,
+            content="m1 + m2",
+            metadata={"message_id": "m2", "source_event_ids": ["m1", "m2"]},
+        )
+    )
+    observed = bus._event_queue.get_nowait()  # noqa: SLF001 - synthetic bus boundary
+    assert observed.source_event_ids == ("m1", "m2")
+
+
 @pytest.mark.asyncio
 async def test_event_dispatch_is_not_blocked_by_an_observer_producer(tmp_path: Path) -> None:
     """The real dispatch path does not sit in a model call inside a producer.
@@ -284,7 +737,12 @@ async def test_inbound_ingress_admits_new_material_only(tmp_path: Path) -> None:
     runtime = ParticipationRuntime(
         scheduler=scheduler, source_owner=owner, activation_epoch=1, is_enabled=lambda c, i: True
     )
-    ingress = ParticipationIngress(runtime=runtime, ledger=log, is_active=lambda c, i: True)
+    ingress = ParticipationIngress(
+        runtime=runtime,
+        ledger=log,
+        material_provider=_synthetic_material_provider,
+        is_active=lambda c, i: True,
+    )
     try:
         assert ingress.handle_event(_observed(100.0, message_id="m1")) is True
         await asyncio.sleep(0.05)
@@ -374,7 +832,12 @@ async def test_ingress_event_handler_is_awaitable_and_never_breaks_dispatch(
     runtime = ParticipationRuntime(
         scheduler=scheduler, source_owner=owner, activation_epoch=1, is_enabled=lambda c, i: True
     )
-    ingress = ParticipationIngress(runtime=runtime, ledger=log, is_active=lambda c, i: True)
+    ingress = ParticipationIngress(
+        runtime=runtime,
+        ledger=log,
+        material_provider=_synthetic_material_provider,
+        is_active=lambda c, i: True,
+    )
 
     async def on_observed(event: object) -> None:
         ingress.handle_event(event)
@@ -425,6 +888,7 @@ async def test_ingress_failure_does_not_abort_event_dispatch(tmp_path: Path) -> 
     ingress = ParticipationIngress(
         runtime=_ExplodingRuntime(),  # type: ignore[arg-type]
         ledger=log,
+        material_provider=_synthetic_material_provider,
         is_active=lambda c, i: True,
     )
 

@@ -317,6 +317,141 @@ async def test_source_reference_bounds_hold_and_report_drops() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bounded_runtime_offer_releases_dropped_claims_and_reports_count(tmp_path) -> None:
+    """Only newest bounded refs remain owned, with truncation metadata."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        OWNER_PARTICIPATION,
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    handled: list[tuple[str, ...]] = []
+    dispositions: list[tuple[str, dict]] = []
+
+    async def handle(opportunity) -> None:
+        handled.append(tuple(opportunity.source_event_ids))
+        entered.set()
+        await release.wait()
+
+    def record(disposition, opportunity, detail) -> None:
+        dispositions.append((disposition, dict(detail)))
+
+    scheduler = OpportunityScheduler(
+        handle=handle,
+        max_pending_source_refs=2,
+        on_disposition=record,
+        max_concurrent_decisions=1,
+    )
+    await scheduler.start()
+    runtime = ParticipationRuntime(scheduler=scheduler, source_owner=owner)
+    try:
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m1", "m2", "m3"),
+            observed_revision=3,
+            trigger="inbound",
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert handled == [("m2", "m3")]
+        retry = owner.claim(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_id="m1",
+            activation_epoch=1,
+            owner=OWNER_PARTICIPATION,
+        )
+        assert retry.granted and retry.reason == "claimed"
+        started = next(detail for name, detail in dispositions if name == "started")
+        assert started["dropped_source_count"] == 1
+        assert log.highest_considered_revision_sync(
+            channel="whatsapp", chat_id=CHAT
+        ) == 3
+    finally:
+        release.set()
+        await scheduler.stop()
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_merge_keeps_claim_for_reported_inflight_source(tmp_path) -> None:
+    """A source already handed to the handler is not released when coalescing."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        OWNER_PARTICIPATION,
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    handled: list[tuple[str, ...]] = []
+    dispositions: list[tuple[str, dict]] = []
+
+    async def handle(opportunity) -> None:
+        handled.append(tuple(opportunity.source_event_ids))
+        if len(handled) == 1:
+            entered.set()
+            await release.wait()
+
+    def record(disposition, opportunity, detail) -> None:
+        del opportunity
+        dispositions.append((disposition, dict(detail)))
+
+    scheduler = OpportunityScheduler(
+        handle=handle,
+        max_pending_source_refs=1,
+        on_disposition=record,
+        max_concurrent_decisions=1,
+    )
+    await scheduler.start()
+    runtime = ParticipationRuntime(scheduler=scheduler, source_owner=owner)
+    try:
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m1",),
+            observed_revision=1,
+            trigger="inbound",
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("m2",),
+            observed_revision=2,
+            trigger="burst",
+        )
+        still_owned = owner.claim(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_id="m1",
+            activation_epoch=1,
+            owner=OWNER_PARTICIPATION,
+        )
+        assert still_owned.granted and still_owned.reason == "already_owned"
+        release.set()
+        for _ in range(100):
+            if len(handled) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert handled == [("m1",), ("m2",)]
+        started = [detail for name, detail in dispositions if name == "started"]
+        assert started[-1]["dropped_source_count"] == 1
+    finally:
+        release.set()
+        await scheduler.stop()
+        log.close()
+
+
+@pytest.mark.asyncio
 async def test_byte_budget_bounds_encoded_references() -> None:
     release = asyncio.Event()
 
@@ -899,6 +1034,67 @@ def test_shadow_lane_never_consumes_a_production_source_id(tmp_path) -> None:
     log.close()
 
 
+@pytest.mark.asyncio
+async def test_runtime_queue_full_releases_claim_and_does_not_consume_watermark(tmp_path) -> None:
+    """A rejected queue offer leaves both claim and durable considered state untouched."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        OWNER_PARTICIPATION,
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(opportunity) -> None:
+        del opportunity
+        entered.set()
+        await release.wait()
+
+    scheduler = OpportunityScheduler(
+        handle=handle, max_pending_chats=1, max_concurrent_decisions=1
+    )
+    await scheduler.start()
+    runtime = ParticipationRuntime(scheduler=scheduler, source_owner=owner)
+    try:
+        assert runtime.offer_source(
+            channel="whatsapp",
+            chat_id=CHAT,
+            source_event_ids=("first",),
+            observed_revision=1,
+            trigger="inbound",
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert not runtime.offer_source(
+            channel="whatsapp",
+            chat_id=OTHER,
+            source_event_ids=("rejected",),
+            observed_revision=1,
+            trigger="burst",
+        )
+        assert log.highest_considered_revision_sync(
+            channel="whatsapp", chat_id=CHAT
+        ) == 1
+        assert log.highest_considered_revision_sync(
+            channel="whatsapp", chat_id=OTHER
+        ) == 0
+        retry = owner.claim(
+            channel="whatsapp",
+            chat_id=OTHER,
+            source_event_id="rejected",
+            activation_epoch=1,
+            owner=OWNER_PARTICIPATION,
+        )
+        assert retry.granted and retry.reason == "claimed"
+    finally:
+        release.set()
+        await scheduler.stop()
+    log.close()
+
+
 def test_missing_source_id_is_never_claimed(tmp_path) -> None:
     owner, log = _source_owner(tmp_path)
     decision = owner.claim(
@@ -982,6 +1178,69 @@ async def test_runtime_refuses_when_the_chat_is_not_enabled(tmp_path) -> None:
         )
     finally:
         await scheduler.stop()
+    assert log.highest_considered_revision_sync(channel="whatsapp", chat_id=CHAT) == 0
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_hydrates_highest_considered_revision_before_first_offer(tmp_path) -> None:
+    """Restart admission starts after the durable considered watermark, not history."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await log.record_disposition(
+        opportunity_id="already-considered",
+        channel="whatsapp",
+        chat_id=CHAT,
+        disposition="decided_silence",
+        observed_revision=2,
+    )
+    log.mark_material_considered_sync(
+        channel="whatsapp", chat_id=CHAT, observed_revision=2
+    )
+    owner = SourceOwner(store=log)
+    offered = []
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.watermark = 0
+
+        def mark_considered(self, channel: str, chat_id: str, *, observed_revision: int) -> None:
+            self.watermark = int(observed_revision)
+            offered.append(("watermark", channel, chat_id, observed_revision))
+
+        def offer(self, opportunity) -> bool:
+            if int(opportunity.observed_revision) <= self.watermark:
+                return False
+            offered.append(opportunity)
+            return True
+
+    runtime = ParticipationRuntime(
+        scheduler=Scheduler(),
+        source_owner=owner,
+        activation_epoch=1,
+        considered_revision_provider=log.highest_considered_revision_sync,
+    )
+    assert not runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("old-source",),
+        observed_revision=2,
+        trigger="burst",
+    )
+    assert runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("new-source",),
+        observed_revision=3,
+        trigger="inbound",
+    )
+    assert offered[0] == ("watermark", "whatsapp", CHAT, 2)
+    assert offered[1].source_event_ids == ("new-source",)
     log.close()
 
 
@@ -1078,4 +1337,308 @@ async def test_first_observation_after_an_upgrade_does_not_invent_a_transition(
     assert tracker.observe(
         channel="whatsapp", chat_id=CHAT, enabled=True, shadow=True, judge_route="r"
     ) == 2
+    log.close()
+
+
+def test_global_activation_refresh_fences_pause_and_two_chat_changes(tmp_path) -> None:
+    """The activation epoch is one durable global fence, not one fence per chat."""
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    state = {
+        "global": {"enabled": True, "shadow": True, "judge_route": "r"},
+        "processing": {
+            "enabled": True,
+            "managed_targets": ("whatsapp:a@g.us",),
+            "shadow_targets": (),
+        },
+        "chat_opt_ins": {"whatsapp:a@g.us": True, "whatsapp:b@g.us": False},
+        "pauses": {"global": False, "chats": ()},
+    }
+    db_path = tmp_path / "speakups.db"
+    log = SpeakupLog(db_path)
+    tracker = ActivationEpochTracker(store=log, activation_state_provider=lambda: state)
+    assert tracker.refresh_activation_sync() == 1
+    assert tracker.refresh_activation_sync() == 1
+
+    # A second chat's resolved opt-in is part of the same global fingerprint.
+    state["chat_opt_ins"] = {"whatsapp:a@g.us": True, "whatsapp:b@g.us": True}
+    assert tracker.refresh_activation_sync() == 2
+    # A pause and its resume both fence old work even without an inbound message.
+    state["pauses"] = {"global": True, "chats": ()}
+    assert tracker.refresh_activation_sync() == 3
+    state["pauses"] = {"global": False, "chats": ()}
+    assert tracker.refresh_activation_sync() == 4
+    log.close()
+
+    restarted = SpeakupLog(db_path)
+    restarted_tracker = ActivationEpochTracker(
+        store=restarted, activation_state_provider=lambda: state
+    )
+    assert restarted_tracker.refresh_activation_sync() == 4
+    restarted.close()
+
+
+def test_pause_resume_refreshes_shared_activation_epoch_immediately(tmp_path) -> None:
+    """Owner pause controls fence the shared epoch without waiting for a message."""
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+    from yeoman_gateway.policy.engine import PolicyEngine
+    from yeoman_gateway.policy.schema import PolicyConfig
+    from yeoman_shared.config.schema import ProcessingConfig
+
+    policy_path = tmp_path / "policy.json"
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "channels": {
+                "whatsapp": {"chats": {CHAT: {"participation": {"enabled": True}}}}
+            },
+        }
+    )
+    engine = PolicyEngine(policy, workspace=tmp_path, apply_channels={"whatsapp"})
+    processing = ProcessingConfig.model_validate(
+        {"enabled": True, "participation": {"enabled": True, "judgeRoute": "route"}}
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    tracker = ActivationEpochTracker(store=log)
+    adapter = EnginePolicyAdapter(
+        engine=engine,
+        known_tools=set(),
+        policy_path=policy_path,
+        workspace=tmp_path,
+        processing_config=processing,
+        activation_tracker=tracker,
+        reload_on_change=False,
+    )
+    assert adapter.current_activation("whatsapp", CHAT) is not None
+    assert log.activation_epoch_sync("participation") == 1
+
+    adapter._set_global_pause(-1)  # noqa: SLF001 - synthetic owner-control path
+    assert log.activation_epoch_sync("participation") == 2
+    assert adapter._clear_all_pauses() is True  # noqa: SLF001
+    assert log.activation_epoch_sync("participation") == 3
+    log.close()
+
+
+def test_runtime_refreshes_activation_before_each_offer_and_keeps_shadow_lane(tmp_path) -> None:
+    """A producer follows the current snapshot instead of a startup epoch/lane."""
+    from dataclasses import dataclass
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        LANE_PRODUCTION,
+        LANE_SHADOW,
+        OWNER_LEGACY,
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    @dataclass
+    class Activation:
+        activation_epoch: int
+        shadow: bool
+        live: bool
+        observing: bool
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.offered = []
+
+        def offer(self, opportunity):
+            self.offered.append(opportunity)
+            return True
+
+    current = Activation(activation_epoch=1, shadow=True, live=False, observing=True)
+    log = SpeakupLog(tmp_path / "speakups.db")
+    owner = SourceOwner(store=log)
+    scheduler = Scheduler()
+    runtime = ParticipationRuntime(
+        scheduler=scheduler,
+        source_owner=owner,
+        activation_epoch=99,
+        activation_provider=lambda channel, chat_id: current,
+    )
+
+    assert runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("m-shadow",),
+        observed_revision=1,
+        trigger="burst",
+    )
+    assert scheduler.offered[-1].activation_epoch == 1
+    assert scheduler.offered[-1].lane == LANE_SHADOW
+    assert log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_SHADOW
+    ) == 1
+    assert log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_PRODUCTION
+    ) == 0
+    assert owner.claim(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_id="m-shadow",
+        activation_epoch=1,
+        owner=OWNER_LEGACY,
+        lane=LANE_PRODUCTION,
+    ).granted
+
+    current = Activation(activation_epoch=2, shadow=False, live=True, observing=False)
+    assert runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("m-live",),
+        observed_revision=2,
+        trigger="lull",
+    )
+    assert scheduler.offered[-1].activation_epoch == 2
+    assert scheduler.offered[-1].lane == LANE_PRODUCTION
+    assert log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_PRODUCTION
+    ) == 2
+    assert not runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("m-shadow",),
+        observed_revision=2,
+        trigger="inbound",
+    )
+    log.close()
+
+
+def test_shadow_to_live_restart_reuses_material_without_replaying_shadow_lane(tmp_path) -> None:
+    """A shadow claim is separate, so cutover can admit the source once in production."""
+    from dataclasses import dataclass
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        LANE_PRODUCTION,
+        LANE_SHADOW,
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    @dataclass
+    class Activation:
+        activation_epoch: int
+        shadow: bool
+        live: bool
+        observing: bool
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.offered = []
+
+        def offer(self, opportunity):
+            self.offered.append(opportunity)
+            return True
+
+    db_path = tmp_path / "speakups.db"
+    shadow_log = SpeakupLog(db_path)
+    shadow_runtime = ParticipationRuntime(
+        scheduler=Scheduler(),
+        source_owner=SourceOwner(store=shadow_log),
+        activation_provider=lambda channel, chat_id: Activation(1, True, False, True),
+    )
+    assert shadow_runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("cutover-source",),
+        observed_revision=1,
+        trigger="burst",
+    )
+    assert shadow_log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_SHADOW
+    ) == 1
+    assert shadow_log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_PRODUCTION
+    ) == 0
+    shadow_log.close()
+
+    live_log = SpeakupLog(db_path)
+    live_scheduler = Scheduler()
+    live_runtime = ParticipationRuntime(
+        scheduler=live_scheduler,
+        source_owner=SourceOwner(store=live_log),
+        activation_provider=lambda channel, chat_id: Activation(2, False, True, False),
+    )
+    assert live_runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("cutover-source",),
+        observed_revision=1,
+        trigger="inbound",
+    )
+    assert live_scheduler.offered[-1].lane == LANE_PRODUCTION
+    assert live_log.highest_considered_revision_sync(
+        channel="whatsapp", chat_id=CHAT, lane=LANE_PRODUCTION
+    ) == 1
+    live_log.close()
+
+
+def test_runtime_hydrates_only_after_ready_activation_and_uses_lane(tmp_path) -> None:
+    """Inactive/shadow preflight cannot hydrate production state before admission."""
+    from dataclasses import dataclass
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import (
+        ParticipationRuntime,
+        SourceOwner,
+    )
+
+    @dataclass
+    class Activation:
+        activation_epoch: int
+        shadow: bool
+        live: bool
+        observing: bool
+
+    current = Activation(1, False, False, False)
+    calls: list[tuple[str, str]] = []
+
+    class Scheduler:
+        def mark_considered(self, channel, chat_id, *, observed_revision, lane="production"):
+            del channel, chat_id, observed_revision
+            calls.append(("hydration", str(lane)))
+
+        def offer(self, opportunity):
+            del opportunity
+            calls.append(("offer", "production"))
+            return True
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    runtime = ParticipationRuntime(
+        scheduler=Scheduler(),
+        source_owner=SourceOwner(store=log),
+        activation_provider=lambda channel, chat_id: (
+            calls.append(("activation", "snapshot")) or current
+        ),
+        considered_revision_provider=lambda **kwargs: (
+            calls.append(("provider", str(kwargs["lane"]))) or 0
+        ),
+    )
+    assert not runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("not-ready",),
+        observed_revision=1,
+        trigger="burst",
+    )
+    assert calls == [("activation", "snapshot")]
+
+    current = Activation(2, False, True, False)
+    assert runtime.offer_source(
+        channel="whatsapp",
+        chat_id=CHAT,
+        source_event_ids=("ready",),
+        observed_revision=2,
+        trigger="inbound",
+    )
+    assert calls[-3:] == [
+        ("activation", "snapshot"),
+        ("provider", "production"),
+        ("offer", "production"),
+    ]
     log.close()
