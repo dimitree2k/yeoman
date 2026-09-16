@@ -500,10 +500,7 @@ class A2ADelegateTool(Tool):
             worker == "hermes"
             and skill == "research.deep"
             and context is not None
-            and (
-                re.search(r"(?i)\btrading[\s-]?(?:guru|agents)\b", context.request_text)
-                or ticker
-            )
+            and re.search(r"(?i)\btrading[\s-]?(?:guru|agents)\b", context.request_text)
         ):
             skill = "trading.analyze"
         if skill == "trading.analyze" and worker != "hermes":
@@ -685,7 +682,7 @@ class A2ADelegateTool(Tool):
                             content=render_research_output(result.output, mode="full"),
                             canonical_user_id=canonical_user_id if skill == "trading.analyze" else "",
                             symbol=symbol if skill == "trading.analyze" else "",
-                            card=card if skill == "trading.analyze" else "",
+                            card=card,
                         )
                     except Exception as exc:
                         logger.warning("A2A full report was not stored error_type={}", type(exc).__name__)

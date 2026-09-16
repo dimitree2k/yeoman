@@ -632,6 +632,24 @@ async def test_plain_arvid_non_request_gets_reaction_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_reaction_uses_original_lid_message_key() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Arvid",
+            participant="491700000001@s.whatsapp.net",
+            raw_metadata={"participant_lid": "12345@lid"},
+        ),
+        decision=_mention_only_decision(),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _noop_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert len(reactions) == 1
+    assert reactions[0].participant_jid == "12345@lid"
+
+
+@pytest.mark.asyncio
 async def test_short_ack_reply_to_bot_gets_reaction_only() -> None:
     ctx = PipelineContext(
         event=_event(

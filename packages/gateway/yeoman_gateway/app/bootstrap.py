@@ -2324,6 +2324,7 @@ def build_gateway_runtime(
                 channel=event.channel,
                 chat_id=event.chat_id,
                 provider_message_id=event.reply_to_message_id,
+                quoted_text=event.reply_to_text or "",
             )
         from yeoman_gateway.agent.tools.a2a import _ticker
         from yeoman_gateway.policy.identity import canonical_user_id

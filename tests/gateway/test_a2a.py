@@ -481,6 +481,35 @@ def test_quoted_card_finds_only_its_chat_scoped_full_report(tmp_path: Path) -> N
     assert store.report_for_quote(Processing(), channel="whatsapp", chat_id="other@g.us", provider_message_id="card-1") is None
 
 
+def test_legacy_quoted_card_finds_full_report_by_card_text(tmp_path: Path) -> None:
+    store = A2AResearchStore(tmp_path / "research.db")
+    store.save_report(
+        "a2a-" + "c" * 32, channel="whatsapp", chat_id="first@g.us",
+        content="Full report", card="*Apple*: *HOLD* wegen teurer Bewertung.",
+    )
+
+    class NoManagedReceipts:
+        def effects_by_provider_message(self, *args):
+            return ()
+
+    assert store.report_for_quote(
+        NoManagedReceipts(), channel="whatsapp", chat_id="first@g.us", provider_message_id="legacy-1",
+        quoted_text="Nachtrag zur Trading-Recherche\n\n*Apple*: *HOLD* wegen teurer Bewertung.\n\nLangfassung auf Abruf.",
+    ) == "Full report"
+
+
+def test_cross_chat_cached_card_omits_private_report_details(tmp_path: Path) -> None:
+    store = A2AResearchStore(tmp_path / "research.db")
+    store.save_report(
+        "a2a-" + "d" * 32, channel="whatsapp", chat_id="private@s.whatsapp.net",
+        content="My private portfolio details", canonical_user_id="owner-1", symbol="AAPL",
+        card="*HOLD* based on my private portfolio details",
+    )
+    card = store.cached_card("owner-1", "AAPL")
+    assert card is not None and "HOLD" in card
+    assert "portfolio" not in card
+
+
 @pytest.mark.asyncio
 async def test_cached_trading_card_skips_new_a2a_and_quota_across_chats(tmp_path: Path) -> None:
     class Registry:
@@ -502,13 +531,13 @@ async def test_cached_trading_card_skips_new_a2a_and_quota_across_chats(tmp_path
     tool = A2ADelegateTool(Registry(), pending_store=store, quota_governance=Quota())
     token = set_tool_context(ToolInvocationContext(
         channel="whatsapp", chat_id="second@g.us", canonical_user_id="owner-1",
-        request_text="Apple (AAPL) noch mal kurz?",
+        request_text="TradingGuru: Apple (AAPL) noch mal kurz?",
     ))
     try:
         result = await tool.execute(worker="hermes", skill="research.deep", input={"question": "Apple (AAPL)", "idempotency_key": "second"})
     finally:
         reset_tool_context(token)
-    assert "CACHED" in result and "*Hold*" in result
+    assert "CACHED" in result and "HOLD" in result
     assert store.cached_card("other-user", "AAPL") is None
     assert store.cached_card("owner-1", "MSFT") is None
 
@@ -541,7 +570,7 @@ async def test_poll_persists_full_report_before_offering_it_in_card(tmp_path: Pa
     assert "Hohe Bewertung" in A2AResearchStore(path).report(
         "a2a-effect-1", channel="whatsapp", chat_id="owners@g.us"
     )
-    assert "*Hold*" in A2AResearchStore(path).cached_card("owner-1", "AAPL")
+    assert "HOLD" in A2AResearchStore(path).cached_card("owner-1", "AAPL")
 
 
 @pytest.mark.asyncio
@@ -680,6 +709,30 @@ async def test_explicit_trading_guru_request_uses_trading_analyze(tmp_path: Path
         reset_tool_context(token)
 
     assert calls == ["trading.analyze"]
+
+
+@pytest.mark.asyncio
+async def test_ticker_alone_does_not_override_explicit_deep_research(tmp_path: Path) -> None:
+    processing = ProcessingStore(tmp_path / "processing.db")
+    calls: list[str] = []
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            calls.append(skill)
+            return A2AWorkerResult("hermes", "task-1", context_id or "ctx", "TASK_STATE_COMPLETED", skill, {"report": "ok"})
+
+    tool = _delegate_tool(processing, Client())
+    token = set_tool_context(ToolInvocationContext(
+        channel="whatsapp", chat_id="chat@g.us", is_owner=True,
+        request_text="Deep Research zu Microsoft (MSFT) und Lieferketten",
+    ))
+    try:
+        await tool.execute(worker="hermes", skill="research.deep", input={
+            "question": "Microsoft (MSFT) und Lieferketten", "idempotency_key": "msft-deep-1",
+        })
+    finally:
+        reset_tool_context(token)
+    assert calls == ["research.deep"]
 
 
 @pytest.mark.asyncio

@@ -152,7 +152,7 @@ class ImplicitBotAddressMiddleware:
                         chat_id=event.chat_id,
                         message_id=event.message_id,
                         emoji=reaction_for_name_mention(content),
-                        participant_jid=event.participant,
+                        participant_jid=event.reaction_participant_jid,
                         origin=SYSTEM_ORIGIN,
                     )
                 )
@@ -215,7 +215,7 @@ class ImplicitBotAddressMiddleware:
                     chat_id=event.chat_id,
                     message_id=event.message_id,
                     emoji=emoji,
-                    participant_jid=event.participant,
+                    participant_jid=event.reaction_participant_jid,
                     origin=SYSTEM_ORIGIN,
                 )
             )

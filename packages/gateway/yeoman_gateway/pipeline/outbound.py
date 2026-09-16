@@ -232,7 +232,7 @@ class OutboundMiddleware:
                         chat_id=event.chat_id,
                         message_id=event.message_id,
                         emoji=emoji,
-                        participant_jid=event.participant,
+                        participant_jid=event.reaction_participant_jid,
                     )
                 )
                 ctx.metric("reaction_sent", labels=(("channel", event.channel),))

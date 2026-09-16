@@ -41,7 +41,7 @@ async def test_missing_old_report_explains_without_new_run() -> None:
         accept_message=True, should_respond=True, allowed_tools=frozenset(),
         reason="owner", is_owner=True,
     ))
-    middleware = ResponderMiddleware(responder=Responder(), report_lookup=lambda event: "")
+    middleware = ResponderMiddleware(responder=Responder(), report_lookup=lambda event: None)
 
     async def next_layer(ctx):
         assert "nicht gespeichert" in ctx.reply

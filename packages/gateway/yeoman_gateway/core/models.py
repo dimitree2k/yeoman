@@ -124,6 +124,12 @@ class InboundEvent:
         """Normalized text used for dedupe and downstream processing."""
         return self.content.strip()
 
+    @property
+    def reaction_participant_jid(self) -> str | None:
+        """Original WhatsApp message-key participant, not the phone alias used for mentions."""
+        original = self.raw_metadata.get("participant_lid")
+        return original if isinstance(original, str) and original else self.participant
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class OutboundEvent:

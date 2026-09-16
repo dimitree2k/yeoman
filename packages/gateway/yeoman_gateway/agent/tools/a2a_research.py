@@ -223,15 +223,27 @@ class A2AResearchStore:
                 "AND completed_ms>=? ORDER BY completed_ms DESC LIMIT 1",
                 (canonical_user_id, symbol, int(time.time() * 1000) - max_age_ms),
             ).fetchone()
-        return str(row["card"]) if row is not None else None
+        if row is None:
+            return None
+        signal = re.search(r"\b(BUY|HOLD|SELL|KAUFEN|HALTEN|VERKAUFEN)\b", str(row["card"]), re.IGNORECASE)
+        return f"{symbol}: {signal.group(1).upper()} (Signal aus der letzten Analyse)" if signal else None
 
-    def report_for_quote(self, processing_store: Any, *, channel: str, chat_id: str, provider_message_id: str) -> str | None:
+    def report_for_quote(self, processing_store: Any, *, channel: str, chat_id: str,
+                         provider_message_id: str, quoted_text: str = "") -> str | None:
         for outbound_effect_id in processing_store.effects_by_provider_message(channel, chat_id, provider_message_id):
             effect = processing_store.get_effect(outbound_effect_id)
             operation_key = effect.operation_key if effect is not None else ""
             match = re.search(r"a2a-result:(a2a-[0-9a-f]{32})(?::|$)", operation_key)
             if match:
                 return self.report(match.group(1), channel=channel, chat_id=chat_id) or ""
+        if quoted_text and "Langfassung auf Abruf" in quoted_text:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT content, card FROM completed_reports WHERE channel=? AND chat_id=? AND card<>''",
+                    (channel, chat_id),
+                ).fetchall()
+            matches = [str(row["content"]) for row in rows if str(row["card"])[:40] in quoted_text]
+            return matches[0] if len(matches) == 1 else ""
         return None
 
 

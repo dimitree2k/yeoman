@@ -78,7 +78,7 @@ class ResponderMiddleware:
                 report = self._report_lookup(ctx.event)
             reply = (
                 report or "Die Langfassung zu dieser Nachricht wurde leider nicht gespeichert."
-                if report is not None
+                if report is not None or quoted_full
                 else await self._responder.generate_reply(ctx.event, ctx.decision)
             )
 

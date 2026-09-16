@@ -112,7 +112,7 @@ class InputSecurityMiddleware:
                     chat_id=ctx.event.chat_id,
                     message_id=ctx.event.message_id,
                     emoji=self._BLOCK_EMOJI,
-                    participant_jid=ctx.event.participant,
+                    participant_jid=ctx.event.reaction_participant_jid,
                     origin=SYSTEM_ORIGIN,
                 )
             )

@@ -933,7 +933,7 @@ class WhatsAppChannel(BaseChannel):
             message_id=event.message_id,
             text=self._judge_input(event),
             principal=event.sender_id,
-            participant_jid=event.sender_phone_jid or event.participant_jid,
+            participant_jid=event.participant_jid or event.sender_phone_jid,
         )
         if not sent:
             self._processing_gate.note_ambient_declined(event.message_id)
@@ -958,7 +958,7 @@ class WhatsAppChannel(BaseChannel):
             chat_id=event.chat_jid,
             message_id=event.message_id,
             principal=event.sender_id,
-            participant_jid=event.sender_phone_jid or event.participant_jid,
+            participant_jid=event.participant_jid or event.sender_phone_jid,
         )
         if not sent:
             self._processing_gate.note_ambient_declined(event.message_id)
