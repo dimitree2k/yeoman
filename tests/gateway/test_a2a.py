@@ -709,18 +709,24 @@ async def test_poll_persists_full_report_before_offering_it_in_card(tmp_path: Pa
             )
 
     class Delivery:
-        async def send(self, **kwargs):
-            assert store.report("a2a-effect-1", channel="whatsapp", chat_id="owners@g.us") is not None
-            assert "*Hold*" in kwargs["content"]
-            assert "Langfassung auf Abruf" in kwargs["content"]
-            assert "Hohe Bewertung" not in kwargs["content"]
-            return None
+        def __init__(self):
+            self.sent = []
 
-    tool = A2ADelegateTool(Registry(), delivery=Delivery(), pending_store=store)
+        async def send(self, **kwargs):
+            self.sent.append(kwargs)
+
+    delivery = Delivery()
+    tool = A2ADelegateTool(Registry(), delivery=delivery, pending_store=store)
     await tool._poll_research(
         "hermes", "task-1", "trading.analyze", "ctx-1", (), "a2a-effect-1", "whatsapp", "owners@g.us",
         canonical_user_id="owner-1", symbol="AAPL",
     )
+    assert store.report("a2a-effect-1", channel="whatsapp", chat_id="owners@g.us") is not None
+    assert len(delivery.sent) == 1
+    content = delivery.sent[0]["content"]
+    assert "*Hold*" in content
+    assert "Langfassung auf Abruf" in content
+    assert "Hohe Bewertung" not in content
     assert "Hohe Bewertung" in A2AResearchStore(path).report(
         "a2a-effect-1", channel="whatsapp", chat_id="owners@g.us"
     )

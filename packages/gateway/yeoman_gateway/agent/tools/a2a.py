@@ -774,10 +774,12 @@ class A2ADelegateTool(Tool):
                         logger.warning("A2A full report was not stored error_type={}", type(exc).__name__)
                     else:
                         report_saved = True
+                requested_length = _report_length(length)
+                render_mode = "card" if requested_length == DEFAULT_REPORT_LENGTH else requested_length
                 final_content = render_research_output(
                     result.output,
-                    mode=_report_length(length),
-                    offer_full=report_saved and _report_length(length) == DEFAULT_REPORT_LENGTH,
+                    mode=render_mode,
+                    offer_full=report_saved and requested_length == DEFAULT_REPORT_LENGTH,
                 ) or (
                     f"error={result.error_code} retryable={result.retryable}"
                 )
