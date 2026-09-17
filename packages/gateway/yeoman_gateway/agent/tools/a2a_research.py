@@ -33,6 +33,8 @@ class PendingResearch:
     created_ms: int = 0
     canonical_user_id: str = ""
     symbol: str = ""
+    length: str = "short"
+    thread_id: str = ""
 
 
 class A2AResearchStore:
@@ -69,6 +71,8 @@ class A2AResearchStore:
                     created_ms INTEGER NOT NULL DEFAULT 0
                     ,canonical_user_id TEXT NOT NULL DEFAULT ''
                     ,symbol TEXT NOT NULL DEFAULT ''
+                    ,length TEXT NOT NULL DEFAULT 'short'
+                    ,thread_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -96,6 +100,8 @@ class A2AResearchStore:
                 ("created_ms", "INTEGER NOT NULL DEFAULT 0"),
                 ("canonical_user_id", "TEXT NOT NULL DEFAULT ''"),
                 ("symbol", "TEXT NOT NULL DEFAULT ''"),
+                ("length", "TEXT NOT NULL DEFAULT 'short'"),
+                ("thread_id", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in existing:
                     connection.execute(
@@ -123,8 +129,9 @@ class A2AResearchStore:
                 """
                 INSERT INTO pending_research
                     (task_id, worker, skill, context_id, reference_task_ids,
-                     channel, chat_id, effect_id, question, created_ms, canonical_user_id, symbol)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     channel, chat_id, effect_id, question, created_ms, canonical_user_id, symbol,
+                     length, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     worker=excluded.worker,
                     skill=excluded.skill,
@@ -136,7 +143,9 @@ class A2AResearchStore:
                     question=excluded.question,
                     created_ms=excluded.created_ms,
                     canonical_user_id=excluded.canonical_user_id,
-                    symbol=excluded.symbol
+                    symbol=excluded.symbol,
+                    length=excluded.length,
+                    thread_id=excluded.thread_id
                 """,
                 (
                     pending.task_id,
@@ -151,6 +160,8 @@ class A2AResearchStore:
                     int(pending.created_ms),
                     pending.canonical_user_id,
                     pending.symbol,
+                    pending.length,
+                    pending.thread_id,
                 ),
             )
 
@@ -159,7 +170,8 @@ class A2AResearchStore:
             rows = connection.execute(
                 """
                 SELECT task_id, worker, skill, context_id, reference_task_ids,
-                       channel, chat_id, effect_id, question, created_ms, canonical_user_id, symbol
+                       channel, chat_id, effect_id, question, created_ms, canonical_user_id, symbol,
+                       length, thread_id
                 FROM pending_research
                 ORDER BY rowid
                 """
@@ -185,6 +197,8 @@ class A2AResearchStore:
                     created_ms=int(row["created_ms"] or 0),
                     canonical_user_id=str(row["canonical_user_id"] or ""),
                     symbol=str(row["symbol"] or ""),
+                    length=str(row["length"] or "short"),
+                    thread_id=str(row["thread_id"] or ""),
                 )
             )
         return tuple(result)
@@ -216,6 +230,18 @@ class A2AResearchStore:
             ).fetchone()
         return str(row["content"]) if row is not None else None
 
+    @staticmethod
+    def _variant(content: str, card: str, length: str) -> str:
+        if length == "short":
+            return card or content
+        if length == "long" and len(content) > 2_000:
+            cutoff = 1_999
+            boundary = content.rfind("\n", 0, cutoff)
+            if boundary < 1_000:
+                boundary = cutoff
+            return content[: max(1, boundary)].rstrip() + "…"
+        return content
+
     def cached_card(self, canonical_user_id: str, symbol: str, *, max_age_ms: int = 86_400_000) -> str | None:
         if not canonical_user_id or not symbol:
             return None
@@ -242,20 +268,34 @@ class A2AResearchStore:
         return row is not None
 
     def report_for_quote(self, processing_store: Any, *, channel: str, chat_id: str,
-                         provider_message_id: str, quoted_text: str = "") -> str | None:
+                         provider_message_id: str, quoted_text: str = "",
+                         length: str = "full") -> str | None:
         for outbound_effect_id in processing_store.effects_by_provider_message(channel, chat_id, provider_message_id):
             effect = processing_store.get_effect(outbound_effect_id)
             operation_key = effect.operation_key if effect is not None else ""
             match = re.search(r"a2a-result:(a2a-[0-9a-f]{32})(?::|$)", operation_key)
             if match:
-                return self.report(match.group(1), channel=channel, chat_id=chat_id) or ""
+                with self._connect() as connection:
+                    row = connection.execute(
+                        "SELECT content, card FROM completed_reports WHERE effect_id=? AND channel=? AND chat_id=?",
+                        (match.group(1), channel, chat_id),
+                    ).fetchone()
+                if row is None:
+                    return ""
+                return self._variant(
+                    str(row["content"]), str(row["card"] or ""), length
+                )
         if quoted_text:
             with self._connect() as connection:
                 rows = connection.execute(
                     "SELECT content, card FROM completed_reports WHERE channel=? AND chat_id=? AND card<>''",
                     (channel, chat_id),
                 ).fetchall()
-            matches = [str(row["content"]) for row in rows if str(row["card"])[:40] in quoted_text]
+            matches = [
+                self._variant(str(row["content"]), str(row["card"]), length)
+                for row in rows
+                if str(row["card"])[:40] in quoted_text
+            ]
             return matches[0] if len(matches) == 1 else ""
         return None
 

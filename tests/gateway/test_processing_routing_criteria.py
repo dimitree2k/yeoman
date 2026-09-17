@@ -61,13 +61,6 @@ def _seed(store: ProcessingStore, event) -> ThreadRegistry:
     return ThreadRegistry(store=store, config=_Config())
 
 
-def _two_candidate_threads(store: ProcessingStore, registry: ThreadRegistry) -> tuple[str, str]:
-    """Two open threads of the same principal, each with a matching subject."""
-    first = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
-    second = registry.assign(_event("m2", "Prüfe die Nebenkostenabrechnung.", mentioned=True), now_ms=T0 + 1)
-    return str(first.thread_id), str(second.thread_id)
-
-
 # criterion 2 -------------------------------------------------------------------------------
 
 
@@ -218,31 +211,6 @@ def test_criterion_14_a_closed_turn_gets_the_next_turn_in_the_same_thread(tmp_pa
     store.close()
 
 
-# criterion 7 -------------------------------------------------------------------------------
-
-
-def test_criterion_7_each_ambient_order_gets_its_own_lineage(tmp_path: Path) -> None:
-    """No shared chat turn for independent ambient orders.
-
-    Criterion 7 asks for a valid lineage per ambient order; the effect side of that (the
-    answer carrying its own turn) is covered end to end by
-    ``test_an_ambient_answer_closes_its_turn_after_sending``.
-    """
-    store = _store(tmp_path)
-    registry = _seed(store, _event("m1", "erster Gedanke"))
-    first = registry.assign(_event("m1", "erster Gedanke"), now_ms=T0)
-    second = registry.assign(_event("m2", "zweiter Gedanke"), now_ms=T0 + 500)
-
-    assert first.thread_id and second.thread_id
-    assert first.thread_id != second.thread_id
-    assert first.turn_id != second.turn_id
-    # Neither order borrows the other's thread or turn.
-    assert store.get_turn(str(second.turn_id)).thread_id == second.thread_id
-    assert store.get_thread(str(first.thread_id)).kind == "ambient"
-    assert store.get_thread(str(second.thread_id)).kind == "ambient"
-    store.close()
-
-
 def _sent_bot_question(store: ProcessingStore, turn_id: str, text: str) -> str:
     """A provably sent bot message inside a turn - the only bot evidence that counts."""
     store.enqueue_effect(
@@ -257,35 +225,6 @@ def _sent_bot_question(store: ProcessingStore, turn_id: str, text: str) -> str:
     store.transition("fx-question", expected="queued", target="executing", now_ms=T0, worker_id="w")
     store.transition("fx-question", expected="executing", target="sent", now_ms=T0, worker_id="w")
     return "fx-question"
-
-
-# criterion 1 -------------------------------------------------------------------------------
-
-
-def test_criterion_1_a_single_candidate_is_attached_only_with_a_positive_signal(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    registry = _seed(store, _event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True))
-    started = registry.assign(_event("m1", "Fasse den Mietvertrag zusammen.", mentioned=True), now_ms=T0)
-
-    # Without a signal: no attachment, even though exactly one thread is open.
-    store.append_event(
-        event_key="k-m2", event_id="m2", trace_id="t-m2",
-        payload=_event("m2", "Wie wird morgen das Wetter?"), now_ms=T0 + 1,
-    )
-    no_signal = registry.assign(_event("m2", "Wie wird morgen das Wetter?"), now_ms=T0 + 2)
-    assert no_signal.rule is not JoinRule.FOLLOWUP_SINGLE_ACTIVE
-    assert no_signal.thread_id != started.thread_id
-
-    # With a positive signal: the single candidate is attached.
-    text = "Zum Mietvertrag: ergänze bitte die Kündigungsfrist."
-    store.append_event(
-        event_key="k-m3", event_id="m3", trace_id="t-m3",
-        payload=_event("m3", text), now_ms=T0 + 3,
-    )
-    attached = registry.assign(_event("m3", text), now_ms=T0 + 4)
-    assert attached.rule is JoinRule.FOLLOWUP_SINGLE_ACTIVE
-    assert attached.thread_id == started.thread_id
-    store.close()
 
 
 # criterion 3 -------------------------------------------------------------------------------

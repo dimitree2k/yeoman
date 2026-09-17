@@ -5,7 +5,7 @@ description = "Yeoman gateway — message processing and agent runtime"
 requires-python = ">=3.14"
 dependencies = [
     "yeoman-shared",
-    "hermes-yeoman-a2a-contracts==1.0.1",
+    "hermes-yeoman-a2a-contracts==1.0.2",
     "typer>=0.20.0,<0.24.1",
     "litellm>=1.83.14,<1.84.0",
     "websockets>=16.0",

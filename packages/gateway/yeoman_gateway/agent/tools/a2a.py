@@ -63,8 +63,13 @@ _CARD_DECISION_HEADINGS = (
 )
 _CARD_HEADING_RE = re.compile(r"^#{2,4}\s*(.+?)\s*$")
 _CARD_DECISION_RE = re.compile(r"\b(buy|sell|hold|underweight|overweight|neutral|reduzieren|kaufen|verkaufen|halten)\b", re.IGNORECASE)
-_CARD_BULLET_LIMIT = 4
-_CARD_FALLBACK_CHARS = 700
+REPORT_LENGTHS = frozenset({"short", "long", "full"})
+DEFAULT_REPORT_LENGTH = "short"
+_CARD_BULLET_LIMIT = 2
+_CARD_MAX_CHARS = 600
+_CARD_REASON_MAX_CHARS = 220
+_CARD_FALLBACK_CHARS = _CARD_MAX_CHARS
+_LONG_REPORT_MAX_CHARS = 2_000
 _CARD_NOTE = "Langfassung auf Abruf."
 _TICKER_RE = re.compile(r"\(([A-Z]{1,5})\)|\$([A-Z]{1,5})\b")
 
@@ -111,6 +116,21 @@ def _strip_server_paths(text: str) -> str:
     """Remove lines naming the worker's report file: that path is not reachable from the chat."""
     without_lines = _SERVER_PATH_LINE_RE.sub("", text)
     return _SERVER_PATH_RE.sub(" ", without_lines).strip()
+
+
+def _bounded_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    cutoff = max(1, max_chars - 1)
+    boundary = text.rfind("\n", 0, cutoff)
+    if boundary < max_chars // 2:
+        boundary = cutoff
+    return text[: max(1, boundary)].rstrip() + "…"
+
+
+def _report_length(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in REPORT_LENGTHS else DEFAULT_REPORT_LENGTH
 
 
 def _source_lines(sources: Any) -> str:
@@ -173,7 +193,7 @@ def _card_body(text: str) -> str:
                 continue
             if stripped.startswith(("- ", "* ", "• ")):
                 if len(bullets) < _CARD_BULLET_LIMIT:
-                    bullets.append("• " + stripped[2:].strip())
+                    bullets.append("• " + _bounded_text(stripped[2:].strip(), _CARD_REASON_MAX_CHARS))
                 elif bullets:
                     break
                 continue
@@ -189,7 +209,7 @@ def _card_body(text: str) -> str:
         return " ".join(text.split())[:_CARD_FALLBACK_CHARS]
 
     parts = [part for part in (lead, decision, signal, *bullets) if part]
-    return "\n\n".join(parts)
+    return _bounded_text("\n\n".join(parts), _CARD_MAX_CHARS)
 
 
 def render_research_output(payload: Any, *, mode: str = "card", offer_full: bool = True) -> str:
@@ -199,9 +219,10 @@ def render_research_output(payload: Any, *, mode: str = "card", offer_full: bool
     reasoning preamble and server-side file paths. For a chat message all three are noise, so
     the body is cleaned and the sources are listed explicitly instead of being buried in prose.
 
-    ``mode="card"`` (the default) condenses the report to the verdict plus its strongest reasons
-    and points at the full version on request; ``mode="full"`` keeps the whole cleaned report for
-    callers that need the detail. Plain strings (errors, summaries) pass through unchanged.
+    ``mode="card"`` (the default) condenses the report to the verdict plus its two strongest
+    reasons and points at the full version on request; ``mode="long"`` returns a bounded detail
+    view and ``mode="full"`` keeps the whole cleaned report. Plain strings (errors, summaries)
+    pass through unchanged.
     """
     if isinstance(payload, dict):
         report = payload.get("report")
@@ -212,8 +233,12 @@ def render_research_output(payload: Any, *, mode: str = "card", offer_full: bool
         # Condense while the markdown structure is still intact: the chat conversion below
         # flattens headings into plain lines, which would hide the section boundaries.
         cleaned = _strip_markdown_line_breaks(_strip_server_paths(_strip_reasoning(text))).strip()
-        body = _card_body(cleaned) if mode == "card" else cleaned
+        body = _card_body(cleaned) if mode == "card" else (
+            _bounded_text(cleaned, _LONG_REPORT_MAX_CHARS) if mode == "long" else cleaned
+        )
         body = _to_chat_markup(body).strip()
+        if mode == "card":
+            body = _bounded_text(body, _CARD_MAX_CHARS)
         if mode == "card" and offer_full and body and body != cleaned:
             body = f"{body}\n\n{_CARD_NOTE}"
         if sources:
@@ -285,7 +310,13 @@ class A2ADelegateTool(Tool):
                     "enum": ["search.web", "research.deep", "trading.analyze"],
                     "description": "Supported delegated skill.",
                 },
-                "input": {"type": "object", "description": "Skill-specific structured input."},
+                "input": {
+                    "type": "object",
+                    "description": (
+                        "Skill-specific structured input. For trading.analyze, length is one of "
+                        "short, long, full and defaults to short."
+                    ),
+                },
             },
             "required": ["worker", "skill", "input"],
             "additionalProperties": False,
@@ -293,6 +324,20 @@ class A2ADelegateTool(Tool):
 
     def _context_id(self) -> str | None:
         return self._session_key or None
+
+    @staticmethod
+    def _origin_thread_id(context: Any | None) -> str:
+        if context is not None:
+            thread_id = str(getattr(context, "thread_id", "") or "")
+            if thread_id:
+                return thread_id
+        try:
+            from yeoman_gateway.processing.dispatch import CURRENT_TURN
+
+            binding = CURRENT_TURN.get()
+        except Exception:
+            return ""
+        return str(getattr(getattr(binding, "turn", None), "thread_id", "") or "")
 
     def _claim(self, worker: str, skill: str, input: dict[str, Any]) -> tuple[bool, str, str]:
         if self._store is None:
@@ -480,6 +525,8 @@ class A2ADelegateTool(Tool):
                 pending.created_ms,
                 pending.canonical_user_id,
                 pending.symbol,
+                pending.length,
+                pending.thread_id,
             )
         )
         self._background.add(task)
@@ -525,8 +572,14 @@ class A2ADelegateTool(Tool):
             skill = "trading.analyze"
         if skill == "trading.analyze" and worker != "hermes":
             return f"[{worker} | not-sent | worker-binding]"
+        requested_length = DEFAULT_REPORT_LENGTH
         if skill == "trading.analyze":
-            input = {**input, "output_format": "markdown"}
+            requested_length = _report_length(input.get("length"))
+            input = {
+                **input,
+                "output_format": "markdown",
+                "length": requested_length,
+            }
         if skill == "trading.analyze" and self._research_store is not None and context is not None:
             cached = self._research_store.cached_card(context.canonical_user_id, ticker)
             if cached:
@@ -614,6 +667,8 @@ class A2ADelegateTool(Tool):
                 created_ms=int(time.time() * 1000),
                 canonical_user_id=turn.canonical_user_id if turn is not None else "",
                 symbol=ticker if skill == "trading.analyze" else "",
+                length=requested_length,
+                thread_id=self._origin_thread_id(turn),
             )
             if self._research_store is not None:
                 self._research_store.put(pending)
@@ -653,6 +708,8 @@ class A2ADelegateTool(Tool):
         created_ms: int = 0,
         canonical_user_id: str = "",
         symbol: str = "",
+        length: str = DEFAULT_REPORT_LENGTH,
+        thread_id: str = "",
     ) -> None:
         final_content: str
         extensions = 0
@@ -717,7 +774,11 @@ class A2ADelegateTool(Tool):
                         logger.warning("A2A full report was not stored error_type={}", type(exc).__name__)
                     else:
                         report_saved = True
-                final_content = render_research_output(result.output, offer_full=report_saved) or (
+                final_content = render_research_output(
+                    result.output,
+                    mode=_report_length(length),
+                    offer_full=report_saved and _report_length(length) == DEFAULT_REPORT_LENGTH,
+                ) or (
                     f"error={result.error_code} retryable={result.retryable}"
                 )
             break
@@ -745,5 +806,43 @@ class A2ADelegateTool(Tool):
                         safe_log_token(state or "unknown"),
                     )
                     return
+                self._register_result_anchor(thread_id=thread_id, receipt=receipt)
                 if self._research_store is not None:
                     self._research_store.delete(task_id, effect_id=effect_id)
+
+    def _register_result_anchor(self, *, thread_id: str, receipt: Any | None) -> None:
+        """Make a successfully delivered detached result quotable in its origin thread."""
+        if not thread_id or receipt is None or str(getattr(receipt, "state", "") or "") not in {
+            "sent", "delivered"
+        }:
+            return
+        store = self._store
+        register = getattr(store, "register_thread_message", None)
+        if not callable(register):
+            return
+        effect_id = str(getattr(receipt, "effect_id", "") or "")
+        transport = getattr(receipt, "transport_receipt", None)
+        provider_message_id = str(getattr(transport, "provider_message_id", "") or "")
+        if not provider_message_id:
+            persisted = getattr(store, "effect_transport_receipt", None)
+            if callable(persisted) and effect_id:
+                try:
+                    transport = persisted(effect_id)
+                except Exception:
+                    transport = None
+                provider_message_id = str(
+                    getattr(transport, "provider_message_id", "") or ""
+                )
+        if not effect_id or not provider_message_id:
+            return
+        try:
+            register(
+                thread_id=thread_id,
+                turn_id=None,
+                direction="out",
+                effect_id=effect_id,
+                message_id=provider_message_id,
+                now_ms=int(time.time() * 1000),
+            )
+        except Exception as exc:  # pragma: no cover - defensive store hook
+            logger.debug("A2A result thread anchor skipped effect={} error={}", effect_id, exc)

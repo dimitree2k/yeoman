@@ -260,7 +260,7 @@ yeoman env
 
 ### Standalone A2A relay (v1)
 
-The Hermes/Yeoman A2A relay uses contract release `1.0.1` and profile
+The Hermes/Yeoman A2A relay uses contract release `1.0.2` and profile
 `urn:hermes-yeoman:a2a-profile:v1`. It is a separate, authenticated service.
 Put the bearer secret and network boundary settings in
 `~/.yeoman/secrets/a2a.env`. Put the non-secret settings shared with Gateway

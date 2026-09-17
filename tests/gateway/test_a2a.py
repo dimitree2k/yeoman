@@ -88,10 +88,56 @@ async def test_trading_delegation_requests_markdown_output() -> None:
     assert calls == [
         (
             "trading.analyze",
-            {"question": "Analyse KO", "idempotency_key": "ko-1", "output_format": "markdown"},
+            {
+                "question": "Analyse KO",
+                "idempotency_key": "ko-1",
+                "output_format": "markdown",
+                "length": "short",
+            },
             None,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_trading_delegation_passes_explicit_length() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        async def invoke_skill(
+            self,
+            skill: str,
+            input: dict[str, object],
+            *,
+            context_id: str | None = None,
+            reference_task_ids=(),
+        ) -> A2AWorkerResult:
+            del skill, context_id, reference_task_ids
+            calls.append(input)
+            return A2AWorkerResult(
+                "hermes", "task-full", "ctx-full", "TASK_STATE_COMPLETED", "trading.analyze",
+                {"report": "# Report", "sources": []},
+            )
+
+    tool = A2ADelegateTool(
+        A2AWorkerRegistry(
+            [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+            client_factory=lambda _: FakeClient(),
+        )
+    )
+
+    await tool.execute(
+        worker="hermes",
+        skill="trading.analyze",
+        input={"question": "Analyse KO", "idempotency_key": "ko-full", "length": "full"},
+    )
+
+    assert calls == [{
+        "question": "Analyse KO",
+        "idempotency_key": "ko-full",
+        "length": "full",
+        "output_format": "markdown",
+    }]
 
 
 @pytest.mark.asyncio
@@ -523,6 +569,42 @@ def test_quoted_card_finds_only_its_chat_scoped_full_report(tmp_path: Path) -> N
     assert store.report_for_quote(Processing(), channel="whatsapp", chat_id="other@g.us", provider_message_id="card-1") is None
 
 
+def test_quoted_report_returns_requested_length_variant(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    store = A2AResearchStore(tmp_path / "research.db")
+    report_effect_id = "a2a-" + "f" * 32
+    full = "Full report\n\n" + ("detail " * 600)
+    store.save_report(
+        report_effect_id, channel="whatsapp", chat_id="first@g.us", content=full, card="Short card",
+    )
+
+    class Processing:
+        def effects_by_provider_message(self, channel, chat_id, message_id):
+            return ("outbound-1",)
+
+        def get_effect(self, effect_id):
+            del effect_id
+            return SimpleNamespace(
+                operation_key=f"send_text:whatsapp:first@g.us:a2a-result:{report_effect_id}"
+            )
+
+    processing = Processing()
+    assert store.report_for_quote(
+        processing, channel="whatsapp", chat_id="first@g.us", provider_message_id="card-1",
+        length="short",
+    ) == "Short card"
+    long = store.report_for_quote(
+        processing, channel="whatsapp", chat_id="first@g.us", provider_message_id="card-1",
+        length="long",
+    )
+    assert long is not None and long.startswith("Full report") and len(long) <= 2_000
+    assert store.report_for_quote(
+        processing, channel="whatsapp", chat_id="first@g.us", provider_message_id="card-1",
+        length="full",
+    ) == full
+
+
 def test_legacy_quoted_card_finds_full_report_by_card_text(tmp_path: Path) -> None:
     store = A2AResearchStore(tmp_path / "research.db")
     store.save_report(
@@ -643,6 +725,51 @@ async def test_poll_persists_full_report_before_offering_it_in_card(tmp_path: Pa
         "a2a-effect-1", channel="whatsapp", chat_id="owners@g.us"
     )
     assert "HOLD" in A2AResearchStore(path).cached_card("owner-1", "AAPL")
+
+
+@pytest.mark.asyncio
+async def test_completed_result_registers_confirmed_thread_anchor(tmp_path: Path) -> None:
+    from yeoman_gateway.processing.models import EffectReceipt, EffectTarget, TextPayload
+
+    processing = ProcessingStore(tmp_path / "processing.db")
+    research = A2AResearchStore(tmp_path / "research.db")
+    thread_id = processing.open_thread(
+        channel="whatsapp", chat_id="chat@g.us", root_principal="owner", kind="mention",
+        trigger_event_id="root-event", now_ms=1,
+    )
+
+    class Registry:
+        async def poll_task(self, *args, **kwargs):
+            return A2AWorkerResult(
+                "hermes", "task-anchor", "ctx-anchor", "TASK_STATE_COMPLETED", "research.deep",
+                {"report": "done", "sources": []},
+            )
+
+    class Delivery:
+        async def send(self, **kwargs):
+            processing.enqueue_effect(
+                effect_id="outbound-result",
+                operation_key="send_text:whatsapp:chat@g.us:a2a-result:effect-anchor",
+                payload=TextPayload(text=str(kwargs["content"])),
+                target=EffectTarget(channel="whatsapp", chat_id="chat@g.us"),
+                now_ms=2,
+                state="sent",
+            )
+            processing.record_transport_receipt(
+                "outbound-result", channel="whatsapp", chat_id="chat@g.us", now_ms=3,
+                provider_message_id="provider-result",
+            )
+            return EffectReceipt(effect_id="outbound-result", state="sent")
+
+    tool = A2ADelegateTool(
+        Registry(), store=processing, delivery=Delivery(), pending_store=research,
+    )
+    await tool._poll_research(
+        "hermes", "task-anchor", "research.deep", "ctx-anchor", (), "effect-anchor",
+        "whatsapp", "chat@g.us", "q", 1, "", "", "short", thread_id,
+    )
+
+    assert processing.thread_for_message("provider-result") == (thread_id, None)
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1178,26 @@ def test_card_mode_is_a_short_summary_of_a_long_report() -> None:
     assert "Langfassung" in card
 
 
+def test_card_mode_stays_bounded_with_two_reasons() -> None:
+    from yeoman_gateway.agent.tools.a2a import render_research_output
+
+    reasons = "\n".join(
+        f"- Hauptgrund {index}: " + ("wichtige Einordnung. " * 18)
+        for index in range(1, 4)
+    )
+    report = (
+        "# KO — Analyse\n\n## Entscheidung\n\n**Underweight**.\n\n"
+        f"## Begründung\n\n{reasons}\n"
+    )
+
+    card = render_research_output({"report": report}, mode="card")
+
+    assert len(card.split("\n\nLangfassung auf Abruf.", 1)[0]) <= 600
+    assert "• Hauptgrund 1" in card
+    assert "• Hauptgrund 2" in card
+    assert "• Hauptgrund 3" not in card
+
+
 def test_card_prioritizes_trading_decision_over_earlier_market_summary() -> None:
     from yeoman_gateway.agent.tools.a2a import render_research_output
 
@@ -1100,6 +1247,30 @@ def test_full_mode_keeps_the_whole_report() -> None:
     assert "FOMC nächste Woche" in full
     assert "Bewertung bleibt hoch" in full
     assert "Langfassung auf Abruf." not in full
+
+
+def test_pending_research_preserves_requested_length_and_thread(tmp_path: Path) -> None:
+    path = tmp_path / "research.db"
+    store = A2AResearchStore(path)
+    store.put(
+        PendingResearch(
+            task_id="research-length",
+            worker="hermes",
+            skill="trading.analyze",
+            context_id="ctx-length",
+            reference_task_ids=(),
+            channel="whatsapp",
+            chat_id="chat@g.us",
+            effect_id="effect-length",
+            length="full",
+            thread_id="thread-length",
+        )
+    )
+
+    pending = store.pending()[0]
+
+    assert pending.length == "full"
+    assert pending.thread_id == "thread-length"
 
 
 def test_card_mode_keeps_errors_and_short_answers_unchanged() -> None:

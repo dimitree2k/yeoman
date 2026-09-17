@@ -28,6 +28,29 @@ async def test_owner_quoted_langfassung_uses_stored_report_without_llm() -> None
     await middleware(ctx, next_layer)
 
 
+async def test_owner_natural_language_full_report_request_uses_stored_report_without_llm() -> None:
+    class Responder:
+        async def generate_reply(self, *args):
+            raise AssertionError("must not start a model or A2A run")
+
+    event = InboundEvent(
+        channel="whatsapp", chat_id="first@g.us", sender_id="owner",
+        content="Kann ich die Langfassung haben?", reply_to_bot=True, reply_to_message_id="card-1",
+    )
+    ctx = PipelineContext(event=event, decision=PolicyDecision(
+        accept_message=True, should_respond=True, allowed_tools=frozenset(),
+        reason="owner", is_owner=True,
+    ))
+    middleware = ResponderMiddleware(
+        responder=Responder(), report_lookup=lambda event: "Full report with risks",
+    )
+
+    async def next_layer(ctx):
+        assert ctx.reply == "Full report with risks"
+
+    await middleware(ctx, next_layer)
+
+
 async def test_missing_old_report_explains_without_new_run() -> None:
     class Responder:
         async def generate_reply(self, *args):

@@ -56,6 +56,7 @@ from yeoman_gateway.persona_evolution import (
     persona_evolution_result_needs_notification,
     run_persona_evolution_cron,
 )
+from yeoman_gateway.pipeline.responder import requested_report_length
 from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.processing.dispatch import (
@@ -2315,16 +2316,15 @@ def build_gateway_runtime(
     def _lookup_quoted_report(event: InboundEvent) -> str | None:
         if research_reports is None:
             return None
-        full_request = event.content.strip().lower().rstrip(".!?").strip() in {
-            "langfassung", "langfassung bitte", "vollbericht", "vollbericht bitte",
-        }
-        if full_request and event.reply_to_bot and event.reply_to_message_id:
+        requested_length = requested_report_length(event.content)
+        if requested_length and event.reply_to_bot and event.reply_to_message_id:
             return research_reports.report_for_quote(
                 processing_store,
                 channel=event.channel,
                 chat_id=event.chat_id,
                 provider_message_id=event.reply_to_message_id,
                 quoted_text=event.reply_to_text or "",
+                length=requested_length,
             )
         from yeoman_gateway.agent.tools.a2a import _ticker
         from yeoman_gateway.policy.identity import canonical_user_id

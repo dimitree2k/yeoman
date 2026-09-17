@@ -16,6 +16,26 @@ from yeoman_gateway.core.ports import ResponderPort
 _REACTION_RE = re.compile(r"^\s*::reaction::(.+?)\s*$", re.DOTALL)
 
 
+def requested_report_length(content: str) -> str | None:
+    """Map explicit report-length wording to the A2A length enum."""
+    normalized = " ".join(re.sub(r"[^\w]+", " ", str(content or "").casefold()).split())
+    if re.search(
+        r"\b(?:langfassung|langversion|vollbericht|vollversion|full report|full length)\b"
+        r"|\bfull length true\b|\blength full\b",
+        normalized,
+    ):
+        return "full"
+    if re.search(
+        r"\b(?:langzusammenfassung|ausführliche zusammenfassung|ausfuehrliche zusammenfassung|long report)\b"
+        r"|\blength long\b",
+        normalized,
+    ):
+        return "long"
+    if re.search(r"\b(?:kurzfassung|kurzversion)\b|\blength short\b", normalized):
+        return "short"
+    return None
+
+
 class ResponderMiddleware:
     """Generate an LLM reply and place it in ``ctx.reply``."""
 
@@ -65,20 +85,21 @@ class ResponderMiddleware:
                 typing_started = True
 
             report = None
-            quoted_full = bool(
-                ctx.event.reply_to_bot
-                and ctx.event.reply_to_message_id
-                and re.fullmatch(r"(?i)\s*(?:langfassung|vollbericht)(?:\s+bitte)?[.!?]?\s*", ctx.event.content)
+            quoted_length = (
+                requested_report_length(ctx.event.content)
+                if ctx.event.reply_to_bot and ctx.event.reply_to_message_id
+                else None
             )
+            quoted_report = quoted_length is not None
             stock_summary = bool(
                 re.search(r"\([A-Z]{1,5}\)|\$[A-Z]{1,5}\b", ctx.event.content)
                 and re.search(r"(?i)\b(?:aktie|stock|tradingguru|tradingagents|analyse)\b", ctx.event.content)
             )
-            if self._report_lookup is not None and ctx.decision.is_owner and ctx.event.channel == "whatsapp" and (quoted_full or stock_summary):
+            if self._report_lookup is not None and ctx.decision.is_owner and ctx.event.channel == "whatsapp" and (quoted_report or stock_summary):
                 report = self._report_lookup(ctx.event)
             reply = (
                 report or "Die Langfassung zu dieser Nachricht wurde leider nicht gespeichert."
-                if report is not None or quoted_full
+                if report is not None or quoted_report
                 else await self._responder.generate_reply(ctx.event, ctx.decision)
             )
 

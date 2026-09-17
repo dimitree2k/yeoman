@@ -11,8 +11,8 @@ import a2a_contracts
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
-CONTRACT_RELEASE = "1.0.1"
-CONTRACT_COMMIT = "1c658bfc4d5ae872f47d9abeef5aa365cf305af1"
+CONTRACT_RELEASE = "1.0.2"
+CONTRACT_COMMIT = "93b6aa35ac74d12784bc8e24f2f23f3898714467"
 PROFILE_URI = "urn:hermes-yeoman:a2a-profile:v1"
 
 #: Callers act on these messages (a model retries with a corrected payload, an operator reads
