@@ -12,7 +12,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
 CONTRACT_RELEASE = "1.0.2"
-CONTRACT_COMMIT = "93b6aa35ac74d12784bc8e24f2f23f3898714467"
+CONTRACT_COMMIT = "18ebe1bfff1fa275d80c8e77f8f6437911e3bb19"
 PROFILE_URI = "urn:hermes-yeoman:a2a-profile:v1"
 
 #: Callers act on these messages (a model retries with a corrected payload, an operator reads

@@ -5,7 +5,7 @@ members = ["packages/shared", "packages/gateway", "packages/overseer"]
 yeoman-shared = { workspace = true }
 yeoman-gateway = { workspace = true }
 yeoman-overseer = { workspace = true }
-hermes-yeoman-a2a-contracts = { git = "https://github.com/dimitree2k/hermes-yeoman-a2a-contracts.git", rev = "93b6aa35ac74d12784bc8e24f2f23f3898714467" }
+hermes-yeoman-a2a-contracts = { git = "https://github.com/dimitree2k/hermes-yeoman-a2a-contracts.git", rev = "18ebe1bfff1fa275d80c8e77f8f6437911e3bb19" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

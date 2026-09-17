@@ -19,7 +19,7 @@ def test_installed_contract_metadata_is_pinned() -> None:
     import a2a_contracts
 
     assert CONTRACT_RELEASE == a2a_contracts.CONTRACT_VERSION == "1.0.2"
-    assert CONTRACT_COMMIT == "93b6aa35ac74d12784bc8e24f2f23f3898714467"
+    assert CONTRACT_COMMIT == "18ebe1bfff1fa275d80c8e77f8f6437911e3bb19"
     assert PROFILE_URI == a2a_contracts.PROFILE_URI == "urn:hermes-yeoman:a2a-profile:v1"
 
 
