@@ -17,8 +17,14 @@ class ContactsService:
         known_jids: Mapping of identifier -> contact_id, loaded on boot.
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self.store = ContactsStore(db_path=db_path)
+    def __init__(self, db_path: Path | None = None, *, store: ContactsStore | None = None) -> None:
+        self.owns_store = store is None
+        if store is not None:
+            self.store = store
+        elif db_path is not None:
+            self.store = ContactsStore(db_path=db_path)
+        else:
+            raise ValueError("ContactsService needs either db_path or store")
         self.known_jids: dict[str, str] = {}
         self._display_names: dict[str, str] = {}
         self.reload_cache()
@@ -256,5 +262,6 @@ class ContactsService:
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Close the underlying store."""
-        self.store.close()
+        """Close the underlying store when this service owns it."""
+        if self.owns_store:
+            self.store.close()

@@ -93,6 +93,8 @@ class MemoryService:
         workspace: Path,
         config: "MemoryConfig",
         root_config: "Config | None" = None,
+        store: "MemoryStore | None" = None,
+        owns_store: bool = True,
     ) -> None:
         self.workspace = workspace
         self.config = config
@@ -104,7 +106,8 @@ class MemoryService:
         if not db_path.is_absolute():
             db_path = (Path.home() / ".yeoman" / db_path).resolve()
         self.db_path = db_path
-        self.store = MemoryStore(db_path)
+        self.owns_store = bool(owns_store) and store is None
+        self.store = store if store is not None else MemoryStore(db_path)
         self.state_store = SessionStateStore(workspace, state_dir=self.config.wal.state_dir)
         self._owner_ids = _load_owner_ids()
 
@@ -1584,7 +1587,8 @@ class MemoryService:
         self._capture_stop.set()
         if self._capture_thread.is_alive():
             self._capture_thread.join(timeout=2.0)
-        self.store.close()
+        if self.owns_store:
+            self.store.close()
 
 
 def _load_owner_ids() -> dict[str, set[str]]:

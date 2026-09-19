@@ -18,9 +18,27 @@ def _now_iso() -> str:
 
 
 class ContactsStore:
-    """Thread-safe SQLite CRUD for contacts, identifiers, aliases, and fields."""
+    """Thread-safe SQLite CRUD for contacts, identifiers, aliases, and fields.
 
-    def __init__(self, db_path: Path) -> None:
+    The store either owns its connection (``db_path``) or joins the knowledge store's
+    one connection (``owner``).  A joining store never commits on its own and never
+    closes the shared connection: the knowledge transaction owner is in charge.
+    """
+
+    def __init__(self, db_path: Path | None = None, *, owner: object | None = None) -> None:
+        if owner is not None:
+            self._owner = owner
+            self._owns_connection = False
+            self.db_path = Path(str(getattr(owner, "db_path")))
+            self._lock = getattr(owner, "lock")
+            self._conn = getattr(owner, "connection")
+            self._conn.row_factory = sqlite3.Row
+            self._create_schema()
+            return
+        if db_path is None:
+            raise ValueError("ContactsStore needs either db_path or owner")
+        self._owner = None
+        self._owns_connection = True
         self.db_path = db_path.expanduser()
         ensure_dir(self.db_path.parent)
         self._lock = threading.RLock()
@@ -31,7 +49,19 @@ class ContactsStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._create_schema()
 
+    def _commit_owned(self) -> None:
+        """Commit only when this store owns its connection.
+
+        A store that joined the knowledge store's connection never commits: the outer
+        knowledge transaction is the only commit site.
+        """
+        if self._owner is not None:
+            return
+        self._conn.commit()
+
     def close(self) -> None:
+        if not self._owns_connection:
+            return
         with self._lock:
             self._conn.close()
 
@@ -91,7 +121,7 @@ class ContactsStore:
                     ON contact_fields (contact_id);
                 """
             )
-            self._conn.commit()
+            self._commit_owned()
 
             # Migration: dedup existing rows then add unique index on contact_fields.
             self._conn.executescript("""
@@ -167,7 +197,7 @@ class ContactsStore:
                 """,
                 (contact_id, display_name, phone_number, int(is_owner), now, now),
             )
-            self._conn.commit()
+            self._commit_owned()
             row = self._conn.execute(
                 "SELECT * FROM contacts WHERE id = ?", (contact_id,)
             ).fetchone()
@@ -189,7 +219,7 @@ class ContactsStore:
                 "UPDATE contacts SET display_name = ?, updated_at = ? WHERE id = ?",
                 (display_name, now, contact_id),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def set_owner(self, contact_id: str, is_owner: bool = True) -> None:
         now = _now_iso()
@@ -198,7 +228,7 @@ class ContactsStore:
                 "UPDATE contacts SET is_owner = ?, updated_at = ? WHERE id = ?",
                 (int(is_owner), now, contact_id),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def search_by_display_name(self, query: str) -> list[Contact]:
         with self._lock:
@@ -226,7 +256,7 @@ class ContactsStore:
                 """,
                 (channel, identifier, contact_id, kind),
             )
-            self._conn.commit()
+            self._commit_owned()
         return ContactIdentifier(
             contact_id=contact_id,
             channel=channel,
@@ -286,7 +316,7 @@ class ContactsStore:
                 """,
                 (contact_id, alias, source, now, now),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def get_aliases(self, contact_id: str) -> list[ContactAlias]:
         with self._lock:
@@ -328,7 +358,7 @@ class ContactsStore:
                 """,
                 (contact_id, kind, value, label, now, now),
             )
-            self._conn.commit()
+            self._commit_owned()
         return ContactField(
             contact_id=contact_id,
             kind=kind,
@@ -356,7 +386,7 @@ class ContactsStore:
                 """,
                 (contact_id, kind, value, label, now, now),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def get_fields(self, contact_id: str) -> list[ContactField]:
         with self._lock:
@@ -372,7 +402,7 @@ class ContactsStore:
                 "DELETE FROM contact_fields WHERE contact_id = ? AND kind = ? AND value = ?",
                 (contact_id, kind, value),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     # ── merge ────────────────────────────────────────────────────────────
 
@@ -422,4 +452,4 @@ class ContactsStore:
                 "DELETE FROM contacts WHERE id = ?",
                 (source_id,),
             )
-            self._conn.commit()
+            self._commit_owned()

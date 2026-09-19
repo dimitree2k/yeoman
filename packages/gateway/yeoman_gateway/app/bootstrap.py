@@ -1945,32 +1945,91 @@ def build_gateway_runtime(
         except Exception as exc:
             logger.warning("security classifier disabled: {}", exc)
 
-    memory_service = MemoryService(workspace=workspace, config=config.memory, root_config=config)
+    from yeoman_gateway.storage.chat_registry import ChatRegistry
+
+    chat_registry = ChatRegistry(
+        db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
+    )
+
+    # ── knowledge storage ownership ──────────────────────────────────────────
+    # With knowledge.enabled the consolidated store is the *only* writer: the memory
+    # and contacts services join its one connection instead of opening their own.
+    # Without it the legacy layout is untouched (no partial cutover, no second writer).
+    knowledge_service: object | None = None
+    if getattr(config.knowledge, "enabled", False):
+        from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
+        from yeoman_gateway.knowledge.runtime import (
+            RuntimeKnowledgePolicy,
+            RuntimeKnowledgeSources,
+        )
+
+        knowledge_policy = RuntimeKnowledgePolicy(
+            engine=policy_engine.policy if policy_engine else None,
+            chat_registry=chat_registry,
+            admin_principals=frozenset(
+                getattr(policy_engine.policy, "admin_principals", frozenset())
+                if policy_engine
+                else frozenset()
+            ),
+            capture_actors=frozenset(),
+        )
+        knowledge_sources = RuntimeKnowledgeSources()
+        try:
+            knowledge_service = open_knowledge_store(
+                Path(config.knowledge.db_path).expanduser(),
+                workspace_id=workspace_id_for(workspace),
+                source_authority=knowledge_sources,
+                policy_authority=knowledge_policy,
+                legacy_sources=tuple(
+                    Path(item).expanduser()
+                    for item in (
+                        list(config.knowledge.legacy_memory_paths)
+                        + list(config.knowledge.legacy_contacts_paths)
+                    )
+                ),
+            )
+        except Exception as exc:
+            # Fail closed: never silently fall back to a second, unprotected store.
+            logger.error("person knowledge unavailable: {}", exc)
+            raise
+
+    if knowledge_service is not None:
+        memory_service = MemoryService(
+            workspace=workspace,
+            config=config.memory,
+            root_config=config,
+            store=knowledge_service.memory_store(),
+            owns_store=False,
+        )
+        contacts_service = ContactsService(store=knowledge_service.contacts_store())
+        contacts_service.mark_owner_from_policy(
+            policy_engine.policy.owners if policy_engine else {},
+        )
+        memory_service.set_contacts(contacts_service)
+    else:
+        memory_service = MemoryService(
+            workspace=workspace, config=config.memory, root_config=config
+        )
+        contacts_service = ContactsService(
+            db_path=get_operational_data_path() / "contacts" / "contacts.db",
+        )
+        contacts_service.mark_owner_from_policy(
+            policy_engine.policy.owners if policy_engine else {},
+        )
+        memory_service.set_contacts(contacts_service)
+        try:
+            linked = contacts_service.backfill_memory(memory_service.store)
+            if linked > 0:
+                logger.info("contacts: backfilled {} memory nodes with contact_id", linked)
+        except Exception as e:
+            logger.warning("contacts: memory backfill failed: {}", e)
+
     try:
         imported = memory_service.backfill_from_workspace_files(force=False)
         if imported > 0:
             logger.info("memory backfill imported {} entries", imported)
     except Exception as e:
         logger.warning("memory backfill failed: {}", e)
-
-    contacts_service = ContactsService(
-        db_path=get_operational_data_path() / "contacts" / "contacts.db",
-    )
-    from yeoman_gateway.storage.chat_registry import ChatRegistry
-
-    chat_registry = ChatRegistry(
-        db_path=get_operational_data_path() / "inbound" / "chat_registry.db",
-    )
-    contacts_service.mark_owner_from_policy(
-        policy_engine.policy.owners if policy_engine else {},
-    )
-    memory_service.set_contacts(contacts_service)
-    try:
-        linked = contacts_service.backfill_memory(memory_service.store)
-        if linked > 0:
-            logger.info("contacts: backfilled {} memory nodes with contact_id", linked)
-    except Exception as e:
-        logger.warning("contacts: memory backfill failed: {}", e)
 
     cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")

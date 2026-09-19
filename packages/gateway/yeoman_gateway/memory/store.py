@@ -94,9 +94,27 @@ _SHARED_FACT_SCHEMA: tuple[str, ...] = (
 
 
 class MemoryStore:
-    """Persist semantic memory entries with FTS and optional embedding vectors."""
+    """Persist semantic memory entries with FTS and optional embedding vectors.
 
-    def __init__(self, db_path: Path) -> None:
+    The store either owns its connection (``db_path``) or joins the knowledge store's
+    one connection (``owner``).  A joining store never commits on its own and never
+    closes the shared connection: the knowledge transaction owner is in charge.
+    """
+
+    def __init__(self, db_path: Path | None = None, *, owner: object | None = None) -> None:
+        if owner is not None:
+            self._owner = owner
+            self._owns_connection = False
+            self.db_path = Path(str(getattr(owner, "db_path")))
+            self._lock = getattr(owner, "lock")
+            self._conn = getattr(owner, "connection")
+            self._conn.row_factory = sqlite3.Row
+            self._migrate_shared_facts()
+            return
+        if db_path is None:
+            raise ValueError("MemoryStore needs either db_path or owner")
+        self._owner = None
+        self._owns_connection = True
         self.db_path = db_path.expanduser()
         ensure_dir(self.db_path.parent)
         self._lock = threading.RLock()
@@ -106,7 +124,19 @@ class MemoryStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._create_schema()
 
+    def _commit_owned(self) -> None:
+        """Commit only when this store owns its connection.
+
+        A store that joined the knowledge store's connection never commits: the outer
+        knowledge transaction is the only commit site.
+        """
+        if self._owner is not None:
+            return
+        self._conn.commit()
+
     def close(self) -> None:
+        if not self._owns_connection:
+            return
         with self._lock:
             self._conn.close()
 
@@ -217,7 +247,7 @@ class MemoryStore:
             except sqlite3.OperationalError:
                 self._conn.execute("ALTER TABLE memory2_nodes ADD COLUMN contact_id TEXT")
             self._migrate_shared_facts()
-            self._conn.commit()
+            self._commit_owned()
 
     def _migrate_shared_facts(self) -> None:
         """Additive shared-fact schema (Plan 05).
@@ -252,7 +282,7 @@ class MemoryStore:
                 """,
                 (str(key), str(value)),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def fact_audience(self, fact_id: str) -> tuple[str, ...]:
         """Stored audience rows of a fact. Missing rows mean nobody, never everybody."""
@@ -331,7 +361,7 @@ class MemoryStore:
                 f" AND source_event_id IN ({placeholders})",
                 (str(fact_id), *[str(item) for item in source_event_ids]),
             )
-            self._conn.commit()
+            self._commit_owned()
         return int(cursor.rowcount)
 
     def upsert_fact_job(
@@ -385,7 +415,7 @@ class MemoryStore:
                     None if attempts is None else int(attempts),
                 ),
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def get_fact_job(self, job_key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -429,7 +459,7 @@ class MemoryStore:
         """Store a fact's vector so semantic retrieval can find it."""
         with self._lock:
             self._upsert_embedding(str(fact_id), str(workspace_id), str(model), vector)
-            self._conn.commit()
+            self._commit_owned()
 
     def has_fact_embeddings(self) -> bool:
         """True when at least one shared fact carries a vector.
@@ -462,7 +492,7 @@ class MemoryStore:
                 """,
                 (str(next_epoch),),
             )
-            self._conn.commit()
+            self._commit_owned()
         return next_epoch
 
     # -- shared facts (Plan 05, Aufgabe 1) --------------------------------------
@@ -559,7 +589,7 @@ class MemoryStore:
                     " VALUES (?, ?, 'allowed')",
                     (fact.fact_id, principal),
                 )
-            self._conn.commit()
+            self._commit_owned()
         stored = self.get_fact(fact.fact_id)
         if stored is None:  # pragma: no cover - defensive
             raise RuntimeError(f"fact vanished right after write: {fact.fact_id}")
@@ -690,7 +720,7 @@ class MemoryStore:
                     str(fact_id),
                 ),
             )
-            self._conn.commit()
+            self._commit_owned()
             changed = cursor.rowcount > 0
         if changed:
             self.bump_acl_epoch()
@@ -708,7 +738,7 @@ class MemoryStore:
                 (int(now_ms), int(now_ms), str(fact_id)),
             )
             if cursor.rowcount == 0:
-                self._conn.commit()
+                self._commit_owned()
                 return False
             self._conn.execute(
                 "DELETE FROM memory2_fact_principals WHERE fact_id = ?", (str(fact_id),)
@@ -729,7 +759,7 @@ class MemoryStore:
             self._conn.execute(
                 "DELETE FROM memory2_embeddings WHERE entry_id = ?", (str(fact_id),)
             )
-            self._conn.commit()
+            self._commit_owned()
         self.bump_acl_epoch()
         return True
 
@@ -836,14 +866,14 @@ class MemoryStore:
                     (existing_entry.id,),
                 ).fetchone()
                 if row is None:
-                    self._conn.commit()
+                    self._commit_owned()
                     return existing_entry, False
                 merged = self._row_to_entry(row)
                 if embedding_model and embedding is not None:
                     self._upsert_embedding(
                         merged.id, merged.workspace_id, embedding_model, embedding
                     )
-                self._conn.commit()
+                self._commit_owned()
                 return merged, False
 
             entry_id = entry.id or str(uuid.uuid4())
@@ -895,7 +925,7 @@ class MemoryStore:
             )
             if embedding_model and embedding is not None:
                 self._upsert_embedding(entry_id, entry.workspace_id, embedding_model, embedding)
-            self._conn.commit()
+            self._commit_owned()
             row = self._conn.execute(
                 "SELECT * FROM memory2_nodes WHERE id = ? LIMIT 1",
                 (entry_id,),
@@ -1000,7 +1030,7 @@ class MemoryStore:
                     f"UPDATE memory2_nodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
                     (now_iso, *hit_ids),
                 )
-                self._conn.commit()
+                self._commit_owned()
             return hits
 
     def search_vector(
@@ -1067,7 +1097,7 @@ class MemoryStore:
                     f"UPDATE memory2_nodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
                     (now_iso, *hit_ids),
                 )
-                self._conn.commit()
+                self._commit_owned()
             return hits
 
     def list_recent(
@@ -1121,7 +1151,7 @@ class MemoryStore:
                     f"UPDATE memory2_nodes SET last_accessed_at = ? WHERE id IN ({placeholders})",
                     (now_iso, *(hit.entry.id for hit in hits)),
                 )
-                self._conn.commit()
+                self._commit_owned()
             return hits
 
     def soft_delete(self, ids: list[str]) -> int:
@@ -1136,7 +1166,7 @@ class MemoryStore:
                 f" WHERE id IN ({placeholders}) AND is_deleted = 0",
                 (now_iso, *ids),
             )
-            self._conn.commit()
+            self._commit_owned()
             return cursor.rowcount
 
     def get_node(self, entry_id: str, *, workspace_id: str) -> MemoryEntry | None:
@@ -1172,13 +1202,13 @@ class MemoryStore:
                 (meta_json, now_iso, entry_id, workspace_id),
             )
             if cursor.rowcount <= 0:
-                self._conn.commit()
+                self._commit_owned()
                 return None
             row = self._conn.execute(
                 "SELECT * FROM memory2_nodes WHERE id = ? AND workspace_id = ? LIMIT 1",
                 (entry_id, workspace_id),
             ).fetchone()
-            self._conn.commit()
+            self._commit_owned()
         return self._row_to_entry(row) if row is not None else None
 
     def list_nodes_for_disclosure_backfill(
@@ -1251,7 +1281,7 @@ class MemoryStore:
                 WHERE is_deleted = 0
                 """
             )
-            self._conn.commit()
+            self._commit_owned()
 
     def link_nodes_to_contact(self, sender_id: str, contact_id: str) -> int:
         """Link existing memory nodes to a contact by sender_id."""
@@ -1261,7 +1291,7 @@ class MemoryStore:
                 " WHERE sender_id = ? AND (contact_id IS NULL OR contact_id = '')",
                 (contact_id, sender_id),
             )
-            self._conn.commit()
+            self._commit_owned()
             return cursor.rowcount
 
     def append_idea_backlog_item(
@@ -1282,7 +1312,7 @@ class MemoryStore:
                 """,
                 (stage, title, source, now_iso, now_iso, promoted_at),
             )
-            self._conn.commit()
+            self._commit_owned()
             return int(cur.lastrowid)
 
 

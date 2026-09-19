@@ -128,6 +128,16 @@ DEFAULT_WHATSAPP_REPLY_CONTEXT: dict[str, Any] = {
     "session_history_limit_group": 20,
 }
 
+DEFAULT_KNOWLEDGE: dict[str, Any] = {
+    # Off by default: the consolidated store is opted in only after a verified
+    # offline migration produced it (see the private cutover runbook).
+    "enabled": False,
+    "db_path": "~/.yeoman/data/knowledge/knowledge.db",
+    "legacy_contacts_paths": ["~/.yeoman/data/contacts/contacts.db"],
+    "legacy_memory_paths": ["~/.yeoman/data/memory/memory.db"],
+}
+
+
 DEFAULT_MEMORY: dict[str, Any] = {
     "enabled": True,
     "mode": "primary",

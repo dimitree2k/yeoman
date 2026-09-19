@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_settings import BaseSettings
 
 from yeoman_shared.config.defaults import (
+    DEFAULT_KNOWLEDGE,
     DEFAULT_MEMORY,
     DEFAULT_SECURITY,
     DEFAULT_WHATSAPP_MEDIA,
@@ -401,6 +402,28 @@ class MemorySharedConfig(BaseModel):
         if self.extraction_enabled and not self.enabled:
             raise ValueError("memory.shared.extractionEnabled requires memory.shared.enabled")
         return self
+
+
+class KnowledgeConfig(BaseModel):
+    """Consolidated person-knowledge store (people, statements, provenance).
+
+    ``enabled`` defaults to false: the runtime only opens the consolidated store once a
+    verified offline migration produced it.  With the switch off nothing changes; with
+    the switch on a missing or unverified store is a hard startup error instead of a
+    silent second writer.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = bool(DEFAULT_KNOWLEDGE["enabled"])
+    db_path: str = str(DEFAULT_KNOWLEDGE["db_path"])
+    legacy_contacts_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_KNOWLEDGE["legacy_contacts_paths"])
+    )
+    legacy_memory_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_KNOWLEDGE["legacy_memory_paths"])
+    )
+    capture_enabled: bool = False
 
 
 class MemoryConfig(BaseModel):
@@ -897,6 +920,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     bus: BusConfig = Field(default_factory=BusConfig)
     ipc: IpcConfig = Field(default_factory=IpcConfig)
     webhooks: WebhooksConfig = Field(default_factory=WebhooksConfig)
