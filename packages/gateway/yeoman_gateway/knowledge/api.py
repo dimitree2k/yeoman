@@ -69,23 +69,32 @@ def workspace_id_for(workspace: Path | str) -> str:
     ]
 
 
-def _has_legacy_schema(db_path: Path) -> bool:
+def _legacy_schema_names(db_path: Path) -> set[str]:
+    """Table names of an existing file, or an empty set when it is unreadable."""
     if not db_path.exists():
-        return False
+        return set()
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:  # pragma: no cover - defensive
-        return False
+        return set()
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     except sqlite3.Error:  # pragma: no cover - defensive
-        return False
+        return set()
     finally:
         conn.close()
-    names = {str(row[0]) for row in rows}
-    return bool(names & {"memory2_nodes", "memory2_facts", "contact_identifiers"})
+    return {str(row[0]) for row in rows}
+
+
+def _has_legacy_schema(db_path: Path) -> bool:
+    return bool(
+        _legacy_schema_names(db_path)
+        & {"memory2_nodes", "memory2_facts", "contact_identifiers"}
+    )
+
+
+def _has_knowledge_schema(db_path: Path) -> bool:
+    return bool(_legacy_schema_names(db_path) & {"knowledge_meta", "knowledge_statements"})
 
 
 def open_knowledge_store(
@@ -108,8 +117,12 @@ def open_knowledge_store(
     """
     path = Path(db_path).expanduser()
     legacy = [Path(item).expanduser() for item in legacy_sources]
+    occupied = path.exists() and not _has_knowledge_schema(path)
     fresh = not path.exists()
-    if fresh and any(item.exists() for item in legacy):
+    if (fresh and any(item.exists() for item in legacy)) or occupied:
+        # Either the consolidated store is missing while legacy data exists, or the path
+        # already holds a different database (for example a legacy memory file that was
+        # configured directly).  Both mean: migrate explicitly, never write here.
         raise KnowledgeStartupError(
             "migration_required",
             "legacy memory/contacts data exists but no verified knowledge store was built",
@@ -122,8 +135,16 @@ def open_knowledge_store(
         # A brand-new installation with no legacy data is complete by construction.
         store.set_meta("migration_complete", "1")
         store.set_meta("migration_id", "fresh-install")
+        store.set_meta("semantic_digest", "")
         store.commit_if_idle()
     version = store.schema_version
+    if path.exists() and not version:
+        # An occupied path without a schema version is not a knowledge store.
+        store.close()
+        raise KnowledgeStartupError(
+            "schema_incompatible",
+            "the target file carries no knowledge schema version",
+        )
     if version and version != SCHEMA_VERSION:
         store.close()
         raise KnowledgeStartupError(
