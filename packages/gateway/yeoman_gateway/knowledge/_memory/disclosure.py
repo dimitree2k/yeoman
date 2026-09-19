@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from yeoman_gateway.memory.models import MemoryHit
+from yeoman_gateway.knowledge._memory.models import MemoryHit
 
 SENSITIVITIES = {"normal", "sensitive", "private", "taboo"}
 DISCLOSURE_MODES = {"speakable", "context_only", "owner_only", "never_initiate"}

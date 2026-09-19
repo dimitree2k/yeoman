@@ -64,14 +64,14 @@ def test_disabled_mode_keeps_shared_memory_inert(tmp_path: Path) -> None:
 def test_shared_off_but_memory_on_builds_nothing(tmp_path: Path) -> None:
     from unittest.mock import patch
 
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 
     config = _config(tmp_path)
     config.memory.enabled = True
     config.processing.enabled = True
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         memory = MemoryService(workspace=workspace, config=config.memory)
 
     runtime = build_shared_fact_runtime(
@@ -86,7 +86,7 @@ def test_shared_off_but_memory_on_builds_nothing(tmp_path: Path) -> None:
 def test_enabled_switches_build_runtime_only_with_every_switch(tmp_path: Path) -> None:
     from unittest.mock import patch
 
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 
     config = _config(tmp_path)
     config.memory.enabled = True
@@ -94,7 +94,7 @@ def test_enabled_switches_build_runtime_only_with_every_switch(tmp_path: Path) -
     config.processing.enabled = True
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         memory = MemoryService(workspace=workspace, config=config.memory)
 
     assert build_shared_fact_runtime(config, store=None, memory=memory) is None  # no journal, no runtime
@@ -112,7 +112,7 @@ def test_enabled_switches_build_runtime_only_with_every_switch(tmp_path: Path) -
 def test_extraction_opt_in_creates_a_queue_that_is_not_started(tmp_path: Path) -> None:
     from unittest.mock import patch
 
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 
     config = _config(tmp_path)
     config.memory.enabled = True
@@ -121,7 +121,7 @@ def test_extraction_opt_in_creates_a_queue_that_is_not_started(tmp_path: Path) -
     config.processing.enabled = True
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         memory = MemoryService(workspace=workspace, config=config.memory)
 
     runtime = build_shared_fact_runtime(

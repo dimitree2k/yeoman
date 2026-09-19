@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from yeoman_gateway.memory.archive_backfill import (
+from yeoman_gateway.knowledge._memory.archive_backfill import (
     ARCHIVE_EVENT_PREFIX,
     ArchiveEventSource,
     archive_event,
@@ -14,8 +14,8 @@ from yeoman_gateway.memory.archive_backfill import (
     iter_chat_ids,
     run_archive_backfill,
 )
-from yeoman_gateway.memory.extraction_jobs import SharedFactExtractionQueue
-from yeoman_gateway.memory.store import MemoryStore
+from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactExtractionQueue
+from yeoman_gateway.knowledge._memory.store import MemoryStore
 from yeoman_gateway.storage.inbound_archive import InboundArchive
 
 CHAT = "gruppe@g.us"
@@ -47,7 +47,7 @@ class _Extractor:
         self.calls: list[list[str]] = []
 
     def __call__(self, events):
-        from yeoman_gateway.memory.extraction_jobs import SharedFactCandidate
+        from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactCandidate
 
         ids = [getattr(event, "event_id", "") for event in events]
         self.calls.append(ids)

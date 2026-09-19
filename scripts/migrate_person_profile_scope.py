@@ -20,7 +20,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import get_operational_data_path
 

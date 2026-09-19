@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
 from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
-from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.storage.inbound_archive import InboundArchive
 

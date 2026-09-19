@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from yeoman_gateway.memory.store import MemoryStore
+    from yeoman_gateway.knowledge._memory.store import MemoryStore
 
 AssertionStatus = Literal["assertion", "confirmed", "superseded", "revoked", "expired"]
 VisibilityScope = Literal["chat_shared", "principals", "author_only"]

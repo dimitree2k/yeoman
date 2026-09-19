@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 
 def test_resolve_jid_to_name_returns_display_name(tmp_path) -> None:

@@ -16,28 +16,28 @@ from typing import TYPE_CHECKING, Iterable, Literal
 
 from loguru import logger
 
-from yeoman_gateway.memory.disclosure import (
+from yeoman_gateway.knowledge._memory.disclosure import (
     classify_disclosure_for_content,
     metadata_to_json_dict,
     render_disclosed_hits,
 )
-from yeoman_gateway.memory.embeddings import MemoryEmbeddingService
-from yeoman_gateway.memory.extractor import ExtractedCandidate, MemoryExtractorService
-from yeoman_gateway.memory.models import (
+from yeoman_gateway.knowledge._memory.embeddings import MemoryEmbeddingService
+from yeoman_gateway.knowledge._memory.extractor import ExtractedCandidate, MemoryExtractorService
+from yeoman_gateway.knowledge._memory.models import (
     MemoryCaptureCandidate,
     MemoryCaptureResult,
     MemoryEntry,
     MemoryHit,
     MemorySector,
 )
-from yeoman_gateway.memory.read_gate import FactAclPredicate, FactReadGate
-from yeoman_gateway.memory.session_state import SessionStateStore
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.read_gate import FactAclPredicate, FactReadGate
+from yeoman_gateway.knowledge._memory.session_state import SessionStateStore
+from yeoman_gateway.knowledge._memory.shared_facts import (
     FactReadContext,
     FactRetrievalResult,
     InvalidationReport,
 )
-from yeoman_gateway.memory.store import MemoryStore
+from yeoman_gateway.knowledge._memory.store import MemoryStore
 from yeoman_gateway.policy.loader import load_policy
 
 if TYPE_CHECKING:

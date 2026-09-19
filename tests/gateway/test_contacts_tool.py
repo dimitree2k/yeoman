@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from yeoman_gateway.agent.tools.contacts import ContactsTool
 from yeoman_gateway.agent.tools.resolve_contact import ResolveContactTool
-from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.storage.chat_registry import ChatRegistry
 
 

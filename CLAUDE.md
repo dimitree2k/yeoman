@@ -11,7 +11,8 @@ Version: **1.0.0**
 | Entry point / CLI | `packages/gateway/pyproject.toml` → `yeoman_gateway.__main__:main` |
 | Orchestrator pipeline | `yeoman_gateway/core/orchestrator.py` |
 | Policy engine | `yeoman_gateway/policy/engine.py` |
-| Memory service | `yeoman_gateway/memory/service.py` |
+| Person knowledge (public API) | `yeoman_gateway/knowledge/{api,models}.py` (people, statements, recall, migration) |
+| Memory / contacts (private) | `yeoman_gateway/knowledge/_memory/`, `yeoman_gateway/knowledge/_contacts/` — owned by `knowledge`, reachable only through its API |
 | Channel adapters | `yeoman_gateway/channels/{telegram,discord,whatsapp,feishu}.py` |
 | Tool registry | `yeoman_gateway/agent/tools/registry.py` |
 | Provider registry | `yeoman_gateway/providers/registry.py` (single source of truth) |
@@ -134,7 +135,7 @@ Media (ASR/TTS/vision) is cross-cutting: channels enrich inbound, responder synt
 | `bus/` | gateway | Async message queue with deduplication |
 | `providers/` | gateway | LLM registry, LiteLLM wrapper, OpenAI-compat, transcription |
 | `policy/` | gateway | Engine, schema, loader, identity normalization, personas, admin handlers |
-| `memory/` | gateway | Service, SQLite store, embeddings, extractor, session state (WAL) |
+| `knowledge/` | gateway | Person knowledge: public `api.py`/`models.py`, private `_store`, `_identity`, `_statements`, `_retrieval`, `_migration`, plus the owned `_memory/` and `_contacts/` adapters (one SQLite connection, one transaction owner) |
 | `media/` | gateway | ASR (Groq Whisper), TTS (ElevenLabs), vision, routing, storage |
 | `security/` | gateway | Rule engine, built-in rules, noop (dev) |
 | `skills/` | gateway | Bundled skills (github, weather, summarize, tmux, cron, etc.) |

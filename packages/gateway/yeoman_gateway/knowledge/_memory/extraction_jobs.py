@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 from loguru import logger
 
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.shared_facts import (
     SharedFact,
     effective_audience,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from yeoman_gateway.memory.store import MemoryStore
+    from yeoman_gateway.knowledge._memory.store import MemoryStore
 
 EXTRACTOR_VERSION = "v1"
 
@@ -671,7 +671,9 @@ class SharedFactExtractionQueue:
         if self._embedder is None or not fact.content.strip():
             return
         try:
-            from yeoman_gateway.memory.store import MemoryStore  # noqa: F401  (type only)
+            from yeoman_gateway.knowledge._memory.store import (
+                MemoryStore,  # noqa: F401  (type only)
+            )
 
             vector = self._embedder.embed(fact.content)
         except Exception as exc:
@@ -780,7 +782,7 @@ def _job_refs(job: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
 
 
 def _fact_sources(refs: tuple[tuple[str, int], ...], candidate: SharedFactCandidate) -> list[Any]:
-    from yeoman_gateway.memory.shared_facts import FactSource
+    from yeoman_gateway.knowledge._memory.shared_facts import FactSource
 
     return [
         FactSource(

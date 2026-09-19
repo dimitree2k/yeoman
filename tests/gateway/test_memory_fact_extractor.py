@@ -6,16 +6,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from yeoman_gateway.memory.extraction_jobs import (
+from yeoman_gateway.knowledge._memory.extraction_jobs import (
     SharedFactExtractionQueue,
     check_candidate,
 )
-from yeoman_gateway.memory.fact_extractor import (
+from yeoman_gateway.knowledge._memory.fact_extractor import (
     MAX_CANDIDATES_PER_JOB,
     SharedFactExtractor,
     event_view,
 )
-from yeoman_gateway.memory.store import MemoryStore
+from yeoman_gateway.knowledge._memory.store import MemoryStore
 from yeoman_shared.config.schema import Config
 
 CHAT = "gruppe@g.us"
@@ -198,8 +198,8 @@ def test_queue_publishes_a_readable_fact_from_the_extractor(tmp_path: Path) -> N
     Synchronous on purpose: the extractor calls ``asyncio.run`` internally, which is only
     legal off the event loop - the queue runs it on its own worker thread in production.
     """
-    from yeoman_gateway.memory.read_gate import FactReadGate
-    from yeoman_gateway.memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge._memory.read_gate import FactReadGate
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
 
     store = MemoryStore(tmp_path / "memory.db")
     extractor = _extractor(
@@ -257,7 +257,7 @@ def test_queue_publishes_a_readable_fact_from_the_extractor(tmp_path: Path) -> N
 
 def test_meta_statements_are_refused() -> None:
     """"The author says X" is a transcript, not a fact - proven against real output."""
-    from yeoman_gateway.memory.extraction_jobs import is_meta_statement
+    from yeoman_gateway.knowledge._memory.extraction_jobs import is_meta_statement
 
     assert is_meta_statement('Der Autor sagt: "noch tests".')
     assert is_meta_statement("The message says the meeting moved")
@@ -359,8 +359,8 @@ def test_fact_is_found_by_meaning_not_only_by_words(tmp_path: Path) -> None:
     """A query with no word in common still finds the fact, via the vector path."""
     from unittest.mock import patch
 
-    from yeoman_gateway.memory.service import MemoryService
-    from yeoman_gateway.memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge._memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_shared.config.schema import Config
 
     workspace = tmp_path / "ws"
@@ -370,7 +370,7 @@ def test_fact_is_found_by_meaning_not_only_by_words(tmp_path: Path) -> None:
     cfg.memory.capture.enabled = False
     cfg.memory.embedding.enabled = False
     cfg.memory.shared.enabled = True
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         service = MemoryService(workspace=workspace, config=cfg.memory)
 
     embedder = _StubEmbedder()
@@ -399,7 +399,10 @@ def test_two_candidates_in_one_batch_become_two_facts(tmp_path: Path) -> None:
     The first real backfill died here with
     ``IntegrityError: UNIQUE constraint failed: memory2_nodes.id``.
     """
-    from yeoman_gateway.memory.extraction_jobs import SharedFactCandidate, candidate_fact_id
+    from yeoman_gateway.knowledge._memory.extraction_jobs import (
+        SharedFactCandidate,
+        candidate_fact_id,
+    )
 
     store = MemoryStore(tmp_path / "memory.db")
 
@@ -484,7 +487,7 @@ def test_a_crash_left_running_job_is_requeued(tmp_path: Path) -> None:
 
 def test_screens_refuse_what_the_real_backfill_stored() -> None:
     """Every example below was stored as a fact by the first real backfill."""
-    from yeoman_gateway.memory.extraction_jobs import screen_content
+    from yeoman_gateway.knowledge._memory.extraction_jobs import screen_content
 
     refused = {
         "Ich habe Claude erklärt, wer Carsten ist, was er so will und was sein skill ist.":
@@ -514,8 +517,8 @@ def test_screens_refuse_what_the_real_backfill_stored() -> None:
 
 
 def test_rescreen_revokes_stored_noise_and_keeps_real_facts(tmp_path: Path) -> None:
-    from yeoman_gateway.memory.extraction_jobs import rescreen_stored_facts
-    from yeoman_gateway.memory.shared_facts import SharedFact
+    from yeoman_gateway.knowledge._memory.extraction_jobs import rescreen_stored_facts
+    from yeoman_gateway.knowledge._memory.shared_facts import SharedFact
 
     def _stored(fact_id: str, content: str) -> SharedFact:
         return SharedFact(
@@ -546,7 +549,7 @@ def test_rescreen_revokes_stored_noise_and_keeps_real_facts(tmp_path: Path) -> N
 
 def test_a_revoked_fact_is_never_resurrected_by_a_rerun(tmp_path: Path) -> None:
     """Re-publishing a revoked statement must not undo the human decision."""
-    from yeoman_gateway.memory.extraction_jobs import SharedFactCandidate
+    from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactCandidate
 
     store = MemoryStore(tmp_path / "memory.db")
     queue = _queue_with(store, embedder=_StubEmbedder())
@@ -605,7 +608,7 @@ def test_f08_a_job_cancelled_during_extraction_never_publishes(tmp_path: Path) -
     source payload unreadable while the job runs, then returns a candidate. The old code
     published it anyway and overwrote the cancellation with 'done'.
     """
-    from yeoman_gateway.memory.extraction_jobs import (
+    from yeoman_gateway.knowledge._memory.extraction_jobs import (
         SharedFactCandidate,
         SharedFactExtractionQueue,
     )
@@ -664,7 +667,7 @@ def test_f08_a_job_cancelled_during_extraction_never_publishes(tmp_path: Path) -
 
 def test_f08_an_unreadable_source_stops_publication(tmp_path: Path) -> None:
     """The source payload disappearing during the call is treated like a revocation."""
-    from yeoman_gateway.memory.extraction_jobs import (
+    from yeoman_gateway.knowledge._memory.extraction_jobs import (
         SharedFactCandidate,
         SharedFactExtractionQueue,
     )
@@ -776,7 +779,7 @@ def test_f12_cet_is_a_zone_not_an_offset() -> None:
     day, which a fixed offset gets wrong for half the year.
     """
 
-    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+    from yeoman_gateway.knowledge._memory.fact_extractor import SharedFactExtractor
 
     extractor = SharedFactExtractor.__new__(SharedFactExtractor)
     extractor._timezone_name = "Europe/Berlin"  # type: ignore[attr-defined]
@@ -797,7 +800,7 @@ def test_f12_cet_is_a_zone_not_an_offset() -> None:
 
 def test_f12_an_unknown_zone_keeps_the_configured_offset() -> None:
     """The legacy fixed offset stays the fallback - it is not silently dropped."""
-    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+    from yeoman_gateway.knowledge._memory.fact_extractor import SharedFactExtractor
 
     extractor = SharedFactExtractor.__new__(SharedFactExtractor)
     extractor._timezone_name = "Fixed/Unknown"  # type: ignore[attr-defined]

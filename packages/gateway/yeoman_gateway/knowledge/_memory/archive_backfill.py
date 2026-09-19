@@ -213,7 +213,7 @@ def run_archive_backfill(
     now_ms: int | None = None,
 ) -> BackfillReport:
     """Plan (or run) extraction over archived history. Dry run by default."""
-    from yeoman_gateway.memory.read_gate import chat_scope_key as scope_key
+    from yeoman_gateway.knowledge._memory.read_gate import chat_scope_key as scope_key
 
     stamp = int(now_ms if now_ms is not None else datetime.now(UTC).timestamp() * 1000)
     rows = iter_archive_messages(

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from yeoman_gateway.adapters.responder_llm import LLMResponder
-from yeoman_gateway.memory.shared_facts import FactSource, SharedFact
+from yeoman_gateway.knowledge._memory.shared_facts import FactSource, SharedFact
 from yeoman_gateway.processing.dispatch import CURRENT_TURN
 from yeoman_gateway.processing.models import StoredTurn, TurnBinding
 from yeoman_shared.config.schema import Config
@@ -41,7 +41,7 @@ class _Queue:
 
 
 def _memory(tmp_path: Path):
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
@@ -50,7 +50,7 @@ def _memory(tmp_path: Path):
     cfg.memory.capture.enabled = False
     cfg.memory.embedding.enabled = False
     cfg.memory.shared.enabled = True
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         return MemoryService(workspace=workspace, config=cfg.memory)
 
 

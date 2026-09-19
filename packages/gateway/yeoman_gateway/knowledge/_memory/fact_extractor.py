@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from loguru import logger
 
-from yeoman_gateway.memory.extraction_jobs import (
+from yeoman_gateway.knowledge._memory.extraction_jobs import (
     ACCEPTED_BASES,
     REJECT_BASES,
     SharedFactCandidate,

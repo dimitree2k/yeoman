@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from yeoman_gateway.memory.read_gate import build_read_context, registry_members
+from yeoman_gateway.knowledge._memory.read_gate import build_read_context, registry_members
 from yeoman_gateway.processing.reconcile import _effect_meta
 from yeoman_gateway.processing.store import ProcessingStore
 
@@ -254,7 +254,7 @@ def test_f05_a_reaction_never_invalidates(tmp_path: Path) -> None:
 
 def test_f05_edit_supersedes_facts_instead_of_revoking_them(tmp_path: Path) -> None:
     """An edit replaces the statement; a delete removes it."""
-    from yeoman_gateway.memory.shared_facts import FactSource, SharedFact
+    from yeoman_gateway.knowledge._memory.shared_facts import FactSource, SharedFact
     from yeoman_gateway.processing.invalidation import SignalInvalidator
 
     store, _thread_id, _turn_id = _store_with_message(tmp_path)

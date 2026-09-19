@@ -621,13 +621,13 @@ class KnowledgeService:
 
     def memory_store(self) -> Any:
         """The session/notes adapter's view of the shared store.  Internal use only."""
-        from yeoman_gateway.memory.store import MemoryStore
+        from yeoman_gateway.knowledge._memory.store import MemoryStore
 
         return MemoryStore(owner=self._store)
 
     def contacts_store(self) -> Any:
         """The contacts cache adapter's view of the shared store.  Internal use only."""
-        from yeoman_gateway.contacts.store import ContactsStore
+        from yeoman_gateway.knowledge._contacts.store import ContactsStore
 
         return ContactsStore(owner=self._store)
 

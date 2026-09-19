@@ -6,7 +6,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from yeoman_gateway.contacts.store import ContactsStore
+from yeoman_gateway.knowledge._contacts.store import ContactsStore
 
 
 class ContactsService:

@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from yeoman_gateway.memory.extraction_jobs import (
+from yeoman_gateway.knowledge._memory.extraction_jobs import (
     SharedFactCandidate,
     SharedFactExtractionQueue,
     check_candidate,
@@ -17,7 +17,7 @@ from yeoman_gateway.memory.extraction_jobs import (
     resolve_relative_time,
     turn_settled_job,
 )
-from yeoman_gateway.memory.store import MemoryStore
+from yeoman_gateway.knowledge._memory.store import MemoryStore
 
 T0 = 1_700_000_000_000
 WORKSPACE = "ws1"

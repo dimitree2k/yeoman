@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from yeoman_gateway.memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.service import MemoryService
 
 
 def _minimal_memory_config():
@@ -22,13 +22,13 @@ def _make_service(tmp_path: Path) -> MemoryService:
     workspace.mkdir(exist_ok=True)
     config = _minimal_memory_config()
     config.db_path = str(tmp_path / "memory.db")
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         svc = MemoryService(workspace=workspace, config=config)
     return svc
 
 
 def _insert_entry(svc: MemoryService, content: str, chat_id: str = "test-chat") -> str:
-    from yeoman_gateway.memory.models import MemoryEntry
+    from yeoman_gateway.knowledge._memory.models import MemoryEntry
     entry = MemoryEntry(
         id=str(uuid.uuid4()),
         workspace_id=svc.workspace_id,

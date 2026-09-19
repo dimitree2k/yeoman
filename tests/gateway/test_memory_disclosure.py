@@ -14,16 +14,19 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.cli.commands import app
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.memory.disclosure import classify_disclosure_for_content, render_disclosed_hits
-from yeoman_gateway.memory.disclosure_backfill import (
+from yeoman_gateway.knowledge._memory.disclosure import (
+    classify_disclosure_for_content,
+    render_disclosed_hits,
+)
+from yeoman_gateway.knowledge._memory.disclosure_backfill import (
     DisclosureTagSuggestion,
     NarrowDisclosureClassifier,
     parse_suggestions,
     run_disclosure_backfill,
 )
-from yeoman_gateway.memory.extractor import _SYSTEM_PROMPT
-from yeoman_gateway.memory.models import MemoryEntry, MemoryHit
-from yeoman_gateway.memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.extractor import _SYSTEM_PROMPT
+from yeoman_gateway.knowledge._memory.models import MemoryEntry, MemoryHit
+from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
 from yeoman_shared.config.loader import save_config
 from yeoman_shared.config.schema import Config
@@ -195,7 +198,7 @@ def _make_service(tmp_path: Path) -> MemoryService:
     cfg.memory.db_path = str(tmp_path / "memory.db")
     cfg.memory.capture.enabled = False
     cfg.memory.embedding.enabled = False
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         return MemoryService(workspace=workspace, config=cfg.memory)
 
 

@@ -32,24 +32,19 @@ PRIVATE_MODULES = (
     "yeoman_gateway.knowledge._retrieval",
     "yeoman_gateway.knowledge._migration",
     "yeoman_gateway.knowledge.authority",
-    "yeoman_gateway.contacts.store",
-    "yeoman_gateway.memory.store",
-    "yeoman_gateway.contacts.service",
-    "yeoman_gateway.memory.service",
+    "yeoman_gateway.knowledge._contacts.store",
+    "yeoman_gateway.knowledge._memory.store",
+    "yeoman_gateway.knowledge._contacts.service",
+    "yeoman_gateway.knowledge._memory.service",
 )
 
 #: Files allowed to import the modules above, with the reason.
 #:
-#: ``memory/`` and ``contacts/`` are the module's *current* private implementation of
-#: the storage adapters; they are owned by knowledge (one connection, one transaction
-#: owner) but still live under their historical paths so the mechanical move can be a
-#: separate reviewable step.  They are listed here explicitly rather than silently
-#: ignored, and ``test_legacy_packages_do_not_expose_a_second_writer`` proves that they
-#: cannot open a second store while knowledge owns them.
+#: The storage adapters live inside the module as ``knowledge/_memory`` and
+#: ``knowledge/_contacts``; only the knowledge package itself, the composition root and
+#: the migration CLI may reach them.
 ALLOWED_IMPORTERS: dict[str, str] = {
     "knowledge": "the owning module",
-    "memory": "private storage adapter owned by knowledge",
-    "contacts": "private storage adapter owned by knowledge",
     "cli/knowledge_commands.py": "migration CLI (offline operator path)",
 }
 #: The composition root may build the private adapters.
@@ -79,8 +74,6 @@ DOCUMENTED_EXCEPTIONS: dict[str, int] = {
 #: The only modules allowed to touch a raw SQLite connection for runtime data.
 SQLITE_ALLOWED = (
     "knowledge/",
-    "contacts/",
-    "memory/",
     "storage/",
     "processing/",
     "app/bootstrap.py",
@@ -196,14 +189,14 @@ def test_type_only_annotations_do_not_count_as_runtime_dependency():
     source = (
         "from typing import TYPE_CHECKING\n"
         "if TYPE_CHECKING:\n"
-        "    from yeoman_gateway.contacts.service import ContactsService\n"
+        "    from yeoman_gateway.knowledge._contacts.service import ContactsService\n"
         "def f(x: 'ContactsService') -> None: ...\n".replace("\\n", "\n")
     )
     tree = ast.parse(source)
     runtime = [name for name, _ in _module_names(tree, runtime_only=True)]
-    assert "yeoman_gateway.contacts.service" not in runtime
+    assert "yeoman_gateway.knowledge._contacts.service" not in runtime
     assert "typing" in runtime  # the plain import in front of the guard is still seen
-    assert "yeoman_gateway.contacts.service" in [
+    assert "yeoman_gateway.knowledge._contacts.service" in [
         name for name, _ in _module_names(tree)
     ]
 
@@ -246,14 +239,14 @@ def test_the_checker_detects_a_planted_violation(tmp_path):
     """The checker must fail on a synthetic module that imports a private store."""
     planted = tmp_path / "planted.py"
     planted.write_text(
-        "from yeoman_gateway.memory.store import MemoryStore\n"
+        "from yeoman_gateway.knowledge._memory.store import MemoryStore\n"
         "def f(service):\n"
         "    return service.known_jids\n",
         encoding="utf-8",
     )
     tree = ast.parse(planted.read_text(encoding="utf-8"), filename=str(planted))
     modules = [name for name, _ in _module_names(tree)]
-    assert "yeoman_gateway.memory.store" in modules
+    assert "yeoman_gateway.knowledge._memory.store" in modules
     attributes = [
         node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
     ]

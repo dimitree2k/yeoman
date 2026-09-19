@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from yeoman_gateway.contacts.service import ContactsService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware

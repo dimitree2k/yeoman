@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
-    from yeoman_gateway.contacts.models import Contact
-    from yeoman_gateway.contacts.service import ContactsService
+    from yeoman_gateway.knowledge._contacts.models import Contact
+    from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.storage.chat_registry import ChatRegistry
 
 _MENTION_TOKEN_RE = re.compile(

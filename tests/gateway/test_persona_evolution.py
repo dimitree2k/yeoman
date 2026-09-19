@@ -15,7 +15,7 @@ from yeoman_gateway.channels.telegram import TelegramChannel
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.core.pipeline import PipelineContext
-from yeoman_gateway.memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     apply_persona_evolution_proposal,

@@ -6,8 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from yeoman_gateway.memory.read_gate import FactPermissionCache, FactReadGate
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.read_gate import FactPermissionCache, FactReadGate
+from yeoman_gateway.knowledge._memory.shared_facts import (
     FactReadContext,
     FactSource,
     SharedFact,
@@ -36,7 +36,7 @@ class _Journal:
 
 
 def _service(tmp_path: Path):
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -45,7 +45,7 @@ def _service(tmp_path: Path):
     cfg.memory.capture.enabled = False
     cfg.memory.embedding.enabled = False
     cfg.memory.shared.enabled = True
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         return MemoryService(workspace=workspace, config=cfg.memory)
 
 
@@ -185,7 +185,7 @@ def test_permission_cache_is_empty_after_invalidation(tmp_path: Path) -> None:
 
 
 def test_cancelled_job_for_a_deleted_source_never_runs(tmp_path: Path) -> None:
-    from yeoman_gateway.memory.extraction_jobs import SharedFactExtractionQueue
+    from yeoman_gateway.knowledge._memory.extraction_jobs import SharedFactExtractionQueue
 
     service = _service(tmp_path)
     store = service.store

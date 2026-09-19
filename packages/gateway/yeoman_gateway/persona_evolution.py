@@ -17,7 +17,7 @@ from yeoman_shared.utils.helpers import ensure_dir, safe_filename
 from yeoman_gateway.consciousness.log import SpeakupLog
 
 if TYPE_CHECKING:  # the persona path consumes the facade's ranking results, not its store
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.policy.persona import resolve_persona_path
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.storage.inbound_archive import InboundArchive

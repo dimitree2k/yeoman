@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from yeoman_gateway.memory.models import MemorySector
+from yeoman_gateway.knowledge._memory.models import MemorySector
 from yeoman_gateway.providers.litellm_provider import LiteLLMProvider
 
 if TYPE_CHECKING:

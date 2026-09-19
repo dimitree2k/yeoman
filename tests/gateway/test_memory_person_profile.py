@@ -4,8 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from yeoman_gateway.memory.extractor import ExtractedCandidate
-from yeoman_gateway.memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.extractor import ExtractedCandidate
+from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_shared.config.schema import MemoryAclConfig, MemoryConfig
 
 

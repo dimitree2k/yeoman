@@ -14,14 +14,14 @@ from typing import Protocol
 
 from loguru import logger
 
-from yeoman_gateway.memory.disclosure import (
+from yeoman_gateway.knowledge._memory.disclosure import (
     SENSITIVITIES,
     classify_disclosure_for_content,
     metadata_to_json_dict,
     normalize_list,
     normalize_metadata,
 )
-from yeoman_gateway.memory.models import MemoryEntry
+from yeoman_gateway.knowledge._memory.models import MemoryEntry
 
 
 class DisclosureClassifier(Protocol):

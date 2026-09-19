@@ -5,14 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from yeoman_gateway.memory.read_gate import FactPermissionCache, FactReadGate
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.read_gate import FactPermissionCache, FactReadGate
+from yeoman_gateway.knowledge._memory.shared_facts import (
     FactReadContext,
     FactSource,
     SharedFact,
     can_read_shared,
 )
-from yeoman_gateway.memory.store import MemoryStore
+from yeoman_gateway.knowledge._memory.store import MemoryStore
 
 WORKSPACE_SCOPE = "gruppe-a"
 T0 = 1_700_000_000_000
@@ -231,7 +231,7 @@ class _RecordingProvider:
 def _service(tmp_path: Path, *, shared: bool = True):
     from unittest.mock import patch
 
-    from yeoman_gateway.memory.service import MemoryService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
     from yeoman_shared.config.schema import Config
 
     workspace = tmp_path / "workspace"
@@ -241,7 +241,7 @@ def _service(tmp_path: Path, *, shared: bool = True):
     cfg.memory.capture.enabled = False
     cfg.memory.embedding.enabled = False
     cfg.memory.shared.enabled = shared
-    with patch("yeoman_gateway.memory.service._load_owner_ids", return_value={}):
+    with patch("yeoman_gateway.knowledge._memory.service._load_owner_ids", return_value={}):
         return MemoryService(workspace=workspace, config=cfg.memory)
 
 

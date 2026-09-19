@@ -7,7 +7,7 @@ import pytest
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
-from yeoman_gateway.memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
 from yeoman_shared.config.schema import Config
 from yeoman_shared.telemetry import InMemoryTelemetry

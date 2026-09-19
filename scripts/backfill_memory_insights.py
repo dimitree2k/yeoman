@@ -27,8 +27,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from yeoman_gateway.contacts.service import ContactsService
-from yeoman_gateway.memory.service import (
+from yeoman_gateway.knowledge._contacts.service import ContactsService
+from yeoman_gateway.knowledge._memory.service import (
     MemoryService,
     _BackgroundNoteBuffer,
     _BackgroundNoteEvent,

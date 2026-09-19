@@ -69,12 +69,12 @@ if TYPE_CHECKING:
 
     from yeoman_gateway.a2a.registry import A2AWorkerRegistry
     from yeoman_gateway.caldav.service import CalDAVService
-    from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.service import CronService
+    from yeoman_gateway.knowledge._contacts.service import ContactsService
+    from yeoman_gateway.knowledge._memory.service import MemoryService
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
-    from yeoman_gateway.memory.service import MemoryService
     from yeoman_gateway.storage.chat_registry import ChatRegistry
     from yeoman_gateway.storage.inbound_archive import InboundArchive
     from yeoman_gateway.storage.private_handoff import PrivateHandoffStore
@@ -876,7 +876,7 @@ class LLMResponder(ResponderPort):
     def _voice_send_governance_error(self, request: VoiceSendRequest) -> str | None:
         """Enforce non-owner recipient membership and the rolling daily quota."""
         from yeoman_gateway.agent.tools.resolve_contact import chat_participant_identifiers
-        from yeoman_gateway.memory.read_gate import registry_members
+        from yeoman_gateway.knowledge._memory.read_gate import registry_members
         from yeoman_gateway.processing.dispatch import CURRENT_PRINCIPAL
         from yeoman_gateway.processing.tool_context import current_tool_context
 
@@ -2679,7 +2679,7 @@ class LLMResponder(ResponderPort):
             return ""
         import time
 
-        from yeoman_gateway.memory.read_gate import build_read_context
+        from yeoman_gateway.knowledge._memory.read_gate import build_read_context
 
         turn = getattr(binding, "turn", None)
         principal = str(getattr(turn, "principal", "") or "")
@@ -2724,8 +2724,8 @@ class LLMResponder(ResponderPort):
         """
         if self.knowledge is None or not principal:
             return None
+        from yeoman_gateway.knowledge._memory.read_gate import registry_members
         from yeoman_gateway.knowledge.models import TrustedReadContext
-        from yeoman_gateway.memory.read_gate import registry_members
 
         is_direct = not str(chat_id).endswith("@g.us")
         members = None
@@ -2807,8 +2807,8 @@ class LLMResponder(ResponderPort):
         register = getattr(self.knowledge, "register_turn_source", None)
         if register is None or not sources:
             return False
+        from yeoman_gateway.knowledge._memory.read_gate import registry_members
         from yeoman_gateway.knowledge.models import SourceRef
-        from yeoman_gateway.memory.read_gate import registry_members
 
         is_direct = not str(chat_id).endswith("@g.us")
         members: frozenset[str] = frozenset()
@@ -2903,7 +2903,7 @@ class LLMResponder(ResponderPort):
             return False
         import time
 
-        from yeoman_gateway.memory.read_gate import chat_scope_key
+        from yeoman_gateway.knowledge._memory.read_gate import chat_scope_key
 
         job_key = runtime.extraction.enqueue(
             turn_ref=turn_id,

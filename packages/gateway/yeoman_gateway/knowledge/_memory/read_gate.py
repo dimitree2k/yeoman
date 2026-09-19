@@ -15,14 +15,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.shared_facts import (
     FactReadContext,
     SharedFact,
     can_read_shared,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from yeoman_gateway.memory.store import MemoryStore
+    from yeoman_gateway.knowledge._memory.store import MemoryStore
 
 #: Fact states that may still be read.
 READABLE_STATUSES: tuple[str, ...] = ("assertion", "confirmed")

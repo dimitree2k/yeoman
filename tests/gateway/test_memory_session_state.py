@@ -1,6 +1,6 @@
 """Tests for session-state path ownership and persistence."""
 
-from yeoman_gateway.memory.session_state import SessionStateStore
+from yeoman_gateway.knowledge._memory.session_state import SessionStateStore
 
 
 def test_default_session_state_is_under_runtime_data(tmp_path, monkeypatch) -> None:

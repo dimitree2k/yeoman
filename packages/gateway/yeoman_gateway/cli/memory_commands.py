@@ -9,14 +9,14 @@ from typing import Literal
 import typer
 from rich.table import Table
 
-from yeoman_gateway.memory.disclosure import (
+from yeoman_gateway.knowledge._memory.disclosure import (
     DISCLOSURE_MODES,
     SENSITIVITIES,
     disclosure_decision,
     normalize_list,
     normalize_metadata,
 )
-from yeoman_gateway.memory.disclosure_backfill import (
+from yeoman_gateway.knowledge._memory.disclosure_backfill import (
     ModelDisclosureClassifier,
     NarrowDisclosureClassifier,
     run_disclosure_backfill,
@@ -857,15 +857,15 @@ def memory_facts_backfill(
 
     from yeoman_shared.config.loader import load_config
 
-    from yeoman_gateway.memory.archive_backfill import (
+    from yeoman_gateway.knowledge._memory.archive_backfill import (
         ArchiveEventSource,
         run_archive_backfill,
     )
-    from yeoman_gateway.memory.extraction_jobs import (
+    from yeoman_gateway.knowledge._memory.extraction_jobs import (
         EXTRACTOR_VERSION,
         SharedFactExtractionQueue,
     )
-    from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+    from yeoman_gateway.knowledge._memory.fact_extractor import SharedFactExtractor
     from yeoman_gateway.storage.chat_registry import ChatRegistry
     from yeoman_gateway.storage.inbound_archive import InboundArchive
 
@@ -980,7 +980,7 @@ def memory_facts_rescreen(
     """
     import time
 
-    from yeoman_gateway.memory.extraction_jobs import rescreen_stored_facts
+    from yeoman_gateway.knowledge._memory.extraction_jobs import rescreen_stored_facts
 
     stamp = int(time.time() * 1000)
     with _memory_service_context() as service:

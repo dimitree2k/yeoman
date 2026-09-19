@@ -42,8 +42,8 @@ if TYPE_CHECKING:
     from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
     from yeoman_gateway.consciousness.log import SpeakupLog
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
-    from yeoman_gateway.contacts.service import ContactsService
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
+    from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier

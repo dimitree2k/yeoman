@@ -8,8 +8,8 @@ from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
 from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.bus.queue import MessageBus
-from yeoman_gateway.contacts.service import ContactsService
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig

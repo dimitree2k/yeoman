@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
-    from yeoman_gateway.contacts.service import ContactsService
+    from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 
 class ContactsTool(Tool):

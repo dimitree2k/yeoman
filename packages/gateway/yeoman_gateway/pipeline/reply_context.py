@@ -16,7 +16,7 @@ from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import ReplyArchivePort
 
 if TYPE_CHECKING:
-    from yeoman_gateway.contacts.service import ContactsService
+    from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 # Bridge placeholders that are not meaningful reply text — the archive
 # transcript (if available) should take precedence.

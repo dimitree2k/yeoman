@@ -10,7 +10,12 @@ from pathlib import Path
 
 from yeoman_shared.utils.helpers import ensure_dir
 
-from yeoman_gateway.contacts.models import Contact, ContactAlias, ContactField, ContactIdentifier
+from yeoman_gateway.knowledge._contacts.models import (
+    Contact,
+    ContactAlias,
+    ContactField,
+    ContactIdentifier,
+)
 
 
 def _now_iso() -> str:

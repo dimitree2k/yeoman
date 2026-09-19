@@ -13,9 +13,9 @@ from typing import Any
 
 from yeoman_shared.utils.helpers import ensure_dir
 
-from yeoman_gateway.memory.models import MemoryEntry, MemoryHit, MemorySector
-from yeoman_gateway.memory.read_gate import FactAclPredicate
-from yeoman_gateway.memory.shared_facts import (
+from yeoman_gateway.knowledge._memory.models import MemoryEntry, MemoryHit, MemorySector
+from yeoman_gateway.knowledge._memory.read_gate import FactAclPredicate
+from yeoman_gateway.knowledge._memory.shared_facts import (
     ASSERTION_STATUSES,
     FactSource,
     SharedFact,

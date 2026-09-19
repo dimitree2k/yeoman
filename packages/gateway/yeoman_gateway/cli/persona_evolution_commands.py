@@ -10,7 +10,7 @@ from yeoman_shared.config.loader import load_config
 from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path, safe_filename
 
 from yeoman_gateway.consciousness.log import SpeakupLog
-from yeoman_gateway.memory import MemoryService
+from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     apply_persona_evolution_proposal,
     build_persona_evolution_status,

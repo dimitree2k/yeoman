@@ -25,7 +25,6 @@ from yeoman_gateway.agent.tools.file_access import build_file_access_resolver
 from yeoman_gateway.bus.events import InboundMessage, OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.manager import ChannelManager
-from yeoman_gateway.contacts.service import ContactsService
 from yeoman_gateway.core.intents import (
     OrchestratorIntent,
     PersistSessionIntent,
@@ -42,6 +41,8 @@ from yeoman_gateway.cron.service import CronJobDeferredError, CronJobSkippedErro
 from yeoman_gateway.cron.types import CronJob
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
+from yeoman_gateway.knowledge._contacts.service import ContactsService
+from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
@@ -49,7 +50,6 @@ from yeoman_gateway.media.router import ModelRouter
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.tts import TTSSynthesizer
 from yeoman_gateway.media.vision import VisionDescriber
-from yeoman_gateway.memory import MemoryService
 from yeoman_gateway.persona_evolution import (
     PersonaEvolutionLedger,
     build_persona_evolution_approval_message,
@@ -635,11 +635,11 @@ def build_shared_fact_runtime(
     if memory is None or store is None:
         return None
 
-    from yeoman_gateway.memory.extraction_jobs import (
+    from yeoman_gateway.knowledge._memory.extraction_jobs import (
         EXTRACTOR_VERSION,
         SharedFactExtractionQueue,
     )
-    from yeoman_gateway.memory.read_gate import FactReadGate
+    from yeoman_gateway.knowledge._memory.read_gate import FactReadGate
 
     extraction_cfg = getattr(config.processing, "extraction", None)
     retention_cfg = getattr(config.processing, "retention", None)
@@ -648,7 +648,7 @@ def build_shared_fact_runtime(
     )
     extractor = None
     if bool(getattr(shared, "extraction_enabled", False)):
-        from yeoman_gateway.memory.fact_extractor import SharedFactExtractor
+        from yeoman_gateway.knowledge._memory.fact_extractor import SharedFactExtractor
 
         try:
             tz_name = str(getattr(extraction_cfg, "timezone", "UTC") or "UTC")
@@ -1390,7 +1390,7 @@ def _shared_fact_members(chat_registry: object | None):
         return None
 
     def _lookup(channel: str, chat_id: str) -> frozenset[str] | None:
-        from yeoman_gateway.memory.read_gate import registry_members
+        from yeoman_gateway.knowledge._memory.read_gate import registry_members
 
         members = registry_members(chat_registry, channel=channel, chat_id=chat_id)
         return frozenset(members) if members else None
