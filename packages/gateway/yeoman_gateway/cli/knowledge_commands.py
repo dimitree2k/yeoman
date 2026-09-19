@@ -12,16 +12,9 @@ startup, no implicit migration.  Every failure exits non-zero and prints a stabl
 reason code (``source_error``, ``target_exists``, ``unsupported_schema``,
 ``manifest_mismatch``); diagnostics are redacted to table names, counts and ids.
 
-Registration is intentionally *not* wired into the main application from this module,
-because ``yeoman_gateway/cli/commands.py`` is owned by another change.  The intended
-registration, next to the other command imports in that module, is::
-
-    from . import knowledge_commands as _knowledge_commands  # noqa: F401
-    from .core import app
-    app.add_typer(_knowledge_commands.knowledge_app, name="knowledge")
-
-Nothing is attached to the shared ``app`` at import time, so importing this module has
-no side effect beyond defining the sub-app.
+Registration follows the existing convention: this module imports the shared ``app``
+and attaches its sub-app at import time, and ``cli/commands.py`` imports the module
+next to the other command modules.
 """
 
 from __future__ import annotations
@@ -32,6 +25,8 @@ from typing import Final, NoReturn
 import typer
 from rich.table import Table
 from rich.text import Text
+
+from .core import app, console
 
 from yeoman_gateway.knowledge._migration import (
     MigrationInventory,
@@ -47,6 +42,7 @@ from yeoman_gateway.knowledge._migration import (
 from .core import console
 
 knowledge_app = typer.Typer(help="Person knowledge: offline migration inventory and build")
+app.add_typer(knowledge_app, name="knowledge")
 migration_app = typer.Typer(help="Inspect, build and verify offline legacy snapshots")
 knowledge_app.add_typer(migration_app, name="migration")
 

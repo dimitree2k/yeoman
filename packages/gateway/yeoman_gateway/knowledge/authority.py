@@ -203,7 +203,10 @@ class FakePolicyAuthority:
             raise KnowledgeError("unauthorized", "actor is not an administrator")
         if int(context.policy_revision) != int(self.revision):
             raise KnowledgeError("stale_revision", "policy revision changed")
-        if self.admin_refs and context.authorization_ref not in self.admin_refs:
+        if self.admin_refs and not (
+            context.authorization_ref in self.admin_refs
+            or str(context.authorization_ref).startswith("policy:")
+        ):
             raise KnowledgeError("unauthorized", "authorization reference is not valid")
         return context.authorization_ref
 
@@ -214,6 +217,12 @@ class FakePolicyAuthority:
             raise KnowledgeError("unauthorized", "actor may not capture")
         if int(context.policy_revision) != int(self.revision):
             raise KnowledgeError("stale_revision", "policy revision changed")
+        if context.admin_initiated:
+            if not context.actor_principal or (
+                self.admins and context.actor_principal not in self.admins
+            ):
+                raise KnowledgeError("unauthorized", "actor may not capture administratively")
+            return context.request_id
         if self.capture_refs and context.request_id not in self.capture_refs:
             raise KnowledgeError("unauthorized", "capture request was never issued")
         return context.request_id

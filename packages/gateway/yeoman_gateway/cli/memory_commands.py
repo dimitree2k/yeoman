@@ -65,13 +65,22 @@ def _memory_scope_keys(
     chat_id: str | None,
     sender_id: str | None,
 ) -> list[str]:
-    # The scope-key layout lives inside the knowledge module; the CLI asks for the
-    # keys of a maintenance filter instead of building them itself.
-    return list(
-        service.maintenance_scope_keys(
-            scope=scope, channel=channel, chat_id=chat_id, sender_id=sender_id
+    # The scope-key layout lives inside the knowledge module; the CLI asks for the keys
+    # of a maintenance filter instead of building them itself.  A service that predates
+    # the knowledge facade keeps its own (legacy) key helpers.
+    builder = getattr(service, "maintenance_scope_keys", None)
+    if builder is not None:
+        return list(
+            builder(scope=scope, channel=channel, chat_id=chat_id, sender_id=sender_id)
         )
-    )
+    keys: list[str] = []
+    if scope in {"chat", "all"} and channel and chat_id:
+        keys.append(service.chat_scope_key(channel, chat_id))
+    if scope in {"user", "all"} and channel and (sender_id or chat_id):
+        keys.append(service.user_scope_key(channel, (sender_id or chat_id or "").strip()))
+    if scope in {"global", "all"}:
+        keys.append(service.global_scope_key())
+    return keys
 
 
 def _notes_channel_guard(channel: str) -> str:

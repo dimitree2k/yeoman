@@ -493,6 +493,9 @@ class TrustedCaptureContext:
     authorized_sources: tuple[SourceRef, ...]
     actor_principal: str = ""
     authorized: bool = True
+    #: An administrative capture is authorized by the actor's owner authority instead of
+    #: by a channel-issued capture receipt.
+    admin_initiated: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "request_id", _require_id(self.request_id, "request_id"))

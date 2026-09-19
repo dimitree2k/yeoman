@@ -36,6 +36,7 @@ from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     KnowledgeStats,
     MaintenanceReport,
+    PersonLinkCandidate,
     PersonProfile,
     PersonResolution,
     RecallQuery,
@@ -146,6 +147,54 @@ def open_knowledge_store(
     )
 
 
+class _RecordingSourceAuthority:
+    """Wrap a read-only proof owner so an administrative source can be registered."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._sources: dict[tuple[str, int], Any] = {}
+
+    def register_source(self, source: SourceRef, audience: Any) -> SourceRef:
+        self._sources[source.key] = source
+        return source
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def verify_source(self, source: SourceRef) -> bool:
+        if source.key in self._sources:
+            return self._sources[source.key] == source
+        return bool(self._inner.verify_source(source))
+
+    def verify_source_ref(self, event_id: str, revision: int) -> SourceRef | None:
+        known = self._sources.get((str(event_id), int(revision)))
+        if known is not None:
+            return known
+        return self._inner.verify_source_ref(event_id, revision)
+
+    def source_revoked(self, source: SourceRef) -> bool:
+        return bool(self._inner.source_revoked(source))
+
+    def mark_source_revoked(self, source: SourceRef) -> None:
+        self._sources.pop(source.key, None)
+        marker = getattr(self._inner, "mark_source_revoked", None)
+        if marker is not None:
+            marker(source)
+
+    def evidence_audience(self, source: SourceRef, *, basis: str) -> Any:
+        if source.key in self._sources:
+            from yeoman_gateway.knowledge.authority import EvidenceAudience
+
+            return EvidenceAudience.author_only(snapshot_id="owner_note")
+        return self._inner.evidence_audience(source, basis=basis)
+
+
+def _iso_from_ms(ms: int) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(int(ms) / 1000.0, tz=UTC).isoformat(timespec="seconds")
+
+
 def _scope_of(sources: tuple[SourceRef, ...] | list[SourceRef]) -> str:
     if not sources:
         return ""
@@ -167,15 +216,17 @@ class KnowledgeService:
         retention_ms: int | None = None,
     ) -> None:
         self._store = store
-        self._authority = source_authority
+        # One wrapper so administrative sources registered later are visible to the
+        # statement engine through the very same object.
+        self._authority = _RecordingSourceAuthority(source_authority)
         self._policy = policy_authority
         self.workspace_id = str(workspace_id)
         self._clock = clock
-        self._identity = IdentityEngine(store, authority=source_authority, policy=policy_authority)
+        self._identity = IdentityEngine(store, authority=self._authority, policy=policy_authority)
         self._statements = StatementEngine(
             store,
             identity=self._identity,
-            authority=source_authority,
+            authority=self._authority,
             policy=policy_authority,
             workspace_id=self.workspace_id,
             retention_ms=retention_ms,
@@ -727,6 +778,102 @@ class KnowledgeService:
             keys.append(f"workspace:{self.workspace_id}:global")
         return tuple(keys)
 
+    def bind_identifier_for_migration(
+        self, *, person_id: str, channel: str, kind: str, value: str
+    ) -> None:
+        """Bind one identifier during the transitional legacy co-existence.
+
+        Only the composition/transitional path uses this; it records unverified,
+        non-durable evidence (``legacy-import``) so a later merge or revocation can see
+        exactly where the binding came from.
+        """
+        ts = self._now()
+        self._store.execute(
+            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+            " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
+            (str(channel), str(value), str(person_id), str(kind)),
+        )
+        self._store.execute(
+            "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
+            " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
+            " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
+            " ON CONFLICT(channel, kind, value) DO NOTHING",
+            (str(channel), str(kind), str(value), str(person_id), ts, ts),
+        )
+        self._store.commit_if_idle()
+
+    def promote_legacy_person(
+        self,
+        *,
+        person_id: str,
+        display_name: str,
+        identifiers: tuple[Any, ...] = (),
+        aliases: tuple[Any, ...] = (),
+        fields: tuple[Any, ...] = (),
+    ) -> None:
+        """Register a person that already exists in the legacy contacts layout.
+
+        Used by the transitional runtime while the two layouts coexist: the ids are
+        preserved, names become observed aliases and profile text stays quarantined
+        instead of being promoted to a readable statement.
+        """
+        from yeoman_gateway.knowledge._store import QUARANTINE_REASONS
+
+        ts = self._now()
+        self._store.execute(
+            "INSERT INTO contacts (id, display_name, phone_number, is_owner, created_at,"
+            " updated_at, revision, status, preferred_name_visibility)"
+            " VALUES (?, ?, NULL, 0, ?, ?, 1, 'active', 'public')"
+            " ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name,"
+            " updated_at = excluded.updated_at",
+            (str(person_id), str(display_name), _iso_from_ms(ts), _iso_from_ms(ts)),
+        )
+        for item in identifiers:
+            channel = str(getattr(item, "channel", "") or "")
+            value = str(getattr(item, "identifier", "") or "")
+            kind = str(getattr(item, "kind", "") or "handle")
+            if not channel or not value:
+                continue
+            self._store.execute(
+                "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
+                (channel, value, str(person_id), kind),
+            )
+            self._store.execute(
+                "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
+                " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
+                " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
+                " ON CONFLICT(channel, kind, value) DO NOTHING",
+                (channel, kind, value, str(person_id), ts, ts),
+            )
+        for item in aliases:
+            alias = str(getattr(item, "alias", "") or "")
+            source = str(getattr(item, "source", "") or "observed")
+            if not alias:
+                continue
+            self._store.execute(
+                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(contact_id, alias, source) DO NOTHING",
+                (str(person_id), alias, source, _iso_from_ms(ts), _iso_from_ms(ts)),
+            )
+        for item in fields:
+            value = str(getattr(item, "value", "") or "")
+            if not value:
+                continue
+            # Legacy profile text has no proven source or ACL: keep it quarantined.
+            self._store.execute(
+                "INSERT INTO knowledge_quarantine (quarantine_id, source_table, source_pk,"
+                " reason, detail_json, created_ms) VALUES (?, 'contact_fields', ?, ?, '{}', ?)"
+                " ON CONFLICT(source_table, source_pk, reason) DO NOTHING",
+                (
+                    self._store.new_id(),
+                    f"{person_id}:{getattr(item, 'kind', '')}",
+                    QUARANTINE_REASONS[0],
+                    ts,
+                ),
+            )
+        self._store.commit_if_idle()
+
     def person_id_for_value(self, value: str) -> str | None:
         """Person id for a proven identifier value, searched across channels."""
         token = str(value or "").strip()
@@ -786,12 +933,11 @@ class KnowledgeService:
             author_principal=context.actor_principal,
             occurred_at_ms=self._now(),
         )
-        register = getattr(self._authority, "register_source", None)
-        if register is None:
-            raise KnowledgeError("unauthorized", "administrative sources are not available")
         from yeoman_gateway.knowledge.authority import EvidenceAudience
 
-        register(source, EvidenceAudience.author_only(snapshot_id="owner_note"))
+        self._authority.register_source(
+            source, EvidenceAudience.author_only(snapshot_id="owner_note")
+        )
         candidate = StatementCandidate(
             content=str(content),
             sources=(source,),
@@ -814,6 +960,7 @@ class KnowledgeService:
             authorized_sources=(source,),
             actor_principal=context.actor_principal,
             authorized=True,
+            admin_initiated=True,
         )
         with self._store.transaction():
             result = self._statements.capture(candidate, context=capture_context)

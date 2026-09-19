@@ -171,9 +171,14 @@ class ContactsTool(Tool):
             return "Error: identifier is required"
         if self._knowledge is None:
             return "Error: knowledge is unavailable"
-        person_id = self._knowledge.identifier_for_principal(
-            f"whatsapp:{identifier}"
-        ) or self._knowledge.identifier_for_principal(f"telegram:{identifier}")
+        # Identifier -> person, never identifier -> name: a tool argument must not be
+        # able to name a person it cannot prove an identifier for.
+        person_id = self._knowledge.person_id_for_value(identifier)
+        if person_id is None:
+            for channel in ("whatsapp", "telegram", "signal"):
+                person_id = self._knowledge.person_id_for_value(f"{channel}:{identifier}")
+                if person_id is not None:
+                    break
         if person_id is None:
             return f"Error: no person found for identifier '{identifier}'"
         # A name change is an admin action: Policy decides the authority, not this tool.
