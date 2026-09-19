@@ -1584,6 +1584,7 @@ def build_effect_router(
     if store is None or policy_adapter is None or not config.processing.enabled:
         return None
 
+    from yeoman_gateway.consciousness.log import DELIVERY_RESERVATION_TTL_MS
     from yeoman_gateway.processing.dispatch import BusEffectExecutor, IntentEffectRouter
     from yeoman_gateway.processing.effects import EffectGateway
     from yeoman_gateway.processing.participation_runtime import (
@@ -1798,6 +1799,19 @@ def build_effect_router(
             expected_payload_hash=str(getattr(admission, "payload_hash", "") or ""),
         )
 
+    def _reservation_pre_dispatch(envelope: object) -> tuple[bool, str]:
+        row_reader = getattr(participation_ledger, "_delivery_row_for_effect", None)
+        reservation = (
+            row_reader(str(getattr(envelope, "effect_id", "")))
+            if callable(row_reader)
+            else None
+        )
+        if reservation is not None and int(time.time() * 1000) >= (
+            int(reservation["created_at_ms"]) + DELIVERY_RESERVATION_TTL_MS
+        ):
+            return False, "reservation_expired"
+        return True, "allow"
+
     def _participation_pre_dispatch(envelope: object) -> tuple[bool, str]:
         admission_id = str(getattr(envelope, "admission_id", "") or "")
         admission = store.get_participation_admission(admission_id) if admission_id else None
@@ -1825,6 +1839,7 @@ def build_effect_router(
         security=security,
         security_block_message=config.security.block_user_message,
         participation_pre_dispatch=_participation_pre_dispatch,
+        reservation_pre_dispatch=_reservation_pre_dispatch,
     )
     gateway = EffectGateway(
         store,
@@ -1956,6 +1971,7 @@ def build_gateway_runtime(
     # and contacts services join its one connection instead of opening their own.
     # Without it the legacy layout is untouched (no partial cutover, no second writer).
     knowledge_service: object | None = None
+    knowledge_sources: object | None = None
     if getattr(config.knowledge, "enabled", False):
         from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
         from yeoman_gateway.knowledge.runtime import (
@@ -2168,6 +2184,8 @@ def build_gateway_runtime(
         a2a_delivery=service_effects,
         processing_store=processing_store,
         memory_service=memory_service,
+        knowledge=knowledge_service,
+        knowledge_sources=knowledge_sources,
         telemetry=telemetry,
         security=security,
         cron_service=cron,
@@ -2402,6 +2420,7 @@ def build_gateway_runtime(
         responder=thread_responder or responder,
         reply_archive=archive_adapter,
         contacts=contacts_service,
+        knowledge=knowledge_service,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,

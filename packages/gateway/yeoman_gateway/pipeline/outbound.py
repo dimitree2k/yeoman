@@ -176,8 +176,11 @@ class OutboundMiddleware:
         owner_alert_resolver: Callable[[str], list[str]] | None = None,
         owner_alert_cooldown_seconds: int = 300,
         allowed_reaction_emojis: Sequence[str] | None = None,
+        knowledge: object | None = None,
     ) -> None:
         self._contacts = contacts
+        #: Public knowledge facade; used in preference to the legacy contacts cache.
+        self._knowledge = knowledge
         self._security = security
         self._security_block_message = security_block_message
         self._tts = tts
@@ -300,14 +303,21 @@ class OutboundMiddleware:
         if outbound_channel == "whatsapp":
             mention_candidates = _collect_whatsapp_mention_candidates(event)
             # Resolve @Name mentions via contacts DB
-            if self._contacts is not None and ctx.reply:
+            if (self._knowledge is not None or self._contacts is not None) and ctx.reply:
                 seen = set(mention_candidates)
                 for match in re.finditer(r"(?<!\w)@(\w+)", ctx.reply):
                     name = match.group(1)
-                    jid = self._contacts.resolve_name_to_jid(
-                        name, channel="whatsapp",
-                        group_participants=list(seen),
-                    )
+                    jid: str | None = None
+                    if self._knowledge is not None:
+                        identifier = self._knowledge.identifier_for_name(
+                            name, channel="whatsapp", prefer=tuple(seen)
+                        )
+                        jid = None if identifier is None else identifier.value
+                    elif self._contacts is not None:
+                        jid = self._contacts.resolve_name_to_jid(
+                            name, channel="whatsapp",
+                            group_participants=list(seen),
+                        )
                     if jid and jid not in seen:
                         mention_candidates.append(jid)
                         seen.add(jid)

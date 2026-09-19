@@ -10,12 +10,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from yeoman_shared.utils.helpers import ensure_dir, safe_filename
 
 from yeoman_gateway.consciousness.log import SpeakupLog
-from yeoman_gateway.memory.service import MemoryService
+
+if TYPE_CHECKING:  # the persona path consumes the facade's ranking results, not its store
+    from yeoman_gateway.memory.service import MemoryService
 from yeoman_gateway.policy.persona import resolve_persona_path
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -902,7 +904,7 @@ async def collect_persona_evolution_evidence(
     policy: PolicyConfig,
     workspace: Path,
     persona_file: str,
-    memory: MemoryService,
+    memory: "MemoryService",
     speakup_log: SpeakupLog,
     inbound_archive: InboundArchive,
     window_days: int = 14,
@@ -1235,7 +1237,7 @@ async def run_persona_evolution_cron(
     policy: PolicyConfig,
     workspace: Path,
     persona_file: str,
-    memory: MemoryService,
+    memory: "MemoryService",
     speakup_log: SpeakupLog,
     inbound_archive: InboundArchive,
     window_days: int = 1,
@@ -1497,7 +1499,7 @@ async def build_persona_evolution_status(
     *,
     policy: PolicyConfig,
     workspace: Path,
-    memory: MemoryService,
+    memory: "MemoryService",
     speakup_log: SpeakupLog,
     state_db_path: Path,
     persona_file: str,

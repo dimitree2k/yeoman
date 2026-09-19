@@ -612,6 +612,41 @@ class KnowledgeService:
 
     # ── internal helpers used by the runtime adapters ────────────────────────
 
+    def register_turn_source(
+        self,
+        *,
+        source: SourceRef,
+        verified_members: frozenset[str],
+        snapshot_id: str,
+        author_only: bool = False,
+    ) -> bool:
+        """Register one archived turn revision as proven evidence.
+
+        The caller proves *who was in the chat* (its own registry decision); the module
+        turns that into the audience record.  Registering evidence is not a capture: no
+        statement is published and no read right is granted.
+        """
+        from yeoman_gateway.knowledge.authority import EvidenceAudience
+
+        register = getattr(self._authority, "register_source", None)
+        if register is None or not source.event_id:
+            return False
+        if author_only:
+            register(source, EvidenceAudience.author_only(snapshot_id=snapshot_id))
+            return True
+        if not verified_members:
+            return False
+        register(
+            source,
+            EvidenceAudience.known(frozenset(verified_members), snapshot_id=snapshot_id),
+        )
+        return True
+
+    @property
+    def knowledge_sources(self) -> Any:
+        """The proof owner for archived sources (the registered source authority)."""
+        return self._authority
+
     def display_name(
         self,
         person_id: str,
@@ -902,6 +937,66 @@ class KnowledgeService:
     def canonical_id(self, person_id: str) -> str:
         """Current canonical person for an original (possibly merged) person id."""
         return self._identity.canonical_id(person_id)
+
+    def name_for_identifier(self, value: str, *, for_group: bool = True) -> str | None:
+        """Display name of the person a proven identifier belongs to.
+
+        Rendering helper for history and reply context.  ``for_group`` keeps names that
+        were only released for a direct conversation out of group output.
+        """
+        person_id = self.person_id_for_value(value)
+        if person_id is None:
+            return None
+        return self.display_name(person_id, for_group=for_group)
+
+    def identifier_for_name(
+        self,
+        name: str,
+        *,
+        channel: str,
+        prefer: tuple[str, ...] = (),
+    ) -> Identifier | None:
+        """One delivery identifier for an exact name or alias.
+
+        Refuses ambiguity: two people with the same name yield ``None`` instead of a
+        first match, and an optional ``prefer`` list narrows to identifiers already
+        present in the current conversation.
+        """
+        query = str(name or "").strip()
+        if not query:
+            return None
+        rows = self._store.query(
+            """
+            SELECT DISTINCT c.id AS id FROM contacts c
+             LEFT JOIN contact_aliases a ON a.contact_id = c.id
+             WHERE c.status = 'active'
+               AND (c.display_name = ? COLLATE NOCASE
+                    OR c.preferred_name = ? COLLATE NOCASE
+                    OR a.alias = ? COLLATE NOCASE)
+             ORDER BY c.id
+            """,
+            (query, query, query),
+        )
+        people = [self.canonical_id(str(row["id"])) for row in rows]
+        people = list(dict.fromkeys(people))
+        if len(people) != 1:
+            return None
+        resolution = self._identity.resolve_endpoint(people[0], str(channel))
+        candidates = [resolution.identifier] if resolution.identifier else []
+        if not candidates:
+            bindings = self._identity.active_bindings_of(people[0])
+            candidates = [
+                item.identifier for item in bindings if item.identifier.channel == str(channel)
+            ]
+        if not candidates:
+            return None
+        if prefer:
+            preferred = [item for item in candidates if item.value in prefer]
+            if len(preferred) == 1:
+                return preferred[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
         """Proven identifier bindings of a person, for diagnostics and tools."""

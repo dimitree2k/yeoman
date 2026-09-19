@@ -34,6 +34,8 @@ PRIVATE_MODULES = (
     "yeoman_gateway.knowledge.authority",
     "yeoman_gateway.contacts.store",
     "yeoman_gateway.memory.store",
+    "yeoman_gateway.contacts.service",
+    "yeoman_gateway.memory.service",
 )
 
 #: Files allowed to import the modules above, with the reason.
@@ -103,14 +105,24 @@ def _is_allowed(relative: str) -> bool:
     )
 
 
-def _module_names(tree: ast.AST) -> list[tuple[str, int]]:
-    """Every imported module name plus every literal dynamic-import string."""
+def _module_names(tree: ast.AST, *, runtime_only: bool = False) -> list[tuple[str, int]]:
+    """Imported module names plus every literal dynamic-import string.
+
+    With ``runtime_only`` an import guarded by ``if TYPE_CHECKING:`` is skipped: a
+    type-only annotation does not create a runtime dependency on the private module.
+    """
     found: list[tuple[str, int]] = []
+    type_checking_lines = _type_checking_lines(tree) if runtime_only else frozenset()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            found.extend((alias.name, node.lineno) for alias in node.names)
+            found.extend(
+                (alias.name, node.lineno)
+                for alias in node.names
+                if node.lineno not in type_checking_lines
+            )
         elif isinstance(node, ast.ImportFrom) and node.module:
-            found.append((node.module, node.lineno))
+            if node.lineno not in type_checking_lines:
+                found.append((node.module, node.lineno))
         elif isinstance(node, ast.Call):
             function = node.func
             name = getattr(function, "id", None) or getattr(function, "attr", None)
@@ -121,6 +133,22 @@ def _module_names(tree: ast.AST) -> list[tuple[str, int]]:
     return found
 
 
+def _type_checking_lines(tree: ast.AST) -> frozenset[int]:
+    """Line numbers of imports that sit inside an ``if TYPE_CHECKING:`` block."""
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        name = getattr(test, "id", None) or getattr(test, "attr", None)
+        if name != "TYPE_CHECKING":
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                lines.add(child.lineno)
+    return frozenset(lines)
+
+
 def test_no_consumer_imports_a_private_store():
     violations: list[str] = []
     for path in _iter_modules():
@@ -128,7 +156,7 @@ def test_no_consumer_imports_a_private_store():
         if _is_allowed(relative):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for module, lineno in _module_names(tree):
+        for module, lineno in _module_names(tree, runtime_only=True):
             for private in PRIVATE_MODULES:
                 if module == private or module.startswith(private + "."):
                     violations.append(f"{relative}:{lineno} imports {module}")
@@ -161,6 +189,23 @@ def test_no_consumer_reads_a_known_jids_map_or_builds_scope_keys():
         if len(found) > allowed:
             violations.extend(found)
     assert not violations, "forbidden contact/knowledge access:\n" + "\n".join(violations)
+
+
+def test_type_only_annotations_do_not_count_as_runtime_dependency():
+    """The rule itself: a TYPE_CHECKING import is not a runtime import."""
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from yeoman_gateway.contacts.service import ContactsService\n"
+        "def f(x: 'ContactsService') -> None: ...\n".replace("\\n", "\n")
+    )
+    tree = ast.parse(source)
+    runtime = [name for name, _ in _module_names(tree, runtime_only=True)]
+    assert "yeoman_gateway.contacts.service" not in runtime
+    assert "typing" in runtime  # the plain import in front of the guard is still seen
+    assert "yeoman_gateway.contacts.service" in [
+        name for name, _ in _module_names(tree)
+    ]
 
 
 def test_dynamic_import_strings_do_not_name_legacy_stores():

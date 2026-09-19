@@ -65,6 +65,7 @@ class Orchestrator:
         responder: ResponderPort,
         reply_archive: ReplyArchivePort | None = None,
         contacts: "ContactsService | None" = None,
+        knowledge: object | None = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 8,
@@ -105,6 +106,7 @@ class Orchestrator:
             ReplyContextMiddleware(
                 archive=reply_archive,
                 contacts=contacts,
+                knowledge=knowledge,
                 reply_context_window_limit=reply_context_window_limit,
                 reply_context_line_max_chars=reply_context_line_max_chars,
                 ambient_window_limit=ambient_window_limit,
@@ -154,6 +156,7 @@ class Orchestrator:
             ),
             OutboundMiddleware(
                 contacts=contacts,
+                knowledge=knowledge,
                 security=security,
                 security_block_message=security_block_message,
                 tts=tts,

@@ -449,6 +449,7 @@ class LLMResponder(ResponderPort):
         effect_router: object | None = None,
         memory_service: "MemoryService | None" = None,
         knowledge: object | None = None,
+        knowledge_sources: object | None = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
@@ -489,6 +490,10 @@ class LLMResponder(ResponderPort):
         #: Public person-knowledge facade.  Read paths that need names, rosters or a
         #: protected recall use this instead of reaching into contacts/memory stores.
         self.knowledge = knowledge
+        #: Proof owner for archived turn sources.  Retained for the compositions that
+        #: still inject it; registration itself goes through the public facade so the
+        #: responder never needs the module's private authority types.
+        self.knowledge_sources = knowledge_sources
         self.telemetry = telemetry
         self.security = security
         self.owner_alert_resolver = owner_alert_resolver
@@ -2621,6 +2626,14 @@ class LLMResponder(ResponderPort):
             except Exception as e:
                 logger.warning("shared fact extraction enqueue failed: {}", e)
 
+            # Person knowledge: register this turn's archived revisions with the proof
+            # owner so a later capture has verifiable provenance.  Registering evidence
+            # is not a capture: no statement is published here.
+            try:
+                self._register_turn_knowledge_sources(channel=channel, chat_id=chat_id)
+            except Exception as e:
+                logger.warning("knowledge source registration failed: {}", e)
+
             try:
                 self.memory.post_write_session_state(
                     session_key=session_key,
@@ -2780,6 +2793,91 @@ class LLMResponder(ResponderPort):
             facts_text = ", ".join(facts)
             lines.append(f"- {name}: {facts_text}" if facts_text else f"- {name}")
         return "\n".join(lines)
+
+    def _register_knowledge_sources(
+        self, *, channel: str, chat_id: str, sources: list[tuple[str, int]]
+    ) -> bool:
+        """Hand the finished turn's archived revisions to the knowledge proof owner.
+
+        The audience snapshot comes from the chat registry as it is *now*: for a direct
+        conversation the author is the only reader, for a group the proven participant
+        list.  Without a proven list nothing is registered, so a later capture fails
+        closed instead of publishing an unproven provenance.
+        """
+        register = getattr(self.knowledge, "register_turn_source", None)
+        if register is None or not sources:
+            return False
+        from yeoman_gateway.knowledge.models import SourceRef
+        from yeoman_gateway.memory.read_gate import registry_members
+
+        is_direct = not str(chat_id).endswith("@g.us")
+        members: frozenset[str] = frozenset()
+        if is_direct:
+            binding = self._trusted_turn_binding()
+            turn = getattr(binding, "turn", None) if binding is not None else None
+            principal = str(getattr(turn, "principal", "") or "")
+            if principal:
+                members = frozenset({principal})
+        elif self.chat_registry is not None:
+            proven = registry_members(self.chat_registry, channel=channel, chat_id=chat_id)
+            members = frozenset(str(item) for item in proven)
+        if not is_direct and not members:
+            # Unknown membership: register nothing rather than an audience we cannot prove.
+            return False
+        snapshot_id = f"{channel}:{chat_id}:{len(members)}"
+        registered = 0
+        for event_id, revision in sources:
+            source = SourceRef(
+                event_id=str(event_id),
+                revision=int(revision),
+                channel=str(channel),
+                chat_id=str(chat_id),
+                author_principal=self._source_author_principal(event_id),
+                occurred_at_ms=int(time.time() * 1000),
+            )
+            if register(
+                source=source,
+                verified_members=members,
+                snapshot_id=snapshot_id,
+                author_only=is_direct,
+            ):
+                registered += 1
+        if registered:
+            self._metric("knowledge_sources_registered", registered)
+        return bool(registered)
+
+    def _source_author_principal(self, event_id: str) -> str:
+        """Author principal of an archived event, read from the archive owner."""
+        archive = self.inbound_archive
+        for name in ("author_principal", "principal_for_event"):
+            method = getattr(archive, name, None)
+            if callable(method):
+                try:
+                    value = method(event_id)
+                except Exception:  # pragma: no cover - defensive
+                    value = None
+                if value:
+                    return str(value)
+        return ""
+
+    def _register_turn_knowledge_sources(self, *, channel: str, chat_id: str) -> int:
+        """Register the finished turn's live sources; returns how many were registered."""
+        runtime = self._shared_fact_runtime()
+        binding = self._trusted_turn_binding()
+        if runtime is None or binding is None:
+            return 0
+        turn = getattr(binding, "turn", None)
+        turn_id = str(getattr(turn, "turn_id", "") or "")
+        processing = getattr(runtime, "processing", None)
+        if not turn_id or processing is None:
+            return 0
+        refs = [
+            (source.event_id, int(source.revision_at_join))
+            for source in processing.turn_sources(turn_id)
+            if source.removed_ms is None
+        ]
+        self._register_knowledge_sources(channel=channel, chat_id=chat_id, sources=refs)
+        return len(refs)
 
     def _enqueue_shared_extraction(self, *, channel: str, chat_id: str) -> bool:
         """Queue extraction for the finished turn. Returns True when a job was queued."""

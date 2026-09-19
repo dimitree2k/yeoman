@@ -33,12 +33,15 @@ class ReplyContextMiddleware:
         *,
         archive: ReplyArchivePort | None = None,
         contacts: "ContactsService | None" = None,
+        knowledge: object | None = None,
         reply_context_window_limit: int = 6,
         reply_context_line_max_chars: int = 500,
         ambient_window_limit: int = 8,
     ) -> None:
         self._archive = archive
         self._contacts = contacts
+        #: Public knowledge facade; used in preference to the legacy contacts cache.
+        self._knowledge = knowledge
         self._reply_window_limit = max(1, int(reply_context_window_limit))
         self._line_max_chars = max(32, int(reply_context_line_max_chars))
         self._ambient_limit = max(0, int(ambient_window_limit))
@@ -197,10 +200,15 @@ class ReplyContextMiddleware:
         return lines[: max(self._reply_window_limit, self._ambient_limit)]
 
     def _resolve_speaker(self, row: ArchivedMessage) -> str:
-        if self._contacts is not None and row.sender_id:
-            name = self._contacts.resolve_jid_to_name(row.sender_id)
-            if name:
-                return name
+        if row.sender_id:
+            if self._knowledge is not None:
+                name = self._knowledge.name_for_identifier(row.sender_id, for_group=True)
+                if name:
+                    return name
+            elif self._contacts is not None:
+                name = self._contacts.resolve_jid_to_name(row.sender_id)
+                if name:
+                    return name
         return (
             row.sender_name or row.sender_id or row.participant or "unknown"
         ).strip() or "unknown"
