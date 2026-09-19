@@ -333,7 +333,7 @@ class ParticipationJudge:
             and not (action == "react" and intent in {"initiate", "continue"})
         ):
             raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
-        if intent == "continue" and action != "react" and not view.allows_continuation:
+        if intent == "continue" and action == "comment" and not view.allows_continuation:
             raise ParticipationDecisionError("invalid_response", detail="continuation_not_allowed")
 
         evidence = payload.get("evidence_ids")

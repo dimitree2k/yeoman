@@ -534,6 +534,22 @@ async def test_silence_ignores_irrelevant_stray_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_silence_ignores_an_unavailable_continuation_intent() -> None:
+    """A correct silence is not rejected over an intent that has no effect."""
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="silence",
+        intent="continue",
+    )), allowed_emojis=(EMOJI,))
+
+    decision = await judge.decide(
+        _opportunity(),
+        _context(anchors=[], allowed_intents=[], allows_continuation=False),
+    )
+
+    assert decision.action == "silence"
+
+
+@pytest.mark.asyncio
 async def test_speaking_decisions_still_validate_their_evidence() -> None:
     """The leniency stops at evidence: a foreign id is never repaired."""
     for payload_overrides, reason in (
