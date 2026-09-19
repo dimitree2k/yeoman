@@ -235,7 +235,7 @@ class RetrievalEngine:
             (*params, int(query.limit) * 8),
         )
         statement_ids = [str(row["statement_id"]) for row in rows]
-        denied = self._denied_count(context, decision, query)
+        denied = self._denied_count(context, decision, query, clauses=clauses, params=params)
         if not statement_ids:
             return CandidateRows((), denied), decision
 
@@ -243,29 +243,41 @@ class RetrievalEngine:
         return CandidateRows(tuple(ranked[: query.limit]), denied), decision
 
     def _denied_count(
-        self, context: TrustedReadContext, decision: ReadDecision, query: RecallQuery
+        self,
+        context: TrustedReadContext,
+        decision: ReadDecision,
+        query: RecallQuery,
+        *,
+        clauses: str,
+        params: list[Any],
     ) -> int:
-        """How many statements exist in scope but are not readable.  Never exposed to users."""
+        """Statements in scope that this reader may not see.
+
+        Only an explicitly owner-authorized caller receives this number; a normal reader
+        learns nothing about how much was withheld.
+        """
         if not context.owner:
             return 0
-        clauses, params = self._person_filter_clause(query.person_ids, query.roles)
-        sql = (
-            "SELECT COUNT(*) FROM knowledge_statements s"
-            " WHERE s.workspace_id = ? AND s.scope_key = ? AND s.revoked_at_ms IS NULL"
-        )
-        bound: list[Any] = [self.workspace_id, context.scope_key()]
-        if clauses:
-            sql += f" AND {clauses}"
-            bound.extend(params)
-        total = int(self._store.scalar(sql, tuple(bound)) or 0)
         permitted = int(
             self._store.scalar(
-                f"SELECT COUNT(*) FROM knowledge_statements s WHERE "
-                f"{self._gate_clause(context, decision)[0]}",
-                tuple(self._gate_clause(context, decision)[1]),
+                f"SELECT COUNT(*) FROM knowledge_statements s WHERE {clauses}",
+                tuple(params),
             )
             or 0
         )
+        person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
+        sql = (
+            "SELECT COUNT(*) FROM knowledge_statements s"
+            " WHERE s.workspace_id = ? AND s.scope_key = ? AND s.revoked_at_ms IS NULL"
+            " AND s.superseded_by IS NULL"
+            " AND s.status IN ('assertion','confirmed')"
+            " AND (s.valid_until_ms IS NULL OR s.valid_until_ms > ?)"
+        )
+        bound: list[Any] = [self.workspace_id, context.scope_key(), int(context.now_ms)]
+        if person_clause:
+            sql += f" AND {person_clause}"
+            bound.extend(person_params)
+        total = int(self._store.scalar(sql, tuple(bound)) or 0)
         return max(0, total - permitted)
 
     def _rank(self, text: str, statement_ids: list[str]) -> list[str]:
