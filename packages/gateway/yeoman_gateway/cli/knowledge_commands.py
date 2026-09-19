@@ -26,8 +26,6 @@ import typer
 from rich.table import Table
 from rich.text import Text
 
-from .core import app, console
-
 from yeoman_gateway.knowledge._migration import (
     MigrationInventory,
     MigrationReport,
@@ -39,7 +37,7 @@ from yeoman_gateway.knowledge._migration import (
     verify_target,
 )
 
-from .core import console
+from .core import app, console
 
 knowledge_app = typer.Typer(help="Person knowledge: offline migration inventory and build")
 app.add_typer(knowledge_app, name="knowledge")
