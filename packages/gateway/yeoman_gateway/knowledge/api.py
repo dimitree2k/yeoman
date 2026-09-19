@@ -19,8 +19,8 @@ from typing import Any, Iterable
 
 from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
-from yeoman_gateway.knowledge._statements import StatementEngine
-from yeoman_gateway.knowledge._store import SCHEMA_VERSION, KnowledgeStore, StorageUnavailable
+from yeoman_gateway.knowledge._statements import StatementEngine, token_re
+from yeoman_gateway.knowledge._store import SCHEMA_VERSION, KnowledgeStore
 from yeoman_gateway.knowledge.authority import (
     PolicyAuthority,
     SourceAuthority,
@@ -202,6 +202,11 @@ class KnowledgeService:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    @property
+    def policy_revision(self) -> int:
+        """The Policy revision this service validates its trusted contexts against."""
+        return int(self._policy.current_policy_revision())
 
     def _now(self) -> int:
         if self._clock is not None:
@@ -568,6 +573,149 @@ class KnowledgeService:
         if not decision.allowed:
             return ()
         return self._identity.eligible_people_for_context(checked)
+
+    def recall_context(
+        self,
+        text: str,
+        *,
+        context: TrustedReadContext,
+        reply_to_text: str | None = None,
+        reply_to_person: str | None = None,
+        limit: int = 12,
+    ) -> KnowledgeContext:
+        """Scoped recall of ordinary, non-personal memories for one verified reader.
+
+        This is the only read path for memories that carry no statement shell.  It is
+        *not* a fallback around the statement gate: the caller has already been checked
+        against current membership and audience, and the returned rows are restricted to
+        scopes derived server-side from that same verified context.
+        """
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return KnowledgeContext(
+                reason=decision.reason,
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+            )
+        query = " ".join(str(text or "").split()) or " ".join(str(reply_to_text or "").split())
+        if not query:
+            return KnowledgeContext(
+                reason="empty",
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+            )
+        scope_keys = self._allowed_scope_keys(checked, decision, reply_to_person)
+        if not scope_keys:
+            return KnowledgeContext(
+                reason="empty",
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+            )
+        placeholders = ",".join("?" for _ in scope_keys)
+        tokens = [token for token in token_re().findall(query.lower()) if len(token) > 1][:16]
+        if not tokens:
+            return KnowledgeContext(
+                reason="empty",
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+            )
+        match = " OR ".join(tokens)
+        rows = self._store.query(
+            "SELECT n.id AS id, n.content AS content FROM memory2_nodes_fts"
+            " JOIN memory2_nodes n ON n.id = memory2_nodes_fts.entry_id"
+            f" WHERE n.workspace_id = ? AND n.is_deleted = 0 AND n.scope_key IN ({placeholders})"
+            " AND memory2_nodes_fts MATCH ?"
+            " AND n.id NOT IN (SELECT statement_id FROM knowledge_statements WHERE status <> 'revoked')"
+            " ORDER BY bm25(memory2_nodes_fts) ASC, n.updated_at DESC LIMIT ?",
+            (self.workspace_id, *scope_keys, match, int(max(1, min(limit, 50)))),
+        )
+        lines: list[str] = []
+        ids: list[str] = []
+        for row in rows:
+            content = str(row["content"] or "").strip()
+            if not content:
+                continue
+            lines.append(content)
+            ids.append(str(row["id"]))
+        return KnowledgeContext(
+            text="\n".join(lines),
+            statement_ids=tuple(ids),
+            identity_revision=self._store.identity_revision,
+            acl_epoch=self._store.acl_epoch,
+            context_revision=f"legacy:{self._store.acl_epoch}:{len(ids)}",
+            reason="ok" if ids else "empty",
+        )
+
+    def _allowed_scope_keys(
+        self,
+        context: TrustedReadContext,
+        decision: Any,
+        reply_to_person: str | None,
+    ) -> tuple[str, ...]:
+        """Scope keys this exact reader may search, derived from the verified context."""
+        keys = [context.scope_key()]
+        keys.append(f"channel:{context.channel}:user:{context.principal_id.split(':')[-1]}")
+        keys.append(f"workspace:{self.workspace_id}:global")
+        for candidate in (reply_to_person,):
+            if not candidate:
+                continue
+            person_id = self.person_for_principal(str(candidate)) or self._identity.canonical_id(
+                str(candidate)
+            )
+            if person_id and self._identity.get_person(person_id) is not None:
+                keys.append(f"contact:{person_id}")
+        principal_person = self.person_for_principal(context.principal_id)
+        if principal_person:
+            keys.append(f"contact:{principal_person}")
+        return tuple(dict.fromkeys(keys))
+
+    def known_identifier_values(self) -> tuple[str, ...]:
+        """Every identifier value the runtime knows, without exposing owner mapping.
+
+        Used for alias matching in delivery decisions; it deliberately returns values
+        only, never the person they belong to.
+        """
+        rows = self._store.query(
+            "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
+            " UNION SELECT identifier FROM contact_identifiers ORDER BY 1"
+        )
+        return tuple(str(row[0]) for row in rows)
+
+    def roster(
+        self, *, context: TrustedReadContext, participant_ids: tuple[str, ...]
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Names and released facts for proven members of one chat.
+
+        Only people proven by an identifier binding are returned, and only names their
+        visibility allows.  Facts come from permitted statements, never from a
+        ``contact_fields`` copy.
+        """
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return ()
+        entries: list[tuple[str, tuple[str, ...]]] = []
+        for raw in participant_ids:
+            principal = str(raw or "").strip()
+            if not principal:
+                continue
+            person_id = self.person_for_principal(principal)
+            if person_id is None:
+                continue
+            name = self.display_name(person_id, context=checked, for_group=not checked.is_direct)
+            if not name:
+                continue
+            profile = self.profile(person_id, context=checked)
+            facts: list[str] = []
+            for line in profile.context.text.splitlines():
+                clean = line.strip()
+                if clean:
+                    facts.append(clean)
+            if any(existing[0] == name for existing in entries):
+                continue
+            entries.append((name, tuple(facts)))
+        return tuple(entries)
 
     def alias_names(self, person_id: str) -> tuple[str, ...]:
         """Observed aliases of a person.  Untrusted text, for display only."""

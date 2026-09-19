@@ -308,7 +308,6 @@ class RetrievalEngine:
                     f" WHERE n.id IN ({placeholders})",
                     tuple(statement_ids),
                 )
-                lowered = text.lower()
                 for row in rows:
                     content = str(row["content"] or "").lower()
                     overlap = sum(1 for token in tokens if token in content)

@@ -442,7 +442,7 @@ _CORE_SCHEMA: tuple[str, ...] = (
 )
 
 
-class StorageUnavailable(KnowledgeError):
+class StorageUnavailable(KnowledgeError):  # noqa: N818 - domain name from the design
     """The knowledge database cannot serve the request."""
 
     def __init__(self, message: str = "knowledge storage unavailable") -> None:

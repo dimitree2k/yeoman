@@ -769,7 +769,7 @@ class IdentityEngine:
     ) -> ChangeReceipt:
         """Set the released address preference.  This changes no rights at all."""
         self._require_owner(context)
-        authorization = self._policy.require_admin(context)
+        self._policy.require_admin(context)
         canonical = self.canonical_id(person_id)
         self.require_person(canonical)
         clean = validate_name(name)

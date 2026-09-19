@@ -448,6 +448,7 @@ class LLMResponder(ResponderPort):
         session_manager: SessionManager | None = None,
         effect_router: object | None = None,
         memory_service: "MemoryService | None" = None,
+        knowledge: object | None = None,
         telemetry: TelemetryPort | None = None,
         security: SecurityPort | None = None,
         owner_alert_resolver: "Callable[[str], list[str]] | None" = None,
@@ -485,6 +486,9 @@ class LLMResponder(ResponderPort):
         self.chat_registry = chat_registry
         self.caldav_service = caldav_service
         self.memory = memory_service
+        #: Public person-knowledge facade.  Read paths that need names, rosters or a
+        #: protected recall use this instead of reaching into contacts/memory stores.
+        self.knowledge = knowledge
         self.telemetry = telemetry
         self.security = security
         self.owner_alert_resolver = owner_alert_resolver
@@ -1076,7 +1080,12 @@ class LLMResponder(ResponderPort):
             allowed_values.extend(str(value) for value in mentioned if str(value or "").strip())
         if target_aliases.intersection(_whatsapp_aliases(*allowed_values)):
             return True
-        if self.contacts_service is not None:
+        knowledge = getattr(self, "knowledge", None)
+        if knowledge is not None:
+            for value in knowledge.known_identifier_values():
+                if target_aliases.intersection(_whatsapp_aliases(str(value))):
+                    return True
+        elif self.contacts_service is not None:  # pragma: no cover - legacy fallback
             for jid in self.contacts_service.known_jids:
                 if target_aliases.intersection(_whatsapp_aliases(str(jid))):
                     return True
@@ -2690,6 +2699,92 @@ class LLMResponder(ResponderPort):
         self._metric("memory_shared_chars", len(result.text))
         return result.text
 
+    def _knowledge_read_context(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        principal: str,
+        is_owner: bool,
+        purpose: str = "reply",
+    ):
+        """Build a trusted read context from the *current* registry membership.
+
+        Returns ``None`` when membership is not proven, which callers must treat as
+        "no personal knowledge" rather than as "everyone".
+        """
+        if self.knowledge is None or not principal:
+            return None
+        from yeoman_gateway.knowledge.models import TrustedReadContext
+        from yeoman_gateway.memory.read_gate import registry_members
+
+        is_direct = not str(chat_id).endswith("@g.us")
+        members = None
+        if self.chat_registry is not None:
+            proven = registry_members(self.chat_registry, channel=channel, chat_id=chat_id)
+            if proven:
+                members = frozenset(str(item) for item in proven)
+        if members is None and is_direct:
+            members = frozenset({principal, str(chat_id)})
+        return TrustedReadContext(
+            principal_id=str(principal),
+            channel=str(channel),
+            chat_id=str(chat_id),
+            recipient_principals=members,
+            membership_revision=None if members is None else f"{channel}:{chat_id}:{len(members)}",
+            policy_revision=self._knowledge_policy_revision(),
+            purpose=purpose,
+            now_ms=int(time.time() * 1000),
+            is_direct=is_direct,
+            owner=bool(is_owner),
+        )
+
+    def _knowledge_policy_revision(self) -> int:
+        revision = getattr(self.knowledge, "policy_revision", None)
+        if isinstance(revision, int):
+            return revision
+        return 1
+
+    def _knowledge_roster_text(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        metadata: dict[str, object],
+        is_owner: bool,
+    ) -> str:
+        """Group roster from proven members and permitted statements only."""
+        if self.knowledge is None:
+            return ""
+        binding = self._trusted_turn_binding()
+        turn = getattr(binding, "turn", None) if binding is not None else None
+        principal = str(getattr(turn, "principal", "") or "")
+        if not principal:
+            return ""
+        context = self._knowledge_read_context(
+            channel=channel,
+            chat_id=chat_id,
+            principal=principal,
+            is_owner=is_owner,
+        )
+        if context is None or not context.membership_known:
+            return ""
+        participants: list[str] = []
+        raw_mentions = metadata.get("mentioned_jids")
+        if isinstance(raw_mentions, list):
+            participants.extend(str(item) for item in raw_mentions if str(item or "").strip())
+        participants.extend(sorted(context.recipient_principals or frozenset()))
+        rows = self.knowledge.roster(
+            context=context, participant_ids=tuple(dict.fromkeys(participants))
+        )
+        if not rows:
+            return ""
+        lines = ["[Group Members]"]
+        for name, facts in rows:
+            facts_text = ", ".join(facts)
+            lines.append(f"- {name}: {facts_text}" if facts_text else f"- {name}")
+        return "\n".join(lines)
+
     def _enqueue_shared_extraction(self, *, channel: str, chat_id: str) -> bool:
         """Queue extraction for the finished turn. Returns True when a job was queued."""
         runtime = self._shared_fact_runtime()
@@ -2777,20 +2872,12 @@ class LLMResponder(ResponderPort):
                 decision.private_handoff_remaining_replies
             )
         # Inject contacts roster for group chats with disclosure enabled
-        if (
-            decision.contacts_disclosure
-            and event.is_group
-            and self.contacts is not None
-        ):
-            mentioned_jids = event.raw_metadata.get("mentioned_jids", [])
-            jids: list[str] = []
-            if isinstance(mentioned_jids, list):
-                jids.extend(str(j) for j in mentioned_jids if isinstance(j, str))
-            for jid in self.contacts.known_jids:
-                if jid not in jids:
-                    jids.append(jid)
-            roster_text = self.contacts.format_roster_text(
-                channel=route_channel, participant_jids=jids,
+        if decision.contacts_disclosure and event.is_group:
+            roster_text = self._knowledge_roster_text(
+                channel=route_channel,
+                chat_id=route_chat_id,
+                metadata=event.raw_metadata,
+                is_owner=bool(decision.is_owner),
             )
             if roster_text:
                 metadata["_contacts_roster_text"] = roster_text

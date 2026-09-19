@@ -1292,6 +1292,13 @@ class StatementEngine:
         return len(rows)
 
 
+def token_re():
+    """Token pattern shared with the scoped legacy recall."""
+    import re
+
+    return re.compile(r"[0-9A-Za-z_]{2,}")
+
+
 def _scope_key(source: SourceRef) -> str:
     return f"channel:{source.channel}:chat:{source.chat_id}"
 
