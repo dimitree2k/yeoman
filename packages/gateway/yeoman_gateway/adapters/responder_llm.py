@@ -1085,10 +1085,6 @@ class LLMResponder(ResponderPort):
             for value in knowledge.known_identifier_values():
                 if target_aliases.intersection(_whatsapp_aliases(str(value))):
                     return True
-        elif self.contacts_service is not None:  # pragma: no cover - legacy fallback
-            for jid in self.contacts_service.known_jids:
-                if target_aliases.intersection(_whatsapp_aliases(str(jid))):
-                    return True
         return False
 
     @staticmethod

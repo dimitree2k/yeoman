@@ -13,8 +13,13 @@ if TYPE_CHECKING:
 class ContactsTool(Tool):
     """CRUD operations on the contacts CRM."""
 
-    def __init__(self, contacts: "ContactsService") -> None:
+    def __init__(
+        self, contacts: "ContactsService", knowledge: object | None = None
+    ) -> None:
         self._contacts = contacts
+        #: Public person-knowledge facade.  Identifier lookups go through it so this
+        #: tool never reads the contacts cache directly.
+        self._knowledge = knowledge
         self._channel = ""
         self._chat_id = ""
 
@@ -116,89 +121,137 @@ class ContactsTool(Tool):
     def _search(self, query: str) -> str:
         if not query:
             return "Error: query is required for search"
-        results = self._contacts.store.search_by_display_name(query)
-        if not results:
-            results = self._contacts.store.search_by_alias(query)
-        if not results:
-            return f"No contacts found matching '{query}'"
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        found = self._knowledge.search_people_with_policy(
+            query, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        )
+        if not found:
+            return f"No people found matching '{query}'"
         lines = []
-        for c in results:
-            idents = self._contacts.store.get_identifiers(c.id)
-            ident_str = ", ".join(f"{i.channel}:{i.identifier}" for i in idents)
-            lines.append(f"- {c.display_name} ({ident_str})")
-        return "Found contacts:\n" + "\n".join(lines)
+        for person in found:
+            identifiers = self._knowledge.person_identifiers(person.person_id)
+            ident_str = ", ".join(f"{item.channel}:{item.value}" for item in identifiers)
+            lines.append(f"- {person.display_name or person.person_id} ({ident_str})")
+        return "Found people:\n" + "\n".join(lines)
 
     def _get(self, name: str) -> str:
         if not name:
             return "Error: name is required"
-        contacts = self._contacts.store.search_by_display_name(name)
-        if not contacts:
-            return f"No contact found with name '{name}'"
-        c = contacts[0]
-        idents = self._contacts.store.get_identifiers(c.id)
-        aliases = self._contacts.store.get_aliases(c.id)
-        fields = self._contacts.store.get_fields(c.id)
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        found = self._knowledge.search_people_with_policy(
+            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        )
+        if not found:
+            return f"No person found with name '{name}'"
+        person = found[0]
+        identifiers = self._knowledge.person_identifiers(person.person_id)
+        aliases = self._knowledge.alias_names(person.person_id)
+        facts = self._knowledge.person_facts(person.person_id)
         lines = [
-            f"Name: {c.display_name}",
-            f"Phone: {c.phone_number or 'N/A'}",
-            f"Owner: {'Yes' if c.is_owner else 'No'}",
+            f"Name: {person.display_name or person.person_id}",
+            f"Person: {person.person_id}",
         ]
-        if idents:
-            lines.append("Identifiers: " + ", ".join(f"{i.kind}={i.identifier}" for i in idents))
+        if identifiers:
+            lines.append(
+                "Identifiers: " + ", ".join(f"{item.kind}={item.value}" for item in identifiers)
+            )
         if aliases:
-            lines.append("Aliases: " + ", ".join(a.alias for a in aliases))
-        if fields:
-            for f in fields:
-                label = f" ({f.label})" if f.label else ""
-                lines.append(f"{f.kind}{label}: {f.value}")
+            lines.append("Observed names: " + ", ".join(aliases))
+        for kind, value, label in facts:
+            label_str = f" ({label})" if label else ""
+            lines.append(f"{kind}{label_str}: {value}")
         return "\n".join(lines)
 
     def _update_name(self, identifier: str, name: str) -> str:
         if not name:
             return "Error: name is required"
-        contact_id: str | None = None
-        if identifier:
-            contact_id = self._contacts.known_jids.get(identifier)
-        if not contact_id:
-            return f"Error: no contact found for identifier '{identifier}'"
-        self._contacts.update_display_name(contact_id, name)
-        return f"Updated display name to '{name}'"
+        if not identifier:
+            return "Error: identifier is required"
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        person_id = self._knowledge.identifier_for_principal(
+            f"whatsapp:{identifier}"
+        ) or self._knowledge.identifier_for_principal(f"telegram:{identifier}")
+        if person_id is None:
+            return f"Error: no person found for identifier '{identifier}'"
+        # A name change is an admin action: Policy decides the authority, not this tool.
+        self._knowledge.set_preferred_name_with_policy(
+            person_id, name, reason="contacts_tool"
+        )
+        return f"Updated preferred name to '{name}'"
 
     def _add_field(self, name: str, kind: str, value: str, label: str | None) -> str:
         if not name or not kind or not value:
             return "Error: name, kind, and value are required"
-        contacts = self._contacts.store.search_by_display_name(name)
-        if not contacts:
-            return f"Error: no contact found with name '{name}'"
-        c = contacts[0]
-        self._contacts.store.add_field(
-            contact_id=c.id, kind=kind, value=value, label=label,
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        found = self._knowledge.search_people_with_policy(
+            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
         )
+        if not found:
+            return f"Error: no person found with name '{name}'"
+        person = found[0]
+        try:
+            receipt = self._knowledge.record_note(
+                person.person_id,
+                content=value,
+                label=label or kind,
+                channel=self._channel or "whatsapp",
+                chat_id=self._chat_id or "cli",
+            )
+        except Exception as exc:  # domain errors are reported, never swallowed
+            return f"Error: {exc}"
         label_str = f" ({label})" if label else ""
-        return f"Added {kind}{label_str}: {value} to {c.display_name}"
+        return (
+            f"Added {kind}{label_str}: {value} to {person.display_name or person.person_id}"
+            f" [statement {receipt.changed_ids[0] if receipt.changed_ids else 'n/a'}]"
+        )
 
     def _remove_field(self, name: str, kind: str, value: str) -> str:
         if not name or not kind or not value:
             return "Error: name, kind, and value are required"
-        contacts = self._contacts.store.search_by_display_name(name)
-        if not contacts:
-            return f"Error: no contact found with name '{name}'"
-        self._contacts.store.delete_field(contacts[0].id, kind, value)
-        return f"Removed {kind}: {value} from {contacts[0].display_name}"
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        found = self._knowledge.search_people_with_policy(
+            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        )
+        if not found:
+            return f"Error: no person found with name '{name}'"
+        person = found[0]
+        erased = self._knowledge.erase_matching_statements(
+            person.person_id, contains=value, reason="contacts_tool_remove_field"
+        )
+        return f"Removed {kind}: {value} from {person.display_name or person.person_id} ({erased} statements)"
 
     def _merge(self, target_name: str, source_name: str) -> str:
         if not target_name or not source_name:
             return "Error: target_name and source_name are required"
-        targets = self._contacts.store.search_by_display_name(target_name)
-        sources = self._contacts.store.search_by_display_name(source_name)
-        if not targets:
-            return f"Error: no contact found with name '{target_name}'"
-        if not sources:
-            return f"Error: no contact found with name '{source_name}'"
-        if targets[0].id == sources[0].id:
-            return "Error: target and source are the same contact"
-        self._contacts.store.merge_contacts(
-            target_id=targets[0].id, source_id=sources[0].id,
+        if self._knowledge is None:
+            return "Error: knowledge is unavailable"
+        targets = self._knowledge.search_people_with_policy(
+            target_name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
         )
-        self._contacts.reload_cache()
-        return f"Merged '{source_name}' into '{target_name}'"
+        sources = self._knowledge.search_people_with_policy(
+            source_name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        )
+        if not targets:
+            return f"Error: no person found with name '{target_name}'"
+        if not sources:
+            return f"Error: no person found with name '{source_name}'"
+        if len(targets) > 1 or len(sources) > 1:
+            # Two matching names must never trigger an automatic merge.
+            return (
+                "Error: the name is ambiguous; use an exact person id"
+                f" (targets={len(targets)}, sources={len(sources)})"
+            )
+        target_id, source_id = targets[0].person_id, sources[0].person_id
+        if target_id == source_id:
+            return "Error: target and source are the same person"
+        receipt = self._knowledge.merge_people_with_policy(
+            target_id, source_id, reason="contacts_tool_merge"
+        )
+        return (
+            f"Merged '{source_name}' into '{target_name}' (operation {receipt.operation_id})"
+        )

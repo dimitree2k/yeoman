@@ -69,6 +69,19 @@ class RuntimeKnowledgePolicy:
     def current_policy_revision(self) -> int:
         return int(self.policy_revision)
 
+    def admin_actor(self) -> str:
+        """The principal the runtime accepts as an owner actor, if Policy names one."""
+        if self.admin_principals:
+            return sorted(self.admin_principals)[0]
+        owners = getattr(self.engine, "owners", None)
+        if isinstance(owners, Mapping):
+            for channel in sorted(owners):
+                for candidate in owners[channel] or ():
+                    token = str(candidate or "").strip()
+                    if token:
+                        return f"{channel}:{token}"
+        return ""
+
     def require_admin(self, context: TrustedAdminContext) -> str:
         if not context.owner:
             raise KnowledgeError("unauthorized", "admin context lacks owner authority")

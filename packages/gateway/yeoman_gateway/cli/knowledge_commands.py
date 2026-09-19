@@ -130,27 +130,25 @@ def migration_verify(
 
 
 def _print_inventory(inventory: MigrationInventory) -> None:
-    for source in (inventory.contacts, inventory.memory):
-        table = Table(title=Text(f"{source.path.name}  sha256:{source.fingerprint}"))
+    for label, source in (("contacts", inventory.contacts), ("memory", inventory.memory)):
+        _line(f"{label} snapshot: {source.path}")
+        _line(
+            f"  sha256:{source.fingerprint}"
+            f"  schema_version: {source.schema_version or 'unknown'}"
+            f"  tables: {len(source.tables)}"
+            f"  unsupported: {len(source.unsupported)}"
+            f"  identifier conflicts: {len(source.identifier_conflicts)}"
+        )
+        table = Table(title=Text(f"{label} tables"))
         table.add_column("table")
         table.add_column("rows", justify="right")
         for name, count in source.row_counts:
             table.add_row(name, str(count))
         console.print(table)
-        console.print(
-            Text(
-                f"  schema_version: {source.schema_version or 'unknown'}"
-                f"   tables: {len(source.tables)}"
-                f"   unsupported: {len(source.unsupported)}"
-                f"   identifier conflicts: {len(source.identifier_conflicts)}"
-            )
-        )
         if source.unsupported:
-            console.print(
-                Text(f"  unsupported objects: {', '.join(source.unsupported)}", style="yellow")
-            )
+            _line(f"  unsupported objects: {', '.join(source.unsupported)}", style="yellow")
     for statement in inventory.statements:
-        console.print(Text(f"- {statement}"))
+        _line(f"- {statement}")
 
 
 def _print_report(report: MigrationReport) -> None:
@@ -163,36 +161,35 @@ def _print_report(report: MigrationReport) -> None:
     console.print(table)
     quarantined = sum(count for _table, _reason, count in report.quarantined)
     for name, reason, count in report.quarantined:
-        console.print(Text(f"  quarantined {name}: {reason} x{count}", style="yellow"))
-    console.print(Text(f"target: {report.target_path}  sha256:{report.target_fingerprint}"))
-    console.print(Text(f"manifest: {report.manifest_path}  migration_complete=false"))
-    console.print(
-        Text(
-            f"imported rows: {report.imported_rows}"
-            f"   quarantined rows: {quarantined}"
-            f"   unaccounted rows: {report.unaccounted_rows}"
-        )
+        _line(f"  quarantined {name}: {reason} x{count}", style="yellow")
+    _line(f"target: {report.target_path}  sha256:{report.target_fingerprint}")
+    _line(f"manifest: {report.manifest_path}  migration_complete=false")
+    _line(
+        f"imported rows: {report.imported_rows}"
+        f"   quarantined rows: {quarantined}"
+        f"   unaccounted rows: {report.unaccounted_rows}"
     )
 
 
 def _print_verification(report: VerificationReport) -> None:
-    console.print(Text(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}"))
-    console.print(
-        Text(f"foreign_key_check: {'ok' if report.foreign_keys_ok else 'failed'}")
+    _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
+    _line(f"foreign_key_check: {'ok' if report.foreign_keys_ok else 'failed'}")
+    _line(
+        "target fingerprint: "
+        + ("matches manifest" if report.fingerprint_ok else "does not match manifest")
     )
-    console.print(
-        Text(
-            "target fingerprint: "
-            + ("matches manifest" if report.fingerprint_ok else "does not match manifest")
-        )
+    _line(
+        f"table counts: {'match manifest' if report.counts_match else 'differ'} "
+        f"({len(report.mismatches)} mismatches)"
     )
-    console.print(
-        Text(
-            f"table counts: {'match manifest' if report.counts_match else 'differ'} "
-            f"({len(report.mismatches)} mismatches)"
-        )
-    )
-    console.print(Text(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red"))
+    for table, expected, actual in report.mismatches:
+        _line(f"  {table}: manifest says {expected} rows, target has {actual}")
+    _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
+
+
+def _line(message: str, *, style: str = "") -> None:
+    """Print one diagnostic line without wrapping or cropping (paths stay intact)."""
+    console.print(Text(message, style=style or None), soft_wrap=True)
 
 
 def _reason_code(reason: str) -> str:

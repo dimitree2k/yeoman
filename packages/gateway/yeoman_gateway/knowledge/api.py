@@ -540,6 +540,25 @@ class KnowledgeService:
             state="ready",
         )
 
+    # ── private storage bindings for the internal runtime adapters ───────────
+    #
+    # These return sub-stores that *join* this service's connection.  They exist for the
+    # two internal adapters (session notes/backlog and the contacts cache) and for the
+    # composition root.  They are not part of the consumer contract: external callers
+    # use the typed methods above and never receive a store handle.
+
+    def memory_store(self) -> Any:
+        """The session/notes adapter's view of the shared store.  Internal use only."""
+        from yeoman_gateway.memory.store import MemoryStore
+
+        return MemoryStore(owner=self._store)
+
+    def contacts_store(self) -> Any:
+        """The contacts cache adapter's view of the shared store.  Internal use only."""
+        from yeoman_gateway.contacts.store import ContactsStore
+
+        return ContactsStore(owner=self._store)
+
     # ── internal helpers used by the runtime adapters ────────────────────────
 
     def display_name(
@@ -669,6 +688,311 @@ class KnowledgeService:
         if principal_person:
             keys.append(f"contact:{principal_person}")
         return tuple(dict.fromkeys(keys))
+
+    def admin_context_for(self, *, reason: str) -> TrustedAdminContext:
+        """Issue an admin context from Policy's own owner decision.
+
+        Runtime surfaces (tools, CLI) never build admin authority from their arguments;
+        they ask here and Policy decides.
+        """
+        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+        if not actor:
+            raise KnowledgeError("unauthorized", "no owner actor is available from policy")
+        return TrustedAdminContext(
+            actor_principal=str(actor),
+            policy_revision=self.policy_revision,
+            authorization_ref=f"policy:{reason}",
+            owner=True,
+        )
+
+    def maintenance_scope_keys(
+        self,
+        *,
+        scope: str,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Scope keys for an authorized maintenance query.
+
+        Administrative diagnostics may filter by scope; the key layout stays inside the
+        module so no consumer builds these strings itself.
+        """
+        keys: list[str] = []
+        if scope in {"chat", "all"} and channel and chat_id:
+            keys.append(f"channel:{channel}:chat:{chat_id}")
+        if scope in {"user", "all"} and channel and (sender_id or chat_id):
+            keys.append(f"channel:{channel}:user:{(sender_id or chat_id or '').strip()}")
+        if scope in {"global", "all"}:
+            keys.append(f"workspace:{self.workspace_id}:global")
+        return tuple(keys)
+
+    def person_id_for_value(self, value: str) -> str | None:
+        """Person id for a proven identifier value, searched across channels."""
+        token = str(value or "").strip()
+        if not token:
+            return None
+        candidates: list[str] = [token]
+        local = token.split("@", 1)[0]
+        if local and local != token:
+            candidates.append(local)
+        for candidate in dict.fromkeys(candidates):
+            row = self._store.query_one(
+                "SELECT person_id FROM knowledge_identifier_bindings"
+                " WHERE value = ? AND status = 'active' LIMIT 1",
+                (candidate,),
+            )
+            if row is not None:
+                return self.canonical_id(str(row["person_id"]))
+            legacy = self._store.query_one(
+                "SELECT contact_id FROM contact_identifiers WHERE identifier = ? LIMIT 1",
+                (candidate,),
+            )
+            if legacy is not None:
+                return self.canonical_id(str(legacy["contact_id"]))
+        return None
+
+    def canonical_id(self, person_id: str) -> str:
+        """Current canonical person for an original (possibly merged) person id."""
+        return self._identity.canonical_id(person_id)
+
+    def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
+        """Proven identifier bindings of a person, for diagnostics and tools."""
+        return tuple(item.identifier for item in self._identity.active_bindings_of(person_id))
+
+    def record_note(
+        self,
+        person_id: str,
+        *,
+        content: str,
+        label: str | None = None,
+        channel: str = "cli",
+        chat_id: str = "cli",
+    ) -> ChangeReceipt:
+        """Record an administrator's hand-written note as a real statement.
+
+        The note receives a persistent administrative source receipt and its audience is
+        the owner only - never derived from free text and never widened by a person link.
+        """
+        context = self.admin_context_for(reason=f"note:{label or 'manual'}")
+        person = self._identity.canonical_id(person_id)
+        if self._identity.get_person(person) is None:
+            raise KnowledgeError("unresolved", f"unknown person: {person_id}")
+        source = SourceRef(
+            event_id=f"admin-note:{context.authorization_ref}:{self._store.new_id()}",
+            revision=1,
+            channel=str(channel),
+            chat_id=str(chat_id),
+            author_principal=context.actor_principal,
+            occurred_at_ms=self._now(),
+        )
+        register = getattr(self._authority, "register_source", None)
+        if register is None:
+            raise KnowledgeError("unauthorized", "administrative sources are not available")
+        from yeoman_gateway.knowledge.authority import EvidenceAudience
+
+        register(source, EvidenceAudience.author_only(snapshot_id="owner_note"))
+        candidate = StatementCandidate(
+            content=str(content),
+            sources=(source,),
+            people=(
+                PersonLinkCandidate(
+                    person_id=person,
+                    role="subject",
+                    source=source,
+                    attribution="confirmed",
+                ),
+            ),
+            extractor_version="admin-note-v1",
+            confidence=1.0,
+            kind="note",
+        )
+        capture_context = TrustedCaptureContext(
+            request_id=f"admin-note:{source.event_id}",
+            policy_revision=self.policy_revision,
+            capture_basis="owner_private_note",
+            authorized_sources=(source,),
+            actor_principal=context.actor_principal,
+            authorized=True,
+        )
+        with self._store.transaction():
+            result = self._statements.capture(candidate, context=capture_context)
+        return ChangeReceipt(
+            operation_id=source.event_id,
+            identity_revision=self._store.identity_revision,
+            acl_epoch=self._store.acl_epoch,
+            changed_ids=result.statement_ids,
+        )
+
+    def erase_matching_statements(
+        self, person_id: str, *, contains: str, reason: str = "admin"
+    ) -> int:
+        """Erase the statements about a person whose text contains a token.
+
+        Used by the administrative remove-field action: the caller names the content,
+        the service decides which authorized statements actually match.
+        """
+        needle = str(contains or "").strip()
+        if not needle:
+            return 0
+        rows = self._store.query(
+            "SELECT s.statement_id, n.content, src.event_id, src.revision, src.channel,"
+            " src.chat_id, src.author_principal, src.occurred_at_ms"
+            " FROM knowledge_statements s"
+            " JOIN memory2_nodes n ON n.id = s.statement_id"
+            " JOIN knowledge_statement_sources src ON src.statement_id = s.statement_id"
+            " WHERE s.status <> 'revoked' AND n.content LIKE ?"
+            " AND s.statement_id IN (SELECT statement_id FROM knowledge_statement_people"
+            "                        WHERE person_id = ?)",
+            (f"%{needle}%", str(person_id)),
+        )
+        context = self.admin_context_for(reason=reason)
+        erased = 0
+        for row in rows:
+            expected = SourceRef(
+                event_id=str(row["event_id"]),
+                revision=int(row["revision"]),
+                channel=str(row["channel"]),
+                chat_id=str(row["chat_id"]),
+                author_principal=str(row["author_principal"]),
+                occurred_at_ms=int(row["occurred_at_ms"]),
+            )
+            with self._store.transaction():
+                self._statements.erase_statement(
+                    str(row["statement_id"]), expected_source=expected, context=context
+                )
+            erased += 1
+        return erased
+
+    def merge_people_with_policy(
+        self, target_id: str, source_id: str, *, reason: str = "admin"
+    ) -> ChangeReceipt:
+        """Reversible merge with a Policy-issued admin context."""
+        context = self.admin_context_for(reason=reason)
+        with self._store.transaction():
+            return self._identity.merge_people(
+                target_id,
+                source_id,
+                expected_revision=self._store.identity_revision,
+                context=context,
+            )
+
+    def search_people_with_policy(
+        self,
+        name: str,
+        *,
+        channel: str = "whatsapp",
+        chat_id: str = "cli",
+        purpose: str = "admin",
+    ) -> tuple[PersonResolution, ...]:
+        """Name lookup for authorized surfaces; several people may share a name."""
+        context = TrustedReadContext(
+            principal_id=self._policy.admin_actor()
+            if hasattr(self._policy, "admin_actor")
+            else "owner",
+            channel=str(channel),
+            chat_id=str(chat_id),
+            recipient_principals=frozenset(
+                {
+                    self._policy.admin_actor()
+                    if hasattr(self._policy, "admin_actor")
+                    else "owner"
+                }
+            ),
+            membership_revision="admin",
+            policy_revision=self.policy_revision,
+            purpose=purpose if purpose in ("reply", "proactive", "profile", "admin") else "admin",
+            now_ms=self._now(),
+            is_direct=True,
+            owner=True,
+        )
+        return self._identity.search_by_name(name, context=context)
+
+    def person_facts(
+        self, person_id: str, *, context: TrustedReadContext | None = None
+    ) -> tuple[tuple[str, str, str | None], ...]:
+        """Released profile facts of a person: (kind, value, label).
+
+        This is a projection over permitted statements, never a copy stored in a
+        contact field.
+        """
+        rows = self._store.query(
+            "SELECT statement_id, status FROM knowledge_statements"
+            " WHERE speaker_person_id = ? OR statement_id IN"
+            " (SELECT statement_id FROM knowledge_statement_people WHERE person_id = ?)"
+            " ORDER BY created_ms DESC LIMIT 50",
+            (str(person_id), str(person_id)),
+        )
+        facts: list[tuple[str, str, str | None]] = []
+        for row in rows:
+            statement_id = str(row["statement_id"])
+            readable = True
+            if context is not None:
+                readable = bool(
+                    self.recall(RecallQuery(person_ids=(person_id,), limit=50), context=context)
+                    .statement_ids
+                )
+            if not readable:
+                continue
+            summary = self._statements.get_statement(statement_id)
+            if summary is None or not summary.content:
+                continue
+            facts.append(("statement", summary.content, summary.status))
+        return tuple(facts)
+
+    def set_preferred_name_with_policy(
+        self,
+        person_id: str,
+        name: str,
+        *,
+        reason: str = "tool",
+        visibility: str = "public",
+    ) -> ChangeReceipt:
+        """Owner path for name changes requested from an authorized runtime surface.
+
+        The admin context is issued here from the Policy authority's own owner decision -
+        never from tool arguments - and the caller only supplies the person and the name.
+        """
+        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+        if not actor:
+            raise KnowledgeError("unauthorized", "no owner actor is available from policy")
+        context = TrustedAdminContext(
+            actor_principal=str(actor),
+            policy_revision=self.policy_revision,
+            authorization_ref=f"policy:{reason}",
+            owner=True,
+        )
+        return self.set_preferred_name(person_id, name, context=context, visibility=visibility)
+
+    def roster_for_chat(
+        self,
+        *,
+        context: TrustedReadContext,
+        participant_ids: tuple[str, ...] = (),
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Backwards-compatible alias of :meth:`roster` with an explicit tuple."""
+        return self.roster(context=context, participant_ids=participant_ids)
+
+    def identifier_for_principal(
+        self, principal: str, *, prefer_kind: str | None = None
+    ) -> Identifier | None:
+        """The proven identifier of one principal, or ``None``.
+
+        Replaces direct lookups in the old in-memory identifier cache; the answer comes
+        from stored bindings, not from a name.
+        """
+        person_id = self.person_for_principal(principal)
+        if person_id is None:
+            return None
+        channel = str(principal).partition(":")[0] or "whatsapp"
+        resolution = self._identity.resolve_endpoint(person_id, channel, prefer_kind=prefer_kind)
+        return resolution.identifier
+
+    def person_display_name(
+        self, person_id: str, *, context: TrustedReadContext | None = None
+    ) -> str | None:
+        """Eligible address of a person.  Without a context: released names only."""
+        return self.display_name(person_id, context=context)
 
     def known_identifier_values(self) -> tuple[str, ...]:
         """Every identifier value the runtime knows, without exposing owner mapping.

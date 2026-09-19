@@ -253,11 +253,12 @@ class IdentityEngine:
             ),
         )
         # Keep the legacy contact_identifiers cache in step for the migration window.
+        # The claim is atomic: whoever inserts the row first owns the identifier, and a
+        # loser never overwrites an existing owner.
         self._store.execute(
             "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
             " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(channel, identifier) DO UPDATE SET"
-            " contact_id = excluded.contact_id, kind = excluded.kind",
+            " ON CONFLICT(channel, identifier) DO NOTHING",
             (identifier.channel, identifier.value, person_id, identifier.kind),
         )
 
@@ -276,8 +277,36 @@ class IdentityEngine:
         self._store.execute(
             "INSERT INTO contacts (id, display_name, phone_number, is_owner, created_at,"
             " updated_at, revision, status, preferred_name_visibility)"
-            " VALUES (?, ?, NULL, 0, ?, ?, 1, 'active', 'public')",
+            " VALUES (?, ?, NULL, 0, ?, ?, 1, 'active', 'public')"
+            " ON CONFLICT(id) DO NOTHING",
             (person_id, display, iso, iso),
+        )
+        claimed = self._store.execute(
+            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(channel, identifier) DO NOTHING",
+            (identifier.channel, identifier.value, person_id, identifier.kind),
+        )
+        if not claimed.rowcount:
+            # Another observer already owns this identifier: drop this stub entirely
+            # (the savepoint in resolve_observation rolls the contact row back too) and
+            # let the caller read the winner.
+            raise sqlite3.IntegrityError("identifier is already bound")
+        self._store.execute(
+            "INSERT INTO knowledge_identifier_bindings"
+            " (channel, kind, value, person_id, status, evidence_ref, mapping_verified,"
+            "  created_ms, updated_ms) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)"
+            " ON CONFLICT(channel, kind, value) DO NOTHING",
+            (
+                identifier.channel,
+                identifier.kind,
+                identifier.value,
+                person_id,
+                evidence_ref,
+                int(mapping_verified),
+                ts,
+                ts,
+            ),
         )
         self._bind(
             person_id=person_id,

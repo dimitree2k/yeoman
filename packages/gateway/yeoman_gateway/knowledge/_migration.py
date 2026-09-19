@@ -6,7 +6,10 @@ This module is deliberately boring and offline:
   :mod:`yeoman_gateway.app.bootstrap`;
 * legacy snapshots are opened through a ``mode=ro`` SQLite URI only (see
   :func:`yeoman_gateway.knowledge._store.open_readonly`) and are never written to, not
-  even by a journal or WAL rollback;
+  even by a journal or WAL rollback.  A read-only open of a WAL-flagged snapshot makes
+  SQLite create empty ``-wal``/``-shm`` sidecars; those are removed again on close, so
+  the snapshot directory is left exactly as it was found (a pre-existing sidecar is
+  never touched, and a non-empty ``-wal``/``-journal`` is refused outright);
 * every SQL *value* is a bound parameter.  SQL identifiers come from this module's
   allow-list or from ``PRAGMA table_info`` and are quoted, never interpolated from
   data;
@@ -142,7 +145,7 @@ _FINGERPRINT_CHUNK: Final[int] = 1024 * 1024
 _REPORTABLE_TYPES: Final[tuple[str, ...]] = ("table", "view")
 
 
-class UnsupportedSchema(Exception):
+class UnsupportedSchema(Exception):  # noqa: N818 - public name fixed by the phase contract
     """Raised when a source snapshot cannot be imported without guessing."""
 
     def __init__(self, reason: str, detail: str = "") -> None:
@@ -262,13 +265,47 @@ class _SourceHandle:
     counts: dict[str, int]
     #: Allow-listed objects that are not migrated: ``(table, rows, reason)``.
     ignored: tuple[tuple[str, int, str], ...]
+    #: ``-wal``/``-shm`` sidecars that existed before this read (never removed).
+    sidecars_before: frozenset[Path]
 
     def close(self) -> None:
         self.connection.close()
+        _remove_read_sidecars(self.path, self.sidecars_before)
+
+
+def _read_sidecars(path: Path) -> frozenset[Path]:
+    return frozenset(
+        candidate
+        for candidate in (
+            path.with_name(path.name + "-wal"),
+            path.with_name(path.name + "-shm"),
+        )
+        if candidate.exists()
+    )
+
+
+def _remove_read_sidecars(path: Path, before: frozenset[Path]) -> None:
+    """Drop the empty WAL sidecars a read-only open of a WAL snapshot creates.
+
+    SQLite creates ``-shm``/``-wal`` next to a WAL-flagged database even for a
+    read-only connection; the source file itself is never touched.  Removing only the
+    files that did not exist before this read keeps the snapshot directory exactly as
+    it was found, and a pre-existing sidecar is never deleted.
+    """
+    for suffix in ("-wal", "-shm"):
+        candidate = path.with_name(path.name + suffix)
+        if candidate in before or not candidate.exists():
+            continue
+        try:
+            if candidate.stat().st_size == 0 or suffix == "-shm":
+                candidate.unlink()
+        except OSError:  # pragma: no cover - defensive
+            continue
 
 
 def _open_source(role: str, path: Path) -> _SourceHandle:
     _require_snapshot_file(path)
+    sidecars_before = _read_sidecars(path)
     connection = _connect_readonly(path)
     try:
         objects = _read_objects(connection, path)
@@ -292,6 +329,7 @@ def _open_source(role: str, path: Path) -> _SourceHandle:
         )
     except BaseException:
         connection.close()
+        _remove_read_sidecars(path, sidecars_before)
         raise
     return _SourceHandle(
         role=role,
@@ -300,6 +338,7 @@ def _open_source(role: str, path: Path) -> _SourceHandle:
         inventory=inventory,
         counts=counts,
         ignored=ignored,
+        sidecars_before=sidecars_before,
     )
 
 
@@ -983,6 +1022,7 @@ def verify_target(*, target: Path, manifest: Path) -> VerificationReport:
     payload = _read_manifest(manifest_path)
     if not target_path.exists():
         raise MigrationSourceError("target_missing", f"target does not exist: {target_path}")
+    sidecars_before = _read_sidecars(target_path)
     connection = _connect_readonly(target_path)
     try:
         integrity_ok = _integrity_ok(connection)
@@ -990,6 +1030,7 @@ def verify_target(*, target: Path, manifest: Path) -> VerificationReport:
         mismatches = _count_mismatches(connection, payload, target_path)
     finally:
         connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
     expected = str(payload.get("target_fingerprint") or "")
     fingerprint_ok = bool(expected) and expected == file_fingerprint(target_path)
     counts_match = not mismatches

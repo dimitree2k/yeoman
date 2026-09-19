@@ -103,11 +103,16 @@ def chat_participant_identifiers(
 def _display_for_identifier(
     contacts: "ContactsService",
     identifier: str,
+    *,
+    knowledge: object | None = None,
 ) -> str | None:
-    contact_id = contacts.known_jids.get(identifier)
-    if not contact_id:
+    """Released display name for an identifier, resolved through the public facade."""
+    if knowledge is None:
         return None
-    return contacts.get_display_name(contact_id)
+    person_id = knowledge.person_id_for_value(identifier)
+    if person_id is None:
+        return None
+    return knowledge.person_display_name(person_id)
 
 
 def _contact_identifiers(
@@ -144,6 +149,7 @@ def _reference_matches_labels(
 def resolve_contact_reference(
     *,
     contacts: "ContactsService",
+    knowledge: object | None = None,
     reference: str,
     channel: str,
     chat_id: str,
@@ -162,7 +168,9 @@ def resolve_contact_reference(
         for candidate in mention_candidates:
             mapped = participant_map.get(candidate, candidate)
             for identifier in (mapped, candidate):
-                display = _display_for_identifier(contacts, identifier)
+                display = _display_for_identifier(
+                    contacts, identifier, knowledge=knowledge
+                )
                 if display:
                     return ContactResolution(
                         display_name=display,
@@ -212,24 +220,19 @@ def contact_resolution_matches_reference(
     contacts: "ContactsService",
     reference: str,
     resolution: ContactResolution,
+    knowledge: object | None = None,
 ) -> bool:
     """Check that an exact mention resolves to one candidate for a name/alias."""
-    contact_id = contacts.known_jids.get(resolution.jid)
-    if not contact_id and resolution.matched_identifier:
-        contact_id = contacts.known_jids.get(resolution.matched_identifier)
-    if not contact_id:
+    if knowledge is None:
         return False
-    contact = contacts.store.get_contact(contact_id)
-    if contact is None:
+    person_id = knowledge.person_id_for_value(resolution.jid)
+    if person_id is None and resolution.matched_identifier:
+        person_id = knowledge.person_id_for_value(resolution.matched_identifier)
+    if person_id is None:
         return False
-    labels = [
-        contact.display_name,
-        *[
-            alias.alias
-            for alias in contacts.store.get_aliases(contact_id)
-        ],
-    ]
-    return _reference_matches_labels(reference, labels)
+    labels = [knowledge.person_display_name(person_id) or ""]
+    labels.extend(knowledge.alias_names(person_id))
+    return _reference_matches_labels(reference, [label for label in labels if label])
 
 
 class ResolveContactTool(Tool):
@@ -239,9 +242,11 @@ class ResolveContactTool(Tool):
         self,
         *,
         contacts: "ContactsService",
+        knowledge: object | None = None,
         chat_registry: "ChatRegistry | None" = None,
     ) -> None:
         self._contacts = contacts
+        self._knowledge = knowledge
         self._chat_registry = chat_registry
         self._channel = ""
         self._chat_id = ""
@@ -279,6 +284,7 @@ class ResolveContactTool(Tool):
         del kwargs
         result = resolve_contact_reference(
             contacts=self._contacts,
+            knowledge=self._knowledge,
             reference=query,
             channel=self._channel,
             chat_id=self._chat_id,
