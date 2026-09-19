@@ -7,9 +7,12 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+from yeoman_shared.config.schema import Config
 
 
 class _LearnedTasteTools:
+    config = Config()
+
     def __init__(
         self,
         *,

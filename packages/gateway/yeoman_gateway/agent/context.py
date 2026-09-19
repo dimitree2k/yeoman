@@ -539,7 +539,7 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         messages.append({"role": "system", "content": clock_context})
 
         reply_budget_context = self._build_reply_budget_context(current_metadata)
-        if reply_budget_context and not compact:
+        if reply_budget_context:
             messages.append({"role": "system", "content": reply_budget_context})
 
         # Retrieved long-term memory (bounded, synthetic system context)

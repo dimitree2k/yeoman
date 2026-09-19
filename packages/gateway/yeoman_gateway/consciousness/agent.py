@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -31,6 +32,7 @@ class ConsciousnessAgent:
         target_channel: str | None = None,
         target_chat_id: str | None = None,
     ) -> dict[str, object]:
+        started_at = time.monotonic()
         self._tools.begin_run(trigger=trigger)
         logger.info(
             "consciousness agent run_once trigger={} target_channel={} target_chat={}",
@@ -123,6 +125,36 @@ class ConsciousnessAgent:
                 trigger=trigger,
             )
 
+        cfg = self._tools.config.consciousness
+        if len(message) > int(cfg.max_speakup_length_chars):
+            freshness_minutes = (
+                cfg.burst_window_minutes if trigger == "burst"
+                else cfg.lull_activity_window_minutes
+            )
+            deadline = started_at + max(1, int(freshness_minutes)) * 60
+            if time.monotonic() >= deadline:
+                return {"status": "rejected", "reason": "stale_rewrite_context"}
+            rewrite_prompt = json.loads(prompt)
+            rewrite_prompt["instruction"] = (
+                'Return JSON only: {"message": "..."} or {"silence": true}. '
+                "Rewrite draft_message semantically as one thought in 1-2 short sentences. "
+                "Follow message_limits; preserve its meaning, persona, and reply context. "
+                "Do not truncate or choose a new target, action, confidence, or reply anchor."
+            )
+            rewrite_prompt["draft_message"] = message
+            rewrite_prompt["original_decision"] = decision
+            rewritten = self._planner(json.dumps(rewrite_prompt, default=str))
+            if inspect.isawaitable(rewritten):
+                rewritten = await rewritten
+            if time.monotonic() >= deadline:
+                return {"status": "rejected", "reason": "stale_rewrite_context"}
+            rewrite = self._parse_decision(rewritten)
+            replacement = rewrite.get("message")
+            if rewrite.get("silence") is True or not isinstance(replacement, str):
+                return {"status": "rejected", "reason": "invalid_rewrite_response"}
+            # Only text changes; the original decision still owns all routing metadata.
+            message = replacement.strip()
+
         reply_to_raw = decision.get("reply_to_message_id")
         reply_to = str(reply_to_raw).strip() if reply_to_raw else None
         action_type = str(decision.get("action_type") or "observation")
@@ -213,8 +245,10 @@ class ConsciousnessAgent:
                 selected_profile = str(candidate.get("profile") or "").strip()
                 break
         profile_rules = self._profile_rules(selected_profile)
+        max_chars = int(self._tools.config.consciousness.max_speakup_length_chars)
         return json.dumps(
             {
+                "message_limits": {"target_chars": min(350, max_chars), "max_chars": max_chars},
                 "instruction": (
                     "Return JSON only. Either {\"silence\": true, \"reason\": \"...\"} "
                     "or one proposal with chat_id, message, action_type, confidence, "
@@ -225,6 +259,10 @@ class ConsciousnessAgent:
                 ),
                 "trigger": trigger,
                 "golden_rules": [
+                    f"Express one thought in 1-2 short sentences. Aim for at most "
+                    f"{min(350, max_chars)} characters; the hard maximum is {max_chars} "
+                    "characters including spaces. Prefer silence if a useful thought "
+                    "cannot fit; never cut a sentence off to fit.",
                     *trigger_rules,
                     *profile_rules,
                     "Do NOT echo, paraphrase, or restate any message in chat_window. "

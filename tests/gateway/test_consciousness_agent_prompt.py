@@ -7,9 +7,12 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.consciousness.agent import ConsciousnessAgent
+from yeoman_shared.config.schema import Config
 
 
 class _PromptTools:
+    config = Config()
+
     def __init__(self, *, trigger: str = "burst") -> None:
         self._trigger = trigger
 

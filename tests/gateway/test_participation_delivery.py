@@ -3,7 +3,7 @@
 These tests use real temporary SQLite stores and synthetic identities. Nothing here
 contacts a transport, a provider or a live chat. ``transport_accepted`` consumes the
 send allowance; ``delivered`` requires exact recipient evidence; an unresolved hold
-never regains capacity by crossing a window boundary (spec section 9).
+keeps its evidence after its ten-minute budget lease expires.
 """
 
 from __future__ import annotations
@@ -1229,6 +1229,46 @@ async def test_duplicate_reservation_for_same_effect_is_idempotent(tmp_path: Pat
     assert await log.consumed_slots(
         channel=CHANNEL, chat_id=CHAT, category="comment", now_ms=2000, window_ms=HOUR_MS
     ) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window_kind", ["rolling", "calendar_day"])
+async def test_transport_acceptance_expires_from_budget_without_recipient_receipt(
+    tmp_path: Path, window_kind: str,
+) -> None:
+    log = SpeakupLog(tmp_path / "speakups.db")
+    await _proposal(log, "p1")
+    limits = (("initiation", 1, HOUR_MS, window_kind),)
+    accepted_ms = DAY_MS - 1000
+    assert await log.reserve_delivery(
+        proposal_id="p1", effect_id="e1", channel=CHANNEL, chat_id=CHAT,
+        now_ms=accepted_ms, limits=limits,
+    )
+    await log.project_transport_accepted(
+        "p1", effect_id="e1", provider_message_id="prov-1",
+        evidence_kind="transport_receipt", evidence_ref="receipt-1",
+        now_ms=accepted_ms,
+    )
+    record = await log.delivery_record(proposal_id="p1", effect_id="e1")
+    assert not await log.reserve_delivery(
+        proposal_id="p2", effect_id="e2", channel=CHANNEL, chat_id=CHAT,
+        now_ms=accepted_ms + 1, limits=limits,
+    )
+    log.close()
+    log = SpeakupLog(tmp_path / "speakups.db")
+    boundary_ms = accepted_ms + HOUR_MS if window_kind == "rolling" else DAY_MS
+    assert await log.consumed_slots(
+        channel=CHANNEL, chat_id=CHAT, category="initiation",
+        now_ms=boundary_ms, window_ms=HOUR_MS, window_kind=window_kind,
+    ) == 0
+    assert await log.reserve_delivery(
+        proposal_id="p2", effect_id="e2", channel=CHANNEL, chat_id=CHAT,
+        now_ms=boundary_ms, limits=limits,
+    )
+    # Aging accounting must neither rewrite delivery evidence nor resubmit e1.
+    assert await log.delivery_record(proposal_id="p1", effect_id="e1") == record
+    assert await log.delivery_state(proposal_id="p1", effect_id="e1") == "transport_accepted"
     log.close()
 
 
@@ -2463,14 +2503,14 @@ async def test_reconciler_retains_unknown_and_missing_effects(tmp_path: Path) ->
     assert counters["retained"] == 1
     assert await log.delivery_state(proposal_id="p1", effect_id="missing") == "reserved"
     assert await log.delivery_state(proposal_id="p2", effect_id="e2") == "delivery_unknown"
-    # Both holds survive a window boundary.
+    # Evidence survives, but both ten-minute budget leases have expired.
     assert await log.consumed_slots(
         channel=CHANNEL,
         chat_id=CHAT,
         category="comment",
         now_ms=1000 + 2 * HOUR_MS,
         window_ms=HOUR_MS,
-    ) == 2
+    ) == 0
     store.close()
     log.close()
 

@@ -26,6 +26,7 @@ from loguru import logger
 from yeoman_shared.reactions import SYSTEM_ORIGIN, allowed_reaction
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
+from yeoman_gateway.consciousness.log import DELIVERY_RESERVATION_TTL_MS
 from yeoman_gateway.core.intents import SendOutboundIntent, SendReactionIntent
 from yeoman_gateway.processing.budget import ChatBudget, ThreadBudget
 from yeoman_gateway.processing.models import (
@@ -120,6 +121,7 @@ class BusEffectExecutor:
         direct_sender: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         direct_reaction_sender: Callable[[ReactionMessage], Awaitable[None]] | None = None,
         participation_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
+        reservation_pre_dispatch: Callable[[EffectEnvelope], tuple[bool, str]] | None = None,
     ) -> None:
         self._bus = bus
         self._mark_provenance = mark_provenance
@@ -128,6 +130,7 @@ class BusEffectExecutor:
         self._direct_sender = direct_sender
         self._direct_reaction_sender = direct_reaction_sender
         self._participation_pre_dispatch = participation_pre_dispatch
+        self._reservation_pre_dispatch = reservation_pre_dispatch
         self._confirm = confirm
         self._delete_handler = delete_handler
         self._external_handler = external_handler
@@ -307,6 +310,10 @@ class BusEffectExecutor:
         )
 
     def _check_participation_pre_dispatch(self, envelope: EffectEnvelope) -> None:
+        if self._reservation_pre_dispatch is not None:
+            allowed, reason = self._reservation_pre_dispatch(envelope)
+            if not allowed:
+                raise ParticipationPreDispatchDenied(reason)
         if envelope.origin != "participation":
             return
         checker = self._participation_pre_dispatch
@@ -957,6 +964,15 @@ class IntentEffectRouter:
             thread_id=str(getattr(turn, "thread_id", "") or ""), now_ms=now
         )
 
+        expires_at_ms = now + deadline_ms
+        row_reader = getattr(self._participation_ledger, "_delivery_row_for_effect", None)
+        reservation = row_reader(effect_id) if effect_id and callable(row_reader) else None
+        if reservation is not None:
+            expires_at_ms = min(
+                expires_at_ms,
+                int(reservation["created_at_ms"]) + DELIVERY_RESERVATION_TTL_MS,
+            )
+
         envelope = EffectEnvelope(
             effect_id=effect_id or uuid.uuid4().hex,
             operation_key=f"{operation_key}:{turn_id}:{turn_revision}",
@@ -967,7 +983,7 @@ class IntentEffectRouter:
             turn_revision=turn_revision,
             principal=principal,
             capability=CAPABILITY_BY_KIND[payload.kind],
-            expires_at_ms=now + deadline_ms,
+            expires_at_ms=expires_at_ms,
             created_ms=now,
             origin="participation" if admission is not None else "legacy",
             admission_id=(

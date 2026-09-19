@@ -954,3 +954,92 @@ async def test_agent_missing_target_channel_with_chat_skips_planner(tmp_path: Pa
         "channel": "missing",
     }
     assert planner_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cap', [200, 500])
+async def test_short_speakup_prompt_binds_config_and_sends_directly(tmp_path, cap):
+    tools = _tools(tmp_path, config=_config(maxSpeakupLengthChars=cap))
+    calls = []
+
+    def planner(prompt):
+        payload = json.loads(prompt)
+        calls.append(payload)
+        limits = payload['message_limits']
+        assert limits == {'target_chars': min(350, cap), 'max_chars': cap}
+        assert 'one thought' in ' '.join(payload['golden_rules'])
+        return {'message': 'A compact thought.', 'confidence': 0.9}
+
+    result = await ConsciousnessAgent(tools=tools, planner=planner).run_once(trigger='burst')
+    assert result['status'] == 'sent'
+    assert (await tools.bus.consume_outbound()).content == 'A compact thought.'
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('retry', [
+    {'message': 'A compact thought.', 'chat_id': 'other', 'channel': 'other',
+     'action_type': 'invalid', 'confidence': 0, 'reply_to_message_id': 'other'},
+    {'message': 'x' * 201}, {'message': ''}, {'message': ['invalid']},
+    {'silence': True, 'message': 'Do not send.'}, 'not JSON',
+])
+async def test_overlong_speakup_rewrites_once_without_changing_metadata(tmp_path, retry):
+    tools = _tools(tmp_path)
+    tools.inbound_archive.record_inbound(
+        channel='whatsapp', chat_id='owner@s.whatsapp.net', message_id='anchor',
+        participant=None, sender_id='owner@s.whatsapp.net', text='A current topic.',
+        timestamp=int(tools._now().timestamp()),
+    )
+    original = {'message': 'A long thought. ' * 20, 'confidence': 0.9,
+                'action_type': 'observation', 'reply_to_message_id': 'anchor'}
+    calls = []
+
+    async def planner(prompt):
+        calls.append(json.loads(prompt))
+        return original if len(calls) == 1 else retry
+
+    result = await ConsciousnessAgent(tools=tools, planner=planner).run_once(trigger='burst')
+    assert len(calls) == 2
+    assert calls[1]['chat_window'] == calls[0]['chat_window']
+    assert calls[1]['draft_message'] == original['message'].strip()
+    if isinstance(retry, dict) and retry.get('message') == 'A compact thought.':
+        assert result['status'] == 'sent'
+        sent = await tools.bus.consume_outbound()
+        assert sent.content == 'A compact thought.'
+        assert sent.chat_id == 'owner@s.whatsapp.net'
+        assert sent.channel == 'whatsapp'
+        assert sent.reply_to == 'anchor'
+        assert sent.metadata['action_type'] == 'observation'
+        # The rewrite's zero confidence would fail the existing confidence rail.
+        assert original['confidence'] == 0.9
+    else:
+        assert result['status'] != 'sent'
+        assert tools.bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('expires_before_retry', [False, True])
+async def test_overlong_speakup_does_not_rewrite_or_send_after_context_expires(
+    tmp_path, monkeypatch, expires_before_retry,
+):
+    from yeoman_gateway.consciousness import agent as agent_module
+
+    tools = _tools(tmp_path, config=_config(burstWindowMinutes=1))
+    clock = [0.0]
+    from types import SimpleNamespace
+    monkeypatch.setattr(agent_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+    calls = []
+
+    def planner(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            if expires_before_retry:
+                clock[0] = 61.0
+            return {'message': 'x' * 201, 'confidence': 0.9}
+        clock[0] = 61.0
+        return {'message': 'A compact thought.'}
+
+    result = await ConsciousnessAgent(tools=tools, planner=planner).run_once(trigger='burst')
+    assert result['reason'] == 'stale_rewrite_context'
+    assert len(calls) == (1 if expires_before_retry else 2)
+    assert tools.bus.outbound_size == 0

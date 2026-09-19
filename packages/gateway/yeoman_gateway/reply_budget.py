@@ -23,8 +23,8 @@ _URL_RE = re.compile(r"(?i)\bhttps?://|www\.")
 _CODE_RE = re.compile(r"```|`[^`]+`|^\s{4,}\S", re.MULTILINE)
 _CURRENT_DATA_RE = re.compile(
     r"(?i)\b("
-    r"aktuell|heute|jetzt|gerade|stand|kurs|quote|preis|rendite|zins|"
-    r"current|today|latest|price|market|stock|ticker|crypto|forex|yield|"
+    r"kurs|quote|preis|rendite|zins|"
+    r"price|market|stock|ticker|crypto|forex|yield|"
     r"aktie|etf|index|börse|boerse|dax|nasdaq|s&p|bitcoin|btc|eth|%"
     r")\b"
 )
@@ -206,12 +206,14 @@ def enforce_reply_budget(
     tool_used: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Return final text plus enforcement metadata."""
+    # Tool use alone says nothing about how much explanation the answer needs.
+    del tool_used
     original = str(text or "").strip()
     if not original or not isinstance(budget, dict) or not bool(budget.get("enabled", False)):
         return original, {"applied": False, "reason": "disabled"}
 
     final_sensitive = has_domain_sensitive_signal(original) or has_domain_sensitive_signal(user_content)
-    if tool_used or final_sensitive or bool(budget.get("long_form_allowed", False)):
+    if final_sensitive or bool(budget.get("long_form_allowed", False)):
         limit = int(budget.get("long_form_max_chars") or DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS)
         if len(original) <= limit:
             return original, {"applied": False, "reason": "domain_sensitive_or_long_form"}

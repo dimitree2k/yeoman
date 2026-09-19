@@ -159,6 +159,7 @@ class ParticipationReceiptReconciler:
         self._log = log
         self._store = store
         self._unsubmitted_ttl_ms = max(1, int(unsubmitted_ttl_ms))
+        self._legacy_offset = 0
 
     async def reconcile(self, *, limit: int = 50, now_ms: int | None = None) -> dict[str, int]:
         """One bounded reconciliation pass. Returns per-outcome counters."""
@@ -196,7 +197,9 @@ class ParticipationReceiptReconciler:
                 # never upgraded into Participation evidence by this projector.
                 counters["skipped"] += 1
                 continue
-            if state in {"transport_accepted", "delivery_unknown"}:
+            if state == "transport_accepted" or (
+                state == "delivery_unknown" and (effect is None or effect.state != "sent")
+            ):
                 if await self._project_recipient_evidence(
                     proposal_id=proposal_id,
                     effect_id=effect_id,
@@ -237,14 +240,10 @@ class ParticipationReceiptReconciler:
                 await self._log.project_transport_accepted(
                     proposal_id,
                     effect_id=effect_id,
-                    provider_message_id=(
-                        None if transport is None else transport.provider_message_id
-                    ),
+                    provider_message_id=transport.provider_message_id,
                     evidence_kind="transport_receipt",
-                    evidence_ref=(
-                        effect_id if transport is None else (transport.receipt_id or effect_id)
-                    ),
-                    now_ms=moment,
+                    evidence_ref=transport.receipt_id or effect_id,
+                    now_ms=transport.confirmed_ms,
                 )
                 counters["accepted"] += 1
                 if await self._project_recipient_evidence(
@@ -277,6 +276,37 @@ class ParticipationReceiptReconciler:
                 counters["retained"] += 1
                 continue
             counters["skipped"] += 1
+        if self._store is not None:
+            # Legacy speakups need acceptance accounting, never participation anchors.
+            legacy_rows = await self._log.pending_delivery_reservations(
+                limit=limit,
+                origin="legacy",
+                lane="production",
+                states=("reserved", "submitted", "delivery_unknown"),
+                offset=self._legacy_offset,
+            )
+            self._legacy_offset = (
+                self._legacy_offset + len(legacy_rows)
+                if len(legacy_rows) >= max(1, int(limit))
+                else 0
+            )
+            for row in legacy_rows:
+                effect_id = str(row["effect_id"])
+                effect = self._store.get_effect(effect_id)
+                if effect is None or effect.origin != "legacy" or effect.state != "sent":
+                    continue
+                transport = self._store.effect_transport_receipt(effect_id)
+                if transport is None:
+                    continue
+                await self._log.project_transport_accepted(
+                    str(row["proposal_id"]),
+                    effect_id=effect_id,
+                    provider_message_id=transport.provider_message_id,
+                    evidence_kind="transport_receipt",
+                    evidence_ref=transport.receipt_id or effect_id,
+                    now_ms=transport.confirmed_ms,
+                )
+                counters["accepted"] += 1
         return counters
 
     async def _valid_pending_approval(

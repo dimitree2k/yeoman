@@ -131,10 +131,18 @@ async def test_reply_budget_middleware_derives_turn_budget_and_preserves_reply_c
     assert ctx.reply == "next reached"
 
 
-def test_reply_budget_prompt_is_trusted_system_context(tmp_path: Path) -> None:
+@pytest.mark.parametrize("compact", [False, True])
+def test_reply_budget_prompt_is_trusted_system_context(tmp_path: Path, compact: bool) -> None:
+    persona_text = None
+    if compact:
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts/RUNTIME.md").write_text("Runtime rules")
+        (tmp_path / "prompts/AGENTS.md").write_text("Evidence rules")
+        persona_text = "<!-- prompt-chain: compact -->\nPersona"
     messages = ContextBuilder(tmp_path).build_messages(
         history=[],
         current_message="Arvid, kurz dazu",
+        persona_text=persona_text,
         current_metadata={
             "sender_id": "u1",
             "reply_budget": {
@@ -214,10 +222,10 @@ async def test_responder_persists_budgeted_reply_in_session(tmp_path: Path, comp
     ("extra_metadata", "content", "expected"),
     [
         ({}, "Arvid, kurze Einschaetzung", _SHORT_REPLY),
-        ({"reply_budget_tool_used": True}, "Arvid, kurze Einschaetzung", _LONG_REPLY),
+        ({"reply_budget_tool_used": True}, "Arvid, kurze Einschaetzung", _SHORT_REPLY),
         ({}, "Arvid, was macht die Aktie heute?", _LONG_REPLY),
     ],
-    ids=["short_no_tool_no_signal", "long_tool_used", "long_current_data_signal"],
+    ids=["short_no_tool_no_signal", "short_tool_used", "long_current_data_signal"],
 )
 async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
     tmp_path: Path,
@@ -268,3 +276,29 @@ async def test_compact_persona_reply_budget_keeps_short_and_long_form_branches(
     )
 
     assert reply == expected
+
+
+@pytest.mark.parametrize("word", ["heute", "jetzt", "gerade", "aktuell", "stand", "current", "today", "latest"])
+def test_casual_time_words_do_not_relax_reply_budget(word: str) -> None:
+    from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
+
+    content = f"Du redest {word} viel."
+    budget = derive_reply_budget(
+        policy={"enabled": True, "targets": {"social_one_liner": 80}},
+        answer_shape="social_one_liner", content=content, is_owner=False,
+    )
+    assert budget is not None and budget.hard_cap_enabled
+    reply, _ = enforce_reply_budget(
+        _LONG_REPLY, budget.as_metadata(), user_content=content, tool_used=True,
+    )
+    assert reply == _SHORT_REPLY
+
+
+@pytest.mark.parametrize("content", ["Quelle: https://example.org/ " + _LONG_REPLY, "Der Aktienkurs ist unsicher. " + _LONG_REPLY])
+def test_evidence_still_uses_long_form_limit(content: str) -> None:
+    from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
+
+    budget = derive_reply_budget(policy={"enabled": True, "targets": {"short_take": 80}}, answer_shape="short_take", content="Kurz bitte", is_owner=False)
+    assert budget is not None
+    reply, _ = enforce_reply_budget(content, budget.as_metadata())
+    assert reply == content

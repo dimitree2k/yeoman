@@ -47,10 +47,13 @@ PROPOSAL_STATES: tuple[str, ...] = (
     "failed",
 )
 
+#: A budget hold is a lease, separate from permanent delivery evidence.
+DELIVERY_RESERVATION_TTL_MS = 10 * 60_000
+
 #: Reservation categories with their identity in the ledger.
 RESERVATION_CATEGORIES: tuple[str, ...] = ("initiation", "comment", "reaction")
 
-#: Delivery states in which the reserved capacity is definitely gone.
+#: Delivery evidence that a release/failure claim must not overwrite.
 CONSUMED_DELIVERY_STATES: frozenset[str] = frozenset(
     {"transport_accepted", "delivered", "delivery_unknown"}
 )
@@ -71,6 +74,23 @@ RECIPIENT_EVIDENCE_KINDS: frozenset[str] = frozenset(
 
 #: Evidence kinds scoped to at least one recipient instead of every member.
 GROUP_SCOPED_EVIDENCE_KINDS: frozenset[str] = frozenset({"group_delivery_at_least_one"})
+
+
+# One initiating proposal is one send, even with two capacity dimensions or
+# overlapping legacy history. Transport acceptance is sufficient for budgeting.
+_CONFIRMED_SPEAKUPS_SQL = """
+    SELECT proposal_id, MAX(sent_at) AS sent_at FROM (
+        SELECT id AS proposal_id, committed_at AS sent_at FROM speakups
+        WHERE channel = :channel AND chat_id = :chat_id AND status = 'sent'
+          AND committed_at IS NOT NULL
+        UNION ALL
+        SELECT proposal_id, accepted_at_ms / 1000.0 AS sent_at
+        FROM delivery_reservations
+        WHERE channel = :channel AND chat_id = :chat_id AND category = 'initiation'
+          AND delivery_state IN ('transport_accepted', 'delivered')
+          AND accepted_at_ms IS NOT NULL
+    ) GROUP BY proposal_id
+"""
 
 
 def deterministic_effect_id(
@@ -108,15 +128,14 @@ def _held_or_accepted_count(
     chat_id: str,
     category: str,
     exclude_proposal_id: str,
+    now_ms: int,
     accepted_since_ms: int | None = None,
     accepted_before_ms: int | None = None,
 ) -> int:
-    """Accepted sends inside the accounting window **plus** every unresolved hold.
+    """Confirmed sends in the accounting window plus unexpired budget leases.
 
-    The two sets are a union, not an intersection: a hold that was never accepted
-    still occupies its slot, and an unresolved hold is counted regardless of age -
-    an unknown outcome never regains capacity by crossing a day or rolling-window
-    boundary (spec section 9).
+    Unknown delivery evidence survives lease expiry, but cannot hold capacity
+    indefinitely. Only real acceptance/delivery counts as a confirmed send.
     """
     sql = [
         "SELECT COUNT(*) AS c FROM delivery_reservations",
@@ -125,14 +144,16 @@ def _held_or_accepted_count(
     params: list[Any] = [channel, chat_id, category, exclude_proposal_id]
     if accepted_since_ms is not None:
         sql.append(
-            "AND ((accepted_at_ms IS NOT NULL AND accepted_at_ms >= ?"
+            "AND ((delivery_state IN ('transport_accepted', 'delivered')"
+            " AND accepted_at_ms IS NOT NULL AND accepted_at_ms >= ?"
             " AND (? IS NULL OR accepted_at_ms < ?))"
-            " OR delivery_state IN"
-            " ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown'))"
+            " OR (delivery_state IN ('reserved', 'submitted', 'delivery_unknown')"
+            " AND created_at_ms > ?))"
         )
         params.append(int(accepted_since_ms))
         params.append(None if accepted_before_ms is None else int(accepted_before_ms))
         params.append(None if accepted_before_ms is None else int(accepted_before_ms))
+        params.append(int(now_ms) - DELIVERY_RESERVATION_TTL_MS)
     row = conn.execute(" ".join(sql), tuple(params)).fetchone()
     return int(row["c"] if row else 0)
 
@@ -156,6 +177,7 @@ def _rolling_capacity(
         chat_id=chat_id,
         category=category,
         exclude_proposal_id=exclude_proposal_id,
+        now_ms=now_ms,
         accepted_since_ms=window_start + 1,
     )
     if used >= int(limit):
@@ -173,7 +195,7 @@ def _calendar_day_capacity(
     now_ms: int,
     exclude_proposal_id: str,
 ) -> tuple[bool, str]:
-    """Capacity for the current UTC calendar day. Indefinite holds still count."""
+    """Capacity for the current UTC calendar day, including unexpired leases."""
     current = datetime.fromtimestamp(int(now_ms) / 1000, UTC)
     day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
     start_ms = int(day_start.timestamp() * 1000)
@@ -184,6 +206,7 @@ def _calendar_day_capacity(
         chat_id=chat_id,
         category=category,
         exclude_proposal_id=exclude_proposal_id,
+        now_ms=now_ms,
         accepted_since_ms=start_ms,
         accepted_before_ms=end_ms,
     )
@@ -820,7 +843,7 @@ class SpeakupLog:
         current UTC calendar day (initiation). Zero limits deny the action. All
         dimensions are acquired together or none are. A duplicate reservation for
         the same ``(proposal_id, effect_id)`` is idempotent and returns whether
-        that reservation is still held.
+        that reservation is still held within its original ten-minute lease.
         """
         proposal = str(proposal_id or "").strip()
         effect = str(effect_id or "").strip()
@@ -849,15 +872,19 @@ class SpeakupLog:
             # of that effect and is always written for all of them together.
             existing = conn.execute(
                 """
-                SELECT delivery_state, channel, chat_id, lane, origin
+                SELECT delivery_state, channel, chat_id, lane, origin, created_at_ms, effect_id, proposal_id
                 FROM delivery_reservations
-                WHERE effect_id = ? LIMIT 1
+                WHERE effect_id = ? OR (proposal_id = ? AND channel = ? AND chat_id = ? AND lane = ?)
+                LIMIT 1
                 """,
-                (effect,),
+                (effect, proposal, str(channel), str(chat_id), reservation_lane),
             ).fetchone()
             if existing is not None:
                 if (
-                    str(existing["channel"]) != str(channel)
+                    int(now_ms) >= int(existing["created_at_ms"]) + DELIVERY_RESERVATION_TTL_MS
+                    or str(existing["effect_id"]) != effect
+                    or str(existing["proposal_id"]) != proposal
+                    or str(existing["channel"]) != str(channel)
                     or str(existing["chat_id"]) != str(chat_id)
                     or str(existing["lane"]) != reservation_lane
                     or str(existing["origin"]) != reservation_origin
@@ -1777,6 +1804,14 @@ class SpeakupLog:
     ) -> None:
         """Mark the reservation as submitted to the effect gateway (local queue only)."""
         with self._write() as conn:
+            reservation = conn.execute(
+                "SELECT created_at_ms FROM delivery_reservations WHERE effect_id = ? LIMIT 1",
+                (str(effect_id),),
+            ).fetchone()
+            if reservation is not None and int(now_ms) >= (
+                int(reservation["created_at_ms"]) + DELIVERY_RESERVATION_TTL_MS
+            ):
+                raise ValueError("reservation_expired")
             conn.execute(
                 """
                 UPDATE delivery_reservations
@@ -1829,7 +1864,7 @@ class SpeakupLog:
                 """
                 UPDATE delivery_reservations
                 SET delivery_state = 'transport_accepted',
-                    accepted_at_ms = COALESCE(accepted_at_ms, ?),
+                    accepted_at_ms = ?,
                     provider_message_id = COALESCE(?, provider_message_id),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'accepted'
                 WHERE effect_id = ?
@@ -1882,12 +1917,14 @@ class SpeakupLog:
                 UPDATE delivery_reservations
                 SET delivery_state = 'delivered',
                     delivered_at_ms = COALESCE(delivered_at_ms, ?),
-                    accepted_at_ms = COALESCE(accepted_at_ms, ?),
+                    accepted_at_ms = CASE WHEN delivery_state = 'transport_accepted'
+                        THEN COALESCE(accepted_at_ms, ?) ELSE ? END,
                     provider_message_id = COALESCE(?, provider_message_id),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'delivered'
                 WHERE effect_id = ?
                 """,
                 (
+                    int(now_ms),
                     int(now_ms),
                     int(now_ms),
                     provider_message_id,
@@ -1910,23 +1947,22 @@ class SpeakupLog:
     ) -> None:
         """Retain the reservation for an inconclusive outcome. Never a refund."""
         with self._write() as conn:
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE delivery_reservations
                 SET delivery_state = 'delivery_unknown',
-                    accepted_at_ms = COALESCE(accepted_at_ms, ?),
                     evidence_kind = ?, evidence_ref = ?, attempt_state = 'unknown'
                 WHERE effect_id = ?
-                  AND delivery_state IN ('reserved', 'submitted', 'transport_accepted')
+                  AND delivery_state IN ('reserved', 'submitted')
                 """,
                 (
-                    int(now_ms),
                     str(evidence_kind),
                     str(evidence_ref),
                     str(effect_id),
                 ),
             )
-        await self.mark_status(proposal_id, status="delivery_unknown")
+        if updated.rowcount:
+            await self.mark_status(proposal_id, status="delivery_unknown")
 
     async def release_delivery(
         self,
@@ -1939,8 +1975,8 @@ class SpeakupLog:
     ) -> bool:
         """Release an unsubmitted/definitely-unaccepted reservation.
 
-        An accepted send is never refunded, and an unknown in-flight delivery keeps
-        its hold even after expiry or pause (spec section 9).
+        An accepted send is never refunded. Unknown delivery evidence is retained;
+        its budget lease expires independently after ten minutes.
         """
         if state not in RELEASED_DELIVERY_STATES:
             raise ValueError(f"not a releasing state: {state}")
@@ -2074,6 +2110,7 @@ class SpeakupLog:
                     chat_id=chat_id,
                     category=category,
                     exclude_proposal_id="",
+                    now_ms=now_ms,
                     accepted_since_ms=start_ms,
                     accepted_before_ms=end_ms,
                 )
@@ -2083,6 +2120,7 @@ class SpeakupLog:
                 chat_id=chat_id,
                 category=category,
                 exclude_proposal_id="",
+                now_ms=now_ms,
                 accepted_since_ms=int(now_ms) - max(1, int(window_ms)) + 1,
             )
 
@@ -2090,25 +2128,27 @@ class SpeakupLog:
         self,
         *,
         limit: int = 200,
+        offset: int = 0,
         origin: str | None = None,
         lane: str | None = None,
+        states: tuple[str, ...] = ("reserved", "submitted", "transport_accepted", "delivery_unknown"),
     ) -> list[dict[str, Any]]:
         """Holds that are not terminally released, oldest first.
 
         ``attempt_state='unsubmitted'`` rows are cancellable speculation; rows that
         were already handed to transport need reconciliation, never a blind resend.
         """
-        clauses = [
-            "delivery_state IN ('reserved', 'submitted', 'transport_accepted', 'delivery_unknown')"
-        ]
-        params: list[Any] = []
+        if not states:
+            return []
+        clauses = [f"delivery_state IN ({','.join('?' for _ in states)})"]
+        params: list[Any] = list(states)
         if origin is not None:
             clauses.append("origin = ?")
             params.append(str(origin))
         if lane is not None:
             clauses.append("lane = ?")
             params.append(str(lane))
-        params.append(max(1, int(limit)))
+        params.extend((max(1, int(limit)), max(0, int(offset))))
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -2120,7 +2160,7 @@ class SpeakupLog:
                     WHEN 'reserved' THEN 1
                     ELSE 2
                 END, created_at_ms ASC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
                 tuple(params),
             ).fetchall()
@@ -2577,16 +2617,9 @@ class SpeakupLog:
         end = start + timedelta(days=1)
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM speakups
-                WHERE channel = ?
-                  AND chat_id = ?
-                  AND status = 'sent'
-                  AND committed_at >= ?
-                  AND committed_at < ?
-                """,
-                (channel, chat_id, start.timestamp(), end.timestamp()),
+                f"SELECT COUNT(*) AS c FROM ({_CONFIRMED_SPEAKUPS_SQL}) "
+                "WHERE sent_at >= :start AND sent_at < :end",
+                dict(channel=channel, chat_id=chat_id, start=start.timestamp(), end=end.timestamp()),
             ).fetchone()
         return int(row["c"] if row else 0)
 
@@ -2597,20 +2630,12 @@ class SpeakupLog:
         chat_id: str,
         since: datetime,
     ) -> int:
-        current_since = since
-        if current_since.tzinfo is None:
-            current_since = current_since.replace(tzinfo=UTC)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=UTC)
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM speakups
-                WHERE channel = ?
-                  AND chat_id = ?
-                  AND status = 'sent'
-                  AND committed_at >= ?
-                """,
-                (channel, chat_id, current_since.astimezone(UTC).timestamp()),
+                f"SELECT COUNT(*) AS c FROM ({_CONFIRMED_SPEAKUPS_SQL}) WHERE sent_at >= :since",
+                dict(channel=channel, chat_id=chat_id, since=since.timestamp()),
             ).fetchone()
         return int(row["c"] if row else 0)
 
@@ -2622,21 +2647,10 @@ class SpeakupLog:
     ) -> float | None:
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT committed_at
-                FROM speakups
-                WHERE channel = ?
-                  AND chat_id = ?
-                  AND status = 'sent'
-                  AND committed_at IS NOT NULL
-                ORDER BY committed_at DESC
-                LIMIT 1
-                """,
-                (channel, chat_id),
+                f"SELECT MAX(sent_at) AS sent_at FROM ({_CONFIRMED_SPEAKUPS_SQL})",
+                dict(channel=channel, chat_id=chat_id),
             ).fetchone()
-        if row is None or row["committed_at"] is None:
-            return None
-        return float(row["committed_at"])
+        return float(row["sent_at"]) if row is not None and row["sent_at"] is not None else None
 
     async def history(self, channel: str, chat_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
