@@ -116,7 +116,19 @@ def migration_verify(
         detail = ", ".join(
             f"{table} expected {expected} rows, found {actual}"
             for table, expected, actual in report.mismatches
-        ) or "integrity, foreign keys or fingerprint check failed"
+        )
+        if not detail:
+            if not report.complete:
+                # The database itself says it is not a finished migration, whatever the
+                # external manifest claims.  This is the crash-recovery signal.
+                detail = (
+                    "target carries no complete migration marker; rebuild it from the"
+                    " snapshots instead of using it"
+                )
+            elif not report.digest_ok:
+                detail = "target content does not match the manifest digest"
+            else:
+                detail = "integrity, foreign keys or fingerprint check failed"
         _fail("manifest_mismatch", detail)
 
 

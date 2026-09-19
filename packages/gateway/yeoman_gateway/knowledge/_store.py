@@ -36,6 +36,7 @@ TOOL_VERSION: Final[str] = "knowledge/1.0.0"
 #: Reasons for quarantined legacy rows.  Never contains row content.
 QUARANTINE_REASONS: Final[tuple[str, ...]] = (
     "profile-without-source",
+    "legacy-node-without-fact-shell",
     "unknown-audience",
     "unproven-role",
     "unproven-identifier-link",

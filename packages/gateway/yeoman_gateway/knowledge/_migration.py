@@ -46,6 +46,9 @@ from yeoman_gateway.knowledge.models import ValidationError, normalize_identifie
 __all__ = [
     "LEGACY_FTS_TABLE",
     "KNOWN_LEGACY_TABLES",
+    "LEGACY_NO_FACT_REASON",
+    "LEGACY_PROFILE_REASON",
+    "LEGACY_UNPROVEN_REASON",
     "MANIFEST_VERSION",
     "MigrationInventory",
     "MigrationReport",
@@ -54,6 +57,7 @@ __all__ = [
     "UnsupportedSchema",
     "VerificationReport",
     "inspect_sources",
+    "semantic_digest",
     "migrate_sources",
     "verify_target",
 ]
@@ -226,6 +230,8 @@ class VerificationReport:
     foreign_keys_ok: bool
     fingerprint_ok: bool
     counts_match: bool
+    complete: bool
+    digest_ok: bool
     verdict: str
     mismatches: tuple[tuple[str, int, int], ...]
 
@@ -649,9 +655,21 @@ def _require_distinct_sources(contacts: Path, memory: Path) -> None:
 def _build(
     handles: list[_SourceHandle], target_path: Path, manifest_path: Path
 ) -> MigrationReport:
+    """Build a staged target, validate it, publish it, then write the manifest.
+
+    Publication order is deliberate: the database carries the authoritative
+    ``migration_complete`` marker, the external manifest is regenerable.  A crash
+    between the two leaves a database that is present but explicitly incomplete, which
+    ``verify_target`` reports instead of silently accepting.
+    """
     migration_id = uuid.uuid4().hex
     created_ms = int(time.time() * 1000)
-    store = KnowledgeStore(target_path)
+    staging = target_path.with_name(f".{target_path.name}.staging-{migration_id}")
+    source_fingerprint = _combined_fingerprint(
+        *(handle.inventory.fingerprint for handle in handles)
+    )
+    store = KnowledgeStore(staging)
+    payload: dict[str, Any] | None = None
     published = False
     try:
         with store.transaction():
@@ -659,9 +677,7 @@ def _build(
                 _copy_table(store, handles, table, created_ms)
                 for table in (*_TABLE_ORDER, LEGACY_FTS_TABLE)
             ]
-            source_fingerprint = _combined_fingerprint(
-                *(handle.inventory.fingerprint for handle in handles)
-            )
+            resolution = _resolve_legacy_rows(store, created_ms=created_ms)
             for key, value in (
                 ("migration_id", migration_id),
                 ("source_fingerprint", source_fingerprint),
@@ -673,28 +689,47 @@ def _build(
                     " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, value),
                 )
+            digest = _semantic_digest(store)
+            store.execute(
+                "INSERT INTO knowledge_meta (key, value) VALUES ('semantic_digest', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (digest,),
+            )
+            store.execute(
+                "INSERT INTO knowledge_meta (key, value) VALUES ('migration_complete', '1')"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+            _validate_staged(store)
         store.close()
-        target_fingerprint = file_fingerprint(target_path)
+
+        target_fingerprint = file_fingerprint(staging)
         payload = _manifest_payload(
             handles=handles,
             outcomes=outcomes,
+            resolution=resolution,
             target_path=target_path,
             target_fingerprint=target_fingerprint,
             migration_id=migration_id,
             created_ms=created_ms,
             source_fingerprint=source_fingerprint,
+            semantic_digest=digest,
         )
+        # Publish: the staged file is complete and validated, so a rename is the only
+        # step that can still fail, and it fails atomically.
+        staging.replace(target_path)
+        published = True
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        published = True
     finally:
         if not store.closed:
             store.close()
+        _discard(staging)
         if not published:
             _discard(target_path)
             _discard(manifest_path)
+    assert payload is not None
     return _report_from_payload(
         payload,
         target_path=target_path,
@@ -705,6 +740,102 @@ def _build(
             (handle.role, handle.inventory.fingerprint) for handle in handles
         ),
     )
+
+
+def _validate_staged(store: KnowledgeStore) -> None:
+    """Refuse to publish a target that is not internally consistent."""
+    if not store.integrity_ok():
+        raise MigrationSourceError(
+            "staged_integrity_failed", "PRAGMA integrity_check failed on the staged target"
+        )
+    if not store.foreign_keys_ok():
+        raise MigrationSourceError(
+            "staged_foreign_key_failed", "PRAGMA foreign_key_check failed on the staged target"
+        )
+    expected = int(store.scalar("SELECT COUNT(*) FROM memory2_nodes WHERE is_deleted = 0") or 0)
+    indexed = int(store.scalar("SELECT COUNT(*) FROM memory2_nodes_fts") or 0)
+    if indexed != expected:
+        raise MigrationSourceError(
+            "staged_fts_mismatch",
+            f"FTS holds {indexed} entries for {expected} live nodes",
+        )
+
+
+def semantic_digest(target: Path) -> str:
+    """Public read-only semantic digest of a built target.
+
+    Sorted by primary key and independent of file layout, page order and timestamps, so
+    two builds from the same snapshots produce the same value.
+    """
+    store = KnowledgeStore(Path(target).expanduser(), create=False)
+    try:
+        return _semantic_digest(store)
+    finally:
+        store.close()
+
+
+#: Columns excluded from the semantic digest because they only record *when* an
+#: operation ran.  They stay in the rows and in the manifest, but two builds of the same
+#: snapshots must not differ because a second passed between them.
+_VOLATILE_DIGEST_COLUMNS: Final[frozenset[str]] = frozenset(
+    {"created_ms", "updated_ms", "created_at", "updated_at", "last_accessed_at", "undone_ms"}
+)
+
+
+def _semantic_digest(store: KnowledgeStore) -> str:
+    """Content fingerprint of every durable knowledge row, order-independent.
+
+    Sorted by the digested columns and free of operational timestamps, so it proves
+    "same inputs, same knowledge" instead of "same wall clock".
+    """
+    digest = hashlib.sha256()
+    for table in _DIGEST_TABLES:
+        if not store.has_table(table):
+            continue
+        columns = [
+            name
+            for name, _pk in _target_columns(store, table)
+            if name not in _VOLATILE_DIGEST_COLUMNS
+        ]
+        if not columns:
+            continue
+        order = ", ".join(_quote_ident(name) for name in columns)
+        digest.update(f"\x1e{table}\x1e".encode("utf-8"))
+        for row in store.query(
+            f"SELECT {order} FROM {_quote_ident(table)} ORDER BY {order}"
+        ):
+            digest.update(
+                ("\x1f".join("" if value is None else str(value) for value in row)).encode(
+                    "utf-8"
+                )
+            )
+            digest.update(b"\x1e")
+    return digest.hexdigest()
+
+
+_DIGEST_TABLES: Final[tuple[str, ...]] = (
+    "contacts",
+    "contact_identifiers",
+    "contact_aliases",
+    "contact_fields",
+    "knowledge_identifier_bindings",
+    "knowledge_identity_redirects",
+    "knowledge_statements",
+    "knowledge_statement_people",
+    "knowledge_statement_sources",
+    "knowledge_statement_principals",
+    "knowledge_jobs",
+    "knowledge_quarantine",
+    "memory2_nodes",
+    "memory2_nodes_fts",
+    "memory2_facts",
+    "memory2_fact_sources",
+    "memory2_fact_principals",
+    "memory2_fact_jobs",
+    "memory2_embeddings",
+    "memory2_meta",
+    "idea_backlog_items",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,11 +985,16 @@ def _record_quarantine(
     reason: str,
     created_ms: int,
 ) -> None:
+    # Deterministic id: two builds from the same snapshots must produce identical rows,
+    # otherwise the semantic digest cannot prove reproducibility.
+    quarantine_id = hashlib.sha256(
+        f"{table}\x1f{source_pk}\x1f{reason}".encode("utf-8")
+    ).hexdigest()[:32]
     store.execute(
         "INSERT OR IGNORE INTO knowledge_quarantine"
         " (quarantine_id, source_table, source_pk, reason, detail_json, created_ms)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (uuid.uuid4().hex, table, source_pk, reason, "{}", created_ms),
+        (quarantine_id, table, source_pk, reason, "{}", created_ms),
     )
 
 
@@ -878,11 +1014,13 @@ def _manifest_payload(
     *,
     handles: list[_SourceHandle],
     outcomes: list[_TableOutcome],
+    resolution: _LegacyResolution,
     target_path: Path,
     target_fingerprint: str,
     migration_id: str,
     created_ms: int,
     source_fingerprint: str,
+    semantic_digest: str,
 ) -> dict[str, Any]:
     ignored: list[dict[str, Any]] = []
     for handle in handles:
@@ -914,6 +1052,9 @@ def _manifest_payload(
         {"table": outcome.table, "reason": reason, "count": count}
         for outcome in outcomes
         for reason, count in outcome.quarantined
+    ] + [
+        {"table": table, "reason": reason, "count": count}
+        for table, reason, count in resolution.quarantined
     ]
     conflicts = [
         (handle.role, name)
@@ -924,7 +1065,9 @@ def _manifest_payload(
         "manifest_version": MANIFEST_VERSION,
         "tool_version": TOOL_VERSION,
         "target_schema_version": SCHEMA_VERSION,
-        "migration_complete": False,
+        "migration_complete": True,
+        "semantic_digest": semantic_digest,
+        "legacy_resolution": resolution.to_payload(),
         "migration_id": migration_id,
         "created_ms": created_ms,
         "target_path": str(target_path),
@@ -1028,13 +1171,24 @@ def verify_target(*, target: Path, manifest: Path) -> VerificationReport:
         integrity_ok = _integrity_ok(connection)
         foreign_keys_ok = _foreign_keys_ok(connection)
         mismatches = _count_mismatches(connection, payload, target_path)
+        complete = _marker_is_complete(connection, payload)
     finally:
         connection.close()
         _remove_read_sidecars(target_path, sidecars_before)
     expected = str(payload.get("target_fingerprint") or "")
     fingerprint_ok = bool(expected) and expected == file_fingerprint(target_path)
     counts_match = not mismatches
-    ok = integrity_ok and foreign_keys_ok and fingerprint_ok and counts_match
+    # The digest is content-based, so it survives a staging rename while still proving
+    # that the published rows are the rows this manifest describes.
+    digest_ok = semantic_digest(target_path) == str(payload.get("semantic_digest") or "")
+    ok = (
+        integrity_ok
+        and foreign_keys_ok
+        and fingerprint_ok
+        and counts_match
+        and complete
+        and digest_ok
+    )
     return VerificationReport(
         target_path=target_path,
         manifest_path=manifest_path,
@@ -1042,9 +1196,36 @@ def verify_target(*, target: Path, manifest: Path) -> VerificationReport:
         foreign_keys_ok=foreign_keys_ok,
         fingerprint_ok=fingerprint_ok,
         counts_match=counts_match,
+        complete=complete,
+        digest_ok=digest_ok,
         verdict="ok" if ok else "failed",
         mismatches=mismatches,
     )
+
+
+def _marker_is_complete(
+    connection: sqlite3.Connection, payload: dict[str, Any]
+) -> bool:
+    """The database - not the manifest - is the authority on completeness.
+
+    A database without the marker was interrupted between the row copy and the final
+    publish decision, or is a legacy file that must never be presented as migrated.
+    """
+    if payload.get("migration_complete") is not True:
+        return False
+    try:
+        rows = connection.execute(
+            "SELECT key, value FROM knowledge_meta WHERE key IN"
+            " ('migration_complete', 'migration_id', 'semantic_digest')"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    values = {str(row[0]): str(row[1]) for row in rows}
+    if values.get("migration_complete") != "1":
+        return False
+    if values.get("migration_id") != str(payload.get("migration_id") or ""):
+        return False
+    return values.get("semantic_digest") == str(payload.get("semantic_digest") or "")
 
 
 def _read_manifest(manifest_path: Path) -> dict[str, Any]:
@@ -1157,3 +1338,180 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (tuple, list, set)):
         return [_jsonable(item) for item in value]
     return value
+
+
+# ── P4.2: conservative legacy disposition ────────────────────────────────────
+
+#: Reasons for a legacy fact that is kept but deliberately *not* promoted.
+LEGACY_UNPROVEN_REASON: Final[str] = "unproven-role"
+LEGACY_PROFILE_REASON: Final[str] = "profile-without-source"
+LEGACY_NO_FACT_REASON: Final[str] = "legacy-node-without-fact-shell"
+
+_SCOPE_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^([a-z0-9_]+):(.+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyResolution:
+    """What the conservative legacy pass decided, counted by category and reason."""
+
+    examined: int
+    links: int
+    quarantined: tuple[tuple[str, str, int], ...]
+    unresolved_mentions: int
+    kept_unproven: int
+    notes: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "examined": self.examined,
+            "person_links": self.links,
+            "quarantined": [
+                {"table": table, "reason": reason, "count": count}
+                for table, reason, count in self.quarantined
+            ],
+            "unresolved_mentions": self.unresolved_mentions,
+            "kept_unproven": self.kept_unproven,
+            "notes": list(self.notes),
+        }
+
+
+def _resolve_legacy_rows(store: KnowledgeStore, *, created_ms: int) -> _LegacyResolution:
+    """Give every remaining legacy row an explicit disposition.
+
+    Conservative by construction:
+
+    * ``contact_fields`` text has no proven source and no ACL, so it is quarantined and
+      never becomes a readable statement - it stays in its original table.
+    * Legacy person columns (``sender_id``, ``contact_id``, ``about_sender``) are *not*
+      translated into speakers or subjects.  A ``sender_id`` is recorded as an
+      unresolved mention of the node's private metadata, which is exactly what it is:
+      an unproven handle.  No contact is matched by name or by number shape.
+    * A legacy node without a shared-fact shell keeps its text but never becomes
+      person-readable; it is counted, not promoted.
+    """
+    reasons: Counter[tuple[str, str]] = Counter()
+    notes: list[str] = []
+    links = 0
+    unresolved_mentions = 0
+    kept_unproven = 0
+    examined = 0
+
+    field_rows = store.query(
+        "SELECT rowid AS rid, contact_id, kind, value FROM contact_fields ORDER BY rowid"
+    )
+    for row in field_rows:
+        examined += 1
+        reasons[("contact_fields", LEGACY_PROFILE_REASON)] += 1
+        _record_quarantine(
+            store,
+            table="contact_fields",
+            source_pk=f"{row['contact_id']}:{row['kind']}:{row['rid']}",
+            reason=LEGACY_PROFILE_REASON,
+            created_ms=created_ms,
+        )
+    if field_rows:
+        notes.append(
+            "contact_fields text kept in place; quarantined because source and ACL are unproven"
+        )
+
+    node_rows = store.query(
+        "SELECT n.id AS id, n.sender_id AS sender_id, n.contact_id AS contact_id,"
+        " n.scope_key AS scope_key, n.content AS content,"
+        " CASE WHEN f.fact_id IS NULL THEN 0 ELSE 1 END AS has_fact"
+        " FROM memory2_nodes n LEFT JOIN memory2_facts f ON f.fact_id = n.id"
+        " ORDER BY n.id"
+    )
+    for row in node_rows:
+        statement_id = str(row["id"])
+        has_shell = int(row["has_fact"]) == 1
+        shells = store.query(
+            "SELECT 1 FROM knowledge_statements WHERE statement_id = ?", (statement_id,)
+        )
+        already_person_readable = bool(shells)
+        sender = "" if row["sender_id"] is None else str(row["sender_id"]).strip()
+        contact = "" if row["contact_id"] is None else str(row["contact_id"]).strip()
+        if contact:
+            # A legacy contact link is *not* a proven speaker or subject: record it as
+            # an unresolved mention so it is visible without granting any role.
+            examined += 1
+            _record_quarantine(
+                store,
+                table="memory2_nodes",
+                source_pk=statement_id,
+                reason=LEGACY_UNPROVEN_REASON,
+                created_ms=created_ms,
+            )
+            reasons[("memory2_nodes", LEGACY_UNPROVEN_REASON)] += 1
+        if sender and not already_person_readable:
+            unresolved_mentions += 1
+            store.execute(
+                "INSERT INTO knowledge_meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"legacy_unresolved_mention:{statement_id}", sender),
+            )
+        if not has_shell and not already_person_readable:
+            kept_unproven += 1
+            examined += 1
+            _record_quarantine(
+                store,
+                table="memory2_nodes",
+                source_pk=statement_id,
+                reason=LEGACY_NO_FACT_REASON,
+                created_ms=created_ms,
+            )
+            reasons[("memory2_nodes", LEGACY_NO_FACT_REASON)] += 1
+
+    fact_rows = store.query(
+        "SELECT fs.fact_id AS fact_id, fs.author_principal AS author_principal,"
+        " fs.occurred_ms AS occurred_ms FROM memory2_fact_sources fs ORDER BY fs.fact_id"
+    )
+    for row in fact_rows:
+        statement_id = str(row["fact_id"])
+        author = str(row["author_principal"] or "").strip()
+        if not author:
+            continue
+        person_id = store.query_one(
+            "SELECT person_id FROM knowledge_identifier_bindings"
+            " WHERE status = 'active' AND value IN (?, ?) LIMIT 1",
+            (author, author.split("@", 1)[0]),
+        )
+        if person_id is None:
+            # The author is a proven transport principal without a person binding: the
+            # speaker edge is left absent instead of guessing one.
+            continue
+        linked = store.execute(
+            "INSERT INTO knowledge_statement_people (statement_id, person_id, role,"
+            " evidence_source_id, evidence_revision, attribution, created_ms)"
+            " VALUES (?, ?, 'speaker', ?, 1, 'transport', ?)"
+            " ON CONFLICT DO NOTHING",
+            (
+                statement_id,
+                str(person_id["person_id"]),
+                f"legacy:{statement_id}",
+                created_ms,
+            ),
+        )
+        if linked.rowcount:
+            links += 1
+    if links:
+        notes.append(
+            "speaker edges reconstructed only from proven transport principals"
+        )
+    return _LegacyResolution(
+        examined=examined,
+        links=links,
+        quarantined=tuple(
+            sorted((table, reason, count) for (table, reason), count in reasons.items())
+        ),
+        unresolved_mentions=unresolved_mentions,
+        kept_unproven=kept_unproven,
+        notes=tuple(notes),
+    )
+
+
+def _parse_legacy_scope(scope_key: str) -> tuple[str, str] | None:
+    """Split the legacy ``channel:chat_id`` scope key.  Never guesses a shape."""
+    match = _SCOPE_KEY_RE.match(str(scope_key or ""))
+    if match is None:
+        return None
+    return match.group(1), match.group(2)

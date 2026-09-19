@@ -8,7 +8,6 @@ confirms nothing about the trip.
 from __future__ import annotations
 
 import pytest
-
 from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     PersonLinkCandidate,

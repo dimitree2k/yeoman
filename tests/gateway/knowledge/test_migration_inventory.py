@@ -33,6 +33,7 @@ from yeoman_gateway.knowledge._migration import (
     UnsupportedSchema,
     inspect_sources,
     migrate_sources,
+    semantic_digest,
     verify_target,
 )
 from yeoman_gateway.knowledge._store import QUARANTINE_REASONS, TOOL_VERSION
@@ -298,7 +299,12 @@ def test_manifest_lists_every_source_table(tmp_path: Path) -> None:
     assert report.manifest_path == manifest
     assert report.target_fingerprint == _sha256(target)
     assert report.unaccounted_rows == 0
-    assert report.quarantined == ()
+    # Nothing is silently dropped: the legacy profile rows and unproven nodes are
+    # explicitly quarantined rather than promoted.
+    assert report.quarantined
+    assert all(
+        reason in QUARANTINE_REASONS for _table, reason, _count in report.quarantined
+    )
     for name, source_rows, imported_rows in report.tables:
         assert source_rows == BASE_ROWS[name]
         assert imported_rows == source_rows
@@ -306,7 +312,10 @@ def test_manifest_lists_every_source_table(tmp_path: Path) -> None:
 
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert json.loads(report.to_json()) == payload
-    assert payload["migration_complete"] is False
+    # The database carries the authoritative completeness marker; the manifest mirrors it.
+    assert payload["migration_complete"] is True
+    assert payload["semantic_digest"] == semantic_digest(target)
+    assert payload["legacy_resolution"]["quarantined"]
     assert payload["tool_version"] == TOOL_VERSION
     assert payload["target_fingerprint"] == report.target_fingerprint
     assert payload["unaccounted_rows"] == 0
@@ -385,6 +394,8 @@ def test_legacy_nodes_without_contact_id_column_are_imported(tmp_path: Path) -> 
     assert _rows(target, "SELECT id, is_deleted FROM memory2_nodes ORDER BY id") == _rows(
         sources.memory, "SELECT id, is_deleted FROM memory2_nodes ORDER BY id"
     )
+    # Legacy profile text and unproven person columns are quarantined, never promoted.
+    assert report.quarantined
     assert verify_target(target=target, manifest=manifest).verdict == "ok"
 
 
@@ -400,17 +411,22 @@ def test_constraint_violating_row_is_quarantined(tmp_path: Path) -> None:
 
     counts = {name: (source, imported) for name, source, imported in report.tables}
     assert counts["memory2_embeddings"] == (2, 1)
-    assert report.quarantined == (("memory2_embeddings", "schema-unknown", 1),)
-    assert report.quarantined[0][1] in QUARANTINE_REASONS
+    assert ("memory2_embeddings", "schema-unknown", 1) in report.quarantined
+    # Every reason on the "unproven" path is one the target schema check accepts.
+    assert all(reason in QUARANTINE_REASONS for _table, reason, _count in report.quarantined)
     assert report.unaccounted_rows == 0
-    assert _rows(
-        target,
-        "SELECT source_table, reason, COUNT(*) FROM knowledge_quarantine GROUP BY 1, 2",
-    ) == [("memory2_embeddings", "schema-unknown", 1)]
+    quarantined_rows = dict(
+        ((table, reason), count)
+        for table, reason, count in _rows(
+            target,
+            "SELECT source_table, reason, COUNT(*) FROM knowledge_quarantine GROUP BY 1, 2",
+        )
+    )
+    assert quarantined_rows[("memory2_embeddings", "schema-unknown")] == 1
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["quarantined"] == [
-        {"count": 1, "reason": "schema-unknown", "table": "memory2_embeddings"}
-    ]
+    assert {"count": 1, "reason": "schema-unknown", "table": "memory2_embeddings"} in (
+        payload["quarantined"]
+    )
     # The quarantined row left no foreign-key violation behind.
     assert verify_target(target=target, manifest=manifest).verdict == "ok"
 
@@ -427,7 +443,10 @@ def test_fts_entry_for_deleted_node_is_accounted(tmp_path: Path) -> None:
 
     counts = {name: (source, imported) for name, source, imported in report.tables}
     assert counts["memory2_nodes_fts"] == (4, 3)
-    assert report.quarantined == (("memory2_nodes_fts", "schema-unknown", 1),)
+    assert ("memory2_nodes_fts", "schema-unknown", 1) in report.quarantined
+    assert all(
+        reason in QUARANTINE_REASONS for _table, reason, _count in report.quarantined
+    )
     assert report.unaccounted_rows == 0
     indexed = {row[0] for row in _rows(target, "SELECT entry_id FROM memory2_nodes_fts")}
     assert indexed == {ACTIVE_NODE_ID, LINKED_NODE_ID, "dddddddd-4444-4444-8444-dddddddddddd"}

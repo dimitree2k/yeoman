@@ -8,7 +8,6 @@ audience come from trusted runtime metadata, never from the model.
 from __future__ import annotations
 
 import pytest
-
 from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     PersonLinkCandidate,

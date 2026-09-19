@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from yeoman_gateway.knowledge.models import (
     RecallQuery,
     ValidationError,
@@ -127,10 +126,6 @@ def test_reader_outside_the_target_audience_is_denied(knowledge_harness):
     source = h.source(tom, audience={h.principal_for(tom), h.principal_for(alex)})
     h.capture_text("Alex reist.", source, subjects=(alex,))
     # The chat contains Tom, Alex and Maria; only Tom and Alex were in the audience.
-    context = h.read_context(
-        tom,
-        recipients={h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)},
-    )
     as_maria = h.read_context(
         maria,
         recipients={h.principal_for(tom), h.principal_for(alex), h.principal_for(maria)},
@@ -189,7 +184,6 @@ def test_query_limits_and_cursor_validation(knowledge_harness):
     tom = h.person("Tom")
     source = h.source(tom)
     h.capture_text("Alex reist.", source)
-    context = h.read_context(tom)
     with pytest.raises(ValidationError):
         RecallQuery(limit=0)
     with pytest.raises(ValidationError):

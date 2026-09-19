@@ -10,13 +10,12 @@ from __future__ import annotations
 import threading
 
 import pytest
-
 from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
 from yeoman_gateway.knowledge.models import (
+    Identifier,
     KnowledgeError,
     TrustedAdminContext,
     TrustedIdentityObservation,
-    Identifier,
 )
 
 

@@ -7,11 +7,9 @@ platform evidence, never from a name, and that typos in a namespace never merge 
 from __future__ import annotations
 
 import pytest
-
 from yeoman_gateway.knowledge.models import (
     Identifier,
     KnowledgeError,
-    PersonResolution,
     TrustedIdentityObservation,
 )
 

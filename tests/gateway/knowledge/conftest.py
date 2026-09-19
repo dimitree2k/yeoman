@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-
 from yeoman_gateway.knowledge.api import KnowledgeService, open_knowledge_store
 from yeoman_gateway.knowledge.authority import (
     EvidenceAudience,
