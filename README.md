@@ -608,6 +608,9 @@ the protocol version.
 | `yeoman memory facts supersede <id> --by <ref>` | Mark a fact superseded by a replacement |
 | `yeoman memory facts jobs [--state queued]` | Extraction backlog and skip reasons |
 | `yeoman memory facts backfill --chat <id> --since <date>` | Extract facts from history — **dry-run** unless `--apply` |
+| **Knowledge** (admin) | |
+| `yeoman knowledge migration inspect\|build\|verify` | Offline legacy snapshot inventory, build and verification |
+| `yeoman knowledge capture status` | Statement-promotion counters: job states, refusal reasons, oldest queued wait |
 | **Config** | |
 | `yeoman config migrate-to-env` | Move secrets from config.json to .env |
 | **Overseer** | |
