@@ -143,6 +143,33 @@ Before large feature work or architectural refactors:
 - Treat those docs as historical/architectural context, not guaranteed current code.
 - Reconcile against source and tests before editing.
 
+## Bounded Delivery Protocol
+
+This repository uses bounded execution. Generic continuous-execution or
+five-round subagent workflows are not used automatically here.
+
+- Before recovery or refactoring, record the branch, `HEAD`, and worktree
+  status. Preserve uncommitted changes as a patch or WIP commit; never reset,
+  clean, or discard them without explicit approval.
+- One task may use at most one implementer and one reviewer.
+- At most one fix round is automatic. A second fix round requires an explicit
+  human decision.
+- Only P0/P1 findings inside the stated task scope block completion. Record
+  P2/P3 findings in the ledger and defer them.
+- Do not broaden a task because a reviewer finds unrelated edge cases.
+- Timebox work to 60 minutes per task and 4 hours per phase. On timeout,
+  usage-limit error, or a hanging test, stop, preserve state, and report.
+  Do not silently retry or spawn another agent.
+- Use three test tiers: targeted RED/GREEN checks while editing; the related
+  suite once at task completion; the full suite once at final handoff. Do not
+  rerun an unchanged suite after every agent message.
+- Keep parent handoffs to ten lines plus a path to the detailed report. Do not
+  copy full logs, source files, or agent reports into the parent context.
+- After dispatch, verify that the actual child model matches the requested
+  model. A mismatch is a stop condition.
+- Do not merge, push, deploy, or restart services as part of a bounded task
+  unless the user explicitly authorizes that side effect.
+
 ## Test And Validation Matrix
 
 Prefer targeted checks while iterating, then broader checks before handoff:
