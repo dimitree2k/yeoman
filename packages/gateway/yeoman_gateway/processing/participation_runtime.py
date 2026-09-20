@@ -848,8 +848,16 @@ class ParticipationRuntime:
             return
         if action not in set(inputs.allowed_actions):
             raise ParticipationDecisionError("invalid_response", detail="action_not_allowed")
+        target = str(decision.target_message_id or "").strip()
+        if action in {"react", "comment"}:
+            if not target:
+                raise ParticipationDecisionError("missing_target")
+            if target not in set(opportunity.source_event_ids):
+                raise ParticipationDecisionError(
+                    "unknown_evidence", detail="target_not_current"
+                )
         if action == "react":
-            if not decision.target_message_id or not decision.emoji:
+            if not decision.emoji:
                 raise ParticipationDecisionError("missing_target")
             return
         if intent not in set(inputs.allowed_intents):

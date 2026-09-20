@@ -374,9 +374,9 @@ class ParticipationJudge:
             _bounded_id(payload.get("anchor_message_id")) if action == "comment" else None
         )
         target = _bounded_id(payload.get("target_message_id"))
-        if target is None and action == "react":
+        if target is None and action in {"react", "comment"}:
             # Trusted default: only the newest current source is targetable. Older
-            # optional history must never become a silent reaction target.
+            # optional history must never become a silent effect target.
             target = view.newest_current_source_id
         if anchor is not None and anchor not in view.anchor_ids:
             raise ParticipationDecisionError("unknown_evidence", detail="anchor_not_supplied")
@@ -388,7 +388,7 @@ class ParticipationJudge:
             and target not in view.current_source_ids
         ):
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_current")
-        if action == "react" and target is None:
+        if action in {"react", "comment"} and target is None:
             raise ParticipationDecisionError("missing_target", detail="target_not_supplied")
         if intent == "continue" and action == "comment":
             # Only *prose* acts on continuity: a comment that continues an exchange must

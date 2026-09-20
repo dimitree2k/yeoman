@@ -1262,11 +1262,15 @@ class _ParticipationSubmission:
         if generator is None:
             return None
         event, policy_decision = _participation_event(opportunity, decision)
+        writer_context = dict(context or {})
+        writer_context["target_message_id"] = getattr(
+            decision, "target_message_id", None
+        )
         return await generator(
             event,
             policy_decision,
             purpose=str(getattr(decision, "purpose", "") or ""),
-            context=dict(context or {}),
+            context=writer_context,
             model_profile=self._writer_profile,
         )
 

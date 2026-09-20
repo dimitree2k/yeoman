@@ -402,12 +402,9 @@ class _ParticipationSubmitOutcome:
 
 def _render_participation_transcript(context: dict[str, object], *, limit: int = 4000) -> str:
     """Render the trusted context as plain data lines for the draft prompt."""
-    lines: list[str] = []
-    current = {
-        str(item)
-        for item in (context.get("current_source_ids") or ())
-        if str(item).strip()
-    }
+    target_id = str(context.get("target_message_id") or "").strip()
+    target_line = ""
+    context_lines: list[str] = []
     messages = context.get("messages")
     if isinstance(messages, list):
         for item in messages:
@@ -418,8 +415,10 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
             if not body:
                 continue
             message_id = str(item.get("event_id") or item.get("message_id") or "")
-            marker = "CURRENT" if message_id in current else "CONTEXT"
-            lines.append(f"[{marker}] {sender}: {body}")
+            if not target_line and message_id == target_id:
+                target_line = f"[CURRENT] {sender}: {body}"
+            else:
+                context_lines.append(f"[CONTEXT] {sender}: {body}")
     anchors = context.get("anchors")
     if isinstance(anchors, list):
         for anchor in anchors:
@@ -427,8 +426,8 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
                 continue
             text = str(anchor.get("message") or "").strip()
             if text:
-                lines.append(f"Arvid (already delivered): {text}")
-    rendered = "\n".join(lines)
+                context_lines.append(f"Arvid (already delivered): {text}")
+    rendered = "\n".join(([target_line] if target_line else []) + context_lines)
     return rendered[:limit]
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1189,8 +1190,10 @@ async def test_simultaneous_reservations_under_limit_one_yield_one_success(
     log = SpeakupLog(tmp_path / "speakups.db")
     await _proposal(log, "p1")
     await _proposal(log, "p2")
+    barrier = threading.Barrier(2)
 
     def reserve(proposal_id: str, effect_id: str) -> bool:
+        barrier.wait(timeout=5)
         return log.reserve_delivery_sync(
             proposal_id=proposal_id,
             effect_id=effect_id,

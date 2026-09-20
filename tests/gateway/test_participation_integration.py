@@ -1829,7 +1829,9 @@ async def test_unsolicited_generation_has_no_executable_tools(tmp_path: Path) ->
 
     submission = _ToolSpySubmission()
     runtime, _judge, _context, log = _runtime(
-        tmp_path, decision=COMMENT, submission=submission
+        tmp_path,
+        decision=replace(COMMENT, target_message_id="s4-m1"),
+        submission=submission,
     )
     result = await runtime.evaluate_participation(_opportunity("s4-m1"))
     assert result["status"] == "submitted"
@@ -1967,7 +1969,45 @@ async def test_comment_admission_hash_includes_reply_target(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_writer_prompt_marks_current_source_separately_from_old_context() -> None:
+async def test_comment_without_current_target_fails_closed_at_runtime(tmp_path: Path) -> None:
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=replace(COMMENT, target_message_id=None),
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "judge_failed", "reason": "missing_target"}
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_passes_selected_target_to_writer_context() -> None:
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+
+    captured: dict[str, object] = {}
+
+    class _Responder:
+        async def generate_participation_draft(self, *args: object, **kwargs: object) -> str:
+            del args
+            captured.update(kwargs["context"])  # type: ignore[arg-type]
+            return "draft"
+
+    submission = _ParticipationSubmission(
+        responder=_Responder(),
+        writer_profile="participation_writer",
+    )
+    await submission.generate_draft(
+        opportunity=_opportunity("m1", "m2"),
+        decision=replace(COMMENT, target_message_id="m2"),
+        context={"current_source_ids": ["m1", "m2"], "messages": []},
+    )
+
+    assert captured["target_message_id"] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_writer_prompt_marks_only_selected_current_target() -> None:
     from yeoman_gateway.adapters.responder_llm import LLMResponder
     from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 
@@ -2000,16 +2040,17 @@ async def test_writer_prompt_marks_current_source_separately_from_old_context() 
         ),
         purpose="Explain the current JEV use case.",
         context={
-            "current_source_ids": ["current"],
+            "current_source_ids": ["first", "selected"],
+            "target_message_id": "selected",
             "messages": [
                 {
-                    "event_id": "old",
-                    "sender": "Arvid",
-                    "text": "bist du geupdatet?",
+                    "event_id": "first",
+                    "sender": "Anna",
+                    "text": "first coalesced source",
                 },
                 {
-                    "event_id": "current",
-                    "sender": "Arvid",
+                    "event_id": "selected",
+                    "sender": "Ben",
                     "text": "JEV needs a concrete use case",
                 },
             ],
@@ -2017,9 +2058,28 @@ async def test_writer_prompt_marks_current_source_separately_from_old_context() 
         model_profile="participation_writer",
     )
 
-    assert "[CONTEXT] Arvid: bist du geupdatet?" in responder.prompt
-    assert "[CURRENT] Arvid: JEV needs a concrete use case" in responder.prompt
+    assert "[CONTEXT] Anna: first coalesced source" in responder.prompt
+    assert "[CURRENT] Ben: JEV needs a concrete use case" in responder.prompt
+    assert "[CURRENT] Anna" not in responder.prompt
     assert "Answer only the [CURRENT] message" in responder.prompt
+
+
+def test_writer_transcript_keeps_selected_target_when_context_exceeds_limit() -> None:
+    from yeoman_gateway.adapters.responder_llm import _render_participation_transcript
+
+    transcript = _render_participation_transcript(
+        {
+            "target_message_id": "selected",
+            "current_source_ids": ["selected"],
+            "messages": [
+                {"event_id": "old", "sender": "Anna", "text": "x" * 5000},
+                {"event_id": "selected", "sender": "Ben", "text": "current question"},
+            ],
+        }
+    )
+
+    assert transcript.startswith("[CURRENT] Ben: current question")
+    assert len(transcript) <= 4000
 
 
 @pytest.mark.asyncio

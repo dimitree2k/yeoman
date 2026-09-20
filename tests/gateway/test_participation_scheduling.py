@@ -157,6 +157,7 @@ async def test_direct_fence_discards_waiting_draft_before_transport(tmp_path) ->
                 reason="synthetic",
                 purpose="synthetic",
                 contribution_type="observation",
+                target_message_id="m1",
             )
 
     class Context:

@@ -272,6 +272,22 @@ async def test_reaction_without_a_target_needs_some_retained_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_comment_without_target_defaults_to_newest_current_source() -> None:
+    judge = ParticipationJudge(client=_Client(_payload(
+        action="comment",
+        intent="initiate",
+        purpose="answer the current question",
+        contribution_type="observation",
+    )), allowed_emojis=(EMOJI,))
+
+    decision = await judge.decide(
+        _opportunity(), _context(current_source_ids=["m1", "m2"])
+    )
+
+    assert decision.target_message_id == "m2"
+
+
+@pytest.mark.asyncio
 async def test_continuation_without_a_delivered_anchor_is_refused() -> None:
     judge = ParticipationJudge(client=_Client(_payload(
         action="comment", intent="continue", purpose="x", anchor_message_id=None
