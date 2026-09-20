@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +13,8 @@ import {
   shouldIgnoreFromMeInbound,
 } from './whatsapp.js';
 import { BridgeServer } from './server.js';
+import { BridgeOutbox } from './outbox.js';
+import { createEventEnvelope } from './protocol.js';
 
 function inboundMessage(messageId: string): Record<string, unknown> {
   return {
@@ -358,6 +360,89 @@ test('concurrent duplicate signals retry after the leading handler fails', async
 
     assert.equal(callbacks, 2);
     assert.equal((client as any).recentInbound.size, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('registered duplicate message survives fatal pre-rename failure for restart replay', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-dedupe-recovery-'));
+  const eventId = 'recovery-event-1';
+  const eventKey = 'recovery-key-1';
+  const finalPath = join(
+    root,
+    `00000000000000000001-${encodeURIComponent(eventId)}-${encodeURIComponent(eventKey)}.json`,
+  );
+  try {
+    const server = new BridgeServer(
+      '127.0.0.1',
+      0,
+      '',
+      '',
+      '',
+      false,
+      false,
+      false,
+      'secret',
+      '0.2.0',
+      'test-build',
+      true,
+      'default',
+      root,
+    );
+    await (server as any).outbox.open();
+    // Force only the canonical rename to fail after the fsynced temp record exists.
+    await mkdir(finalPath);
+    await chmod(finalPath, 0o500);
+
+    let callbacks = 0;
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: (message) => {
+        callbacks += 1;
+        return (server as any).trackProviderEvent(
+          (server as any).broadcastReplayable(
+            createEventEnvelope({
+              type: 'message',
+              eventId,
+              eventKey,
+              payload: { messageId: message.messageId, text: message.text },
+            }),
+          ),
+        );
+      },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (server as any).wa = client;
+    const listeners = new Map<string, (value: any) => void>();
+    (client as any).sock = {
+      readMessages: async () => undefined,
+      ev: { on: (name: string, listener: (value: any) => void) => listeners.set(name, listener) },
+    };
+    (client as any).registerInboundMessageHandler();
+    (client as any).running = true;
+    (client as any).connected = true;
+    (client as any).acceptingProviderEvents = true;
+
+    const message = inboundMessage('same-key-recovery');
+    listeners.get('messages.upsert')!({ messages: [message, message], type: 'notify' });
+    await waitFor(() => (server as any).persistenceFailure === true);
+    assert.equal(callbacks, 1);
+    assert.equal((client as any).acceptingProviderEvents, false);
+    assert.equal((client as any).droppedInboundDuplicates, 0);
+
+    await chmod(finalPath, 0o700);
+    await rm(finalPath, { recursive: true, force: true });
+    const restarted = new BridgeOutbox(root);
+    await restarted.open();
+    const pending = await restarted.pending();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].eventId, eventId);
+    assert.equal(pending[0].eventKey, eventKey);
+    assert.equal((pending[0].payload as any).messageId, 'same-key-recovery');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

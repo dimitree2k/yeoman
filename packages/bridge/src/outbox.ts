@@ -44,6 +44,7 @@ export type OutboxDiagnostics = {
 };
 
 const OUTBOX_FILE_RE = /^(\d+)-.+\.json$/;
+const STAGED_FILE_RE = /^\.((\d+)-.+\.json)\.[0-9a-f-]+\.tmp$/;
 const QUARANTINE_DIR = 'quarantine';
 const OWNER_DIR_MODE = 0o700;
 const OWNER_FILE_MODE = 0o600;
@@ -155,7 +156,11 @@ export class BridgeOutbox {
     }
 
     const files = (await readdir(this.directory, { withFileTypes: true }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) => {
+        const aStaged = a.name.startsWith('.') ? 1 : 0;
+        const bStaged = b.name.startsWith('.') ? 1 : 0;
+        return aStaged - bStaged || a.name.localeCompare(b.name);
+      });
     const loaded: OutboxEntry[] = [];
     const sequences = new Set<number>();
     const eventIds = new Set<string>();
@@ -167,11 +172,12 @@ export class BridgeOutbox {
       await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
 
       const match = OUTBOX_FILE_RE.exec(file.name);
-      if (!match) {
+      const stagedMatch = STAGED_FILE_RE.exec(file.name);
+      if (!match && !stagedMatch) {
         await this.quarantine(path, 'malformed-filename');
         continue;
       }
-      const sequence = Number(match[1]);
+      const sequence = Number(match?.[1] ?? stagedMatch?.[2]);
       if (!Number.isSafeInteger(sequence) || sequence < 1) {
         await this.quarantine(path, 'sequence-overflow');
         continue;
@@ -188,7 +194,12 @@ export class BridgeOutbox {
         await this.quarantine(path, 'non-replayable');
         continue;
       }
-      if (fileNameFor(sequence, parsed) !== file.name) {
+      const expectedFileName = fileNameFor(sequence, parsed);
+      if (match && expectedFileName !== file.name) {
+        await this.quarantine(path, 'identity-mismatch');
+        continue;
+      }
+      if (stagedMatch && expectedFileName !== stagedMatch[1]) {
         await this.quarantine(path, 'identity-mismatch');
         continue;
       }
@@ -254,6 +265,30 @@ export class BridgeOutbox {
     return result;
   }
 
+  private async rememberStaged(
+    sequence: number,
+    fileName: string,
+    expected: ReplayableBridgeEvent,
+  ): Promise<void> {
+    const path = join(this.directory, fileName);
+    const stats = await lstat(path);
+    if (!stats.isFile()) throw new Error('Bridge outbox staged record is not a regular file');
+    await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
+    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!this.isReplayableEvent(parsed) || JSON.stringify(parsed) !== JSON.stringify(expected)) {
+      throw new Error('Bridge outbox staged record mismatch');
+    }
+    const existing = this.entries.get(expected.eventId);
+    if (existing) {
+      if (JSON.stringify(existing.event) !== JSON.stringify(expected)) {
+        throw new Error('Conflicting bridge outbox event');
+      }
+      return;
+    }
+    this.entries.set(expected.eventId, { sequence, fileName, event: expected });
+    this.nextSequence = Math.max(this.nextSequence, sequence + 1);
+  }
+
   async append(event: BridgeEventEnvelope): Promise<ReplayableBridgeEvent> {
     const replayable = asReplayableEvent(event);
     await this.open();
@@ -270,16 +305,22 @@ export class BridgeOutbox {
       const fileName = fileNameFor(sequence, replayable);
       const finalPath = join(this.directory, fileName);
       const temporaryPath = join(this.directory, `.${fileName}.${randomUUID()}.tmp`);
+      const temporaryFileName = temporaryPath.slice(this.directory.length + 1);
       let handle: Awaited<ReturnType<typeof openFile>> | undefined;
+      let staged = false;
       try {
         handle = await openFile(temporaryPath, 'wx', OWNER_FILE_MODE);
         await handle.writeFile(JSON.stringify(replayable), 'utf8');
         await handle.sync();
+        staged = true;
         await handle.close();
         handle = undefined;
+        // Make the retry filename durable before attempting the canonical rename.
+        await syncDirectory(this.directory);
       } catch (error) {
         await handle?.close().catch(() => undefined);
-        await unlink(temporaryPath).catch(() => undefined);
+        if (!staged) await unlink(temporaryPath).catch(() => undefined);
+        else await this.rememberStaged(sequence, temporaryFileName, replayable).catch(() => undefined);
         throw error;
       }
 
@@ -290,7 +331,7 @@ export class BridgeOutbox {
         await syncDirectory(this.directory);
       } catch (error) {
         if (renamed) await this.reconcilePersisted(sequence, fileName, replayable);
-        else await unlink(temporaryPath).catch(() => undefined);
+        else await this.rememberStaged(sequence, temporaryFileName, replayable).catch(() => undefined);
         throw error;
       }
 
