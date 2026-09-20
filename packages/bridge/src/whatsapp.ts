@@ -137,9 +137,12 @@ export interface WhatsAppClientOptions {
   acceptFromMe?: boolean;
   readReceipts?: boolean;
   accountId?: string;
-  onMessage: (msg: InboundMessageV2) => void;
+  onMessage: (msg: InboundMessageV2) => void | Promise<void>;
   /** Journal evidence from the provider: edit, delete, reaction or receipt. */
-  onSignal?: (kind: 'edit' | 'delete' | 'reaction' | 'receipt', payload: Record<string, unknown>) => void;
+  onSignal?: (
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt',
+    payload: Record<string, unknown>,
+  ) => void | Promise<void>;
   onQR: (qr: string) => void;
   onStatus: (status: string, detail?: Record<string, unknown>) => void;
   onError: (error: string) => void;
@@ -463,6 +466,8 @@ export class WhatsAppClient {
   private sock: any = null;
   private running = false;
   private loopTask: Promise<void> | null = null;
+  private acceptingProviderEvents = false;
+  private readonly providerEventHandlers = new Set<Promise<void>>();
 
   private connected = false;
   private reconnectAttempts = 0;
@@ -740,8 +745,43 @@ export class WhatsAppClient {
   async start(): Promise<void> {
     if (this.running) return;
     await this.ensureMediaDirs();
+    this.acceptingProviderEvents = true;
     this.running = true;
     this.loopTask = this.runLoop();
+  }
+
+  private admitProviderEvent(handler: () => void | Promise<void>): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
+    let tracked: Promise<void>;
+    tracked = Promise.resolve()
+      .then(handler)
+      .catch((error: unknown) => {
+        this.lastError = safeErrorMessage(error);
+        this.options.onError(`provider_event_failed: ${this.lastError}`);
+      })
+      .finally(() => this.providerEventHandlers.delete(tracked));
+    this.providerEventHandlers.add(tracked);
+    return tracked;
+  }
+
+  private async drainProviderEvents(): Promise<void> {
+    while (this.providerEventHandlers.size > 0) {
+      await Promise.allSettled(Array.from(this.providerEventHandlers));
+    }
+  }
+
+  stopIntake(): void {
+    this.acceptingProviderEvents = false;
+    this.running = false;
+    this.connected = false;
+    this.resolveConnected(false);
+    if (this.sock) {
+      try {
+        this.sock.end(undefined);
+      } catch {
+        // Ignore end failures.
+      }
+    }
   }
 
   private async runLoop(): Promise<void> {
@@ -940,14 +980,18 @@ export class WhatsAppClient {
   ): void {
     const emit = this.options.onSignal;
     if (!emit) return;
-    const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
-    if (this.seenInbound(dedupeKey)) return;
-    try {
-      emit(kind, payload);
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      this.options.onError(`signal_emit_failed: ${this.lastError}`);
-    }
+    this.admitProviderEvent(async () => {
+      const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
+      if (this.seenInbound(dedupeKey)) return;
+      try {
+        await emit(kind, payload);
+      } catch (err) {
+        this.recentInbound.delete(dedupeKey);
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.options.onError(`signal_emit_failed: ${this.lastError}`);
+        throw err;
+      }
+    });
   }
 
   /**
@@ -1364,6 +1408,112 @@ export class WhatsAppClient {
     this.connectWaiters.clear();
   }
 
+  private async handleInboundMessage(msg: any): Promise<void> {
+    const remoteJidRaw = String(msg?.key?.remoteJid || '');
+    if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) return;
+
+    const chatJid = normalizeJid(remoteJidRaw);
+    if (!chatJid) return;
+
+    const messageId = String(msg?.key?.id || '').trim();
+    if (!messageId) return;
+    const fromMe = Boolean(msg?.key?.fromMe);
+    const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
+    if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) return;
+
+    this.storeInboundForQuote(chatJid, messageId, msg);
+
+    const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
+    if (this.seenInbound(dedupeKey)) {
+      this.droppedInboundDuplicates += 1;
+      return;
+    }
+
+    const isGroup = chatJid.endsWith('@g.us');
+    const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
+    const senderId = jidUserToken(participantJid || chatJid);
+
+    const extracted = this.extractMessageTextAndMedia(msg);
+    if (!extracted.text) return;
+    let inboundMedia = extracted.media;
+    if (inboundMedia?.kind === 'image') {
+      try {
+        inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'audio') {
+      try {
+        inboundMedia = await this.persistInboundAudio(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'video') {
+      try {
+        inboundMedia = await this.persistInboundVideo(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'sticker') {
+      try {
+        inboundMedia = await this.persistInboundSticker(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'document') {
+      try {
+        inboundMedia = await this.persistInboundDocument(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    }
+
+    const mention = this.extractMentionMeta(msg, extracted.text);
+    const reply = await this.buildReplyMeta(msg, chatJid);
+    const tsRaw = msg?.messageTimestamp;
+    const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
+
+    if (this.options.readReceipts !== false && this.sock) {
+      void this.sock.readMessages([msg.key]).catch((err: unknown) => {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`read_receipt_failed: ${this.lastError}`);
+      });
+    }
+
+    this.lastMessageAt = nowMs();
+
+    try {
+      await this.options.onMessage({
+        messageId,
+        chatJid,
+        participantJid,
+        senderId,
+        senderPhoneJid: this.phoneJidForParticipant(participantJid),
+        lidConflict: this.isLidConflict(participantJid),
+        senderName: (msg.pushName || '').trim() || undefined,
+        isGroup,
+        text: limitText(extracted.text, 8_000),
+        timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
+        mentionedJids: mention.mentionedJids,
+        mentionedBot: mention.mentionedBot,
+        replyToBot: mention.replyToBot,
+        replyToMessageId: reply.replyToMessageId,
+        replyToParticipantJid: reply.replyToParticipantJid,
+        replyToText: reply.replyToText,
+        replyToMedia: reply.replyToMedia,
+        media: inboundMedia,
+      });
+    } catch (error) {
+      this.recentInbound.delete(dedupeKey);
+      throw error;
+    }
+  }
+
   private async connectOnce(): Promise<void> {
     const logger = pino({ level: 'silent' });
     await ensureAuthSecurity(this.options.authDir);
@@ -1548,108 +1698,10 @@ export class WhatsAppClient {
       }
     });
 
-    this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
+    this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
       if (type !== 'notify' && type !== 'append') return;
-      for (const msg of messages) {
-        if (!this.running) return;
-        const remoteJidRaw = String(msg?.key?.remoteJid || '');
-        if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) continue;
-
-        const chatJid = normalizeJid(remoteJidRaw);
-        if (!chatJid) continue;
-
-        const messageId = String(msg?.key?.id || '').trim();
-        if (!messageId) continue;
-        const fromMe = Boolean(msg?.key?.fromMe);
-        const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
-        if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) continue;
-
-        this.storeInboundForQuote(chatJid, messageId, msg);
-
-        const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
-        if (this.seenInbound(dedupeKey)) {
-          this.droppedInboundDuplicates += 1;
-          continue;
-        }
-
-        const isGroup = chatJid.endsWith('@g.us');
-        const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
-        const senderId = jidUserToken(participantJid || chatJid);
-
-        const extracted = this.extractMessageTextAndMedia(msg);
-        if (!extracted.text) continue;
-        let inboundMedia = extracted.media;
-        if (inboundMedia?.kind === 'image') {
-          try {
-            inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'audio') {
-          try {
-            inboundMedia = await this.persistInboundAudio(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'video') {
-          try {
-            inboundMedia = await this.persistInboundVideo(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'sticker') {
-          try {
-            inboundMedia = await this.persistInboundSticker(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'document') {
-          try {
-            inboundMedia = await this.persistInboundDocument(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        }
-
-        const mention = this.extractMentionMeta(msg, extracted.text);
-        const reply = await this.buildReplyMeta(msg, chatJid);
-        const tsRaw = msg?.messageTimestamp;
-        const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
-
-        if (this.options.readReceipts !== false) {
-          void this.sock.readMessages([msg.key]).catch((err: unknown) => {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`read_receipt_failed: ${this.lastError}`);
-          });
-        }
-
-        this.lastMessageAt = nowMs();
-
-        this.options.onMessage({
-          messageId,
-          chatJid,
-          participantJid,
-          senderId,
-          senderPhoneJid: this.phoneJidForParticipant(participantJid),
-          lidConflict: this.isLidConflict(participantJid),
-          senderName: (msg.pushName || '').trim() || undefined,
-          isGroup,
-          text: limitText(extracted.text, 8_000),
-          timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
-          mentionedJids: mention.mentionedJids,
-          mentionedBot: mention.mentionedBot,
-          replyToBot: mention.replyToBot,
-          replyToMessageId: reply.replyToMessageId,
-          replyToParticipantJid: reply.replyToParticipantJid,
-          replyToText: reply.replyToText,
-          replyToMedia: reply.replyToMedia,
-          media: inboundMedia,
-        });
+      for (const msg of messages ?? []) {
+        this.admitProviderEvent(() => this.handleInboundMessage(msg));
       }
     });
 
@@ -2026,21 +2078,14 @@ export class WhatsAppClient {
   }
 
   async stop(): Promise<void> {
-    this.running = false;
-    this.resolveConnected(false);
-
-    if (this.sock) {
-      try {
-        this.sock.end(undefined);
-      } catch {
-        // Ignore end failures.
-      }
-      this.sock = null;
-    }
+    this.stopIntake();
 
     if (this.loopTask) {
       await Promise.race([this.loopTask, sleep(1_000)]);
       this.loopTask = null;
     }
+
+    await this.drainProviderEvents();
+    this.sock = null;
   }
 }

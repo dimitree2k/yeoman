@@ -127,10 +127,10 @@ export class BridgeServer {
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => {
-        this.trackProviderEvent(this.broadcastMessage(msg));
+        return this.trackProviderEvent(this.broadcastMessage(msg));
       },
       onSignal: (kind, payload) => {
-        this.trackProviderEvent(
+        return this.trackProviderEvent(
           this.broadcastReplayable(
             createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
           ),
@@ -556,7 +556,7 @@ export class BridgeServer {
   }
 
   private async broadcastReplayable(event: BridgeEventEnvelope): Promise<void> {
-    if (this.intakeStopped || this.stopping) throw new Error('Bridge event intake is stopped');
+    if (this.persistenceFailure) throw new Error('Bridge event intake is stopped');
     let persisted: ReplayableBridgeEvent;
     try {
       persisted = await this.outbox.append(event);
@@ -603,17 +603,20 @@ export class BridgeServer {
     if (this.persistenceFailure) return;
     this.persistenceFailure = true;
     this.intakeStopped = true;
+    this.wa?.stopIntake();
     console.error('Bridge event persistence failed; provider intake stopped');
   }
 
-  private trackProviderEvent(operation: Promise<void>): void {
+  private trackProviderEvent(operation: Promise<void>): Promise<void> {
     let tracked: Promise<void>;
     tracked = operation
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!this.stopping) this.recordPersistenceFailure();
+        throw error;
       })
       .finally(() => this.inFlight.delete(tracked));
     this.inFlight.add(tracked);
+    return tracked;
   }
 
   private handleClientClose(meta: ClientMeta): void {

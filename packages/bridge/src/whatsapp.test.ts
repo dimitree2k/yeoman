@@ -12,6 +12,15 @@ import {
   resolveWhatsAppWebVersion,
   shouldIgnoreFromMeInbound,
 } from './whatsapp.js';
+import { BridgeServer } from './server.js';
+
+function inboundMessage(messageId: string): Record<string, unknown> {
+  return {
+    key: { remoteJid: '12345@s.whatsapp.net', id: messageId },
+    message: { conversation: 'durable inbound message' },
+    messageTimestamp: 1_700_000_000,
+  };
+}
 
 test('resolveParticipantJid ignores quoted participant metadata in direct chat', () => {
   const msg = {
@@ -105,6 +114,108 @@ test('resolveWhatsAppWebVersion falls back when fetch fails', async () => {
   });
 
   assert.deepEqual(version, FALLBACK_WHATSAPP_WEB_VERSION);
+});
+
+test('fatal persistence failure halts provider intake before another event enters dedupe', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-fatal-intake-'));
+  try {
+    const server = new BridgeServer(
+      '127.0.0.1',
+      0,
+      '',
+      '',
+      '',
+      false,
+      false,
+      false,
+      'secret',
+      '0.2.0',
+      'test-build',
+      true,
+      'default',
+      root,
+    );
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: (message) =>
+        (server as any).trackProviderEvent((server as any).broadcastMessage(message)),
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (server as any).wa = client;
+    (server as any).outbox.append = async () => {
+      throw new Error('durable append failed');
+    };
+    (client as any).sock = { readMessages: async () => undefined };
+    (client as any).running = true;
+    (client as any).connected = true;
+    (client as any).acceptingProviderEvents = true;
+
+    await (client as any).admitProviderEvent(() =>
+      (client as any).handleInboundMessage(inboundMessage('fatal-event-1')),
+    );
+
+    assert.equal((server as any).persistenceFailure, true);
+    assert.equal((client as any).acceptingProviderEvents, false);
+    assert.equal((client as any).running, false);
+    assert.equal((client as any).connected, false);
+    assert.equal((client as any).recentInbound.size, 0);
+
+    await (client as any).admitProviderEvent(() =>
+      (client as any).handleInboundMessage(inboundMessage('must-not-enter-dedupe')),
+    );
+    assert.equal((client as any).recentInbound.size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('stop waits for an admitted provider handler before returning', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-provider-drain-'));
+  try {
+    let release!: () => void;
+    let markCallbackStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: async () => {
+        markCallbackStarted();
+        await blocked;
+      },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (client as any).sock = { readMessages: async () => undefined };
+    (client as any).running = true;
+    (client as any).acceptingProviderEvents = true;
+
+    const handler = (client as any).admitProviderEvent(() =>
+      (client as any).handleInboundMessage(inboundMessage('drain-event-1')),
+    );
+    await callbackStarted;
+
+    let stopped = false;
+    const stopping = client.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false);
+    release();
+    await handler;
+    await stopping;
+    assert.equal(stopped, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('deleteMessage sends a fromMe delete key for the exact target', async () => {
