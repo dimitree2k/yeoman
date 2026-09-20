@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1199,10 +1200,12 @@ async def test_simultaneous_reservations_under_limit_one_yield_one_success(
             limits=(("initiation", 1, DAY_MS, "calendar_day"),),
         )
 
-    results = await asyncio.gather(
-        asyncio.to_thread(reserve, "p1", "e1"),
-        asyncio.to_thread(reserve, "p2", "e2"),
-    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (
+            pool.submit(reserve, "p1", "e1"),
+            pool.submit(reserve, "p2", "e2"),
+        )
+        results = [future.result() for future in futures]
     assert sorted(results) == [False, True]
     assert await log.consumed_slots(
         channel=CHANNEL,
