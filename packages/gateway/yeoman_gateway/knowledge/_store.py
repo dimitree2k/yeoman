@@ -358,6 +358,52 @@ _CORE_SCHEMA: tuple[str, ...] = (
     " ON conversation_relations (from_conversation_id, relation)",
     "CREATE INDEX IF NOT EXISTS conversation_relations_by_to"
     " ON conversation_relations (to_conversation_id, relation)",
+    # ── episodes (Phase 2) ───────────────────────────────────────────────────
+    # A derived statement about closed context.  The source join is the provenance: an
+    # episode is never readable more broadly than every one of its sources permits.
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_episodes (
+        episode_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','superseded','stale')),
+        digest TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        uncertainty REAL NOT NULL,
+        source_count INTEGER NOT NULL DEFAULT 0,
+        window_start_ms INTEGER NOT NULL DEFAULT 0,
+        window_end_ms INTEGER NOT NULL DEFAULT 0,
+        supersedes TEXT REFERENCES knowledge_episodes(episode_id),
+        created_ms INTEGER NOT NULL,
+        stale_ms INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_episodes_by_scope"
+    " ON knowledge_episodes (workspace_id, scope_key, status, version DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_episode_sources (
+        episode_id TEXT NOT NULL REFERENCES knowledge_episodes(episode_id)
+            ON DELETE CASCADE,
+        event_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        statement_id TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
+        occurred_ms INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','revoked','unknown')),
+        PRIMARY KEY (episode_id, event_id, revision, statement_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS knowledge_episode_sources_by_episode"
+    " ON knowledge_episode_sources (episode_id)",
+    "CREATE INDEX IF NOT EXISTS knowledge_episode_sources_by_statement"
+    " ON knowledge_episode_sources (statement_id)",
     """
     CREATE TABLE IF NOT EXISTS knowledge_meta (
         key TEXT PRIMARY KEY,
@@ -814,6 +860,8 @@ class KnowledgeStore:
             "conversations",
             "conversation_memberships",
             "conversation_relations",
+            "knowledge_episodes",
+            "knowledge_episode_sources",
             "memory2_nodes",
             "memory2_facts",
             "memory2_fact_sources",

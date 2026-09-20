@@ -27,6 +27,9 @@ __all__ = [
     "CONVERSATION_ORIGINS",
     "CONVERSATION_RELATIONS",
     "CONVERSATION_STATUSES",
+    "DAY_MS",
+    "EPISODE_CLOSURE_MS",
+    "EPISODE_STATUSES",
     "ERROR_CODES",
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
@@ -46,6 +49,10 @@ __all__ = [
     "ConversationSplitReceipt",
     "ConversationView",
     "EndpointResolution",
+    "EpisodeBuildReport",
+    "EpisodeSeed",
+    "EpisodeSourceRef",
+    "EpisodeView",
     "Identifier",
     "KnowledgeContext",
     "KnowledgeError",
@@ -120,6 +127,14 @@ CONVERSATION_RELATIONS: Final[tuple[str, ...]] = (
 )
 
 CONVERSATION_STATUSES: Final[tuple[str, ...]] = ("open", "closed", "merged")
+
+DAY_MS: Final[int] = 86_400_000
+
+#: "Approximately two months": context whose sources are all older than this may be
+#: consolidated.  The boundary means consolidation, never deletion of the log.
+EPISODE_CLOSURE_MS: Final[int] = 60 * DAY_MS
+
+EPISODE_STATUSES: Final[tuple[str, ...]] = ("active", "superseded", "stale")
 
 ERROR_CODES: Final[tuple[str, ...]] = (
     "invalid_input",
@@ -675,6 +690,75 @@ class PersonProfile:
 
     person: PersonResolution
     context: KnowledgeContext
+
+
+# ── episodes ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeSourceRef:
+    """One covered source revision, and the statement it supports in this episode."""
+
+    event_id: str
+    revision: int
+    statement_id: str = ""
+    channel: str = ""
+    chat_id: str = ""
+    occurred_ms: int = 0
+    status: str = "active"
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeSeed:
+    """One closed statement offered to the summarizer, with its own provenance."""
+
+    statement_id: str
+    content: str
+    author_principal: str = ""
+    confidence: float = 0.5
+    occurred_ms: int = 0
+    source_event_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeView:
+    """A derived statement about closed context.  Never independent human evidence."""
+
+    episode_id: str
+    workspace_id: str = ""
+    scope_key: str = ""
+    version: int = 1
+    status: str = "active"
+    text: str = ""
+    model_version: str = ""
+    prompt_version: str = ""
+    uncertainty: float = 1.0
+    source_count: int = 0
+    sources: tuple[EpisodeSourceRef, ...] = ()
+    supersedes: str | None = None
+    created_ms: int = 0
+    reason: str = "ok"
+
+    @property
+    def derived(self) -> bool:
+        """An episode is a derivation, not a fresh human statement."""
+        return True
+
+    @property
+    def stale(self) -> bool:
+        return self.status == "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeBuildReport:
+    """What one consolidation pass did."""
+
+    created: int = 0
+    reused: int = 0
+    superseded: int = 0
+    stale: int = 0
+    skipped: int = 0
+    episode_ids: tuple[str, ...] = ()
 
 
 # ── conversation threads ─────────────────────────────────────────────────────

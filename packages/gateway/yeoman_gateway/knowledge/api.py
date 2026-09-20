@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from yeoman_gateway.knowledge._conversations import ConversationEngine
+from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
 from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
 from yeoman_gateway.knowledge._statements import StatementEngine, token_re
@@ -37,6 +38,8 @@ from yeoman_gateway.knowledge.models import (
     ConversationSplitReceipt,
     ConversationView,
     EndpointResolution,
+    EpisodeBuildReport,
+    EpisodeView,
     Identifier,
     KnowledgeContext,
     KnowledgeError,
@@ -269,6 +272,12 @@ class KnowledgeService:
             workspace_id=self.workspace_id,
         )
         self._conversations = ConversationEngine(
+            store,
+            authority=self._authority,
+            retrieval=self._retrieval,
+            workspace_id=self.workspace_id,
+        )
+        self._episodes = EpisodeConsolidator(
             store,
             authority=self._authority,
             retrieval=self._retrieval,
@@ -629,6 +638,50 @@ class KnowledgeService:
         return self._conversations.conversations_for_source(
             source, context=self._read_context(context)
         )
+
+    # ── episodes ─────────────────────────────────────────────────────────────
+    #
+    # An episode is a derived statement about closed context, with complete source and
+    # statement provenance.  It is never independent human evidence, it is never disclosed
+    # more broadly than every one of its sources permits, and rebuilding keeps the prior
+    # version for audit.
+
+    def consolidate_episodes(
+        self,
+        *,
+        scope_key: str,
+        context: TrustedAdminContext,
+        summarizer: Any | None = None,
+        now_ms: int | None = None,
+        model_version: str | None = None,
+        prompt_version: str | None = None,
+    ) -> EpisodeBuildReport:
+        """Build or reuse the active episode of one chat scope.  Administrative."""
+        self._require_admin_context(context)
+        from yeoman_gateway.knowledge._episodes import (
+            DEFAULT_MODEL_VERSION,
+            EPISODE_PROMPT_VERSION,
+        )
+
+        return self._episodes.consolidate(
+            scope_key=str(scope_key),
+            summarizer=summarizer,
+            now_ms=self._now() if now_ms is None else int(now_ms),
+            model_version=model_version or DEFAULT_MODEL_VERSION,
+            prompt_version=prompt_version or EPISODE_PROMPT_VERSION,
+        )
+
+    def episodes(
+        self, *, scope_key: str, context: TrustedReadContext
+    ) -> tuple[EpisodeView, ...]:
+        """Every episode of the reader's own scope, gated and staleness-checked."""
+        return self._episodes.list_episodes(
+            scope_key=str(scope_key), context=self._read_context(context)
+        )
+
+    def episode(self, episode_id: str, *, context: TrustedReadContext) -> EpisodeView:
+        """One episode, including a superseded version kept for audit."""
+        return self._episodes.get(episode_id, context=self._read_context(context))
 
     # ── administration and diagnostics ───────────────────────────────────────
 
