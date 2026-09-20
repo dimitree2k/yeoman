@@ -126,12 +126,14 @@ class EnginePolicyAdapter(PolicyPort):
         private_handoff_store: "PrivateHandoffStore | None" = None,
         workspace: Path | None = None,
         processing_config: Any | None = None,
+        models_config: Any | None = None,
         activation_tracker: Any | None = None,
     ) -> None:
         self._engine = engine
         self._known_tools = policy_known_tools(known_tools)
         self._policy_path = policy_path
         self._processing_config = processing_config
+        self._models_config = models_config
         self._session_manager = session_manager
         self._processing_store = processing_store
         self._private_handoff_store = private_handoff_store
@@ -468,6 +470,29 @@ class EnginePolicyAdapter(PolicyPort):
         known_targets.update(managed_targets)
         known_targets.update(shadow_targets)
 
+        reply_actions = getattr(processing, "reply_actions", None) or {}
+        participation_action_caps = {
+            target: str(
+                reply_actions.get(target, "answer")
+                if isinstance(reply_actions, dict)
+                else "answer"
+            )
+            .strip()
+            .lower()
+            for target in sorted(known_targets)
+        }
+
+        routes = getattr(self._models_config, "routes", None) or {}
+        profiles = getattr(self._models_config, "profiles", None) or {}
+        writer_profile_name = str(routes.get("participation.writer") or "")
+        writer_profile = profiles.get(writer_profile_name) if writer_profile_name else None
+        participation_writer = {
+            "route": "participation.writer",
+            "profile": writer_profile_name,
+            "provider": str(getattr(writer_profile, "provider", "") or ""),
+            "model": str(getattr(writer_profile, "model", "") or ""),
+        }
+
         chat_opt_ins: dict[str, bool] = {}
         for target in sorted(known_targets):
             channel, separator, chat_id = target.partition(":")
@@ -503,6 +528,8 @@ class EnginePolicyAdapter(PolicyPort):
                 "shadow_targets": shadow_targets,
             },
             "chat_opt_ins": chat_opt_ins,
+            "participation_action_caps": participation_action_caps,
+            "participation_writer": participation_writer,
             "active_pauses": {
                 "global": global_pause,
                 "chats": active_chat_pauses,

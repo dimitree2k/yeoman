@@ -76,6 +76,14 @@ class ParticipationBlockedError(RuntimeError):
         super().__init__(self.reason)
 
 
+class ParticipationDraftError(RuntimeError):
+    """A stable, content-free failure from the draft-only writer."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason if reason in {"provider_error", "timeout"} else "provider_error"
+        super().__init__(self.reason)
+
+
 class SnapshotProvider(Protocol):
     """Resolves the effective participation snapshot for one exact target."""
 
@@ -142,6 +150,7 @@ class ParticipationRuntime:
         is_participant_allowed: Callable[[str, str, str], bool] | None = None,
         submission: Any | None = None,
         reactor: Any | None = None,
+        writer_available: bool = True,
         clock_ms: Callable[[], int] | None = None,
         direct_work_active: Callable[[str, str], bool] | None = None,
     ) -> None:
@@ -161,6 +170,7 @@ class ParticipationRuntime:
         )
         self._submission = submission
         self._reactor = reactor
+        self._writer_available = bool(writer_available)
         self._clock_ms = clock_ms or _now_ms
         self._direct_work_active = direct_work_active
         self._counters: dict[str, int] = {}
@@ -172,6 +182,25 @@ class ParticipationRuntime:
 
     def _count(self, name: str) -> None:
         self._counters[name] = self._counters.get(name, 0) + 1
+
+    async def _record_judge_failure(
+        self,
+        attempt_id: str,
+        failure: ParticipationDecisionError,
+        chat_id: str,
+    ) -> None:
+        detail_code = str(failure.detail or "").strip() or None
+        logger.warning(
+            "participation_judge_rejected chat={} reason={} detail_code={}",
+            chat_id,
+            failure.reason,
+            detail_code or "none",
+        )
+        await self._ledger.record_judge_outcome(
+            attempt_id,
+            outcome=failure.reason,
+            detail_code=detail_code,
+        )
 
     # -- entrypoint --------------------------------------------------------------------
 
@@ -297,7 +326,7 @@ class ParticipationRuntime:
             decision = await self._judge.decide(opportunity, context)
         except ParticipationDecisionError as failure:
             self._count("judge_failed")
-            await self._ledger.record_judge_outcome(attempt_id, outcome=failure.reason)
+            await self._record_judge_failure(attempt_id, failure, opportunity.chat_id)
             await self._record(opportunity, "judge_failed", failure.reason)
             return {"status": "judge_failed", "reason": failure.reason}
         except Exception as exc:  # noqa: BLE001 - one chat must not stop the queue
@@ -324,7 +353,7 @@ class ParticipationRuntime:
             )
         except ParticipationDecisionError as failure:
             self._count("judge_failed")
-            await self._ledger.record_judge_outcome(attempt_id, outcome=failure.reason)
+            await self._record_judge_failure(attempt_id, failure, opportunity.chat_id)
             await self._record(opportunity, "judge_failed", failure.reason)
             return {"status": "judge_failed", "reason": failure.reason}
         await self._ledger.record_judge_outcome(attempt_id, outcome=decision.action)
@@ -572,11 +601,17 @@ class ParticipationRuntime:
             if reply_action not in {"answer", "react", "silence"}:
                 raise ParticipationBlockedError("invalid_snapshot")
             reply_allowed = {
-                "answer": {"silence", "comment"},
+                "answer": {"silence", "react", "comment"},
                 "react": {"silence", "react"},
                 "silence": {"silence"},
             }[str(reply_action)]
             candidate_actions &= reply_allowed
+        writer_unavailable = not self._writer_available and "comment" in candidate_actions
+        if writer_unavailable:
+            candidate_actions.discard("comment")
+            comment_intents.clear()
+        if writer_unavailable and not candidate_actions - {"silence"}:
+            raise ParticipationBlockedError("writer_unavailable")
         candidate_actions.add("silence")
         allowed_actions = tuple(action for action in _ACTIONS if action in candidate_actions)
 
@@ -604,6 +639,7 @@ class ParticipationRuntime:
                 "reaction_limits": reaction_limits,
                 "comment_limits": comment_limits,
                 "initiation_limits": initiation_limits,
+                "writer_unavailable": writer_unavailable,
             }
         )
         bounds = ParticipationContextBounds(
@@ -728,13 +764,16 @@ class ParticipationRuntime:
         allow_continuation = _snapshot_bool(
             inputs.snapshot, "allow_continuation", default=False
         )
+        writer_unavailable = _snapshot_bool(
+            inputs.snapshot, "writer_unavailable", default=False
+        )
         comment_intents = {
             str(item)
             for item in (
                 _snapshot_value(inputs.snapshot, "comment_allowed_intents", ()) or ()
             )
         }
-        if candidate and allow_continuation:
+        if candidate and allow_continuation and not writer_unavailable:
             comment_intents.add("continue")
         else:
             comment_intents.discard("continue")
@@ -751,7 +790,7 @@ class ParticipationRuntime:
         allowed_actions = tuple(inputs.allowed_actions)
         if "comment" in allowed_actions and not comment_intents:
             allowed_actions = tuple(item for item in allowed_actions if item != "comment")
-        elif "comment" not in allowed_actions and comment_intents:
+        elif "comment" not in allowed_actions and comment_intents and not writer_unavailable:
             requested = _snapshot_tokens(inputs.snapshot, "allowed_actions")
             reply_action = _snapshot_value(inputs.snapshot, "reply_action")
             if (requested is None or "comment" in requested) and reply_action not in {
@@ -1007,6 +1046,10 @@ class ParticipationRuntime:
                 decision=decision,
                 context=context,
             )
+        except ParticipationDraftError as exc:
+            await self._release_comment(opportunity, effect_id, exc.reason)
+            await self._record(opportunity, "generation_failed", exc.reason)
+            return {"status": "generation_failed", "reason": exc.reason}
         except Exception as exc:  # noqa: BLE001 - a failed draft releases the hold
             logger.warning(
                 "participation_draft_failed chat={} error_type={}",
@@ -1359,8 +1402,8 @@ class ParticipationRuntime:
                     current.opportunity, current.context
                 )
             except ParticipationDecisionError as failure:
-                await self._ledger.record_judge_outcome(
-                    attempt_id, outcome=failure.reason
+                await self._record_judge_failure(
+                    attempt_id, failure, current.opportunity.chat_id
                 )
                 self._count("judge_failed")
                 await self._release_comment(initial_opportunity, effect_id, failure.reason)
@@ -1398,8 +1441,8 @@ class ParticipationRuntime:
                     context=current.context,
                 )
             except ParticipationDecisionError as failure:
-                await self._ledger.record_judge_outcome(
-                    attempt_id, outcome=failure.reason
+                await self._record_judge_failure(
+                    attempt_id, failure, current.opportunity.chat_id
                 )
                 self._count("judge_failed")
                 await self._release_comment(initial_opportunity, effect_id, failure.reason)
@@ -1467,6 +1510,14 @@ class ParticipationRuntime:
                         decision=reevaluated,
                         context=current.context,
                     )
+                except ParticipationDraftError as exc:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, exc.reason
+                    )
+                    await self._record(
+                        current.opportunity, "generation_failed", exc.reason
+                    )
+                    return {"status": "generation_failed", "reason": exc.reason}
                 except Exception as exc:  # noqa: BLE001 - release definite failure
                     logger.warning(
                         "participation_replacement_failed chat={} error_type={}",
@@ -2333,6 +2384,7 @@ __all__ = [
     "ParticipationAdmission",
     "ParticipationAuthorizationRequest",
     "ParticipationBlockedError",
+    "ParticipationDraftError",
     "ParticipationEffectAuthorizer",
     "ParticipationRuntime",
     "SnapshotProvider",

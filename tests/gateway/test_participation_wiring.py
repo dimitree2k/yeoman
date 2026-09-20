@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -614,6 +615,83 @@ async def test_admin_terminal_dispatch_finishes_exact_overlapping_direct_binding
         store.close()
 
 
+def test_activation_epoch_fences_action_cap_and_writer_identity(tmp_path: Path) -> None:
+    """Old opportunities must not survive either output-authority configuration change."""
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    chat_id = "group@g.us"
+    target = f"whatsapp:{chat_id}"
+    config = Config.model_validate(
+        {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/v1",
+                        "provider": "openrouter",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
+            "processing": {
+                "enabled": True,
+                "chats": [target],
+                "reply_actions": {target: "answer"},
+                "participation": {
+                    "enabled": True,
+                    "judgeRoute": "participation.judge",
+                },
+            },
+        }
+    )
+    engine = PolicyEngine(
+        PolicyConfig.model_validate(
+            {
+                "channels": {
+                    "whatsapp": {
+                        "chats": {chat_id: {"participation": {"enabled": True}}}
+                    }
+                }
+            }
+        ),
+        workspace=tmp_path,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    tracker = ActivationEpochTracker(store=log)
+    adapter = EnginePolicyAdapter(
+        engine=engine,
+        known_tools=set(),
+        workspace=tmp_path,
+        processing_config=config.processing,
+        models_config=config.models,
+        activation_tracker=tracker,
+    )
+
+    try:
+        state = adapter._activation_state()  # noqa: SLF001
+        assert state["participation_action_caps"] == {target: "answer"}
+        assert state["participation_writer"] == {
+            "route": "participation.writer",
+            "profile": "participation_writer",
+            "provider": "openrouter",
+            "model": "writer/v1",
+        }
+        assert tracker.refresh_activation_sync() == 1
+        assert tracker.refresh_activation_sync() == 1
+
+        config.processing.reply_actions[target] = "react"
+        assert tracker.refresh_activation_sync() == 2
+        assert tracker.refresh_activation_sync() == 2
+
+        config.models.profiles["participation_writer"].model = "writer/v2"
+        assert tracker.refresh_activation_sync() == 3
+        assert tracker.refresh_activation_sync() == 3
+    finally:
+        log.close()
+
+
 def test_restart_activation_transition_new_offers_use_new_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -896,7 +974,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
                     "shadow": False,
                     "judgeRoute": "participation.judge",
                 },
-                "reply_actions": {f"whatsapp:{chat_id}": "react"},
+                "reply_actions": {f"whatsapp:{chat_id}": "answer"},
             }
         }
     )
@@ -1042,6 +1120,119 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
 
 
 @pytest.mark.asyncio
+async def test_participation_writer_uses_explicit_route_provider_and_model(
+    tmp_path: Path,
+) -> None:
+    """Using the policy/global profile here would reproduce the live wrong-provider bug."""
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.media.router import ModelRouter
+    from yeoman_gateway.processing.participation import (
+        ParticipationDecision,
+        ParticipationOpportunity,
+    )
+    from yeoman_gateway.processing.participation_runtime import (
+        ParticipationDraftError,
+    )
+    from yeoman_gateway.providers.base import LLMResponse
+
+    config = Config.model_validate(
+        {
+            "models": {
+                "profiles": {
+                    "assistant_default": {
+                        "kind": "chat",
+                        "model": "global/model",
+                        "provider": "global",
+                    },
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "openrouter",
+                        "timeout_ms": 1,
+                    },
+                },
+                "routes": {
+                    "assistant.reply": "assistant_default",
+                    "participation.writer": "participation_writer",
+                },
+            }
+        }
+    )
+    calls: list[tuple[str, str | None]] = []
+    writer_mode = "success"
+
+    class GlobalProvider:
+        async def chat(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("Participation must not use the global provider")
+
+        def get_default_model(self) -> str:
+            return "global/model"
+
+    class WriterProvider:
+        async def chat(self, *args: object, **kwargs: object) -> LLMResponse:
+            del args
+            assert kwargs["model"] == "writer/model"
+            if writer_mode == "timeout":
+                await asyncio.sleep(0.05)
+            return LLMResponse(content="explicit writer draft")
+
+    def provider_factory(model: str, provider: str | None = None) -> WriterProvider:
+        calls.append((model, provider))
+        return WriterProvider()
+
+    responder = LLMResponder(
+        provider=GlobalProvider(),  # type: ignore[arg-type]
+        workspace=tmp_path,
+        bus=MessageBus(),
+        model_router=ModelRouter(config.models),
+        routed_provider_factory=provider_factory,  # type: ignore[arg-type]
+    )
+    submission = _ParticipationSubmission(
+        responder=responder,
+        writer_profile="participation_writer",
+    )
+    opportunity = ParticipationOpportunity(
+        opportunity_id="writer-route",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        trigger="inbound",
+        source_event_ids=("m1",),
+        observed_revision=1,
+        activation_epoch=1,
+        created_at_ms=1,
+    )
+    decision = ParticipationDecision(
+        action="comment",
+        intent="initiate",
+        reason="useful",
+        purpose="answer briefly",
+        contribution_type="observation",
+    )
+
+    try:
+        draft = await submission.generate_draft(
+            opportunity=opportunity,
+            decision=decision,
+            context={"messages": []},
+        )
+        assert draft == "explicit writer draft"
+        assert calls == [("writer/model", "openrouter")]
+
+        writer_mode = "timeout"
+        with pytest.raises(ParticipationDraftError, match="timeout"):
+            await submission.generate_draft(
+                opportunity=opportunity,
+                decision=decision,
+                context={"messages": []},
+            )
+    finally:
+        await responder.aclose()
+
+
+@pytest.mark.asyncio
 async def test_participation_approval_rechecks_pause_and_submits_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1061,6 +1252,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
     from yeoman_gateway.core.models import PolicyDecision
     from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
     from yeoman_gateway.processing.participation import ParticipationOpportunity
@@ -1105,6 +1297,16 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     owner = "owner@s.whatsapp.net"
     config = Config.model_validate(
         {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "openrouter",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
             "consciousness": {
                 "enabled": False,
                 "defaultDailyCap": 2,
@@ -1193,6 +1395,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         workspace=tmp_path,
         bus=bus,
         service_effects=effects,
+        model_router=ModelRouter(config.models),
+        routed_provider_factory=lambda model, provider_name=None: provider,
     )
     responder = build_thread_responder(
         config,

@@ -119,7 +119,8 @@ async def test_reaction_needs_an_exact_target_and_an_allowed_emoji() -> None:
     assert decision.action == "react"
     assert decision.emoji == EMOJI
     assert decision.target_message_id == "m2"
-    assert decision.anchor_message_id == "prov-1"
+    assert decision.intent == "initiate"
+    assert decision.anchor_message_id is None
 
 
 @pytest.mark.asyncio
@@ -157,7 +158,7 @@ async def test_short_primary_emoji_reaches_judgment_without_a_time_rule() -> Non
     )
     decision = await judge.decide(_opportunity(), context)
     assert decision.action == "react"
-    assert decision.anchor_message_id == "prov-1"
+    assert decision.anchor_message_id is None
 
 
 # -- boundary failures -----------------------------------------------------------------
@@ -183,7 +184,6 @@ async def test_empty_response_raises_a_classified_failure() -> None:
     [
         ("not json at all", "invalid_response"),
         (json.dumps({"action": "shout", "intent": "initiate"}), "invalid_response"),
-        (json.dumps({"action": "silence", "intent": "mindread"}), "invalid_response"),
         ('{"action": "comment", "intent": "initiate"}', "invalid_response"),
     ],
 )
@@ -371,6 +371,7 @@ async def test_oversized_context_is_refused_before_the_provider_call() -> None:
     with pytest.raises(ParticipationDecisionError) as error:
         await judge.decide(_opportunity(), huge)
     assert error.value.reason == "context_too_large"
+    assert error.value.detail == "context_budget_exceeded"
     assert client.calls == []
 
 
@@ -531,6 +532,105 @@ async def test_silence_ignores_irrelevant_stray_fields() -> None:
     assert decision.contribution_type is None
     assert decision.target_message_id is None
     assert decision.anchor_message_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "silence"},
+        {
+            "action": "silence",
+            "intent": "mindread",
+            "evidence_ids": "foreign-message-id",
+            "target_message_id": "foreign-message-id",
+            "anchor_message_id": "foreign-anchor",
+            "purpose": {"not": "text"},
+            "emoji": "not-an-emoji",
+            "closes_exchange": True,
+            "unexpected": {"authority": True},
+        },
+    ],
+)
+async def test_silence_projects_malformed_effect_fields_to_canonical_inert_decision(
+    payload: dict[str, object],
+) -> None:
+    """Validating any effect field before this projection would reject safe silence."""
+    judge = ParticipationJudge(client=_Client(json.dumps(payload)), allowed_emojis=(EMOJI,))
+
+    decision = await judge.decide(_opportunity(), _context())
+
+    assert decision.action == "silence"
+    assert decision.intent == "initiate"
+    assert decision.evidence_ids == ()
+    assert decision.anchor_message_id is None
+    assert decision.target_message_id is None
+    assert decision.contribution_type is None
+    assert decision.purpose == ""
+    assert decision.emoji is None
+    assert decision.closes_exchange is False
+
+
+@pytest.mark.asyncio
+async def test_react_discards_comment_fields_but_keeps_reaction_authority_strict() -> None:
+    judge = ParticipationJudge(
+        client=_Client(
+            _payload(
+                action="react",
+                intent="mindread",
+                evidence_ids=["m2"],
+                target_message_id="m2",
+                emoji=EMOJI,
+                anchor_message_id="foreign-anchor",
+                contribution_type="cold_joke",
+                purpose="write a long comment",
+                closes_exchange=True,
+            )
+        ),
+        allowed_emojis=(EMOJI,),
+    )
+
+    decision = await judge.decide(_opportunity(), _context())
+
+    assert decision.action == "react"
+    assert decision.intent == "initiate"
+    assert decision.evidence_ids == ("m2",)
+    assert decision.target_message_id == "m2"
+    assert decision.emoji == EMOJI
+    assert decision.anchor_message_id is None
+    assert decision.contribution_type is None
+    assert decision.purpose == ""
+    assert decision.closes_exchange is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "reason", "detail"),
+    [
+        ({"evidence_ids": "m2"}, "invalid_response", "evidence_not_list"),
+        ({"evidence_ids": ["foreign-message-id"]}, "unknown_evidence", "unknown_evidence_id"),
+        ({"target_message_id": "m1"}, "unknown_evidence", "target_not_current"),
+        ({"emoji": "not-an-emoji"}, "unknown_emoji", "unknown_emoji"),
+    ],
+)
+async def test_react_rejections_use_stable_content_free_detail_codes(
+    fields: dict[str, object], reason: str, detail: str
+) -> None:
+    payload = {
+        "action": "react",
+        "intent": "initiate",
+        "target_message_id": "m2",
+        "emoji": EMOJI,
+    }
+    payload.update(fields)
+    judge = ParticipationJudge(client=_Client(_payload(**payload)), allowed_emojis=(EMOJI,))
+
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context(current_source_ids=["m2"]))
+
+    assert error.value.reason == reason
+    assert error.value.detail == detail
+    assert "foreign-message-id" not in error.value.detail
 
 
 @pytest.mark.asyncio

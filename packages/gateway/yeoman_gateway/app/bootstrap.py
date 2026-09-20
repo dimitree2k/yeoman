@@ -1111,13 +1111,40 @@ def _build_participation_runtime(
             engine=policy_engine, channel=channel, chat_id=chat_id, sender=sender
         )
 
-    submission = _ParticipationSubmission(
-        responder=responder, approval_tools=approval_tools
+    writer_profile = ""
+    try:
+        resolved_writer = ModelRouter(config.models).resolve_primary("participation.writer")
+        writer_model = str(resolved_writer.model or "").strip()
+        if not writer_model:
+            raise ValueError("writer model is empty")
+        ProviderFactory(config=config).create_chat_provider(
+            writer_model, resolved_writer.provider
+        )
+        writer_profile = resolved_writer.profile_name
+        logger.info(
+            "participation writer ready route={} profile={} provider={} model={}",
+            resolved_writer.route_key,
+            resolved_writer.profile_name,
+            resolved_writer.provider or "auto",
+            writer_model,
+        )
+    except Exception:  # noqa: BLE001 - unavailable writer removes only comments
+        logger.warning(
+            "participation writer unavailable route=participation.writer category=writer_unavailable"
+        )
+    submission = (
+        _ParticipationSubmission(
+            responder=responder,
+            approval_tools=approval_tools,
+            writer_profile=writer_profile,
+        )
+        if writer_profile
+        else None
     )
     bind_submission = getattr(
         approval_tools, "set_participation_submission", None
     )
-    if callable(bind_submission):
+    if callable(bind_submission) and submission is not None:
         bind_submission(submission)
     reactor = (
         _ParticipationReactor(responder=responder)
@@ -1136,6 +1163,7 @@ def _build_participation_runtime(
         is_participant_allowed=_is_participant_allowed,
         submission=submission,
         reactor=reactor,
+        writer_available=submission is not None,
         direct_work_active=(
             processing_store.direct_work_active
             if processing_store is not None
@@ -1186,9 +1214,14 @@ class _ParticipationSubmission:
     """Adapter from a selected comment to the draft-only generator and effect path."""
 
     def __init__(
-        self, *, responder: object | None, approval_tools: object | None = None
+        self,
+        *,
+        responder: object | None,
+        writer_profile: str,
+        approval_tools: object | None = None,
     ) -> None:
         self._responder = responder
+        self._writer_profile = str(writer_profile)
         self._approval_tools = approval_tools
 
     async def generate_draft(
@@ -1203,6 +1236,7 @@ class _ParticipationSubmission:
             policy_decision,
             purpose=str(getattr(decision, "purpose", "") or ""),
             context=dict(context or {}),
+            model_profile=self._writer_profile,
         )
 
     async def submit(
@@ -1727,7 +1761,11 @@ def build_effect_router(
                 except (TypeError, ValueError):
                     quiet = True
             current_rights = bool(
-                (action == "react" and reply_action == "react" and participation.allow_reactions)
+                (
+                    action == "react"
+                    and reply_action in {"answer", "react"}
+                    and participation.allow_reactions
+                )
                 or (
                     action == "comment"
                     and reply_action == "answer"
@@ -2061,6 +2099,7 @@ def build_gateway_runtime(
         private_handoff_store=private_handoffs,
         workspace=workspace,
         processing_config=config.processing,
+        models_config=config.models,
         activation_tracker=activation_tracker,
     )
     if activation_tracker is not None:

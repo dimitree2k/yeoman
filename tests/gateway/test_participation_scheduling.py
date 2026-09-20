@@ -837,6 +837,55 @@ async def test_attempts_are_charged_before_the_provider_and_never_refunded(
     log.close()
 
 
+def test_legacy_judge_attempts_gain_nullable_detail_code_without_losing_rows(
+    tmp_path,
+) -> None:
+    import sqlite3
+
+    path = tmp_path / "speakups.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE judge_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            opportunity_id TEXT NOT NULL,
+            evaluation_index INTEGER NOT NULL DEFAULT 0,
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            hourly_limit INTEGER NOT NULL,
+            continuation_candidate INTEGER NOT NULL DEFAULT 0,
+            continuation_reserve INTEGER NOT NULL DEFAULT 0,
+            outcome TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO judge_attempts (
+            attempt_id, opportunity_id, channel, chat_id, created_at_ms, hourly_limit
+        ) VALUES ('legacy:0', 'legacy', 'whatsapp', ?, 1, 1)
+        """,
+        (CHAT,),
+    )
+    conn.commit()
+    conn.close()
+
+    from yeoman_gateway.consciousness.log import SpeakupLog
+
+    log = SpeakupLog(path)
+    columns = {
+        row["name"] for row in log._conn.execute("PRAGMA table_info(judge_attempts)")  # noqa: SLF001
+    }
+    row = log._conn.execute(  # noqa: SLF001
+        "SELECT attempt_id, detail_code FROM judge_attempts WHERE attempt_id = 'legacy:0'"
+    ).fetchone()
+
+    assert "detail_code" in columns
+    assert dict(row) == {"attempt_id": "legacy:0", "detail_code": None}
+    log.close()
+
+
 @pytest.mark.asyncio
 async def test_duplicate_attempt_id_never_calls_the_provider_twice(tmp_path) -> None:
     from yeoman_gateway.consciousness.log import SpeakupLog

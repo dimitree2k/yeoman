@@ -2217,7 +2217,7 @@ class LLMResponder(ResponderPort):
             )
             resolved_profile = self._profile_for_name(model_profile)
             try:
-                draft = await self._chat_loop(
+                generation = self._chat_loop(
                     messages=messages,
                     allowed_tools=set(),
                     security_context={
@@ -2255,11 +2255,30 @@ class LLMResponder(ResponderPort):
                     current_metadata=dict(metadata),
                     trace=trace,
                 )
-            except LLMProviderError:
-                logger.warning(
-                    "Provider-error draft dropped channel={} chat={}", channel, chat_id
+                timeout_ms = int(getattr(resolved_profile, "timeout_ms", 0) or 0)
+                draft = (
+                    await asyncio.wait_for(generation, timeout=timeout_ms / 1000)
+                    if timeout_ms > 0
+                    else await generation
                 )
-                draft = None
+            except TimeoutError as exc:
+                logger.warning(
+                    "Participation writer timed out channel={} chat={}", channel, chat_id
+                )
+                from yeoman_gateway.processing.participation_runtime import (
+                    ParticipationDraftError,
+                )
+
+                raise ParticipationDraftError("timeout") from exc
+            except LLMProviderError as exc:
+                logger.warning(
+                    "Participation writer provider error channel={} chat={}", channel, chat_id
+                )
+                from yeoman_gateway.processing.participation_runtime import (
+                    ParticipationDraftError,
+                )
+
+                raise ParticipationDraftError("provider_error") from exc
             lf.end_span(trace, output={"outcome": "draft" if draft else "empty"})
             return draft
         finally:
@@ -3004,6 +3023,7 @@ class LLMResponder(ResponderPort):
         *,
         purpose: str,
         context: dict[str, object],
+        model_profile: str,
     ) -> str | None:
         """Draft-only generation for unsolicited participation (spec section 8.1).
 
@@ -3039,7 +3059,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_delay_seconds=2.5,
             talkative_cooldown_use_llm_message=False,
             is_owner=False,
-            model_profile=decision.model_profile,
+            model_profile=model_profile,
             session_history_limit=None,
             draft_only=True,
         )

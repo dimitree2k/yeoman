@@ -66,6 +66,7 @@ class ThreadActorResponder:
         *,
         purpose: str,
         context: dict[str, object],
+        model_profile: str,
     ) -> str | None:
         """Draft-only generation for unsolicited participation (spec section 8.1).
 
@@ -79,7 +80,13 @@ class ThreadActorResponder:
         if generator is None:
             logger.warning("participation draft requested but the responder has no draft path")
             return None
-        return await generator(event, decision, purpose=purpose, context=context)
+        return await generator(
+            event,
+            decision,
+            purpose=purpose,
+            context=context,
+            model_profile=model_profile,
+        )
 
     async def react_to_participation(
         self,

@@ -420,7 +420,14 @@ __all__ = [
 
 
 #: Inputs whose change is an activation transition (spec section 3.1).
-ACTIVATION_INPUTS: tuple[str, ...] = ("enabled", "shadow", "judge_route")
+ACTIVATION_INPUTS: tuple[str, ...] = (
+    "enabled",
+    "shadow",
+    "judge_route",
+    "action_cap",
+    "writer_route",
+    "writer_profile",
+)
 
 
 def _canonical_activation_value(value: object) -> object:

@@ -236,6 +236,7 @@ def _runtime(
     processing_shadowed: bool = False,
     approval_required: bool = False,
     reply_action: str | None = None,
+    writer_available: bool = True,
     snapshot_overrides: dict[str, object] | None = None,
 ):
     log = SpeakupLog(tmp_path / "speakups.db")
@@ -315,6 +316,7 @@ def _runtime(
         ),
         submission=submission if submission is not None else _Submission(),
         reactor=reactor if reactor is not None else _Reactor(),
+        writer_available=writer_available,
         clock_ms=lambda: NOW_MS,
     )
     return runtime, judge, context, log
@@ -450,6 +452,99 @@ async def test_comment_is_one_judge_one_generation_one_effect(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_writer_unavailable_removes_only_comment(tmp_path: Path) -> None:
+    """A missing writer must not disable an otherwise permitted reaction."""
+    runtime, _judge, context, log = _runtime(
+        tmp_path,
+        decision=REACT,
+        writer_available=False,
+        reply_action="answer",
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result["status"] == "reaction_submitted"
+    assert context.inputs is not None
+    assert context.inputs.allowed_actions == ("silence", "react")
+    assert context.inputs.snapshot["writer_unavailable"] is True
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_unavailable_is_visible_when_comment_is_the_only_effect(
+    tmp_path: Path,
+) -> None:
+    runtime, judge, context, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        writer_available=False,
+        policy_participation={"enabled": True, "allowReactions": False},
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "skipped", "reason": "writer_unavailable"}
+    assert judge.calls == 0
+    assert context.calls == 0
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["provider_error", "timeout"])
+async def test_classified_draft_failure_releases_reservation(
+    tmp_path: Path, reason: str
+) -> None:
+    from yeoman_gateway.processing.participation_runtime import ParticipationDraftError
+
+    class FailingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            del opportunity, decision, context
+            self.calls += 1
+            raise ParticipationDraftError(reason)
+
+    submission = FailingSubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "generation_failed", "reason": reason}
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    record = await log.delivery_record(
+        proposal_id="opp-1",
+        effect_id=deterministic_effect_id(
+            channel=CHANNEL, chat_id=CHAT, operation="comment", proposal_id="opp-1"
+        ),
+    )
+    assert record is not None and record["delivery_state"] == "failed"
+    disposition = await log.disposition("opp-1")
+    assert disposition is not None and disposition["reason"] == reason
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_draft_remains_distinct_and_releases_reservation(tmp_path: Path) -> None:
+    class EmptySubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            del opportunity, decision, context
+            self.calls += 1
+            return ""
+
+    submission = EmptySubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "generation_failed", "reason": "empty_draft"}
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
 async def test_judge_failure_records_a_failure_and_generates_nothing(tmp_path: Path) -> None:
     submission = _Submission()
     runtime, judge, _context, log = _runtime(
@@ -463,6 +558,27 @@ async def test_judge_failure_records_a_failure_and_generates_nothing(tmp_path: P
     assert submission.calls == 0
     state = await log.disposition("opp-1")
     assert state is not None and state["disposition"] == "judge_failed"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_judge_failure_persists_only_sanitized_detail_code(tmp_path: Path) -> None:
+    runtime, _judge, _context, log = _runtime(
+        tmp_path,
+        decision=ParticipationDecisionError(
+            "unknown_evidence", detail="unknown_evidence_id"
+        ),
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result == {"status": "judge_failed", "reason": "unknown_evidence"}
+    attempts = await log.judge_attempts_since(channel=CHANNEL, chat_id=CHAT, since_ms=0)
+    assert attempts[0]["outcome"] == "unknown_evidence"
+    assert attempts[0]["detail_code"] == "unknown_evidence_id"
+    assert "foreign-message-id" not in json.dumps(attempts[0])
+    disposition = await log.disposition("opp-1")
+    assert disposition is not None and disposition["reason"] == "unknown_evidence"
     log.close()
 
 
@@ -1365,6 +1481,21 @@ async def test_reaction_permission_is_independent_of_comment_intents(tmp_path: P
     assert judge.calls == 1
     assert context.inputs is not None
     assert context.inputs.allowed_actions == ("silence", "react")
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_answer_caps_participation_at_react_and_comment(tmp_path: Path) -> None:
+    """Removing ``react`` from the answer cap would suppress a permitted gesture."""
+    runtime, _judge, context, log = _runtime(
+        tmp_path, decision=REACT, reply_action="answer"
+    )
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result["status"] == "reaction_submitted"
+    assert context.inputs is not None
+    assert context.inputs.allowed_actions == ("silence", "react", "comment")
     log.close()
 
 
