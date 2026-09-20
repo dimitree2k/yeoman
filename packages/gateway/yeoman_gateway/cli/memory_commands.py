@@ -706,6 +706,68 @@ def memory_backfill(
     console.print(f"[green]✓[/green] Backfill imported {imported} entries.")
 
 
+@memory_app.command("lineage-inventory")
+def memory_lineage_inventory(
+    inbound_dir: str | None = typer.Option(
+        None, "--inbound-dir", help="Directory of legacy inbound JSONL archives"
+    ),
+    processing_db: str | None = typer.Option(
+        None, "--processing-db", help="Path to the ProcessingStore database"
+    ),
+    session_state_dir: str | None = typer.Option(
+        None, "--session-state-dir", help="Directory of legacy session JSONL files"
+    ),
+    knowledge_db: str | None = typer.Option(
+        None, "--knowledge-db", help="Path to an existing knowledge store"
+    ),
+    media_root: str | None = typer.Option(
+        None, "--media-root", help="Directory of stored media references"
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Apply the import instead of reporting the dry run"
+    ),
+    allow_model_jobs: bool = typer.Option(
+        False,
+        "--allow-model-jobs",
+        help="Schedule derived model work; requires an explicit report of the eligible count",
+    ),
+) -> None:
+    """Inventory legacy lineage sources (metadata only) and optionally import them.
+
+    The default is a dry run: metadata, counts and schema only, never content, never a
+    provider or model call, and never a PDF parse or OCR.  Derived model work is only
+    scheduled with --allow-model-jobs, whose eligible count is always reported first.
+    """
+    from yeoman_gateway.knowledge._migration import import_lineage, inspect_lineage_sources
+
+    inventory = inspect_lineage_sources(
+        inbound_dir=inbound_dir,
+        processing_db=processing_db,
+        session_state_dir=session_state_dir,
+        knowledge_db=knowledge_db,
+        media_root=media_root,
+    )
+    counts = inventory.counts()
+    table = Table(title="Lineage inventory (metadata only)")
+    table.add_column("Decision")
+    table.add_column("Rows", justify="right")
+    for decision, count in sorted(counts.items()):
+        table.add_row(decision, str(count))
+    table.add_row("eligible model jobs", str(inventory.eligible_model_jobs))
+    console.print(table)
+
+    if not apply:
+        console.print(
+            "[yellow]Dry run:[/yellow] nothing was imported, no model job was scheduled."
+        )
+        return
+    report = import_lineage(inventory, apply=True, allow_model_jobs=allow_model_jobs)
+    console.print(
+        f"[green]✓[/green] imported {report.imported}, quarantined {report.quarantined}, "
+        f"scheduled {report.model_jobs_scheduled} of {report.eligible_model_jobs} eligible job(s)."
+    )
+
+
 @memory_app.command("reindex")
 def memory_reindex() -> None:
     """Rebuild memory full-text index."""

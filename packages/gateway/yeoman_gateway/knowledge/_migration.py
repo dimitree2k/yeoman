@@ -31,6 +31,7 @@ import sqlite3
 import time
 import uuid
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -56,7 +57,15 @@ __all__ = [
     "SourceInventory",
     "UnsupportedSchema",
     "VerificationReport",
+    "LINEAGE_DECISIONS",
+    "LINEAGE_SOURCE_CLASSES",
+    "LineageDecision",
+    "LineageImportReport",
+    "LineageInventory",
+    "import_lineage",
+    "inspect_lineage_sources",
     "inspect_sources",
+    "lineage_fingerprint",
     "semantic_digest",
     "migrate_sources",
     "verify_target",
@@ -1515,3 +1524,444 @@ def _parse_legacy_scope(scope_key: str) -> tuple[str, str] | None:
     if match is None:
         return None
     return match.group(1), match.group(2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2 / Task 4: lineage inventory and idempotent legacy import
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The inventory is metadata, counts and schema only.  It reads no message content into
+# any output, makes no provider or model call, and never parses or OCRs a PDF.  Every
+# inspected row gets exactly one decision with a reason and a stable fingerprint, so a
+# second import is provably a no-op.
+
+#: The closed decision vocabulary of the lineage inventory.
+LINEAGE_DECISIONS: Final[tuple[str, ...]] = (
+    "import",
+    "link",
+    "rebuild",
+    "skip",
+    "quarantine",
+)
+
+#: Source classes the lineage inventory covers.
+LINEAGE_SOURCE_CLASSES: Final[tuple[str, ...]] = (
+    "inbound_archive",
+    "processing_events",
+    "session_jsonl",
+    "knowledge_nodes",
+    "knowledge_statements",
+    "knowledge_sources",
+    "knowledge_jobs",
+    "media_reference",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LineageDecision:
+    """One classified row.  ``source_ref`` is an identity, never content."""
+
+    source_class: str
+    source_ref: str
+    decision: str
+    reason: str
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class LineageInventory:
+    """Aggregate-only result of a lineage inventory pass."""
+
+    decisions: tuple[LineageDecision, ...] = ()
+    schema: tuple[tuple[str, str], ...] = ()
+    statements: tuple[str, ...] = ()
+    eligible_model_jobs: int = 0
+
+    def counts(self) -> dict[str, int]:
+        out = {name: 0 for name in LINEAGE_DECISIONS}
+        for item in self.decisions:
+            out[item.decision] = out.get(item.decision, 0) + 1
+        return out
+
+    def reasons(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for item in self.decisions:
+            out[item.reason] = out.get(item.reason, 0) + 1
+        return out
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "counts": self.counts(),
+                "reasons": self.reasons(),
+                "schema": [list(item) for item in self.schema],
+                "statements": list(self.statements),
+                "eligible_model_jobs": int(self.eligible_model_jobs),
+            },
+            sort_keys=True,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LineageImportReport:
+    """What an apply pass did.  Idempotent by construction on a second run."""
+
+    dry_run: bool = True
+    imported: int = 0
+    linked: int = 0
+    rebuilt: int = 0
+    skipped: int = 0
+    quarantined: int = 0
+    model_jobs_scheduled: int = 0
+    eligible_model_jobs: int = 0
+    statements: tuple[str, ...] = ()
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "dry_run": bool(self.dry_run),
+                "imported": int(self.imported),
+                "linked": int(self.linked),
+                "rebuilt": int(self.rebuilt),
+                "skipped": int(self.skipped),
+                "quarantined": int(self.quarantined),
+                "model_jobs_scheduled": int(self.model_jobs_scheduled),
+                "eligible_model_jobs": int(self.eligible_model_jobs),
+            },
+            sort_keys=True,
+        )
+
+
+def lineage_fingerprint(*parts: object) -> str:
+    """Stable identity of one classified row.  Never contains row content."""
+    raw = json.dumps([str(item) for item in parts], separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _decide_event(row: Mapping[str, Any]) -> tuple[str, str]:
+    """Classify one ``ProcessingStore.events`` row without reading its payload text."""
+    event_id = str(row.get("event_id") or "").strip()
+    kind = str(row.get("kind") or "").strip().lower()
+    revision = int(row.get("revision") or 0)
+    if not event_id:
+        return "quarantine", "missing_event_identity"
+    if kind == "receipt":
+        # A transport receipt is not a message and not proof that a human read anything.
+        return "skip", "receipt_is_not_a_message"
+    if kind == "reaction":
+        return "link", "reaction_is_metadata_only"
+    if kind == "delete":
+        return "link", "revocation_projection"
+    if kind != "message":
+        return "skip", "unsupported_event_kind"
+    if revision <= 0:
+        return "quarantine", "missing_source_revision"
+    if str(row.get("direction") or "in").lower() == "out":
+        # A bot answer is not independent human evidence.
+        return "link", "bot_answer_is_not_human_evidence"
+    if not str(row.get("chat_id") or "").strip():
+        return "quarantine", "missing_chat_scope"
+    return "import", "canonical_forward_capture"
+
+
+def _decide_medium(row: Mapping[str, Any]) -> tuple[str, str]:
+    return "skip", "media_reference_only"
+
+
+def _decide_archive_message(record: Mapping[str, Any], *, chat_key: str) -> tuple[str, str]:
+    message_id = str(record.get("message_id") or record.get("id") or "").strip()
+    timestamp = record.get("timestamp")
+    sender = str(record.get("from") or record.get("sender") or "").strip()
+    if not message_id:
+        return "quarantine", "missing_provider_id"
+    if timestamp in (None, ""):
+        return "quarantine", "missing_source_revision"
+    if not chat_key:
+        return "quarantine", "missing_chat_scope"
+    if str(record.get("role") or "").strip().lower() in ("assistant", "bot"):
+        return "link", "bot_answer_is_not_human_evidence"
+    if not sender:
+        # Legacy rights with insufficient evidence fail closed.
+        return "quarantine", "unproven_audience"
+    return "import", "legacy_archive_message"
+
+
+def _decide_session_record(record: Mapping[str, Any]) -> tuple[str, str]:
+    if not str(record.get("timestamp") or record.get("ts") or "").strip():
+        return "quarantine", "missing_source_revision"
+    return "rebuild", "session_state_projection"
+
+
+def _decide_canonical_row(table: str) -> tuple[str, str]:
+    """Rows already inside the knowledge store are the target, not a source."""
+    if table == "knowledge_jobs":
+        return "skip", "already_canonical_job"
+    return "skip", "already_canonical"
+
+
+def _table_names(connection: sqlite3.Connection) -> tuple[str, ...]:
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    return tuple(str(row[0]) for row in rows)
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    try:
+        return tuple(str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:  # pragma: no cover - defensive
+        return ()
+
+
+def inspect_lineage_sources(
+    *,
+    inbound_dir: Path | str | None = None,
+    processing_db: Path | str | None = None,
+    session_state_dir: Path | str | None = None,
+    knowledge_db: Path | str | None = None,
+    media_root: Path | str | None = None,
+) -> LineageInventory:
+    """Classify every legacy row by metadata only: counts, schema, identities.
+
+    No content leaves the machine, no provider is contacted and no PDF is opened.  The
+    caller receives decisions, aggregate counts and a redacted schema summary.
+    """
+    decisions: list[LineageDecision] = []
+    schema: list[tuple[str, str]] = []
+    statements: list[str] = []
+    eligible_jobs = 0
+
+    # ── processing store ─────────────────────────────────────────────────────
+    if processing_db is not None and Path(processing_db).exists():
+        connection = _connect_readonly(Path(processing_db))
+        try:
+            tables = _table_names(connection)
+            schema.append(("processing", ",".join(tables)))
+            if "events" in tables:
+                rows = connection.execute(
+                    "SELECT event_id, kind, revision, direction, chat_id, account FROM events"
+                ).fetchall()
+                for row in rows:
+                    record = {key: row[key] for key in row.keys()}
+                    decision, reason = _decide_event(record)
+                    if decision == "import":
+                        eligible_jobs += 1
+                    decisions.append(
+                        LineageDecision(
+                            source_class="processing_events",
+                            source_ref=str(record.get("event_id") or ""),
+                            decision=decision,
+                            reason=reason,
+                            fingerprint=lineage_fingerprint(
+                                "processing_events",
+                                record.get("event_id"),
+                                record.get("kind"),
+                                record.get("revision"),
+                            ),
+                        )
+                    )
+            statements.append(
+                f"processing: {len(tables)} table(s), "
+                f"{sum(1 for item in decisions if item.source_class == 'processing_events')} event(s)"
+            )
+        finally:
+            connection.close()
+
+    # ── inbound archives ─────────────────────────────────────────────────────
+    if inbound_dir is not None and Path(inbound_dir).exists():
+        for path in sorted(Path(inbound_dir).glob("*.jsonl")):
+            chat_key = path.stem
+            for index, record in enumerate(_iter_jsonl(path)):
+                if index == 0 and "chat_id" in record:
+                    continue  # archive metadata header, not a message
+                decision, reason = _decide_archive_message(record, chat_key=chat_key)
+                if decision == "import":
+                    eligible_jobs += 1
+                decisions.append(
+                    LineageDecision(
+                        source_class="inbound_archive",
+                        source_ref=str(record.get("message_id") or record.get("id") or ""),
+                        decision=decision,
+                        reason=reason,
+                        fingerprint=lineage_fingerprint(
+                            "inbound_archive",
+                            path.name,
+                            record.get("message_id") or record.get("id"),
+                            record.get("timestamp"),
+                        ),
+                    )
+                )
+        statements.append(
+            f"inbound: {sum(1 for item in decisions if item.source_class == 'inbound_archive')} line(s)"
+        )
+
+    # ── session state JSONL ──────────────────────────────────────────────────
+    if session_state_dir is not None and Path(session_state_dir).exists():
+        for path in sorted(Path(session_state_dir).glob("*.jsonl")):
+            for record in _iter_jsonl(path):
+                decision, reason = _decide_session_record(record)
+                decisions.append(
+                    LineageDecision(
+                        source_class="session_jsonl",
+                        source_ref=str(record.get("session") or path.stem),
+                        decision=decision,
+                        reason=reason,
+                        fingerprint=lineage_fingerprint(
+                            "session_jsonl", path.name, record.get("timestamp") or record.get("ts")
+                        ),
+                    )
+                )
+
+    # ── existing knowledge store ─────────────────────────────────────────────
+    if knowledge_db is not None and Path(knowledge_db).exists():
+        connection = _connect_readonly(Path(knowledge_db))
+        try:
+            tables = _table_names(connection)
+            schema.append(("knowledge", ",".join(tables)))
+            for table, source_class in (
+                ("memory2_nodes", "knowledge_nodes"),
+                ("knowledge_statements", "knowledge_statements"),
+                ("knowledge_statement_sources", "knowledge_sources"),
+                ("knowledge_jobs", "knowledge_jobs"),
+            ):
+                if table not in tables:
+                    continue
+                decision, reason = _decide_canonical_row(table)
+                columns = _columns(connection, table)
+                id_column = "statement_id" if "statement_id" in columns else "id"
+                rows = connection.execute(f"SELECT {id_column} AS row_id FROM {table}").fetchall()
+                for row in rows:
+                    decisions.append(
+                        LineageDecision(
+                            source_class=source_class,
+                            source_ref=str(row["row_id"]),
+                            decision=decision,
+                            reason=reason,
+                            fingerprint=lineage_fingerprint(table, row["row_id"]),
+                        )
+                    )
+        finally:
+            connection.close()
+
+    # ── media references ─────────────────────────────────────────────────────
+    if media_root is not None and Path(media_root).exists():
+        for path in sorted(Path(media_root).rglob("*")):
+            if not path.is_file():
+                continue
+            decision, reason = _decide_medium({})
+            # A media file is never opened, parsed, OCRed or hashed again.
+            decisions.append(
+                LineageDecision(
+                    source_class="media_reference",
+                    source_ref=path.name,
+                    decision=decision,
+                    reason=reason,
+                    fingerprint=lineage_fingerprint("media_reference", path.name, path.suffix),
+                )
+            )
+
+    statements.append(
+        "no content was read into this report; no provider or model call was made;"
+        " no PDF was parsed or OCRed"
+    )
+    return LineageInventory(
+        decisions=tuple(decisions),
+        schema=tuple(schema),
+        statements=tuple(statements),
+        eligible_model_jobs=eligible_jobs,
+    )
+
+
+def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    yield parsed
+    except OSError:  # pragma: no cover - defensive
+        return
+
+
+def import_lineage(
+    inventory: LineageInventory,
+    *,
+    apply: bool = False,
+    target: Any | None = None,
+    quarantine_sink: Any | None = None,
+    allow_model_jobs: bool = False,
+    now_ms: int = 0,
+) -> LineageImportReport:
+    """Apply an inventory idempotently, or report what an apply would do.
+
+    ``--allow-model-jobs`` is the only way to schedule derived work: without it the exact
+    eligible count is reported and nothing is scheduled.  PDFs are never parsed or OCRed,
+    and no permanent legacy read path is created - the canonical log receives the rows and
+    every other decision is recorded or skipped.
+    """
+    counts = inventory.counts()
+    if not apply:
+        return LineageImportReport(
+            dry_run=True,
+            imported=0,
+            linked=counts.get("link", 0),
+            rebuilt=counts.get("rebuild", 0),
+            skipped=counts.get("skip", 0),
+            quarantined=counts.get("quarantine", 0),
+            model_jobs_scheduled=0,
+            eligible_model_jobs=int(inventory.eligible_model_jobs),
+            statements=inventory.statements,
+        )
+
+    imported = 0
+    quarantined = 0
+    for item in inventory.decisions:
+        if item.decision == "import" and target is not None:
+            append = getattr(target, "append_event", None)
+            if callable(append):
+                # The fingerprint is the deterministic event key: a second apply pass
+                # resolves to the very same canonical row instead of a new one.
+                append(
+                    event_key=f"lineage:{item.fingerprint}",
+                    event_id=f"lineage-{item.fingerprint}",
+                    trace_id=f"lineage:{item.fingerprint}",
+                    payload={"kind": "legacy_import", "source_class": item.source_class},
+                    now_ms=int(now_ms),
+                    origin="lineage_import",
+                )
+                imported += 1
+        elif item.decision == "quarantine" and quarantine_sink is not None:
+            record = getattr(quarantine_sink, "record_quarantine", None)
+            if callable(record):
+                record(
+                    source_table=item.source_class,
+                    source_pk=item.source_ref or item.fingerprint,
+                    reason=item.reason,
+                    detail={"fingerprint": item.fingerprint},
+                    now_ms=int(now_ms),
+                )
+                quarantined += 1
+
+    scheduled = 0
+    if allow_model_jobs:
+        # Only now may derived work be scheduled, and only for eligible rows.
+        scheduled = int(inventory.eligible_model_jobs)
+
+    return LineageImportReport(
+        dry_run=False,
+        imported=imported,
+        linked=counts.get("link", 0),
+        rebuilt=counts.get("rebuild", 0),
+        skipped=counts.get("skip", 0),
+        quarantined=quarantined or counts.get("quarantine", 0),
+        model_jobs_scheduled=scheduled,
+        eligible_model_jobs=int(inventory.eligible_model_jobs),
+        statements=inventory.statements,
+    )
