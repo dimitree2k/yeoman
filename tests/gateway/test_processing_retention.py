@@ -386,6 +386,85 @@ def test_concurrent_start_is_rejected_until_stop_fence_and_restart_is_safe() -> 
     asyncio.run(scenario())
 
 
+def test_cancelled_first_stop_keeps_second_stop_fenced_until_store_drain() -> None:
+    store = _CloseAwareStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        first = asyncio.create_task(service.stop())
+        for _ in range(200):
+            if service._stopping:
+                break
+            await asyncio.sleep(0)
+        second = asyncio.create_task(service.stop())
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not second.done()
+
+        try:
+            await asyncio.wait_for(asyncio.shield(second), timeout=0.05)
+        except TimeoutError:
+            store.release.set()
+            await second
+        else:
+            store.close()
+            store.release.set()
+        await asyncio.gather(sweep, second)
+        store.close()
+        assert store.after_close == 0
+
+    asyncio.run(scenario())
+
+
+def test_all_cancelled_stoppers_leave_background_drain_and_allow_restart() -> None:
+    store = _CloseAwareStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.05)
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        first = asyncio.create_task(service.stop())
+        second = asyncio.create_task(service.stop())
+        for _ in range(200):
+            if service._stopping:
+                break
+            await asyncio.sleep(0)
+
+        first.cancel()
+        second.cancel()
+        for stopper in (first, second):
+            with pytest.raises(asyncio.CancelledError):
+                await stopper
+
+        stop_task = getattr(service, "_stop_task", None)
+        assert stop_task is not None
+        store.release.set()
+        await sweep
+        await asyncio.wait_for(asyncio.shield(stop_task), timeout=1)
+        store.close()
+        assert store.after_close == 0
+        assert service._pending_sweeps == 0
+        assert service.running is False
+
+        await service.start()
+        assert service.running is True
+        await service.stop()
+        retention_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if "ProcessingRetentionService._run_loop" in repr(task.get_coro())
+            or "ProcessingRetentionService._drain_stop" in repr(task.get_coro())
+        ]
+        assert retention_tasks == []
+
+    asyncio.run(scenario())
+
+
 def test_repeated_start_stop_leaves_no_retention_tasks_or_pending_sweeps() -> None:
     service = ProcessingRetentionService(
         _SlowStore(delay_seconds=0.01),

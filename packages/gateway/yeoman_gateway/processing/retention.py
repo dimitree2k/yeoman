@@ -45,10 +45,7 @@ class ProcessingRetentionService:
         self._interval_seconds = max(0.05, float(interval_seconds))
         self._startup_delay_seconds = max(0.0, float(startup_delay_seconds))
         self._task: asyncio.Task[None] | None = None
-        self._lifecycle_lock = asyncio.Lock()
-        self._stop_done = asyncio.Event()
-        self._stop_done.set()
-        self._stop_in_progress = False
+        self._stop_task: asyncio.Task[None] | None = None
         self._sweep_lock = asyncio.Lock()
         self._pending_zero = asyncio.Event()
         self._pending_zero.set()
@@ -61,40 +58,31 @@ class ProcessingRetentionService:
     # -- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
-        if self._stop_in_progress or self._lifecycle_lock.locked():
-            raise RuntimeError("processing retention stop is in progress")
-        await self._lifecycle_lock.acquire()
-        try:
-            if self._stop_in_progress:
+        if self._stop_task is not None:
+            if not self._stop_task.done():
                 raise RuntimeError("processing retention stop is in progress")
-            if self._task is not None:
-                return
-            self._stopping = False
-            self._task = asyncio.create_task(self._run_loop())
-        finally:
-            self._lifecycle_lock.release()
+            self._stop_task = None
+        if self._task is not None:
+            return
+        self._stopping = False
+        self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
-        if self._stop_in_progress:
-            await self._stop_done.wait()
-            return
-        self._stop_in_progress = True
-        self._stop_done.clear()
-        self._stopping = True
-        try:
-            async with self._lifecycle_lock:
-                task = self._task
-                self._task = None
-                if task is not None:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                await self._pending_zero.wait()
-        finally:
-            self._stop_in_progress = False
-            self._stop_done.set()
+        if self._stop_task is None:
+            self._stopping = True
+            task = self._task
+            self._task = None
+            self._stop_task = asyncio.create_task(self._drain_stop(task))
+        await asyncio.shield(self._stop_task)
+
+    async def _drain_stop(self, task: asyncio.Task[None] | None) -> None:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._pending_zero.wait()
 
     @property
     def running(self) -> bool:
