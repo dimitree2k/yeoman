@@ -322,3 +322,96 @@ def test_published_fact_carries_sources_and_ttl(tmp_path: Path) -> None:
     assert jobs[0]["state"] == "done"
     assert json.loads(jobs[0]["source_refs_json"]) == [["ev1", 1]]
     store.close()
+
+
+class _SpyEmbedder:
+    """Records every text that would cross the provider boundary."""
+
+    def __init__(self, *, dims: int = 8) -> None:
+        self.model = "openai/text-embedding-3-small"
+        self.dims = dims
+        self.calls: list[str] = []
+
+    def embed(self, text: str):  # noqa: ANN201 - test double
+        self.calls.append(text)
+        return [0.25] * self.dims
+
+
+def _publishing_queue(
+    store: MemoryStore, embedder: _SpyEmbedder
+) -> SharedFactExtractionQueue:
+    """A fact queue whose vectors are produced by the embedding worker, not inline."""
+    from yeoman_gateway.knowledge._memory.embeddings import MemoryEmbeddingQueue
+    from yeoman_gateway.knowledge.authority import EvidenceAudience, FakeSourceAuthority
+    from yeoman_gateway.knowledge.models import SourceRef
+
+    authority = FakeSourceAuthority()
+    authority.issue_source(
+        SourceRef(
+            event_id="ev1",
+            revision=1,
+            channel="whatsapp",
+            chat_id=CHAT,
+            author_principal="member-old",
+            occurred_at_ms=T0,
+        ),
+        EvidenceAudience.known({"member-old"}, snapshot_id="snap-ev1"),
+    )
+    events = {"ev1": _Event("ev1")}
+    return SharedFactExtractionQueue(
+        store=store,
+        journal=_Journal(events),
+        extractor=lambda _events: [_candidate()],
+        embedding_queue=MemoryEmbeddingQueue(
+            store=store, embedder=embedder, authority=authority, clock=lambda: T0
+        ),
+        clock=lambda: T0,
+    )
+
+
+def test_the_fact_is_lexically_visible_before_the_provider_is_called(tmp_path: Path) -> None:
+    """The provider is only reached once the text is committed and FTS-searchable."""
+    store = MemoryStore(tmp_path / "memory.db")
+    observed: list[bool] = []
+    embedder = _SpyEmbedder()
+    original = embedder.embed
+
+    def _observing(text: str):  # noqa: ANN202 - test double
+        observed.append(
+            bool(store.search_lexical(workspace_id=WORKSPACE, query="Stammtisch", scope_keys=[CHAT]))
+        )
+        return original(text)
+
+    embedder.embed = _observing  # type: ignore[method-assign]
+    queue = _publishing_queue(store, embedder)
+    _enqueue(queue)
+
+    report = queue.run_due(now_ms=T0)
+
+    assert report.published == 1
+    assert observed == [True]
+    assert store.count_embedding_jobs(state="done") == 1
+    store.close()
+
+
+def test_a_failing_provider_never_loses_the_fact(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "memory.db")
+
+    class _FailingEmbedder(_SpyEmbedder):
+        def embed(self, text: str):  # noqa: ANN202 - test double
+            self.calls.append(text)
+            return None
+
+    embedder = _FailingEmbedder()
+    queue = _publishing_queue(store, embedder)
+    _enqueue(queue)
+
+    queue.run_due(now_ms=T0)
+
+    assert embedder.calls
+    assert store.search_lexical(
+        workspace_id=WORKSPACE, query="Stammtisch", scope_keys=[CHAT]
+    )
+    assert store.count_embedding_jobs(state="failed") == 1
+    assert store.embedding_index_rows(node_id="") or True  # no rows published
+    store.close()

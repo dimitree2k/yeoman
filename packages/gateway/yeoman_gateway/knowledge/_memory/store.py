@@ -12,7 +12,7 @@ from array import array
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from yeoman_shared.utils.helpers import ensure_dir
 
@@ -95,6 +95,80 @@ _SHARED_FACT_SCHEMA: tuple[str, ...] = (
     """,
 )
 
+#: Versioned, rebuildable embedding index (Phase 2 / Task 2).  Additive on every open,
+#: exactly like the shared-fact schema: vectors are an index, never memory truth, and the
+#: document key is ``(document_id, content_hash, source_revision_hash, model_id,
+#: dimension, preprocessing_version)`` so incompatible versions can never be mixed.
+_EMBEDDING_INDEX_SCHEMA: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS memory2_embedding_jobs (
+        job_key TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
+        source_event_id TEXT NOT NULL DEFAULT '',
+        source_revision INTEGER NOT NULL DEFAULT 0,
+        source_revision_hash TEXT NOT NULL DEFAULT '',
+        model_id TEXT NOT NULL DEFAULT '',
+        dimension INTEGER NOT NULL DEFAULT 0,
+        preprocessing_version TEXT NOT NULL DEFAULT '',
+        conversation_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_refs_json TEXT NOT NULL DEFAULT '[]',
+        page_number INTEGER,
+        state TEXT NOT NULL
+            CHECK(state IN ('queued','running','done','failed','skipped','cancelled')),
+        reason TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        due_ms INTEGER NOT NULL,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory2_embedding_jobs_due
+      ON memory2_embedding_jobs (state, due_ms)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory2_embedding_index (
+        document_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source_revision_hash TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        dimension INTEGER NOT NULL,
+        preprocessing_version TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
+        source_event_id TEXT NOT NULL DEFAULT '',
+        source_revision INTEGER NOT NULL DEFAULT 0,
+        node_id TEXT NOT NULL DEFAULT '',
+        section_index INTEGER NOT NULL DEFAULT 0,
+        section_start INTEGER NOT NULL DEFAULT 0,
+        section_end INTEGER NOT NULL DEFAULT 0,
+        page_number INTEGER,
+        conversation_ids_json TEXT NOT NULL DEFAULT '[]',
+        vector BLOB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','retired')),
+        created_ms INTEGER NOT NULL,
+        retired_ms INTEGER,
+        PRIMARY KEY (document_id, content_hash, source_revision_hash, model_id,
+                     dimension, preprocessing_version)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory2_embedding_index_active
+      ON memory2_embedding_index (workspace_id, scope_key, status, model_id, dimension)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory2_embedding_index_source
+      ON memory2_embedding_index (source_event_id, source_revision)
+    """,
+)
+
 
 class MemoryStore:
     """Persist semantic memory entries with FTS and optional embedding vectors.
@@ -104,7 +178,16 @@ class MemoryStore:
     closes the shared connection: the knowledge transaction owner is in charge.
     """
 
-    def __init__(self, db_path: Path | None = None, *, owner: object | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        owner: object | None = None,
+        source_authority: object | None = None,
+    ) -> None:
+        #: Optional live source authority.  When present, vector search re-checks
+        #: revocation and provenance immediately before a candidate is returned.
+        self.source_authority = source_authority
         if owner is not None:
             self._owner = owner
             self._owns_connection = False
@@ -136,6 +219,20 @@ class MemoryStore:
         if self._owner is not None:
             return
         self._conn.commit()
+
+    # ── small read helpers ───────────────────────────────────────────────────
+
+    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(sql, params).fetchall())
+
+    def query_one(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
+    def scalar(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        row = self.query_one(sql, params)
+        return None if row is None else row[0]
 
     def close(self) -> None:
         if not self._owns_connection:
@@ -261,6 +358,18 @@ class MemoryStore:
         with self._lock:
             for statement in _SHARED_FACT_SCHEMA:
                 self._conn.execute(statement)
+            for statement in _EMBEDDING_INDEX_SCHEMA:
+                self._conn.execute(statement)
+            try:
+                self._conn.execute(
+                    "SELECT source_refs_json FROM memory2_embedding_jobs LIMIT 0"
+                )
+            except sqlite3.OperationalError:
+                # Additive migration: an older file gains the column, never a new table.
+                self._conn.execute(
+                    "ALTER TABLE memory2_embedding_jobs"
+                    " ADD COLUMN source_refs_json TEXT NOT NULL DEFAULT '[]'"
+                )
             self._conn.execute(
                 "INSERT OR IGNORE INTO memory2_meta (key, value)"
                 " VALUES ('memory_schema_version', '2')"
@@ -476,6 +585,19 @@ class MemoryStore:
                 " JOIN memory2_facts f ON f.fact_id = e.entry_id LIMIT 1"
             ).fetchone()
         return row is not None
+
+    def embedding_dimension(self, model_id: str) -> int:
+        """The dimension observed for a model, learned on the first successful publish."""
+        raw = self.get_meta(f"embedding_dimension:{str(model_id)}")
+        try:
+            return int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def remember_embedding_dimension(self, model_id: str, dimension: int) -> None:
+        if int(dimension) <= 0:
+            return
+        self.set_meta(f"embedding_dimension:{str(model_id)}", str(int(dimension)))
 
     def acl_epoch(self) -> int:
         raw = self.get_meta("acl_epoch")
@@ -762,6 +884,13 @@ class MemoryStore:
             self._conn.execute(
                 "DELETE FROM memory2_embeddings WHERE entry_id = ?", (str(fact_id),)
             )
+            # The versioned index holds the same copy of the text, so it is retired in
+            # the same transaction; a retired row is never scored again.
+            self._conn.execute(
+                "UPDATE memory2_embedding_index SET status = 'retired', retired_ms = ?"
+                " WHERE node_id = ? AND status = 'active'",
+                (int(now_ms), str(fact_id)),
+            )
             self._commit_owned()
         self.bump_acl_epoch()
         return True
@@ -828,9 +957,16 @@ class MemoryStore:
         return getattr(event, key, default)
 
     @staticmethod
-    def _approved_enrichment_items(value: object) -> Iterable[tuple[str, str]]:
+    def _approved_enrichment_items(value: object) -> Iterable[tuple[str, str, int | None]]:
+        """Yield ``(kind, text, page_number)`` for text an explicit act already produced.
+
+        ``document_text`` is the only PDF-derived kind, and it is accepted *only* with an
+        explicit single page number.  A passive PDF arrival carries no enrichment at all,
+        so it can never produce a node - and therefore never an embedding job either.
+        """
         allowed = {
             "audio_transcript",
+            "document_text",
             "image_description",
             "media_description",
             "sticker_description",
@@ -842,8 +978,14 @@ class MemoryStore:
         if not isinstance(value, Mapping) and not isinstance(value, (str, bytes, bytearray)):
             kind = str(getattr(value, "kind", getattr(value, "type", "")) or "").strip().lower()
             content = getattr(value, "text", getattr(value, "content", None))
-            if kind in allowed and isinstance(content, str) and getattr(value, "approved", True) is not False:
-                yield kind, content
+            page = getattr(value, "page_number", None)
+            if (
+                kind in allowed
+                and isinstance(content, str)
+                and getattr(value, "approved", True) is not False
+                and _page_allows(kind, page)
+            ):
+                yield kind, content, _page_value(kind, page)
                 return
         if isinstance(value, Mapping):
             if value.get("approved", True) is False:
@@ -852,13 +994,19 @@ class MemoryStore:
             content = value.get("text")
             if content is None:
                 content = value.get("content")
-            if kind in allowed and isinstance(content, str) and value.get("approved", True) is not False:
-                yield kind, content
+            page = value.get("page_number")
+            if (
+                kind in allowed
+                and isinstance(content, str)
+                and value.get("approved", True) is not False
+                and _page_allows(kind, page)
+            ):
+                yield kind, content, _page_value(kind, page)
                 return
             for key, item in value.items():
                 normalized_key = str(key).strip().lower()
-                if normalized_key in allowed and isinstance(item, str):
-                    yield normalized_key, item
+                if normalized_key in allowed and isinstance(item, str) and _page_allows(normalized_key, None):
+                    yield normalized_key, item, _page_value(normalized_key, None)
             return
         if not isinstance(value, Iterable) or isinstance(value, (str, bytes, bytearray)):
             return
@@ -894,9 +1042,9 @@ class MemoryStore:
             text = self._event_value(event, "text", None)
         if text is None:
             text = payload.get("text") or payload.get("content")
-        candidates: list[tuple[str, str]] = []
+        candidates: list[tuple[str, str, int | None]] = []
         if isinstance(text, str) and text.strip():
-            candidates.append(("message", text))
+            candidates.append(("message", text, None))
         candidates.extend(self._approved_enrichment_items(payload.get("approved_enrichments")))
         candidates.extend(self._approved_enrichment_items(enrichments))
 
@@ -931,7 +1079,7 @@ class MemoryStore:
         now_iso = datetime.now(UTC).isoformat()
         indexed: list[MemoryEntry] = []
         seen: set[tuple[str, str]] = set()
-        for node_kind, raw_content in candidates:
+        for node_kind, raw_content, page_number in candidates:
             content = raw_content.strip()
             if not content or (node_kind, content) in seen:
                 continue
@@ -956,6 +1104,9 @@ class MemoryStore:
             }
             if node_kind != "message":
                 metadata["enrichment_kind"] = node_kind
+            if page_number is not None:
+                # One explicitly authorized page, never a whole document.
+                metadata["page_number"] = int(page_number)
             entry = MemoryEntry(
                 id=entry_id,
                 workspace_id=resolved_workspace_id,
@@ -1143,6 +1294,415 @@ class MemoryStore:
             """,
             (entry_id, workspace_id, model, len(vector), payload, now_iso),
         )
+
+    # ── versioned embedding index (Phase 2 / Task 2) ─────────────────────────
+    #
+    # Vectors are a rebuildable index, never memory truth.  FTS and the node rows stay
+    # the lexical truth, so a provider outage can only cost recall quality, never a
+    # result.  Every row carries the full document key, which is what keeps two models,
+    # two dimensions or two preprocessing versions from ever being compared.
+
+    def upsert_embedding_job(
+        self,
+        *,
+        job_key: str,
+        workspace_id: str,
+        node_id: str,
+        scope_key: str,
+        channel: str,
+        chat_id: str,
+        source_event_id: str,
+        source_revision: int,
+        source_revision_hash: str,
+        model_id: str,
+        dimension: int,
+        preprocessing_version: str,
+        now_ms: int,
+        conversation_ids: Iterable[str] = (),
+        source_refs: Iterable[tuple[str, int]] = (),
+        page_number: int | None = None,
+        state: str = "queued",
+        reason: str | None = None,
+        due_ms: int | None = None,
+        attempts: int | None = None,
+    ) -> str:
+        """Insert or update one durable embedding job, unioning conversation relations."""
+        merged_ids: list[str] = []
+        existing = self.get_embedding_job(job_key)
+        if existing is not None:
+            merged_ids.extend(str(item) for item in existing.get("conversation_ids", ()))
+        merged_ids.extend(str(item) for item in conversation_ids if str(item))
+        merged_ids = sorted(dict.fromkeys(merged_ids))
+        merged_refs: list[list[object]] = []
+        if existing is not None:
+            merged_refs.extend(
+                [str(event_id), int(revision)]
+                for event_id, revision in existing.get("source_refs", ())
+            )
+        merged_refs.extend(
+            [str(event_id), int(revision)] for event_id, revision in source_refs
+        )
+        merged_refs = sorted({(str(item[0]), int(item[1])) for item in merged_refs})
+        merged_refs = [[event_id, revision] for event_id, revision in merged_refs]
+        first_seen = (
+            int(existing["created_ms"]) if existing is not None else int(now_ms)
+        )
+        current_attempts = int(existing["attempts"]) if existing is not None else 0
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory2_embedding_jobs (
+                    job_key, workspace_id, node_id, scope_key, channel, chat_id,
+                    source_event_id, source_revision, source_revision_hash, model_id,
+                    dimension, preprocessing_version, conversation_ids_json,
+                    source_refs_json, page_number,
+                    state, reason, attempts, due_ms, created_ms, updated_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_key) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    node_id = excluded.node_id,
+                    scope_key = excluded.scope_key,
+                    channel = excluded.channel,
+                    chat_id = excluded.chat_id,
+                    source_event_id = excluded.source_event_id,
+                    source_revision = excluded.source_revision,
+                    source_revision_hash = excluded.source_revision_hash,
+                    model_id = excluded.model_id,
+                    dimension = excluded.dimension,
+                    preprocessing_version = excluded.preprocessing_version,
+                    conversation_ids_json = excluded.conversation_ids_json,
+                    source_refs_json = excluded.source_refs_json,
+                    page_number = excluded.page_number,
+                    state = excluded.state,
+                    reason = excluded.reason,
+                    attempts = excluded.attempts,
+                    due_ms = excluded.due_ms,
+                    updated_ms = excluded.updated_ms
+                """,
+                (
+                    str(job_key),
+                    str(workspace_id),
+                    str(node_id),
+                    str(scope_key),
+                    str(channel),
+                    str(chat_id),
+                    str(source_event_id),
+                    int(source_revision),
+                    str(source_revision_hash),
+                    str(model_id),
+                    int(dimension),
+                    str(preprocessing_version),
+                    json.dumps(merged_ids),
+                    json.dumps(merged_refs),
+                    None if page_number is None else int(page_number),
+                    str(state),
+                    reason,
+                    current_attempts if attempts is None else int(attempts),
+                    int(now_ms if due_ms is None else due_ms),
+                    first_seen,
+                    int(now_ms),
+                ),
+            )
+            self._commit_owned()
+        return str(job_key)
+
+    def get_embedding_job(self, job_key: str) -> dict[str, Any] | None:
+        row = self.query_one(
+            "SELECT * FROM memory2_embedding_jobs WHERE job_key = ?", (str(job_key),)
+        )
+        return None if row is None else _embedding_job_row(row)
+
+    def list_embedding_jobs(
+        self,
+        *,
+        state: str | None = None,
+        due_before_ms: int | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(str(state))
+        if due_before_ms is not None:
+            clauses.append("due_ms <= ?")
+            params.append(int(due_before_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.query(
+            f"SELECT * FROM memory2_embedding_jobs{where} ORDER BY due_ms, rowid LIMIT ?",
+            (*params, int(limit)),
+        )
+        return [_embedding_job_row(row) for row in rows]
+
+    def count_embedding_jobs(self, *, state: str | None = None) -> int:
+        if state is None:
+            return int(self.scalar("SELECT COUNT(*) FROM memory2_embedding_jobs") or 0)
+        return int(
+            self.scalar(
+                "SELECT COUNT(*) FROM memory2_embedding_jobs WHERE state = ?", (str(state),)
+            )
+            or 0
+        )
+
+    def publish_embedding_section(
+        self,
+        *,
+        document_id: str,
+        content_hash: str,
+        source_revision_hash: str,
+        model_id: str,
+        dimension: int,
+        preprocessing_version: str,
+        workspace_id: str,
+        scope_key: str,
+        channel: str,
+        chat_id: str,
+        source_event_id: str,
+        source_revision: int,
+        node_id: str,
+        section_index: int,
+        section_start: int,
+        section_end: int,
+        vector: list[float],
+        now_ms: int,
+        page_number: int | None = None,
+        conversation_ids: Iterable[str] = (),
+    ) -> None:
+        """Publish one section under its full document key."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO memory2_embedding_index (
+                    document_id, content_hash, source_revision_hash, model_id, dimension,
+                    preprocessing_version, workspace_id, scope_key, channel, chat_id,
+                    source_event_id, source_revision, node_id, section_index, section_start,
+                    section_end, page_number, conversation_ids_json, vector, status,
+                    created_ms, retired_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL)
+                ON CONFLICT(document_id, content_hash, source_revision_hash, model_id,
+                            dimension, preprocessing_version)
+                DO UPDATE SET
+                    vector = excluded.vector,
+                    status = 'active',
+                    retired_ms = NULL,
+                    created_ms = excluded.created_ms,
+                    conversation_ids_json = excluded.conversation_ids_json
+                """,
+                (
+                    str(document_id),
+                    str(content_hash),
+                    str(source_revision_hash),
+                    str(model_id),
+                    int(dimension),
+                    str(preprocessing_version),
+                    str(workspace_id),
+                    str(scope_key),
+                    str(channel),
+                    str(chat_id),
+                    str(source_event_id),
+                    int(source_revision),
+                    str(node_id),
+                    int(section_index),
+                    int(section_start),
+                    int(section_end),
+                    None if page_number is None else int(page_number),
+                    json.dumps(sorted({str(item) for item in conversation_ids if str(item)})),
+                    self._serialize_vector(list(vector)),
+                    int(now_ms),
+                ),
+            )
+            self._commit_owned()
+
+    def retire_embedding_sections(
+        self,
+        *,
+        node_id: str,
+        keep_keys: Iterable[tuple[str, str, str, str, int, str]],
+        now_ms: int,
+    ) -> int:
+        """Retire every other active row of this node: a replacement precedes retirement.
+
+        Only rows whose *full* document key is not part of the replacement are retired, so
+        the sections of one document survive together while an older model, dimension,
+        preprocessing version or source revision is retired.
+        """
+        keep = {
+            (
+                str(document_id),
+                str(content_hash),
+                str(source_revision_hash),
+                str(model_id),
+                int(dimension),
+                str(preprocessing_version),
+            )
+            for (
+                document_id,
+                content_hash,
+                source_revision_hash,
+                model_id,
+                dimension,
+                preprocessing_version,
+            ) in keep_keys
+        }
+        # Retirement is scoped to each *replaced document section*: a row is retired only
+        # when it carries the same ``document_id`` as one that was just published, i.e. it
+        # is the previous version of that exact section (another model, dimension,
+        # preprocessing version or source revision).  Sections this run did not touch, and
+        # every other document of the node, stay untouched.
+        keep_document_ids = {key[0] for key in keep}
+        rows = self.query(
+            "SELECT document_id, content_hash, source_revision_hash, model_id, dimension,"
+            " preprocessing_version FROM memory2_embedding_index"
+            " WHERE node_id = ? AND status = 'active'"
+            " AND document_id IN ({})".format(
+                ",".join("?" for _ in keep_document_ids) or "NULL"
+            ),
+            (str(node_id), *sorted(keep_document_ids)),
+        )
+        retired = 0
+        with self._lock:
+            for row in rows:
+                key = (
+                    str(row["document_id"]),
+                    str(row["content_hash"]),
+                    str(row["source_revision_hash"]),
+                    str(row["model_id"]),
+                    int(row["dimension"]),
+                    str(row["preprocessing_version"]),
+                )
+                if key in keep:
+                    continue
+                cursor = self._conn.execute(
+                    "UPDATE memory2_embedding_index SET status = 'retired', retired_ms = ?"
+                    " WHERE document_id = ? AND content_hash = ? AND source_revision_hash = ?"
+                    " AND model_id = ? AND dimension = ? AND preprocessing_version = ?"
+                    " AND status = 'active'",
+                    (
+                        int(now_ms),
+                        str(row["document_id"]),
+                        str(row["content_hash"]),
+                        str(row["source_revision_hash"]),
+                        str(row["model_id"]),
+                        int(row["dimension"]),
+                        str(row["preprocessing_version"]),
+                    ),
+                )
+                retired += int(cursor.rowcount or 0)
+            self._commit_owned()
+        return retired
+
+    def embedding_index_rows(
+        self,
+        *,
+        source_event_id: str | None = None,
+        node_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_event_id is not None:
+            clauses.append("source_event_id = ?")
+            params.append(str(source_event_id))
+        if node_id is not None:
+            clauses.append("node_id = ?")
+            params.append(str(node_id))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.query(
+            f"SELECT * FROM memory2_embedding_index{where}"
+            " ORDER BY node_id, section_index, model_id, dimension",
+            tuple(params),
+        )
+        return [_embedding_index_row(row) for row in rows]
+
+    def search_embedding_index(
+        self,
+        *,
+        workspace_id: str,
+        query_vector: list[float],
+        scope_keys: list[str],
+        limit: int = 12,
+        candidate_limit: int = 256,
+        model_id: str | None = None,
+        preprocessing_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Nearest sections with a *compatible* document key.
+
+        The dimension is always bound to the query vector's length, and the model and
+        preprocessing version are bound whenever the caller names them, so a stale index
+        can never be scored against a different version.  Rows whose source is no longer
+        proven and unrevoked are dropped here, immediately before output.
+        """
+        if not scope_keys or not query_vector:
+            return []
+        clauses = [
+            "workspace_id = ?",
+            "status = 'active'",
+            "dimension = ?",
+        ]
+        params: list[Any] = [str(workspace_id), len(query_vector)]
+        if model_id is not None:
+            clauses.append("model_id = ?")
+            params.append(str(model_id))
+        if preprocessing_version is not None:
+            clauses.append("preprocessing_version = ?")
+            params.append(str(preprocessing_version))
+        scope_placeholders = ",".join("?" for _ in scope_keys)
+        clauses.append(f"scope_key IN ({scope_placeholders})")
+        params.extend(str(item) for item in scope_keys)
+        rows = self.query(
+            f"SELECT * FROM memory2_embedding_index WHERE {' AND '.join(clauses)}"
+            " ORDER BY created_ms DESC LIMIT ?",
+            (*params, int(candidate_limit)),
+        )
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            payload = row["vector"]
+            if payload is None:
+                continue
+            scored.append(
+                (
+                    _cosine_similarity(query_vector, self._deserialize_vector(bytes(payload))),
+                    _embedding_index_row(row),
+                )
+            )
+        kept: list[dict[str, Any]] = []
+        for score, item in sorted(scored, key=lambda pair: (-pair[0], pair[1]["document_id"])):
+            if score <= 0.0:
+                continue
+            if not self._source_still_readable(item):
+                continue
+            item["score"] = max(0.0, min(1.0, float(score)))
+            kept.append(item)
+            if len(kept) >= max(1, int(limit)):
+                break
+        return kept
+
+    def _source_still_readable(self, item: Mapping[str, Any]) -> bool:
+        """Re-check provenance and revocation against the live authority, if there is one."""
+        authority = self.source_authority
+        event_id = str(item.get("source_event_id") or "")
+        if not event_id:
+            return True
+        node_id = str(item.get("node_id") or "")
+        if node_id:
+            row = self.query_one(
+                "SELECT is_deleted FROM memory2_nodes WHERE id = ? LIMIT 1", (node_id,)
+            )
+            if row is not None and bool(int(row["is_deleted"])):
+                return False
+        if authority is None:
+            return True
+        getter = getattr(authority, "verify_source_ref", None)
+        revoked = getattr(authority, "source_revoked", None)
+        if not callable(getter):
+            return True
+        source = getter(event_id, int(item.get("source_revision") or 0))
+        if source is None:
+            return False
+        return not (callable(revoked) and revoked(source))
 
     def search_lexical(
         self,
@@ -1526,6 +2086,65 @@ class MemoryStore:
             )
             self._commit_owned()
             return int(cur.lastrowid)
+
+
+def _embedding_job_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = {key: row[key] for key in row.keys()}
+    item["conversation_ids"] = _decode_ids(item.get("conversation_ids_json"))
+    item["source_refs"] = _decode_refs(item.get("source_refs_json"))
+    return item
+
+
+def _decode_refs(raw: object) -> list[tuple[str, int]]:
+    try:
+        parsed = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[tuple[str, int]] = []
+    for item in parsed:
+        try:
+            event_id, revision = item
+        except (TypeError, ValueError):
+            continue
+        out.append((str(event_id), int(revision)))
+    return out
+
+
+def _embedding_index_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = {key: row[key] for key in row.keys()}
+    item["conversation_ids"] = _decode_ids(item.get("conversation_ids_json"))
+    return item
+
+
+def _decode_ids(raw: object) -> list[str]:
+    try:
+        parsed = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed]
+
+
+
+#: Enrichment kinds that carry text produced by an explicit, authorized bounded action.
+#: ``document_text`` additionally requires exactly one named page.
+_PAGED_ENRICHMENT_KINDS: Final[frozenset[str]] = frozenset({"document_text"})
+
+
+def _page_allows(kind: str, page: object) -> bool:
+    """A paged kind is accepted only with an explicit, positive, single page number."""
+    if kind not in _PAGED_ENRICHMENT_KINDS:
+        return True
+    return isinstance(page, int) and not isinstance(page, bool) and page >= 1
+
+
+def _page_value(kind: str, page: object) -> int | None:
+    if kind not in _PAGED_ENRICHMENT_KINDS:
+        return None
+    return int(page) if _page_allows(kind, page) else None
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:

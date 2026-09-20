@@ -396,6 +396,28 @@ class KnowledgeService:
         checked = self._read_context(context)
         return self._retrieval.recall(query, context=checked)
 
+    def recall_hybrid(
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        embedder: Any | None = None,
+        preprocessing_version: str | None = None,
+    ) -> KnowledgeContext:
+        """Automatic context and recall: exact/FTS first, vectors only as an addition.
+
+        Uses the same read gate as :meth:`recall`; a missing or failing provider can only
+        reduce recall, never hide a lexically findable statement.  The preprocessing
+        version is bound so a row produced by another preprocessing is never merged.
+        """
+        checked = self._read_context(context)
+        return self._retrieval.recall_hybrid(
+            query,
+            context=checked,
+            embedder=embedder,
+            preprocessing_version=preprocessing_version,
+        )
+
     def profile(self, person_id: str, *, context: TrustedReadContext) -> PersonProfile:
         checked = self._read_context(context)
         return self._retrieval.profile(person_id, context=checked)

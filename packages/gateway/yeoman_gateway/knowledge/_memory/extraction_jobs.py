@@ -393,6 +393,7 @@ class SharedFactExtractionQueue:
         extractor: Callable[[Any], Iterable[SharedFactCandidate]] | None = None,
         journal: Any | None = None,
         embedder: Any | None = None,
+        embedding_queue: Any | None = None,
         idle_ms: int = 60_000,
         max_delay_ms: int = 300_000,
         max_waiting: int = 32,
@@ -406,6 +407,15 @@ class SharedFactExtractionQueue:
         self._extractor = extractor
         self._journal = journal
         self._embedder = embedder
+        # Publishing a fact never calls a provider: the vector is produced later by the
+        # durable embedding worker, so a slow or failing provider cannot delay or undo a
+        # fact that is already lexically stored and searchable.
+        self._embedding_queue = embedding_queue
+        if self._embedding_queue is None and embedder is not None:
+            from yeoman_gateway.knowledge._memory.embeddings import MemoryEmbeddingQueue
+
+            self._embedding_queue = MemoryEmbeddingQueue(store=store, embedder=embedder)
+        self.embeddings_queued = 0
         self.embeddings_written = 0
         self.embeddings_failed = 0
         self.skipped_existing = 0
@@ -545,6 +555,10 @@ class SharedFactExtractionQueue:
         jobs = self._store.list_fact_jobs(state="queued", due_before_ms=int(now_ms), limit=limit or 20)
         for job in jobs:
             self._run_job(job, now_ms=int(now_ms), report=report)
+        if self._embedding_queue is not None:
+            # The one existing worker also drains the embedding jobs, so publishing a fact
+            # never waits for a provider and no second scheduler is introduced.
+            self._embedding_queue.run_due(now_ms=int(now_ms))
         return report
 
     # -- one job ----------------------------------------------------------------
@@ -663,36 +677,50 @@ class SharedFactExtractionQueue:
         return True
 
     def _embed_fact(self, fact: SharedFact) -> None:
-        """Attach a vector so the fact is findable by meaning, not only by words.
+        """Queue a vector so the fact is findable by meaning, not only by words.
 
-        An embedding failure never loses the fact: it stays stored and retrievable
-        lexically, and the failure is counted instead of hidden.
+        The provider call itself happens in the embedding worker.  A provider failure
+        therefore never loses, delays or hides the fact: it stays stored and retrievable
+        lexically, and the failed job stays durable so it can be retried.
         """
-        if self._embedder is None or not fact.content.strip():
+        if self._embedding_queue is None or not fact.content.strip():
             return
         try:
-            from yeoman_gateway.knowledge._memory.store import (
-                MemoryStore,  # noqa: F401  (type only)
-            )
-
-            vector = self._embedder.embed(fact.content)
-        except Exception as exc:
-            self.embeddings_failed += 1
-            logger.warning("shared fact embedding failed: {}", exc)
-            return
-        if not vector:
-            self.embeddings_failed += 1
-            return
-        model = str(getattr(self._embedder, "model", "unknown"))
-        try:
-            self._store.set_fact_embedding(
-                fact.fact_id, workspace_id=fact.workspace_id, model=model, vector=list(vector)
-            )
+            entry = self._store.get_node(fact.fact_id, workspace_id=fact.workspace_id)
         except Exception as exc:  # pragma: no cover - defensive
             self.embeddings_failed += 1
-            logger.warning("shared fact embedding could not be stored: {}", exc)
+            logger.warning("shared fact embedding lookup failed: {}", exc)
             return
-        self.embeddings_written += 1
+        if entry is None:  # pragma: no cover - defensive
+            self.embeddings_failed += 1
+            return
+        sources = tuple(getattr(fact, "sources", ()) or ())
+        primary = sources[0] if sources else None
+        try:
+            self._embedding_queue.enqueue_node(
+                entry,
+                now_ms=self._clock(),
+                source_event_id=(
+                    None if primary is None else str(getattr(primary, "source_event_id", "") or "")
+                ),
+                source_revision=(
+                    None if primary is None else int(getattr(primary, "source_revision", 0) or 0)
+                ),
+                # A statement may rest on several sources; the job carries all of them so
+                # the worker can prove every one before a provider is contacted.
+                source_refs=tuple(
+                    (
+                        str(getattr(item, "source_event_id", "") or ""),
+                        int(getattr(item, "source_revision", 0) or 0),
+                    )
+                    for item in sources
+                ),
+            )
+        except Exception as exc:
+            self.embeddings_failed += 1
+            logger.warning("shared fact embedding could not be queued: {}", exc)
+            return
+        self.embeddings_queued += 1
 
     def _load_events(self, refs: tuple[tuple[str, int], ...]) -> list[Any] | None:
         """All source events, or ``None`` when any payload is no longer available."""

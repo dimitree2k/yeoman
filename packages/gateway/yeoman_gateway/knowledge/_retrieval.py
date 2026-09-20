@@ -343,6 +343,99 @@ class RetrievalEngine:
             denied_count=rows.denied,
         )
 
+    def recall_hybrid(
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        embedder: Any | None = None,
+        preprocessing_version: str | None = None,
+    ) -> KnowledgeContext:
+        """Merge exact/FTS and vector candidates by statement identity, then gate again.
+
+        The lexical path is the base: it is produced first and never depends on a
+        provider.  Vector candidates only ever *add* ids, are filtered by the same SQL
+        gate, and are dropped silently when the provider fails - an outage costs recall,
+        never a lexically findable statement.  Immediately before rendering, every merged
+        id is re-checked against current rights and revocation.
+        """
+        decision = self.decide(context)
+        if not decision.allowed:
+            return KnowledgeContext(
+                text="",
+                statement_ids=(),
+                source_refs=(),
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+                context_revision=self.context_revision(context, decision, ()),
+                reason=decision.reason,
+            )
+        rows, decision = self.candidates(query, context=context)
+        merged = list(rows.statement_ids)
+        for statement_id in self._vector_candidates(
+            query,
+            context=context,
+            embedder=embedder,
+            preprocessing_version=preprocessing_version,
+        ):
+            if statement_id not in merged:
+                merged.append(statement_id)
+        allowed_ids = self._recheck_ids(tuple(merged), context, decision)
+        text, source_refs = self._render(allowed_ids, context, decision)
+        return KnowledgeContext(
+            text=text,
+            statement_ids=allowed_ids,
+            source_refs=source_refs,
+            identity_revision=self._store.identity_revision,
+            acl_epoch=self._store.acl_epoch,
+            context_revision=self.context_revision(context, decision, allowed_ids),
+            reason="ok" if allowed_ids else "empty",
+            denied_count=rows.denied,
+        )
+
+    def _vector_candidates(
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        embedder: Any | None,
+        preprocessing_version: str | None = None,
+    ) -> tuple[str, ...]:
+        """Statement ids whose embedding section is nearest, or nothing at all.
+
+        The lookup goes through the store's own guarded search, which binds the dimension
+        to the query vector's length and the model and preprocessing version to the
+        caller's, and re-checks provenance and revocation immediately before the row is
+        returned.  Every failure mode - no provider, no index, a provider error, a version
+        mismatch, a retired row - resolves to "no extra candidates" rather than an error,
+        which is what keeps FTS usable when embeddings are not.
+        """
+        if embedder is None or not query.text.strip():
+            return ()
+        if not self._store.has_table("memory2_embedding_index"):
+            return ()
+        try:
+            vector = embedder.embed(query.text)
+        except Exception:
+            return ()
+        if not vector:
+            return ()
+        from yeoman_gateway.knowledge._memory.embeddings import (
+            EMBEDDING_PREPROCESSING_VERSION,
+        )
+        from yeoman_gateway.knowledge._memory.store import MemoryStore
+
+        memory = MemoryStore(owner=self._store)
+        rows = memory.search_embedding_index(
+            workspace_id=self.workspace_id,
+            query_vector=list(vector),
+            scope_keys=[context.scope_key()],
+            limit=64,
+            model_id=str(getattr(embedder, "model", "") or "") or None,
+            preprocessing_version=preprocessing_version or EMBEDDING_PREPROCESSING_VERSION,
+        )
+        return tuple(str(row["node_id"]) for row in rows)
+
     def profile(self, person_id: str, *, context: TrustedReadContext) -> PersonProfile:
         """Profile projection: person plus the statements this reader may see."""
         decision = self.decide(context)
