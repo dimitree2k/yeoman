@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import {
   MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
+  deriveProviderEventIdentity,
   type BridgeEventEnvelope,
   type BridgeEventType,
 } from './protocol.js';
@@ -61,6 +62,20 @@ const QUARANTINE_DIR = 'quarantine';
 const OWNER_DIR_MODE = 0o700;
 const OWNER_FILE_MODE = 0o600;
 const DIAGNOSTIC_REASON_RE = /^[a-z0-9_-]{1,64}$/;
+const VOLATILE_PROVIDER_FIELDS = new Set([
+  'observedAt',
+  'observed_at_ms',
+  'ingestedAt',
+  'ingested_at_ms',
+  'ingestionAt',
+  'ingestion_at_ms',
+  'receivedAt',
+  'received_at_ms',
+  'committedAt',
+  'committed_at_ms',
+  'commit_ms',
+  'confirmed_ms',
+]);
 
 export function defaultBridgeOutboxDir(): string {
   return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-outbox');
@@ -68,12 +83,6 @@ export function defaultBridgeOutboxDir(): string {
 
 export function isReplayableEventType(type: string): type is ReplayableEventType {
   return type === 'message' || type === 'edit' || type === 'delete' || type === 'reaction' || type === 'receipt';
-}
-
-function eventKeyFor(event: BridgeEventEnvelope): string {
-  return createHash('sha256')
-    .update(JSON.stringify({ type: event.type, accountId: event.accountId, payload: event.payload }))
-    .digest('hex');
 }
 
 function diagnosticIdentity(value: string): string {
@@ -85,21 +94,53 @@ function diagnosticReason(value: string): string {
   return DIAGNOSTIC_REASON_RE.test(reason) ? reason : 'rejected';
 }
 
+function canonicalProviderValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalProviderValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !VOLATILE_PROVIDER_FIELDS.has(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalProviderValue(item)]),
+  );
+}
+
 function asReplayableEvent(event: BridgeEventEnvelope): ReplayableBridgeEvent {
   if (!isReplayableEventType(event.type)) {
     throw new Error(`Invalid replayable event type: ${event.type}`);
   }
   const type = event.type;
-  const eventId = typeof event.eventId === 'string' && event.eventId.trim() ? event.eventId : randomUUID();
+  const derived = deriveProviderEventIdentity(type, event.accountId, event.payload);
+  const eventId = typeof event.eventId === 'string' && event.eventId.trim()
+    ? event.eventId
+    : derived?.eventId || randomUUID();
   const eventKey = typeof event.eventKey === 'string' && event.eventKey.trim()
     ? event.eventKey
-    : eventKeyFor(event);
+    : derived?.eventKey || `local:${randomUUID()}`;
   const observedAt = typeof event.observedAt === 'number' && Number.isFinite(event.observedAt)
     ? event.observedAt
     : typeof event.ts === 'number' && Number.isFinite(event.ts)
       ? event.ts
       : Date.now();
   return { ...event, type, eventId, eventKey, observedAt };
+}
+
+function sameReplayableEvent(a: ReplayableBridgeEvent, b: ReplayableBridgeEvent): boolean {
+  return JSON.stringify({
+    version: a.version,
+    type: a.type,
+    accountId: a.accountId,
+    eventId: a.eventId,
+    eventKey: a.eventKey,
+    payload: canonicalProviderValue(a.payload),
+  }) === JSON.stringify({
+    version: b.version,
+    type: b.type,
+    accountId: b.accountId,
+    eventId: b.eventId,
+    eventKey: b.eventKey,
+    payload: canonicalProviderValue(b.payload),
+  });
 }
 
 function fileNameFor(sequence: number, event: ReplayableBridgeEvent): string {
@@ -422,7 +463,7 @@ export class BridgeOutbox {
     }
     const existing = this.entries.get(expected.eventId);
     if (existing) {
-      if (JSON.stringify(existing.event) !== JSON.stringify(expected)) {
+      if (!sameReplayableEvent(existing.event, expected)) {
         throw new Error('Conflicting bridge outbox event');
       }
       return;
@@ -446,7 +487,7 @@ export class BridgeOutbox {
       }
       const existing = this.entries.get(replayable.eventId);
       if (existing) {
-        if (JSON.stringify(existing.event) !== JSON.stringify(replayable)) {
+        if (!sameReplayableEvent(existing.event, replayable)) {
           throw new Error('Conflicting bridge outbox event');
         }
         return existing.event;

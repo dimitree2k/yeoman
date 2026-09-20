@@ -177,6 +177,9 @@ class _RecordingSourceAuthority:
 
     def register_source(self, source: SourceRef, audience: Any) -> SourceRef:
         self._sources[source.key] = source
+        register = getattr(self._inner, "register_source", None)
+        if register is not None:
+            register(source, audience)
         return source
 
     def __getattr__(self, name: str) -> Any:

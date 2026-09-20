@@ -135,6 +135,41 @@ def test_message_relation_and_capture_identity_are_not_invented() -> None:
     assert body["reply_to_text"] == "quoted context"
 
 
+def test_provider_occurrence_bridge_observation_and_gateway_commit_stay_distinct(
+    tmp_path: Path,
+) -> None:
+    gateway_commit_ms = T0 + 500
+    bridge_observation_ms = T0 + 250
+    provider_occurrence_seconds = 1_700_000_123
+    store = ProcessingStore(tmp_path / "p.db")
+    sink = SignalJournalSink(store, clock=lambda: gateway_commit_ms)
+
+    event_id = sink.capture(
+        "message",
+        {
+            "chatJid": CHAT,
+            "messageId": "three-times-1",
+            "senderId": "4915@s.whatsapp.net",
+            "text": "provider text",
+            "timestamp": provider_occurrence_seconds,
+        },
+        event_id="bridge-event-three-times",
+        event_key="bridge-key-three-times",
+        account="account-a",
+        observed_at_ms=bridge_observation_ms,
+        strict=True,
+    )
+
+    assert event_id == "bridge-event-three-times"
+    event = store.get_event(event_id)
+    assert event is not None
+    assert event.occurred_ms == provider_occurrence_seconds * 1000
+    assert event.created_ms == gateway_commit_ms
+    assert event.payload is not None
+    assert event.payload["observed_at_ms"] == bridge_observation_ms
+    store.close()
+
+
 def test_media_hash_mapping_keeps_only_valid_sha256_and_uses_first_valid_candidate() -> None:
     signal = WhatsAppSignalMapper().map(
         {

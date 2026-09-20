@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export const PROTOCOL_VERSION = 5 as const;
 export const MAX_BRIDGE_FRAME_BYTES = 262_144 as const;
 
@@ -191,6 +193,62 @@ export interface BridgeSendResult {
   messageId?: string;
   providerMessageId?: string;
   clientMessageId?: string;
+}
+
+export interface ProviderEventIdentity {
+  eventId: string;
+  eventKey: string;
+}
+
+function identityPart(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+}
+
+/** Derive replay identity from provider ids only; payload text is never part of the key. */
+export function deriveProviderEventIdentity(
+  type: Extract<BridgeEventType, 'message' | 'edit' | 'delete' | 'reaction' | 'receipt'>,
+  accountId: string,
+  payload: Record<string, unknown>,
+): ProviderEventIdentity | undefined {
+  const account = identityPart(accountId);
+  const chat = identityPart(payload.chatJid ?? payload.chat_jid ?? payload.chat);
+  if (!account || !chat) return undefined;
+
+  let providerIdentity: string[];
+  if (type === 'message') {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    providerIdentity = [messageId];
+  } else if (type === 'edit') {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    const revision = identityPart(payload.revision ?? payload.editRevision ?? '');
+    providerIdentity = revision ? [messageId, revision] : [messageId];
+  } else if (type === 'delete') {
+    const messageId = identityPart(
+      payload.messageId ?? payload.message_id ?? payload.targetMessageId ?? payload.id,
+    );
+    if (!messageId) return undefined;
+    providerIdentity = [messageId];
+  } else if (type === 'reaction') {
+    const target = identityPart(payload.targetMessageId ?? payload.target_message_id ?? payload.messageId);
+    const sender = identityPart(payload.senderId ?? payload.sender ?? payload.participantJid);
+    if (!target) return undefined;
+    providerIdentity = [target, sender];
+  } else {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    const recipient = identityPart(
+      payload.recipientJid ?? payload.recipient ?? payload.participantJid ?? payload.to,
+    );
+    const status = identityPart(payload.status ?? payload.receiptType ?? 'delivered').toLowerCase();
+    providerIdentity = [messageId, recipient, status];
+  }
+
+  const encoded = [account, chat, type, ...providerIdentity].map((value) => encodeURIComponent(value));
+  const eventKey = `whatsapp:${encoded.join(':')}`;
+  const eventId = `wa_${createHash('sha256').update(eventKey, 'utf8').digest('hex').slice(0, 32)}`;
+  return { eventId, eventKey };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

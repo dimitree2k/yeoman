@@ -165,6 +165,58 @@ def test_long_payload_roundtrip_keeps_canonical_json_bytes(tmp_path):
     db.close()
 
 
+def test_confirmed_whatsapp_receipt_appends_one_correlated_outbound_event(tmp_path):
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.enqueue_effect(
+        effect_id="fx-out-1",
+        operation_key="turn:send:1",
+        payload={"kind": "text", "text": "confirmed text"},
+        target={"channel": "whatsapp", "chat_id": "chat@g.us"},
+        now_ms=now,
+    )
+
+    assert db._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE direction = 'out'"
+    ).fetchone()["n"] == 0
+
+    db.record_transport_receipt(
+        "fx-out-1",
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        attempt_id="attempt-1",
+        provider_message_id="provider-out-1",
+        client_message_id="client-out-1",
+        now_ms=now,
+    )
+    db.record_transport_receipt(
+        "fx-out-1",
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        attempt_id="attempt-1",
+        provider_message_id="provider-out-1",
+        client_message_id="client-out-1",
+        now_ms=now + 1,
+    )
+
+    rows = db._conn.execute(
+        "SELECT event_id FROM events WHERE direction = 'out' ORDER BY event_id"
+    ).fetchall()
+    assert len(rows) == 1
+    event = db.get_event(str(rows[0]["event_id"]))
+    assert event is not None
+    assert event.origin == CANONICAL_WHATSAPP_ORIGIN
+    assert event.direction == "out"
+    assert event.payload is not None
+    assert event.payload["effect_id"] == "fx-out-1"
+    assert event.payload["attempt_id"] == "attempt-1"
+    assert event.payload["provider_message_id"] == "provider-out-1"
+    assert event.payload["client_message_id"] == "client-out-1"
+    assert event.payload["text"] == "confirmed text"
+    assert len(db.transport_receipts("fx-out-1")) == 1
+    db.close()
+
+
 def test_store_normalizes_revision_in_payload_and_column(tmp_path):
     db = ProcessingStore(tmp_path / "processing.db")
     db.append_event(

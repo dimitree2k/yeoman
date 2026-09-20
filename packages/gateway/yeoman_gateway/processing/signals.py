@@ -71,6 +71,7 @@ class JournalSignal:
     revision: int = 1
     audience_ref: str | None = None
     occurred_ms: int | None = None
+    observed_at_ms: int | None = None
     source_message_id: str | None = None
     target_message_id: str | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
@@ -91,6 +92,8 @@ class JournalSignal:
             "source_message_id": self.source_message_id,
             "target_message_id": self.target_message_id,
         }
+        if self.observed_at_ms is not None:
+            body["observed_at_ms"] = self.observed_at_ms
         body.update(dict(self.payload))
         return body
 
@@ -235,7 +238,7 @@ class WhatsAppSignalMapper:
             event_id=event_id or signal.event_id,
             event_key=event_key or signal.event_key,
             account=account if account is not None else signal.account,
-            occurred_ms=observed_at_ms if observed_at_ms is not None else signal.occurred_ms,
+            observed_at_ms=observed_at_ms,
         )
         return signal
 
@@ -468,6 +471,7 @@ class SignalJournalSink:
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
         invalidator: Any | None = None,
+        memory: Any | None = None,
     ) -> None:
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
@@ -475,6 +479,7 @@ class SignalJournalSink:
         # Review F05: an edit/delete must not stop at the journal. The invalidator raises
         # the turn revision, cancels stale effects and revokes derived facts.
         self._invalidator = invalidator
+        self._memory = memory
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
         return self.capture(kind, payload)
@@ -534,9 +539,148 @@ class SignalJournalSink:
         )
         if strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
+        if signal.kind == "message" and self._memory is not None:
+            get_event = getattr(self._store, "get_event", None)
+            get_authority = getattr(self._store, "get_event_source_authority", None)
+            index_event = getattr(self._memory, "index_canonical_event", None)
+            if callable(get_event) and callable(index_event):
+                try:
+                    event = get_event(stored_event_id)
+                    if event is not None:
+                        audience = (
+                            get_authority(stored_event_id, signal.revision)
+                            if callable(get_authority)
+                            else None
+                        )
+                        index_event(event, audience=audience)
+                except Exception as exc:  # pragma: no cover - projection must not block ACK
+                    logger.warning(
+                        "canonical message FTS projection failed error_type={}",
+                        type(exc).__name__,
+                    )
+        if str(kind) in ("edit", "delete"):
+            revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)
+            if strict and revoked_sources:
+                self._invalidate_memory_projection(
+                    signal, revoked_sources, now_ms=now
+                )
         if not strict:
             self.invalidate(kind, payload)
         return stored_event_id
+
+    def _invalidate_memory_projection(
+        self, signal: Any, source_event_ids: Iterable[str], *, now_ms: int | None
+    ) -> None:
+        """Apply strict source tombstones to memory without changing turn semantics."""
+        if self._memory is None:
+            return
+        invalidate = getattr(self._memory, "invalidate_sources", None)
+        direct_soft_delete = False
+        if not callable(invalidate):
+            invalidate = getattr(self._memory, "soft_delete_sources", None)
+            direct_soft_delete = callable(invalidate)
+        get_event = getattr(self._store, "get_event", None)
+        if not callable(invalidate) or not callable(get_event):
+            return
+        principal = str(getattr(signal, "principal", "") or "")
+        account = str(getattr(signal, "account", "") or "")
+        channel = str(getattr(signal, "channel", "") or "")
+        chat_id = str(getattr(signal, "chat_id", "") or "")
+        provider_message_id = str(
+            getattr(signal, "source_message_id", "")
+            or getattr(signal, "target_message_id", "")
+            or ""
+        )
+        authorized: list[str] = []
+        for event_id in source_event_ids:
+            source = get_event(str(event_id))
+            if (
+                source is not None
+                and str(getattr(source, "kind", "")) == "message"
+                and str(getattr(source, "channel", "")) == channel
+                and str(getattr(source, "chat_id", "")) == chat_id
+                and str(getattr(source, "source_message_id", "")) == provider_message_id
+                and (not account or str(getattr(source, "account", "")) == account)
+                and (not principal or str(getattr(source, "principal", "")) == principal)
+            ):
+                authorized.append(str(event_id))
+        if not authorized:
+            return
+        try:
+            if direct_soft_delete:
+                invalidate(authorized)
+            else:
+                invalidate(
+                    authorized,
+                    now_ms=int(now_ms if now_ms is not None else 0),
+                    kind=str(getattr(signal, "kind", "delete")),
+                )
+        except Exception as exc:  # pragma: no cover - projection must not block ACK
+            logger.warning(
+                "canonical source tombstone failed error_type={}",
+                type(exc).__name__,
+            )
+
+    def index_enrichments(
+        self, source_message_id: str, enrichments: Iterable[Mapping[str, Any] | object]
+    ) -> tuple[Any, ...]:
+        """Index approved text derived from an already-journaled message."""
+        if self._memory is None:
+            return ()
+        get_event = getattr(self._store, "get_event", None)
+        events_by_source = getattr(self._store, "events_by_source_message", None)
+        index_event = getattr(self._memory, "index_canonical_event", None)
+        if not callable(index_event):
+            return ()
+        event = get_event(str(source_message_id)) if callable(get_event) else None
+        if event is not None and str(getattr(event, "kind", "")) != "message":
+            event = None
+        if event is None and callable(events_by_source):
+            event = next(
+                (
+                    candidate
+                    for candidate in events_by_source(str(source_message_id))
+                    if str(getattr(candidate, "kind", "")) == "message"
+                ),
+                None,
+            )
+        if event is None:
+            return ()
+        authority_getter = getattr(self._store, "get_event_source_authority", None)
+        audience = (
+            authority_getter(event.event_id, event.revision)
+            if callable(authority_getter)
+            else None
+        )
+        try:
+            return tuple(index_event(event, audience=audience, enrichments=enrichments))
+        except Exception as exc:  # pragma: no cover - projection must not block routing
+            logger.warning(
+                "canonical enrichment FTS projection failed error_type={}",
+                type(exc).__name__,
+            )
+            return ()
+
+    def project_source_revocation(
+        self, signal: Any, *, now_ms: int | None = None, strict: bool = False
+    ) -> tuple[str, ...]:
+        """Persist edit/delete authority changes without mutating the canonical event."""
+        projector = getattr(self._store, "project_source_revocation", None)
+        if projector is None:
+            return ()
+        try:
+            return tuple(projector(signal, now_ms=now_ms))
+        except Exception as exc:
+            if strict:
+                raise
+            # The event is already canonical; leave it available for a later projection
+            # retry rather than turning a provider tombstone into a dropped event.
+            logger.warning(
+                "source authority projection failed kind={} error={}",
+                getattr(signal, "kind", "unknown"),
+                type(exc).__name__,
+            )
+            return ()
 
     def invalidate(self, kind: str, payload: Mapping[str, Any]) -> None:
         """Apply legacy edit/delete projection after the canonical ACK boundary."""

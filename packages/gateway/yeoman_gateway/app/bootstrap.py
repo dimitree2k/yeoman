@@ -1433,12 +1433,13 @@ def build_reconciliation_service(
     *,
     probe: object | None = None,
     project_participation_receipts: Callable[[], Awaitable[object]] | None = None,
+    recover_pending: bool = False,
 ):
-    """Reconciler for the new mode; ``None`` while processing is off or no store is open.
+    """Reconciler for enabled processing or already-pending durable recovery.
 
-    Disabled mode stays inert: no store, no database and no background task.
+    Disabled mode stays inert unless startup found work that must be reconciled.
     """
-    if not config.processing.enabled:
+    if not config.processing.enabled and not recover_pending:
         return None
     if store is None and project_participation_receipts is None:
         return None
@@ -1468,8 +1469,13 @@ def _build_participation_receipt_projection(
     log: object | None,
     store: "ProcessingStore | None",
     inbound_archive: object,
+    recover_pending: bool = False,
 ) -> tuple[object | None, Callable[[], Awaitable[object]] | None]:
-    if log is None or not config.processing.enabled:
+    if (
+        log is None
+        or store is None
+        or (not config.processing.enabled and not recover_pending)
+    ):
         return None, None
     from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
 
@@ -2032,7 +2038,7 @@ def build_gateway_runtime(
             ),
             capture_actors=frozenset(),
         )
-        knowledge_sources = RuntimeKnowledgeSources()
+        knowledge_sources = RuntimeKnowledgeSources(processing_store=processing_store)
         try:
             knowledge_service = open_knowledge_store(
                 Path(config.knowledge.db_path).expanduser(),
@@ -2208,6 +2214,7 @@ def build_gateway_runtime(
             log=speakup_log,
             store=processing_store,
             inbound_archive=inbound_archive,
+            recover_pending=pending_participation_recovery,
         )
     )
 
@@ -2313,6 +2320,7 @@ def build_gateway_runtime(
         processing_signals=(
             SignalJournalSink(
                 processing_store,
+                memory=memory_service,
                 invalidator=(
                     SignalInvalidator(
                         store=processing_store,
@@ -3528,6 +3536,7 @@ def build_gateway_runtime(
             config,
             processing_store,
             project_participation_receipts=project_participation_receipts,
+            recover_pending=pending_participation_recovery,
         ),
         retention=build_retention_service(config, processing_store),
         shared_facts=shared_fact_runtime,

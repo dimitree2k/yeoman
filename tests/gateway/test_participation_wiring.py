@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -516,7 +517,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         workspace=log_only_home / "workspace",
         bus=MessageBus(),
     )
-    assert log_only_runtime.processing is None
+    assert log_only_runtime.processing is not None
     assert log_only_runtime.speakup_log is not None
     assert log_only_runtime.reconciliation is not None
     idle = _Idle()
@@ -529,7 +530,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     log_only_runtime.shared_facts = None
     log_only_runtime.startup_hook = None
     await log_only_runtime.run()
-    assert not log_only_processing.exists()
+    assert log_only_processing.exists()
     reopened_log_only = SpeakupLog(log_only_speakups)
     assert await reopened_log_only.delivery_state(
         proposal_id="orphaned-unsubmitted", effect_id="orphaned-effect"
@@ -553,7 +554,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         workspace=empty_home / "workspace",
         bus=MessageBus(),
     )
-    assert empty_runtime.processing is None
+    assert empty_runtime.processing is not None
     assert empty_runtime.speakup_log is None
     assert empty_runtime.reconciliation is None
     idle = _Idle()
@@ -566,7 +567,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     empty_runtime.shared_facts = None
     empty_runtime.startup_hook = None
     await empty_runtime.run()
-    assert not empty_processing.exists()
+    assert empty_processing.exists()
     assert not empty_speakups.exists()
 
 
@@ -827,7 +828,10 @@ async def test_whatsapp_debounce_preserves_all_participation_source_ids(
     key = "group@g.us:person"
     channel._debounce_buffers[key] = [event("m1", "one"), event("m2", "two")]  # noqa: SLF001
     channel._debounce_delays[key] = 0  # noqa: SLF001
-    await channel._flush_debounce_bucket(key, 0)  # noqa: SLF001
+    channel._schedule_debounce_timer_locked(key, 0)  # noqa: SLF001
+    timer = channel._debounce_tasks[key]  # noqa: SLF001
+    await timer
+    await asyncio.gather(*channel._debounce_publish_tasks)  # noqa: SLF001
 
     observed = bus._event_queue.get_nowait()  # noqa: SLF001
     assert observed.source_event_ids == ("m1", "m2")

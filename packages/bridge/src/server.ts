@@ -7,6 +7,7 @@ import {
   createErrorResponse,
   createEventEnvelope,
   createOkResponse,
+  deriveProviderEventIdentity,
   isLoopbackAddress,
   parseBridgeCommand,
   parseDeleteMessagePayload,
@@ -198,9 +199,10 @@ export class BridgeServer {
         return this.trackProviderEvent(this.broadcastMessage(msg));
       },
       onSignal: (kind, payload) => {
+        const identity = deriveProviderEventIdentity(kind, this.accountId, payload);
         return this.trackProviderEvent(
           this.broadcastReplayable(
-            createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
+            createEventEnvelope({ type: kind, accountId: this.accountId, payload, ...identity }),
           ),
         );
       },
@@ -580,30 +582,33 @@ export class BridgeServer {
   }
 
   private async broadcastMessage(msg: InboundMessageV2): Promise<void> {
+    const payload = {
+      messageId: msg.messageId,
+      chatJid: msg.chatJid,
+      participantJid: msg.participantJid,
+      senderId: msg.senderId,
+      senderPhoneJid: msg.senderPhoneJid,
+      lidConflict: msg.lidConflict,
+      senderName: msg.senderName,
+      isGroup: msg.isGroup,
+      text: msg.text,
+      timestamp: msg.timestamp,
+      mentionedJids: msg.mentionedJids,
+      mentionedBot: msg.mentionedBot,
+      replyToBot: msg.replyToBot,
+      replyToMessageId: msg.replyToMessageId,
+      replyToParticipantJid: msg.replyToParticipantJid,
+      replyToText: msg.replyToText,
+      replyToMedia: mediaMetadata(msg.replyToMedia),
+      media: mediaMetadata(msg.media),
+    };
+    const identity = deriveProviderEventIdentity('message', this.accountId, payload);
     await this.broadcastReplayable(
       createEventEnvelope({
         type: 'message',
         accountId: this.accountId,
-        payload: {
-          messageId: msg.messageId,
-          chatJid: msg.chatJid,
-          participantJid: msg.participantJid,
-          senderId: msg.senderId,
-          senderPhoneJid: msg.senderPhoneJid,
-          lidConflict: msg.lidConflict,
-          senderName: msg.senderName,
-          isGroup: msg.isGroup,
-          text: msg.text,
-          timestamp: msg.timestamp,
-          mentionedJids: msg.mentionedJids,
-          mentionedBot: msg.mentionedBot,
-          replyToBot: msg.replyToBot,
-          replyToMessageId: msg.replyToMessageId,
-          replyToParticipantJid: msg.replyToParticipantJid,
-          replyToText: msg.replyToText,
-          replyToMedia: mediaMetadata(msg.replyToMedia),
-          media: mediaMetadata(msg.media),
-        },
+        payload,
+        ...identity,
       }),
     );
   }

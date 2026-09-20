@@ -217,6 +217,43 @@ test('BridgeServer replays complete message metadata without binary payloads', a
   }
 });
 
+test('BridgeServer derives provider identity independently of content and quarantines conflicts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-provider-identity-'));
+  try {
+    const message = {
+      messageId: 'provider-message-1',
+      chatJid: 'chat@g.us',
+      participantJid: '4915@s.whatsapp.net',
+      senderId: '4915',
+      isGroup: true,
+      text: 'first provider text',
+      timestamp: 1_700_000_000,
+      mentionedJids: [],
+      mentionedBot: false,
+      replyToBot: false,
+    };
+    const server = makeServer(root);
+    await (server as any).broadcastMessage(message);
+    const first = (await (server as any).outbox.pending())[0];
+    assert.ok(first);
+
+    const replay = makeServer(root);
+    await (replay as any).broadcastMessage(message);
+    const replayed = await (replay as any).outbox.pending();
+    assert.equal(replayed.length, 1);
+    assert.equal(replayed[0].eventId, first.eventId);
+    assert.equal(replayed[0].eventKey, first.eventKey);
+
+    await assert.rejects(
+      (replay as any).broadcastMessage({ ...message, text: 'conflicting provider text' }),
+      /Conflicting bridge outbox event/,
+    );
+    assert.equal((await (replay as any).outbox.pending()).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('BridgeServer accepts an event exactly at the UTF-8 serialized byte ceiling', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
   try {

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from yeoman_gateway.agent.tools.base import Tool
 from yeoman_gateway.media.document_cache import DocumentCache, MediaItem
+from yeoman_gateway.media.document_processing import is_explicit_pdf_request
 
 if TYPE_CHECKING:
     from yeoman_gateway.media.lazy_resolver import LazyMediaProcessor
@@ -161,15 +162,18 @@ class MediaHistoryTool(Tool):
                 lines.append("\nExtraction is unavailable because no media processor is configured.")
             else:
                 question = str(kwargs.get("query") or "").strip()
-                extraction = await self._processor.extract_for_question(items[0], question)
-                if extraction is None:
-                    lines.append("\nExtraction returned no content.")
+                if not is_explicit_pdf_request(question):
+                    lines.append("\nExtraction requires an explicit content question.")
                 else:
-                    lines.append("\n[Media Extraction]")
-                    mode = str(extraction.get("mode") or "unknown")
-                    content = str(extraction.get("content") or "").strip()
-                    lines.append(f"mode: {mode}")
-                    lines.append(content or "(empty)")
+                    extraction = await self._processor.extract_for_question(items[0], question)
+                    if extraction is None:
+                        lines.append("\nExtraction returned no content.")
+                    else:
+                        lines.append("\n[Media Extraction]")
+                        mode = str(extraction.get("mode") or "unknown")
+                        content = str(extraction.get("content") or "").strip()
+                        lines.append(f"mode: {mode}")
+                        lines.append(content or "(empty)")
 
         return "\n".join(lines)
 

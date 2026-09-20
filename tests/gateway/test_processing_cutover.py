@@ -279,7 +279,9 @@ def test_rollback_deletes_no_database_and_no_archive(tmp_path: Path) -> None:
     store.close()
 
     runtime.config.processing.enabled = False
-    assert build_processing_store(runtime.config) is None  # new mode offline
+    reopened = build_processing_store(runtime.config)
+    assert reopened is not None  # canonical intake remains durable while responders are off
+    reopened.close()
 
     # The data is still there: rollback is a switch, not a migration back.
     import sqlite3

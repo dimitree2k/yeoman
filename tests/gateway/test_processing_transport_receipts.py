@@ -14,7 +14,7 @@ from yeoman_gateway.processing.models import (
     TextPayload,
 )
 from yeoman_gateway.processing.policy import SnapshotEffectAuthorizer
-from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_gateway.processing.store import SCHEMA_VERSION, ProcessingStore
 
 CHAT = "chat@g.us"
 T0 = 1_700_000_000_000
@@ -137,6 +137,39 @@ async def test_a_second_execution_does_not_add_a_second_receipt(tmp_path: Path) 
     store.close()
 
 
+def test_non_whatsapp_receipts_retain_time_distinctions(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    store.enqueue_effect(
+        effect_id="fx-non-whatsapp",
+        operation_key="non-whatsapp-receipt",
+        payload={"text": "hi"},
+        target={"channel": "signal", "chat_id": CHAT},
+        now_ms=T0,
+    )
+
+    first = store.record_transport_receipt(
+        "fx-non-whatsapp",
+        channel="signal",
+        chat_id=CHAT,
+        attempt_id="attempt-1",
+        provider_message_id="provider-1",
+        now_ms=T0,
+    )
+    second = store.record_transport_receipt(
+        "fx-non-whatsapp",
+        channel="signal",
+        chat_id=CHAT,
+        attempt_id="attempt-2",
+        provider_message_id="provider-1",
+        now_ms=T0 + 1,
+    )
+
+    assert first != second
+    receipts = store.transport_receipts("fx-non-whatsapp")
+    assert [receipt.attempt_id for receipt in receipts] == ["attempt-1", "attempt-2"]
+    store.close()
+
+
 def test_receipt_for_an_unknown_effect_is_refused(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     with pytest.raises(ProcessingError):
@@ -159,7 +192,7 @@ def test_receipts_survive_a_reopen(tmp_path: Path) -> None:
     store.close()
 
     store = ProcessingStore(path)
-    assert store.schema_version == 7
+    assert store.schema_version == SCHEMA_VERSION
     receipt = store.effect_transport_receipt("fx1")
     assert receipt is not None and receipt.provider_message_id == "3EB0ABC"
     store.close()

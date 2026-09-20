@@ -20,16 +20,24 @@ CHAT = "chat@g.us"
 NOW = 1_700_000_000_000
 
 
-def _frame(kind: str, payload: dict, *, event_id: str, event_key: str) -> str:
+def _frame(
+    kind: str,
+    payload: dict,
+    *,
+    event_id: str,
+    event_key: str,
+    ts: int = NOW,
+    observed_at: int = NOW,
+) -> str:
     return json.dumps(
         {
             "version": PROTOCOL_VERSION,
             "type": kind,
-            "ts": NOW,
+            "ts": ts,
             "accountId": "account-a",
             "eventId": event_id,
             "eventKey": event_key,
-            "observedAt": NOW,
+            "observedAt": observed_at,
             "payload": payload,
         }
     )
@@ -179,6 +187,59 @@ def test_same_replay_is_acknowledged_again_without_second_route(tmp_path: Path) 
     assert acknowledgements == [{"eventId": "event-replay"}] * 2
     assert published == ["message-replay"]
     assert store.count_events() == 1
+    store.close()
+
+
+def test_replay_with_new_bridge_observation_is_idempotent_after_ack(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    commit_times = iter((NOW + 100, NOW + 200))
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel.set_processing_signals(
+        SignalJournalSink(store, clock=lambda: next(commit_times))
+    )
+    acknowledgements: list[dict] = []
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del timeout_seconds, kwargs
+        assert command_type == "ack_event"
+        acknowledgements.append(payload)
+        return {"acknowledged": True}
+
+    channel._send_command = ack  # type: ignore[method-assign]
+    payload = {
+        "chatJid": CHAT,
+        "messageId": "message-observation-replay",
+        "senderId": "4915@s.whatsapp.net",
+        "text": "same provider payload",
+        "timestamp": 1_700_000_123,
+    }
+    first = _frame(
+        "message",
+        payload,
+        event_id="event-observation-replay",
+        event_key="wa:account-a:message-observation-replay",
+    )
+    replay = _frame(
+        "message",
+        payload,
+        event_id="event-observation-replay",
+        event_key="wa:account-a:message-observation-replay",
+        ts=NOW + 50,
+        observed_at=NOW + 50,
+    )
+
+    asyncio.run(channel._handle_bridge_message(first))
+    _drain_inbound(channel)
+    asyncio.run(channel._handle_bridge_message(replay))
+    _drain_inbound(channel)
+
+    assert acknowledgements == [{"eventId": "event-observation-replay"}] * 2
+    assert store.count_events() == 1
+    event = store.get_event("event-observation-replay")
+    assert event is not None
+    assert event.created_ms == NOW + 100
+    assert event.payload is not None
+    assert event.payload["observed_at_ms"] == NOW
     store.close()
 
 

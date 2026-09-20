@@ -145,6 +145,43 @@ test('inbound text is not truncated at 8000 characters', async () => {
   assert.equal(received.text, text);
 });
 
+test('inbound provider text preserves leading and trailing whitespace', async () => {
+  const text = "  exact provider text \n\t";
+  let received: any;
+  const client = testClient((message) => {
+    received = message;
+  });
+  (client as any).sock = { readMessages: async () => undefined };
+
+  await (client as any).processInboundMessage(
+    {
+      key: { remoteJid: '12345@s.whatsapp.net', id: 'whitespace-message' },
+      message: { conversation: text },
+      messageTimestamp: 1_700_000_000,
+    },
+    '12345@s.whatsapp.net',
+    '12345@s.whatsapp.net',
+    'whitespace-message',
+  );
+
+  assert.equal(received.text, text);
+});
+
+test('media captions preserve provider text without synthetic labels', () => {
+  const client = testClient();
+  const caption = '  exact caption \n\t';
+  const messages = [
+    { imageMessage: { caption, mimetype: 'image/jpeg' } },
+    { videoMessage: { caption, mimetype: 'video/mp4' } },
+    { documentMessage: { caption, mimetype: 'text/plain', fileName: 'note.txt' } },
+  ];
+
+  for (const message of messages) {
+    const extracted = (client as any).extractMessageTextAndMedia({ message });
+    assert.equal(extracted.text, caption);
+  }
+});
+
 test('media-only inbound messages carry metadata without binary payloads', () => {
   const client = testClient();
   const providerHash = Buffer.alloc(32, 0xab);
@@ -185,7 +222,7 @@ test('PDF extraction is not attempted and the envelope only contains caption met
     },
   });
 
-  assert.equal(extracted.text, '[Document] Please review page one');
+  assert.equal(extracted.text, 'Please review page one');
   assert.deepEqual(extracted.media, {
     kind: 'document',
     mimeType: 'application/pdf',
@@ -344,6 +381,58 @@ test('fatal persistence failure halts provider intake before another event enter
       (client as any).handleInboundMessage(inboundMessage('must-not-enter-dedupe')),
     );
     assert.equal((client as any).recentInbound.size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('message handler forwards same provider identity conflicts to the outbox', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-handler-conflict-'));
+  try {
+    const errors: string[] = [];
+    const server = new BridgeServer(
+      '127.0.0.1',
+      0,
+      '',
+      '',
+      '',
+      false,
+      false,
+      false,
+      'secret',
+      '0.2.0',
+      'test-build',
+      true,
+      'default',
+      root,
+    );
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: (message) =>
+        (server as any).trackProviderEvent((server as any).broadcastMessage(message)),
+      onQR: () => {},
+      onStatus: () => {},
+      onError: (error) => errors.push(error),
+    });
+    (server as any).wa = client;
+    (client as any).sock = { readMessages: async () => undefined };
+    (client as any).acceptingProviderEvents = true;
+
+    const first = {
+      ...inboundMessage('handler-conflict-1'),
+      message: { conversation: 'first provider text' },
+    };
+    const conflicting = {
+      ...first,
+      message: { conversation: 'second provider text' },
+    };
+    await (client as any).handleInboundMessage(first);
+    await (client as any).handleInboundMessage(conflicting);
+
+    assert.equal((client as any).droppedInboundDuplicates, 0);
+    assert.equal(errors.some((error) => error.includes('Conflicting bridge outbox event')), true);
+    assert.equal((await (server as any).outbox.pending()).length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

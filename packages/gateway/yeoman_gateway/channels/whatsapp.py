@@ -33,6 +33,35 @@ from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.vision import VisionDescriber
 
+_VOLATILE_PROVIDER_FIELDS = frozenset(
+    {
+        "observedAt",
+        "observed_at_ms",
+        "ingestedAt",
+        "ingested_at_ms",
+        "ingestionAt",
+        "ingestion_at_ms",
+        "receivedAt",
+        "received_at_ms",
+        "committedAt",
+        "committed_at_ms",
+        "commit_ms",
+        "confirmed_ms",
+    }
+)
+
+
+def _canonical_provider_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_canonical_provider_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _canonical_provider_value(value[key])
+        for key in sorted(value)
+        if key not in _VOLATILE_PROVIDER_FIELDS
+    }
+
 if TYPE_CHECKING:
     from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
@@ -993,8 +1022,12 @@ class WhatsAppChannel(BaseChannel):
             kind,
             event_key,
             account_id,
-            str(observed_at),
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            json.dumps(
+                _canonical_provider_value(payload),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
         )
 
     async def _run_off_loop(self, operation: Any) -> Any:
@@ -1625,6 +1658,7 @@ class WhatsAppChannel(BaseChannel):
                 return
 
         event = await self._enrich_media_event(event)
+        self._index_approved_enrichments(event)
         if ambient_candidate:
             # Only the judge decides whether this becomes an answer. Either way the message
             # is archived and stays context for the chat.
@@ -2002,6 +2036,28 @@ class WhatsAppChannel(BaseChannel):
         event = await self._enrich_primary_media_event(event)
         event = await self._enrich_quoted_image_event(event)
         return event
+
+    def _index_approved_enrichments(self, event: InboundEvent) -> None:
+        """Forward existing, bounded media text to the canonical FTS projection."""
+        indexer = getattr(self._processing_signals, "index_enrichments", None)
+        if not callable(indexer):
+            return
+        enrichments: list[dict[str, object]] = []
+        if event.voice_transcript:
+            enrichments.append(
+                {"kind": "voice_transcript", "text": event.voice_transcript, "approved": True}
+            )
+        if event.media_description:
+            kind = {
+                "image": "image_description",
+                "video": "video_description",
+                "sticker": "sticker_description",
+            }.get(event.media_kind or "", "media_description")
+            enrichments.append(
+                {"kind": kind, "text": event.media_description, "approved": True}
+            )
+        if enrichments:
+            indexer(event.message_id, enrichments)
 
     async def _enrich_quoted_image_event(self, event: InboundEvent) -> InboundEvent:
         if (
@@ -2781,6 +2837,9 @@ def _receipt_from_bridge(
     payload: dict[str, Any] = {}
     if provider_message_id:
         payload["provider_message_id"] = str(provider_message_id)
+    client_message_id = payload_source.get("clientMessageId")
+    if client_message_id:
+        payload["client_message_id"] = str(client_message_id)
     if target_message_id:
         payload["target_message_id"] = str(target_message_id)
     return payload or None

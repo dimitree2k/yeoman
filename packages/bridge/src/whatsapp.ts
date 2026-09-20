@@ -1276,22 +1276,22 @@ export class WhatsAppClient {
     if (!message) return null;
 
     if (typeof message.conversation === 'string' && message.conversation.trim()) {
-      return message.conversation.trim();
+      return message.conversation;
     }
     if (typeof message.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text.trim()) {
-      return message.extendedTextMessage.text.trim();
+      return message.extendedTextMessage.text;
     }
     if (message.imageMessage) {
-      const caption = String(message.imageMessage.caption || '').trim();
-      return caption ? `[Image] ${caption}` : '[Image]';
+      const caption = String(message.imageMessage.caption || '');
+      return caption || '[Image]';
     }
     if (message.videoMessage) {
-      const caption = String(message.videoMessage.caption || '').trim();
-      return caption ? `[Video] ${caption}` : '[Video]';
+      const caption = String(message.videoMessage.caption || '');
+      return caption || '[Video]';
     }
     if (message.documentMessage) {
-      const caption = String(message.documentMessage.caption || '').trim();
-      return caption ? `[Document] ${caption}` : '[Document]';
+      const caption = String(message.documentMessage.caption || '');
+      return caption || '[Document]';
     }
     if (message.audioMessage) return '[Voice Message]';
     if (message.stickerMessage) return '[Sticker]';
@@ -1311,7 +1311,7 @@ export class WhatsAppClient {
 
     const replyToMessageId = replyToMessageIdRaw || undefined;
     const replyToParticipantJid = replyToParticipantJidRaw || undefined;
-    const replyToText = replyToTextRaw ? limitText(replyToTextRaw, 1_000) : undefined;
+    const replyToText = replyToTextRaw || undefined;
 
     let replyToMedia: InboundMedia | undefined;
     if (replyToMessageId && context.quotedMessage) {
@@ -1475,17 +1475,17 @@ export class WhatsAppClient {
     if (!message) return { text: null };
 
     if (typeof message.conversation === 'string' && message.conversation.trim()) {
-      return { text: message.conversation.trim() };
+      return { text: message.conversation };
     }
 
     if (typeof message.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text.trim()) {
-      return { text: message.extendedTextMessage.text.trim() };
+      return { text: message.extendedTextMessage.text };
     }
 
     if (message.imageMessage) {
-      const caption = String(message.imageMessage.caption || '').trim();
+      const caption = String(message.imageMessage.caption || '');
       return {
-        text: caption ? `[Image] ${caption}` : '[Image]',
+        text: caption || '[Image]',
         media: {
           kind: 'image',
           mimeType: message.imageMessage.mimetype,
@@ -1495,9 +1495,9 @@ export class WhatsAppClient {
     }
 
     if (message.videoMessage) {
-      const caption = String(message.videoMessage.caption || '').trim();
+      const caption = String(message.videoMessage.caption || '');
       return {
-        text: caption ? `[Video] ${caption}` : '[Video]',
+        text: caption || '[Video]',
         media: {
           kind: 'video',
           mimeType: message.videoMessage.mimetype,
@@ -1520,9 +1520,9 @@ export class WhatsAppClient {
     }
 
     if (message.documentMessage) {
-      const caption = String(message.documentMessage.caption || '').trim();
+      const caption = String(message.documentMessage.caption || '');
       return {
-        text: caption ? `[Document] ${caption}` : '[Document]',
+        text: caption || '[Document]',
         media: {
           kind: 'document',
           mimeType: message.documentMessage.mimetype,
@@ -1574,7 +1574,17 @@ export class WhatsAppClient {
 
     this.storeInboundForQuote(chatJid, messageId, msg);
 
-    const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
+    const extracted = this.extractMessageTextAndMedia(msg);
+    const providerContent = JSON.stringify({
+      text: extracted.text,
+      media: extracted.media,
+      timestamp: msg?.messageTimestamp ?? null,
+      participant: msg?.key?.participant ?? msg?.participant ?? null,
+      fromMe: Boolean(msg?.key?.fromMe),
+    });
+    const dedupeKey = createHash('sha1')
+      .update(`${chatJid}:${messageId}:${providerContent}`)
+      .digest('hex');
     return this.admitDedupeEvent(
       dedupeKey,
       () => this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
