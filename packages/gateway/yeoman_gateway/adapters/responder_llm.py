@@ -1840,7 +1840,9 @@ class LLMResponder(ResponderPort):
         else:
             return "⚙️❓"  # max iterations reached without a text response
 
-        return final_content or "🤔❓"
+        if final_content:
+            return final_content
+        return None if (security_context or {}).get("draft_only") else "🤔❓"
 
     @staticmethod
     def _topic_tokens(text: str) -> set[str]:
@@ -2215,7 +2217,18 @@ class LLMResponder(ResponderPort):
                 chat_id=chat_id,
                 allowed_tools=set(),
             )
+            from yeoman_gateway.processing.participation_runtime import (
+                ParticipationDraftError,
+            )
+
             resolved_profile = self._profile_for_name(model_profile)
+            writer_model = str(getattr(resolved_profile, "model", "") or "").strip()
+            try:
+                writer_provider = self._provider_for_profile(resolved_profile)
+            except Exception as exc:  # noqa: BLE001 - route binding fails closed
+                raise ParticipationDraftError("provider_error") from exc
+            if not writer_model or writer_provider is None:
+                raise ParticipationDraftError("provider_error")
             try:
                 generation = self._chat_loop(
                     messages=messages,
@@ -2228,8 +2241,8 @@ class LLMResponder(ResponderPort):
                         "draft_only": True,
                     },
                     is_owner=bool(is_owner),
-                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
-                    provider=self._provider_for_profile(resolved_profile),
+                    model=writer_model,
+                    provider=writer_provider,
                     max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
                     temperature=(
                         float(getattr(resolved_profile, "temperature"))
@@ -2265,19 +2278,11 @@ class LLMResponder(ResponderPort):
                 logger.warning(
                     "Participation writer timed out channel={} chat={}", channel, chat_id
                 )
-                from yeoman_gateway.processing.participation_runtime import (
-                    ParticipationDraftError,
-                )
-
                 raise ParticipationDraftError("timeout") from exc
             except LLMProviderError as exc:
                 logger.warning(
                     "Participation writer provider error channel={} chat={}", channel, chat_id
                 )
-                from yeoman_gateway.processing.participation_runtime import (
-                    ParticipationDraftError,
-                )
-
                 raise ParticipationDraftError("provider_error") from exc
             lf.end_span(trace, output={"outcome": "draft" if draft else "empty"})
             return draft

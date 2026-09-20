@@ -1117,15 +1117,22 @@ def _build_participation_runtime(
         writer_model = str(resolved_writer.model or "").strip()
         if not writer_model:
             raise ValueError("writer model is empty")
+        writer_provider = str(resolved_writer.provider or "").strip()
+        if not writer_provider:
+            raise ValueError("writer provider is empty")
+        if config.get_provider(
+            writer_model, provider_name=writer_provider
+        ) is None:
+            raise ValueError("writer provider is unavailable")
         ProviderFactory(config=config).create_chat_provider(
-            writer_model, resolved_writer.provider
+            writer_model, writer_provider
         )
         writer_profile = resolved_writer.profile_name
         logger.info(
             "participation writer ready route={} profile={} provider={} model={}",
             resolved_writer.route_key,
             resolved_writer.profile_name,
-            resolved_writer.provider or "auto",
+            writer_provider,
             writer_model,
         )
     except Exception:  # noqa: BLE001 - unavailable writer removes only comments

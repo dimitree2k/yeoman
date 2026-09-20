@@ -962,10 +962,21 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         "yeoman_gateway.processing.model_route.RouteClient", RouteClient
     )
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
     sender = "person@s.whatsapp.net"
     config = Config.model_validate(
         {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "does_not_exist",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
             "processing": {
                 "enabled": True,
                 "chats": [f"whatsapp:{chat_id}"],
@@ -1080,6 +1091,8 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         policy_adapter=adapter,
     )
     decision_runtime, _reconciler = decision
+    assert decision_runtime._submission is None  # noqa: SLF001
+    assert not decision_runtime._writer_available  # noqa: SLF001
     opportunity = ParticipationOpportunity(
         opportunity_id="opportunity-reaction-1",
         channel="whatsapp",
@@ -1177,10 +1190,16 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
             assert kwargs["model"] == "writer/model"
             if writer_mode == "timeout":
                 await asyncio.sleep(0.05)
+            if writer_mode == "empty":
+                return LLMResponse(content=None)
             return LLMResponse(content="explicit writer draft")
 
-    def provider_factory(model: str, provider: str | None = None) -> WriterProvider:
+    def provider_factory(
+        model: str, provider: str | None = None
+    ) -> WriterProvider | None:
         calls.append((model, provider))
+        if writer_mode == "unbound":
+            return None
         return WriterProvider()
 
     responder = LLMResponder(
@@ -1223,6 +1242,21 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
 
         writer_mode = "timeout"
         with pytest.raises(ParticipationDraftError, match="timeout"):
+            await submission.generate_draft(
+                opportunity=opportunity,
+                decision=decision,
+                context={"messages": []},
+            )
+
+        writer_mode = "empty"
+        assert await submission.generate_draft(
+            opportunity=opportunity,
+            decision=decision,
+            context={"messages": []},
+        ) is None
+
+        writer_mode = "unbound"
+        with pytest.raises(ParticipationDraftError, match="provider_error"):
             await submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
@@ -1292,6 +1326,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         "yeoman_gateway.processing.model_route.RouteClient", RouteClient
     )
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
     sender = "person@s.whatsapp.net"
     owner = "owner@s.whatsapp.net"
