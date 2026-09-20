@@ -27,6 +27,8 @@ function clientMeta(ws: any, subscribed = false) {
     subscribed,
     replaying: false,
     replayQueue: [],
+    deliveredEventIds: new Set<string>(),
+    acknowledgedEventIds: new Set<string>(),
   };
 }
 
@@ -126,6 +128,7 @@ test('BridgeServer persists before a subscriber send and preserves pending event
     const subscriber = fakeClient();
     const meta = clientMeta(subscriber.ws, true);
     (server as any).clients.add(meta);
+    (server as any).canonicalSubscriber = meta;
     const deliveredAfterPersist: boolean[] = [];
     subscriber.ws.send = () => {
       deliveredAfterPersist.push(readdirSync(root).length > 0);
@@ -160,6 +163,144 @@ test('status events remain operational broadcasts and are not outbox business ev
     );
     assert.equal(client.messages.length, 1);
     assert.deepEqual(await (server as any).outbox.pending(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('only the canonical subscriber can receive and ACK replayable events', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
+  try {
+    const server = makeServer(root);
+    const first = fakeClient();
+    const second = fakeClient();
+    const firstMeta = clientMeta(first.ws);
+    const secondMeta = clientMeta(second.ws);
+    (server as any).clients.add(firstMeta);
+    (server as any).clients.add(secondMeta);
+    const event = await (server as any).outbox.append(
+      createEventEnvelope({ type: 'message', payload: { messageId: 'ack-boundary-1' } }),
+    );
+
+    await (server as any).handleClientMessage(
+      firstMeta,
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'subscribe_events', token: 'secret', payload: {} }),
+    );
+    await (server as any).handleClientMessage(
+      secondMeta,
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'subscribe_events', token: 'secret', payload: {} }),
+    );
+    assert.equal(firstMeta.subscribed, true);
+    assert.equal(secondMeta.subscribed, false);
+    assert.equal((second.messages[0] as any).payload.ok, false);
+
+    await (server as any).handleClientMessage(
+      secondMeta,
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        type: 'ack_event',
+        token: 'secret',
+        payload: { eventId: event.eventId },
+      }),
+    );
+    assert.equal((second.messages.at(-1) as any).payload.ok, false);
+    assert.equal((await (server as any).outbox.pending()).length, 1);
+
+    await (server as any).handleClientMessage(
+      firstMeta,
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        type: 'ack_event',
+        token: 'secret',
+        payload: { eventId: event.eventId },
+      }),
+    );
+    assert.deepEqual(await (server as any).outbox.pending(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('disconnect releases the canonical slot and leaves pending events for replay', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
+  try {
+    const server = makeServer(root);
+    const first = fakeClient();
+    const firstMeta = clientMeta(first.ws);
+    (server as any).clients.add(firstMeta);
+    await (server as any).outbox.append(
+      createEventEnvelope({ type: 'message', payload: { messageId: 'disconnect-replay-1' } }),
+    );
+    await (server as any).handleClientMessage(
+      firstMeta,
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'subscribe_events', token: 'secret', payload: {} }),
+    );
+    (server as any).handleClientClose(firstMeta);
+    assert.equal(firstMeta.subscribed, false);
+
+    const second = fakeClient();
+    const secondMeta = clientMeta(second.ws);
+    (server as any).clients.add(secondMeta);
+    await (server as any).handleClientMessage(
+      secondMeta,
+      JSON.stringify({ version: PROTOCOL_VERSION, type: 'subscribe_events', token: 'secret', payload: {} }),
+    );
+    assert.equal(second.messages.some((item: any) => item.payload?.messageId === 'disconnect-replay-1'), true);
+    assert.equal((await (server as any).outbox.pending()).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('persistence failure is visible and stops provider intake', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
+  try {
+    const server = makeServer(root);
+    (server as any).outbox.append = async () => {
+      throw new Error('disk full with payload secret-token');
+    };
+
+    await assert.rejects(
+      (server as any).broadcastReplayable(
+        createEventEnvelope({ type: 'message', payload: { text: 'raw payload' } }),
+      ),
+      /disk full/,
+    );
+    assert.equal((server as any).intakeStopped, true);
+    assert.equal((server as any).persistenceFailure, true);
+    assert.equal(JSON.stringify((server as any).diagnostics()).includes('secret-token'), false);
+    assert.equal(JSON.stringify((server as any).diagnostics()).includes('raw payload'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('stop drains an in-flight persistence operation before returning', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
+  try {
+    const server = makeServer(root);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    (server as any).outbox.append = async () => {
+      await blocked;
+      return { eventId: 'drained-1', eventKey: 'drained-key', observedAt: 1 };
+    };
+    (server as any).trackProviderEvent(
+      (server as any).broadcastReplayable(
+        createEventEnvelope({ type: 'message', payload: { messageId: 'drained-1' } }),
+      ),
+    );
+    let stopped = false;
+    const stopping = server.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false);
+    release();
+    await stopping;
+    assert.equal(stopped, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

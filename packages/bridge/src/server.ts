@@ -37,6 +37,8 @@ type ClientMeta = {
   subscribed: boolean;
   replaying: boolean;
   replayQueue: ReplayableBridgeEvent[];
+  deliveredEventIds: Set<string>;
+  acknowledgedEventIds: Set<string>;
 };
 
 const MAX_COMMAND_BYTES = 256 * 1024;
@@ -77,6 +79,11 @@ export class BridgeServer {
   private wa: WhatsAppClient | null = null;
   private readonly clients = new Set<ClientMeta>();
   private readonly outbox: BridgeOutbox;
+  private canonicalSubscriber: ClientMeta | null = null;
+  private readonly inFlight = new Set<Promise<void>>();
+  private intakeStopped = false;
+  private persistenceFailure = false;
+  private stopping = false;
 
   constructor(
     private readonly host: string,
@@ -98,6 +105,9 @@ export class BridgeServer {
   }
 
   async start(): Promise<void> {
+    this.stopping = false;
+    this.intakeStopped = false;
+    this.persistenceFailure = false;
     await this.outbox.open();
     this.wss = new WebSocketServer({
       host: this.host,
@@ -117,12 +127,15 @@ export class BridgeServer {
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => {
-        void this.broadcastMessage(msg);
+        this.trackProviderEvent(this.broadcastMessage(msg));
       },
-      onSignal: (kind, payload) =>
-        void this.broadcastReplayable(
-          createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
-        ),
+      onSignal: (kind, payload) => {
+        this.trackProviderEvent(
+          this.broadcastReplayable(
+            createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
+          ),
+        );
+      },
       onQR: (qr) =>
         this.broadcastEvent(
           createEventEnvelope({
@@ -176,6 +189,8 @@ export class BridgeServer {
         subscribed: false,
         replaying: false,
         replayQueue: [],
+        deliveredEventIds: new Set(),
+        acknowledgedEventIds: new Set(),
       };
       this.clients.add(meta);
 
@@ -208,13 +223,11 @@ export class BridgeServer {
       });
 
       ws.on('close', () => {
-        meta.subscribed = false;
-        this.clients.delete(meta);
+        this.handleClientClose(meta);
       });
 
       ws.on('error', () => {
-        meta.subscribed = false;
-        this.clients.delete(meta);
+        this.handleClientClose(meta);
       });
     });
   }
@@ -258,8 +271,20 @@ export class BridgeServer {
     }
 
     if (cmd.type === 'subscribe_events') {
+      if (this.canonicalSubscriber && this.canonicalSubscriber !== meta) {
+        this.sendToClient(
+          meta,
+          createErrorResponse({
+            requestId: cmd.requestId,
+            accountId: this.accountId,
+            error: protocolError('ERR_AUTH', 'Canonical event subscriber already connected', true),
+          }),
+        );
+        return;
+      }
       const alreadySubscribed = meta.subscribed;
       meta.subscribed = true;
+      this.canonicalSubscriber = meta;
       this.sendToClient(
         meta,
         createOkResponse({
@@ -274,7 +299,24 @@ export class BridgeServer {
 
     if (cmd.type === 'ack_event') {
       const { eventId } = parseAckEventPayload(cmd.payload);
+      const canAck =
+        this.canonicalSubscriber === meta &&
+        meta.subscribed &&
+        (meta.deliveredEventIds.has(eventId) || meta.acknowledgedEventIds.has(eventId));
+      if (!canAck) {
+        this.sendToClient(
+          meta,
+          createErrorResponse({
+            requestId: cmd.requestId,
+            accountId: this.accountId,
+            error: protocolError('ERR_AUTH', 'Event ACK requires current subscriber delivery', false),
+          }),
+        );
+        return;
+      }
       const acknowledged = await this.outbox.ack(eventId);
+      meta.deliveredEventIds.delete(eventId);
+      meta.acknowledgedEventIds.add(eventId);
       this.sendToClient(
         meta,
         createOkResponse({
@@ -461,6 +503,8 @@ export class BridgeServer {
           dedupeCacheSize: waHealth.dedupeCacheSize,
         },
         outbox: this.outbox.diagnostics(),
+        intakeStopped: this.intakeStopped,
+        persistenceFailure: this.persistenceFailure,
       };
     }
 
@@ -495,13 +539,14 @@ export class BridgeServer {
     );
   }
 
-  private sendToClient(meta: ClientMeta, event: BridgeEventEnvelope): void {
-    if (meta.ws.readyState !== WebSocket.OPEN) return;
+  private sendToClient(meta: ClientMeta, event: BridgeEventEnvelope): boolean {
+    if (meta.ws.readyState !== WebSocket.OPEN) return false;
     if (meta.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
       meta.droppedEvents += 1;
-      return;
+      return false;
     }
     meta.ws.send(JSON.stringify(event));
+    return true;
   }
 
   private broadcastEvent(event: BridgeEventEnvelope): void {
@@ -511,20 +556,21 @@ export class BridgeServer {
   }
 
   private async broadcastReplayable(event: BridgeEventEnvelope): Promise<void> {
+    if (this.intakeStopped || this.stopping) throw new Error('Bridge event intake is stopped');
     let persisted: ReplayableBridgeEvent;
     try {
       persisted = await this.outbox.append(event);
-    } catch {
-      console.error('Bridge event persistence failed');
-      return;
+    } catch (error) {
+      this.recordPersistenceFailure();
+      throw error;
     }
 
     for (const meta of this.clients) {
-      if (!meta.subscribed) continue;
+      if (!meta.subscribed || this.canonicalSubscriber !== meta) continue;
       if (meta.replaying) {
         meta.replayQueue.push(persisted);
       } else {
-        this.sendToClient(meta, persisted);
+        this.deliverReplayable(meta, persisted);
       }
     }
   }
@@ -535,20 +581,75 @@ export class BridgeServer {
     try {
       for (const event of await this.outbox.pending()) {
         if (!meta.subscribed || !this.clients.has(meta)) return;
-        sent.add(event.eventId);
-        this.sendToClient(meta, event);
+        if (this.deliverReplayable(meta, event)) sent.add(event.eventId);
       }
     } finally {
       meta.replaying = false;
       const queued = meta.replayQueue.splice(0);
       if (!meta.subscribed || !this.clients.has(meta)) return;
       for (const event of queued) {
-        if (!sent.has(event.eventId)) this.sendToClient(meta, event);
+        if (!sent.has(event.eventId)) this.deliverReplayable(meta, event);
       }
     }
   }
 
+  private deliverReplayable(meta: ClientMeta, event: ReplayableBridgeEvent): boolean {
+    const delivered = this.sendToClient(meta, event);
+    if (delivered) meta.deliveredEventIds.add(event.eventId);
+    return delivered;
+  }
+
+  private recordPersistenceFailure(): void {
+    if (this.persistenceFailure) return;
+    this.persistenceFailure = true;
+    this.intakeStopped = true;
+    console.error('Bridge event persistence failed; provider intake stopped');
+  }
+
+  private trackProviderEvent(operation: Promise<void>): void {
+    let tracked: Promise<void>;
+    tracked = operation
+      .catch(() => {
+        if (!this.stopping) this.recordPersistenceFailure();
+      })
+      .finally(() => this.inFlight.delete(tracked));
+    this.inFlight.add(tracked);
+  }
+
+  private handleClientClose(meta: ClientMeta): void {
+    if (this.canonicalSubscriber === meta) this.canonicalSubscriber = null;
+    meta.subscribed = false;
+    meta.replaying = false;
+    meta.replayQueue.length = 0;
+    meta.deliveredEventIds.clear();
+    meta.acknowledgedEventIds.clear();
+    this.clients.delete(meta);
+  }
+
+  diagnostics(): {
+    intakeStopped: boolean;
+    persistenceFailure: boolean;
+    canonicalSubscriber: boolean;
+    outbox: ReturnType<BridgeOutbox['diagnostics']>;
+  } {
+    return {
+      intakeStopped: this.intakeStopped,
+      persistenceFailure: this.persistenceFailure,
+      canonicalSubscriber: this.canonicalSubscriber !== null,
+      outbox: this.outbox.diagnostics(),
+    };
+  }
+
   async stop(): Promise<void> {
+    this.stopping = true;
+    this.intakeStopped = true;
+    if (this.wa) {
+      await this.wa.stop();
+      this.wa = null;
+    }
+    await Promise.allSettled(Array.from(this.inFlight));
+    await this.outbox.flush();
+    this.canonicalSubscriber = null;
     for (const meta of this.clients) {
       meta.ws.close();
     }
@@ -557,11 +658,6 @@ export class BridgeServer {
     if (this.wss) {
       this.wss.close();
       this.wss = null;
-    }
-
-    if (this.wa) {
-      await this.wa.stop();
-      this.wa = null;
     }
   }
 }

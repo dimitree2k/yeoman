@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,6 +18,7 @@ function event(overrides: Record<string, unknown> = {}): Record<string, unknown>
     version: 5,
     type: 'message',
     ts: 1_700_000_000_000,
+    observedAt: 1_700_000_000_000,
     accountId: 'default',
     payload: {
       messageId: 'provider-message-1',
@@ -40,7 +41,7 @@ test('event is durable before a subscriber callback can see it', async () => {
   try {
     let callbackSawFile = false;
     const persisted = await outbox.append(event());
-    const files = await readdir(root);
+    const files = (await readdir(root)).filter((file) => file.endsWith('.json'));
     callbackSawFile = files.length === 1;
 
     assert.equal(callbackSawFile, true);
@@ -121,6 +122,130 @@ test('diagnostics omit tokens and raw event payloads', async () => {
 
     assert.equal(diagnostic.includes('secret-token'), false);
     assert.equal(diagnostic.includes('do-not-log-this'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('outbox rejects every non-replayable event type', async () => {
+  const { root, outbox } = await temporaryOutbox();
+  try {
+    for (const type of ['status', 'qr', 'error', 'response']) {
+      await assert.rejects(
+        outbox.append(event({ type })),
+        /replayable event type/,
+      );
+    }
+    assert.deepEqual(await outbox.pending(), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('open quarantines malformed, overflow, and filename-mismatched records', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-'));
+  try {
+    await writeFile(join(root, '00000000000000000001-bad-key.json'), '{not-json', { mode: 0o600 });
+    await writeFile(
+      join(root, '999999999999999999999999-overflow-key.json'),
+      JSON.stringify(event({ eventId: 'overflow-event', eventKey: 'overflow-key' })),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(root, '00000000000000000002-wrong-id-wrong-key.json'),
+      JSON.stringify(event({ eventId: 'actual-id', eventKey: 'actual-key' })),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(root, '00000000000000000003-status-id-status-key.json'),
+      JSON.stringify(event({ type: 'status', eventId: 'status-id', eventKey: 'status-key' })),
+      { mode: 0o600 },
+    );
+    const { BridgeOutbox } = await loadOutbox();
+    const outbox = new BridgeOutbox(root);
+    await outbox.open();
+
+    assert.deepEqual(await outbox.pending(), []);
+    assert.equal((outbox.diagnostics() as any).quarantined, 4);
+    const quarantine = await readdir(join(root, 'quarantine'));
+    assert.equal(quarantine.length, 4);
+    for (const file of quarantine) {
+      assert.equal((await lstat(join(root, 'quarantine', file))).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('open quarantines duplicate sequence records and keeps order deterministic', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-'));
+  try {
+    const first = event({ eventId: 'duplicate-sequence-1', eventKey: 'duplicate-key-1' });
+    const second = event({ eventId: 'duplicate-sequence-2', eventKey: 'duplicate-key-2' });
+    await writeFile(
+      join(root, '00000000000000000001-duplicate-sequence-1-duplicate-key-1.json'),
+      JSON.stringify(first),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(root, '00000000000000000001-duplicate-sequence-2-duplicate-key-2.json'),
+      JSON.stringify(second),
+      { mode: 0o600 },
+    );
+    const { BridgeOutbox } = await loadOutbox();
+    const outbox = new BridgeOutbox(root);
+    await outbox.open();
+
+    assert.deepEqual((await outbox.pending()).map((item: any) => item.eventId), ['duplicate-sequence-1']);
+    assert.equal((outbox.diagnostics() as any).quarantined, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('open enforces owner-only directory and file permissions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-'));
+  try {
+    await chmod(root, 0o755);
+    const file = join(root, '00000000000000000001-safe-event-safe-key.json');
+    await writeFile(file, JSON.stringify(event({ eventId: 'safe-event', eventKey: 'safe-key' })), {
+      mode: 0o644,
+    });
+    const { BridgeOutbox } = await loadOutbox();
+    const outbox = new BridgeOutbox(root);
+    await outbox.open();
+
+    assert.equal((await lstat(root)).mode & 0o777, 0o700);
+    assert.equal((await lstat(file)).mode & 0o777, 0o600);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('open enforces owner-only quarantine file permissions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-'));
+  try {
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o755 });
+    const file = join(quarantine, '2026-09-20-malformed-json.json');
+    await writeFile(file, '{private payload}', { mode: 0o644 });
+    const { BridgeOutbox } = await loadOutbox();
+    const outbox = new BridgeOutbox(root);
+    await outbox.open();
+
+    assert.equal((await lstat(quarantine)).mode & 0o777, 0o700);
+    assert.equal((await lstat(file)).mode & 0o777, 0o600);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('open fails closed for a non-regular spool candidate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-'));
+  try {
+    await mkdir(join(root, '00000000000000000001-not-a-file'), { mode: 0o700 });
+    const { BridgeOutbox } = await loadOutbox();
+    await assert.rejects(new BridgeOutbox(root).open(), /regular|quarantine|outbox/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
