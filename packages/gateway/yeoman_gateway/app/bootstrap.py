@@ -463,37 +463,64 @@ class GatewayRuntime:
                 tasks.append(self.bus.dispatch_events())
             await asyncio.gather(*tasks)
         finally:
+            cleanup_errors: list[BaseException] = []
+            retention_error: BaseException | None = None
+
+            async def attempt_async(action: Callable[[], Awaitable[Any]]) -> None:
+                try:
+                    await action()
+                except BaseException as exc:  # cleanup must continue after one failure
+                    cleanup_errors.append(exc)
+
+            def attempt_sync(action: Callable[[], Any]) -> None:
+                try:
+                    action()
+                except BaseException as exc:  # cleanup must continue after one failure
+                    cleanup_errors.append(exc)
+
             if self.gateway_socket:
-                await self.gateway_socket.stop()
-            self.heartbeat.stop()
+                await attempt_async(self.gateway_socket.stop)
+            attempt_sync(self.heartbeat.stop)
             if self.opportunity_scheduler is not None:
-                await self.opportunity_scheduler.stop()
+                await attempt_async(self.opportunity_scheduler.stop)
             if self.participation_maintenance is not None:
                 maintenance_stop = getattr(self.participation_maintenance, "stop", None)
                 if maintenance_stop is not None:
-                    await maintenance_stop()
+                    await attempt_async(maintenance_stop)
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
-                self.lull_observer.stop()
-            self.cron.stop()
-            self.orchestrator.stop()
-            await self.channels.stop_all()
+                attempt_sync(self.lull_observer.stop)
+            attempt_sync(self.cron.stop)
+            attempt_sync(self.orchestrator.stop)
+            await attempt_async(self.channels.stop_all)
             if self.reconciliation is not None:
-                await self.reconciliation.stop()
+                await attempt_async(self.reconciliation.stop)
             if self.retention is not None:
-                await self.retention.stop()
-            await self.responder.aclose()
-            self.inbound_archive.close()
+                try:
+                    await self.retention.stop()
+                except BaseException as exc:
+                    # This failure is the primary shutdown result, but all remaining
+                    # cleanup (including the store fence) still runs below.
+                    retention_error = exc
+            await attempt_async(self.responder.aclose)
+            attempt_sync(self.inbound_archive.close)
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
-                self.speakup_log.close()
+                attempt_sync(self.speakup_log.close)
             if hasattr(self.chat_registry, "close"):
-                self.chat_registry.close()
+                attempt_sync(self.chat_registry.close)
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
-                self.shared_facts.stop()
-            self.contacts.close()
-            self.memory.close()
+                attempt_sync(self.shared_facts.stop)
+            attempt_sync(self.contacts.close)
+            attempt_sync(self.memory.close)
             if self.processing is not None:
-                self.processing.close()
-            await tracing.shutdown()
+                attempt_sync(self.processing.close)
+            await attempt_async(tracing.shutdown)
+
+            if retention_error is not None:
+                for error in cleanup_errors:
+                    logger.error("Gateway cleanup also failed error_type={}", type(error).__name__)
+                raise retention_error
+            if cleanup_errors:
+                raise cleanup_errors[0]
 
 
 class ProcessingStoreUnavailableError(RuntimeError):
@@ -548,14 +575,12 @@ def _has_pending_participation_recovery(
 def build_processing_store(
     config: "Config", *, recover_pending: bool = False
 ) -> "ProcessingStore | None":
-    """Open the durable processing store, but only when the new mode is enabled.
+    """Open the durable canonical journal independently of processing responders.
 
-    Disabled mode stays byte-for-byte inert: no second database appears next to the
-    archives. A store that cannot be opened leaves the new mode offline (fail closed)
-    instead of degrading into an unaudited path.
+    ``processing.enabled`` still gates the responder, policy and effect builders. The
+    journal must remain available in disabled mode so provider capture and replay
+    acknowledgement never depend on whether downstream processing is enabled.
     """
-    if not config.processing.enabled and not recover_pending:
-        return None
 
     from yeoman_gateway.processing.models import DAY_MS, RetentionSettings
     from yeoman_gateway.processing.store import ProcessingStore
@@ -841,7 +866,11 @@ def _build_participation_runtime(
     leaves the new path absent rather than falling back to an unguarded one.
     """
     participation = getattr(config.processing, "participation", None)
-    if participation is None or not bool(getattr(participation, "enabled", False)):
+    if (
+        not config.processing.enabled
+        or participation is None
+        or not bool(getattr(participation, "enabled", False))
+    ):
         return None, None, None
     from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
     from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
@@ -1440,11 +1469,14 @@ def build_reconciliation_service(
     *,
     probe: object | None = None,
     project_participation_receipts: Callable[[], Awaitable[object]] | None = None,
+    recover_pending: bool = False,
 ):
-    """Reconciler for the new mode; ``None`` while processing is off or no store is open.
+    """Reconciler for enabled processing or already-pending durable recovery.
 
-    Disabled mode stays inert: no store, no database and no background task.
+    Disabled mode stays inert unless startup found work that must be reconciled.
     """
+    if not config.processing.enabled and not recover_pending:
+        return None
     if store is None and project_participation_receipts is None:
         return None
 
@@ -1473,8 +1505,13 @@ def _build_participation_receipt_projection(
     log: object | None,
     store: "ProcessingStore | None",
     inbound_archive: object,
+    recover_pending: bool = False,
 ) -> tuple[object | None, Callable[[], Awaitable[object]] | None]:
-    if log is None:
+    if (
+        log is None
+        or store is None
+        or (not config.processing.enabled and not recover_pending)
+    ):
         return None, None
     from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
 
@@ -1495,6 +1532,18 @@ def _build_participation_receipt_projection(
     if callable(feedback):
         feedback(_archive_feedback_reader(inbound_archive, reconciler))
     return reconciler, _project
+
+
+def build_a2a_research_store(
+    config: "Config", processing_store: "ProcessingStore | None"
+):
+    """Build the detached research ledger only with processing features enabled."""
+    if processing_store is None or not config.processing.enabled:
+        return None
+    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
+
+    path = sibling_path(processing_store)
+    return A2AResearchStore(path) if path else None
 
 
 def build_retention_service(
@@ -2028,7 +2077,7 @@ def build_gateway_runtime(
             ),
             capture_actors=frozenset(),
         )
-        knowledge_sources = RuntimeKnowledgeSources()
+        knowledge_sources = RuntimeKnowledgeSources(processing_store=processing_store)
         try:
             knowledge_service = open_knowledge_store(
                 Path(config.knowledge.db_path).expanduser(),
@@ -2205,6 +2254,7 @@ def build_gateway_runtime(
             log=speakup_log,
             store=processing_store,
             inbound_archive=inbound_archive,
+            recover_pending=pending_participation_recovery,
         )
     )
 
@@ -2310,6 +2360,7 @@ def build_gateway_runtime(
         processing_signals=(
             SignalJournalSink(
                 processing_store,
+                memory=memory_service,
                 invalidator=(
                     SignalInvalidator(
                         store=processing_store,
@@ -2425,10 +2476,7 @@ def build_gateway_runtime(
         _release_participation_chat,
     )
 
-    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
-
-    research_path = sibling_path(processing_store)
-    research_reports = A2AResearchStore(research_path) if research_path else None
+    research_reports = build_a2a_research_store(config, processing_store)
 
     def _lookup_quoted_report(event: InboundEvent) -> str | None:
         if research_reports is None:
@@ -3310,7 +3358,7 @@ def build_gateway_runtime(
             _decision_runtime = None
         participation_maintenance = None
         maintenance_config = getattr(config.processing, "participation_maintenance", None)
-        if maintenance_config is not None and bool(
+        if config.processing.enabled and maintenance_config is not None and bool(
             getattr(maintenance_config, "enabled", False)
         ):
             from yeoman_gateway.consciousness.participation_maintenance import (
@@ -3475,6 +3523,7 @@ def build_gateway_runtime(
             config,
             processing_store,
             project_participation_receipts=project_participation_receipts,
+            recover_pending=pending_participation_recovery,
         ),
         retention=build_retention_service(config, processing_store),
         shared_facts=shared_fact_runtime,

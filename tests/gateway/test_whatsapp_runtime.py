@@ -1,6 +1,9 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from yeoman_gateway.app.bootstrap import GatewayRuntime
 from yeoman_gateway.channels.whatsapp_runtime import BridgeStatus, WhatsAppRuntimeManager
 
 
@@ -80,3 +83,75 @@ def test_systemd_bridge_accepts_reachable_port_without_visible_pid(tmp_path, mon
 
     assert status.running is True
     assert status.pids == []
+
+
+def test_gateway_cleanup_closes_processing_when_retention_stop_fails(monkeypatch) -> None:
+    class AsyncNoop:
+        tools = {}
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def aclose(self):
+            return None
+
+    class Lifecycle:
+        async def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    class FailingRetention(AsyncNoop):
+        async def stop(self):
+            raise RuntimeError("retention failed")
+
+    closed: list[str] = []
+
+    class FailingOrchestrator(AsyncNoop):
+        async def run(self):
+            raise RuntimeError("runtime body failed")
+
+        def stop(self):
+            closed.append("orchestrator")
+
+    class Channels(AsyncNoop):
+        async def start_all(self):
+            return None
+
+        async def stop_all(self):
+            closed.append("channels")
+
+    class Processing:
+        def close(self):
+            closed.append("processing")
+
+    class Closing:
+        def close(self):
+            closed.append("close")
+
+    runtime = GatewayRuntime(
+        orchestrator=FailingOrchestrator(),
+        channels=Channels(),
+        cron=Lifecycle(),
+        heartbeat=Lifecycle(),
+        inbound_archive=Closing(),
+        responder=AsyncNoop(),
+        memory=Closing(),
+        contacts=Closing(),
+        chat_registry=Closing(),
+        processing=Processing(),
+        retention=FailingRetention(),
+    )
+
+    monkeypatch.setattr("yeoman_gateway.app.bootstrap.tracing.init", lambda: None)
+    monkeypatch.setattr("yeoman_gateway.app.bootstrap.tracing.shutdown", AsyncNoop().stop)
+
+    with pytest.raises(RuntimeError, match="retention failed"):
+        asyncio.run(runtime.run())
+
+    assert "processing" in closed
+    assert "channels" in closed

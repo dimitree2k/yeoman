@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 import threading
 import uuid
 from array import array
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -818,6 +821,179 @@ class MemoryStore:
             is_deleted=bool(int(row["is_deleted"])),
         )
 
+    @staticmethod
+    def _event_value(event: object, key: str, default: Any = None) -> Any:
+        if isinstance(event, Mapping):
+            return event.get(key, default)
+        return getattr(event, key, default)
+
+    @staticmethod
+    def _approved_enrichment_items(value: object) -> Iterable[tuple[str, str]]:
+        allowed = {
+            "audio_transcript",
+            "image_description",
+            "media_description",
+            "sticker_description",
+            "video_description",
+            "voice_transcript",
+        }
+        if value is None:
+            return
+        if not isinstance(value, Mapping) and not isinstance(value, (str, bytes, bytearray)):
+            kind = str(getattr(value, "kind", getattr(value, "type", "")) or "").strip().lower()
+            content = getattr(value, "text", getattr(value, "content", None))
+            if kind in allowed and isinstance(content, str) and getattr(value, "approved", True) is not False:
+                yield kind, content
+                return
+        if isinstance(value, Mapping):
+            if value.get("approved", True) is False:
+                return
+            kind = str(value.get("kind") or value.get("type") or "").strip().lower()
+            content = value.get("text")
+            if content is None:
+                content = value.get("content")
+            if kind in allowed and isinstance(content, str) and value.get("approved", True) is not False:
+                yield kind, content
+                return
+            for key, item in value.items():
+                normalized_key = str(key).strip().lower()
+                if normalized_key in allowed and isinstance(item, str):
+                    yield normalized_key, item
+            return
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes, bytearray)):
+            return
+        for item in value:
+            yield from MemoryStore._approved_enrichment_items(item)
+
+    def index_canonical_event(
+        self,
+        event: object,
+        *,
+        audience: Mapping[str, Any] | object | None = None,
+        enrichments: Iterable[Mapping[str, Any] | object] = (),
+        workspace_id: str | None = None,
+    ) -> tuple[MemoryEntry, ...]:
+        """Project canonical message text and approved enrichments into the existing FTS.
+
+        The event journal remains authoritative.  These deterministic ``memory2_nodes``
+        rows are only a searchable projection and carry enough source/audience metadata
+        for a later tombstone to remove them without adding another schema.
+        """
+        event_id = str(self._event_value(event, "event_id", "") or "").strip()
+        channel = str(self._event_value(event, "channel", "") or "").strip()
+        chat_id = str(self._event_value(event, "chat_id", "") or "").strip()
+        if not event_id or not channel or not chat_id:
+            return ()
+        if str(self._event_value(event, "kind", "message") or "message") != "message":
+            return ()
+
+        payload = self._event_value(event, "payload", {})
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        text = self._event_value(event, "content", None)
+        if text is None:
+            text = self._event_value(event, "text", None)
+        if text is None:
+            text = payload.get("text") or payload.get("content")
+        candidates: list[tuple[str, str]] = []
+        if isinstance(text, str) and text.strip():
+            candidates.append(("message", text))
+        candidates.extend(self._approved_enrichment_items(payload.get("approved_enrichments")))
+        candidates.extend(self._approved_enrichment_items(enrichments))
+
+        authority = audience
+        if authority is None:
+            authority = {}
+        get_authority = (
+            authority.get if isinstance(authority, Mapping) else lambda key, default=None: getattr(authority, key, default)
+        )
+        audience_status = str(get_authority("status", get_authority("audience_status", "unknown")) or "unknown")
+        raw_members = get_authority("members", get_authority("audience_members", ())) or ()
+        if isinstance(raw_members, str):
+            raw_members = (raw_members,)
+        audience_members = tuple(sorted({str(item).strip() for item in raw_members if str(item).strip()}))
+        audience_snapshot_id = get_authority(
+            "snapshot_id", get_authority("audience_snapshot_id", None)
+        )
+        policy_revision = get_authority("policy_revision", None)
+        revoked_at_ms = get_authority("revoked_at_ms", None)
+        if bool(get_authority("revoked", False)) and revoked_at_ms is None:
+            revoked_at_ms = 0
+        revision = int(self._event_value(event, "revision", 1) or 1)
+        trace_id = str(self._event_value(event, "trace_id", "") or "")
+        principal = str(self._event_value(event, "principal", "") or "")
+        direction = str(self._event_value(event, "direction", "in") or "in")
+        source_message_id = self._event_value(event, "source_message_id", None)
+        occurred_ms = self._event_value(event, "occurred_ms", None)
+        resolved_workspace_id = str(
+            workspace_id or self._event_value(event, "workspace_id", "") or "canonical"
+        )
+        scope_key = f"channel:{channel}:chat:{chat_id}"
+        now_iso = datetime.now(UTC).isoformat()
+        indexed: list[MemoryEntry] = []
+        seen: set[tuple[str, str]] = set()
+        for node_kind, raw_content in candidates:
+            content = raw_content.strip()
+            if not content or (node_kind, content) in seen:
+                continue
+            seen.add((node_kind, content))
+            digest = hashlib.sha256(
+                f"{event_id}\x00{revision}\x00{node_kind}\x00{content}".encode("utf-8")
+            ).hexdigest()
+            entry_id = f"canonical:{event_id}:{revision}:{node_kind}:{digest[:16]}"
+            metadata = {
+                "source_event_id": event_id,
+                "source_revision": revision,
+                "source_trace_id": trace_id,
+                "source_channel": channel,
+                "source_chat_id": chat_id,
+                "source_occurred_ms": occurred_ms,
+                "audience_status": audience_status,
+                "audience_members": list(audience_members),
+                "audience_snapshot_id": audience_snapshot_id,
+                "policy_revision": policy_revision,
+                "revoked_at_ms": revoked_at_ms,
+                "direction": direction,
+            }
+            if node_kind != "message":
+                metadata["enrichment_kind"] = node_kind
+            entry = MemoryEntry(
+                id=entry_id,
+                workspace_id=resolved_workspace_id,
+                scope_type="chat",
+                scope_key=scope_key,
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=principal or None,
+                sector="episodic",
+                kind="whatsapp_message" if node_kind == "message" else "whatsapp_enrichment",
+                content=content,
+                content_norm=content.lower(),
+                content_hash=digest,
+                salience=0.5,
+                confidence=1.0,
+                source="whatsapp_canonical",
+                source_message_id=(str(source_message_id) if source_message_id else None),
+                source_role="assistant" if direction == "out" else "user",
+                meta_json=json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                created_at=now_iso,
+                updated_at=now_iso,
+                valid_from=now_iso,
+                is_deleted=revoked_at_ms is not None,
+            )
+            saved, inserted = self.upsert_node(entry)
+            if not inserted and not saved.is_deleted and saved.meta_json != entry.meta_json:
+                updated = self.update_node_meta(
+                    saved.id,
+                    workspace_id=saved.workspace_id,
+                    meta_json=entry.meta_json,
+                )
+                if updated is not None:
+                    saved = updated
+            if revoked_at_ms is not None:
+                self.soft_delete([saved.id])
+            indexed.append(saved)
+        return tuple(indexed)
+
     def upsert_node(
         self,
         entry: MemoryEntry,
@@ -829,6 +1005,17 @@ class MemoryStore:
         """Insert or merge one entry. Returns (entry, inserted_new)."""
         now_iso = datetime.now(UTC).isoformat()
         with self._lock:
+            existing_by_id = None
+            if entry.id:
+                existing_by_id = self._conn.execute(
+                    "SELECT * FROM memory2_nodes WHERE id = ? LIMIT 1", (entry.id,)
+                ).fetchone()
+            if existing_by_id is not None:
+                if str(existing_by_id["content_hash"]) != entry.content_hash:
+                    raise sqlite3.IntegrityError(f"memory node id already exists: {entry.id}")
+                existing_entry = self._row_to_entry(existing_by_id)
+                self._commit_owned()
+                return existing_entry, False
             existing = self._conn.execute(
                 """
                 SELECT *
@@ -919,10 +1106,11 @@ class MemoryStore:
                     1 if entry.is_deleted else 0,
                 ),
             )
-            self._conn.execute(
-                "INSERT INTO memory2_nodes_fts (entry_id, content) VALUES (?, ?)",
-                (entry_id, entry.content_norm or entry.content),
-            )
+            if not entry.is_deleted:
+                self._conn.execute(
+                    "INSERT INTO memory2_nodes_fts (entry_id, content) VALUES (?, ?)",
+                    (entry_id, entry.content_norm or entry.content),
+                )
             if embedding_model and embedding is not None:
                 self._upsert_embedding(entry_id, entry.workspace_id, embedding_model, embedding)
             self._commit_owned()
@@ -1166,8 +1354,32 @@ class MemoryStore:
                 f" WHERE id IN ({placeholders}) AND is_deleted = 0",
                 (now_iso, *ids),
             )
+            self._conn.execute(
+                f"DELETE FROM memory2_nodes_fts WHERE entry_id IN ({placeholders})",
+                tuple(ids),
+            )
             self._commit_owned()
             return cursor.rowcount
+
+    def soft_delete_sources(self, source_event_ids: Iterable[str]) -> int:
+        """Soft-delete canonical projections for the supplied source event IDs."""
+        wanted = {str(item) for item in source_event_ids if str(item)}
+        if not wanted:
+            return 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, meta_json FROM memory2_nodes "
+                "WHERE source = 'whatsapp_canonical' AND is_deleted = 0"
+            ).fetchall()
+        matching: list[str] = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["meta_json"] or "{}"))
+            except (TypeError, ValueError):
+                continue
+            if str(metadata.get("source_event_id", "")) in wanted:
+                matching.append(str(row["id"]))
+        return self.soft_delete(matching)
 
     def get_node(self, entry_id: str, *, workspace_id: str) -> MemoryEntry | None:
         """Return one active entry by ID."""

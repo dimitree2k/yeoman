@@ -51,7 +51,8 @@ def test_disabled_mode_keeps_shared_memory_inert(tmp_path: Path) -> None:
 
     assert config.processing.enabled is False
     assert config.memory.shared.enabled is False
-    assert build_processing_store(config) is None
+    processing = build_processing_store(config)
+    assert processing is not None
     assert (
         build_shared_fact_runtime(
             config, store=None, processing=None, chat_registry=None, policy=None
@@ -59,6 +60,7 @@ def test_disabled_mode_keeps_shared_memory_inert(tmp_path: Path) -> None:
         is None
     )
     assert not (tmp_path / "memory.db").exists()
+    processing.close()
 
 
 def test_shared_off_but_memory_on_builds_nothing(tmp_path: Path) -> None:

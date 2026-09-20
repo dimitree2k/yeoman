@@ -167,10 +167,16 @@ def test_channel_hook_journals_signals_without_touching_ingest(tmp_path: Path) -
     channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
     channel.set_processing_signals(SignalJournalSink(store, clock=lambda: T0))
 
+    event_key = f"whatsapp:{CHAT}:reaction:3EB0:4915:🔥:1700000000000"
+    event_id = signal_event_id(event_key)
     frame = json.dumps(
         {
             "version": PROTOCOL_VERSION,
             "type": "reaction",
+            "accountId": "account-a",
+            "eventId": event_id,
+            "eventKey": event_key,
+            "observedAt": T0,
             "payload": {"chatJid": CHAT, "targetMessageId": "3EB0", "senderId": "4915@s.whatsapp.net",
                         "emoji": "🔥", "timestamp": 1_700_000_000},
         }
@@ -180,7 +186,7 @@ def test_channel_hook_journals_signals_without_touching_ingest(tmp_path: Path) -
     asyncio.run(channel._handle_bridge_message(frame))
 
     assert store.count_events() == 1
-    stored = store.get_event(signal_event_id(f"whatsapp:{CHAT}:reaction:3EB0:4915:🔥:1700000000000"))
+    stored = store.get_event(event_id)
     assert stored is not None and stored.kind == "reaction"
 
     class _Boom:

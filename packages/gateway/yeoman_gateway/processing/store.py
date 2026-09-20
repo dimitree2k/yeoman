@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     CLAIMABLE_EFFECT_STATES,
     EFFECT_STATES,
     TURN_STATES,
@@ -59,6 +60,7 @@ from yeoman_gateway.processing.models import (
     TurnStateError,
     canonical_hash,
     canonical_json,
+    normalize_revision,
     payload_from_mapping,
     payload_to_mapping,
     validate_transition,
@@ -70,7 +72,71 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
+
+_VOLATILE_EVENT_PAYLOAD_KEYS = frozenset(
+    {
+        "observedAt",
+        "observed_at_ms",
+        "ingestedAt",
+        "ingested_at_ms",
+        "ingestionAt",
+        "ingestion_at_ms",
+        "receivedAt",
+        "received_at_ms",
+        "committedAt",
+        "committed_at_ms",
+        "commit_ms",
+        "confirmed_ms",
+    }
+)
+
+
+def _canonical_event_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_canonical_event_value(item) for item in value]
+    if not isinstance(value, Mapping):
+        return value
+    return {
+        str(key): _canonical_event_value(item)
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        if str(key) not in _VOLATILE_EVENT_PAYLOAD_KEYS
+    }
+
+
+def _event_payload_hash(payload: Any) -> str:
+    return canonical_hash(_canonical_event_value(payload))
+
+
+_AUDIENCE_STATUSES = frozenset({"known", "author_only", "unknown"})
+
+
+def _authority_status(value: Any, *, members: Iterable[str] = ()) -> str:
+    status = str(value or "").strip().lower()
+    normalized_members = tuple(str(item).strip() for item in members if str(item).strip())
+    if not status:
+        status = "known" if normalized_members else "unknown"
+    if status not in _AUDIENCE_STATUSES:
+        raise ValueError(f"unknown audience status: {status!r}")
+    if status == "known" and not normalized_members:
+        # An empty known audience is still a proven, private snapshot.  It is not
+        # upgraded to unknown merely because nobody was present at capture time.
+        return status
+    return status
+
+
+def _authority_members(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = (value,)
+    else:
+        try:
+            values = tuple(value)
+        except TypeError:
+            return ()
+    return tuple(sorted({str(item).strip() for item in values if str(item).strip()}))
+
 
 _SCHEMA = (
     """
@@ -242,6 +308,37 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
           PRIMARY KEY (canonical_user_id, quota_key)
         )
         """,
+    ),
+    7: (
+        "ALTER TABLE events ADD COLUMN account TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE events ADD COLUMN direction TEXT NOT NULL DEFAULT 'in'",
+        "ALTER TABLE events ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE events ADD COLUMN audience_ref TEXT",
+    ),
+    8: (
+        """
+        CREATE TABLE IF NOT EXISTS event_source_authority (
+          event_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          author_principal TEXT NOT NULL,
+          source_channel TEXT NOT NULL,
+          source_chat_id TEXT NOT NULL,
+          occurred_at_ms INTEGER NOT NULL,
+          audience_status TEXT NOT NULL,
+          audience_members_json TEXT NOT NULL DEFAULT '[]',
+          audience_snapshot_id TEXT,
+          policy_revision TEXT,
+          revoked_at_ms INTEGER,
+          revoking_event_id TEXT,
+          created_ms INTEGER NOT NULL,
+          updated_ms INTEGER NOT NULL,
+          PRIMARY KEY (event_id, revision)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_event_source_authority_chat "
+        "ON event_source_authority(source_channel, source_chat_id, revoked_at_ms)",
+        "CREATE INDEX IF NOT EXISTS idx_event_source_authority_revoking "
+        "ON event_source_authority(revoking_event_id)",
     ),
     4: (
         """
@@ -722,6 +819,10 @@ class ProcessingStore:
         trace_id: str,
         payload: CanonicalEvent | Mapping[str, Any],
         now_ms: int | None = None,
+        account: str | None = None,
+        direction: str | None = None,
+        revision: int | None = None,
+        audience_ref: str | None = None,
     ) -> str:
         """Append one canonical event; idempotent per provider identity.
 
@@ -736,54 +837,119 @@ class ProcessingStore:
         event = self._coerce_event(
             event_key=event_key, event_id=event_id, trace_id=trace_id, payload=payload,
             created_ms=created,
+            account=account,
+            direction=direction,
+            revision=revision,
+            audience_ref=audience_ref,
         )
         with self._write() as conn:
-            row = conn.execute(
-                "SELECT event_id, payload_hash, payload_json FROM events WHERE event_key = ?",
-                (event.event_key,),
-            ).fetchone()
-            if row is not None:
-                if row["payload_json"] is None or row["payload_hash"] == event.payload_hash:
-                    return str(row["event_id"])
-                raise JournalConflictError(
-                    f"event_key {event.event_key!r} already exists with a different payload"
-                )
-            clash = conn.execute(
-                "SELECT event_key FROM events WHERE event_id = ?", (event.event_id,)
-            ).fetchone()
-            if clash is not None:
-                raise JournalConflictError(
-                    f"event_id {event.event_id!r} already belongs to {clash['event_key']!r}"
-                )
-            conn.execute(
-                """
-                INSERT INTO events (
-                  event_id, event_key, trace_id, kind, origin, channel, chat_id, principal,
-                  source_message_id, target_message_id, thread_id, turn_id, occurred_ms,
-                  payload_hash, payload_json, payload_purged_ms, created_ms
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
-                """,
-                (
-                    event.event_id,
-                    event.event_key,
-                    event.trace_id,
-                    event.kind,
-                    event.origin,
-                    event.channel,
-                    event.chat_id,
-                    event.principal,
-                    event.source_message_id,
-                    event.target_message_id,
-                    event.thread_id,
-                    event.turn_id,
-                    event.occurred_ms,
-                    event.payload_hash,
-                    canonical_json(dict(event.payload or {})),
-                    event.created_ms,
-                ),
+            return self._append_event_connection(conn, event)
+
+    def _append_event_connection(
+        self, conn: sqlite3.Connection, event: CanonicalEvent
+    ) -> str:
+        """Append *event* inside an already-open transaction."""
+        row = conn.execute(
+            "SELECT event_id, payload_hash, payload_json, account, direction, revision, "
+            "audience_ref FROM events WHERE event_key = ?",
+            (event.event_key,),
+        ).fetchone()
+        if row is not None:
+            existing_payload_hash = str(row["payload_hash"])
+            if row["payload_json"] is not None:
+                try:
+                    existing_payload_hash = _event_payload_hash(json.loads(row["payload_json"]))
+                except (TypeError, ValueError):
+                    pass
+            same_metadata = (
+                str(row["account"] or "") == event.account
+                and str(row["direction"] or "in") == event.direction
+                and int(row["revision"] or 1) == event.revision
+                and (str(row["audience_ref"]) if row["audience_ref"] is not None else None)
+                == event.audience_ref
             )
-            self._record_relations(conn, event)
+            if row["payload_json"] is None or (
+                existing_payload_hash == event.payload_hash and same_metadata
+            ):
+                self._ensure_event_source_authority_connection(conn, event)
+                return str(row["event_id"])
+            raise JournalConflictError(
+                f"event_key {event.event_key!r} already exists with different content"
+            )
+        clash = conn.execute(
+            "SELECT event_key FROM events WHERE event_id = ?", (event.event_id,)
+        ).fetchone()
+        if clash is not None:
+            raise JournalConflictError(
+                f"event_id {event.event_id!r} already belongs to {clash['event_key']!r}"
+            )
+        conn.execute(
+            """
+            INSERT INTO events (
+              event_id, event_key, trace_id, kind, origin, channel, chat_id, principal,
+              account, direction, revision, audience_ref, source_message_id, target_message_id,
+              thread_id, turn_id, occurred_ms, payload_hash, payload_json, payload_purged_ms,
+              created_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+            """,
+            (
+                event.event_id,
+                event.event_key,
+                event.trace_id,
+                event.kind,
+                event.origin,
+                event.channel,
+                event.chat_id,
+                event.principal,
+                event.account,
+                event.direction,
+                event.revision,
+                event.audience_ref,
+                event.source_message_id,
+                event.target_message_id,
+                event.thread_id,
+                event.turn_id,
+                event.occurred_ms,
+                event.payload_hash,
+                canonical_json(dict(event.payload or {})),
+                event.created_ms,
+            ),
+        )
+        self._record_relations(conn, event)
+        self._ensure_event_source_authority_connection(conn, event)
         return event.event_id
+
+    def _ensure_event_source_authority_connection(
+        self, conn: sqlite3.Connection, event: CanonicalEvent
+    ) -> None:
+        """Create the source projection once, without replacing durable authority."""
+        # Provider payloads are evidence, not authority.  A trusted runtime adapter must
+        # explicitly register the audience snapshot before it can be read.
+        status, members, snapshot_id, policy_revision = "unknown", (), None, None
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO event_source_authority (
+              event_id, revision, author_principal, source_channel, source_chat_id,
+              occurred_at_ms, audience_status, audience_members_json,
+              audience_snapshot_id, policy_revision, revoked_at_ms, revoking_event_id,
+              created_ms, updated_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?)
+            """,
+            (
+                event.event_id,
+                int(event.revision),
+                event.principal,
+                event.channel,
+                event.chat_id,
+                int(event.occurred_ms if event.occurred_ms is not None else event.created_ms or 0),
+                status,
+                canonical_json(list(members)),
+                snapshot_id,
+                policy_revision,
+                int(event.created_ms or 0),
+                int(event.created_ms or 0),
+            ),
+        )
 
     def _coerce_event(
         self,
@@ -793,6 +959,10 @@ class ProcessingStore:
         trace_id: str,
         payload: CanonicalEvent | Mapping[str, Any],
         created_ms: int,
+        account: str | None = None,
+        direction: str | None = None,
+        revision: int | None = None,
+        audience_ref: str | None = None,
     ) -> CanonicalEvent:
         if isinstance(payload, CanonicalEvent):
             body: dict[str, Any] = dict(payload.payload or {})
@@ -805,6 +975,13 @@ class ProcessingStore:
                 principal=payload.principal,
                 channel=payload.channel,
                 chat_id=payload.chat_id,
+                account=payload.account if account is None else str(account),
+                direction=payload.direction if direction is None else str(direction),
+                revision=normalize_revision(
+                    payload.revision if revision is None else revision, default=1
+                )
+                or 1,
+                audience_ref=payload.audience_ref if audience_ref is None else audience_ref,
                 occurred_ms=payload.occurred_ms,
                 created_ms=created_ms,
                 source_message_id=payload.source_message_id,
@@ -812,11 +989,15 @@ class ProcessingStore:
                 thread_id=payload.thread_id,
                 turn_id=payload.turn_id,
                 payload=body,
-                payload_hash=canonical_hash(body),
+                payload_hash=_event_payload_hash(body),
             )
         if not isinstance(payload, Mapping):
             raise TypeError("event payload must be a CanonicalEvent or a mapping")
         body = dict(payload)
+        normalized_revision = normalize_revision(body.get("revision"), default=1)
+        assert normalized_revision is not None
+        if "revision" in body:
+            body["revision"] = normalized_revision
         return CanonicalEvent(
             event_id=event_id,
             event_key=event_key,
@@ -826,6 +1007,21 @@ class ProcessingStore:
             principal=str(body.get("principal") or ""),
             channel=str(body.get("channel") or ""),
             chat_id=str(body.get("chat_id") or ""),
+            account=str(
+                account
+                if account is not None
+                else body.get("account") or body.get("account_id") or ""
+            ),
+            direction=str(direction if direction is not None else body.get("direction") or "in"),
+            revision=normalize_revision(
+                revision if revision is not None else body.get("revision"), default=1
+            )
+            or 1,
+            audience_ref=(
+                audience_ref
+                if audience_ref is not None
+                else _opt_str(body.get("audience_ref") or body.get("audienceRef"))
+            ),
             occurred_ms=_opt_int(body.get("occurred_ms") or body.get("timestamp_ms")),
             created_ms=created_ms,
             source_message_id=_opt_str(
@@ -835,7 +1031,7 @@ class ProcessingStore:
             thread_id=_opt_str(body.get("thread_id")),
             turn_id=_opt_str(body.get("turn_id")),
             payload=body,
-            payload_hash=canonical_hash(body),
+            payload_hash=_event_payload_hash(body),
         )
 
     def _record_relations(self, conn: sqlite3.Connection, event: CanonicalEvent) -> None:
@@ -883,6 +1079,373 @@ class ProcessingStore:
                 "SELECT * FROM events WHERE event_key = ?", (event_key,)
             ).fetchone()
         return self._event_from_row(row) if row is not None else None
+
+    # -- source authority -------------------------------------------------------------
+
+    def upsert_event_source_authority(
+        self,
+        *,
+        event_id: str | None = None,
+        revision: int = 1,
+        source: Any | None = None,
+        audience: Any | None = None,
+        author_principal: str | None = None,
+        source_channel: str | None = None,
+        source_chat_id: str | None = None,
+        occurred_at_ms: int | None = None,
+        audience_status: str | None = None,
+        audience_members: Iterable[str] | None = None,
+        audience_snapshot_id: str | None = None,
+        policy_revision: str | int | None = None,
+        revoked: bool = False,
+        revoked_at_ms: int | None = None,
+        revoking_event_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist one source revision and its audience proof.
+
+        The row is an authority projection, not a replacement for the canonical event.
+        Repeating the same registration is idempotent and never clears a revocation.
+        """
+        if source is not None:
+            event_id = str(getattr(source, "event_id", event_id or ""))
+            revision = int(getattr(source, "revision", revision))
+            author_principal = str(
+                getattr(source, "author_principal", author_principal or "")
+            )
+            source_channel = str(getattr(source, "channel", source_channel or ""))
+            source_chat_id = str(getattr(source, "chat_id", source_chat_id or ""))
+            occurred_at_ms = int(
+                getattr(source, "occurred_at_ms", occurred_at_ms or 0)
+            )
+        event_token = str(event_id or "").strip()
+        if not event_token:
+            raise ValueError("event_id is required")
+        if int(revision) < 1:
+            raise ValueError("revision must be positive")
+
+        explicit_audience = audience is not None or any(
+            value is not None
+            for value in (
+                audience_status,
+                audience_members,
+                audience_snapshot_id,
+                policy_revision,
+            )
+        )
+        members = _authority_members(
+            getattr(audience, "members", audience_members)
+            if audience is not None
+            else audience_members
+        )
+        status_value = (
+            getattr(audience, "status", audience_status)
+            if audience is not None
+            else audience_status
+        )
+        status = _authority_status(status_value, members=members)
+        snapshot_value = (
+            getattr(audience, "snapshot_id", audience_snapshot_id)
+            if audience is not None
+            else audience_snapshot_id
+        )
+        policy_value = (
+            policy_revision
+            if policy_revision is not None
+            else (getattr(audience, "policy_revision", None) if audience is not None else None)
+        )
+        snapshot = (
+            str(snapshot_value) if snapshot_value is not None and str(snapshot_value) else None
+        )
+        policy = (
+            str(policy_value) if policy_value is not None and str(policy_value) else None
+        )
+        author = str(author_principal or "")
+        channel = str(source_channel or "")
+        chat_id = str(source_chat_id or "")
+        occurred = int(occurred_at_ms or 0)
+        moment = self._now(now_ms)
+        revoked_at = moment if revoked and revoked_at_ms is None else revoked_at_ms
+
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT * FROM event_source_authority WHERE event_id = ? AND revision = ?",
+                (event_token, int(revision)),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO event_source_authority (
+                      event_id, revision, author_principal, source_channel, source_chat_id,
+                      occurred_at_ms, audience_status, audience_members_json,
+                      audience_snapshot_id, policy_revision, revoked_at_ms, revoking_event_id,
+                      created_ms, updated_ms
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event_token,
+                        int(revision),
+                        author,
+                        channel,
+                        chat_id,
+                        occurred,
+                        status,
+                        canonical_json(list(members)),
+                        snapshot,
+                        policy,
+                        revoked_at,
+                        str(revoking_event_id) if revoking_event_id else None,
+                        moment,
+                        moment,
+                    ),
+                )
+            else:
+                for column, value in (
+                    ("author_principal", author),
+                    ("source_channel", channel),
+                    ("source_chat_id", chat_id),
+                    ("occurred_at_ms", occurred),
+                ):
+                    current = row[column]
+                    if current not in (None, "", 0) and value not in (None, "", 0):
+                        if str(current) != str(value):
+                            raise JournalConflictError(
+                                f"source authority {event_token!r}:{revision} conflicts on {column}"
+                            )
+                if explicit_audience:
+                    conn.execute(
+                        """
+                        UPDATE event_source_authority
+                           SET audience_status = ?, audience_members_json = ?,
+                               audience_snapshot_id = ?, policy_revision = ?, updated_ms = ?
+                         WHERE event_id = ? AND revision = ?
+                        """,
+                        (
+                            status,
+                            canonical_json(list(members)),
+                            snapshot,
+                            policy,
+                            moment,
+                            event_token,
+                            int(revision),
+                        ),
+                    )
+                if revoked_at is not None:
+                    conn.execute(
+                        """
+                        UPDATE event_source_authority
+                           SET revoked_at_ms = COALESCE(revoked_at_ms, ?),
+                               revoking_event_id = COALESCE(revoking_event_id, ?),
+                               updated_ms = ?
+                         WHERE event_id = ? AND revision = ?
+                        """,
+                        (
+                            int(revoked_at),
+                            str(revoking_event_id) if revoking_event_id else None,
+                            moment,
+                            event_token,
+                            int(revision),
+                        ),
+                    )
+            result = conn.execute(
+                "SELECT * FROM event_source_authority WHERE event_id = ? AND revision = ?",
+                (event_token, int(revision)),
+            ).fetchone()
+        assert result is not None
+        return _source_authority_from_row(result)
+
+    def get_event_source_authority(
+        self, event_id: str, revision: int = 1
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM event_source_authority WHERE event_id = ? AND revision = ?",
+                (str(event_id), int(revision)),
+            ).fetchone()
+        return _source_authority_from_row(row) if row is not None else None
+
+    def source_authority_for_event(
+        self, event_id: str, revision: int = 1
+    ) -> dict[str, Any] | None:
+        return self.get_event_source_authority(event_id, revision)
+
+    def revoke_event_source_authority(
+        self,
+        event_id: str,
+        *,
+        revision: int = 1,
+        revoking_event_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> bool:
+        """Soft-revoke one source revision, retaining its identity and audience proof."""
+        moment = self._now(now_ms)
+        with self._write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE event_source_authority
+                   SET revoked_at_ms = COALESCE(revoked_at_ms, ?),
+                       revoking_event_id = COALESCE(revoking_event_id, ?),
+                       updated_ms = ?
+                 WHERE event_id = ? AND revision = ? AND revoked_at_ms IS NULL
+                """,
+                (
+                    moment,
+                    str(revoking_event_id) if revoking_event_id else None,
+                    moment,
+                    str(event_id),
+                    int(revision),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def events_by_provider_identity(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        provider_message_id: str,
+        account: str | None = None,
+        kinds: Iterable[str] = ("message", "edit"),
+    ) -> tuple[CanonicalEvent, ...]:
+        """Resolve a provider message id within its channel/chat boundary."""
+        wanted = tuple(str(kind) for kind in kinds if str(kind))
+        if not channel or not chat_id or not provider_message_id or not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        conditions = [
+            "channel = ?",
+            "chat_id = ?",
+            "source_message_id = ?",
+            f"kind IN ({placeholders})",
+        ]
+        params: list[Any] = [str(channel), str(chat_id), str(provider_message_id), *wanted]
+        if account:
+            conditions.append("account = ?")
+            params.append(str(account))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM events WHERE " + " AND ".join(conditions) + " "
+                "ORDER BY revision, created_ms, event_id",
+                params,
+            ).fetchall()
+        return tuple(self._event_from_row(row) for row in rows)
+
+    def project_source_revocation(
+        self,
+        event: CanonicalEvent | Mapping[str, Any],
+        *,
+        now_ms: int | None = None,
+    ) -> tuple[str, ...]:
+        """Project an authorized edit/delete onto prior source revisions.
+
+        The provider event remains an append-only event.  Only the authority projection is
+        changed, and repeating the same projection is a no-op.
+        """
+        kind = str(getattr(event, "kind", "") or (event.get("kind") if isinstance(event, Mapping) else ""))
+        if kind not in ("edit", "delete"):
+            return ()
+        get = event.get if isinstance(event, Mapping) else lambda key, default=None: getattr(event, key, default)
+        channel = str(get("channel", "") or "")
+        chat_id = str(get("chat_id", "") or "")
+        provider_id = str(get("source_message_id", "") or get("target_message_id", "") or "")
+        account = str(get("account", "") or "")
+        event_id = str(get("event_id", "") or "")
+        revision = int(get("revision", 1) or 1)
+        if not channel or not chat_id or not provider_id or not event_id:
+            return ()
+        moment = self._now(now_ms)
+        with self._write() as conn:
+            conditions = [
+                "channel = ?",
+                "chat_id = ?",
+                "source_message_id = ?",
+                "kind IN ('message','edit')",
+            ]
+            params: list[Any] = [channel, chat_id, provider_id]
+            if account:
+                conditions.append("account = ?")
+                params.append(account)
+            rows = conn.execute(
+                "SELECT * FROM events WHERE " + " AND ".join(conditions) + " "
+                "ORDER BY revision, created_ms, event_id",
+                params,
+            ).fetchall()
+            # The provider's delete/edit identity is authoritative even when the Bridge
+            # payload has no senderId.  Account/channel/chat/provider-id scoping above is
+            # the correlation boundary; principal is process-local metadata, not identity.
+            candidates = [row for row in rows if str(row["event_id"]) != event_id]
+            if not candidates:
+                return ()
+            if kind == "edit":
+                prior = candidates[-1]
+                prior_authority = conn.execute(
+                    "SELECT audience_status, audience_members_json, audience_snapshot_id, "
+                    "policy_revision FROM event_source_authority "
+                    "WHERE event_id = ? AND revision = ?",
+                    (str(prior["event_id"]), int(prior["revision"])),
+                ).fetchone()
+                if prior_authority is None:
+                    prior_event = self._event_from_row(prior)
+                    self._ensure_event_source_authority_connection(conn, prior_event)
+                    prior_authority = conn.execute(
+                        "SELECT audience_status, audience_members_json, audience_snapshot_id, "
+                        "policy_revision FROM event_source_authority "
+                        "WHERE event_id = ? AND revision = ?",
+                        (str(prior["event_id"]), int(prior["revision"])),
+                    ).fetchone()
+                if prior_authority is None:
+                    return ()
+                conn.execute(
+                    """
+                    UPDATE event_source_authority
+                       SET audience_status = ?, audience_members_json = ?,
+                           audience_snapshot_id = ?, policy_revision = ?, updated_ms = ?
+                     WHERE event_id = ? AND revision = ?
+                    """,
+                    (
+                        str(prior_authority["audience_status"]),
+                        str(prior_authority["audience_members_json"]),
+                        prior_authority["audience_snapshot_id"],
+                        prior_authority["policy_revision"],
+                        moment,
+                        event_id,
+                        revision,
+                    ),
+                )
+            revoked: list[str] = []
+            for row in candidates:
+                authority = conn.execute(
+                    "SELECT revoked_at_ms FROM event_source_authority "
+                    "WHERE event_id = ? AND revision = ?",
+                    (str(row["event_id"]), int(row["revision"])),
+                ).fetchone()
+                if authority is None:
+                    event_row = self._event_from_row(row)
+                    self._ensure_event_source_authority_connection(conn, event_row)
+                    authority = conn.execute(
+                        "SELECT revoked_at_ms FROM event_source_authority "
+                        "WHERE event_id = ? AND revision = ?",
+                        (str(row["event_id"]), int(row["revision"])),
+                    ).fetchone()
+                if authority is not None and authority["revoked_at_ms"] is not None:
+                    continue
+                cursor = conn.execute(
+                    """
+                    UPDATE event_source_authority
+                       SET revoked_at_ms = ?, revoking_event_id = ?, updated_ms = ?
+                     WHERE event_id = ? AND revision = ? AND revoked_at_ms IS NULL
+                    """,
+                    (
+                        moment,
+                        event_id,
+                        moment,
+                        str(row["event_id"]),
+                        int(row["revision"]),
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    revoked.append(str(row["event_id"]))
+        return tuple(revoked)
 
     def unresolved_relations(self) -> tuple[RelationMeta, ...]:
         with self._lock:
@@ -2224,8 +2787,25 @@ class ProcessingStore:
         """Store what the transport reported. An unknown effect is a programming error."""
         if self.get_effect(effect_id) is None:
             raise ProcessingError(f"unknown effect: {effect_id}")
-        receipt_id = f"rc_{canonical_hash([effect_id, provider_message_id, client_message_id, now_ms])[:20]}"
+        if channel == "whatsapp":
+            receipt_identity = [
+                effect_id,
+                channel,
+                chat_id,
+                provider_message_id,
+                client_message_id,
+            ]
+        else:
+            receipt_identity = [effect_id, provider_message_id, client_message_id, now_ms]
+        receipt_id = f"rc_{canonical_hash(receipt_identity)[:20]}"
         with self._write() as conn:
+            effect_row = conn.execute(
+                "SELECT effect_id, trace_id, principal, payload_json FROM effects "
+                "WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if effect_row is None:
+                raise ProcessingError(f"unknown effect: {effect_id}")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO transport_receipts (receipt_id, effect_id, attempt_id,
@@ -2244,6 +2824,49 @@ class ProcessingStore:
                     detail,
                 ),
             )
+            if channel == "whatsapp":
+                event_key = f"whatsapp:{chat_id}:out:{effect_id}"
+                existing_event = conn.execute(
+                    "SELECT event_id FROM events WHERE event_key = ?", (event_key,)
+                ).fetchone()
+                if existing_event is None:
+                    effect_payload: dict[str, Any] = {}
+                    if effect_row["payload_json"] is not None:
+                        decoded = json.loads(str(effect_row["payload_json"]))
+                        if isinstance(decoded, Mapping):
+                            effect_payload = dict(decoded)
+                    body: dict[str, Any] = {
+                        "kind": "message",
+                        "origin": CANONICAL_WHATSAPP_ORIGIN,
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "direction": "out",
+                        "effect_id": effect_id,
+                        "attempt_id": attempt_id,
+                        "provider_message_id": provider_message_id,
+                        "client_message_id": client_message_id,
+                        "confirmed_ms": now_ms,
+                        "effect_payload": effect_payload,
+                    }
+                    for key in ("text", "caption", "media", "message_id", "reply_to"):
+                        if key in effect_payload:
+                            body[key] = effect_payload[key]
+                    event = CanonicalEvent(
+                        event_id=f"out_{canonical_hash(event_key)[:32]}",
+                        event_key=event_key,
+                        trace_id=str(effect_row["trace_id"] or f"effect:{effect_id}"),
+                        kind="message",
+                        origin=CANONICAL_WHATSAPP_ORIGIN,
+                        principal=str(effect_row["principal"] or ""),
+                        channel=channel,
+                        chat_id=chat_id,
+                        direction="out",
+                        source_message_id=provider_message_id,
+                        payload=body,
+                        created_ms=now_ms,
+                        payload_hash=_event_payload_hash(body),
+                    )
+                    self._append_event_connection(conn, event)
         return receipt_id
 
     def transport_receipts(self, effect_id: str) -> tuple[TransportReceipt, ...]:
@@ -2889,8 +3512,9 @@ class ProcessingStore:
                 """
                 UPDATE events SET payload_json = NULL, payload_purged_ms = ?
                  WHERE payload_json IS NOT NULL AND created_ms <= ?
+                   AND NOT (channel = 'whatsapp' AND origin = ?)
                 """,
-                (now_ms, payload_cutoff),
+                (now_ms, payload_cutoff, CANONICAL_WHATSAPP_ORIGIN),
             )
             event_payloads_purged = int(cursor.rowcount or 0)
 
@@ -2910,6 +3534,7 @@ class ProcessingStore:
                 """
                 DELETE FROM events
                  WHERE created_ms <= :metadata
+                   AND NOT (channel = 'whatsapp' AND origin = :canonical_origin)
                    AND NOT (
                      created_ms > :unresolved
                      AND event_id IN (
@@ -2917,7 +3542,11 @@ class ProcessingStore:
                      )
                    )
                 """,
-                {"metadata": metadata_cutoff, "unresolved": unresolved_cutoff},
+                {
+                    "metadata": metadata_cutoff,
+                    "unresolved": unresolved_cutoff,
+                    "canonical_origin": CANONICAL_WHATSAPP_ORIGIN,
+                },
             )
             events_deleted = int(cursor.rowcount or 0)
             relations_after = int(
@@ -2979,6 +3608,12 @@ class ProcessingStore:
             principal=str(row["principal"]),
             channel=str(row["channel"]),
             chat_id=str(row["chat_id"]),
+            account=str(row["account"] or ""),
+            direction=str(row["direction"] or "in"),
+            revision=int(row["revision"] or 1),
+            audience_ref=(
+                str(row["audience_ref"]) if row["audience_ref"] is not None else None
+            ),
             occurred_ms=int(row["occurred_ms"]) if row["occurred_ms"] is not None else None,
             created_ms=int(row["created_ms"]),
             source_message_id=(
@@ -2995,6 +3630,39 @@ class ProcessingStore:
                 int(row["payload_purged_ms"]) if row["payload_purged_ms"] is not None else None
             ),
         )
+
+
+def _source_authority_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(row["audience_members_json"] or "[]"))
+    except (TypeError, ValueError):
+        decoded = []
+    members = tuple(sorted({str(item) for item in decoded if str(item)})) if isinstance(decoded, list) else ()
+    policy = row["policy_revision"]
+    return {
+        "event_id": str(row["event_id"]),
+        "revision": int(row["revision"]),
+        "author_principal": str(row["author_principal"] or ""),
+        "source_channel": str(row["source_channel"] or ""),
+        "source_chat_id": str(row["source_chat_id"] or ""),
+        "channel": str(row["source_channel"] or ""),
+        "chat_id": str(row["source_chat_id"] or ""),
+        "occurred_at_ms": int(row["occurred_at_ms"] or 0),
+        "audience_status": str(row["audience_status"] or "unknown"),
+        "audience_members": members,
+        "audience_snapshot_id": (
+            str(row["audience_snapshot_id"])
+            if row["audience_snapshot_id"] is not None
+            else None
+        ),
+        "policy_revision": str(policy) if policy is not None else None,
+        "revoked_at_ms": int(row["revoked_at_ms"]) if row["revoked_at_ms"] is not None else None,
+        "revoking_event_id": (
+            str(row["revoking_event_id"]) if row["revoking_event_id"] is not None else None
+        ),
+        "created_ms": int(row["created_ms"]),
+        "updated_ms": int(row["updated_ms"]),
+    }
 
 
 def _probe_from_row(row: sqlite3.Row) -> ProbeRecord:
@@ -3120,6 +3788,12 @@ def _event_meta_from_row(
         principal=str(row["principal"]),
         channel=str(row["channel"]),
         chat_id=str(row["chat_id"]),
+        account=str(row["account"] or ""),
+        direction=str(row["direction"] or "in"),
+        revision=int(row["revision"] or 1),
+        audience_ref=(
+            str(row["audience_ref"]) if row["audience_ref"] is not None else None
+        ),
         occurred_ms=int(row["occurred_ms"]) if row["occurred_ms"] is not None else None,
         created_ms=int(row["created_ms"]) if row["created_ms"] is not None else None,
         payload_hash=str(row["payload_hash"]),

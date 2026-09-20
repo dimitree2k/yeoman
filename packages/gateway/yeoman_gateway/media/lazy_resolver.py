@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from yeoman_gateway.implicit_addressing import looks_like_question_or_request
 from yeoman_gateway.media.document_cache import DocumentCache, MediaItem
+
+_PDF_REQUEST_RE = re.compile(
+    r"(?i)\b(?:analy[sz](?:e|ieren)?|check|extract|inspect|read|review|"
+    r"summari[sz](?:e|ing|ieren)?|zusammenfass(?:en|ung)?)\b"
+)
 
 
 class LazyMediaProcessor(Protocol):
@@ -44,7 +50,10 @@ class LazyMediaResolver:
         if item is None:
             return None
         mode = self._mode_for_item(item)
-        extraction = self.cache.get_extraction(item.id, mode)
+        if mode == "pdf_text" and not self._can_inspect_pdf(item, content, metadata):
+            return None
+        cache_mode = "pdf_text:page:1" if mode == "pdf_text" else mode
+        extraction = self.cache.get_extraction(item.id, cache_mode)
         if extraction is None:
             return None
         return self._block_for_item(item, mode=mode, content=extraction.content)
@@ -64,7 +73,13 @@ class LazyMediaResolver:
             return None
 
         mode = self._mode_for_item(item)
-        cached = self.cache.get_extraction(item.id, mode)
+        if mode == "pdf_text":
+            if not self._can_inspect_pdf(item, content, metadata):
+                return None
+            if self.processor is not None:
+                return await self.processor.extract_for_question(item, content)
+        cache_mode = "pdf_text:page:1" if mode == "pdf_text" else mode
+        cached = self.cache.get_extraction(item.id, cache_mode)
         if cached is not None:
             return self._block_for_item(item, mode=mode, content=cached.content)
 
@@ -105,6 +120,19 @@ class LazyMediaResolver:
         if len(items) == 1:
             return items[0]
         return None
+
+    @staticmethod
+    def _can_inspect_pdf(
+        item: MediaItem,
+        content: str,
+        metadata: dict[str, Any] | None,
+    ) -> bool:
+        if not (looks_like_question_or_request(content) or _PDF_REQUEST_RE.search(content)):
+            return False
+        if not metadata:
+            return False
+        reply_to = str(metadata.get("reply_to_message_id") or metadata.get("reply_to") or "").strip()
+        return reply_to == item.message_id
 
     @staticmethod
     def _has_direct_media_reference(

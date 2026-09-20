@@ -6,6 +6,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 import { defaultMediaDir } from './media_paths.js';
+import { defaultBridgeOutboxDir } from './outbox.js';
 import { BridgeServer } from './server.js';
 
 if (!globalThis.crypto) {
@@ -51,6 +52,7 @@ const BRIDGE_TOKEN = (
 ).trim();
 const MANIFEST_PATH = process.env.BRIDGE_MANIFEST_PATH || join(process.cwd(), 'bridge.manifest.json');
 const READ_RECEIPTS = parseBoolEnv(process.env.WHATSAPP_READ_RECEIPTS, true);
+const BRIDGE_OUTBOX_DIR = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir();
 
 function loadManifestIdentity(path: string): { bridgeVersion: string; buildId: string } {
   try {
@@ -91,6 +93,8 @@ const server = new BridgeServer(
   identity.bridgeVersion,
   identity.buildId,
   READ_RECEIPTS,
+  'default',
+  BRIDGE_OUTBOX_DIR,
 );
 
 process.on('SIGINT', async () => {

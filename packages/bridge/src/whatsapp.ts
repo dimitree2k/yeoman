@@ -36,7 +36,10 @@ export interface InboundMedia {
   mimeType?: string;
   fileName?: string;
   path?: string;
+  ref?: string;
   bytes?: number;
+  sha256?: string;
+  hash?: string;
 }
 
 export interface InboundMessageV2 {
@@ -137,9 +140,12 @@ export interface WhatsAppClientOptions {
   acceptFromMe?: boolean;
   readReceipts?: boolean;
   accountId?: string;
-  onMessage: (msg: InboundMessageV2) => void;
+  onMessage: (msg: InboundMessageV2) => void | Promise<void>;
   /** Journal evidence from the provider: edit, delete, reaction or receipt. */
-  onSignal?: (kind: 'edit' | 'delete' | 'reaction' | 'receipt', payload: Record<string, unknown>) => void;
+  onSignal?: (
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt',
+    payload: Record<string, unknown>,
+  ) => void | Promise<void>;
   onQR: (qr: string) => void;
   onStatus: (status: string, detail?: Record<string, unknown>) => void;
   onError: (error: string) => void;
@@ -288,6 +294,66 @@ function limitText(value: string, max = 10_000): string {
   const text = String(value || '');
   if (text.length <= max) return text;
   return text.slice(0, max);
+}
+
+function providerMediaBytes(media: any): number | undefined {
+  const raw = media?.fileLength ?? media?.fileSize ?? media?.bytes;
+  const bytes = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : undefined;
+}
+
+function mediaSha256(buffer: Buffer): string {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+function normalizeProviderSha256(value: any): string | undefined {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return SHA256_HEX_RE.test(normalized) ? normalized.toLowerCase() : undefined;
+  }
+  if (Buffer.isBuffer(value) && value.length === 32) return value.toString('hex');
+  if (value instanceof Uint8Array && value.length === 32) {
+    return Buffer.from(value).toString('hex');
+  }
+  return undefined;
+}
+
+function providerMediaHash(media: any): string | undefined {
+  for (const candidate of [media?.sha256, media?.hash, media?.fileSha256]) {
+    const normalized = normalizeProviderSha256(candidate);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function providerMediaMetadata(media: any): Pick<InboundMedia, 'bytes' | 'sha256'> {
+  const bytes = providerMediaBytes(media);
+  const sha256 = providerMediaHash(media);
+  return {
+    ...(bytes === undefined ? {} : { bytes }),
+    ...(sha256 === undefined ? {} : { sha256 }),
+  };
+}
+
+function sendResult(
+  to: string,
+  sent: any,
+  clientMessageId?: string,
+): {
+  to: string;
+  messageId?: string;
+  providerMessageId?: string;
+  clientMessageId?: string;
+} {
+  const providerMessageId = String(sent?.key?.id || '').trim() || undefined;
+  return {
+    to,
+    messageId: providerMessageId || clientMessageId || undefined,
+    providerMessageId,
+    clientMessageId: clientMessageId || undefined,
+  };
 }
 
 function mediaMimeFromFileName(pathOrName: string): string | undefined {
@@ -463,6 +529,9 @@ export class WhatsAppClient {
   private sock: any = null;
   private running = false;
   private loopTask: Promise<void> | null = null;
+  private acceptingProviderEvents = false;
+  private readonly providerEventHandlers = new Set<Promise<void>>();
+  private readonly providerDedupe = new Map<string, { task: Promise<void>; failed: boolean }>();
 
   private connected = false;
   private reconnectAttempts = 0;
@@ -556,6 +625,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -602,6 +672,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -648,6 +719,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -694,6 +766,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -734,14 +807,86 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     await this.ensureMediaDirs();
+    this.acceptingProviderEvents = true;
     this.running = true;
     this.loopTask = this.runLoop();
+  }
+
+  private admitProviderEvent(handler: () => void | Promise<void>): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
+    let tracked: Promise<void>;
+    tracked = Promise.resolve()
+      .then(handler)
+      .catch((error: unknown) => {
+        this.lastError = safeErrorMessage(error);
+        this.options.onError(`provider_event_failed: ${this.lastError}`);
+      })
+      .finally(() => this.providerEventHandlers.delete(tracked));
+    this.providerEventHandlers.add(tracked);
+    return tracked;
+  }
+
+  private async drainProviderEvents(): Promise<void> {
+    while (this.providerEventHandlers.size > 0) {
+      await Promise.allSettled(Array.from(this.providerEventHandlers));
+    }
+  }
+
+  private admitDedupeEvent(
+    key: string,
+    handler: () => void | Promise<void>,
+    onDuplicate?: () => void,
+  ): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
+    const previous = this.providerDedupe.get(key);
+    const entry = { task: Promise.resolve(), failed: false };
+    const task = this.admitProviderEvent(async () => {
+      if (previous) {
+        await previous.task;
+        if (!this.acceptingProviderEvents) return;
+      }
+      if (this.hasSeenInbound(key)) {
+        onDuplicate?.();
+        return;
+      }
+      try {
+        await handler();
+        this.markSeenInbound(key);
+      } catch (error) {
+        entry.failed = true;
+        this.recentInbound.delete(key);
+        throw error;
+      }
+    });
+    if (!task) return undefined;
+    entry.task = task;
+    this.providerDedupe.set(key, entry);
+    const clearEntry = () => {
+      if (this.providerDedupe.get(key) === entry) this.providerDedupe.delete(key);
+    };
+    void task.then(clearEntry, clearEntry);
+    return task;
+  }
+
+  stopIntake(): void {
+    this.acceptingProviderEvents = false;
+    this.running = false;
+    this.connected = false;
+    this.resolveConnected(false);
+    if (this.sock) {
+      try {
+        this.sock.end(undefined);
+      } catch {
+        // Ignore end failures.
+      }
+    }
   }
 
   private async runLoop(): Promise<void> {
@@ -905,13 +1050,46 @@ export class WhatsAppClient {
     }
   }
 
-  private seenInbound(key: string): boolean {
+  private hasSeenInbound(key: string): boolean {
     this.cleanupRecentInbound();
     const now = nowMs();
     const existing = this.recentInbound.get(key);
     if (existing && existing > now) return true;
-    this.recentInbound.set(key, now + INBOUND_DEDUPE_TTL_MS);
     return false;
+  }
+
+  private markSeenInbound(key: string): void {
+    this.cleanupRecentInbound();
+    this.recentInbound.set(key, nowMs() + INBOUND_DEDUPE_TTL_MS);
+  }
+
+  private extractEditPayload(update: any): Record<string, unknown> | null {
+    const chatJid = normalizeJid(String(update?.key?.remoteJid || ''));
+    const messageId = String(update?.key?.id || '').trim();
+    if (!chatJid || !messageId) return null;
+
+    const payload: Record<string, unknown> = { chatJid, messageId };
+    const participantJid = normalizeJid(String(update?.key?.participant || ''));
+    if (participantJid) payload.participantJid = participantJid;
+
+    const timestamp = Number(update?.update?.messageTimestamp ?? update?.messageTimestamp ?? 0);
+    if (Number.isFinite(timestamp) && timestamp > 0) payload.timestamp = timestamp;
+
+    const edited = update?.update?.message?.editedMessage?.message;
+    if (edited) {
+      const replacement = this.extractMessageTextAndMedia({ message: edited });
+      if (replacement.text !== null) payload.text = replacement.text;
+      if (replacement.media) payload.media = replacement.media;
+    }
+
+    const revisionRaw =
+      edited?.revision ??
+      edited?.editVersion ??
+      update?.update?.revision ??
+      update?.revision;
+    const revision = Number(revisionRaw);
+    if (Number.isSafeInteger(revision) && revision >= 0) payload.revision = revision;
+    return payload;
   }
 
   private cleanupRecentOutboundSelf(): void {
@@ -937,17 +1115,20 @@ export class WhatsAppClient {
     kind: 'edit' | 'delete' | 'reaction' | 'receipt',
     identity: string,
     payload: Record<string, unknown>,
-  ): void {
+  ): Promise<void> | undefined {
     const emit = this.options.onSignal;
-    if (!emit) return;
+    if (!emit) return undefined;
     const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
-    if (this.seenInbound(dedupeKey)) return;
-    try {
-      emit(kind, payload);
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      this.options.onError(`signal_emit_failed: ${this.lastError}`);
-    }
+    return this.admitDedupeEvent(dedupeKey, async () => {
+      try {
+        await emit(kind, payload);
+      } catch (err) {
+        this.recentInbound.delete(dedupeKey);
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.options.onError(`signal_emit_failed: ${this.lastError}`);
+        throw err;
+      }
+    });
   }
 
   /**
@@ -1095,22 +1276,22 @@ export class WhatsAppClient {
     if (!message) return null;
 
     if (typeof message.conversation === 'string' && message.conversation.trim()) {
-      return message.conversation.trim();
+      return message.conversation;
     }
     if (typeof message.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text.trim()) {
-      return message.extendedTextMessage.text.trim();
+      return message.extendedTextMessage.text;
     }
     if (message.imageMessage) {
-      const caption = String(message.imageMessage.caption || '').trim();
-      return caption ? `[Image] ${caption}` : '[Image]';
+      const caption = String(message.imageMessage.caption || '');
+      return caption || '[Image]';
     }
     if (message.videoMessage) {
-      const caption = String(message.videoMessage.caption || '').trim();
-      return caption ? `[Video] ${caption}` : '[Video]';
+      const caption = String(message.videoMessage.caption || '');
+      return caption || '[Video]';
     }
     if (message.documentMessage) {
-      const caption = String(message.documentMessage.caption || '').trim();
-      return caption ? `[Document] ${caption}` : '[Document]';
+      const caption = String(message.documentMessage.caption || '');
+      return caption || '[Document]';
     }
     if (message.audioMessage) return '[Voice Message]';
     if (message.stickerMessage) return '[Sticker]';
@@ -1130,7 +1311,7 @@ export class WhatsAppClient {
 
     const replyToMessageId = replyToMessageIdRaw || undefined;
     const replyToParticipantJid = replyToParticipantJidRaw || undefined;
-    const replyToText = replyToTextRaw ? limitText(replyToTextRaw, 1_000) : undefined;
+    const replyToText = replyToTextRaw || undefined;
 
     let replyToMedia: InboundMedia | undefined;
     if (replyToMessageId && context.quotedMessage) {
@@ -1240,7 +1421,13 @@ export class WhatsAppClient {
       return undefined;
     }
 
-    return { kind: 'image', mimeType, path: filePath, bytes: buffer.length };
+    return {
+      kind: 'image',
+      mimeType,
+      path: filePath,
+      bytes: buffer.length,
+      sha256: mediaSha256(buffer),
+    };
   }
 
   private extractMentionMeta(msg: any, text: string): {
@@ -1288,31 +1475,34 @@ export class WhatsAppClient {
     if (!message) return { text: null };
 
     if (typeof message.conversation === 'string' && message.conversation.trim()) {
-      return { text: message.conversation.trim() };
+      return { text: message.conversation };
     }
 
     if (typeof message.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text.trim()) {
-      return { text: message.extendedTextMessage.text.trim() };
+      return { text: message.extendedTextMessage.text };
     }
 
     if (message.imageMessage) {
-      const caption = String(message.imageMessage.caption || '').trim();
+      const caption = String(message.imageMessage.caption || '');
       return {
-        text: caption ? `[Image] ${caption}` : '[Image]',
+        text: caption || '[Image]',
         media: {
           kind: 'image',
           mimeType: message.imageMessage.mimetype,
+          ...providerMediaMetadata(message.imageMessage),
         },
       };
     }
 
     if (message.videoMessage) {
-      const caption = String(message.videoMessage.caption || '').trim();
+      const caption = String(message.videoMessage.caption || '');
       return {
-        text: caption ? `[Video] ${caption}` : '[Video]',
+        text: caption || '[Video]',
         media: {
           kind: 'video',
           mimeType: message.videoMessage.mimetype,
+          fileName: message.videoMessage.fileName,
+          ...providerMediaMetadata(message.videoMessage),
         },
       };
     }
@@ -1323,18 +1513,21 @@ export class WhatsAppClient {
         media: {
           kind: 'audio',
           mimeType: message.audioMessage.mimetype,
+          fileName: message.audioMessage.fileName,
+          ...providerMediaMetadata(message.audioMessage),
         },
       };
     }
 
     if (message.documentMessage) {
-      const caption = String(message.documentMessage.caption || '').trim();
+      const caption = String(message.documentMessage.caption || '');
       return {
-        text: caption ? `[Document] ${caption}` : '[Document]',
+        text: caption || '[Document]',
         media: {
           kind: 'document',
           mimeType: message.documentMessage.mimetype,
           fileName: message.documentMessage.fileName,
+          ...providerMediaMetadata(message.documentMessage),
         },
       };
     }
@@ -1345,6 +1538,7 @@ export class WhatsAppClient {
         media: {
           kind: 'sticker',
           mimeType: message.stickerMessage.mimetype,
+          ...providerMediaMetadata(message.stickerMessage),
         },
       };
     }
@@ -1362,6 +1556,137 @@ export class WhatsAppClient {
   private resolveConnected(connected: boolean): void {
     for (const waiter of this.connectWaiters) waiter(connected);
     this.connectWaiters.clear();
+  }
+
+  private handleInboundMessage(msg: any): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
+    const remoteJidRaw = String(msg?.key?.remoteJid || '');
+    if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) return;
+
+    const chatJid = normalizeJid(remoteJidRaw);
+    if (!chatJid) return;
+
+    const messageId = String(msg?.key?.id || '').trim();
+    if (!messageId) return;
+    const fromMe = Boolean(msg?.key?.fromMe);
+    const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
+    if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) return;
+
+    this.storeInboundForQuote(chatJid, messageId, msg);
+
+    const extracted = this.extractMessageTextAndMedia(msg);
+    const providerContent = JSON.stringify({
+      text: extracted.text,
+      media: extracted.media,
+      timestamp: msg?.messageTimestamp ?? null,
+      participant: msg?.key?.participant ?? msg?.participant ?? null,
+      fromMe: Boolean(msg?.key?.fromMe),
+    });
+    const dedupeKey = createHash('sha1')
+      .update(`${chatJid}:${messageId}:${providerContent}`)
+      .digest('hex');
+    return this.admitDedupeEvent(
+      dedupeKey,
+      () => this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
+      () => {
+        this.droppedInboundDuplicates += 1;
+      },
+    );
+  }
+
+  private async processInboundMessage(
+    msg: any,
+    remoteJidRaw: string,
+    chatJid: string,
+    messageId: string,
+  ): Promise<void> {
+    const isGroup = chatJid.endsWith('@g.us');
+    const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
+    const senderId = jidUserToken(participantJid || chatJid);
+
+    const extracted = this.extractMessageTextAndMedia(msg);
+    if (!extracted.text) return;
+    let inboundMedia = extracted.media;
+    if (inboundMedia?.kind === 'image') {
+      try {
+        inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'audio') {
+      try {
+        inboundMedia = await this.persistInboundAudio(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'video') {
+      try {
+        inboundMedia = await this.persistInboundVideo(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'sticker') {
+      try {
+        inboundMedia = await this.persistInboundSticker(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    } else if (inboundMedia?.kind === 'document') {
+      try {
+        inboundMedia = await this.persistInboundDocument(msg, messageId, inboundMedia);
+      } catch (err) {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
+      }
+    }
+
+    const mention = this.extractMentionMeta(msg, extracted.text);
+    const reply = await this.buildReplyMeta(msg, chatJid);
+    const tsRaw = msg?.messageTimestamp;
+    const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
+
+    if (this.options.readReceipts !== false && this.sock) {
+      void this.sock.readMessages([msg.key]).catch((err: unknown) => {
+        this.lastError = safeErrorMessage(err);
+        this.options.onError(`read_receipt_failed: ${this.lastError}`);
+      });
+    }
+
+    this.lastMessageAt = nowMs();
+
+    await this.options.onMessage({
+      messageId,
+      chatJid,
+      participantJid,
+      senderId,
+      senderPhoneJid: this.phoneJidForParticipant(participantJid),
+      lidConflict: this.isLidConflict(participantJid),
+      senderName: (msg.pushName || '').trim() || undefined,
+      isGroup,
+      text: extracted.text,
+      timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
+      mentionedJids: mention.mentionedJids,
+      mentionedBot: mention.mentionedBot,
+      replyToBot: mention.replyToBot,
+      replyToMessageId: reply.replyToMessageId,
+      replyToParticipantJid: reply.replyToParticipantJid,
+      replyToText: reply.replyToText,
+      replyToMedia: reply.replyToMedia,
+      media: inboundMedia,
+    });
+  }
+
+  private registerInboundMessageHandler(): void {
+    this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
+      if (type !== 'notify' && type !== 'append') return;
+      for (const msg of messages ?? []) {
+        this.handleInboundMessage(msg);
+      }
+    });
   }
 
   private async connectOnce(): Promise<void> {
@@ -1467,11 +1792,11 @@ export class WhatsAppClient {
           }
           const edited = update?.update?.message?.editedMessage?.message;
           if (edited) {
-            this.emitSignal('edit', `${messageId}:${Number(update?.update?.messageTimestamp ?? 0)}`, {
-              chatJid,
-              messageId,
-              timestamp: Number(update?.update?.messageTimestamp ?? 0) || undefined,
-            });
+            const payload = this.extractEditPayload(update);
+            if (payload) {
+              const identity = `${messageId}:${String(payload.revision ?? payload.timestamp ?? 0)}`;
+              this.emitSignal('edit', identity, payload);
+            }
           }
         } catch (err) {
           this.lastError = err instanceof Error ? err.message : String(err);
@@ -1548,110 +1873,7 @@ export class WhatsAppClient {
       }
     });
 
-    this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
-      if (type !== 'notify' && type !== 'append') return;
-      for (const msg of messages) {
-        if (!this.running) return;
-        const remoteJidRaw = String(msg?.key?.remoteJid || '');
-        if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) continue;
-
-        const chatJid = normalizeJid(remoteJidRaw);
-        if (!chatJid) continue;
-
-        const messageId = String(msg?.key?.id || '').trim();
-        if (!messageId) continue;
-        const fromMe = Boolean(msg?.key?.fromMe);
-        const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
-        if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) continue;
-
-        this.storeInboundForQuote(chatJid, messageId, msg);
-
-        const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
-        if (this.seenInbound(dedupeKey)) {
-          this.droppedInboundDuplicates += 1;
-          continue;
-        }
-
-        const isGroup = chatJid.endsWith('@g.us');
-        const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
-        const senderId = jidUserToken(participantJid || chatJid);
-
-        const extracted = this.extractMessageTextAndMedia(msg);
-        if (!extracted.text) continue;
-        let inboundMedia = extracted.media;
-        if (inboundMedia?.kind === 'image') {
-          try {
-            inboundMedia = await this.persistInboundImage(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'audio') {
-          try {
-            inboundMedia = await this.persistInboundAudio(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'video') {
-          try {
-            inboundMedia = await this.persistInboundVideo(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'sticker') {
-          try {
-            inboundMedia = await this.persistInboundSticker(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        } else if (inboundMedia?.kind === 'document') {
-          try {
-            inboundMedia = await this.persistInboundDocument(msg, messageId, inboundMedia);
-          } catch (err) {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`inbound_media_save_failed: ${this.lastError}`);
-          }
-        }
-
-        const mention = this.extractMentionMeta(msg, extracted.text);
-        const reply = await this.buildReplyMeta(msg, chatJid);
-        const tsRaw = msg?.messageTimestamp;
-        const timestamp = typeof tsRaw === 'number' ? tsRaw : Number(tsRaw || 0);
-
-        if (this.options.readReceipts !== false) {
-          void this.sock.readMessages([msg.key]).catch((err: unknown) => {
-            this.lastError = safeErrorMessage(err);
-            this.options.onError(`read_receipt_failed: ${this.lastError}`);
-          });
-        }
-
-        this.lastMessageAt = nowMs();
-
-        this.options.onMessage({
-          messageId,
-          chatJid,
-          participantJid,
-          senderId,
-          senderPhoneJid: this.phoneJidForParticipant(participantJid),
-          lidConflict: this.isLidConflict(participantJid),
-          senderName: (msg.pushName || '').trim() || undefined,
-          isGroup,
-          text: limitText(extracted.text, 8_000),
-          timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
-          mentionedJids: mention.mentionedJids,
-          mentionedBot: mention.mentionedBot,
-          replyToBot: mention.replyToBot,
-          replyToMessageId: reply.replyToMessageId,
-          replyToParticipantJid: reply.replyToParticipantJid,
-          replyToText: reply.replyToText,
-          replyToMedia: reply.replyToMedia,
-          media: inboundMedia,
-        });
-      }
-    });
+    this.registerInboundMessageHandler();
 
     await closed;
   }
@@ -1662,7 +1884,12 @@ export class WhatsAppClient {
     replyToMessageId?: string,
     mentions?: string[],
     clientMessageId?: string,
-  ): Promise<{ to: string; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1681,13 +1908,19 @@ export class WhatsAppClient {
       ...(clientMessageId ? { messageId: clientMessageId } : {}),
     });
     this.rememberOutboundSelfMessage(to, sent);
-    const messageId = String(sent?.key?.id || clientMessageId || '').trim() || undefined;
-    return { to, messageId };
+    return sendResult(to, sent, clientMessageId);
   }
 
   async sendMedia(
     input: SendMediaInput,
-  ): Promise<{ to: string; mimeType: string; bytes: number; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    mimeType: string;
+    bytes: number;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1735,18 +1968,23 @@ export class WhatsAppClient {
       this.rememberOutboundSelfMessage(input.to, sent);
     }
 
-    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    const ids = sendResult(input.to, sent, input.clientMessageId);
     return {
-      to: input.to,
+      ...ids,
       mimeType: media.mimeType,
       bytes: media.buffer.length,
-      messageId,
     };
   }
 
   async sendPoll(
     input: SendPollInput,
-  ): Promise<{ to: string; options: number; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    options: number;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1769,13 +2007,18 @@ export class WhatsAppClient {
     );
     this.rememberOutboundSelfMessage(input.to, sent);
 
-    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
-    return { to: input.to, options: options.length, messageId };
+    return { ...sendResult(input.to, sent, input.clientMessageId), options: options.length };
   }
 
   async react(
     input: ReactInput,
-  ): Promise<{ chatJid: string; messageId: string; outboundMessageId?: string }> {
+  ): Promise<{
+    chatJid: string;
+    messageId: string;
+    outboundMessageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1796,12 +2039,13 @@ export class WhatsAppClient {
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
     );
 
-    const outboundMessageId =
-      String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    const ids = sendResult(input.chatJid, sent, input.clientMessageId);
     return {
       chatJid: input.chatJid,
       messageId: input.messageId,
-      outboundMessageId,
+      outboundMessageId: ids.providerMessageId || ids.clientMessageId,
+      providerMessageId: ids.providerMessageId,
+      clientMessageId: ids.clientMessageId,
     };
   }
 
@@ -2026,21 +2270,14 @@ export class WhatsAppClient {
   }
 
   async stop(): Promise<void> {
-    this.running = false;
-    this.resolveConnected(false);
-
-    if (this.sock) {
-      try {
-        this.sock.end(undefined);
-      } catch {
-        // Ignore end failures.
-      }
-      this.sock = null;
-    }
+    this.stopIntake();
 
     if (this.loopTask) {
       await Promise.race([this.loopTask, sleep(1_000)]);
       this.loopTask = null;
     }
+
+    await this.drainProviderEvents();
+    this.sock = null;
   }
 }

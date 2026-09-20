@@ -17,18 +17,19 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
+from yeoman_shared.whatsapp_protocol import MEDIA_METADATA_FIELDS
 
 from yeoman_gateway.processing.models import (
-    DELIVERED_STATUSES_TUPLE as _DELIVERED,
-)
-from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     TransportReceipt,
     canonical_hash,
+    normalize_revision,
 )
+from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE as _DELIVERED
 
 CHANNEL = "whatsapp"
 
@@ -65,7 +66,12 @@ class JournalSignal:
     channel: str
     chat_id: str
     principal: str
+    account: str = ""
+    direction: str = "in"
+    revision: int = 1
+    audience_ref: str | None = None
     occurred_ms: int | None = None
+    observed_at_ms: int | None = None
     source_message_id: str | None = None
     target_message_id: str | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
@@ -74,13 +80,20 @@ class JournalSignal:
         """Mapping the journal stores; references travel so relations can resolve later."""
         body: dict[str, Any] = {
             "kind": self.kind,
-            "origin": "whatsapp_bridge",
+            "origin": CANONICAL_WHATSAPP_ORIGIN,
             "principal": self.principal,
             "channel": self.channel,
             "chat_id": self.chat_id,
+            "account": self.account,
+            "direction": self.direction,
+            "revision": self.revision,
+            "audience_ref": self.audience_ref,
             "occurred_ms": self.occurred_ms,
+            "source_message_id": self.source_message_id,
             "target_message_id": self.target_message_id,
         }
+        if self.observed_at_ms is not None:
+            body["observed_at_ms"] = self.observed_at_ms
         body.update(dict(self.payload))
         return body
 
@@ -96,6 +109,18 @@ def _first(payload: Mapping[str, Any], *keys: str) -> str | None:
         if value is None:
             continue
         text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _raw_text(payload: Mapping[str, Any], *keys: str) -> str | None:
+    """Read text without normalizing bytes that belong to the canonical payload."""
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        text = str(value)
         if text:
             return text
     return None
@@ -129,13 +154,64 @@ def _to_ms(value: Any) -> int | None:
     return int(number * 1000) if number < 1e11 else int(number)
 
 
+def _media_metadata(value: Any) -> dict[str, Any] | None:
+    """Keep only bounded media metadata; never copy provider bytes into the journal."""
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, Any] = {}
+    # Iterate in wire order so replayed JSON has deterministic key ordering even though
+    # the shared allowlist is a frozenset for TypeScript/Python parity.
+    for key in ("kind", "mimeType", "fileName", "bytes", "path", "ref", "sha256", "hash"):
+        if key not in MEDIA_METADATA_FIELDS:
+            continue
+        item = value.get(key)
+        if key == "bytes":
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                result[key] = item
+            continue
+        if key in {"sha256", "hash"}:
+            continue
+        if isinstance(item, str) and item.strip():
+            result[key] = item.strip()
+    for key in ("sha256", "hash"):
+        candidate = value.get(key)
+        if not isinstance(candidate, str):
+            continue
+        normalized_hash = candidate.strip()
+        if len(normalized_hash) == 64 and all(
+            char in "0123456789abcdefABCDEF" for char in normalized_hash
+        ):
+            result["sha256"] = normalized_hash.lower()
+            break
+    return result or None
+
+
+def _revision(value: Any, *, strict: bool = False) -> int | None:
+    try:
+        return normalize_revision(value, default=None)
+    except ValueError:
+        if strict:
+            raise
+        return None
+
+
 class WhatsAppSignalMapper:
     """Maps bridge payloads of one kind into canonical journal signals."""
 
     def __init__(self, *, channel: str = CHANNEL) -> None:
         self._channel = channel
 
-    def map(self, payload: Mapping[str, Any], *, kind: str) -> JournalSignal | None:
+    def map(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        kind: str,
+        event_id: str | None = None,
+        event_key: str | None = None,
+        account: str | None = None,
+        observed_at_ms: int | None = None,
+        strict: bool = False,
+    ) -> JournalSignal | None:
         if kind not in SIGNAL_KINDS:
             raise ValueError(f"unknown signal kind: {kind}")
         if not isinstance(payload, Mapping):
@@ -146,29 +222,56 @@ class WhatsAppSignalMapper:
             return None
 
         if kind == "message":
-            return self._message(payload, chat_id)
-        if kind == "edit":
-            return self._edit(payload, chat_id)
-        if kind == "delete":
-            return self._delete(payload, chat_id)
-        if kind == "reaction":
-            return self._reaction(payload, chat_id)
-        return self._receipt(payload, chat_id)
+            signal = self._message(payload, chat_id, strict=strict)
+        elif kind == "edit":
+            signal = self._edit(payload, chat_id, strict=strict)
+        elif kind == "delete":
+            signal = self._delete(payload, chat_id)
+        elif kind == "reaction":
+            signal = self._reaction(payload, chat_id)
+        else:
+            signal = self._receipt(payload, chat_id)
+        if signal is None:
+            return None
+        signal = replace(
+            signal,
+            event_id=event_id or signal.event_id,
+            event_key=event_key or signal.event_key,
+            account=account if account is not None else signal.account,
+            observed_at_ms=observed_at_ms,
+        )
+        return signal
 
     # -- kinds -------------------------------------------------------------------------
 
-    def _message(self, payload: Mapping[str, Any], chat_id: str) -> JournalSignal | None:
+    def _message(
+        self, payload: Mapping[str, Any], chat_id: str, *, strict: bool = False
+    ) -> JournalSignal | None:
         message_id = _first(payload, "messageId", "message_id", "id")
         if not message_id:
             return None
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
         event_key = f"{self._channel}:{chat_id}:message:{message_id}"
         body = {
-            "text": _first(payload, "text", "content") or "",
+            "text": _raw_text(payload, "text", "content") or "",
             "is_group": bool(payload.get("isGroup")) or chat_id.endswith("@g.us"),
             "mentioned_bot": bool(payload.get("mentionedBot")),
             "reply_to_message_id": _first(payload, "replyToMessageId", "reply_to_message_id"),
         }
+        reply_text = _raw_text(payload, "replyToText", "reply_to_text")
+        if reply_text is not None:
+            body["reply_to_text"] = reply_text
+        reply_participant = _first(
+            payload, "replyToParticipantJid", "reply_to_participant", "reply_to_participant_jid"
+        )
+        if reply_participant is not None:
+            body["reply_to_participant"] = reply_participant
+        reply_media = _media_metadata(payload.get("replyToMedia"))
+        if reply_media is not None:
+            body["reply_to_media"] = reply_media
+        media = _media_metadata(payload.get("media"))
+        if media is not None:
+            body["media"] = media
         return self._signal(
             kind="message",
             event_key=event_key,
@@ -180,20 +283,29 @@ class WhatsAppSignalMapper:
             target_message_id=body["reply_to_message_id"],
         )
 
-    def _edit(self, payload: Mapping[str, Any], chat_id: str) -> JournalSignal | None:
+    def _edit(
+        self, payload: Mapping[str, Any], chat_id: str, *, strict: bool = False
+    ) -> JournalSignal | None:
         message_id = _first(payload, "messageId", "message_id", "id")
         if not message_id:
             return None
         edit_ms = _to_ms(payload.get("timestamp") or payload.get("editTimestamp"))
+        revision_raw = payload.get("revision")
+        if revision_raw is None:
+            revision_raw = payload.get("editRevision")
+        revision = _revision(revision_raw, strict=strict)
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
-        event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{edit_ms or 0}"
+        event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{revision if revision is not None else edit_ms or 0}"
+        body: dict[str, Any] = {"text": _raw_text(payload, "text", "content") or ""}
+        if revision is not None:
+            body["revision"] = revision
         return self._signal(
             kind="edit",
             event_key=event_key,
             chat_id=chat_id,
             principal=principal,
             payload=payload,
-            body={"text": _first(payload, "text", "content") or ""},
+            body=body,
             source_message_id=message_id,
             target_message_id=message_id,
             occurred_ms=edit_ms,
@@ -325,6 +437,11 @@ class WhatsAppSignalMapper:
             channel=self._channel,
             chat_id=chat_id,
             principal=principal,
+            revision=(
+                int(body["revision"])
+                if isinstance(body.get("revision"), int) and int(body["revision"]) >= 1
+                else 1
+            ),
             occurred_ms=occurred,
             source_message_id=source_message_id,
             target_message_id=target_message_id,
@@ -354,6 +471,7 @@ class SignalJournalSink:
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
         invalidator: Any | None = None,
+        memory: Any | None = None,
     ) -> None:
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
@@ -361,28 +479,218 @@ class SignalJournalSink:
         # Review F05: an edit/delete must not stop at the journal. The invalidator raises
         # the turn revision, cancels stale effects and revokes derived facts.
         self._invalidator = invalidator
+        self._memory = memory
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
+        return self.capture(kind, payload)
+
+    def capture(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        event_id: str | None = None,
+        event_key: str | None = None,
+        account: str | None = None,
+        observed_at_ms: int | None = None,
+        strict: bool = False,
+    ) -> str | None:
+        """Map and append one provider event, optionally using bridge identity fields.
+
+        ``strict`` is used by the canonical channel boundary: malformed replayable input
+        must fail closed instead of looking like a successful no-op. The legacy callable
+        path keeps its historical ``None`` result for malformed provider signals.
+        """
+        if strict and (
+            not isinstance(event_id, str)
+            or not event_id.strip()
+            or not isinstance(event_key, str)
+            or not event_key.strip()
+        ):
+            raise ValueError("strict capture requires non-empty event identity")
         if self._store is None:
+            if strict:
+                raise ValueError("strict capture requires a processing store")
             return None
-        signal = self._mapper.map(payload, kind=kind)
+        signal = self._mapper.map(
+            payload,
+            kind=kind,
+            event_id=event_id,
+            event_key=event_key,
+            account=account,
+            observed_at_ms=observed_at_ms,
+            strict=strict,
+        )
         if signal is None:
+            if strict:
+                raise ValueError(f"malformed WhatsApp {kind} event")
             return None
         now = int(self._clock()) if self._clock is not None else None
-        event_id = self._store.append_event(
+        stored_event_id = self._store.append_event(
             event_key=signal.event_key,
             event_id=signal.event_id,
             trace_id=signal.trace_id,
             payload=signal.to_event_payload(),
             now_ms=now,
+            account=signal.account,
+            direction=signal.direction,
+            revision=signal.revision,
+            audience_ref=signal.audience_ref,
         )
-        if self._invalidator is not None and str(kind) in ("edit", "delete"):
-            try:
-                self._invalidator(kind, payload)
-            except Exception as exc:
-                # Journaling is the durable contract; invalidation must never break it.
-                logger.warning("signal invalidation failed kind={} error={}", kind, exc)
-        return event_id
+        if strict and stored_event_id != signal.event_id:
+            raise ValueError("strict capture found a conflicting event identity")
+        if signal.kind == "message" and self._memory is not None:
+            get_event = getattr(self._store, "get_event", None)
+            get_authority = getattr(self._store, "get_event_source_authority", None)
+            index_event = getattr(self._memory, "index_canonical_event", None)
+            if callable(get_event) and callable(index_event):
+                try:
+                    event = get_event(stored_event_id)
+                    if event is not None:
+                        audience = (
+                            get_authority(stored_event_id, signal.revision)
+                            if callable(get_authority)
+                            else None
+                        )
+                        index_event(event, audience=audience)
+                except Exception as exc:  # pragma: no cover - projection must not block ACK
+                    logger.warning(
+                        "canonical message FTS projection failed error_type={}",
+                        type(exc).__name__,
+                    )
+        if str(kind) in ("edit", "delete"):
+            revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)
+            if strict and revoked_sources:
+                self._invalidate_memory_projection(
+                    signal, revoked_sources, now_ms=now
+                )
+        if not strict:
+            self.invalidate(kind, payload)
+        return stored_event_id
+
+    def _invalidate_memory_projection(
+        self, signal: Any, source_event_ids: Iterable[str], *, now_ms: int | None
+    ) -> None:
+        """Apply strict source tombstones to memory without changing turn semantics."""
+        if self._memory is None:
+            return
+        invalidate = getattr(self._memory, "invalidate_sources", None)
+        direct_soft_delete = False
+        if not callable(invalidate):
+            invalidate = getattr(self._memory, "soft_delete_sources", None)
+            direct_soft_delete = callable(invalidate)
+        get_event = getattr(self._store, "get_event", None)
+        if not callable(invalidate) or not callable(get_event):
+            return
+        principal = str(getattr(signal, "principal", "") or "")
+        account = str(getattr(signal, "account", "") or "")
+        channel = str(getattr(signal, "channel", "") or "")
+        chat_id = str(getattr(signal, "chat_id", "") or "")
+        provider_message_id = str(
+            getattr(signal, "source_message_id", "")
+            or getattr(signal, "target_message_id", "")
+            or ""
+        )
+        authorized: list[str] = []
+        for event_id in source_event_ids:
+            source = get_event(str(event_id))
+            if (
+                source is not None
+                and str(getattr(source, "kind", "")) == "message"
+                and str(getattr(source, "channel", "")) == channel
+                and str(getattr(source, "chat_id", "")) == chat_id
+                and str(getattr(source, "source_message_id", "")) == provider_message_id
+                and (not account or str(getattr(source, "account", "")) == account)
+                and (not principal or str(getattr(source, "principal", "")) == principal)
+            ):
+                authorized.append(str(event_id))
+        if not authorized:
+            return
+        try:
+            if direct_soft_delete:
+                invalidate(authorized)
+            else:
+                invalidate(
+                    authorized,
+                    now_ms=int(now_ms if now_ms is not None else 0),
+                    kind=str(getattr(signal, "kind", "delete")),
+                )
+        except Exception as exc:  # pragma: no cover - projection must not block ACK
+            logger.warning(
+                "canonical source tombstone failed error_type={}",
+                type(exc).__name__,
+            )
+
+    def index_enrichments(
+        self, source_message_id: str, enrichments: Iterable[Mapping[str, Any] | object]
+    ) -> tuple[Any, ...]:
+        """Index approved text derived from an already-journaled message."""
+        if self._memory is None:
+            return ()
+        get_event = getattr(self._store, "get_event", None)
+        events_by_source = getattr(self._store, "events_by_source_message", None)
+        index_event = getattr(self._memory, "index_canonical_event", None)
+        if not callable(index_event):
+            return ()
+        event = get_event(str(source_message_id)) if callable(get_event) else None
+        if event is not None and str(getattr(event, "kind", "")) != "message":
+            event = None
+        if event is None and callable(events_by_source):
+            event = next(
+                (
+                    candidate
+                    for candidate in events_by_source(str(source_message_id))
+                    if str(getattr(candidate, "kind", "")) == "message"
+                ),
+                None,
+            )
+        if event is None:
+            return ()
+        authority_getter = getattr(self._store, "get_event_source_authority", None)
+        audience = (
+            authority_getter(event.event_id, event.revision)
+            if callable(authority_getter)
+            else None
+        )
+        try:
+            return tuple(index_event(event, audience=audience, enrichments=enrichments))
+        except Exception as exc:  # pragma: no cover - projection must not block routing
+            logger.warning(
+                "canonical enrichment FTS projection failed error_type={}",
+                type(exc).__name__,
+            )
+            return ()
+
+    def project_source_revocation(
+        self, signal: Any, *, now_ms: int | None = None, strict: bool = False
+    ) -> tuple[str, ...]:
+        """Persist edit/delete authority changes without mutating the canonical event."""
+        projector = getattr(self._store, "project_source_revocation", None)
+        if projector is None:
+            return ()
+        try:
+            return tuple(projector(signal, now_ms=now_ms))
+        except Exception as exc:
+            if strict:
+                raise
+            # The event is already canonical; leave it available for a later projection
+            # retry rather than turning a provider tombstone into a dropped event.
+            logger.warning(
+                "source authority projection failed kind={} error={}",
+                getattr(signal, "kind", "unknown"),
+                type(exc).__name__,
+            )
+            return ()
+
+    def invalidate(self, kind: str, payload: Mapping[str, Any]) -> None:
+        """Apply legacy edit/delete projection after the canonical ACK boundary."""
+        if self._invalidator is None or str(kind) not in ("edit", "delete"):
+            return
+        try:
+            self._invalidator(kind, payload)
+        except Exception as exc:
+            # Journaling is the durable contract; invalidation must never break it.
+            logger.warning("signal invalidation failed kind={} error={}", kind, exc)
 
 
 def attach_receipt_evidence(

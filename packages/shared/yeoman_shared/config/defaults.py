@@ -105,7 +105,7 @@ DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {
     "delete_sticker_after_description": True,
     "persist_incoming_documents": True,
     "max_document_bytes_mb": 12,
-    "max_document_text_pages": 12,
+    "max_document_text_pages": 1,
     "max_document_prompt_chars": 6000,
     "ocr_images": True,
 }

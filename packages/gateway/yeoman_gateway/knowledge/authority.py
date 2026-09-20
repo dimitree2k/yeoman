@@ -35,18 +35,41 @@ class EvidenceAudience:
     status: str
     members: frozenset[str] = frozenset()
     snapshot_id: str | None = None
+    policy_revision: str | None = None
     allowed: frozenset[str] = frozenset()
     explicit: bool = False
 
     @classmethod
     def known(
-        cls, members: frozenset[str] | set[str], *, snapshot_id: str | None = None
+        cls,
+        members: frozenset[str] | set[str],
+        *,
+        snapshot_id: str | None = None,
+        policy_revision: str | int | None = None,
     ) -> "EvidenceAudience":
-        return cls(status="known", members=frozenset(members), snapshot_id=snapshot_id)
+        return cls(
+            status="known",
+            members=frozenset(members),
+            snapshot_id=snapshot_id,
+            policy_revision=(
+                str(policy_revision) if policy_revision is not None else None
+            ),
+        )
 
     @classmethod
-    def author_only(cls, *, snapshot_id: str | None = None) -> "EvidenceAudience":
-        return cls(status="author_only", snapshot_id=snapshot_id)
+    def author_only(
+        cls,
+        *,
+        snapshot_id: str | None = None,
+        policy_revision: str | int | None = None,
+    ) -> "EvidenceAudience":
+        return cls(
+            status="author_only",
+            snapshot_id=snapshot_id,
+            policy_revision=(
+                str(policy_revision) if policy_revision is not None else None
+            ),
+        )
 
     @classmethod
     def unknown(cls) -> "EvidenceAudience":

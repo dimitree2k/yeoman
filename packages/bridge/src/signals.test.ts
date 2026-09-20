@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { PROTOCOL_VERSION, parseBridgeCommand } from './protocol.js';
 
-test('v4 accepts lookup_message and rejects unknown types', () => {
+test('v5 accepts lookup_message and rejects unknown types', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,
     type: 'lookup_message',
@@ -24,7 +24,7 @@ test('v4 accepts lookup_message and rejects unknown types', () => {
 
 test('signal event types are part of the protocol', async () => {
   const protocol = await import('./protocol.js');
-  assert.equal(protocol.PROTOCOL_VERSION, 4);
+  assert.equal(protocol.PROTOCOL_VERSION, 5);
   // The four signal kinds are emitted as events, so the envelope accepts them.
   const envelope = protocol.createEventEnvelope({
     type: 'reaction',
@@ -32,5 +32,5 @@ test('signal event types are part of the protocol', async () => {
     payload: { chatJid: 'chat@g.us', targetMessageId: '3EB0', emoji: 'x' },
   });
   assert.equal(envelope.type, 'reaction');
-  assert.equal(envelope.version, 4);
+  assert.equal(envelope.version, 5);
 });

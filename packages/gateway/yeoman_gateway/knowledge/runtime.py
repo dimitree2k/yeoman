@@ -20,6 +20,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedCaptureContext,
     TrustedIdentityObservation,
     TrustedReadContext,
+    ValidationError,
 )
 
 
@@ -169,16 +170,17 @@ class ArchiveEvidence:
 
 @dataclass
 class RuntimeKnowledgeSources:
-    """Proof adapter over the inbound archive/processing store.
+    """Proof adapter over the canonical processing-store authority projection.
 
-    A source is only "proven" when it was registered here from the archive owner's own
-    metadata.  Audiences come from the membership snapshot recorded with the evidence -
-    never from a model and never guessed from a name.
+    ``archive`` remains only as a compatibility fallback for offline callers that do not
+    have a processing store.  A runtime instance with ``processing_store`` never reads
+    that process-local map, so restart does not erase source authority.
     """
 
     observations: dict[str, TrustedIdentityObservation] = field(default_factory=dict)
     evidence_refs: set[str] = field(default_factory=set)
     archive: dict[tuple[str, int], ArchiveEvidence] = field(default_factory=dict)
+    processing_store: Any | None = None
 
     # ── registration by the archive owner ────────────────────────────────────
 
@@ -198,7 +200,20 @@ class RuntimeKnowledgeSources:
         audience: EvidenceAudience,
         *,
         revoked: bool = False,
+        policy_revision: str | int | None = None,
     ) -> SourceRef:
+        if self.processing_store is not None:
+            self.processing_store.upsert_event_source_authority(
+                source=source,
+                audience=audience,
+                policy_revision=(
+                    policy_revision
+                    if policy_revision is not None
+                    else audience.policy_revision
+                ),
+                revoked=revoked,
+            )
+            return source
         self.archive[source.key] = ArchiveEvidence(
             source=source, audience=audience, revoked=revoked
         )
@@ -210,6 +225,12 @@ class RuntimeKnowledgeSources:
         return tuple(self.register_source(source, audience) for source, audience in entries)
 
     def revoke(self, source: SourceRef) -> None:
+        if self.processing_store is not None:
+            self.processing_store.revoke_event_source_authority(
+                source.event_id,
+                revision=source.revision,
+            )
+            return
         existing = self.archive.get(source.key)
         if existing is None:
             return
@@ -233,16 +254,29 @@ class RuntimeKnowledgeSources:
         return str(evidence_ref)
 
     def verify_source(self, source: SourceRef) -> bool:
+        if self.processing_store is not None:
+            entry = self.processing_store.get_event_source_authority(
+                source.event_id, source.revision
+            )
+            return bool(entry is not None and _source_from_entry(entry) == source)
         entry = self.archive.get(source.key)
         if entry is None:
             return False
         return entry.source == source
 
     def verify_source_ref(self, event_id: str, revision: int) -> SourceRef | None:
+        if self.processing_store is not None:
+            entry = self.processing_store.get_event_source_authority(event_id, revision)
+            return _source_from_entry(entry) if entry is not None else None
         entry = self.archive.get((str(event_id), int(revision)))
         return None if entry is None else entry.source
 
     def source_revoked(self, source: SourceRef) -> bool:
+        if self.processing_store is not None:
+            entry = self.processing_store.get_event_source_authority(
+                source.event_id, source.revision
+            )
+            return bool(entry is not None and entry.get("revoked_at_ms") is not None)
         entry = self.archive.get(source.key)
         return bool(entry is not None and entry.revoked)
 
@@ -250,5 +284,67 @@ class RuntimeKnowledgeSources:
         self.revoke(source)
 
     def evidence_audience(self, source: SourceRef, *, basis: str) -> EvidenceAudience | None:
+        if self.processing_store is not None:
+            del basis
+            entry = self.processing_store.get_event_source_authority(
+                source.event_id, source.revision
+            )
+            return _audience_from_entry(entry) if entry is not None else None
         entry = self.archive.get(source.key)
         return None if entry is None else entry.audience
+
+    def policy_revision(self, source: SourceRef) -> str | int | None:
+        """Return the policy revision captured with a source audience snapshot."""
+        if self.processing_store is not None:
+            entry = self.processing_store.get_event_source_authority(
+                source.event_id, source.revision
+            )
+            value = None if entry is None else entry.get("policy_revision")
+            if value is not None and str(value).lstrip("-").isdigit():
+                return int(str(value))
+            return value
+        entry = self.archive.get(source.key)
+        return None if entry is None else entry.audience.policy_revision
+
+    def revocation_event_id(self, source: SourceRef) -> str | None:
+        if self.processing_store is not None:
+            entry = self.processing_store.get_event_source_authority(
+                source.event_id, source.revision
+            )
+            return None if entry is None else entry.get("revoking_event_id")
+        entry = self.archive.get(source.key)
+        return None if entry is None or not entry.revoked else None
+
+    def source_for_event(self, event_id: str, revision: int = 1) -> SourceRef | None:
+        return self.verify_source_ref(event_id, revision)
+
+
+def _source_from_entry(entry: Mapping[str, Any]) -> SourceRef | None:
+    try:
+        return SourceRef(
+            event_id=str(entry["event_id"]),
+            revision=int(entry["revision"]),
+            channel=str(entry.get("source_channel") or entry.get("channel") or ""),
+            chat_id=str(entry.get("source_chat_id") or entry.get("chat_id") or ""),
+            author_principal=str(entry["author_principal"]),
+            occurred_at_ms=int(entry.get("occurred_at_ms") or 0),
+        )
+    except (KeyError, TypeError, ValueError, ValidationError):
+        return None
+
+
+def _audience_from_entry(entry: Mapping[str, Any]) -> EvidenceAudience:
+    return EvidenceAudience(
+        status=str(entry.get("audience_status") or "unknown"),
+        members=frozenset(str(item) for item in entry.get("audience_members", ()) or ()),
+        snapshot_id=(
+            str(entry["audience_snapshot_id"])
+            if entry.get("audience_snapshot_id") is not None
+            else None
+        ),
+        policy_revision=(
+            str(entry["policy_revision"])
+            if entry.get("policy_revision") is not None
+            else None
+        ),
+    )

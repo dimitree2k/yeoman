@@ -644,6 +644,10 @@ class MemoryService:
         if not ids:
             return InvalidationReport()
 
+        # Canonical WhatsApp text is a direct FTS projection, not a shared fact.  Apply
+        # the same source tombstone to it while keeping the event journal untouched.
+        self.store.soft_delete_sources(ids)
+
         resolved = kind or self._derive_invalidation_kind(ids)
         revoked: list[str] = []
         superseded: list[str] = []
@@ -678,6 +682,21 @@ class MemoryService:
             superseded=tuple(dict.fromkeys(superseded)),
             jobs_cancelled=cancelled,
             remaining_copies=self.remaining_copies(),
+        )
+
+    def index_canonical_event(
+        self,
+        event: object,
+        *,
+        audience: object | None = None,
+        enrichments: Iterable[object] = (),
+    ) -> tuple[MemoryEntry, ...]:
+        """Project one canonical WhatsApp message into the existing FTS store."""
+        return self.store.index_canonical_event(
+            event,
+            audience=audience,
+            enrichments=enrichments,
+            workspace_id=self.workspace_id,
         )
 
     def _derive_invalidation_kind(self, source_event_ids: list[str]) -> str:

@@ -1,4 +1,28 @@
-export const PROTOCOL_VERSION = 4 as const;
+import { createHash } from 'node:crypto';
+
+export const PROTOCOL_VERSION = 5 as const;
+export const MAX_BRIDGE_FRAME_BYTES = 262_144 as const;
+
+export const REPLAYABLE_EVENT_TYPES = [
+  'message',
+  'edit',
+  'delete',
+  'reaction',
+  'receipt',
+] as const;
+
+export const MEDIA_METADATA_FIELDS = [
+  'kind',
+  'mimeType',
+  'fileName',
+  'bytes',
+  'path',
+  'ref',
+  'sha256',
+  'hash',
+] as const;
+
+export const OUTBOUND_MESSAGE_ID_FIELDS = ['providerMessageId', 'clientMessageId'] as const;
 
 const TOKEN_JSON_RE = /("token"\s*:\s*")[^"]*(")/gi;
 const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
@@ -15,6 +39,8 @@ export type BridgeCommandType =
   | 'login_wait'
   | 'logout'
   | 'lookup_message'
+  | 'subscribe_events'
+  | 'ack_event'
   | 'health';
 
 export type BridgeEventType =
@@ -107,6 +133,14 @@ export interface LookupMessagePayload {
   messageId: string;
 }
 
+export interface SubscribeEventsPayload {
+  [k: string]: never;
+}
+
+export interface AckEventPayload {
+  eventId: string;
+}
+
 /**
  * Answer about one provider message. ``found`` comes from a proven local source only;
  * ``unsupported`` means the bridge has no authority to answer (it is never a claim that
@@ -136,8 +170,85 @@ export interface BridgeEventEnvelope {
   type: BridgeEventType;
   ts: number;
   accountId: string;
+  eventId?: string;
+  eventKey?: string;
+  observedAt?: number;
   requestId?: string;
   payload: Record<string, unknown>;
+}
+
+export interface BridgeMediaMetadata {
+  kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
+  mimeType?: string;
+  fileName?: string;
+  bytes?: number;
+  path?: string;
+  ref?: string;
+  sha256?: string;
+  hash?: string;
+}
+
+export interface BridgeSendResult {
+  to: string;
+  messageId?: string;
+  providerMessageId?: string;
+  clientMessageId?: string;
+}
+
+export interface ProviderEventIdentity {
+  eventId: string;
+  eventKey: string;
+}
+
+function identityPart(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+}
+
+/** Derive replay identity from provider ids only; payload text is never part of the key. */
+export function deriveProviderEventIdentity(
+  type: Extract<BridgeEventType, 'message' | 'edit' | 'delete' | 'reaction' | 'receipt'>,
+  accountId: string,
+  payload: Record<string, unknown>,
+): ProviderEventIdentity | undefined {
+  const account = identityPart(accountId);
+  const chat = identityPart(payload.chatJid ?? payload.chat_jid ?? payload.chat);
+  if (!account || !chat) return undefined;
+
+  let providerIdentity: string[];
+  if (type === 'message') {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    providerIdentity = [messageId];
+  } else if (type === 'edit') {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    const revision = identityPart(payload.revision ?? payload.editRevision ?? '');
+    providerIdentity = revision ? [messageId, revision] : [messageId];
+  } else if (type === 'delete') {
+    const messageId = identityPart(
+      payload.messageId ?? payload.message_id ?? payload.targetMessageId ?? payload.id,
+    );
+    if (!messageId) return undefined;
+    providerIdentity = [messageId];
+  } else if (type === 'reaction') {
+    const target = identityPart(payload.targetMessageId ?? payload.target_message_id ?? payload.messageId);
+    const sender = identityPart(payload.senderId ?? payload.sender ?? payload.participantJid);
+    if (!target) return undefined;
+    providerIdentity = [target, sender];
+  } else {
+    const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+    if (!messageId) return undefined;
+    const recipient = identityPart(
+      payload.recipientJid ?? payload.recipient ?? payload.participantJid ?? payload.to,
+    );
+    const status = identityPart(payload.status ?? payload.receiptType ?? 'delivered').toLowerCase();
+    providerIdentity = [messageId, recipient, status];
+  }
+
+  const encoded = [account, chat, type, ...providerIdentity].map((value) => encodeURIComponent(value));
+  const eventKey = `whatsapp:${encoded.join(':')}`;
+  const eventId = `wa_${createHash('sha256').update(eventKey, 'utf8').digest('hex').slice(0, 32)}`;
+  return { eventId, eventKey };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -315,6 +426,16 @@ function parseLoginWait(payload: Record<string, unknown>): LoginWaitPayload | nu
   return { timeoutMs };
 }
 
+function parseSubscribeEvents(payload: Record<string, unknown>): SubscribeEventsPayload | null {
+  return Object.keys(payload).length === 0 ? {} : null;
+}
+
+function parseAckEvent(payload: Record<string, unknown>): AckEventPayload | null {
+  if (Object.keys(payload).length !== 1) return null;
+  const eventId = asString(payload.eventId);
+  return eventId ? { eventId } : null;
+}
+
 export function parseBridgeCommand(
   value: unknown,
 ): { ok: true; command: BridgeCommandEnvelope } | { ok: false; error: ProtocolError } {
@@ -359,6 +480,8 @@ export function parseBridgeCommand(
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
   else if (typed === 'login_start') validPayload = Boolean(parseLoginStart(payload));
   else if (typed === 'login_wait') validPayload = Boolean(parseLoginWait(payload));
+  else if (typed === 'subscribe_events') validPayload = Boolean(parseSubscribeEvents(payload));
+  else if (typed === 'ack_event') validPayload = Boolean(parseAckEvent(payload));
   else if (typed === 'logout' || typed === 'health') validPayload = true;
   else return err('ERR_UNSUPPORTED', `Unsupported command: ${type}`);
 
@@ -433,9 +556,24 @@ export function parseLoginWaitPayload(payload: Record<string, unknown>): LoginWa
   return parsed;
 }
 
+export function parseSubscribeEventsPayload(payload: Record<string, unknown>): SubscribeEventsPayload {
+  const parsed = parseSubscribeEvents(payload);
+  if (!parsed) throw new Error('Invalid subscribe_events payload');
+  return parsed;
+}
+
+export function parseAckEventPayload(payload: Record<string, unknown>): AckEventPayload {
+  const parsed = parseAckEvent(payload);
+  if (!parsed) throw new Error('Invalid ack_event payload');
+  return parsed;
+}
+
 export function createEventEnvelope(params: {
   type: BridgeEventType;
   accountId?: string;
+  eventId?: string;
+  eventKey?: string;
+  observedAt?: number;
   requestId?: string;
   payload?: Record<string, unknown>;
 }): BridgeEventEnvelope {
@@ -444,6 +582,9 @@ export function createEventEnvelope(params: {
     type: params.type,
     ts: Date.now(),
     accountId: params.accountId ?? 'default',
+    eventId: params.eventId,
+    eventKey: params.eventKey,
+    observedAt: params.observedAt,
     requestId: params.requestId,
     payload: params.payload ?? {},
   };

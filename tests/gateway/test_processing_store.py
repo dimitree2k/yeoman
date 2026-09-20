@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     DAY_MS,
     CanonicalEvent,
     DecisionRecord,
@@ -45,6 +46,35 @@ def test_event_payload_conflict_is_rejected(tmp_path):
     db.close()
 
 
+def test_event_metadata_conflict_is_rejected_even_when_payload_matches(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    payload = {
+        "kind": "message",
+        "channel": "whatsapp",
+        "account": "account-a",
+        "direction": "in",
+        "revision": 1,
+        "text": "same bytes",
+    }
+    assert db.append_event(
+        event_key="wa:event-metadata",
+        event_id="metadata-1",
+        trace_id="trace-1",
+        payload=payload,
+    ) == "metadata-1"
+
+    with pytest.raises(ValueError):
+        db.append_event(
+            event_key="wa:event-metadata",
+            event_id="metadata-2",
+            trace_id="trace-1",
+            payload=payload,
+            account="account-b",
+        )
+    assert db.count_events() == 1
+    db.close()
+
+
 def test_failed_append_does_not_leave_partial_event(tmp_path, monkeypatch):
     db = ProcessingStore(tmp_path / "processing.db")
 
@@ -79,6 +109,10 @@ def test_canonical_event_roundtrip_keeps_metadata_and_hash(tmp_path):
         principal="4915111@s.whatsapp.net",
         channel="whatsapp",
         chat_id="group@g.us",
+        account="account-a",
+        direction="in",
+        revision=2,
+        audience_ref="audience:captured",
         occurred_ms=1_700_000_000_000,
         source_message_id="3A1",
         payload={"kind": "message", "text": "hallo"},
@@ -97,11 +131,111 @@ def test_canonical_event_roundtrip_keeps_metadata_and_hash(tmp_path):
     assert stored.origin == "whatsapp"
     assert stored.principal == "4915111@s.whatsapp.net"
     assert stored.chat_id == "group@g.us"
+    assert stored.account == "account-a"
+    assert stored.direction == "in"
+    assert stored.revision == 2
+    assert stored.audience_ref == "audience:captured"
     assert stored.source_message_id == "3A1"
     assert stored.occurred_ms == 1_700_000_000_000
     assert stored.created_ms == 1_700_000_000_500
     assert stored.payload == {"kind": "message", "text": "hallo"}
     assert stored.payload_hash == canonical_hash({"kind": "message", "text": "hallo"})
+    db.close()
+
+
+def test_long_payload_roundtrip_keeps_canonical_json_bytes(tmp_path):
+    from yeoman_gateway.processing.models import canonical_json
+
+    text = "  " + ("ä" * 8_001) + " \n"
+    payload = {"kind": "message", "channel": "whatsapp", "text": text}
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:long",
+        event_id="long-1",
+        trace_id="trace-long",
+        payload=payload,
+    )
+
+    stored = db.get_event("long-1")
+    assert stored is not None and stored.payload == payload
+    row = db._conn.execute(
+        "SELECT payload_json FROM events WHERE event_id = ?", ("long-1",)
+    ).fetchone()
+    assert row is not None and row["payload_json"] == canonical_json(payload)
+    db.close()
+
+
+def test_confirmed_whatsapp_receipt_appends_one_correlated_outbound_event(tmp_path):
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.enqueue_effect(
+        effect_id="fx-out-1",
+        operation_key="turn:send:1",
+        payload={"kind": "text", "text": "confirmed text"},
+        target={"channel": "whatsapp", "chat_id": "chat@g.us"},
+        now_ms=now,
+    )
+
+    assert db._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE direction = 'out'"
+    ).fetchone()["n"] == 0
+
+    db.record_transport_receipt(
+        "fx-out-1",
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        attempt_id="attempt-1",
+        provider_message_id="provider-out-1",
+        client_message_id="client-out-1",
+        now_ms=now,
+    )
+    db.record_transport_receipt(
+        "fx-out-1",
+        channel="whatsapp",
+        chat_id="chat@g.us",
+        attempt_id="attempt-1",
+        provider_message_id="provider-out-1",
+        client_message_id="client-out-1",
+        now_ms=now + 1,
+    )
+
+    rows = db._conn.execute(
+        "SELECT event_id FROM events WHERE direction = 'out' ORDER BY event_id"
+    ).fetchall()
+    assert len(rows) == 1
+    event = db.get_event(str(rows[0]["event_id"]))
+    assert event is not None
+    assert event.origin == CANONICAL_WHATSAPP_ORIGIN
+    assert event.direction == "out"
+    assert event.payload is not None
+    assert event.payload["effect_id"] == "fx-out-1"
+    assert event.payload["attempt_id"] == "attempt-1"
+    assert event.payload["provider_message_id"] == "provider-out-1"
+    assert event.payload["client_message_id"] == "client-out-1"
+    assert event.payload["text"] == "confirmed text"
+    assert len(db.transport_receipts("fx-out-1")) == 1
+    db.close()
+
+
+def test_store_normalizes_revision_in_payload_and_column(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:revision",
+        event_id="revision-1",
+        trace_id="trace-revision",
+        payload={"kind": "edit", "channel": "whatsapp", "revision": "4"},
+    )
+    stored = db.get_event("revision-1")
+    assert stored is not None and stored.revision == 4
+    assert stored.payload is not None and stored.payload["revision"] == 4
+
+    with pytest.raises(ValueError):
+        db.append_event(
+            event_key="wa:revision-invalid",
+            event_id="revision-invalid",
+            trace_id="trace-revision",
+            payload={"kind": "edit", "revision": 0},
+        )
     db.close()
 
 
@@ -239,6 +373,43 @@ def test_purge_drops_old_metadata_but_protects_unresolved(tmp_path):
     db.close()
 
 
+def test_retention_exempts_only_marked_canonical_whatsapp_events(tmp_path):
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:canonical",
+        event_id="wa-canonical",
+        trace_id="trace-canonical",
+        payload={
+            "kind": "message",
+            "origin": CANONICAL_WHATSAPP_ORIGIN,
+            "channel": "whatsapp",
+            "text": "canonical",
+        },
+        now_ms=now,
+    )
+    db.append_event(
+        event_key="wa:operational",
+        event_id="wa-operational",
+        trace_id="trace-operational",
+        payload={
+            "kind": "message",
+            "origin": "whatsapp_bridge",
+            "channel": "whatsapp",
+            "text": "operational",
+        },
+        now_ms=now,
+    )
+
+    db.purge(now_ms=now + 31 * DAY_MS)
+
+    canonical = db.get_event("wa-canonical")
+    assert canonical is not None and canonical.payload is not None
+    operational = db.get_event("wa-operational")
+    assert operational is None
+    db.close()
+
+
 def test_lineage_view_exposes_metadata_not_raw_text(tmp_path):
     now = 1_700_000_000_000
     db = ProcessingStore(tmp_path / "processing.db")
@@ -286,14 +457,16 @@ def test_retention_settings_reject_negative_values():
         RetentionSettings(unresolved_ms=DAY_MS, metadata_ms=2 * DAY_MS)
 
 
-def test_disabled_processing_creates_no_database(tmp_path, monkeypatch):
-    """The default must stay inert: disabled mode adds no second database."""
+def test_processing_store_opens_even_when_processing_is_disabled(tmp_path, monkeypatch):
+    """Canonical capture is durable even while responders/effects stay disabled."""
     from yeoman_gateway.app.bootstrap import build_processing_store
     from yeoman_shared.config.schema import Config
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
-    assert build_processing_store(Config()) is None
-    assert not (tmp_path / "data" / "processing").exists()
+    store = build_processing_store(Config())
+    assert store is not None
+    assert (tmp_path / "data" / "processing" / "processing.db").exists()
+    store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
     store = build_processing_store(enabled)

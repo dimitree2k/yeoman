@@ -7,9 +7,11 @@ import {
   createErrorResponse,
   createEventEnvelope,
   createOkResponse,
+  deriveProviderEventIdentity,
   isLoopbackAddress,
   parseBridgeCommand,
   parseDeleteMessagePayload,
+  parseAckEventPayload,
   parseListGroupsPayload,
   parseLoginStartPayload,
   parseLoginWaitPayload,
@@ -18,19 +20,31 @@ import {
   parseSendMediaPayload,
   parseSendPollPayload,
   parseSendTextPayload,
+  MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
   type BridgeEventEnvelope,
   type ProtocolError,
 } from './protocol.js';
-import { WhatsAppClient, type InboundMessageV2 } from './whatsapp.js';
+import {
+  BridgeOutbox,
+  defaultBridgeOutboxDir,
+  isReplayableEventType,
+  type ReplayableBridgeEvent,
+} from './outbox.js';
+import { WhatsAppClient, type InboundMedia, type InboundMessageV2 } from './whatsapp.js';
 
 type ClientMeta = {
   ws: WebSocket;
   inflight: number;
   droppedEvents: number;
+  subscribed: boolean;
+  replaying: boolean;
+  replayQueue: ReplayableBridgeEvent[];
+  deliveredEventIds: Set<string>;
+  acknowledgedEventIds: Set<string>;
 };
 
-const MAX_COMMAND_BYTES = 256 * 1024;
+const MAX_COMMAND_BYTES = MAX_BRIDGE_FRAME_BYTES;
 const MAX_INFLIGHT_PER_CLIENT = 20;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 
@@ -63,10 +77,82 @@ function rawDataToString(data: RawData): string {
   return data.toString('utf8');
 }
 
+const SAFE_FRAME_TOKEN_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function safeFrameToken(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !SAFE_FRAME_TOKEN_RE.test(value)) return undefined;
+  return value;
+}
+
+function serializeFrame(event: BridgeEventEnvelope): string | undefined {
+  try {
+    const raw = JSON.stringify(event);
+    return typeof raw === 'string' ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedFrameFallback(event: BridgeEventEnvelope): BridgeEventEnvelope {
+  return createErrorResponse({
+    requestId: safeFrameToken(event.requestId),
+    accountId: safeFrameToken(event.accountId) || 'default',
+    error: protocolError('ERR_PAYLOAD_TOO_LARGE', 'Outbound frame too large', false),
+  });
+}
+
+function sendBoundedFrame(
+  ws: WebSocket,
+  event: BridgeEventEnvelope,
+): { sent: boolean; replaced: boolean } {
+  const raw = serializeFrame(event);
+  if (raw && Buffer.byteLength(raw, 'utf8') <= MAX_BRIDGE_FRAME_BYTES) {
+    ws.send(raw);
+    return { sent: true, replaced: false };
+  }
+
+  // A replayable frame must never be replaced by an error response: doing so could mark an
+  // event delivered without delivering its canonical payload. The outbox normally rejects
+  // these before staging; this branch protects replay of legacy/tampered records too.
+  if (isReplayableEventType(event.type)) {
+    ws.close(1009, 'frame too large');
+    return { sent: false, replaced: false };
+  }
+
+  const fallback = boundedFrameFallback(event);
+  const fallbackRaw = serializeFrame(fallback);
+  if (fallbackRaw && Buffer.byteLength(fallbackRaw, 'utf8') <= MAX_BRIDGE_FRAME_BYTES) {
+    ws.send(fallbackRaw);
+    return { sent: true, replaced: true };
+  }
+
+  ws.close(1009, 'frame too large');
+  return { sent: false, replaced: false };
+}
+
+function mediaMetadata(media: InboundMedia | undefined): Record<string, unknown> | undefined {
+  if (!media) return undefined;
+  const result: Record<string, unknown> = { kind: media.kind };
+  for (const key of ['mimeType', 'fileName', 'path', 'ref', 'sha256', 'hash'] as const) {
+    const value = media[key];
+    if (typeof value === 'string' && value.trim()) result[key] = value.trim();
+  }
+  if (typeof media.bytes === 'number' && Number.isSafeInteger(media.bytes) && media.bytes >= 0) {
+    result.bytes = media.bytes;
+  }
+  return result;
+}
+
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private readonly clients = new Set<ClientMeta>();
+  private readonly outbox: BridgeOutbox;
+  private canonicalSubscriber: ClientMeta | null = null;
+  private readonly inFlight = new Set<Promise<void>>();
+  private intakeStopped = false;
+  private persistenceFailure = false;
+  private stopping = false;
 
   constructor(
     private readonly host: string,
@@ -82,9 +168,16 @@ export class BridgeServer {
     private readonly buildId: string,
     private readonly readReceipts: boolean,
     private readonly accountId = 'default',
-  ) {}
+    outboxDir = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir(),
+  ) {
+    this.outbox = new BridgeOutbox(outboxDir);
+  }
 
   async start(): Promise<void> {
+    this.stopping = false;
+    this.intakeStopped = false;
+    this.persistenceFailure = false;
+    await this.outbox.open();
     this.wss = new WebSocketServer({
       host: this.host,
       port: this.port,
@@ -102,11 +195,17 @@ export class BridgeServer {
       acceptFromMe: this.acceptFromMe,
       readReceipts: this.readReceipts,
       accountId: this.accountId,
-      onMessage: (msg) => this.broadcastMessage(msg),
-      onSignal: (kind, payload) =>
-        this.broadcastEvent(
-          createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
-        ),
+      onMessage: (msg) => {
+        return this.trackProviderEvent(this.broadcastMessage(msg));
+      },
+      onSignal: (kind, payload) => {
+        const identity = deriveProviderEventIdentity(kind, this.accountId, payload);
+        return this.trackProviderEvent(
+          this.broadcastReplayable(
+            createEventEnvelope({ type: kind, accountId: this.accountId, payload, ...identity }),
+          ),
+        );
+      },
       onQR: (qr) =>
         this.broadcastEvent(
           createEventEnvelope({
@@ -148,12 +247,21 @@ export class BridgeServer {
           error: protocolError('ERR_AUTH', 'Bridge accepts loopback clients only', false),
           accountId: this.accountId,
         });
-        ws.send(JSON.stringify(event));
+        sendBoundedFrame(ws, event);
         ws.close(1008, 'loopback only');
         return;
       }
 
-      const meta: ClientMeta = { ws, inflight: 0, droppedEvents: 0 };
+      const meta: ClientMeta = {
+        ws,
+        inflight: 0,
+        droppedEvents: 0,
+        subscribed: false,
+        replaying: false,
+        replayQueue: [],
+        deliveredEventIds: new Set(),
+        acknowledgedEventIds: new Set(),
+      };
       this.clients.add(meta);
 
       ws.on('message', async (data) => {
@@ -162,7 +270,7 @@ export class BridgeServer {
             error: protocolError('ERR_QUEUE_OVERFLOW', 'Command queue overflow', true),
             accountId: this.accountId,
           });
-          ws.send(JSON.stringify(event));
+          sendBoundedFrame(ws, event);
           return;
         }
 
@@ -172,7 +280,7 @@ export class BridgeServer {
             error: protocolError('ERR_PAYLOAD_TOO_LARGE', 'Payload too large', false),
             accountId: this.accountId,
           });
-          ws.send(JSON.stringify(event));
+          sendBoundedFrame(ws, event);
           return;
         }
 
@@ -185,11 +293,11 @@ export class BridgeServer {
       });
 
       ws.on('close', () => {
-        this.clients.delete(meta);
+        this.handleClientClose(meta);
       });
 
       ws.on('error', () => {
-        this.clients.delete(meta);
+        this.handleClientClose(meta);
       });
     });
   }
@@ -227,6 +335,64 @@ export class BridgeServer {
           requestId: cmd.requestId,
           accountId: this.accountId,
           error: protocolError('ERR_AUTH', 'Invalid bridge token', false),
+        }),
+      );
+      return;
+    }
+
+    if (cmd.type === 'subscribe_events') {
+      if (this.canonicalSubscriber && this.canonicalSubscriber !== meta) {
+        this.sendToClient(
+          meta,
+          createErrorResponse({
+            requestId: cmd.requestId,
+            accountId: this.accountId,
+            error: protocolError('ERR_AUTH', 'Canonical event subscriber already connected', true),
+          }),
+        );
+        return;
+      }
+      const alreadySubscribed = meta.subscribed;
+      meta.subscribed = true;
+      this.canonicalSubscriber = meta;
+      this.sendToClient(
+        meta,
+        createOkResponse({
+          requestId: cmd.requestId,
+          accountId: this.accountId,
+          result: { subscribed: true },
+        }),
+      );
+      if (!alreadySubscribed) await this.replayToClient(meta);
+      return;
+    }
+
+    if (cmd.type === 'ack_event') {
+      const { eventId } = parseAckEventPayload(cmd.payload);
+      const canAck =
+        this.canonicalSubscriber === meta &&
+        meta.subscribed &&
+        (meta.deliveredEventIds.has(eventId) || meta.acknowledgedEventIds.has(eventId));
+      if (!canAck) {
+        this.sendToClient(
+          meta,
+          createErrorResponse({
+            requestId: cmd.requestId,
+            accountId: this.accountId,
+            error: protocolError('ERR_AUTH', 'Event ACK requires current subscriber delivery', false),
+          }),
+        );
+        return;
+      }
+      const acknowledged = await this.outbox.ack(eventId);
+      meta.deliveredEventIds.delete(eventId);
+      meta.acknowledgedEventIds.add(eventId);
+      this.sendToClient(
+        meta,
+        createOkResponse({
+          requestId: cmd.requestId,
+          accountId: this.accountId,
+          result: { acknowledged },
         }),
       );
       return;
@@ -406,47 +572,56 @@ export class BridgeServer {
           droppedInboundDuplicates: waHealth.droppedInboundDuplicates,
           dedupeCacheSize: waHealth.dedupeCacheSize,
         },
+        outbox: this.outbox.diagnostics(),
+        intakeStopped: this.intakeStopped,
+        persistenceFailure: this.persistenceFailure,
       };
     }
 
     throw protocolError('ERR_UNSUPPORTED', `Unsupported command: ${type}`, false);
   }
 
-  private broadcastMessage(msg: InboundMessageV2): void {
-    this.broadcastEvent(
+  private async broadcastMessage(msg: InboundMessageV2): Promise<void> {
+    const payload = {
+      messageId: msg.messageId,
+      chatJid: msg.chatJid,
+      participantJid: msg.participantJid,
+      senderId: msg.senderId,
+      senderPhoneJid: msg.senderPhoneJid,
+      lidConflict: msg.lidConflict,
+      senderName: msg.senderName,
+      isGroup: msg.isGroup,
+      text: msg.text,
+      timestamp: msg.timestamp,
+      mentionedJids: msg.mentionedJids,
+      mentionedBot: msg.mentionedBot,
+      replyToBot: msg.replyToBot,
+      replyToMessageId: msg.replyToMessageId,
+      replyToParticipantJid: msg.replyToParticipantJid,
+      replyToText: msg.replyToText,
+      replyToMedia: mediaMetadata(msg.replyToMedia),
+      media: mediaMetadata(msg.media),
+    };
+    const identity = deriveProviderEventIdentity('message', this.accountId, payload);
+    await this.broadcastReplayable(
       createEventEnvelope({
         type: 'message',
         accountId: this.accountId,
-        payload: {
-          messageId: msg.messageId,
-          chatJid: msg.chatJid,
-          participantJid: msg.participantJid,
-          senderId: msg.senderId,
-          senderPhoneJid: msg.senderPhoneJid,
-          lidConflict: msg.lidConflict,
-          senderName: msg.senderName,
-          isGroup: msg.isGroup,
-          text: msg.text,
-          timestamp: msg.timestamp,
-          mentionedJids: msg.mentionedJids,
-          mentionedBot: msg.mentionedBot,
-          replyToBot: msg.replyToBot,
-          replyToMessageId: msg.replyToMessageId,
-          replyToParticipantJid: msg.replyToParticipantJid,
-          replyToText: msg.replyToText,
-          media: msg.media,
-        },
+        payload,
+        ...identity,
       }),
     );
   }
 
-  private sendToClient(meta: ClientMeta, event: BridgeEventEnvelope): void {
-    if (meta.ws.readyState !== WebSocket.OPEN) return;
+  private sendToClient(meta: ClientMeta, event: BridgeEventEnvelope): boolean {
+    if (meta.ws.readyState !== WebSocket.OPEN) return false;
     if (meta.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
       meta.droppedEvents += 1;
-      return;
+      return false;
     }
-    meta.ws.send(JSON.stringify(event));
+    const result = sendBoundedFrame(meta.ws, event);
+    if (result.replaced || !result.sent) meta.droppedEvents += 1;
+    return result.sent;
   }
 
   private broadcastEvent(event: BridgeEventEnvelope): void {
@@ -455,7 +630,104 @@ export class BridgeServer {
     }
   }
 
+  private async broadcastReplayable(event: BridgeEventEnvelope): Promise<void> {
+    if (this.persistenceFailure) throw new Error('Bridge event intake is stopped');
+    let persisted: ReplayableBridgeEvent;
+    try {
+      persisted = await this.outbox.append(event);
+    } catch (error) {
+      this.recordPersistenceFailure();
+      throw error;
+    }
+
+    for (const meta of this.clients) {
+      if (!meta.subscribed || this.canonicalSubscriber !== meta) continue;
+      if (meta.replaying) {
+        meta.replayQueue.push(persisted);
+      } else {
+        this.deliverReplayable(meta, persisted);
+      }
+    }
+  }
+
+  private async replayToClient(meta: ClientMeta): Promise<void> {
+    meta.replaying = true;
+    const sent = new Set<string>();
+    try {
+      for (const event of await this.outbox.pending()) {
+        if (!meta.subscribed || !this.clients.has(meta)) return;
+        if (this.deliverReplayable(meta, event)) sent.add(event.eventId);
+      }
+    } finally {
+      meta.replaying = false;
+      const queued = meta.replayQueue.splice(0);
+      if (!meta.subscribed || !this.clients.has(meta)) return;
+      for (const event of queued) {
+        if (!sent.has(event.eventId)) this.deliverReplayable(meta, event);
+      }
+    }
+  }
+
+  private deliverReplayable(meta: ClientMeta, event: ReplayableBridgeEvent): boolean {
+    const delivered = this.sendToClient(meta, event);
+    if (delivered) meta.deliveredEventIds.add(event.eventId);
+    return delivered;
+  }
+
+  private recordPersistenceFailure(): void {
+    if (this.persistenceFailure) return;
+    this.persistenceFailure = true;
+    this.intakeStopped = true;
+    this.wa?.stopIntake();
+    console.error('Bridge event persistence failed; provider intake stopped');
+  }
+
+  private trackProviderEvent(operation: Promise<void>): Promise<void> {
+    let tracked: Promise<void>;
+    tracked = operation
+      .catch((error: unknown) => {
+        if (!this.stopping) this.recordPersistenceFailure();
+        throw error;
+      })
+      .finally(() => this.inFlight.delete(tracked));
+    this.inFlight.add(tracked);
+    return tracked;
+  }
+
+  private handleClientClose(meta: ClientMeta): void {
+    if (this.canonicalSubscriber === meta) this.canonicalSubscriber = null;
+    meta.subscribed = false;
+    meta.replaying = false;
+    meta.replayQueue.length = 0;
+    meta.deliveredEventIds.clear();
+    meta.acknowledgedEventIds.clear();
+    this.clients.delete(meta);
+  }
+
+  diagnostics(): {
+    intakeStopped: boolean;
+    persistenceFailure: boolean;
+    canonicalSubscriber: boolean;
+    outbox: ReturnType<BridgeOutbox['diagnostics']>;
+  } {
+    return {
+      intakeStopped: this.intakeStopped,
+      persistenceFailure: this.persistenceFailure,
+      canonicalSubscriber: this.canonicalSubscriber !== null,
+      outbox: this.outbox.diagnostics(),
+    };
+  }
+
   async stop(): Promise<void> {
+    this.stopping = true;
+    this.intakeStopped = true;
+    if (this.wa) {
+      await this.wa.stop();
+      this.wa = null;
+    }
+    await Promise.allSettled(Array.from(this.inFlight));
+    await this.outbox.flush();
+    this.canonicalSubscriber = null;
     for (const meta of this.clients) {
       meta.ws.close();
     }
@@ -464,11 +736,6 @@ export class BridgeServer {
     if (this.wss) {
       this.wss.close();
       this.wss = null;
-    }
-
-    if (this.wa) {
-      await this.wa.stop();
-      this.wa = null;
     }
   }
 }

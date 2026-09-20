@@ -145,11 +145,14 @@ def test_f01_an_unopenable_store_stops_startup_instead_of_falling_back(tmp_path:
     with pytest.raises(ProcessingStoreUnavailableError):
         build_processing_store(config)
 
-    # And the disabled mode still stays inert rather than raising.
+    # The canonical journal remains open, while processing feature builders stay inert.
     config.processing.enabled = False
-    assert build_processing_store(config) is None
+    config.processing.db_path = str(tmp_path / "disabled-processing.db")
+    disabled_store = build_processing_store(config)
+    assert disabled_store is not None
     assert build_processing_gate(config, None, None, None) is None
     assert build_effect_router(config, None, None, None) is None
+    disabled_store.close()
 
 
 def _store_with_message(tmp_path: Path, *, message_id: str = "m1", principal: str = "author-1"):

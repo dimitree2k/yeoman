@@ -24,7 +24,7 @@ from yeoman_gateway.policy.loader import save_policy
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.models import PolicySnapshot
 from yeoman_gateway.processing.quota import CapabilityQuotaGovernance, quota_key_for
-from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_gateway.processing.store import SCHEMA_VERSION, ProcessingStore
 from yeoman_gateway.processing.tool_context import (
     ToolInvocationContext,
     reset_tool_context,
@@ -102,7 +102,7 @@ def test_canonical_whatsapp_identity_uses_only_trusted_phone_metadata() -> None:
 
 def test_store_claims_across_chats_and_at_exact_rolling_boundary(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
-    assert store.schema_version == 7
+    assert store.schema_version == SCHEMA_VERSION
     assert store.claim_capability(
         "whatsapp:15550001", "deep_research", "a", cooldown_ms=86_400_000, now_ms=1_000
     ) == (True, 0)
