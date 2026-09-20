@@ -307,8 +307,11 @@ function mediaSha256(buffer: Buffer): string {
 }
 
 function providerMediaHash(media: any): string | undefined {
-  const raw = media?.sha256 ?? media?.hash;
-  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+  const raw = media?.sha256 ?? media?.hash ?? media?.fileSha256;
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (Buffer.isBuffer(raw) && raw.length > 0) return raw.toString('hex');
+  if (raw instanceof Uint8Array && raw.length > 0) return Buffer.from(raw).toString('hex');
+  return undefined;
 }
 
 function providerMediaMetadata(media: any): Pick<InboundMedia, 'bytes' | 'sha256'> {

@@ -14,6 +14,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
   type BridgeEventEnvelope,
   type BridgeEventType,
@@ -41,6 +42,16 @@ export type OutboxDiagnostics = {
   pending: number;
   nextSequence: number;
   quarantined: number;
+  rejected: number;
+};
+
+type RejectionDiagnostic = {
+  eventId: string;
+  eventKey: string;
+  type: ReplayableEventType;
+  observedAt: number;
+  serializedBytes: number;
+  reason: string;
 };
 
 const OUTBOX_FILE_RE = /^(\d+)-.+\.json$/;
@@ -113,6 +124,7 @@ export class BridgeOutbox {
   private readonly entries = new Map<string, OutboxEntry>();
   private nextSequence = 1;
   private quarantined = 0;
+  private rejected = 0;
   private opened = false;
   private opening: Promise<void> | null = null;
   private writeTail: Promise<void> = Promise.resolve();
@@ -153,6 +165,7 @@ export class BridgeOutbox {
       const stats = await lstat(path);
       if (!stats.isFile()) throw new Error('Bridge outbox quarantine candidate is not a regular file');
       await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
+      if (quarantineEntry.name.startsWith('rejected-')) this.rejected += 1;
     }
 
     const files = (await readdir(this.directory, { withFileTypes: true }))
@@ -203,6 +216,18 @@ export class BridgeOutbox {
         await this.quarantine(path, 'identity-mismatch');
         continue;
       }
+      const serialized = JSON.stringify(parsed);
+      const serializedBytes = Buffer.byteLength(serialized, 'utf8');
+      if (serializedBytes > MAX_BRIDGE_FRAME_BYTES) {
+        await unlink(path);
+        await syncDirectory(this.directory);
+        await this.writeRejectionDiagnostic(
+          asReplayableEvent(parsed),
+          serializedBytes,
+          'serialized-size-limit',
+        );
+        continue;
+      }
       if (sequences.has(sequence)) {
         await this.quarantine(path, 'duplicate-sequence');
         continue;
@@ -234,6 +259,44 @@ export class BridgeOutbox {
       this.quarantined += 1;
     } catch {
       throw new Error('Bridge outbox quarantine failed');
+    }
+  }
+
+  private async writeRejectionDiagnostic(
+    event: ReplayableBridgeEvent,
+    serializedBytes: number,
+    reason: string,
+  ): Promise<void> {
+    const diagnostic: RejectionDiagnostic = {
+      eventId: event.eventId,
+      eventKey: event.eventKey,
+      type: event.type,
+      observedAt: event.observedAt,
+      serializedBytes,
+      reason,
+    };
+    const fileName = `rejected-${Date.now()}-${randomUUID()}.json`;
+    const finalPath = join(this.directory, QUARANTINE_DIR, fileName);
+    const temporaryPath = join(
+      this.directory,
+      QUARANTINE_DIR,
+      `.${fileName}.${randomUUID()}.tmp`,
+    );
+    let handle: Awaited<ReturnType<typeof openFile>> | undefined;
+    try {
+      handle = await openFile(temporaryPath, 'wx', OWNER_FILE_MODE);
+      await handle.writeFile(JSON.stringify(diagnostic), 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      await rename(temporaryPath, finalPath);
+      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      this.rejected += 1;
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      await unlink(temporaryPath).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -289,10 +352,19 @@ export class BridgeOutbox {
     this.nextSequence = Math.max(this.nextSequence, sequence + 1);
   }
 
-  async append(event: BridgeEventEnvelope): Promise<ReplayableBridgeEvent> {
+  async append(
+    event: BridgeEventEnvelope,
+    maxSerializedBytes = MAX_BRIDGE_FRAME_BYTES,
+  ): Promise<ReplayableBridgeEvent> {
     const replayable = asReplayableEvent(event);
     await this.open();
     return this.enqueue(async () => {
+      const serialized = JSON.stringify(replayable);
+      const serializedBytes = Buffer.byteLength(serialized, 'utf8');
+      if (serializedBytes > maxSerializedBytes) {
+        await this.writeRejectionDiagnostic(replayable, serializedBytes, 'serialized-size-limit');
+        throw new Error(`serialized event exceeds ${maxSerializedBytes} bytes`);
+      }
       const existing = this.entries.get(replayable.eventId);
       if (existing) {
         if (JSON.stringify(existing.event) !== JSON.stringify(replayable)) {
@@ -310,7 +382,7 @@ export class BridgeOutbox {
       let staged = false;
       try {
         handle = await openFile(temporaryPath, 'wx', OWNER_FILE_MODE);
-        await handle.writeFile(JSON.stringify(replayable), 'utf8');
+        await handle.writeFile(serialized, 'utf8');
         await handle.sync();
         staged = true;
         await handle.close();
@@ -395,6 +467,7 @@ export class BridgeOutbox {
       pending: this.entries.size,
       nextSequence: this.nextSequence,
       quarantined: this.quarantined,
+      rejected: this.rejected,
     };
   }
 }

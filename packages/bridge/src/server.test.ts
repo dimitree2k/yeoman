@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { BridgeServer } from './server.js';
-import { PROTOCOL_VERSION, createEventEnvelope } from './protocol.js';
+import { MAX_BRIDGE_FRAME_BYTES, PROTOCOL_VERSION, createEventEnvelope } from './protocol.js';
 
 function fakeClient() {
   const messages: unknown[] = [];
@@ -49,6 +49,26 @@ function makeServer(outboxDir: string): BridgeServer {
     'default',
     outboxDir,
   );
+}
+
+function eventWithTextThatFitsSerializedLimit(textBytes: number): Record<string, unknown> {
+  const event = {
+    version: PROTOCOL_VERSION,
+    type: 'message',
+    ts: 1_700_000_000_000,
+    observedAt: 1_700_000_000_000,
+    accountId: 'default',
+    eventId: 'boundary-event-1',
+    eventKey: 'boundary-key-1',
+    payload: { messageId: 'boundary-message-1', text: '' },
+  };
+  const overhead = Buffer.byteLength(JSON.stringify(event), 'utf8');
+  let text = 'é'.repeat(Math.floor(Math.max(0, textBytes - overhead) / 2));
+  while (Buffer.byteLength(text, 'utf8') < textBytes - overhead) text += 'x';
+  while (Buffer.byteLength(text, 'utf8') > textBytes - overhead) text = text.slice(0, -1);
+  event.payload.text = text;
+  assert.equal(Buffer.byteLength(JSON.stringify(event), 'utf8'), textBytes);
+  return event;
 }
 
 test('BridgeServer dispatches delete_message to the WhatsApp client', async () => {
@@ -192,6 +212,105 @@ test('BridgeServer replays complete message metadata without binary payloads', a
     assert.deepEqual(event.payload.replyToMedia, message.replyToMedia);
     assert.equal('data' in event.payload.media, false);
     assert.equal('base64' in event.payload.media, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer accepts an event exactly at the UTF-8 serialized byte ceiling', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
+  try {
+    const server = makeServer(root);
+    const client = fakeClient();
+    const meta = clientMeta(client.ws, true);
+    (server as any).clients.add(meta);
+    (server as any).canonicalSubscriber = meta;
+    const event = eventWithTextThatFitsSerializedLimit(MAX_BRIDGE_FRAME_BYTES);
+
+    await (server as any).broadcastReplayable(event);
+
+    assert.equal((await (server as any).outbox.pending()).length, 1);
+    assert.equal(client.messages.length, 1);
+    assert.equal((server as any).intakeStopped, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer quarantines oversized text with a durable identity-only diagnostic', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
+  try {
+    const server = makeServer(root);
+    const client = fakeClient();
+    const meta = clientMeta(client.ws, true);
+    (server as any).clients.add(meta);
+    (server as any).canonicalSubscriber = meta;
+    const event = eventWithTextThatFitsSerializedLimit(MAX_BRIDGE_FRAME_BYTES);
+    (event.payload as any).text += 'x';
+
+    await assert.rejects(
+      (server as any).broadcastReplayable(event),
+      /serialized event exceeds 262144 bytes/,
+    );
+
+    assert.deepEqual(await (server as any).outbox.pending(), []);
+    assert.equal(client.messages.length, 0);
+    assert.equal((server as any).intakeStopped, true);
+    assert.equal((server as any).persistenceFailure, true);
+    assert.equal((server as any).diagnostics().outbox.rejected, 1);
+    const files = await readdir(join(root, 'quarantine'));
+    assert.equal(files.length, 1);
+    const diagnostic = JSON.parse(await readFile(join(root, 'quarantine', files[0]), 'utf8'));
+    assert.deepEqual(Object.keys(diagnostic).sort(), [
+      'eventId', 'eventKey', 'observedAt', 'reason', 'serializedBytes', 'type',
+    ]);
+    assert.equal(diagnostic.eventId, 'boundary-event-1');
+    assert.equal(diagnostic.eventKey, 'boundary-key-1');
+    assert.equal(diagnostic.type, 'message');
+    assert.equal(diagnostic.serializedBytes, MAX_BRIDGE_FRAME_BYTES + 1);
+    assert.equal(diagnostic.reason, 'serialized-size-limit');
+    assert.equal(JSON.stringify(diagnostic).includes('é'), false);
+    assert.equal(JSON.stringify(diagnostic).includes('xxx'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer quarantines oversized media metadata without a pending event or payload leak', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
+  try {
+    const server = makeServer(root);
+    const oversizedHash = 'media-hash-'.repeat(30_000);
+    await assert.rejects(
+      (server as any).broadcastMessage({
+        messageId: 'oversized-media-1',
+        chatJid: 'chat@g.us',
+        participantJid: '4915@s.whatsapp.net',
+        senderId: '4915',
+        isGroup: true,
+        text: '[Document]',
+        timestamp: 1_700_000_000,
+        mentionedJids: [],
+        mentionedBot: false,
+        replyToBot: false,
+        media: {
+          kind: 'document',
+          mimeType: 'application/pdf',
+          fileName: 'large.pdf',
+          bytes: 1,
+          sha256: oversizedHash,
+        },
+      }),
+      /serialized event exceeds 262144 bytes/,
+    );
+
+    assert.deepEqual(await (server as any).outbox.pending(), []);
+    const files = await readdir(join(root, 'quarantine'));
+    assert.equal(files.length, 1);
+    const diagnostic = await readFile(join(root, 'quarantine', files[0]), 'utf8');
+    assert.equal(diagnostic.includes(oversizedHash), false);
+    assert.equal((server as any).intakeStopped, true);
+    assert.equal((server as any).persistenceFailure, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

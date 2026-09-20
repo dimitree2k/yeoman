@@ -19,6 +19,7 @@ import {
   parseSendMediaPayload,
   parseSendPollPayload,
   parseSendTextPayload,
+  MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
   type BridgeEventEnvelope,
   type ProtocolError,
@@ -41,7 +42,7 @@ type ClientMeta = {
   acknowledgedEventIds: Set<string>;
 };
 
-const MAX_COMMAND_BYTES = 256 * 1024;
+const MAX_COMMAND_BYTES = MAX_BRIDGE_FRAME_BYTES;
 const MAX_INFLIGHT_PER_CLIENT = 20;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 

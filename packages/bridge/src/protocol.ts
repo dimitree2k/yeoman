@@ -1,4 +1,5 @@
 export const PROTOCOL_VERSION = 5 as const;
+export const MAX_BRIDGE_FRAME_BYTES = 262_144 as const;
 
 export const REPLAYABLE_EVENT_TYPES = [
   'message',

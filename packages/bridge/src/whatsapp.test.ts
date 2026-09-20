@@ -147,12 +147,14 @@ test('inbound text is not truncated at 8000 characters', async () => {
 
 test('media-only inbound messages carry metadata without binary payloads', () => {
   const client = testClient();
+  const providerHash = Buffer.alloc(32, 0xab);
   const extracted = (client as any).extractMessageTextAndMedia({
     message: {
       documentMessage: {
         mimetype: 'application/pdf',
         fileName: 'report.pdf',
         fileLength: '42',
+        fileSha256: providerHash,
       },
     },
   });
@@ -163,6 +165,7 @@ test('media-only inbound messages carry metadata without binary payloads', () =>
     mimeType: 'application/pdf',
     fileName: 'report.pdf',
     bytes: 42,
+    sha256: providerHash.toString('hex'),
   });
   assert.equal('data' in extracted.media, false);
   assert.equal('base64' in extracted.media, false);
@@ -177,7 +180,7 @@ test('PDF extraction is not attempted and the envelope only contains caption met
         fileName: 'report.pdf',
         caption: 'Please review page one',
         fileLength: 128,
-        fileSha256: Buffer.from('provider-hash'),
+        fileSha256: Uint8Array.from(Buffer.alloc(32, 0xcd)),
       },
     },
   });
@@ -188,6 +191,7 @@ test('PDF extraction is not attempted and the envelope only contains caption met
     mimeType: 'application/pdf',
     fileName: 'report.pdf',
     bytes: 128,
+    sha256: 'cd'.repeat(32),
   });
   assert.equal(Object.keys(extracted.media).some((key) => /data|buffer|base64|text/i.test(key)), false);
 });

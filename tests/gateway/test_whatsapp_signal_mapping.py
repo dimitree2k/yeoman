@@ -16,6 +16,7 @@ from yeoman_gateway.processing.signals import (
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import WhatsAppConfig
 from yeoman_shared.whatsapp_protocol import (
+    MAX_BRIDGE_FRAME_BYTES,
     MEDIA_METADATA_FIELDS,
     PROTOCOL_VERSION,
     REPLAYABLE_EVENT_TYPES,
@@ -52,6 +53,7 @@ def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None
 
 def test_v5_payload_constants_match_supported_event_and_media_shapes() -> None:
     assert REPLAYABLE_EVENT_TYPES == frozenset({"message", "edit", "delete", "reaction", "receipt"})
+    assert MAX_BRIDGE_FRAME_BYTES == 262_144
     assert MEDIA_METADATA_FIELDS == frozenset(
         {"kind", "mimeType", "fileName", "bytes", "path", "ref", "sha256", "hash"}
     )
