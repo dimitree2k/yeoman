@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 4 as const;
+export const PROTOCOL_VERSION = 5 as const;
 
 const TOKEN_JSON_RE = /("token"\s*:\s*")[^"]*(")/gi;
 const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
@@ -15,6 +15,8 @@ export type BridgeCommandType =
   | 'login_wait'
   | 'logout'
   | 'lookup_message'
+  | 'subscribe_events'
+  | 'ack_event'
   | 'health';
 
 export type BridgeEventType =
@@ -107,6 +109,14 @@ export interface LookupMessagePayload {
   messageId: string;
 }
 
+export interface SubscribeEventsPayload {
+  [k: string]: never;
+}
+
+export interface AckEventPayload {
+  eventId: string;
+}
+
 /**
  * Answer about one provider message. ``found`` comes from a proven local source only;
  * ``unsupported`` means the bridge has no authority to answer (it is never a claim that
@@ -136,6 +146,9 @@ export interface BridgeEventEnvelope {
   type: BridgeEventType;
   ts: number;
   accountId: string;
+  eventId?: string;
+  eventKey?: string;
+  observedAt?: number;
   requestId?: string;
   payload: Record<string, unknown>;
 }
@@ -315,6 +328,16 @@ function parseLoginWait(payload: Record<string, unknown>): LoginWaitPayload | nu
   return { timeoutMs };
 }
 
+function parseSubscribeEvents(payload: Record<string, unknown>): SubscribeEventsPayload | null {
+  return Object.keys(payload).length === 0 ? {} : null;
+}
+
+function parseAckEvent(payload: Record<string, unknown>): AckEventPayload | null {
+  if (Object.keys(payload).length !== 1) return null;
+  const eventId = asString(payload.eventId);
+  return eventId ? { eventId } : null;
+}
+
 export function parseBridgeCommand(
   value: unknown,
 ): { ok: true; command: BridgeCommandEnvelope } | { ok: false; error: ProtocolError } {
@@ -359,6 +382,8 @@ export function parseBridgeCommand(
   else if (typed === 'list_groups') validPayload = Boolean(parseListGroups(payload));
   else if (typed === 'login_start') validPayload = Boolean(parseLoginStart(payload));
   else if (typed === 'login_wait') validPayload = Boolean(parseLoginWait(payload));
+  else if (typed === 'subscribe_events') validPayload = Boolean(parseSubscribeEvents(payload));
+  else if (typed === 'ack_event') validPayload = Boolean(parseAckEvent(payload));
   else if (typed === 'logout' || typed === 'health') validPayload = true;
   else return err('ERR_UNSUPPORTED', `Unsupported command: ${type}`);
 
@@ -433,9 +458,24 @@ export function parseLoginWaitPayload(payload: Record<string, unknown>): LoginWa
   return parsed;
 }
 
+export function parseSubscribeEventsPayload(payload: Record<string, unknown>): SubscribeEventsPayload {
+  const parsed = parseSubscribeEvents(payload);
+  if (!parsed) throw new Error('Invalid subscribe_events payload');
+  return parsed;
+}
+
+export function parseAckEventPayload(payload: Record<string, unknown>): AckEventPayload {
+  const parsed = parseAckEvent(payload);
+  if (!parsed) throw new Error('Invalid ack_event payload');
+  return parsed;
+}
+
 export function createEventEnvelope(params: {
   type: BridgeEventType;
   accountId?: string;
+  eventId?: string;
+  eventKey?: string;
+  observedAt?: number;
   requestId?: string;
   payload?: Record<string, unknown>;
 }): BridgeEventEnvelope {
@@ -444,6 +484,9 @@ export function createEventEnvelope(params: {
     type: params.type,
     ts: Date.now(),
     accountId: params.accountId ?? 'default',
+    eventId: params.eventId,
+    eventKey: params.eventKey,
+    observedAt: params.observedAt,
     requestId: params.requestId,
     payload: params.payload ?? {},
   };

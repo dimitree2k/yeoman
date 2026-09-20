@@ -9,11 +9,31 @@ import {
 } from './protocol.js';
 
 test('protocol version gates deterministic message ids', () => {
-  // v4 adds the edit/delete/reaction/receipt signals and lookup_message.
-  assert.equal(PROTOCOL_VERSION, 4);
+  // v5 adds the authenticated event subscription and durable event ACKs.
+  assert.equal(PROTOCOL_VERSION, 5);
 });
 
-test('parseBridgeCommand accepts valid v3 command', () => {
+test('parseBridgeCommand accepts event subscription and exact ACK commands', () => {
+  const subscribe = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'subscribe_events',
+    token: 'secret',
+    requestId: 'req-subscribe',
+    payload: {},
+  });
+  const ack = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'ack_event',
+    token: 'secret',
+    requestId: 'req-ack',
+    payload: { eventId: 'event-1' },
+  });
+
+  assert.equal(subscribe.ok, true);
+  assert.equal(ack.ok, true);
+});
+
+test('parseBridgeCommand accepts a valid command', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,
     type: 'send_text',

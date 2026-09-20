@@ -10,6 +10,7 @@ import {
   isLoopbackAddress,
   parseBridgeCommand,
   parseDeleteMessagePayload,
+  parseAckEventPayload,
   parseListGroupsPayload,
   parseLoginStartPayload,
   parseLoginWaitPayload,
@@ -22,12 +23,20 @@ import {
   type BridgeEventEnvelope,
   type ProtocolError,
 } from './protocol.js';
+import {
+  BridgeOutbox,
+  defaultBridgeOutboxDir,
+  type ReplayableBridgeEvent,
+} from './outbox.js';
 import { WhatsAppClient, type InboundMessageV2 } from './whatsapp.js';
 
 type ClientMeta = {
   ws: WebSocket;
   inflight: number;
   droppedEvents: number;
+  subscribed: boolean;
+  replaying: boolean;
+  replayQueue: ReplayableBridgeEvent[];
 };
 
 const MAX_COMMAND_BYTES = 256 * 1024;
@@ -67,6 +76,7 @@ export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private readonly clients = new Set<ClientMeta>();
+  private readonly outbox: BridgeOutbox;
 
   constructor(
     private readonly host: string,
@@ -82,9 +92,13 @@ export class BridgeServer {
     private readonly buildId: string,
     private readonly readReceipts: boolean,
     private readonly accountId = 'default',
-  ) {}
+    outboxDir = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir(),
+  ) {
+    this.outbox = new BridgeOutbox(outboxDir);
+  }
 
   async start(): Promise<void> {
+    await this.outbox.open();
     this.wss = new WebSocketServer({
       host: this.host,
       port: this.port,
@@ -102,9 +116,11 @@ export class BridgeServer {
       acceptFromMe: this.acceptFromMe,
       readReceipts: this.readReceipts,
       accountId: this.accountId,
-      onMessage: (msg) => this.broadcastMessage(msg),
+      onMessage: (msg) => {
+        void this.broadcastMessage(msg);
+      },
       onSignal: (kind, payload) =>
-        this.broadcastEvent(
+        void this.broadcastReplayable(
           createEventEnvelope({ type: kind, accountId: this.accountId, payload }),
         ),
       onQR: (qr) =>
@@ -153,7 +169,14 @@ export class BridgeServer {
         return;
       }
 
-      const meta: ClientMeta = { ws, inflight: 0, droppedEvents: 0 };
+      const meta: ClientMeta = {
+        ws,
+        inflight: 0,
+        droppedEvents: 0,
+        subscribed: false,
+        replaying: false,
+        replayQueue: [],
+      };
       this.clients.add(meta);
 
       ws.on('message', async (data) => {
@@ -185,10 +208,12 @@ export class BridgeServer {
       });
 
       ws.on('close', () => {
+        meta.subscribed = false;
         this.clients.delete(meta);
       });
 
       ws.on('error', () => {
+        meta.subscribed = false;
         this.clients.delete(meta);
       });
     });
@@ -227,6 +252,35 @@ export class BridgeServer {
           requestId: cmd.requestId,
           accountId: this.accountId,
           error: protocolError('ERR_AUTH', 'Invalid bridge token', false),
+        }),
+      );
+      return;
+    }
+
+    if (cmd.type === 'subscribe_events') {
+      const alreadySubscribed = meta.subscribed;
+      meta.subscribed = true;
+      this.sendToClient(
+        meta,
+        createOkResponse({
+          requestId: cmd.requestId,
+          accountId: this.accountId,
+          result: { subscribed: true },
+        }),
+      );
+      if (!alreadySubscribed) await this.replayToClient(meta);
+      return;
+    }
+
+    if (cmd.type === 'ack_event') {
+      const { eventId } = parseAckEventPayload(cmd.payload);
+      const acknowledged = await this.outbox.ack(eventId);
+      this.sendToClient(
+        meta,
+        createOkResponse({
+          requestId: cmd.requestId,
+          accountId: this.accountId,
+          result: { acknowledged },
         }),
       );
       return;
@@ -406,14 +460,15 @@ export class BridgeServer {
           droppedInboundDuplicates: waHealth.droppedInboundDuplicates,
           dedupeCacheSize: waHealth.dedupeCacheSize,
         },
+        outbox: this.outbox.diagnostics(),
       };
     }
 
     throw protocolError('ERR_UNSUPPORTED', `Unsupported command: ${type}`, false);
   }
 
-  private broadcastMessage(msg: InboundMessageV2): void {
-    this.broadcastEvent(
+  private async broadcastMessage(msg: InboundMessageV2): Promise<void> {
+    await this.broadcastReplayable(
       createEventEnvelope({
         type: 'message',
         accountId: this.accountId,
@@ -452,6 +507,44 @@ export class BridgeServer {
   private broadcastEvent(event: BridgeEventEnvelope): void {
     for (const meta of this.clients) {
       this.sendToClient(meta, event);
+    }
+  }
+
+  private async broadcastReplayable(event: BridgeEventEnvelope): Promise<void> {
+    let persisted: ReplayableBridgeEvent;
+    try {
+      persisted = await this.outbox.append(event);
+    } catch {
+      console.error('Bridge event persistence failed');
+      return;
+    }
+
+    for (const meta of this.clients) {
+      if (!meta.subscribed) continue;
+      if (meta.replaying) {
+        meta.replayQueue.push(persisted);
+      } else {
+        this.sendToClient(meta, persisted);
+      }
+    }
+  }
+
+  private async replayToClient(meta: ClientMeta): Promise<void> {
+    meta.replaying = true;
+    const sent = new Set<string>();
+    try {
+      for (const event of await this.outbox.pending()) {
+        if (!meta.subscribed || !this.clients.has(meta)) return;
+        sent.add(event.eventId);
+        this.sendToClient(meta, event);
+      }
+    } finally {
+      meta.replaying = false;
+      const queued = meta.replayQueue.splice(0);
+      if (!meta.subscribed || !this.clients.has(meta)) return;
+      for (const event of queued) {
+        if (!sent.has(event.eventId)) this.sendToClient(meta, event);
+      }
     }
   }
 
