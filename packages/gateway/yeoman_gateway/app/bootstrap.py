@@ -1925,8 +1925,10 @@ def build_gateway_runtime(
     speakup_log = None
     speakup_approval_store = None
     activation_tracker = None
-    if social_runtime_enabled or (
-        pending_participation_recovery and speakup_path.is_file()
+    if (
+        social_runtime_enabled
+        or config.persona_evolution.enabled
+        or (pending_participation_recovery and speakup_path.is_file())
     ):
         from yeoman_gateway.consciousness.log import SpeakupLog
         from yeoman_gateway.consciousness.participation_runtime import (

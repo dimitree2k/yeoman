@@ -70,6 +70,7 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
     config = Config.model_validate(
         {
             "consciousness": {"enabled": True},
+            "personaEvolution": {"enabled": False},
             "processing": {"enabled": False, "participation": {"enabled": False}},
             "security": {"enabled": False},
         }
@@ -87,6 +88,46 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         assert runtime.speakup_log is None
         assert not hasattr(runtime, "consciousness")
     finally:
+        runtime.inbound_archive.close()
+        runtime.chat_registry.close()
+        runtime.contacts.close()
+        runtime.memory.close()
+
+
+def test_persona_evolution_keeps_historical_speakup_log_without_participation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical social evidence stays readable after the old generator is removed."""
+
+    class _NeverProvider:
+        async def chat(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("opening historical evidence must not call an LLM")
+
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    config = Config.model_validate(
+        {
+            "consciousness": {"enabled": False},
+            "personaEvolution": {"enabled": True},
+            "processing": {"enabled": False, "participation": {"enabled": False}},
+            "security": {"enabled": False},
+        }
+    )
+    runtime = build_gateway_runtime(
+        config=config,
+        provider=_NeverProvider(),  # type: ignore[arg-type]
+        policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path),
+        policy_path=None,
+        workspace=tmp_path / "workspace",
+        bus=MessageBus(),
+    )
+    try:
+        assert runtime.speakup_log is not None
+    finally:
+        if runtime.speakup_log is not None:
+            runtime.speakup_log.close()
         runtime.inbound_archive.close()
         runtime.chat_registry.close()
         runtime.contacts.close()
