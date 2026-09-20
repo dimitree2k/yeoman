@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     DAY_MS,
     CanonicalEvent,
     DecisionRecord,
@@ -164,6 +165,28 @@ def test_long_payload_roundtrip_keeps_canonical_json_bytes(tmp_path):
     db.close()
 
 
+def test_store_normalizes_revision_in_payload_and_column(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:revision",
+        event_id="revision-1",
+        trace_id="trace-revision",
+        payload={"kind": "edit", "channel": "whatsapp", "revision": "4"},
+    )
+    stored = db.get_event("revision-1")
+    assert stored is not None and stored.revision == 4
+    assert stored.payload is not None and stored.payload["revision"] == 4
+
+    with pytest.raises(ValueError):
+        db.append_event(
+            event_key="wa:revision-invalid",
+            event_id="revision-invalid",
+            trace_id="trace-revision",
+            payload={"kind": "edit", "revision": 0},
+        )
+    db.close()
+
+
 def test_missing_reference_stays_unresolved_and_is_never_invented(tmp_path):
     db = ProcessingStore(tmp_path / "processing.db")
     db.append_event(
@@ -295,6 +318,43 @@ def test_purge_drops_old_metadata_but_protects_unresolved(tmp_path):
     db.purge(now_ms=now + 91 * DAY_MS)
     assert db.get_event("e-unresolved") is None
     assert db.unresolved_relations() == ()
+    db.close()
+
+
+def test_retention_exempts_only_marked_canonical_whatsapp_events(tmp_path):
+    now = 1_700_000_000_000
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:canonical",
+        event_id="wa-canonical",
+        trace_id="trace-canonical",
+        payload={
+            "kind": "message",
+            "origin": CANONICAL_WHATSAPP_ORIGIN,
+            "channel": "whatsapp",
+            "text": "canonical",
+        },
+        now_ms=now,
+    )
+    db.append_event(
+        event_key="wa:operational",
+        event_id="wa-operational",
+        trace_id="trace-operational",
+        payload={
+            "kind": "message",
+            "origin": "whatsapp_bridge",
+            "channel": "whatsapp",
+            "text": "operational",
+        },
+        now_ms=now,
+    )
+
+    db.purge(now_ms=now + 31 * DAY_MS)
+
+    canonical = db.get_event("wa-canonical")
+    assert canonical is not None and canonical.payload is not None
+    operational = db.get_event("wa-operational")
+    assert operational is None
     db.close()
 
 

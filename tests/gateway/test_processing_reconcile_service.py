@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from yeoman_gateway.processing.effects import EffectGateway
@@ -315,6 +316,11 @@ async def test_service_factory_is_inert_when_processing_is_disabled(tmp_path: Pa
 
     disabled = Config()
     assert build_reconciliation_service(disabled, None) is None  # no store, no DB, no task
+    with patch.dict("os.environ", {"YEOMAN_HOME": str(tmp_path)}):
+        disabled_store = build_processing_store(disabled)
+    assert disabled_store is not None
+    assert build_reconciliation_service(disabled, disabled_store) is None
+    disabled_store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
     with patch.dict("os.environ", {"YEOMAN_HOME": str(tmp_path)}):
@@ -325,6 +331,41 @@ async def test_service_factory_is_inert_when_processing_is_disabled(tmp_path: Pa
     assert service.running is False  # built, not started
     await service.stop()  # a stop without a start is a no-op
     store.close()
+
+
+def test_disabled_processing_does_not_build_dependent_research_store(tmp_path: Path) -> None:
+    from yeoman_gateway.app.bootstrap import (
+        _build_participation_receipt_projection,
+        _build_participation_runtime,
+        build_a2a_research_store,
+        build_processing_store,
+    )
+    from yeoman_shared.config.schema import Config
+
+    disabled = Config()
+    enabled = Config.model_validate({"processing": {"enabled": True}})
+    with patch.dict("os.environ", {"YEOMAN_HOME": str(tmp_path)}):
+        disabled_store = build_processing_store(disabled)
+        enabled_store = build_processing_store(enabled)
+    assert disabled_store is not None and enabled_store is not None
+    assert build_a2a_research_store(disabled, disabled_store) is None
+    assert _build_participation_receipt_projection(
+        disabled, log=object(), store=disabled_store, inbound_archive=object()
+    ) == (None, None)
+    assert _build_participation_runtime(
+        config=disabled,
+        source_owner=None,
+        log=None,
+        policy_engine=None,
+        inbound_archive=None,
+        processing_store=disabled_store,
+        responder=None,
+        policy_adapter=None,
+    ) == (None, None, None)
+    research = build_a2a_research_store(enabled, enabled_store)
+    assert research is not None
+    disabled_store.close()
+    enabled_store.close()
 
 
 @pytest.mark.asyncio

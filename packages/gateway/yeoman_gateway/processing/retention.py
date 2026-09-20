@@ -13,6 +13,7 @@ sweep is logged and retried on the next interval; it never ends the loop.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -44,6 +45,7 @@ class ProcessingRetentionService:
         self._interval_seconds = max(0.05, float(interval_seconds))
         self._startup_delay_seconds = max(0.0, float(startup_delay_seconds))
         self._task: asyncio.Task[None] | None = None
+        self._inflight_done: threading.Event | None = None
         self._stopping = False
         self._sweeps = 0
         self._failures = 0
@@ -60,13 +62,15 @@ class ProcessingRetentionService:
         self._stopping = True
         task = self._task
         self._task = None
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        inflight = self._inflight_done
+        while inflight is not None and not inflight.is_set():
+            await asyncio.sleep(0.01)
 
     @property
     def running(self) -> bool:
@@ -78,13 +82,48 @@ class ProcessingRetentionService:
     # -- work --------------------------------------------------------------------------
 
     async def sweep_once(self) -> PurgeReport:
-        """Run one retention pass.
+        """Run one retention pass off the event loop.
 
-        ``ProcessingStore`` serializes its short SQLite transaction internally. Calling
-        that transaction directly also keeps lifecycle shutdown deterministic for callers
-        that use ``asyncio.run`` (the retention loop is already a low-frequency task).
+        A private one-worker executor keeps SQLite work off the message loop while making
+        shutdown explicit. Cancellation never abandons an in-flight purge: the operation
+        is awaited before the executor is closed.
         """
-        report = self._store.purge(now_ms=self._clock())
+        if self._stopping:
+            raise RuntimeError("processing retention service is stopping")
+        done = threading.Event()
+        result: list[PurgeReport] = []
+        error: list[BaseException] = []
+
+        def _run_purge() -> None:
+            try:
+                report = self._store.purge(now_ms=self._clock())
+            except BaseException as exc:
+                error.append(exc)
+            else:
+                result.append(report)
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_run_purge,
+            name="yeoman-processing-retention",
+            daemon=True,
+        ).start()
+        self._inflight_done = done
+        try:
+            while not done.is_set():
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            while not done.is_set():
+                await asyncio.sleep(0.01)
+            raise
+        finally:
+            if self._inflight_done is done:
+                self._inflight_done = None
+        if error:
+            raise error[0]
+        assert result
+        report = result[0]
         self._sweeps += 1
         _log_report(report)
         return report

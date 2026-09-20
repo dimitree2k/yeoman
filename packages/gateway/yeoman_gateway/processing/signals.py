@@ -24,12 +24,12 @@ from loguru import logger
 from yeoman_shared.whatsapp_protocol import MEDIA_METADATA_FIELDS
 
 from yeoman_gateway.processing.models import (
-    DELIVERED_STATUSES_TUPLE as _DELIVERED,
-)
-from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     TransportReceipt,
     canonical_hash,
+    normalize_revision,
 )
+from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE as _DELIVERED
 
 CHANNEL = "whatsapp"
 
@@ -79,7 +79,7 @@ class JournalSignal:
         """Mapping the journal stores; references travel so relations can resolve later."""
         body: dict[str, Any] = {
             "kind": self.kind,
-            "origin": "whatsapp_bridge",
+            "origin": CANONICAL_WHATSAPP_ORIGIN,
             "principal": self.principal,
             "channel": self.channel,
             "chat_id": self.chat_id,
@@ -183,14 +183,13 @@ def _media_metadata(value: Any) -> dict[str, Any] | None:
     return result or None
 
 
-def _revision(value: Any) -> int | str | None:
-    if isinstance(value, bool) or value is None:
+def _revision(value: Any, *, strict: bool = False) -> int | None:
+    try:
+        return normalize_revision(value, default=None)
+    except ValueError:
+        if strict:
+            raise
         return None
-    if isinstance(value, int) and value >= 0:
-        return value
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
 
 
 class WhatsAppSignalMapper:
@@ -208,6 +207,7 @@ class WhatsAppSignalMapper:
         event_key: str | None = None,
         account: str | None = None,
         observed_at_ms: int | None = None,
+        strict: bool = False,
     ) -> JournalSignal | None:
         if kind not in SIGNAL_KINDS:
             raise ValueError(f"unknown signal kind: {kind}")
@@ -219,9 +219,9 @@ class WhatsAppSignalMapper:
             return None
 
         if kind == "message":
-            signal = self._message(payload, chat_id)
+            signal = self._message(payload, chat_id, strict=strict)
         elif kind == "edit":
-            signal = self._edit(payload, chat_id)
+            signal = self._edit(payload, chat_id, strict=strict)
         elif kind == "delete":
             signal = self._delete(payload, chat_id)
         elif kind == "reaction":
@@ -241,7 +241,9 @@ class WhatsAppSignalMapper:
 
     # -- kinds -------------------------------------------------------------------------
 
-    def _message(self, payload: Mapping[str, Any], chat_id: str) -> JournalSignal | None:
+    def _message(
+        self, payload: Mapping[str, Any], chat_id: str, *, strict: bool = False
+    ) -> JournalSignal | None:
         message_id = _first(payload, "messageId", "message_id", "id")
         if not message_id:
             return None
@@ -278,7 +280,9 @@ class WhatsAppSignalMapper:
             target_message_id=body["reply_to_message_id"],
         )
 
-    def _edit(self, payload: Mapping[str, Any], chat_id: str) -> JournalSignal | None:
+    def _edit(
+        self, payload: Mapping[str, Any], chat_id: str, *, strict: bool = False
+    ) -> JournalSignal | None:
         message_id = _first(payload, "messageId", "message_id", "id")
         if not message_id:
             return None
@@ -286,7 +290,7 @@ class WhatsAppSignalMapper:
         revision_raw = payload.get("revision")
         if revision_raw is None:
             revision_raw = payload.get("editRevision")
-        revision = _revision(revision_raw)
+        revision = _revision(revision_raw, strict=strict)
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
         event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{revision if revision is not None else edit_ms or 0}"
         body: dict[str, Any] = {"text": _raw_text(payload, "text", "content") or ""}
@@ -492,7 +496,16 @@ class SignalJournalSink:
         must fail closed instead of looking like a successful no-op. The legacy callable
         path keeps its historical ``None`` result for malformed provider signals.
         """
+        if strict and (
+            not isinstance(event_id, str)
+            or not event_id.strip()
+            or not isinstance(event_key, str)
+            or not event_key.strip()
+        ):
+            raise ValueError("strict capture requires non-empty event identity")
         if self._store is None:
+            if strict:
+                raise ValueError("strict capture requires a processing store")
             return None
         signal = self._mapper.map(
             payload,
@@ -501,6 +514,7 @@ class SignalJournalSink:
             event_key=event_key,
             account=account,
             observed_at_ms=observed_at_ms,
+            strict=strict,
         )
         if signal is None:
             if strict:

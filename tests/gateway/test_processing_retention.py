@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
 
 from yeoman_gateway.app.bootstrap import build_retention_service
-from yeoman_gateway.processing.models import DAY_MS, PurgeReport
+from yeoman_gateway.processing.models import CANONICAL_WHATSAPP_ORIGIN, DAY_MS, PurgeReport
 from yeoman_gateway.processing.retention import ProcessingRetentionService
 from yeoman_gateway.processing.store import ProcessingStore
 
@@ -32,6 +34,22 @@ class _FailingStore:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("database is locked")
+        return PurgeReport()
+
+
+class _SlowStore:
+    def __init__(self, delay_seconds: float = 0.2) -> None:
+        self.delay_seconds = delay_seconds
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self.calls = 0
+
+    def purge(self, *, now_ms: int) -> PurgeReport:
+        del now_ms
+        self.calls += 1
+        self.started.set()
+        time.sleep(self.delay_seconds)
+        self.finished.set()
         return PurgeReport()
 
 
@@ -77,7 +95,12 @@ def test_sweep_exempts_canonical_whatsapp_events_but_not_operational_events(tmp_
         event_key="wa:old",
         event_id="wa-old",
         trace_id="trace-wa",
-        payload={"kind": "message", "channel": "whatsapp", "text": "canonical"},
+        payload={
+            "kind": "message",
+            "origin": CANONICAL_WHATSAPP_ORIGIN,
+            "channel": "whatsapp",
+            "text": "canonical",
+        },
         now_ms=NOW,
     )
     store.append_event(
@@ -137,6 +160,45 @@ def test_start_is_idempotent_and_stop_without_start_is_safe() -> None:
         await service.start()
         assert service._task is first, "a second start must not spawn a second loop"
         await service.stop()
+        assert service.running is False
+
+    asyncio.run(scenario())
+
+
+def test_sweep_runs_off_event_loop() -> None:
+    store = _SlowStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        ticks: list[float] = []
+
+        async def ticker() -> None:
+            while not store.finished.is_set():
+                await asyncio.sleep(0.02)
+                ticks.append(asyncio.get_running_loop().time())
+
+        tick_task = asyncio.create_task(ticker())
+        await service.sweep_once()
+        await tick_task
+
+        assert store.calls == 1
+        assert ticks, "a slow purge must not block the event loop"
+        await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stop_waits_for_an_inflight_sweep_before_shutdown() -> None:
+    store = _SlowStore(delay_seconds=0.05)
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        while not store.started.is_set():
+            await asyncio.sleep(0.005)
+        await service.stop()
+        assert store.finished.is_set()
+        await sweep
         assert service.running is False
 
     asyncio.run(scenario())

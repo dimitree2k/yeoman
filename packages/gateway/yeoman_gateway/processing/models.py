@@ -44,6 +44,7 @@ DecisionOutcome = Literal["allow", "deny"]
 DecisionStage = Literal["fast", "final", "admin"]
 
 EVENT_KINDS: tuple[str, ...] = ("message", "edit", "reaction", "delete", "receipt")
+CANONICAL_WHATSAPP_ORIGIN = "whatsapp_canonical"
 EFFECT_STATES: tuple[str, ...] = (
     "planned",
     "queued",
@@ -99,6 +100,26 @@ def canonical_json(value: Any) -> str:
 def canonical_hash(value: Any) -> str:
     """Deterministic SHA-256 over the canonical JSON form of *value*."""
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def normalize_revision(value: Any, *, default: int | None = 1) -> int | None:
+    """Normalize a positive integer revision without accepting bools or floats."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError("revision must be a positive integer")
+    if isinstance(value, int):
+        if value >= 1:
+            return value
+        raise ValueError("revision must be a positive integer")
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = int(value.strip(), 10)
+        except ValueError as exc:
+            raise ValueError("revision must be a positive integer") from exc
+        if parsed >= 1:
+            return parsed
+    raise ValueError("revision must be a positive integer")
 
 
 # --------------------------------------------------------------------------------------
@@ -361,8 +382,9 @@ class CanonicalEvent:
             raise ValueError(f"unknown canonical event kind: {self.kind}")
         if self.direction not in ("in", "out"):
             raise ValueError(f"unknown canonical event direction: {self.direction}")
-        if self.revision < 1:
-            raise ValueError("canonical event revision must be positive")
+        normalized_revision = normalize_revision(self.revision)
+        assert normalized_revision is not None
+        object.__setattr__(self, "revision", normalized_revision)
 
     @property
     def payload_available(self) -> bool:

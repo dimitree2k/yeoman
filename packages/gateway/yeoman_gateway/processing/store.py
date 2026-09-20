@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from yeoman_gateway.processing.models import (
+    CANONICAL_WHATSAPP_ORIGIN,
     CLAIMABLE_EFFECT_STATES,
     EFFECT_STATES,
     TURN_STATES,
@@ -59,6 +60,7 @@ from yeoman_gateway.processing.models import (
     TurnStateError,
     canonical_hash,
     canonical_json,
+    normalize_revision,
     payload_from_mapping,
     payload_to_mapping,
     validate_transition,
@@ -846,7 +848,10 @@ class ProcessingStore:
                 chat_id=payload.chat_id,
                 account=payload.account if account is None else str(account),
                 direction=payload.direction if direction is None else str(direction),
-                revision=payload.revision if revision is None else int(revision),
+                revision=normalize_revision(
+                    payload.revision if revision is None else revision, default=1
+                )
+                or 1,
                 audience_ref=payload.audience_ref if audience_ref is None else audience_ref,
                 occurred_ms=payload.occurred_ms,
                 created_ms=created_ms,
@@ -860,6 +865,10 @@ class ProcessingStore:
         if not isinstance(payload, Mapping):
             raise TypeError("event payload must be a CanonicalEvent or a mapping")
         body = dict(payload)
+        normalized_revision = normalize_revision(body.get("revision"), default=1)
+        assert normalized_revision is not None
+        if "revision" in body:
+            body["revision"] = normalized_revision
         return CanonicalEvent(
             event_id=event_id,
             event_key=event_key,
@@ -875,7 +884,10 @@ class ProcessingStore:
                 else body.get("account") or body.get("account_id") or ""
             ),
             direction=str(direction if direction is not None else body.get("direction") or "in"),
-            revision=int(revision if revision is not None else body.get("revision") or 1),
+            revision=normalize_revision(
+                revision if revision is not None else body.get("revision"), default=1
+            )
+            or 1,
             audience_ref=(
                 audience_ref
                 if audience_ref is not None
@@ -2944,9 +2956,9 @@ class ProcessingStore:
                 """
                 UPDATE events SET payload_json = NULL, payload_purged_ms = ?
                  WHERE payload_json IS NOT NULL AND created_ms <= ?
-                   AND channel <> 'whatsapp'
+                   AND NOT (channel = 'whatsapp' AND origin = ?)
                 """,
-                (now_ms, payload_cutoff),
+                (now_ms, payload_cutoff, CANONICAL_WHATSAPP_ORIGIN),
             )
             event_payloads_purged = int(cursor.rowcount or 0)
 
@@ -2966,7 +2978,7 @@ class ProcessingStore:
                 """
                 DELETE FROM events
                  WHERE created_ms <= :metadata
-                   AND channel <> 'whatsapp'
+                   AND NOT (channel = 'whatsapp' AND origin = :canonical_origin)
                    AND NOT (
                      created_ms > :unresolved
                      AND event_id IN (
@@ -2974,7 +2986,11 @@ class ProcessingStore:
                      )
                    )
                 """,
-                {"metadata": metadata_cutoff, "unresolved": unresolved_cutoff},
+                {
+                    "metadata": metadata_cutoff,
+                    "unresolved": unresolved_cutoff,
+                    "canonical_origin": CANONICAL_WHATSAPP_ORIGIN,
+                },
             )
             events_deleted = int(cursor.rowcount or 0)
             relations_after = int(

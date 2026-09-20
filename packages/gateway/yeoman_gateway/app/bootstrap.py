@@ -844,7 +844,11 @@ def _build_participation_runtime(
     leaves the new path absent rather than falling back to an unguarded one.
     """
     participation = getattr(config.processing, "participation", None)
-    if participation is None or not bool(getattr(participation, "enabled", False)):
+    if (
+        not config.processing.enabled
+        or participation is None
+        or not bool(getattr(participation, "enabled", False))
+    ):
         return None, None, None
     from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
     from yeoman_gateway.consciousness.opportunities import OpportunityScheduler
@@ -1407,6 +1411,8 @@ def build_reconciliation_service(
 
     Disabled mode stays inert: no store, no database and no background task.
     """
+    if not config.processing.enabled:
+        return None
     if store is None and project_participation_receipts is None:
         return None
 
@@ -1436,7 +1442,7 @@ def _build_participation_receipt_projection(
     store: "ProcessingStore | None",
     inbound_archive: object,
 ) -> tuple[object | None, Callable[[], Awaitable[object]] | None]:
-    if log is None:
+    if log is None or not config.processing.enabled:
         return None, None
     from yeoman_gateway.consciousness.delivery import ParticipationReceiptReconciler
 
@@ -1457,6 +1463,18 @@ def _build_participation_receipt_projection(
     if callable(feedback):
         feedback(_archive_feedback_reader(inbound_archive, reconciler))
     return reconciler, _project
+
+
+def build_a2a_research_store(
+    config: "Config", processing_store: "ProcessingStore | None"
+):
+    """Build the detached research ledger only with processing features enabled."""
+    if processing_store is None or not config.processing.enabled:
+        return None
+    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
+
+    path = sibling_path(processing_store)
+    return A2AResearchStore(path) if path else None
 
 
 def build_retention_service(
@@ -2383,10 +2401,7 @@ def build_gateway_runtime(
         _release_participation_chat,
     )
 
-    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
-
-    research_path = sibling_path(processing_store)
-    research_reports = A2AResearchStore(research_path) if research_path else None
+    research_reports = build_a2a_research_store(config, processing_store)
 
     def _lookup_quoted_report(event: InboundEvent) -> str | None:
         if research_reports is None:
@@ -3308,7 +3323,7 @@ def build_gateway_runtime(
             _decision_runtime = None
         participation_maintenance = None
         maintenance_config = getattr(config.processing, "participation_maintenance", None)
-        if maintenance_config is not None and bool(
+        if config.processing.enabled and maintenance_config is not None and bool(
             getattr(maintenance_config, "enabled", False)
         ):
             from yeoman_gateway.consciousness.participation_maintenance import (

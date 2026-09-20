@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.processing.signals import (
@@ -157,6 +158,70 @@ def test_edit_preserves_replacement_text_and_revision() -> None:
     body = signal.to_event_payload()
     assert body["text"] == "replacement text"
     assert body["revision"] == 3
+
+
+def test_edit_revision_is_normalized_in_payload_and_signal_metadata() -> None:
+    signal = WhatsAppSignalMapper().map(
+        {
+            "chatJid": CHAT,
+            "messageId": "edited-normalized",
+            "text": "replacement",
+            "revision": "3",
+        },
+        kind="edit",
+    )
+
+    assert signal is not None
+    assert signal.revision == 3
+    assert signal.to_event_payload()["revision"] == 3
+
+
+@pytest.mark.parametrize("revision", [True, 0, -1, "bad", 1.5])
+def test_strict_signal_capture_rejects_invalid_revision(tmp_path: Path, revision: object) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    sink = SignalJournalSink(store)
+
+    with pytest.raises(ValueError):
+        sink.capture(
+            "edit",
+            {
+                "chatJid": CHAT,
+                "messageId": "edited-invalid",
+                "text": "replacement",
+                "revision": revision,
+            },
+            event_id="event-invalid",
+            event_key="key-invalid",
+            strict=True,
+        )
+    assert store.count_events() == 0
+    store.close()
+
+
+@pytest.mark.parametrize("field", ["event_id", "event_key"])
+def test_strict_signal_capture_rejects_missing_or_empty_root_identity(
+    tmp_path: Path, field: str
+) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    sink = SignalJournalSink(store)
+    identity = {"event_id": "event-1", "event_key": "key-1"}
+    identity[field] = ""
+
+    with pytest.raises(ValueError):
+        sink.capture(
+            "message",
+            {
+                "chatJid": CHAT,
+                "messageId": "message-invalid",
+                "senderId": "4915@s.whatsapp.net",
+                "text": "hello",
+            },
+            event_id=identity["event_id"],
+            event_key=identity["event_key"],
+            strict=True,
+        )
+    assert store.count_events() == 0
+    store.close()
 
 
 def test_delete_reaction_and_receipt_keep_provider_references() -> None:
