@@ -22,6 +22,13 @@ function inboundMessage(messageId: string): Record<string, unknown> {
   };
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 test('resolveParticipantJid ignores quoted participant metadata in direct chat', () => {
   const msg = {
     key: { participant: '86728660521036@lid' },
@@ -213,6 +220,144 @@ test('stop waits for an admitted provider handler before returning', async () =>
     await handler;
     await stopping;
     assert.equal(stopped, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('concurrent duplicate messages retry after the leading handler fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-dedupe-message-'));
+  try {
+    let release!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let callbacks = 0;
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: async () => {
+        callbacks += 1;
+        if (callbacks === 1) {
+          markFirstStarted();
+          await blocked;
+          throw new Error('first durable callback failed');
+        }
+      },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    const listeners = new Map<string, (value: unknown) => void>();
+    (client as any).sock = {
+      readMessages: async () => undefined,
+      ev: { on: (name: string, listener: (value: unknown) => void) => listeners.set(name, listener) },
+    };
+    (client as any).registerInboundMessageHandler();
+    (client as any).running = true;
+    (client as any).acceptingProviderEvents = true;
+    const message = inboundMessage('same-message-key');
+    const upsert = listeners.get('messages.upsert')!;
+
+    upsert({ messages: [message], type: 'notify' });
+    await firstStarted;
+    upsert({ messages: [message], type: 'notify' });
+    release();
+    await waitFor(() => callbacks === 2);
+
+    assert.equal(callbacks, 2);
+    assert.equal((client as any).droppedInboundDuplicates, 0);
+    assert.equal((client as any).recentInbound.size, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('pre-callback message failure clears dedupe state for redelivery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-dedupe-pre-callback-'));
+  try {
+    let callbacks = 0;
+    const client = new WhatsAppClient({
+      authDir: root,
+      readReceipts: false,
+      onMessage: async () => {
+        callbacks += 1;
+      },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    const listeners = new Map<string, (value: unknown) => void>();
+    (client as any).sock = {
+      readMessages: async () => undefined,
+      ev: { on: (name: string, listener: (value: unknown) => void) => listeners.set(name, listener) },
+    };
+    (client as any).registerInboundMessageHandler();
+    (client as any).running = true;
+    (client as any).acceptingProviderEvents = true;
+    const originalBuildReplyMeta = (client as any).buildReplyMeta;
+    (client as any).buildReplyMeta = async () => {
+      throw new Error('reply metadata failed');
+    };
+    const message = inboundMessage('pre-callback-key');
+    const upsert = listeners.get('messages.upsert')!;
+
+    upsert({ messages: [message], type: 'notify' });
+    await waitFor(() => (client as any).providerDedupe.size === 0);
+    assert.equal((client as any).recentInbound.size, 0);
+
+    (client as any).buildReplyMeta = originalBuildReplyMeta;
+    upsert({ messages: [message], type: 'notify' });
+    await waitFor(() => callbacks === 1);
+    assert.equal(callbacks, 1);
+    assert.equal((client as any).recentInbound.size, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('concurrent duplicate signals retry after the leading handler fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-dedupe-signal-'));
+  try {
+    let release!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let callbacks = 0;
+    const client = new WhatsAppClient({
+      authDir: root,
+      onMessage: () => {},
+      onSignal: async () => {
+        callbacks += 1;
+        if (callbacks === 1) {
+          markFirstStarted();
+          await blocked;
+          throw new Error('first signal callback failed');
+        }
+      },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (client as any).running = true;
+    (client as any).acceptingProviderEvents = true;
+
+    (client as any).emitSignal('edit', 'same-signal-key', { messageId: 'signal-1' });
+    await firstStarted;
+    (client as any).emitSignal('edit', 'same-signal-key', { messageId: 'signal-1' });
+    release();
+    await waitFor(() => callbacks === 2);
+
+    assert.equal(callbacks, 2);
+    assert.equal((client as any).recentInbound.size, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

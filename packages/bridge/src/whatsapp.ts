@@ -468,6 +468,7 @@ export class WhatsAppClient {
   private loopTask: Promise<void> | null = null;
   private acceptingProviderEvents = false;
   private readonly providerEventHandlers = new Set<Promise<void>>();
+  private readonly providerDedupe = new Map<string, { task: Promise<void>; failed: boolean }>();
 
   private connected = false;
   private reconnectAttempts = 0;
@@ -770,6 +771,42 @@ export class WhatsAppClient {
     }
   }
 
+  private admitDedupeEvent(
+    key: string,
+    handler: () => void | Promise<void>,
+    onDuplicate?: () => void,
+  ): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
+    const previous = this.providerDedupe.get(key);
+    const entry = { task: Promise.resolve(), failed: false };
+    const task = this.admitProviderEvent(async () => {
+      if (previous) {
+        await previous.task;
+        if (!this.acceptingProviderEvents) return;
+      }
+      if (this.hasSeenInbound(key)) {
+        onDuplicate?.();
+        return;
+      }
+      try {
+        await handler();
+        this.markSeenInbound(key);
+      } catch (error) {
+        entry.failed = true;
+        this.recentInbound.delete(key);
+        throw error;
+      }
+    });
+    if (!task) return undefined;
+    entry.task = task;
+    this.providerDedupe.set(key, entry);
+    const clearEntry = () => {
+      if (this.providerDedupe.get(key) === entry) this.providerDedupe.delete(key);
+    };
+    void task.then(clearEntry, clearEntry);
+    return task;
+  }
+
   stopIntake(): void {
     this.acceptingProviderEvents = false;
     this.running = false;
@@ -945,13 +982,17 @@ export class WhatsAppClient {
     }
   }
 
-  private seenInbound(key: string): boolean {
+  private hasSeenInbound(key: string): boolean {
     this.cleanupRecentInbound();
     const now = nowMs();
     const existing = this.recentInbound.get(key);
     if (existing && existing > now) return true;
-    this.recentInbound.set(key, now + INBOUND_DEDUPE_TTL_MS);
     return false;
+  }
+
+  private markSeenInbound(key: string): void {
+    this.cleanupRecentInbound();
+    this.recentInbound.set(key, nowMs() + INBOUND_DEDUPE_TTL_MS);
   }
 
   private cleanupRecentOutboundSelf(): void {
@@ -977,12 +1018,11 @@ export class WhatsAppClient {
     kind: 'edit' | 'delete' | 'reaction' | 'receipt',
     identity: string,
     payload: Record<string, unknown>,
-  ): void {
+  ): Promise<void> | undefined {
     const emit = this.options.onSignal;
-    if (!emit) return;
-    this.admitProviderEvent(async () => {
-      const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
-      if (this.seenInbound(dedupeKey)) return;
+    if (!emit) return undefined;
+    const dedupeKey = createHash('sha1').update(`signal:${kind}:${identity}`).digest('hex');
+    return this.admitDedupeEvent(dedupeKey, async () => {
       try {
         await emit(kind, payload);
       } catch (err) {
@@ -1408,7 +1448,8 @@ export class WhatsAppClient {
     this.connectWaiters.clear();
   }
 
-  private async handleInboundMessage(msg: any): Promise<void> {
+  private handleInboundMessage(msg: any): Promise<void> | undefined {
+    if (!this.acceptingProviderEvents) return undefined;
     const remoteJidRaw = String(msg?.key?.remoteJid || '');
     if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) return;
 
@@ -1424,11 +1465,21 @@ export class WhatsAppClient {
     this.storeInboundForQuote(chatJid, messageId, msg);
 
     const dedupeKey = createHash('sha1').update(`${chatJid}:${messageId}`).digest('hex');
-    if (this.seenInbound(dedupeKey)) {
-      this.droppedInboundDuplicates += 1;
-      return;
-    }
+    return this.admitDedupeEvent(
+      dedupeKey,
+      () => this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
+      () => {
+        this.droppedInboundDuplicates += 1;
+      },
+    );
+  }
 
+  private async processInboundMessage(
+    msg: any,
+    remoteJidRaw: string,
+    chatJid: string,
+    messageId: string,
+  ): Promise<void> {
     const isGroup = chatJid.endsWith('@g.us');
     const participantJid = resolveParticipantJid(msg, remoteJidRaw, isGroup);
     const senderId = jidUserToken(participantJid || chatJid);
@@ -1487,31 +1538,35 @@ export class WhatsAppClient {
 
     this.lastMessageAt = nowMs();
 
-    try {
-      await this.options.onMessage({
-        messageId,
-        chatJid,
-        participantJid,
-        senderId,
-        senderPhoneJid: this.phoneJidForParticipant(participantJid),
-        lidConflict: this.isLidConflict(participantJid),
-        senderName: (msg.pushName || '').trim() || undefined,
-        isGroup,
-        text: limitText(extracted.text, 8_000),
-        timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
-        mentionedJids: mention.mentionedJids,
-        mentionedBot: mention.mentionedBot,
-        replyToBot: mention.replyToBot,
-        replyToMessageId: reply.replyToMessageId,
-        replyToParticipantJid: reply.replyToParticipantJid,
-        replyToText: reply.replyToText,
-        replyToMedia: reply.replyToMedia,
-        media: inboundMedia,
-      });
-    } catch (error) {
-      this.recentInbound.delete(dedupeKey);
-      throw error;
-    }
+    await this.options.onMessage({
+      messageId,
+      chatJid,
+      participantJid,
+      senderId,
+      senderPhoneJid: this.phoneJidForParticipant(participantJid),
+      lidConflict: this.isLidConflict(participantJid),
+      senderName: (msg.pushName || '').trim() || undefined,
+      isGroup,
+      text: limitText(extracted.text, 8_000),
+      timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
+      mentionedJids: mention.mentionedJids,
+      mentionedBot: mention.mentionedBot,
+      replyToBot: mention.replyToBot,
+      replyToMessageId: reply.replyToMessageId,
+      replyToParticipantJid: reply.replyToParticipantJid,
+      replyToText: reply.replyToText,
+      replyToMedia: reply.replyToMedia,
+      media: inboundMedia,
+    });
+  }
+
+  private registerInboundMessageHandler(): void {
+    this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
+      if (type !== 'notify' && type !== 'append') return;
+      for (const msg of messages ?? []) {
+        this.handleInboundMessage(msg);
+      }
+    });
   }
 
   private async connectOnce(): Promise<void> {
@@ -1698,12 +1753,7 @@ export class WhatsAppClient {
       }
     });
 
-    this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
-      if (type !== 'notify' && type !== 'append') return;
-      for (const msg of messages ?? []) {
-        this.admitProviderEvent(() => this.handleInboundMessage(msg));
-      }
-    });
+    this.registerInboundMessageHandler();
 
     await closed;
   }
