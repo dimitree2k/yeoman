@@ -69,13 +69,16 @@ class ImplicitBotAddressMiddleware:
             await next(ctx)
             return
         if event.is_group:
+            metadata = dict(event.raw_metadata or {})
+            if event.reply_to_text and not metadata.get("reply_to_text"):
+                metadata["reply_to_text"] = event.reply_to_text
             state = classify_conversation_state(
                 session_manager=self._session_manager,
                 channel=event.channel,
                 chat_id=event.chat_id,
                 event_time=event.timestamp,
                 content=str(event.content or ""),
-                metadata=dict(event.raw_metadata or {}),
+                metadata=metadata,
                 mentioned_bot=event.mentioned_bot,
                 reply_to_bot=event.reply_to_bot,
                 bot_name_aliases=self._bot_name_aliases,

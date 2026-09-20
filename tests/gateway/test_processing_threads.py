@@ -74,6 +74,7 @@ def test_join_rules_are_the_spec_order() -> None:
     assert JOIN_RULES == (
         JoinRule.REPLY_KNOWN,
         JoinRule.EXPLICIT_CORRECTION,
+        JoinRule.REPLY_BOT_NEW_THREAD,
         JoinRule.FOLLOWUP_SINGLE_ACTIVE,
         JoinRule.MENTION_NO_REFERENCE,
         JoinRule.DM_LAST_ACTIVE,
@@ -110,7 +111,7 @@ def test_new_thread_is_deterministic_and_idempotent(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# the six rules, one case each
+# the join rules, one case each
 # --------------------------------------------------------------------------------------
 
 
@@ -155,6 +156,27 @@ def test_rule_1_planned_effect_without_provider_id_is_not_an_anchor(tmp_path: Pa
     )
 
     assert reply.rule is not JoinRule.REPLY_KNOWN
+    store.close()
+
+
+def test_reply_to_unknown_bot_anchor_starts_a_new_thread(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "p.db")
+    registry = _registry(store)
+
+    reply = registry.assign(
+        _event(
+            event_id="m2",
+            occurred_ms=T0 + 10 * 60_000,
+            reply_to_bot=True,
+            reply_to_message_id="speakup-msg-1",
+        ),
+        now_ms=T0 + 10 * 60_000,
+    )
+
+    assert reply.rule is JoinRule.REPLY_BOT_NEW_THREAD
+    assert reply.thread_id is not None
+    assert reply.turn_id is not None
+    assert reply.new_thread is True
     store.close()
 
 
