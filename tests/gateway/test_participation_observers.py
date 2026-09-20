@@ -53,12 +53,14 @@ def _config(**overrides: object) -> Config:
     return Config(consciousness=ConsciousnessConfig.model_validate(payload))
 
 
-def _observed(timestamp: float, *, message_id: str = "m1") -> InboundObservedEvent:
+def _observed(
+    timestamp: float, *, message_id: str = "m1", content: str = "hello"
+) -> InboundObservedEvent:
     return InboundObservedEvent(
         channel="whatsapp",
         chat_id=CHAT,
         sender_id="anna@s.whatsapp.net",
-        content="hello",
+        content=content,
         timestamp=timestamp,
         message_id=message_id,
         is_group=True,
@@ -851,9 +853,15 @@ async def test_inbound_ingress_admits_new_material_only(tmp_path: Path) -> None:
         assert ingress.handle_event(_observed(100.0, message_id="m1")) is True
         await asyncio.sleep(0.05)
         assert handled == ["inbound"]
-        # A message with no durable identity, our own output, and tool traffic are all
-        # refused: none of them is new human material to consider.
+        # Missing identities, chat commands, our own output, and tool traffic are all
+        # refused: none is new human material to consider.
         assert ingress.handle_event(_observed(101.0, message_id="")) is False
+        assert (
+            ingress.handle_event(
+                _observed(101.0, message_id="m-command", content="  /new")
+            )
+            is False
+        )
         assert (
             ingress.handle_event(
                 InboundObservedEvent(

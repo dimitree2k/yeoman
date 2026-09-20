@@ -630,6 +630,8 @@ class ParticipationIngress:
         chat_id = str(getattr(event, "chat_id", "") or "").strip()
         if not channel or not chat_id:
             return False
+        if str(getattr(event, "content", "") or "").lstrip().startswith("/"):
+            return False
         if not self._is_active(channel, chat_id):
             return False
         if self._is_direct is not None:
