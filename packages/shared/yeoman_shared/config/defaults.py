@@ -64,13 +64,6 @@ DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
         "temperature": 0.0,
         "timeout_ms": 10000,
     },
-    "consciousness_judgment": {
-        "kind": "chat",
-        "model": "openai/gpt-4o-mini",
-        "max_tokens": 700,
-        "temperature": 0.1,
-        "timeout_ms": 20000,
-    },
 }
 
 DEFAULT_MODEL_ROUTES: dict[str, str] = {
@@ -88,9 +81,6 @@ DEFAULT_MODEL_ROUTES: dict[str, str] = {
     "memory.embed": "memory_embed_fast",
     "memory.capture.extract": "memory_capture_fast",
     "security.classify": "security_classifier",
-    "consciousness.agent": "consciousness_judgment",
-    "consciousness.outcome": "consciousness_judgment",
-    "consciousness.taste": "consciousness_judgment",
 }
 
 DEFAULT_WHATSAPP_MEDIA: dict[str, Any] = {

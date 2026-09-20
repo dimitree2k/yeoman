@@ -54,6 +54,45 @@ async def test_reconciliation_wiring_projects_participation_before_empty_return(
         store.close()
 
 
+def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The superseded flag is compatibility input, not a second output owner."""
+
+    class _NeverProvider:
+        async def chat(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("legacy consciousness must not call an LLM")
+
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    config = Config.model_validate(
+        {
+            "consciousness": {"enabled": True},
+            "processing": {"enabled": False, "participation": {"enabled": False}},
+            "security": {"enabled": False},
+        }
+    )
+    policy = PolicyEngine(PolicyConfig(), workspace=tmp_path)
+    runtime = build_gateway_runtime(
+        config=config,
+        provider=_NeverProvider(),  # type: ignore[arg-type]
+        policy_engine=policy,
+        policy_path=None,
+        workspace=tmp_path / "workspace",
+        bus=MessageBus(),
+    )
+    try:
+        assert runtime.speakup_log is None
+        assert not hasattr(runtime, "consciousness")
+    finally:
+        runtime.inbound_archive.close()
+        runtime.chat_registry.close()
+        runtime.contacts.close()
+        runtime.memory.close()
+
+
 @pytest.mark.asyncio
 async def test_startup_projection_failure_is_fatal_but_background_tick_is_tolerant(
     tmp_path: Path,
@@ -125,7 +164,6 @@ async def test_failed_startup_recovery_blocks_every_ingress() -> None:
         channels=idle,  # type: ignore[arg-type]
         cron=idle,  # type: ignore[arg-type]
         heartbeat=idle,  # type: ignore[arg-type]
-        consciousness=None,
         inbound_archive=idle,  # type: ignore[arg-type]
         responder=idle,  # type: ignore[arg-type]
         memory=idle,  # type: ignore[arg-type]
@@ -427,7 +465,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         assert runtime.processing is not None
         assert runtime.speakup_log is not None
         assert runtime.reconciliation is not None
-        assert runtime.consciousness is None
+        assert not hasattr(runtime, "consciousness")
         assert runtime.opportunity_scheduler is None
         assert runtime.participation_maintenance is None
 

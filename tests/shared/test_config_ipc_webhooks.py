@@ -170,12 +170,10 @@ def test_config_has_consciousness() -> None:
     assert cfg.consciousness.enabled is False
 
 
-def test_config_has_consciousness_model_routes() -> None:
+def test_config_does_not_generate_legacy_consciousness_model_routes() -> None:
     cfg = Config()
-    assert cfg.models.routes["consciousness.agent"] == "consciousness_judgment"
-    assert cfg.models.routes["consciousness.outcome"] == "consciousness_judgment"
-    assert cfg.models.routes["consciousness.taste"] == "consciousness_judgment"
-    assert "consciousness_judgment" in cfg.models.profiles
+    assert not any(route.startswith("consciousness.") for route in cfg.models.routes)
+    assert "consciousness_judgment" not in cfg.models.profiles
 
 
 def test_config_has_assistant_model_route() -> None:
