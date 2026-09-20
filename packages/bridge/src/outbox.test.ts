@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -274,6 +274,76 @@ test('reload rejection is durable before unlink for canonical and staged oversiz
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  }
+});
+
+test('reload replaces crash temps left before fsync or rename without leaking payloads', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-stale-rejection-'));
+  try {
+    const oversized = oversizedEvent('stale-temp-event', 'stale-temp-key');
+    const canonicalName = eventFileName(oversized);
+    const sourcePath = join(root, canonicalName);
+    await writeFile(sourcePath, JSON.stringify(oversized), { mode: 0o600 });
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o700 });
+
+    const seed = new (await loadOutbox()).BridgeOutbox(root);
+    const serializedBytes = Buffer.byteLength(JSON.stringify(oversized), 'utf8');
+    await (seed as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit');
+    const [finalName] = (await readdir(quarantine)).filter((name) => name.startsWith('rejected-'));
+    assert.ok(finalName);
+    await rename(join(quarantine, finalName), join(quarantine, `.${finalName}.matching.tmp`));
+    await writeFile(join(quarantine, `.${finalName}.empty.tmp`), '', { mode: 0o600 });
+    await writeFile(
+      join(quarantine, `.${finalName}.partial.tmp`),
+      '{"eventId":"stale-temp-event","raw":"stale-temp-payload-secret"}',
+      { mode: 0o600 },
+    );
+
+    const restarted = new (await loadOutbox()).BridgeOutbox(root);
+    await restarted.open();
+    assert.deepEqual(await restarted.pending(), []);
+    assert.equal(await pathExists(sourcePath), false);
+    const recovered = (await readdir(quarantine)).filter((name) => name.startsWith('rejected-'));
+    assert.deepEqual(recovered, [finalName]);
+    const diagnostic = await readFile(join(quarantine, finalName), 'utf8');
+    assert.equal(diagnostic.includes('stale-temp-event'), false);
+    assert.equal(diagnostic.includes('stale-temp-key'), false);
+    assert.equal(diagnostic.includes('stale-temp-payload-secret'), false);
+    assert.equal((await readdir(quarantine)).some((name) => name.endsWith('.tmp')), false);
+
+    const secondRestart = new (await loadOutbox()).BridgeOutbox(root);
+    await secondRestart.open();
+    assert.deepEqual(
+      (await readdir(quarantine)).filter((name) => name.startsWith('rejected-')),
+      [finalName],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('matching rejection final is idempotent and conflicting final blocks source removal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-rejection-conflict-'));
+  try {
+    const oversized = oversizedEvent('conflicting-final-event', 'conflicting-final-key');
+    await writeFile(join(root, eventFileName(oversized)), JSON.stringify(oversized), { mode: 0o600 });
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o700 });
+    const serializedBytes = Buffer.byteLength(JSON.stringify(oversized), 'utf8');
+    const seed = new (await loadOutbox()).BridgeOutbox(root);
+    await (seed as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit');
+    await (seed as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit');
+    const [finalName] = (await readdir(quarantine)).filter((name) => name.startsWith('rejected-'));
+    assert.ok(finalName);
+    assert.equal((await readdir(quarantine)).filter((name) => name.startsWith('rejected-')).length, 1);
+    await writeFile(join(quarantine, finalName), '{"conflict":true}', { mode: 0o600 });
+
+    const restarted = new (await loadOutbox()).BridgeOutbox(root);
+    await assert.rejects(restarted.open(), /Conflicting bridge rejection diagnostic/);
+    assert.equal(await pathExists(join(root, eventFileName(oversized))), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

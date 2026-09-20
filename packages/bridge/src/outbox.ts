@@ -294,24 +294,24 @@ export class BridgeOutbox {
       .update(`${event.eventId}\u0000${event.eventKey}\u0000${normalizedReason}\u0000${serializedBytes}`)
       .digest('hex');
     const fileName = `rejected-${diagnosticKey}.json`;
-    const finalPath = join(this.directory, QUARANTINE_DIR, fileName);
-    const temporaryPath = join(this.directory, QUARANTINE_DIR, `.${fileName}.tmp`);
+    const quarantinePath = join(this.directory, QUARANTINE_DIR);
+    const finalPath = join(quarantinePath, fileName);
 
     const existingFinal = await this.readRejectionDiagnostic(finalPath, diagnosticJson);
     if (existingFinal) {
       // A prior process may have crashed after rename but before its directory fsync. Make
       // the already-written diagnostic durable before the caller removes the source record.
-      await syncDirectory(join(this.directory, QUARANTINE_DIR));
-      return;
-    }
-
-    const existingTemporary = await this.readRejectionDiagnostic(temporaryPath, diagnosticJson);
-    if (existingTemporary) {
-      await rename(temporaryPath, finalPath);
-      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      await this.syncFile(finalPath);
+      await this.discardRejectionTemps(quarantinePath, fileName);
+      await syncDirectory(quarantinePath);
       this.rejectionFiles.add(fileName);
       return;
     }
+
+    // Source records are still present while this runs. Any temp from a crashed
+    // attempt is therefore safe to discard without reading or persisting its contents.
+    await this.discardRejectionTemps(quarantinePath, fileName);
+    const temporaryPath = join(quarantinePath, `.${fileName}.${randomUUID()}.tmp`);
 
     let handle: Awaited<ReturnType<typeof openFile>> | undefined;
     try {
@@ -320,9 +320,8 @@ export class BridgeOutbox {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await syncDirectory(join(this.directory, QUARANTINE_DIR));
       await rename(temporaryPath, finalPath);
-      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      await syncDirectory(quarantinePath);
       this.rejectionFiles.add(fileName);
     } catch (error) {
       await handle?.close().catch(() => undefined);
@@ -330,6 +329,30 @@ export class BridgeOutbox {
         await unlink(temporaryPath).catch(() => undefined);
       }
       throw error;
+    }
+  }
+
+  private async discardRejectionTemps(quarantinePath: string, fileName: string): Promise<void> {
+    const prefix = `.${fileName}.`;
+    let discarded = false;
+    for (const name of await readdir(quarantinePath)) {
+      if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
+      const path = join(quarantinePath, name);
+      const stats = await lstat(path);
+      if (!stats.isFile()) throw new Error('Bridge rejection temp is not a regular file');
+      await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
+      await unlink(path);
+      discarded = true;
+    }
+    if (discarded) await syncDirectory(quarantinePath);
+  }
+
+  private async syncFile(path: string): Promise<void> {
+    const handle = await openFile(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
   }
 
