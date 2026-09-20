@@ -45,6 +45,35 @@ def test_event_payload_conflict_is_rejected(tmp_path):
     db.close()
 
 
+def test_event_metadata_conflict_is_rejected_even_when_payload_matches(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    payload = {
+        "kind": "message",
+        "channel": "whatsapp",
+        "account": "account-a",
+        "direction": "in",
+        "revision": 1,
+        "text": "same bytes",
+    }
+    assert db.append_event(
+        event_key="wa:event-metadata",
+        event_id="metadata-1",
+        trace_id="trace-1",
+        payload=payload,
+    ) == "metadata-1"
+
+    with pytest.raises(ValueError):
+        db.append_event(
+            event_key="wa:event-metadata",
+            event_id="metadata-2",
+            trace_id="trace-1",
+            payload=payload,
+            account="account-b",
+        )
+    assert db.count_events() == 1
+    db.close()
+
+
 def test_failed_append_does_not_leave_partial_event(tmp_path, monkeypatch):
     db = ProcessingStore(tmp_path / "processing.db")
 
@@ -79,6 +108,10 @@ def test_canonical_event_roundtrip_keeps_metadata_and_hash(tmp_path):
         principal="4915111@s.whatsapp.net",
         channel="whatsapp",
         chat_id="group@g.us",
+        account="account-a",
+        direction="in",
+        revision=2,
+        audience_ref="audience:captured",
         occurred_ms=1_700_000_000_000,
         source_message_id="3A1",
         payload={"kind": "message", "text": "hallo"},
@@ -97,11 +130,37 @@ def test_canonical_event_roundtrip_keeps_metadata_and_hash(tmp_path):
     assert stored.origin == "whatsapp"
     assert stored.principal == "4915111@s.whatsapp.net"
     assert stored.chat_id == "group@g.us"
+    assert stored.account == "account-a"
+    assert stored.direction == "in"
+    assert stored.revision == 2
+    assert stored.audience_ref == "audience:captured"
     assert stored.source_message_id == "3A1"
     assert stored.occurred_ms == 1_700_000_000_000
     assert stored.created_ms == 1_700_000_000_500
     assert stored.payload == {"kind": "message", "text": "hallo"}
     assert stored.payload_hash == canonical_hash({"kind": "message", "text": "hallo"})
+    db.close()
+
+
+def test_long_payload_roundtrip_keeps_canonical_json_bytes(tmp_path):
+    from yeoman_gateway.processing.models import canonical_json
+
+    text = "  " + ("ä" * 8_001) + " \n"
+    payload = {"kind": "message", "channel": "whatsapp", "text": text}
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:long",
+        event_id="long-1",
+        trace_id="trace-long",
+        payload=payload,
+    )
+
+    stored = db.get_event("long-1")
+    assert stored is not None and stored.payload == payload
+    row = db._conn.execute(
+        "SELECT payload_json FROM events WHERE event_id = ?", ("long-1",)
+    ).fetchone()
+    assert row is not None and row["payload_json"] == canonical_json(payload)
     db.close()
 
 
@@ -286,14 +345,16 @@ def test_retention_settings_reject_negative_values():
         RetentionSettings(unresolved_ms=DAY_MS, metadata_ms=2 * DAY_MS)
 
 
-def test_disabled_processing_creates_no_database(tmp_path, monkeypatch):
-    """The default must stay inert: disabled mode adds no second database."""
+def test_processing_store_opens_even_when_processing_is_disabled(tmp_path, monkeypatch):
+    """Canonical capture is durable even while responders/effects stay disabled."""
     from yeoman_gateway.app.bootstrap import build_processing_store
     from yeoman_shared.config.schema import Config
 
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
-    assert build_processing_store(Config()) is None
-    assert not (tmp_path / "data" / "processing").exists()
+    store = build_processing_store(Config())
+    assert store is not None
+    assert (tmp_path / "data" / "processing" / "processing.db").exists()
+    store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
     store = build_processing_store(enabled)

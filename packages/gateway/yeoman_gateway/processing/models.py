@@ -342,6 +342,10 @@ class CanonicalEvent:
     principal: str = ""
     channel: str = ""
     chat_id: str = ""
+    account: str = ""
+    direction: str = "in"
+    revision: int = 1
+    audience_ref: str | None = None
     occurred_ms: int | None = None
     created_ms: int | None = None
     source_message_id: str | None = None
@@ -355,6 +359,10 @@ class CanonicalEvent:
     def __post_init__(self) -> None:
         if self.kind not in EVENT_KINDS:
             raise ValueError(f"unknown canonical event kind: {self.kind}")
+        if self.direction not in ("in", "out"):
+            raise ValueError(f"unknown canonical event direction: {self.direction}")
+        if self.revision < 1:
+            raise ValueError("canonical event revision must be positive")
 
     @property
     def payload_available(self) -> bool:
@@ -399,6 +407,10 @@ class RetainedEventMeta:
     principal: str
     channel: str
     chat_id: str
+    account: str
+    direction: str
+    revision: int
+    audience_ref: str | None
     occurred_ms: int | None
     created_ms: int | None
     payload_hash: str

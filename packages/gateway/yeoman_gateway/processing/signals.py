@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
@@ -66,6 +66,10 @@ class JournalSignal:
     channel: str
     chat_id: str
     principal: str
+    account: str = ""
+    direction: str = "in"
+    revision: int = 1
+    audience_ref: str | None = None
     occurred_ms: int | None = None
     source_message_id: str | None = None
     target_message_id: str | None = None
@@ -79,6 +83,10 @@ class JournalSignal:
             "principal": self.principal,
             "channel": self.channel,
             "chat_id": self.chat_id,
+            "account": self.account,
+            "direction": self.direction,
+            "revision": self.revision,
+            "audience_ref": self.audience_ref,
             "occurred_ms": self.occurred_ms,
             "source_message_id": self.source_message_id,
             "target_message_id": self.target_message_id,
@@ -98,6 +106,18 @@ def _first(payload: Mapping[str, Any], *keys: str) -> str | None:
         if value is None:
             continue
         text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _raw_text(payload: Mapping[str, Any], *keys: str) -> str | None:
+    """Read text without normalizing bytes that belong to the canonical payload."""
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        text = str(value)
         if text:
             return text
     return None
@@ -179,7 +199,16 @@ class WhatsAppSignalMapper:
     def __init__(self, *, channel: str = CHANNEL) -> None:
         self._channel = channel
 
-    def map(self, payload: Mapping[str, Any], *, kind: str) -> JournalSignal | None:
+    def map(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        kind: str,
+        event_id: str | None = None,
+        event_key: str | None = None,
+        account: str | None = None,
+        observed_at_ms: int | None = None,
+    ) -> JournalSignal | None:
         if kind not in SIGNAL_KINDS:
             raise ValueError(f"unknown signal kind: {kind}")
         if not isinstance(payload, Mapping):
@@ -190,14 +219,25 @@ class WhatsAppSignalMapper:
             return None
 
         if kind == "message":
-            return self._message(payload, chat_id)
-        if kind == "edit":
-            return self._edit(payload, chat_id)
-        if kind == "delete":
-            return self._delete(payload, chat_id)
-        if kind == "reaction":
-            return self._reaction(payload, chat_id)
-        return self._receipt(payload, chat_id)
+            signal = self._message(payload, chat_id)
+        elif kind == "edit":
+            signal = self._edit(payload, chat_id)
+        elif kind == "delete":
+            signal = self._delete(payload, chat_id)
+        elif kind == "reaction":
+            signal = self._reaction(payload, chat_id)
+        else:
+            signal = self._receipt(payload, chat_id)
+        if signal is None:
+            return None
+        signal = replace(
+            signal,
+            event_id=event_id or signal.event_id,
+            event_key=event_key or signal.event_key,
+            account=account if account is not None else signal.account,
+            occurred_ms=observed_at_ms if observed_at_ms is not None else signal.occurred_ms,
+        )
+        return signal
 
     # -- kinds -------------------------------------------------------------------------
 
@@ -208,11 +248,22 @@ class WhatsAppSignalMapper:
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
         event_key = f"{self._channel}:{chat_id}:message:{message_id}"
         body = {
-            "text": _first(payload, "text", "content") or "",
+            "text": _raw_text(payload, "text", "content") or "",
             "is_group": bool(payload.get("isGroup")) or chat_id.endswith("@g.us"),
             "mentioned_bot": bool(payload.get("mentionedBot")),
             "reply_to_message_id": _first(payload, "replyToMessageId", "reply_to_message_id"),
         }
+        reply_text = _raw_text(payload, "replyToText", "reply_to_text")
+        if reply_text is not None:
+            body["reply_to_text"] = reply_text
+        reply_participant = _first(
+            payload, "replyToParticipantJid", "reply_to_participant", "reply_to_participant_jid"
+        )
+        if reply_participant is not None:
+            body["reply_to_participant"] = reply_participant
+        reply_media = _media_metadata(payload.get("replyToMedia"))
+        if reply_media is not None:
+            body["reply_to_media"] = reply_media
         media = _media_metadata(payload.get("media"))
         if media is not None:
             body["media"] = media
@@ -238,7 +289,7 @@ class WhatsAppSignalMapper:
         revision = _revision(revision_raw)
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
         event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{revision if revision is not None else edit_ms or 0}"
-        body: dict[str, Any] = {"text": _first(payload, "text", "content") or ""}
+        body: dict[str, Any] = {"text": _raw_text(payload, "text", "content") or ""}
         if revision is not None:
             body["revision"] = revision
         return self._signal(
@@ -379,6 +430,11 @@ class WhatsAppSignalMapper:
             channel=self._channel,
             chat_id=chat_id,
             principal=principal,
+            revision=(
+                int(body["revision"])
+                if isinstance(body.get("revision"), int) and int(body["revision"]) >= 1
+                else 1
+            ),
             occurred_ms=occurred,
             source_message_id=source_message_id,
             target_message_id=target_message_id,
@@ -417,10 +473,38 @@ class SignalJournalSink:
         self._invalidator = invalidator
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
+        return self.capture(kind, payload)
+
+    def capture(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        event_id: str | None = None,
+        event_key: str | None = None,
+        account: str | None = None,
+        observed_at_ms: int | None = None,
+        strict: bool = False,
+    ) -> str | None:
+        """Map and append one provider event, optionally using bridge identity fields.
+
+        ``strict`` is used by the canonical channel boundary: malformed replayable input
+        must fail closed instead of looking like a successful no-op. The legacy callable
+        path keeps its historical ``None`` result for malformed provider signals.
+        """
         if self._store is None:
             return None
-        signal = self._mapper.map(payload, kind=kind)
+        signal = self._mapper.map(
+            payload,
+            kind=kind,
+            event_id=event_id,
+            event_key=event_key,
+            account=account,
+            observed_at_ms=observed_at_ms,
+        )
         if signal is None:
+            if strict:
+                raise ValueError(f"malformed WhatsApp {kind} event")
             return None
         now = int(self._clock()) if self._clock is not None else None
         event_id = self._store.append_event(
@@ -429,6 +513,10 @@ class SignalJournalSink:
             trace_id=signal.trace_id,
             payload=signal.to_event_payload(),
             now_ms=now,
+            account=signal.account,
+            direction=signal.direction,
+            revision=signal.revision,
+            audience_ref=signal.audience_ref,
         )
         if self._invalidator is not None and str(kind) in ("edit", "delete"):
             try:

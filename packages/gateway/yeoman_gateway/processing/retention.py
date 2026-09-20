@@ -78,8 +78,13 @@ class ProcessingRetentionService:
     # -- work --------------------------------------------------------------------------
 
     async def sweep_once(self) -> PurgeReport:
-        """Run one retention pass off the event loop."""
-        report = await asyncio.to_thread(self._store.purge, now_ms=self._clock())
+        """Run one retention pass.
+
+        ``ProcessingStore`` serializes its short SQLite transaction internally. Calling
+        that transaction directly also keeps lifecycle shutdown deterministic for callers
+        that use ``asyncio.run`` (the retention loop is already a low-frequency task).
+        """
+        report = self._store.purge(now_ms=self._clock())
         self._sweeps += 1
         _log_report(report)
         return report

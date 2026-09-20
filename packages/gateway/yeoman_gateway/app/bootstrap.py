@@ -553,14 +553,12 @@ def _has_pending_participation_recovery(
 def build_processing_store(
     config: "Config", *, recover_pending: bool = False
 ) -> "ProcessingStore | None":
-    """Open the durable processing store, but only when the new mode is enabled.
+    """Open the durable canonical journal independently of processing responders.
 
-    Disabled mode stays byte-for-byte inert: no second database appears next to the
-    archives. A store that cannot be opened leaves the new mode offline (fail closed)
-    instead of degrading into an unaudited path.
+    ``processing.enabled`` still gates the responder, policy and effect builders. The
+    journal must remain available in disabled mode so provider capture and replay
+    acknowledgement never depend on whether downstream processing is enabled.
     """
-    if not config.processing.enabled and not recover_pending:
-        return None
 
     from yeoman_gateway.processing.models import DAY_MS, RetentionSettings
     from yeoman_gateway.processing.store import ProcessingStore

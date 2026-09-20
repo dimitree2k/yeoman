@@ -71,6 +71,32 @@ def test_sweep_keeps_metadata_until_its_own_window(tmp_path) -> None:
     store.close()
 
 
+def test_sweep_exempts_canonical_whatsapp_events_but_not_operational_events(tmp_path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    store.append_event(
+        event_key="wa:old",
+        event_id="wa-old",
+        trace_id="trace-wa",
+        payload={"kind": "message", "channel": "whatsapp", "text": "canonical"},
+        now_ms=NOW,
+    )
+    store.append_event(
+        event_key="ops:old",
+        event_id="ops-old",
+        trace_id="trace-ops",
+        payload={"kind": "message", "text": "operational"},
+        now_ms=NOW,
+    )
+    service = ProcessingRetentionService(store, clock=_Clock(NOW + 31 * DAY_MS))
+
+    asyncio.run(service.sweep_once())
+
+    canonical = store.get_event("wa-old")
+    assert canonical is not None and canonical.payload is not None
+    assert store.get_event("ops-old") is None
+    store.close()
+
+
 def test_the_loop_survives_a_failing_sweep() -> None:
     store = _FailingStore()
     service = ProcessingRetentionService(

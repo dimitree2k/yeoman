@@ -70,7 +70,7 @@ from yeoman_gateway.processing.models import (
     now_ms as _now_ms,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = (
     """
@@ -242,6 +242,12 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
           PRIMARY KEY (canonical_user_id, quota_key)
         )
         """,
+    ),
+    7: (
+        "ALTER TABLE events ADD COLUMN account TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE events ADD COLUMN direction TEXT NOT NULL DEFAULT 'in'",
+        "ALTER TABLE events ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE events ADD COLUMN audience_ref TEXT",
     ),
     4: (
         """
@@ -722,6 +728,10 @@ class ProcessingStore:
         trace_id: str,
         payload: CanonicalEvent | Mapping[str, Any],
         now_ms: int | None = None,
+        account: str | None = None,
+        direction: str | None = None,
+        revision: int | None = None,
+        audience_ref: str | None = None,
     ) -> str:
         """Append one canonical event; idempotent per provider identity.
 
@@ -736,53 +746,78 @@ class ProcessingStore:
         event = self._coerce_event(
             event_key=event_key, event_id=event_id, trace_id=trace_id, payload=payload,
             created_ms=created,
+            account=account,
+            direction=direction,
+            revision=revision,
+            audience_ref=audience_ref,
         )
         with self._write() as conn:
-            row = conn.execute(
-                "SELECT event_id, payload_hash, payload_json FROM events WHERE event_key = ?",
-                (event.event_key,),
-            ).fetchone()
-            if row is not None:
-                if row["payload_json"] is None or row["payload_hash"] == event.payload_hash:
-                    return str(row["event_id"])
-                raise JournalConflictError(
-                    f"event_key {event.event_key!r} already exists with a different payload"
-                )
-            clash = conn.execute(
-                "SELECT event_key FROM events WHERE event_id = ?", (event.event_id,)
-            ).fetchone()
-            if clash is not None:
-                raise JournalConflictError(
-                    f"event_id {event.event_id!r} already belongs to {clash['event_key']!r}"
-                )
-            conn.execute(
-                """
-                INSERT INTO events (
-                  event_id, event_key, trace_id, kind, origin, channel, chat_id, principal,
-                  source_message_id, target_message_id, thread_id, turn_id, occurred_ms,
-                  payload_hash, payload_json, payload_purged_ms, created_ms
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
-                """,
-                (
-                    event.event_id,
-                    event.event_key,
-                    event.trace_id,
-                    event.kind,
-                    event.origin,
-                    event.channel,
-                    event.chat_id,
-                    event.principal,
-                    event.source_message_id,
-                    event.target_message_id,
-                    event.thread_id,
-                    event.turn_id,
-                    event.occurred_ms,
-                    event.payload_hash,
-                    canonical_json(dict(event.payload or {})),
-                    event.created_ms,
-                ),
+            return self._append_event_connection(conn, event)
+
+    def _append_event_connection(
+        self, conn: sqlite3.Connection, event: CanonicalEvent
+    ) -> str:
+        """Append *event* inside an already-open transaction."""
+        row = conn.execute(
+            "SELECT event_id, payload_hash, payload_json, account, direction, revision, "
+            "audience_ref FROM events WHERE event_key = ?",
+            (event.event_key,),
+        ).fetchone()
+        if row is not None:
+            same_metadata = (
+                str(row["account"] or "") == event.account
+                and str(row["direction"] or "in") == event.direction
+                and int(row["revision"] or 1) == event.revision
+                and (str(row["audience_ref"]) if row["audience_ref"] is not None else None)
+                == event.audience_ref
             )
-            self._record_relations(conn, event)
+            if row["payload_json"] is None or (
+                row["payload_hash"] == event.payload_hash and same_metadata
+            ):
+                return str(row["event_id"])
+            raise JournalConflictError(
+                f"event_key {event.event_key!r} already exists with different content"
+            )
+        clash = conn.execute(
+            "SELECT event_key FROM events WHERE event_id = ?", (event.event_id,)
+        ).fetchone()
+        if clash is not None:
+            raise JournalConflictError(
+                f"event_id {event.event_id!r} already belongs to {clash['event_key']!r}"
+            )
+        conn.execute(
+            """
+            INSERT INTO events (
+              event_id, event_key, trace_id, kind, origin, channel, chat_id, principal,
+              account, direction, revision, audience_ref, source_message_id, target_message_id,
+              thread_id, turn_id, occurred_ms, payload_hash, payload_json, payload_purged_ms,
+              created_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+            """,
+            (
+                event.event_id,
+                event.event_key,
+                event.trace_id,
+                event.kind,
+                event.origin,
+                event.channel,
+                event.chat_id,
+                event.principal,
+                event.account,
+                event.direction,
+                event.revision,
+                event.audience_ref,
+                event.source_message_id,
+                event.target_message_id,
+                event.thread_id,
+                event.turn_id,
+                event.occurred_ms,
+                event.payload_hash,
+                canonical_json(dict(event.payload or {})),
+                event.created_ms,
+            ),
+        )
+        self._record_relations(conn, event)
         return event.event_id
 
     def _coerce_event(
@@ -793,6 +828,10 @@ class ProcessingStore:
         trace_id: str,
         payload: CanonicalEvent | Mapping[str, Any],
         created_ms: int,
+        account: str | None = None,
+        direction: str | None = None,
+        revision: int | None = None,
+        audience_ref: str | None = None,
     ) -> CanonicalEvent:
         if isinstance(payload, CanonicalEvent):
             body: dict[str, Any] = dict(payload.payload or {})
@@ -805,6 +844,10 @@ class ProcessingStore:
                 principal=payload.principal,
                 channel=payload.channel,
                 chat_id=payload.chat_id,
+                account=payload.account if account is None else str(account),
+                direction=payload.direction if direction is None else str(direction),
+                revision=payload.revision if revision is None else int(revision),
+                audience_ref=payload.audience_ref if audience_ref is None else audience_ref,
                 occurred_ms=payload.occurred_ms,
                 created_ms=created_ms,
                 source_message_id=payload.source_message_id,
@@ -826,6 +869,18 @@ class ProcessingStore:
             principal=str(body.get("principal") or ""),
             channel=str(body.get("channel") or ""),
             chat_id=str(body.get("chat_id") or ""),
+            account=str(
+                account
+                if account is not None
+                else body.get("account") or body.get("account_id") or ""
+            ),
+            direction=str(direction if direction is not None else body.get("direction") or "in"),
+            revision=int(revision if revision is not None else body.get("revision") or 1),
+            audience_ref=(
+                audience_ref
+                if audience_ref is not None
+                else _opt_str(body.get("audience_ref") or body.get("audienceRef"))
+            ),
             occurred_ms=_opt_int(body.get("occurred_ms") or body.get("timestamp_ms")),
             created_ms=created_ms,
             source_message_id=_opt_str(
@@ -2889,6 +2944,7 @@ class ProcessingStore:
                 """
                 UPDATE events SET payload_json = NULL, payload_purged_ms = ?
                  WHERE payload_json IS NOT NULL AND created_ms <= ?
+                   AND channel <> 'whatsapp'
                 """,
                 (now_ms, payload_cutoff),
             )
@@ -2910,6 +2966,7 @@ class ProcessingStore:
                 """
                 DELETE FROM events
                  WHERE created_ms <= :metadata
+                   AND channel <> 'whatsapp'
                    AND NOT (
                      created_ms > :unresolved
                      AND event_id IN (
@@ -2979,6 +3036,12 @@ class ProcessingStore:
             principal=str(row["principal"]),
             channel=str(row["channel"]),
             chat_id=str(row["chat_id"]),
+            account=str(row["account"] or ""),
+            direction=str(row["direction"] or "in"),
+            revision=int(row["revision"] or 1),
+            audience_ref=(
+                str(row["audience_ref"]) if row["audience_ref"] is not None else None
+            ),
             occurred_ms=int(row["occurred_ms"]) if row["occurred_ms"] is not None else None,
             created_ms=int(row["created_ms"]),
             source_message_id=(
@@ -3120,6 +3183,12 @@ def _event_meta_from_row(
         principal=str(row["principal"]),
         channel=str(row["channel"]),
         chat_id=str(row["chat_id"]),
+        account=str(row["account"] or ""),
+        direction=str(row["direction"] or "in"),
+        revision=int(row["revision"] or 1),
+        audience_ref=(
+            str(row["audience_ref"]) if row["audience_ref"] is not None else None
+        ),
         occurred_ms=int(row["occurred_ms"]) if row["occurred_ms"] is not None else None,
         created_ms=int(row["created_ms"]) if row["created_ms"] is not None else None,
         payload_hash=str(row["payload_hash"]),

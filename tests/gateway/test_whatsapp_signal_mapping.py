@@ -60,7 +60,7 @@ def test_v5_payload_constants_match_supported_event_and_media_shapes() -> None:
 
 
 def test_long_message_and_media_metadata_are_preserved_without_binary_payload() -> None:
-    text = "x" * 8_001
+    text = "  " + ("x" * 8_001) + " \n"
     signal = WhatsAppSignalMapper().map(
         {
             "chatJid": CHAT,
@@ -92,6 +92,33 @@ def test_long_message_and_media_metadata_are_preserved_without_binary_payload() 
         "sha256": "a" * 64,
     }
     assert "data" not in body["media"]
+
+
+def test_message_relation_and_capture_identity_are_not_invented() -> None:
+    signal = WhatsAppSignalMapper().map(
+        {
+            "chatJid": CHAT,
+            "messageId": "reply-1",
+            "senderId": "4915@s.whatsapp.net",
+            "text": "  exact text  ",
+            "replyToMessageId": "original-1",
+            "replyToText": "quoted context",
+        },
+        kind="message",
+        event_id="bridge-event-1",
+        event_key="bridge-key-1",
+        account="account-a",
+        observed_at_ms=T0,
+    )
+
+    assert signal is not None
+    assert signal.event_id == "bridge-event-1"
+    assert signal.event_key == "bridge-key-1"
+    assert signal.account == "account-a"
+    body = signal.to_event_payload()
+    assert body["text"] == "  exact text  "
+    assert body["reply_to_message_id"] == "original-1"
+    assert body["reply_to_text"] == "quoted context"
 
 
 def test_media_hash_mapping_keeps_only_valid_sha256_and_uses_first_valid_candidate() -> None:
