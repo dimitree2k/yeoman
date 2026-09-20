@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sqlite3
+import time
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
-from typing import Literal
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 import typer
 from rich.table import Table
@@ -1055,3 +1062,144 @@ def memory_facts_rescreen(
         console.print(line)
     if report.dry_run:
         console.print("re-run with --apply to revoke")
+
+
+# ── read-only media growth report (Phase 2 / Task 5) ─────────────────────────
+#
+# Measure first, decide later.  This report opens no media content, parses no document,
+# runs no OCR, recomputes no hash and deletes nothing.  It reads stored event metadata and
+# the filesystem's own size information, which is why it can run on live state without
+# touching a single byte of private content.
+
+#: Age buckets, upper bound in days (``None`` = open ended).
+MEDIA_AGE_BUCKETS: tuple[tuple[int | None, str], ...] = (
+    (7, "0-7d"),
+    (30, "8-30d"),
+    (90, "31-90d"),
+    (None, ">90d"),
+)
+
+MEDIA_STATES: tuple[str, ...] = ("present", "missing")
+
+_DAY_MS = 86_400_000
+
+
+@dataclass(frozen=True, slots=True)
+class MediaGrowthRow:
+    """One (kind, age bucket, presence) group with its aggregate byte count."""
+
+    media_kind: str
+    age_bucket: str
+    state: str
+    count: int
+    bytes: int
+
+
+def media_age_bucket(age_ms: int) -> str:
+    days = max(0, int(age_ms)) / _DAY_MS
+    for limit, label in MEDIA_AGE_BUCKETS:
+        if limit is None or days <= limit:
+            return label
+    return MEDIA_AGE_BUCKETS[-1][1]  # pragma: no cover - defensive
+
+
+def media_growth_rows(
+    references: Iterable[Mapping[str, Any]],
+    *,
+    now_ms: int,
+    stat_size: Callable[[str], int | None],
+) -> tuple[MediaGrowthRow, ...]:
+    """Group stored media *metadata* into (kind, age, presence) buckets.
+
+    ``stat_size`` returns the stored file's size in bytes, or ``None`` when the file is
+    missing.  It is the only filesystem access this report performs: no file is opened,
+    read, hashed, parsed or deleted.
+    """
+    grouped: dict[tuple[str, str, str], list[int]] = {}
+    for reference in references:
+        kind = str(reference.get("kind") or "unknown")
+        occurred = int(reference.get("occurred_ms") or 0)
+        bucket = media_age_bucket(int(now_ms) - occurred)
+        size = stat_size(str(reference.get("path") or ""))
+        state = "missing" if size is None else "present"
+        grouped.setdefault((kind, bucket, state), []).append(int(size or 0))
+    rows = [
+        MediaGrowthRow(
+            media_kind=kind,
+            age_bucket=bucket,
+            state=state,
+            count=len(sizes),
+            bytes=sum(sizes),
+        )
+        for (kind, bucket, state), sizes in grouped.items()
+    ]
+    rows.sort(key=lambda row: (row.media_kind, row.age_bucket, row.state))
+    return tuple(rows)
+
+
+def _media_size_only(path: str) -> int | None:
+    """Size of a stored media file.  Never opens it."""
+    if not path:
+        return None
+    try:
+        return int(os.stat(path).st_size)
+    except OSError:
+        return None
+
+
+def collect_media_references(processing_db: Path) -> list[dict[str, Any]]:
+    """Media references from stored event metadata.  Payload text is never returned."""
+    if not Path(processing_db).exists():
+        return []
+    connection = sqlite3.connect(f"file:{Path(processing_db)}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            "SELECT kind, occurred_ms, payload_json FROM events"
+            " WHERE payload_json LIKE '%media%'"
+        ).fetchall()
+    except sqlite3.Error:  # pragma: no cover - defensive
+        return []
+    finally:
+        connection.close()
+    references: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except (TypeError, ValueError):
+            continue
+        media = payload.get("media") if isinstance(payload, dict) else None
+        if not isinstance(media, dict):
+            continue
+        references.append(
+            {
+                "kind": str(media.get("kind") or media.get("mimeType") or "unknown"),
+                "occurred_ms": int(row["occurred_ms"] or 0),
+                "path": str(media.get("path") or ""),
+            }
+        )
+    return references
+
+
+@memory_app.command("media-growth")
+def memory_media_growth(
+    processing_db: str = typer.Option(
+        ..., "--processing-db", help="Path to the ProcessingStore database"
+    ),
+) -> None:
+    """Report media growth by kind, age and presence.  Read-only, deletes nothing."""
+    references = collect_media_references(Path(processing_db))
+    rows = media_growth_rows(
+        references, now_ms=int(time.time() * 1000), stat_size=_media_size_only
+    )
+    table = Table(title="Media growth (read-only, no deletion)")
+    table.add_column("Kind")
+    table.add_column("Age")
+    table.add_column("State")
+    table.add_column("Files", justify="right")
+    table.add_column("Bytes", justify="right")
+    for row in rows:
+        table.add_row(
+            row.media_kind, row.age_bucket, row.state, str(row.count), str(row.bytes)
+        )
+    console.print(table)
