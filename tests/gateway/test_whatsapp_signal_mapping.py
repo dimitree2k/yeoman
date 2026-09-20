@@ -34,7 +34,20 @@ def _channel(store: ProcessingStore) -> WhatsAppChannel:
 
 
 def _frame(kind: str, payload: dict, *, version: int = PROTOCOL_VERSION) -> str:
-    return json.dumps({"version": version, "type": kind, "ts": T0, "accountId": "a", "payload": payload})
+    provider_id = payload.get("messageId") or payload.get("targetMessageId") or kind
+    identity = str(provider_id)
+    return json.dumps(
+        {
+            "version": version,
+            "type": kind,
+            "ts": T0,
+            "accountId": "a",
+            "eventId": f"test-event:{kind}:{identity}",
+            "eventKey": f"test-key:{kind}:{identity}",
+            "observedAt": T0,
+            "payload": payload,
+        }
+    )
 
 
 def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None:
@@ -298,8 +311,8 @@ def _event_ids(store: ProcessingStore) -> list[str]:
         con.close()
 
 
-def test_a_message_frame_still_takes_the_legacy_path(tmp_path: Path) -> None:
-    """Signal frames are additive: the message path is untouched."""
+def test_a_message_frame_is_captured_before_the_legacy_path(tmp_path: Path) -> None:
+    """Canonical capture precedes the existing message projection."""
     store = ProcessingStore(tmp_path / "p.db")
     channel = _channel(store)
     published: list[str] = []
@@ -310,13 +323,34 @@ def test_a_message_frame_still_takes_the_legacy_path(tmp_path: Path) -> None:
     channel._enrich_media_event = lambda event: _passthrough(event)  # type: ignore[method-assign]
     channel._publish_event = _fake_publish  # type: ignore[method-assign]
 
-    asyncio.run(channel._handle_bridge_message(_frame("message", {
-        "chatJid": CHAT, "messageId": "3EB9", "senderId": "4915", "text": "hello",
-        "timestamp": 1_700_000_000,
-    })))
+    async def _ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del payload, timeout_seconds, kwargs
+        assert command_type == "ack_event"
+        return {"acknowledged": True}
+
+    channel._send_command = _ack  # type: ignore[method-assign]
+
+    async def _deliver() -> None:
+        await channel._handle_bridge_message(
+            _frame(
+                "message",
+                {
+                    "chatJid": CHAT,
+                    "messageId": "3EB9",
+                    "senderId": "4915",
+                    "text": "hello",
+                    "timestamp": 1_700_000_000,
+                },
+            )
+        )
+        tasks = tuple(channel._inbound_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    asyncio.run(_deliver())
 
     assert published == ["3EB9"]
-    assert store.count_events() == 0  # the legacy path does not journal signals
+    assert store.count_events() == 1
     store.close()
 
 

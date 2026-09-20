@@ -466,39 +466,66 @@ class GatewayRuntime:
                 tasks.append(self.bus.dispatch_events())
             await asyncio.gather(*tasks)
         finally:
+            cleanup_errors: list[BaseException] = []
+            retention_error: BaseException | None = None
+
+            async def attempt_async(action: Callable[[], Awaitable[Any]]) -> None:
+                try:
+                    await action()
+                except BaseException as exc:  # cleanup must continue after one failure
+                    cleanup_errors.append(exc)
+
+            def attempt_sync(action: Callable[[], Any]) -> None:
+                try:
+                    action()
+                except BaseException as exc:  # cleanup must continue after one failure
+                    cleanup_errors.append(exc)
+
             if self.gateway_socket:
-                await self.gateway_socket.stop()
-            self.heartbeat.stop()
+                await attempt_async(self.gateway_socket.stop)
+            attempt_sync(self.heartbeat.stop)
             if self.opportunity_scheduler is not None:
-                await self.opportunity_scheduler.stop()
+                await attempt_async(self.opportunity_scheduler.stop)
             if self.participation_maintenance is not None:
                 maintenance_stop = getattr(self.participation_maintenance, "stop", None)
                 if maintenance_stop is not None:
-                    await maintenance_stop()
+                    await attempt_async(maintenance_stop)
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
-                self.lull_observer.stop()
+                attempt_sync(self.lull_observer.stop)
             if self.consciousness is not None:
-                self.consciousness.stop()
-            self.cron.stop()
-            self.orchestrator.stop()
-            await self.channels.stop_all()
+                attempt_sync(self.consciousness.stop)
+            attempt_sync(self.cron.stop)
+            attempt_sync(self.orchestrator.stop)
+            await attempt_async(self.channels.stop_all)
             if self.reconciliation is not None:
-                await self.reconciliation.stop()
+                await attempt_async(self.reconciliation.stop)
             if self.retention is not None:
-                await self.retention.stop()
-            await self.responder.aclose()
-            self.inbound_archive.close()
+                try:
+                    await self.retention.stop()
+                except BaseException as exc:
+                    # This failure is the primary shutdown result, but all remaining
+                    # cleanup (including the store fence) still runs below.
+                    retention_error = exc
+            await attempt_async(self.responder.aclose)
+            attempt_sync(self.inbound_archive.close)
             if self.speakup_log is not None and hasattr(self.speakup_log, "close"):
-                self.speakup_log.close()
+                attempt_sync(self.speakup_log.close)
             if hasattr(self.chat_registry, "close"):
-                self.chat_registry.close()
+                attempt_sync(self.chat_registry.close)
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
-                self.shared_facts.stop()
-            self.contacts.close()
-            self.memory.close()
+                attempt_sync(self.shared_facts.stop)
+            attempt_sync(self.contacts.close)
+            attempt_sync(self.memory.close)
             if self.processing is not None:
-                self.processing.close()
-            await tracing.shutdown()
+                attempt_sync(self.processing.close)
+            await attempt_async(tracing.shutdown)
+
+            if retention_error is not None:
+                for error in cleanup_errors:
+                    logger.error("Gateway cleanup also failed error_type={}", type(error).__name__)
+                raise retention_error
+            if cleanup_errors:
+                raise cleanup_errors[0]
 
 
 class ProcessingStoreUnavailableError(RuntimeError):

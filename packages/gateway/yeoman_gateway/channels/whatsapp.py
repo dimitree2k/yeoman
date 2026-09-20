@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import random
 import re
 import uuid
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import WhatsAppConfig
-from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION, REPLAYABLE_EVENT_TYPES
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -645,20 +646,25 @@ class WhatsAppChannel(BaseChannel):
 
         msg_type = data.get("type")
         payload = data.get("payload")
-        if not isinstance(payload, dict):
-            payload = {}
-
         if msg_type == "response":
+            if not isinstance(payload, dict):
+                payload = {}
             request_id = data.get("requestId")
             if isinstance(request_id, str):
                 self._resolve_pending(request_id, payload)
             return
 
-        if msg_type in _PROCESSING_SIGNAL_TYPES:
-            # Provider signals are journal evidence, not orders: the hook touches neither
-            # dedupe, debounce, archive nor publishing, and a failure here must never cost
-            # the legacy ingest path.
-            self._dispatch_processing_signal(str(msg_type), payload)
+        if isinstance(msg_type, str) and msg_type in REPLAYABLE_EVENT_TYPES:
+            if not isinstance(payload, dict):
+                self._reject_replayable_frame(msg_type, "payload_not_object")
+                return
+            if not await self._capture_and_ack_bridge_event(data, str(msg_type), payload):
+                return
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if isinstance(msg_type, str) and msg_type in _PROCESSING_SIGNAL_TYPES:
             return
 
         if msg_type == "message":
@@ -811,17 +817,71 @@ class WhatsAppChannel(BaseChannel):
         """Attach the journal sink for provider signals (edit/delete/reaction/receipt)."""
         self._processing_signals = sink
 
-    def _dispatch_processing_signal(self, kind: str, payload: dict[str, Any]) -> None:
-        sink = self._processing_signals
-        if sink is None:
-            return
+    def _reject_replayable_frame(self, kind: object, reason: str) -> None:
+        """Reject malformed canonical input without echoing its untrusted payload."""
+        logger.warning("Malformed replayable bridge frame type={} reason={}", kind, reason)
+
+    async def _capture_and_ack_bridge_event(
+        self, frame: dict[str, Any], kind: str, payload: dict[str, Any]
+    ) -> bool:
+        """Commit one Bridge event before acknowledging or scheduling any projection."""
+        event_id = frame.get("eventId")
+        event_key = frame.get("eventKey")
+        account_id = frame.get("accountId")
+        observed_at = frame.get("observedAt")
+        if not isinstance(event_id, str) or not event_id.strip():
+            self._reject_replayable_frame(kind, "missing_event_id")
+            return False
+        if not isinstance(event_key, str) or not event_key.strip():
+            self._reject_replayable_frame(kind, "missing_event_key")
+            return False
+        if not isinstance(account_id, str) or not account_id.strip():
+            self._reject_replayable_frame(kind, "missing_account_id")
+            return False
         try:
-            sink(kind, payload)
-        except Exception as exc:
-            # Fail-open for the journal only: an unreadable signal must not break ingest.
-            logger.warning(
-                "processing signal rejected kind={} error_type={}", kind, type(exc).__name__
+            valid_observed_at = (
+                not isinstance(observed_at, bool)
+                and isinstance(observed_at, (int, float))
+                and math.isfinite(observed_at)
+                and observed_at > 0
             )
+        except (OverflowError, ValueError):
+            valid_observed_at = False
+        if not valid_observed_at:
+            self._reject_replayable_frame(kind, "missing_observed_at")
+            return False
+
+        sink = self._processing_signals
+        capture = getattr(sink, "capture", None)
+        if not callable(capture):
+            self._reject_replayable_frame(kind, "canonical_sink_unavailable")
+            return False
+
+        try:
+            capture(
+                kind,
+                payload,
+                event_id=event_id.strip(),
+                event_key=event_key.strip(),
+                account=account_id.strip(),
+                observed_at_ms=int(observed_at),
+                strict=True,
+            )
+            await self._send_command(
+                "ack_event",
+                {"eventId": event_id.strip()},
+                timeout_seconds=20.0,
+            )
+        except Exception as exc:
+            # The canonical row is intentionally retained for a Bridge replay, but no
+            # archive, debounce or routing work is admitted until ACK succeeds.
+            logger.warning(
+                "WhatsApp canonical capture/ack failed type={} error_type={}",
+                kind,
+                type(exc).__name__,
+            )
+            return False
+        return True
 
     def set_processing_gate(self, gate: Any | None) -> None:
         """Attach the fast gate of the new processing mode (``None`` keeps legacy)."""
