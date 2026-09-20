@@ -521,7 +521,7 @@ class SignalJournalSink:
                 raise ValueError(f"malformed WhatsApp {kind} event")
             return None
         now = int(self._clock()) if self._clock is not None else None
-        event_id = self._store.append_event(
+        stored_event_id = self._store.append_event(
             event_key=signal.event_key,
             event_id=signal.event_id,
             trace_id=signal.trace_id,
@@ -532,13 +532,21 @@ class SignalJournalSink:
             revision=signal.revision,
             audience_ref=signal.audience_ref,
         )
-        if self._invalidator is not None and str(kind) in ("edit", "delete"):
-            try:
-                self._invalidator(kind, payload)
-            except Exception as exc:
-                # Journaling is the durable contract; invalidation must never break it.
-                logger.warning("signal invalidation failed kind={} error={}", kind, exc)
-        return event_id
+        if strict and stored_event_id != signal.event_id:
+            raise ValueError("strict capture found a conflicting event identity")
+        if not strict:
+            self.invalidate(kind, payload)
+        return stored_event_id
+
+    def invalidate(self, kind: str, payload: Mapping[str, Any]) -> None:
+        """Apply legacy edit/delete projection after the canonical ACK boundary."""
+        if self._invalidator is None or str(kind) not in ("edit", "delete"):
+            return
+        try:
+            self._invalidator(kind, payload)
+        except Exception as exc:
+            # Journaling is the durable contract; invalidation must never break it.
+            logger.warning("signal invalidation failed kind={} error={}", kind, exc)
 
 
 def attach_receipt_evidence(
