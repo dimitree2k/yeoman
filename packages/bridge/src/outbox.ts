@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmod,
+  link,
   mkdir,
   open as openFile,
   readdir,
@@ -291,7 +292,7 @@ export class BridgeOutbox {
       throw new Error('rejection diagnostic exceeds frame limit');
     }
     const diagnosticKey = createHash('sha256')
-      .update(`${event.eventId}\u0000${event.eventKey}\u0000${normalizedReason}\u0000${serializedBytes}`)
+      .update(`${event.eventId}\u0000${event.eventKey}`)
       .digest('hex');
     const fileName = `rejected-${diagnosticKey}.json`;
     const quarantinePath = join(this.directory, QUARANTINE_DIR);
@@ -299,18 +300,17 @@ export class BridgeOutbox {
 
     const existingFinal = await this.readRejectionDiagnostic(finalPath, diagnosticJson);
     if (existingFinal) {
-      // A prior process may have crashed after rename but before its directory fsync. Make
+      // A prior process may have crashed after publication but before its directory fsync. Make
       // the already-written diagnostic durable before the caller removes the source record.
       await this.syncFile(finalPath);
-      await this.discardRejectionTemps(quarantinePath, fileName);
       await syncDirectory(quarantinePath);
       this.rejectionFiles.add(fileName);
       return;
     }
 
-    // Source records are still present while this runs. Any temp from a crashed
-    // attempt is therefore safe to discard without reading or persisting its contents.
-    await this.discardRejectionTemps(quarantinePath, fileName);
+    // UUID temps are never swept: a sibling process may still own one. Crash leftovers are
+    // owner-only identity diagnostics and are ignored on reload.
+    // ponytail: leave crash temps for safety; add age/owner liveness cleanup only with a lease protocol.
     const temporaryPath = join(quarantinePath, `.${fileName}.${randomUUID()}.tmp`);
 
     let handle: Awaited<ReturnType<typeof openFile>> | undefined;
@@ -320,7 +320,31 @@ export class BridgeOutbox {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporaryPath, finalPath);
+      let published = false;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await link(temporaryPath, finalPath);
+          published = true;
+          break;
+        } catch (error: unknown) {
+          if ((error as { code?: string }).code !== 'EEXIST') throw error;
+          if (await this.readRejectionDiagnostic(finalPath, diagnosticJson)) {
+            await this.syncFile(finalPath);
+            await syncDirectory(quarantinePath);
+            break;
+          }
+        }
+      }
+      if (!published && !(await this.readRejectionDiagnostic(finalPath, diagnosticJson))) {
+        throw new Error('Bridge rejection diagnostic race');
+      }
+      if (published) {
+        await this.syncFile(finalPath);
+        await syncDirectory(quarantinePath);
+      }
+      await unlink(temporaryPath).catch((error: unknown) => {
+        if ((error as { code?: string }).code !== 'ENOENT') throw error;
+      });
       await syncDirectory(quarantinePath);
       this.rejectionFiles.add(fileName);
     } catch (error) {
@@ -330,21 +354,6 @@ export class BridgeOutbox {
       }
       throw error;
     }
-  }
-
-  private async discardRejectionTemps(quarantinePath: string, fileName: string): Promise<void> {
-    const prefix = `.${fileName}.`;
-    let discarded = false;
-    for (const name of await readdir(quarantinePath)) {
-      if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
-      const path = join(quarantinePath, name);
-      const stats = await lstat(path);
-      if (!stats.isFile()) throw new Error('Bridge rejection temp is not a regular file');
-      await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
-      await unlink(path);
-      discarded = true;
-    }
-    if (discarded) await syncDirectory(quarantinePath);
   }
 
   private async syncFile(path: string): Promise<void> {

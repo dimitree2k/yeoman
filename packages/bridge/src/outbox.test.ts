@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -277,7 +277,7 @@ test('reload rejection is durable before unlink for canonical and staged oversiz
   }
 });
 
-test('reload replaces crash temps left before fsync or rename without leaking payloads', async () => {
+test('reload ignores crash temps left before fsync or publication without leaking payloads', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-stale-rejection-'));
   try {
     const oversized = oversizedEvent('stale-temp-event', 'stale-temp-key');
@@ -310,7 +310,10 @@ test('reload replaces crash temps left before fsync or rename without leaking pa
     assert.equal(diagnostic.includes('stale-temp-event'), false);
     assert.equal(diagnostic.includes('stale-temp-key'), false);
     assert.equal(diagnostic.includes('stale-temp-payload-secret'), false);
-    assert.equal((await readdir(quarantine)).some((name) => name.endsWith('.tmp')), false);
+    assert.deepEqual(
+      (await readdir(quarantine)).filter((name) => name.endsWith('.tmp')).sort(),
+      [`.${finalName}.empty.tmp`, `.${finalName}.matching.tmp`, `.${finalName}.partial.tmp`].sort(),
+    );
 
     const secondRestart = new (await loadOutbox()).BridgeOutbox(root);
     await secondRestart.open();
@@ -318,6 +321,98 @@ test('reload replaces crash temps left before fsync or rename without leaking pa
       (await readdir(quarantine)).filter((name) => name.startsWith('rejected-')),
       [finalName],
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a held writer temp survives another rejection writer', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-live-rejection-temp-'));
+  let liveHandle: Awaited<ReturnType<typeof openFile>> | undefined;
+  try {
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o700 });
+    const oversized = oversizedEvent('live-temp-event', 'live-temp-key');
+    const serializedBytes = Buffer.byteLength(JSON.stringify(oversized), 'utf8');
+    const seed = new (await loadOutbox()).BridgeOutbox(root);
+    await (seed as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit');
+    const [finalName] = (await readdir(quarantine)).filter((name) => name.startsWith('rejected-'));
+    assert.ok(finalName);
+    const liveTemp = join(quarantine, `.${finalName}.live-writer.tmp`);
+    await rename(join(quarantine, finalName), liveTemp);
+    liveHandle = await openFile(liveTemp, 'r');
+
+    const recovering = new (await loadOutbox()).BridgeOutbox(root);
+    await (recovering as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit');
+
+    assert.equal(await pathExists(liveTemp), true);
+    assert.equal(await pathExists(join(quarantine, finalName)), true);
+  } finally {
+    await liveHandle?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('matching concurrent rejection writers converge on one durable final', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-matching-rejection-'));
+  try {
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o700 });
+    const oversized = oversizedEvent('matching-event', 'matching-key');
+    const serializedBytes = Buffer.byteLength(JSON.stringify(oversized), 'utf8');
+    const first = new (await loadOutbox()).BridgeOutbox(root);
+    const second = new (await loadOutbox()).BridgeOutbox(root);
+
+    const outcomes = await Promise.allSettled([
+      (first as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit'),
+      (second as any).writeRejectionDiagnostic(oversized, serializedBytes, 'serialized-size-limit'),
+    ]);
+
+    assert.deepEqual(outcomes.map((outcome) => outcome.status), ['fulfilled', 'fulfilled']);
+    assert.equal((await readdir(quarantine)).filter((name) => name.startsWith('rejected-')).length, 1);
+    assert.equal((await readdir(quarantine)).filter((name) => name.endsWith('.tmp')).length, 0);
+    const finalName = (await readdir(quarantine)).find((name) => name.startsWith('rejected-'));
+    assert.ok(finalName);
+    assert.equal(JSON.parse(await readFile(join(quarantine, finalName), 'utf8')).serializedBytes, serializedBytes);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('conflicting concurrent rejection writers never overwrite and fail closed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-conflicting-rejection-'));
+  try {
+    const quarantine = join(root, 'quarantine');
+    await mkdir(quarantine, { mode: 0o700 });
+    const firstEvent = oversizedEvent('same-event-id', 'same-event-key');
+    const secondEvent = event({
+      eventId: 'same-event-id',
+      eventKey: 'same-event-key',
+      type: 'edit',
+      observedAt: 1_700_000_000_001,
+      payload: { messageId: 'same-event-id', text: 'different payload' },
+    });
+    const firstBytes = Buffer.byteLength(JSON.stringify(firstEvent), 'utf8');
+    const secondBytes = firstBytes + 1;
+    const first = new (await loadOutbox()).BridgeOutbox(root);
+    const second = new (await loadOutbox()).BridgeOutbox(root);
+
+    const outcomes = await Promise.allSettled([
+      (first as any).writeRejectionDiagnostic(firstEvent, firstBytes, 'serialized-size-limit'),
+      (second as any).writeRejectionDiagnostic(secondEvent, secondBytes, 'serialized-size-limit'),
+    ]);
+
+    assert.deepEqual(outcomes.map((outcome) => outcome.status).sort(), ['fulfilled', 'rejected']);
+    const finalName = (await readdir(quarantine)).find((name) => name.startsWith('rejected-'));
+    assert.ok(finalName);
+    const finalDiagnostic = JSON.parse(await readFile(join(quarantine, finalName), 'utf8'));
+    const winnerIndex = outcomes.findIndex((outcome) => outcome.status === 'fulfilled');
+    const winner = winnerIndex === 0
+      ? { event: firstEvent, serializedBytes: firstBytes }
+      : { event: secondEvent, serializedBytes: secondBytes };
+    assert.equal(finalDiagnostic.observedAt, winner.event.observedAt);
+    assert.equal(finalDiagnostic.serializedBytes, winner.serializedBytes);
+    assert.equal(finalDiagnostic.type, winner.event.type);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
