@@ -294,6 +294,70 @@ _CORE_SCHEMA: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS knowledge_quarantine_by_reason"
     " ON knowledge_quarantine (reason)",
+    # ── conversation threads (Phase 2) ───────────────────────────────────────
+    # A thread is a subject-matter statement, not a runtime route.  Relations are
+    # relational rows, never a writable ``thread_ids`` JSON blob: one source revision
+    # may legitimately join several threads without its text being copied anywhere.
+    """
+    CREATE TABLE IF NOT EXISTS conversations (
+        conversation_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open'
+            CHECK(status IN ('open','closed','merged')),
+        origin TEXT NOT NULL
+            CHECK(origin IN ('explicit_reply','explicit_quote','manual','split','merge')),
+        confidence REAL NOT NULL DEFAULT 1.0,
+        classifier_version TEXT NOT NULL DEFAULT '',
+        merged_into TEXT REFERENCES conversations(conversation_id),
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS conversations_by_scope"
+    " ON conversations (workspace_id, scope_key, status)",
+    """
+    CREATE TABLE IF NOT EXISTS conversation_memberships (
+        conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id)
+            ON DELETE CASCADE,
+        source_event_id TEXT NOT NULL,
+        source_revision INTEGER NOT NULL,
+        channel TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL DEFAULT '',
+        author_principal TEXT NOT NULL DEFAULT '',
+        origin TEXT NOT NULL
+            CHECK(origin IN ('explicit_reply','explicit_quote','manual','split','merge')),
+        confidence REAL NOT NULL DEFAULT 1.0,
+        classifier_version TEXT NOT NULL DEFAULT '',
+        text_start INTEGER,
+        text_end INTEGER,
+        created_ms INTEGER NOT NULL,
+        PRIMARY KEY (conversation_id, source_event_id, source_revision)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS conversation_memberships_by_source"
+    " ON conversation_memberships (source_event_id, source_revision)",
+    """
+    CREATE TABLE IF NOT EXISTS conversation_relations (
+        relation_id TEXT PRIMARY KEY,
+        from_conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id)
+            ON DELETE CASCADE,
+        to_conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id)
+            ON DELETE CASCADE,
+        relation TEXT NOT NULL
+            CHECK(relation IN ('branches_from','merged_into','related_to')),
+        origin TEXT NOT NULL
+            CHECK(origin IN ('explicit_reply','explicit_quote','manual','split','merge')),
+        confidence REAL NOT NULL DEFAULT 1.0,
+        classifier_version TEXT NOT NULL DEFAULT '',
+        created_ms INTEGER NOT NULL,
+        UNIQUE (from_conversation_id, to_conversation_id, relation)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS conversation_relations_by_from"
+    " ON conversation_relations (from_conversation_id, relation)",
+    "CREATE INDEX IF NOT EXISTS conversation_relations_by_to"
+    " ON conversation_relations (to_conversation_id, relation)",
     """
     CREATE TABLE IF NOT EXISTS knowledge_meta (
         key TEXT PRIMARY KEY,
@@ -747,6 +811,9 @@ class KnowledgeStore:
             "knowledge_statement_principals",
             "knowledge_jobs",
             "knowledge_quarantine",
+            "conversations",
+            "conversation_memberships",
+            "conversation_relations",
             "memory2_nodes",
             "memory2_facts",
             "memory2_fact_sources",

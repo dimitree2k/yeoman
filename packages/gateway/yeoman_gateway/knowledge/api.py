@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
 from yeoman_gateway.knowledge._statements import StatementEngine, token_re
@@ -30,6 +31,11 @@ from yeoman_gateway.knowledge.models import (
     CaptureJobReceipt,
     CaptureResult,
     ChangeReceipt,
+    ConversationMembershipReceipt,
+    ConversationMergeReceipt,
+    ConversationReferenceReceipt,
+    ConversationSplitReceipt,
+    ConversationView,
     EndpointResolution,
     Identifier,
     KnowledgeContext,
@@ -260,6 +266,12 @@ class KnowledgeService:
             identity=self._identity,
             statements=self._statements,
             policy=policy_authority,
+            workspace_id=self.workspace_id,
+        )
+        self._conversations = ConversationEngine(
+            store,
+            authority=self._authority,
+            retrieval=self._retrieval,
             workspace_id=self.workspace_id,
         )
 
@@ -497,6 +509,104 @@ class KnowledgeService:
     ) -> tuple[CaptureJobReceipt, ...]:
         """Internal worker read: job ids only, no statement content."""
         return self._statements.due_jobs(now=now_ms, limit=limit)
+
+    # ── conversation threads ─────────────────────────────────────────────────
+    #
+    # A thread is a subject-matter statement, not a runtime route.  Membership is keyed
+    # by ``(conversation_id, source_event_id, source_revision)`` and stores references,
+    # never text, so one source revision may join several threads.  Every read runs
+    # through the same gate as statements; a thread never widens chat access.
+
+    def attach_conversation_membership(
+        self,
+        source: SourceRef,
+        *,
+        context: TrustedCaptureContext,
+        conversation_id: str | None = None,
+        origin: str = "manual",
+        confidence: float = 1.0,
+        classifier_version: str = "",
+        text_offsets: tuple[int, int] | None = None,
+    ) -> ConversationMembershipReceipt:
+        """Attach one proven source revision to a thread, creating the thread if needed."""
+        return self._conversations.attach_membership(
+            source,
+            context=context,
+            conversation_id=conversation_id,
+            origin=origin,
+            confidence=confidence,
+            classifier_version=classifier_version,
+            text_offsets=text_offsets,
+            now_ms=self._now(),
+        )
+
+    def record_conversation_reference(
+        self,
+        source: SourceRef,
+        *,
+        refers_to: SourceRef,
+        context: TrustedCaptureContext,
+        kind: str = "reply",
+        confidence: float = 1.0,
+        classifier_version: str = "explicit-reference-v1",
+    ) -> ConversationReferenceReceipt:
+        """Record an explicit reply/quote as a relation candidate between two threads."""
+        return self._conversations.record_reference(
+            source,
+            refers_to=refers_to,
+            context=context,
+            kind=kind,
+            confidence=confidence,
+            classifier_version=classifier_version,
+            now_ms=self._now(),
+        )
+
+    def split_conversation(
+        self,
+        conversation_id: str,
+        *,
+        sources: tuple[SourceRef, ...],
+        context: TrustedCaptureContext,
+        origin: str = "split",
+        confidence: float = 1.0,
+        classifier_version: str = "",
+    ) -> ConversationSplitReceipt:
+        """Branch a new thread off an existing one; the prior ids and rows survive."""
+        return self._conversations.split_conversation(
+            conversation_id,
+            sources=sources,
+            context=context,
+            origin=origin,
+            confidence=confidence,
+            classifier_version=classifier_version,
+            now_ms=self._now(),
+        )
+
+    def merge_conversations(
+        self,
+        source_ids: tuple[str, ...],
+        *,
+        target_id: str,
+        context: TrustedCaptureContext,
+    ) -> ConversationMergeReceipt:
+        """Merge threads by redirect: retired ids stay resolvable and auditable."""
+        return self._conversations.merge_conversations(
+            source_ids, target_id=target_id, context=context, now_ms=self._now()
+        )
+
+    def conversation(
+        self, conversation_id: str, *, context: TrustedReadContext
+    ) -> ConversationView:
+        """The gated read projection of one thread, derived from relational rows."""
+        return self._conversations.view(conversation_id, context=self._read_context(context))
+
+    def conversations_for_source(
+        self, source: SourceRef, *, context: TrustedReadContext
+    ) -> tuple[ConversationView, ...]:
+        """Every thread one source revision belongs to, gated per thread."""
+        return self._conversations.conversations_for_source(
+            source, context=self._read_context(context)
+        )
 
     # ── administration and diagnostics ───────────────────────────────────────
 

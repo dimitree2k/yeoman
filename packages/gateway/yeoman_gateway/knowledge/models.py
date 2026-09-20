@@ -24,6 +24,9 @@ from typing import Final
 
 __all__ = [
     "CHANGE_STATUSES",
+    "CONVERSATION_ORIGINS",
+    "CONVERSATION_RELATIONS",
+    "CONVERSATION_STATUSES",
     "ERROR_CODES",
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
@@ -35,6 +38,13 @@ __all__ = [
     "CaptureJobReceipt",
     "CaptureResult",
     "ChangeReceipt",
+    "ConversationMembership",
+    "ConversationMembershipReceipt",
+    "ConversationMergeReceipt",
+    "ConversationReferenceReceipt",
+    "ConversationRelation",
+    "ConversationSplitReceipt",
+    "ConversationView",
     "EndpointResolution",
     "Identifier",
     "KnowledgeContext",
@@ -90,6 +100,26 @@ CHANGE_STATUSES: Final[tuple[str, ...]] = (
 )
 
 READ_PURPOSES: Final[tuple[str, ...]] = ("reply", "proactive", "profile", "admin")
+
+#: How one source revision came to belong to a conversation thread.  A thread is a
+#: subject-matter statement, so membership origin stays explicit and auditable.
+CONVERSATION_ORIGINS: Final[tuple[str, ...]] = (
+    "explicit_reply",
+    "explicit_quote",
+    "manual",
+    "split",
+    "merge",
+)
+
+#: The complete relation vocabulary.  Deliberately tiny: an explicit reply link is a
+#: relation candidate, never a proof of identical topic.
+CONVERSATION_RELATIONS: Final[tuple[str, ...]] = (
+    "branches_from",
+    "merged_into",
+    "related_to",
+)
+
+CONVERSATION_STATUSES: Final[tuple[str, ...]] = ("open", "closed", "merged")
 
 ERROR_CODES: Final[tuple[str, ...]] = (
     "invalid_input",
@@ -645,6 +675,122 @@ class PersonProfile:
 
     person: PersonResolution
     context: KnowledgeContext
+
+
+# ── conversation threads ─────────────────────────────────────────────────────
+
+
+def _require_offsets(value: object) -> tuple[int, int] | None:
+    """Validate an optional ``(start, end)`` character span inside the source text."""
+    if value is None:
+        return None
+    try:
+        start, end = value  # type: ignore[misc]
+    except (TypeError, ValueError):
+        raise ValidationError("text offsets must be a (start, end) pair") from None
+    start = _require_int(start, "text_start", minimum=0)
+    end = _require_int(end, "text_end", minimum=0)
+    if end < start:
+        raise ValidationError("text offsets must satisfy end >= start")
+    return (start, end)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationMembership:
+    """One source revision inside one conversation.  Never carries the source text."""
+
+    conversation_id: str
+    source: SourceRef
+    origin: str
+    confidence: float
+    classifier_version: str
+    text_offsets: tuple[int, int] | None = None
+    created_ms: int = 0
+
+    def __post_init__(self) -> None:
+        _require_choice(self.origin, CONVERSATION_ORIGINS, "origin")
+        object.__setattr__(self, "confidence", _require_confidence(self.confidence))
+        object.__setattr__(self, "text_offsets", _require_offsets(self.text_offsets))
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationRelation:
+    """A typed edge between two conversations.  Old ids always stay resolvable."""
+
+    relation: str
+    from_conversation_id: str
+    to_conversation_id: str
+    origin: str
+    confidence: float
+    classifier_version: str
+    created_ms: int = 0
+
+    def __post_init__(self) -> None:
+        _require_choice(self.relation, CONVERSATION_RELATIONS, "relation")
+        _require_choice(self.origin, CONVERSATION_ORIGINS, "origin")
+        object.__setattr__(self, "confidence", _require_confidence(self.confidence))
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationView:
+    """A read projection derived from relational rows, gated by the Phase-1 read gate."""
+
+    conversation_id: str
+    workspace_id: str = ""
+    scope_key: str = ""
+    status: str = "open"
+    merged_into: str | None = None
+    redirected_from: str | None = None
+    memberships: tuple[ConversationMembership, ...] = ()
+    relations: tuple[ConversationRelation, ...] = ()
+    withheld_memberships: int = 0
+    reason: str = "ok"
+
+    @property
+    def empty(self) -> bool:
+        return not self.memberships
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationMembershipReceipt:
+    """Outcome of attaching one source revision to a conversation."""
+
+    conversation_id: str
+    created_conversation: bool
+    new_memberships: int
+    origin: str
+    confidence: float = 1.0
+    classifier_version: str = ""
+    text_offsets: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationReferenceReceipt:
+    """Outcome of an explicit reply/quote link.  A relation candidate, not a merge."""
+
+    conversation_id: str
+    related_conversation_id: str
+    relation_created: bool
+    relations: tuple[ConversationRelation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationSplitReceipt:
+    """A new branch that leaves the prior conversation id and memberships intact."""
+
+    conversation_id: str
+    branched_from: str
+    origin: str = "split"
+    relations: tuple[ConversationRelation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationMergeReceipt:
+    """A merge that redirects the retired ids instead of rewriting history."""
+
+    conversation_id: str
+    merged_ids: tuple[str, ...] = ()
+    relations: tuple[ConversationRelation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
