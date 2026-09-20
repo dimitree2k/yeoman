@@ -352,7 +352,14 @@ def classify_conversation_state(
         not request_like and looks_like_social_reaction_prompt(content, metadata)
     )
     reply_ack = reply_direct and looks_like_reply_ack(content)
-    low_content_reply = reply_direct and looks_like_low_content_reply(content)
+    reply_target_requests_answer = reply_direct and looks_like_question_or_request(
+        str(metadata.get("reply_to_text") or "")
+    )
+    low_content_reply = (
+        reply_direct
+        and not reply_target_requests_answer
+        and looks_like_low_content_reply(content)
+    )
     group_member_bait = explicit_mention and looks_like_group_member_bait(content)
     recent_followup = is_recent_assistant_followup(
         session_manager=session_manager,

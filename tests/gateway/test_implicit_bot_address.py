@@ -674,6 +674,28 @@ async def test_short_ack_reply_to_bot_gets_reaction_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_short_answer_to_quoted_bot_question_is_answered_not_reacted_to() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="40211",
+            reply_to_bot=True,
+            reply_to_message_id="bot-question-1",
+            reply_to_text="Für welchen Ort genau (Stadt/PLZ)?",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
+
+    assert ctx.halted is False
+    assert ctx.reply == "downstream reached"
+    assert not any(isinstance(intent, SendReactionIntent) for intent in ctx.intents)
+    state = ctx.event.raw_metadata["conversation_state"]
+    assert state["address_mode"] == "reply_to_bot"
+    assert state["preferred_action"] == "answer"
+
+
+@pytest.mark.asyncio
 async def test_quoted_full_report_request_is_answered_not_reacted_to() -> None:
     ctx = PipelineContext(
         event=_event(
@@ -715,7 +737,7 @@ async def test_hesitation_reply_to_bot_gets_reaction_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ente_replay_meme_reply_to_bot_gets_reaction_only() -> None:
+async def test_non_ack_reply_to_quoted_bot_question_reaches_answer_path() -> None:
     ctx = PipelineContext(
         event=_event(
             chat_id="1234567890-1234567890@g.us",
@@ -730,12 +752,12 @@ async def test_ente_replay_meme_reply_to_bot_gets_reaction_only() -> None:
     await ImplicitBotAddressMiddleware()(ctx, _tracking_next)
 
     reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
-    assert ctx.halted is True
-    assert ctx.reply is None
-    assert len(reactions) == 1
+    assert ctx.halted is False
+    assert ctx.reply == "downstream reached"
+    assert reactions == []
     state = ctx.event.raw_metadata["conversation_state"]
-    assert state["address_mode"] == "low_content_reply"
-    assert state["preferred_action"] == "react"
+    assert state["address_mode"] == "reply_to_bot"
+    assert state["preferred_action"] == "answer"
 
 
 @pytest.mark.asyncio

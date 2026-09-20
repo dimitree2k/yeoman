@@ -33,10 +33,11 @@ if TYPE_CHECKING:
 
 
 class JoinRule(StrEnum):
-    """The six rules of spec R03, in binding priority order."""
+    """The thread-join rules, in binding priority order."""
 
     REPLY_KNOWN = "reply_known"  # R03.1
     EXPLICIT_CORRECTION = "explicit_correction"  # R03.2
+    REPLY_BOT_NEW_THREAD = "reply_bot_new_thread"
     FOLLOWUP_SINGLE_ACTIVE = "followup_single_active"  # R03.3
     MENTION_NO_REFERENCE = "mention_new_thread"  # R03.4
     DM_LAST_ACTIVE = "dm_last_active"  # R03.5
@@ -46,6 +47,7 @@ class JoinRule(StrEnum):
 JOIN_RULES: tuple[JoinRule, ...] = (
     JoinRule.REPLY_KNOWN,
     JoinRule.EXPLICIT_CORRECTION,
+    JoinRule.REPLY_BOT_NEW_THREAD,
     JoinRule.FOLLOWUP_SINGLE_ACTIVE,
     JoinRule.MENTION_NO_REFERENCE,
     JoinRule.DM_LAST_ACTIVE,
@@ -85,6 +87,7 @@ class JoinInput:
     kind: str = "message"
     is_group: bool = False
     mentioned_bot: bool = False
+    reply_to_bot: bool = False
     reply_to_message_id: str | None = None
     target_message_id: str | None = None
     explicit_correction: bool = False
@@ -257,6 +260,27 @@ def _rule_followup_single_active(
     )
 
 
+def _rule_reply_bot_new_thread(
+    data: JoinInput, view: JoinView, policy: ThreadPolicy
+) -> JoinDecision | None:
+    """Start a thread for a trusted bot reply whose old anchor is not journaled.
+
+    Proactive service messages may be confirmed by the channel without belonging to a
+    normal Yeoman turn. The platform's exact ``reply_to_bot`` signal is still positive
+    continuity, so the current reply gets a fresh bounded turn instead of falling into
+    ambient observation.
+    """
+    if not data.reply_to_bot or not data.reply_to_message_id or view.reply_thread_id:
+        return None
+    return JoinDecision(
+        rule=JoinRule.REPLY_BOT_NEW_THREAD,
+        reason="reply_to_unknown_bot_anchor",
+        new_thread=True,
+        new_turn=True,
+        quote_ref=data.reply_to_message_id,
+    )
+
+
 def _rule_mention_no_reference(
     data: JoinInput, view: JoinView, policy: ThreadPolicy
 ) -> JoinDecision | None:
@@ -298,6 +322,7 @@ def _rule_ambient(data: JoinInput, view: JoinView, policy: ThreadPolicy) -> Join
 _RULES: Mapping[JoinRule, Callable[[JoinInput, JoinView, ThreadPolicy], JoinDecision | None]] = {
     JoinRule.REPLY_KNOWN: _rule_reply_known,
     JoinRule.EXPLICIT_CORRECTION: _rule_explicit_correction,
+    JoinRule.REPLY_BOT_NEW_THREAD: _rule_reply_bot_new_thread,
     JoinRule.FOLLOWUP_SINGLE_ACTIVE: _rule_followup_single_active,
     JoinRule.MENTION_NO_REFERENCE: _rule_mention_no_reference,
     JoinRule.DM_LAST_ACTIVE: _rule_dm_last_active,
@@ -610,6 +635,7 @@ class ThreadRegistry:
             kind=event.kind,
             is_group=is_group,
             mentioned_bot=bool(payload.get("mentioned_bot")),
+            reply_to_bot=bool(payload.get("reply_to_bot")),
             reply_to_message_id=_opt(payload.get("reply_to_message_id"))
             or _opt(payload.get("reply_to")),
             target_message_id=_opt(payload.get("target_message_id")),
