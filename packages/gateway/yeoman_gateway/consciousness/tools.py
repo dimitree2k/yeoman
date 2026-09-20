@@ -566,7 +566,12 @@ class ConsciousnessTools:
         normalized = str(normalized or "").strip()
         if not normalized:
             return {"status": "approval_queue_failed", "reason": "empty_message"}
-        payload_hash = canonical_hash(payload_to_mapping(TextPayload(text=normalized)))
+        reply_to_message_id = str(admission.target_message_id or "") or None
+        payload_hash = canonical_hash(
+            payload_to_mapping(
+                TextPayload(text=normalized, reply_to=reply_to_message_id)
+            )
+        )
         prepared_admission = replace(
             admission,
             payload_hash=payload_hash,
@@ -597,7 +602,7 @@ class ConsciousnessTools:
             chat_id=chat_id,
             content=normalized,
             action_type="comment",
-            reply_to_message_id=None,
+            reply_to_message_id=reply_to_message_id,
             revision=revision,
         )
         now = self._now()
@@ -613,6 +618,7 @@ class ConsciousnessTools:
             "approval_expires_at_ms": int(expires_at * 1000),
             "approval_owner_channel": channel,
             "approval_owner_chat_id": owner_chat_id,
+            "reply_to_message_id": reply_to_message_id,
         }
         await self.log.record_proposed(
             proposal_id=proposal_id,
@@ -639,6 +645,7 @@ class ConsciousnessTools:
             context_snapshot=context_snapshot,
             trigger=str(getattr(opportunity, "trigger", "inbound") or "inbound"),
             daily_cap=max(0, int(resolved.spontaneity_daily_cap or 0)),
+            reply_to_message_id=reply_to_message_id,
             payload_hash=approval_hash,
             proposal_revision=revision,
         )
@@ -1116,7 +1123,12 @@ class ConsciousnessTools:
             proposal_id=proposal.proposal_id,
         )
         expected_payload_hash = canonical_hash(
-            payload_to_mapping(TextPayload(text=proposal.message))
+            payload_to_mapping(
+                TextPayload(
+                    text=proposal.message,
+                    reply_to=proposal.reply_to_message_id,
+                )
+            )
         )
         if (
             effect_id != expected_effect_id

@@ -1140,7 +1140,7 @@ class ParticipationRuntime:
             await self._release_comment(opportunity, effect_id, "deadline_expired")
             await self._record(opportunity, "stale_discarded", "deadline_expired")
             return {"status": "comment_skipped", "reason": "deadline_expired"}
-        payload = TextPayload(text=text)
+        payload = TextPayload(text=text, reply_to=decision.target_message_id)
         approval_required = bool(
             _snapshot_bool(snapshot, "approval_required", default=False)
             and decision.intent == "initiate"

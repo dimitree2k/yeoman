@@ -11,12 +11,13 @@ import asyncio
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
-from yeoman_gateway.processing.models import TransportReceipt
+from yeoman_gateway.processing.models import TextPayload, TransportReceipt, payload_hash
 from yeoman_gateway.processing.participation import (
     ParticipationDecision,
     ParticipationDecisionError,
@@ -1933,6 +1934,136 @@ async def test_effect_target_is_always_the_admitted_chat(tmp_path: Path) -> None
     assert admission.source_principals == (("m1", "anna@s.whatsapp.net"),)  # type: ignore[attr-defined]
     assert admission.payload_hash  # type: ignore[attr-defined]
     log.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_admission_hash_includes_reply_target(tmp_path: Path) -> None:
+    class _AdmissionSpySubmission(_Submission):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admission: object | None = None
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            self.admission = admission
+            return await super().submit(
+                admission=admission,
+                effect_id=effect_id,
+                content=content,
+                payload_hash=payload_hash,
+            )
+
+    submission = _AdmissionSpySubmission()
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+
+    await runtime.evaluate_participation(_opportunity())
+
+    assert submission.admission is not None
+    assert submission.admission.payload_hash == payload_hash(  # type: ignore[attr-defined]
+        TextPayload(text="a synthetic draft", reply_to="m1")
+    )
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_prompt_marks_current_source_separately_from_old_context() -> None:
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+
+    class _PromptSpy(LLMResponder):
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        def _metadata_for_event(self, event: InboundEvent) -> dict[str, object]:
+            del event
+            return {}
+
+        async def _generate(self, **kwargs: object) -> str:
+            self.prompt = str(kwargs["content"])
+            return "draft"
+
+    responder = _PromptSpy()
+    await responder.generate_participation_draft(
+        InboundEvent(
+            channel=CHANNEL,
+            chat_id=CHAT,
+            sender_id="",
+            content="",
+            is_group=True,
+        ),
+        PolicyDecision(
+            accept_message=False,
+            should_respond=False,
+            allowed_tools=frozenset(),
+            reason="participation_draft_only",
+        ),
+        purpose="Explain the current JEV use case.",
+        context={
+            "current_source_ids": ["current"],
+            "messages": [
+                {
+                    "event_id": "old",
+                    "sender": "Arvid",
+                    "text": "bist du geupdatet?",
+                },
+                {
+                    "event_id": "current",
+                    "sender": "Arvid",
+                    "text": "JEV needs a concrete use case",
+                },
+            ],
+        },
+        model_profile="participation_writer",
+    )
+
+    assert "[CONTEXT] Arvid: bist du geupdatet?" in responder.prompt
+    assert "[CURRENT] Arvid: JEV needs a concrete use case" in responder.prompt
+    assert "Answer only the [CURRENT] message" in responder.prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_comment_replies_to_admitted_target() -> None:
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+
+    class _Sender:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def send(self, **kwargs: object) -> _Receipt:
+            self.calls.append(kwargs)
+            return _Receipt(effect_id=str(kwargs["effect_id"]))
+
+    sender = _Sender()
+    responder = object.__new__(LLMResponder)
+    responder._service_effect_sender = sender
+    admission = SimpleNamespace(
+        admission_id="admission-1",
+        channel=CHANNEL,
+        chat_id=CHAT,
+        target_message_id="m1",
+    )
+
+    result = await responder.submit_participation_comment(
+        admission=admission,
+        effect_id="effect-1",
+        content="current answer",
+    )
+
+    assert result.status == "sent"
+    assert sender.calls == [
+        {
+            "source": "speakup",
+            "operation_ref": "participation:effect-1",
+            "channel": CHANNEL,
+            "chat_id": CHAT,
+            "content": "current answer",
+            "reply_to": "m1",
+            "effect_id": "effect-1",
+            "require_managed": True,
+            "admission": admission,
+        }
+    ]
 
 
 # -- final local authorization and stale work (04.3) -----------------------------------
