@@ -7,6 +7,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
 from yeoman_gateway.app.bootstrap import build_retention_service
 from yeoman_gateway.processing.models import CANONICAL_WHATSAPP_ORIGIN, DAY_MS, PurgeReport
 from yeoman_gateway.processing.retention import ProcessingRetentionService
@@ -51,6 +52,55 @@ class _SlowStore:
         time.sleep(self.delay_seconds)
         self.finished.set()
         return PurgeReport()
+
+
+class _SerializedSlowStore:
+    """Blocks each purge until the test releases that specific call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self.started = [threading.Event(), threading.Event()]
+        self.release = [threading.Event(), threading.Event()]
+        self.finished = [threading.Event(), threading.Event()]
+        self._lock = threading.Lock()
+
+    def purge(self, *, now_ms: int) -> PurgeReport:
+        del now_ms
+        with self._lock:
+            index = self.calls
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.started[index].set()
+        self.release[index].wait(timeout=2)
+        with self._lock:
+            self.active -= 1
+        self.finished[index].set()
+        return PurgeReport()
+
+
+class _CancellableErrorStore:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def purge(self, *, now_ms: int) -> PurgeReport:
+        del now_ms
+        self.started.set()
+        self.release.wait(timeout=2)
+        self.finished.set()
+        raise RuntimeError("purge failed")
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    for _ in range(200):
+        if event.is_set():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("timed out waiting for worker event")
 
 
 def _append_event(store: ProcessingStore) -> None:
@@ -200,6 +250,82 @@ def test_stop_waits_for_an_inflight_sweep_before_shutdown() -> None:
         assert store.finished.is_set()
         await sweep
         assert service.running is False
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_sweeps_are_serialized_and_stop_waits_for_both() -> None:
+    store = _SerializedSlowStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started[0])
+        second = asyncio.create_task(service.sweep_once())
+        await asyncio.sleep(0)
+        stop = asyncio.create_task(service.stop())
+        await asyncio.sleep(0.02)
+
+        assert not stop.done()
+        assert store.calls == 1
+        assert store.max_active == 1
+
+        store.release[0].set()
+        await _wait_for_thread_event(store.started[1])
+        assert not stop.done()
+        assert store.max_active == 1
+
+        store.release[1].set()
+        await asyncio.gather(first, second, stop)
+        assert store.calls == 2
+        assert store.max_active == 1
+        assert service.running is False
+
+    asyncio.run(scenario())
+
+
+def test_stop_rejects_new_sweeps_without_starting_a_worker() -> None:
+    store = _SlowStore(delay_seconds=0.01)
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        await service.stop()
+        with pytest.raises(RuntimeError, match="stopping"):
+            await service.sweep_once()
+        assert store.calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_sweep_waits_for_worker_and_cleans_up() -> None:
+    store = _SlowStore(delay_seconds=0.05)
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+        assert store.finished.is_set()
+        await service.stop()
+        assert store.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_worker_error_propagates_and_stop_is_clean() -> None:
+    store = _CancellableErrorStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        store.release.set()
+        with pytest.raises(RuntimeError, match="purge failed"):
+            await sweep
+        assert store.finished.is_set()
+        await service.stop()
 
     asyncio.run(scenario())
 

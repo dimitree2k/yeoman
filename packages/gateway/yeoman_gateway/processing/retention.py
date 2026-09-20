@@ -45,6 +45,10 @@ class ProcessingRetentionService:
         self._interval_seconds = max(0.05, float(interval_seconds))
         self._startup_delay_seconds = max(0.0, float(startup_delay_seconds))
         self._task: asyncio.Task[None] | None = None
+        self._sweep_lock = asyncio.Lock()
+        self._pending_zero = asyncio.Event()
+        self._pending_zero.set()
+        self._pending_sweeps = 0
         self._inflight_done: threading.Event | None = None
         self._stopping = False
         self._sweeps = 0
@@ -68,9 +72,7 @@ class ProcessingRetentionService:
                 await task
             except asyncio.CancelledError:
                 pass
-        inflight = self._inflight_done
-        while inflight is not None and not inflight.is_set():
-            await asyncio.sleep(0.01)
+        await self._pending_zero.wait()
 
     @property
     def running(self) -> bool:
@@ -84,12 +86,27 @@ class ProcessingRetentionService:
     async def sweep_once(self) -> PurgeReport:
         """Run one retention pass off the event loop.
 
-        A private one-worker executor keeps SQLite work off the message loop while making
-        shutdown explicit. Cancellation never abandons an in-flight purge: the operation
-        is awaited before the executor is closed.
+        A single admission gate keeps SQLite work off the message loop while ensuring
+        that only one purge runs at a time. Cancellation never abandons an in-flight
+        purge: the operation is awaited before the call exits.
         """
         if self._stopping:
             raise RuntimeError("processing retention service is stopping")
+        self._pending_sweeps += 1
+        self._pending_zero.clear()
+        acquired = False
+        try:
+            await self._sweep_lock.acquire()
+            acquired = True
+            return await self._run_sweep()
+        finally:
+            if acquired:
+                self._sweep_lock.release()
+            self._pending_sweeps -= 1
+            if self._pending_sweeps == 0:
+                self._pending_zero.set()
+
+    async def _run_sweep(self) -> PurgeReport:
         done = threading.Event()
         result: list[PurgeReport] = []
         error: list[BaseException] = []
@@ -104,22 +121,28 @@ class ProcessingRetentionService:
             finally:
                 done.set()
 
+        self._inflight_done = done
         threading.Thread(
             target=_run_purge,
             name="yeoman-processing-retention",
             daemon=True,
         ).start()
-        self._inflight_done = done
+        cancelled = False
         try:
             while not done.is_set():
                 await asyncio.sleep(0.01)
         except asyncio.CancelledError:
+            cancelled = True
             while not done.is_set():
-                await asyncio.sleep(0.01)
-            raise
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
         finally:
             if self._inflight_done is done:
                 self._inflight_done = None
+        if cancelled:
+            raise asyncio.CancelledError
         if error:
             raise error[0]
         assert result
