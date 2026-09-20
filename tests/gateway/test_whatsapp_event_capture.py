@@ -354,6 +354,212 @@ def test_stop_drains_acknowledged_projection_before_return(tmp_path: Path) -> No
     store.close()
 
 
+def _parsed_message(channel: WhatsAppChannel, message_id: str, text: str):
+    event = channel._parse_inbound_event(
+        {
+            "chatJid": CHAT,
+            "messageId": message_id,
+            "senderId": "4915",
+            "text": text,
+        }
+    )
+    assert event is not None
+    return event
+
+
+def test_stop_waits_for_timer_owned_debounce_publisher(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._chat_registry = None
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    published: list[str] = []
+
+    async def publish(event):
+        old_started.set()
+        await release_old.wait()
+        published.append(event.message_id)
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "old", "old"))
+        await asyncio.wait_for(old_started.wait(), timeout=1)
+        stopping = asyncio.create_task(channel.stop())
+        await asyncio.sleep(0.02)
+        waiting = not stopping.done()
+        release_old.set()
+        await stopping
+        assert waiting
+        assert published == ["old"]
+
+    asyncio.run(exercise())
+    store.close()
+
+
+def test_debounce_old_batch_completes_before_new_arrival(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._chat_registry = None
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    started: list[str] = []
+
+    async def publish(event):
+        started.append(event.message_id)
+        if event.message_id == "old":
+            old_started.set()
+            await release_old.wait()
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "old", "old"))
+        await asyncio.wait_for(old_started.wait(), timeout=1)
+        await channel._ingest_inbound_event(_parsed_message(channel, "new", "new"))
+        await asyncio.sleep(0.02)
+        assert started == ["old"]
+        release_old.set()
+        await channel.stop()
+        assert started == ["old", "new"]
+
+    asyncio.run(exercise())
+    store.close()
+
+
+def test_capture_failure_closes_live_intake_for_reconnect(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = _channel(store)
+    channel._running = True
+    channel._connected = True
+    channel._events_subscribed = True
+
+    class Socket:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    socket = Socket()
+    channel._ws = socket
+
+    def fail_append(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("sqlite append failed")
+
+    store.append_event = fail_append  # type: ignore[method-assign]
+
+    asyncio.run(
+        channel._handle_bridge_message(
+            _frame(
+                "message",
+                {
+                    "chatJid": CHAT,
+                    "messageId": "capture-timeout",
+                    "senderId": "4915",
+                    "text": "pending reconnect",
+                },
+                event_id="event-capture-timeout",
+                event_key="wa:capture-timeout",
+            )
+        )
+    )
+
+    assert socket.closed is True
+    assert channel._bridge_intake_closed is True
+    assert channel._connected is False
+    assert channel._running is True
+    store.close()
+
+
+def test_start_aborts_when_replay_ack_fails(tmp_path: Path) -> None:
+    import websockets
+
+    store = ProcessingStore(tmp_path / "processing.db")
+    replay_failed = asyncio.Event()
+
+    async def exercise() -> None:
+        async def bridge_handler(websocket) -> None:
+            async for raw in websocket:
+                command = json.loads(raw)
+                assert command.get("token") == "secret"
+                if command["type"] == "health":
+                    result = {"protocolVersion": PROTOCOL_VERSION}
+                    ok = True
+                elif command["type"] == "subscribe_events":
+                    await websocket.send(
+                        _frame(
+                            "message",
+                            {
+                                "chatJid": CHAT,
+                                "messageId": "startup-replay",
+                                "senderId": "4915",
+                                "text": "startup replay",
+                            },
+                            event_id="event-startup-replay",
+                            event_key="wa:startup-replay",
+                        )
+                    )
+                    result = {"subscribed": True}
+                    ok = True
+                elif command["type"] == "ack_event":
+                    replay_failed.set()
+                    result = None
+                    ok = False
+                else:
+                    result = {}
+                    ok = True
+                payload: dict[str, object] = {"ok": ok}
+                if ok:
+                    payload["result"] = result or {}
+                else:
+                    payload["error"] = {
+                        "code": "ERR_ACK_REJECTED",
+                        "message": "replay ACK rejected",
+                        "retryable": True,
+                    }
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "version": PROTOCOL_VERSION,
+                            "type": "response",
+                            "requestId": command.get("requestId"),
+                            "payload": payload,
+                        }
+                    )
+                )
+
+        try:
+            server = await websockets.serve(bridge_handler, "127.0.0.1", 0)
+        except OSError as exc:
+            if "bind" in str(exc).lower():
+                pytest.skip(f"loopback bind unavailable in this test runner: {exc}")
+            raise
+        async with server:
+            port = server.sockets[0].getsockname()[1]
+            channel = WhatsAppChannel(
+                WhatsAppConfig(
+                    bridge_host="127.0.0.1",
+                    bridge_port=port,
+                    bridge_token="secret",
+                    bridge_auto_repair=False,
+                    bridge_startup_timeout_ms=1_000,
+                ),
+                MessageBus(),
+            )
+            channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
+            channel._runtime.ensure_ready = lambda **kwargs: None  # type: ignore[method-assign]
+            await channel.start()
+            assert replay_failed.is_set()
+            assert channel._connected is False
+            assert channel._running is False
+            assert channel._bridge_intake_closed is True
+
+    asyncio.run(exercise())
+    assert store.get_event("event-startup-replay") is not None
+    store.close()
+
+
 def test_debounce_bucket_flushes_before_item_or_byte_ceiling(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = WhatsAppChannel(
