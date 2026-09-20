@@ -583,3 +583,56 @@ def test_builder_stays_inert_without_processing(tmp_path) -> None:
         assert isinstance(build_retention_service(enabled, store), ProcessingRetentionService)
     finally:
         store.close()
+
+
+def test_sweep_exempts_canonical_whatsapp_written_under_the_plain_origin(tmp_path) -> None:
+    """Regression: the live log carries two origin labels for the same canonical log.
+
+    Phase 1's exemption keyed on ``origin = 'whatsapp_canonical'``, but the live log holds
+    2,381 canonical WhatsApp events stamped ``origin = 'whatsapp'`` (and both writers were
+    active concurrently). Those payloads were therefore purged at the journal window. The
+    exemption is keyed on the channel, so neither writer's content can age out.
+    """
+    store = ProcessingStore(tmp_path / "processing.db")
+    store.append_event(
+        event_key="wa:plain",
+        event_id="wa-plain",
+        trace_id="trace-wa-plain",
+        payload={
+            "kind": "message",
+            "origin": "whatsapp",
+            "channel": "whatsapp",
+            "text": "canonical text written under the plain origin",
+        },
+        now_ms=NOW,
+    )
+    # Inside the metadata window, past the payload window: isolates payload retention.
+    service = ProcessingRetentionService(store, clock=_Clock(NOW + 10 * DAY_MS))
+
+    asyncio.run(service.sweep_once())
+
+    surviving = store.get_event("wa-plain")
+    assert surviving is not None
+    assert surviving.payload is not None, "canonical payload was purged at the journal window"
+    assert surviving.payload.get("text") == "canonical text written under the plain origin"
+    store.close()
+
+
+def test_sweep_still_purges_non_whatsapp_payloads(tmp_path) -> None:
+    """The widened exemption must not become a blanket 'never purge anything'."""
+    store = ProcessingStore(tmp_path / "processing.db")
+    store.append_event(
+        event_key="ops:plain",
+        event_id="ops-plain",
+        trace_id="trace-ops-plain",
+        payload={"kind": "message", "channel": "telegram", "text": "operational"},
+        now_ms=NOW,
+    )
+    service = ProcessingRetentionService(store, clock=_Clock(NOW + 10 * DAY_MS))
+
+    asyncio.run(service.sweep_once())
+
+    purged = store.get_event("ops-plain")
+    assert purged is not None
+    assert purged.payload is None
+    store.close()

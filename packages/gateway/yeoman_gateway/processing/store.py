@@ -3504,6 +3504,13 @@ class ProcessingStore:
         an operation key cannot silently fire a second time after retention.
         """
         retention = self._retention
+        # The canonical WhatsApp log is exempt from payload retention: spec section 1.9
+        # forbids removing canonical WhatsApp event content at seven or 60 days, and the
+        # Phase 1 acceptance criterion says a sweep removes neither the row nor the
+        # payload.  The exemption keys on the *channel*, not on an origin label: live data
+        # carries both ``whatsapp`` and ``whatsapp_canonical`` for the same canonical log
+        # (two writers, concurrent), so keying on one label silently purged the other
+        # writer's payloads at the journal window.
         payload_cutoff = now_ms - retention.journal_payload_ms
         metadata_cutoff = now_ms - retention.metadata_ms
         unresolved_cutoff = now_ms - retention.unresolved_ms
@@ -3512,9 +3519,9 @@ class ProcessingStore:
                 """
                 UPDATE events SET payload_json = NULL, payload_purged_ms = ?
                  WHERE payload_json IS NOT NULL AND created_ms <= ?
-                   AND NOT (channel = 'whatsapp' AND origin = ?)
+                   AND NOT (channel = ?)
                 """,
-                (now_ms, payload_cutoff, CANONICAL_WHATSAPP_ORIGIN),
+                (now_ms, payload_cutoff, "whatsapp"),
             )
             event_payloads_purged = int(cursor.rowcount or 0)
 
