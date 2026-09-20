@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from yeoman_gateway.bus.events import ReactionMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 from yeoman_gateway.processing.signals import SignalJournalSink, WhatsAppSignalMapper
@@ -251,6 +252,156 @@ def test_ack_failure_keeps_canonical_row_but_invokes_no_downstream(tmp_path: Pat
 
     assert store.get_event("event-ack-failure") is not None
     assert downstream == []
+    store.close()
+
+
+def test_ack_failure_closes_live_intake_for_reconnect(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = _channel(store)
+    channel._running = True
+    channel._connected = True
+
+    class Socket:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    socket = Socket()
+    channel._ws = socket
+
+    async def fail_ack(*args, **kwargs):
+        del args, kwargs
+        raise TimeoutError("ack timed out")
+
+    channel._send_command = fail_ack  # type: ignore[method-assign]
+
+    asyncio.run(
+        channel._handle_bridge_message(
+            _frame(
+                "message",
+                {
+                    "chatJid": CHAT,
+                    "messageId": "ack-timeout",
+                    "senderId": "4915",
+                    "text": "pending reconnect",
+                },
+                event_id="event-ack-timeout",
+                event_key="wa:ack-timeout",
+            )
+        )
+    )
+
+    assert socket.closed is True
+    assert channel._connected is False
+    assert channel._bridge_intake_closed is True
+    assert channel._running is True
+    assert store.get_event("event-ack-timeout") is not None
+    store.close()
+
+
+def test_stop_drains_acknowledged_projection_before_return(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = _channel(store)
+    channel.config.debounce_ms = 0
+    projection_started = asyncio.Event()
+    release_projection = asyncio.Event()
+    projection_finished = asyncio.Event()
+
+    async def ack(*args, **kwargs):
+        del args, kwargs
+        return {"acknowledged": True}
+
+    async def publish(event):
+        del event
+        projection_started.set()
+        await release_projection.wait()
+        projection_finished.set()
+
+    channel._send_command = ack  # type: ignore[method-assign]
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        reader = asyncio.create_task(
+            channel._handle_bridge_message(
+                _frame(
+                    "message",
+                    {
+                        "chatJid": CHAT,
+                        "messageId": "slow-projection",
+                        "senderId": "4915",
+                        "text": "must finish",
+                    },
+                    event_id="event-slow-projection",
+                    event_key="wa:slow-projection",
+                )
+            )
+        )
+        channel._reader_task = reader
+        channel._events_subscribed = True
+        await asyncio.wait_for(projection_started.wait(), timeout=1)
+
+        stopping = asyncio.create_task(channel.stop())
+        await asyncio.sleep(0.02)
+        assert not stopping.done()
+        assert not projection_finished.is_set()
+        release_projection.set()
+        await stopping
+        await reader
+        assert projection_finished.is_set()
+
+    asyncio.run(exercise())
+    store.close()
+
+
+def test_debounce_bucket_flushes_before_item_or_byte_ceiling(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(
+        WhatsAppConfig(debounce_ms=60_000, debounce_media_ms=60_000), MessageBus()
+    )
+    channel.set_processing_signals(SignalJournalSink(store, clock=lambda: NOW))
+    channel._debounce_max_items = 2
+    channel._debounce_max_bytes = 10_000
+    published: list[tuple[str, tuple[str, ...]]] = []
+
+    async def ack(*args, **kwargs):
+        del args, kwargs
+        return {"acknowledged": True}
+
+    async def publish(event):
+        published.append((event.message_id, event.source_ids))
+
+    channel._send_command = ack  # type: ignore[method-assign]
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        for index, text in enumerate(("one", "two", "three")):
+            await channel._handle_bridge_message(
+                _frame(
+                    "message",
+                    {
+                        "chatJid": CHAT,
+                        "messageId": f"debounce-{index}",
+                        "senderId": "4915",
+                        "text": text,
+                    },
+                    event_id=f"event-debounce-{index}",
+                    event_key=f"wa:debounce-{index}",
+                )
+            )
+        bucket = channel._debounce_buffers[f"{CHAT}:4915"]
+        assert len(bucket) <= 2
+        assert channel._debounce_buffer_bytes[f"{CHAT}:4915"] <= 10_000
+        await channel.stop()
+
+    asyncio.run(exercise())
+
+    assert published
+    assert {source_id for _, source_ids in published for source_id in source_ids} == {
+        "debounce-0",
+        "debounce-1",
+        "debounce-2",
+    }
     store.close()
 
 
@@ -498,7 +649,7 @@ def test_concurrent_same_id_with_different_kind_is_rejected(tmp_path: Path) -> N
     store.close()
 
 
-def test_failed_projection_is_retried_on_the_same_replay(tmp_path: Path) -> None:
+def test_strict_edit_delete_projection_is_deferred_to_task4(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
     sink = channel._processing_signals
@@ -507,8 +658,6 @@ def test_failed_projection_is_retried_on_the_same_replay(tmp_path: Path) -> None
     def invalidate(kind, payload):
         del payload
         calls.append(kind)
-        if len(calls) == 1:
-            raise RuntimeError("projection failed")
 
     sink.invalidate = invalidate
 
@@ -531,14 +680,20 @@ def test_failed_projection_is_retried_on_the_same_replay(tmp_path: Path) -> None
 
     asyncio.run(exercise())
 
-    assert calls == ["delete", "delete"]
+    # Strict canonical capture is the Task 3B ACK boundary.  Legacy invalidation
+    # needs a durable event-id projection owned by Task 4, so it is deliberately
+    # not invoked from this path (including after a reconnect/replay).
+    assert calls == []
     store.close()
 
 
-def test_projection_cache_is_bounded_and_cleared_on_stop(tmp_path: Path) -> None:
+def test_strict_replay_does_not_depend_on_resettable_projection_cache(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
-    channel._max_dedupe_entries = 1
+    invalidated: list[str] = []
+    channel.set_processing_signals(
+        SignalJournalSink(store, clock=lambda: NOW, invalidator=lambda kind, payload: invalidated.append(kind))
+    )
 
     async def ack(*args, **kwargs):
         del args, kwargs
@@ -547,25 +702,28 @@ def test_projection_cache_is_bounded_and_cleared_on_stop(tmp_path: Path) -> None
     channel._send_command = ack  # type: ignore[method-assign]
 
     async def exercise() -> None:
-        for index in range(2):
-            await channel._handle_bridge_message(
-                _frame(
-                    "delete",
-                    {"chatJid": CHAT, "messageId": f"bounded-{index}", "senderId": "4915"},
-                    event_id=f"event-bounded-{index}",
-                    event_key=f"wa:bounded-{index}",
-                )
-            )
-        assert len(channel._projected_event_ids) == 1
+        frame = _frame(
+            "delete",
+            {"chatJid": CHAT, "messageId": "bounded", "senderId": "4915"},
+            event_id="event-bounded",
+            event_key="wa:bounded",
+        )
+        await channel._handle_bridge_message(frame)
+        # Simulate the per-connection worker teardown/recreation that a
+        # reconnect performs, then replay the same canonical event.
+        await channel._stop_bridge_worker()
+        channel._bridge_intake_closed = False
+        channel._stopping = False
+        await channel._handle_bridge_message(frame)
         await channel.stop()
 
     asyncio.run(exercise())
 
-    assert not channel._projected_event_ids
+    assert invalidated == []
     store.close()
 
 
-def test_edit_delete_invalidation_is_after_ack_and_once_per_event(tmp_path: Path) -> None:
+def test_edit_delete_invalidation_is_deferred_after_ack_to_task4(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     invalidated: list[str] = []
     order: list[str] = []
@@ -600,8 +758,8 @@ def test_edit_delete_invalidation_is_after_ack_and_once_per_event(tmp_path: Path
 
     asyncio.run(exercise())
 
-    assert order == ["ack", "invalidate", "ack"]
-    assert invalidated == ["delete"]
+    assert order == ["ack", "ack"]
+    assert invalidated == []
     store.close()
 
 
@@ -674,28 +832,24 @@ def test_reader_authenticates_subscribes_and_resolves_live_ack_response(tmp_path
     async def exercise() -> None:
         routed_event = asyncio.Event()
         acked = asyncio.Event()
+        delivered_event_ids: set[str] = set()
+        ack_rejected = asyncio.Event()
+        reaction_sent = asyncio.Event()
+        connected_during_projection: list[bool] = []
 
         async def bridge_handler(websocket) -> None:
             async for raw in websocket:
                 command = json.loads(raw)
                 commands.append(command)
+                assert command.get("token") == "secret"
                 result = {"protocolVersion": PROTOCOL_VERSION}
+                response_ok = True
+                response_error: dict[str, object] | None = None
                 if command["type"] == "subscribe_events":
-                    result = {"subscribed": True}
-                elif command["type"] == "ack_event":
-                    acked.set()
-                    result = {"acknowledged": True}
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "version": PROTOCOL_VERSION,
-                            "type": "response",
-                            "requestId": command.get("requestId"),
-                            "payload": {"ok": True, "result": result},
-                        }
-                    )
-                )
-                if command["type"] == "subscribe_events":
+                    delivered_event_ids.add("live-event")
+                    # The Bridge may replay before it resolves the subscribe
+                    # command.  The reader must buffer this frame while it
+                    # still consumes the response.
                     await websocket.send(
                         _frame(
                             "message",
@@ -709,6 +863,37 @@ def test_reader_authenticates_subscribes_and_resolves_live_ack_response(tmp_path
                             event_key="wa:live-message",
                         )
                     )
+                    result = {"subscribed": True}
+                elif command["type"] == "ack_event":
+                    if command.get("payload", {}).get("eventId") not in delivered_event_ids:
+                        ack_rejected.set()
+                        response_ok = False
+                        response_error = {
+                            "code": "ERR_NOT_DELIVERED",
+                            "message": "event was not delivered",
+                            "retryable": True,
+                        }
+                    else:
+                        acked.set()
+                        result = {"acknowledged": True}
+                elif command["type"] == "react":
+                    reaction_sent.set()
+                    result = {"reacted": True}
+                response_payload: dict[str, object] = {"ok": response_ok}
+                if response_ok:
+                    response_payload["result"] = result
+                else:
+                    response_payload["error"] = response_error or {}
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "version": PROTOCOL_VERSION,
+                            "type": "response",
+                            "requestId": command.get("requestId"),
+                            "payload": response_payload,
+                        }
+                    )
+                )
 
         try:
             server = await websockets.serve(bridge_handler, "127.0.0.1", 0)
@@ -721,9 +906,17 @@ def test_reader_authenticates_subscribes_and_resolves_live_ack_response(tmp_path
             async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
                 channel._ws = websocket
                 channel._running = True
-                channel._connected = True
 
                 async def publish(event):
+                    connected_during_projection.append(channel._connected)
+                    await channel.send_reaction(
+                        ReactionMessage(
+                            channel="whatsapp",
+                            chat_id=event.chat_jid,
+                            message_id=event.message_id,
+                            emoji="👀",
+                        )
+                    )
                     routed.append(event.message_id)
                     routed_event.set()
 
@@ -733,11 +926,15 @@ def test_reader_authenticates_subscribes_and_resolves_live_ack_response(tmp_path
                 await channel._verify_bridge_health("secret", timeout_seconds=1)
                 await channel._subscribe_bridge_events("secret", timeout_seconds=1)
                 await asyncio.wait_for(acked.wait(), timeout=1)
+                await asyncio.wait_for(reaction_sent.wait(), timeout=1)
                 await asyncio.wait_for(routed_event.wait(), timeout=1)
+                assert not ack_rejected.is_set()
                 await channel.stop()
 
         assert [command["type"] for command in commands[:2]] == ["health", "subscribe_events"]
-        assert commands[1]["token"] == "secret"
+        assert all(command["token"] == "secret" for command in commands)
+        assert delivered_event_ids == {"live-event"}
+        assert connected_during_projection == [True]
         assert routed == ["live-message"]
 
     asyncio.run(exercise())

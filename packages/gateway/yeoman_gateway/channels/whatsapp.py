@@ -123,6 +123,12 @@ SEND_CONNECT_WAIT_SECONDS = 8.0
 SEND_MAX_ATTEMPTS = 3
 SEND_RETRY_BASE_DELAY_SECONDS = 0.6
 BRIDGE_ACK_QUEUE_MAXSIZE = 128
+BRIDGE_ACK_TIMEOUT_SECONDS = 20.0
+# A single sender/chat must not be able to retain an unbounded acknowledged burst while
+# the legacy debounce timer is repeatedly reset.  Oversized/overflowing buckets are
+# flushed synchronously; no acknowledged event is dropped.
+WHATSAPP_DEBOUNCE_MAX_ITEMS = 32
+WHATSAPP_DEBOUNCE_MAX_BYTES = 64 * 1024
 
 
 class BridgeProtocolMismatchError(RuntimeError):
@@ -257,6 +263,7 @@ class WhatsAppChannel(BaseChannel):
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
         self._debounce_buffers: dict[str, list[InboundEvent]] = {}
+        self._debounce_buffer_bytes: dict[str, int] = {}
         self._debounce_delays: dict[str, float] = {}
         self._debounce_tasks: dict[str, asyncio.Task[None]] = {}
         self._inbound_tasks: set[asyncio.Task[None]] = set()
@@ -266,7 +273,6 @@ class WhatsAppChannel(BaseChannel):
         self._bridge_event_lock: asyncio.Lock | None = None
         self._bridge_inflight: dict[str, _BridgeEventWork] = {}
         self._bridge_capture_events: set[threading.Event] = set()
-        self._projected_event_ids: dict[str, None] = {}
         self._bridge_intake_closed = False
         self._stopping = False
         self._ack_queue_maxsize = BRIDGE_ACK_QUEUE_MAXSIZE
@@ -276,6 +282,8 @@ class WhatsAppChannel(BaseChannel):
         self._next_dedupe_cleanup_at = 0.0
         self._max_dedupe_entries = max(1, int(self.config.max_dedupe_entries))
         self._max_debounce_buckets = max(1, int(self.config.max_debounce_buckets))
+        self._debounce_max_items = WHATSAPP_DEBOUNCE_MAX_ITEMS
+        self._debounce_max_bytes = WHATSAPP_DEBOUNCE_MAX_BYTES
         self._dedupe_evictions = 0
         self._debounce_overflow = 0
         self._presence_supported = True
@@ -398,26 +406,50 @@ class WhatsAppChannel(BaseChannel):
                 self._events_subscribed = False
                 self._events_subscription_pending = False
                 self._pending_bridge_events.clear()
-                self._ws = None
-                if self._reader_task:
-                    self._reader_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await self._reader_task
-                    self._reader_task = None
+                websocket = self._ws
                 self._fail_pending("Bridge connection closed")
+                if websocket is not None:
+                    with contextlib.suppress(Exception):
+                        await websocket.close()
+                if self._reader_task:
+                    reader = self._reader_task
+                    if reader is not asyncio.current_task() and not reader.done():
+                        reader.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await reader
+                    self._reader_task = None
+                # A connection teardown may race an ACKed projection.  Drain the
+                # worker before resetting it; pre-ACK commands are bounded by their
+                # normal command timeout and an ACKed projection is never cancelled.
+                await self._drain_bridge_worker()
+                await self._drain_debounce_projections()
+                inbound_tasks = tuple(self._inbound_tasks)
+                if inbound_tasks:
+                    await asyncio.gather(*inbound_tasks, return_exceptions=True)
+                    self._inbound_tasks.difference_update(inbound_tasks)
                 await self._stop_bridge_worker()
+                self._ws = None
 
     async def stop(self) -> None:
         """Stop the WhatsApp channel."""
         self._running = False
         self._connected = False
-        self._events_subscribed = False
-        self._events_subscription_pending = False
+        # Keep the reader and websocket alive while the ACK worker drains.  It
+        # still has to resolve ack_event responses; stopping intake below makes
+        # any newly delivered event fail closed without entering the pipeline.
+        self._bridge_intake_closed = True
         self._pending_bridge_events.clear()
         self._stopping = True
 
         for chat_id in list(self._typing_tasks):
             await self._stop_typing(chat_id)
+
+        while self._bridge_capture_events:
+            await asyncio.sleep(0.001)
+        # Do not cancel the ACK worker here.  Once an event is ACKed, its
+        # projection (including a debounce flush) must finish before shutdown.
+        await self._drain_bridge_worker()
+        await self._drain_debounce_projections()
 
         if self._reader_task:
             reader = self._reader_task
@@ -432,25 +464,19 @@ class WhatsAppChannel(BaseChannel):
                 await self._ws.close()
             self._ws = None
 
+        self._events_subscribed = False
+        self._events_subscription_pending = False
         self._fail_pending("Channel stopped")
-        while self._bridge_capture_events:
-            await asyncio.sleep(0.001)
         await self._stop_bridge_worker()
 
         inbound_tasks = tuple(self._inbound_tasks)
-        for task in inbound_tasks:
-            task.cancel()
         if inbound_tasks:
             await asyncio.gather(*inbound_tasks, return_exceptions=True)
         self._inbound_tasks.difference_update(inbound_tasks)
 
-        debounce_tasks = tuple(self._debounce_tasks.values())
-        for task in debounce_tasks:
-            task.cancel()
-        if debounce_tasks:
-            await asyncio.gather(*debounce_tasks, return_exceptions=True)
         self._debounce_tasks.clear()
         self._debounce_buffers.clear()
+        self._debounce_buffer_bytes.clear()
 
         if self._media_cleanup_task:
             self._media_cleanup_task.cancel()
@@ -684,6 +710,10 @@ class WhatsAppChannel(BaseChannel):
                     "ERR_AUTH", "Bridge did not confirm canonical event subscription", True
                 )
             self._events_subscribed = True
+            # The authenticated response is the transport-ready fence.  Replay
+            # projection may send a reaction/effect immediately, so publish the
+            # connected state before draining frames received during subscribe.
+            self._connected = True
             while self._pending_bridge_events:
                 frame, kind, payload = self._pending_bridge_events.pop(0)
                 await self._capture_and_queue_bridge_event(frame, kind, payload)
@@ -1125,6 +1155,9 @@ class WhatsAppChannel(BaseChannel):
         self._bridge_intake_closed = True
         self._connected = False
         logger.warning("WhatsApp bridge intake closed reason={}", reason)
+        # Wake every command waiter so the outer channel loop can tear down and
+        # reconnect instead of leaving the Bridge outbox pending on a live socket.
+        self._fail_pending(f"Bridge intake closed: {reason}")
         websocket = self._ws
         if websocket is not None:
             with contextlib.suppress(Exception):
@@ -1150,7 +1183,7 @@ class WhatsAppChannel(BaseChannel):
             await self._send_command(
                 "ack_event",
                 {"eventId": work.event_id},
-                timeout_seconds=20.0,
+                timeout_seconds=BRIDGE_ACK_TIMEOUT_SECONDS,
             )
             succeeded = True
         except asyncio.CancelledError:
@@ -1161,6 +1194,10 @@ class WhatsAppChannel(BaseChannel):
                 work.kind,
                 type(exc).__name__,
             )
+            # A synthetic/unit channel without a websocket is already
+            # disconnected; only a live socket needs the forced reconnect fence.
+            if self._ws is not None:
+                await self._close_bridge_intake("ack_failed")
         else:
             try:
                 await self._project_bridge_event(work)
@@ -1183,19 +1220,55 @@ class WhatsAppChannel(BaseChannel):
                 work.completion.set_result(succeeded)
 
     async def _project_bridge_event(self, work: _BridgeEventWork) -> None:
-        if work.event_id in self._projected_event_ids:
-            return
         if work.kind in _PROCESSING_SIGNAL_TYPES:
-            invalidate = getattr(self._processing_signals, "invalidate", None)
-            if callable(invalidate) and work.kind in {"edit", "delete"}:
-                await self._run_off_loop(lambda: invalidate(work.kind, work.payload))
+            # Strict edit/delete invalidation needs a durable event-id keyed
+            # source-authority projection.  The legacy callback is resettable
+            # process-local state, so Task 3B intentionally does not invoke it;
+            # Task 4 owns that durable projection.
+            return
         elif work.kind == "message":
             event = self._parse_inbound_event(work.payload)
             if event:
                 await self._ingest_inbound_event(event)
-        self._projected_event_ids[work.event_id] = None
-        while len(self._projected_event_ids) > self._max_dedupe_entries:
-            self._projected_event_ids.pop(next(iter(self._projected_event_ids)))
+
+    async def _drain_bridge_worker(self) -> None:
+        """Drain all queued ACK/projection work before the worker is torn down.
+
+        Each ACK command already has the normal finite command timeout.  Waiting
+        on ``Queue.join`` here is deliberate: once an ACK succeeds, cancellation
+        would lose a projection that the Bridge will not replay.
+        """
+        queue = self._bridge_ack_queue
+        if queue is None:
+            return
+        await queue.join()
+
+    async def _drain_debounce_projections(self) -> None:
+        """Flush acknowledged debounce batches before connection/store teardown."""
+        for key in tuple(self._debounce_buffers):
+            try:
+                await self._flush_debounce_bucket_now(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The canonical row and Bridge ACK remain durable even when a
+                # legacy downstream projection fails during shutdown.
+                logger.warning(
+                    "WhatsApp debounce projection failed during shutdown error_type={}",
+                    type(exc).__name__,
+                )
+
+        tasks = tuple(self._debounce_tasks.values())
+        if not tasks:
+            return
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                logger.warning(
+                    "WhatsApp debounce task failed during shutdown error_type={}",
+                    type(result).__name__,
+                )
+        self._debounce_tasks.clear()
 
     async def _stop_bridge_worker(self) -> None:
         worker = self._bridge_ack_worker
@@ -1220,7 +1293,6 @@ class WhatsAppChannel(BaseChannel):
                     if not work.completion.done():
                         work.completion.set_result(False)
                 self._bridge_inflight.clear()
-        self._projected_event_ids.clear()
 
     def set_processing_gate(self, gate: Any | None) -> None:
         """Attach the fast gate of the new processing mode (``None`` keeps legacy)."""
@@ -1571,8 +1643,31 @@ class WhatsAppChannel(BaseChannel):
                 )
             await self._publish_event(event)
             return
-        bucket = self._debounce_buffers.setdefault(key, [])
+
+        event_bytes = self._debounce_event_bytes(event)
+        bucket = self._debounce_buffers.get(key)
+        bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
+        if bucket and (
+            len(bucket) >= self._debounce_max_items
+            or bucket_bytes + event_bytes > self._debounce_max_bytes
+        ):
+            # Flush the existing acknowledged batch before admitting the next
+            # event.  This bounds both list cardinality and retained payload
+            # bytes without dropping anything already accepted by the Bridge.
+            await self._flush_debounce_bucket_now(key)
+            bucket = None
+            bucket_bytes = 0
+
+        if event_bytes > self._debounce_max_bytes:
+            # A single oversized event cannot fit a bounded bucket; project it
+            # directly rather than retaining unbounded memory or dropping it.
+            await self._publish_event(event)
+            return
+
+        if bucket is None:
+            bucket = self._debounce_buffers.setdefault(key, [])
         bucket.append(event)
+        self._debounce_buffer_bytes[key] = bucket_bytes + event_bytes
         self._debounce_delays[key] = min(
             self._debounce_delays.get(key, effective_debounce),
             effective_debounce,
@@ -1594,18 +1689,50 @@ class WhatsAppChannel(BaseChannel):
         if exc is not None:
             logger.error(f"WhatsApp inbound task failed: {exc}")
 
+    @staticmethod
+    def _debounce_event_bytes(event: InboundEvent) -> int:
+        # ``repr`` includes every slotted field, including relation/media
+        # metadata, so the ceiling covers the retained object rather than only
+        # its visible text.
+        return max(1, len(repr(event).encode("utf-8")))
+
+    async def _flush_debounce_bucket_now(self, key: str) -> None:
+        task = self._debounce_tasks.pop(key, None)
+        # If the timer already took ownership of the list, let it finish; its
+        # buffer is no longer present and cancelling it would lose an ACKed
+        # projection.  Otherwise cancel only the sleeping timer and flush here.
+        if task is not None and task is not asyncio.current_task():
+            if key not in self._debounce_buffers:
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                return
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        events = self._debounce_buffers.pop(key, [])
+        self._debounce_buffer_bytes.pop(key, None)
+        self._debounce_delays.pop(key, None)
+        if events:
+            await self._publish_debounce_batch(events)
+
     async def _flush_debounce_bucket(self, key: str, delay_ms: float) -> None:
         try:
             await asyncio.sleep(delay_ms / 1000.0)
         except asyncio.CancelledError:
-            return
+            if not self._stopping:
+                return
 
         events = self._debounce_buffers.pop(key, [])
         self._debounce_tasks.pop(key, None)
+        self._debounce_buffer_bytes.pop(key, None)
         self._debounce_delays.pop(key, None)
         if not events:
             return
 
+        await self._publish_debounce_batch(events)
+
+    async def _publish_debounce_batch(self, events: list[InboundEvent]) -> None:
         if len(events) == 1:
             await self._publish_event(events[0])
             return
