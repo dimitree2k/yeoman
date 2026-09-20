@@ -465,6 +465,84 @@ def test_all_cancelled_stoppers_leave_background_drain_and_allow_restart() -> No
     asyncio.run(scenario())
 
 
+def test_failed_periodic_task_drains_before_stop_reports_and_rejects_restart() -> None:
+    store = _CloseAwareStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def failed_periodic_task() -> None:
+        raise RuntimeError("periodic loop boom")
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        service._task = asyncio.create_task(failed_periodic_task())
+        await asyncio.sleep(0)
+        assert service._task.done()
+
+        stop = asyncio.create_task(service.stop())
+        await asyncio.sleep(0.02)
+        assert not stop.done(), "stop must keep the store fence while the sweep is blocked"
+        assert service._pending_sweeps == 1
+
+        store.release.set()
+        await sweep
+        with pytest.raises(RuntimeError, match="periodic loop boom"):
+            await stop
+        assert service._pending_sweeps == 0
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await service.start()
+
+        store.close()
+        assert store.after_close == 0
+
+    asyncio.run(scenario())
+
+
+def test_failed_periodic_task_is_observed_when_all_stoppers_are_cancelled() -> None:
+    store = _CloseAwareStore()
+    service = ProcessingRetentionService(store, clock=_Clock(), startup_delay_seconds=0.0)
+
+    async def failed_periodic_task() -> None:
+        raise RuntimeError("periodic loop boom")
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, object]] = []
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        service._task = asyncio.create_task(failed_periodic_task())
+        await asyncio.sleep(0)
+
+        first = asyncio.create_task(service.stop())
+        second = asyncio.create_task(service.stop())
+        await asyncio.sleep(0)
+        first.cancel()
+        second.cancel()
+        for stopper in (first, second):
+            with pytest.raises(asyncio.CancelledError):
+                await stopper
+
+        stop_task = service._stop_task
+        assert stop_task is not None
+        assert not stop_task.done()
+        store.release.set()
+        await sweep
+        await asyncio.shield(stop_task)
+        assert stop_task.exception() is None
+        assert service._pending_sweeps == 0
+        assert unhandled == []
+        with pytest.raises(RuntimeError, match="periodic loop boom"):
+            await service.stop()
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await service.start()
+
+        store.close()
+        assert store.after_close == 0
+
+    asyncio.run(scenario())
+
+
 def test_repeated_start_stop_leaves_no_retention_tasks_or_pending_sweeps() -> None:
     service = ProcessingRetentionService(
         _SlowStore(delay_seconds=0.01),

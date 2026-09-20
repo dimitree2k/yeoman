@@ -46,6 +46,7 @@ class ProcessingRetentionService:
         self._startup_delay_seconds = max(0.0, float(startup_delay_seconds))
         self._task: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
+        self._stop_failure: BaseException | None = None
         self._sweep_lock = asyncio.Lock()
         self._pending_zero = asyncio.Event()
         self._pending_zero.set()
@@ -61,6 +62,10 @@ class ProcessingRetentionService:
         if self._stop_task is not None:
             if not self._stop_task.done():
                 raise RuntimeError("processing retention stop is in progress")
+            if self._stop_failure is not None:
+                raise RuntimeError("processing retention stop failed; recovery required") from (
+                    self._stop_failure
+                )
             self._stop_task = None
         if self._task is not None:
             return
@@ -72,17 +77,26 @@ class ProcessingRetentionService:
             self._stopping = True
             task = self._task
             self._task = None
+            self._stop_failure = None
             self._stop_task = asyncio.create_task(self._drain_stop(task))
         await asyncio.shield(self._stop_task)
+        if self._stop_failure is not None:
+            raise self._stop_failure
 
     async def _drain_stop(self, task: asyncio.Task[None] | None) -> None:
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        await self._pending_zero.wait()
+        failure: BaseException | None = None
+        try:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as exc:
+                    failure = exc
+        finally:
+            await self._pending_zero.wait()
+            self._stop_failure = failure
 
     @property
     def running(self) -> bool:
