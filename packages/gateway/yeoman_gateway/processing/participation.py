@@ -230,7 +230,7 @@ class ParticipationJudge:
         if budget > self._max_input_tokens:
             raise ParticipationDecisionError(
                 "context_too_large",
-                detail=f"{budget}>{self._max_input_tokens}",
+                detail="context_budget_exceeded",
             )
         try:
             raw = await asyncio.wait_for(
@@ -240,14 +240,14 @@ class ParticipationJudge:
         except asyncio.CancelledError:
             raise
         except TimeoutError as exc:
-            raise ParticipationDecisionError("timeout", detail=type(exc).__name__) from exc
+            raise ParticipationDecisionError("timeout") from exc
         except Exception as exc:
             logger.warning(
                 "participation_judge_failed route={} error_type={}",
                 self.route_key,
                 type(exc).__name__,
             )
-            raise ParticipationDecisionError("provider_error", detail=type(exc).__name__) from exc
+            raise ParticipationDecisionError("provider_error") from exc
         text = str(raw or "").strip()
         if not text:
             raise ParticipationDecisionError("empty_response")
@@ -319,19 +319,31 @@ class ParticipationJudge:
         action = _ACTION_ALIASES.get(str(payload.get("action") or "").strip().lower())
         if action is None:
             raise ParticipationDecisionError("invalid_response", detail="unknown_action")
-        intent = _INTENT_ALIASES.get(str(payload.get("intent") or "").strip().lower())
-        if intent is None:
-            raise ParticipationDecisionError("invalid_response", detail="unknown_intent")
         if action not in set(view.allowed_actions):
             raise ParticipationDecisionError("invalid_response", detail="action_not_allowed")
+
+        reason = _bounded_text(payload.get("reason"), MAX_REASON_CHARS)
+        if action == "silence":
+            return ParticipationDecision(
+                action="silence",
+                intent="initiate",
+                reason=reason,
+            )
+
+        intent: DecisionIntent = "initiate"
+        if action == "comment":
+            parsed_intent = _INTENT_ALIASES.get(
+                str(payload.get("intent") or "").strip().lower()
+            )
+            if parsed_intent is None:
+                raise ParticipationDecisionError(
+                    "invalid_response", detail="intent_not_allowed"
+                )
+            intent = parsed_intent  # type: ignore[assignment]
         if intent == "direct" and not view.direct_addressed:
             # A model may not promote ambient material into the tool-capable direct path.
             raise ParticipationDecisionError("untrusted_intent", detail="direct_not_admitted")
-        if (
-            action != "silence"
-            and intent not in view.allowed_intents
-            and not (action == "react" and intent in {"initiate", "continue"})
-        ):
+        if action == "comment" and intent not in view.allowed_intents:
             raise ParticipationDecisionError("invalid_response", detail="intent_not_allowed")
         if intent == "continue" and action == "comment" and not view.allows_continuation:
             raise ParticipationDecisionError("invalid_response", detail="continuation_not_allowed")
@@ -352,20 +364,17 @@ class ParticipationJudge:
                     continue
                 if token not in view.evidence_ids:
                     raise ParticipationDecisionError(
-                        "unknown_evidence", detail=token[:64]
+                        "unknown_evidence", detail="unknown_evidence_id"
                     )
                 if token not in collected:
                     collected.append(token)
             evidence_ids = tuple(collected)
 
-        speaks = action != "silence"
-        # Fields that cannot change what happens are only validated when they matter.
-        # A silent verdict that decorates itself with a stray target, anchor or action
-        # category is incoherent, but it is still silence - and rejecting it would
-        # discard a correct "do not speak" decision over an unused field.
-        anchor = _bounded_id(payload.get("anchor_message_id")) if speaks else None
-        target = _bounded_id(payload.get("target_message_id")) if speaks else None
-        if speaks and target is None and action == "react":
+        anchor = (
+            _bounded_id(payload.get("anchor_message_id")) if action == "comment" else None
+        )
+        target = _bounded_id(payload.get("target_message_id"))
+        if target is None and action == "react":
             # Trusted default: only the newest current source is targetable. Older
             # optional history must never become a silent reaction target.
             target = view.newest_current_source_id
@@ -380,7 +389,7 @@ class ParticipationJudge:
         ):
             raise ParticipationDecisionError("unknown_evidence", detail="target_not_current")
         if action == "react" and target is None:
-            raise ParticipationDecisionError("missing_target")
+            raise ParticipationDecisionError("missing_target", detail="target_not_supplied")
         if intent == "continue" and action == "comment":
             # Only *prose* acts on continuity: a comment that continues an exchange must
             # be grounded in a delivered Arvid message. A reaction is a gesture anchored
@@ -396,9 +405,14 @@ class ParticipationJudge:
                     "missing_target", detail="continuation_without_delivered_anchor"
                 )
 
-        purpose = _bounded_text(payload.get("purpose"), MAX_PURPOSE_CHARS)
-        reason = _bounded_text(payload.get("reason"), MAX_REASON_CHARS)
-        contribution = _bounded_id(payload.get("contribution_type")) if speaks else None
+        purpose = (
+            _bounded_text(payload.get("purpose"), MAX_PURPOSE_CHARS)
+            if action == "comment"
+            else ""
+        )
+        contribution = (
+            _bounded_id(payload.get("contribution_type")) if action == "comment" else None
+        )
         if action == "comment" and contribution not in view.allowed_contribution_types:
             # The category is an existing policy vocabulary value, never model authority.
             # A model that omits it, or names one the owner did not configure, gets the
@@ -417,8 +431,8 @@ class ParticipationJudge:
         if action == "react":  # a silent verdict never carries a face
             emoji = allowed_reaction(payload.get("emoji") or "", self._allowed_emojis)
             if emoji is None:
-                raise ParticipationDecisionError("unknown_emoji")
-        closes = bool(payload.get("closes_exchange") is True)
+                raise ParticipationDecisionError("unknown_emoji", detail="unknown_emoji")
+        closes = bool(action == "comment" and payload.get("closes_exchange") is True)
         return ParticipationDecision(
             action=action,
             intent=intent,

@@ -383,7 +383,6 @@ class GatewayRuntime:
     channels: ChannelManager
     cron: CronService
     heartbeat: HeartbeatService
-    consciousness: object | None
     inbound_archive: InboundArchive
     responder: LLMResponder
     memory: MemoryService
@@ -435,8 +434,6 @@ class GatewayRuntime:
             self._resume_a2a_research()
             await self.cron.start()
             await self.heartbeat.start()
-            if self.consciousness is not None:
-                await self.consciousness.start()
             if self.lull_observer is not None and hasattr(self.lull_observer, "start"):
                 await self.lull_observer.start()
             if self.opportunity_scheduler is not None:
@@ -492,8 +489,6 @@ class GatewayRuntime:
                     await attempt_async(maintenance_stop)
             if self.lull_observer is not None and hasattr(self.lull_observer, "stop"):
                 attempt_sync(self.lull_observer.stop)
-            if self.consciousness is not None:
-                attempt_sync(self.consciousness.stop)
             attempt_sync(self.cron.stop)
             attempt_sync(self.orchestrator.stop)
             await attempt_async(self.channels.stop_all)
@@ -1140,13 +1135,47 @@ def _build_participation_runtime(
             engine=policy_engine, channel=channel, chat_id=chat_id, sender=sender
         )
 
-    submission = _ParticipationSubmission(
-        responder=responder, approval_tools=approval_tools
+    writer_profile = ""
+    try:
+        resolved_writer = ModelRouter(config.models).resolve_primary("participation.writer")
+        writer_model = str(resolved_writer.model or "").strip()
+        if not writer_model:
+            raise ValueError("writer model is empty")
+        writer_provider = str(resolved_writer.provider or "").strip()
+        if not writer_provider:
+            raise ValueError("writer provider is empty")
+        if config.get_provider(
+            writer_model, provider_name=writer_provider
+        ) is None:
+            raise ValueError("writer provider is unavailable")
+        ProviderFactory(config=config).create_chat_provider(
+            writer_model, writer_provider
+        )
+        writer_profile = resolved_writer.profile_name
+        logger.info(
+            "participation writer ready route={} profile={} provider={} model={}",
+            resolved_writer.route_key,
+            resolved_writer.profile_name,
+            writer_provider,
+            writer_model,
+        )
+    except Exception:  # noqa: BLE001 - unavailable writer removes only comments
+        logger.warning(
+            "participation writer unavailable route=participation.writer category=writer_unavailable"
+        )
+    submission = (
+        _ParticipationSubmission(
+            responder=responder,
+            approval_tools=approval_tools,
+            writer_profile=writer_profile,
+        )
+        if writer_profile
+        else None
     )
     bind_submission = getattr(
         approval_tools, "set_participation_submission", None
     )
-    if callable(bind_submission):
+    if callable(bind_submission) and submission is not None:
         bind_submission(submission)
     reactor = (
         _ParticipationReactor(responder=responder)
@@ -1165,6 +1194,7 @@ def _build_participation_runtime(
         is_participant_allowed=_is_participant_allowed,
         submission=submission,
         reactor=reactor,
+        writer_available=submission is not None,
         direct_work_active=(
             processing_store.direct_work_active
             if processing_store is not None
@@ -1215,9 +1245,14 @@ class _ParticipationSubmission:
     """Adapter from a selected comment to the draft-only generator and effect path."""
 
     def __init__(
-        self, *, responder: object | None, approval_tools: object | None = None
+        self,
+        *,
+        responder: object | None,
+        writer_profile: str,
+        approval_tools: object | None = None,
     ) -> None:
         self._responder = responder
+        self._writer_profile = str(writer_profile)
         self._approval_tools = approval_tools
 
     async def generate_draft(
@@ -1232,6 +1267,7 @@ class _ParticipationSubmission:
             policy_decision,
             purpose=str(getattr(decision, "purpose", "") or ""),
             context=dict(context or {}),
+            model_profile=self._writer_profile,
         )
 
     async def submit(
@@ -1776,7 +1812,11 @@ def build_effect_router(
                 except (TypeError, ValueError):
                     quiet = True
             current_rights = bool(
-                (action == "react" and reply_action == "react" and participation.allow_reactions)
+                (
+                    action == "react"
+                    and reply_action in {"answer", "react"}
+                    and participation.allow_reactions
+                )
                 or (
                     action == "comment"
                     and reply_action == "answer"
@@ -1930,14 +1970,13 @@ def build_gateway_runtime(
         config.processing.enabled
         and getattr(getattr(config.processing, "participation", None), "enabled", False)
     )
-    social_runtime_enabled = policy_engine is not None and (
-        config.consciousness.enabled or participation_enabled
-    )
+    social_runtime_enabled = policy_engine is not None and participation_enabled
     speakup_log = None
     speakup_approval_store = None
     activation_tracker = None
-    if social_runtime_enabled or (
-        pending_participation_recovery and speakup_path.is_file()
+    if (
+        social_runtime_enabled
+        or (pending_participation_recovery and speakup_path.is_file())
     ):
         from yeoman_gateway.consciousness.log import SpeakupLog
         from yeoman_gateway.consciousness.participation_runtime import (
@@ -1947,7 +1986,7 @@ def build_gateway_runtime(
         speakup_log = SpeakupLog(speakup_path)
         if participation_enabled:
             activation_tracker = ActivationEpochTracker(store=speakup_log)
-        if config.consciousness.enabled or participation_enabled:
+        if participation_enabled:
             from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
 
             speakup_approval_store = SpeakupApprovalStore(
@@ -2110,6 +2149,7 @@ def build_gateway_runtime(
         private_handoff_store=private_handoffs,
         workspace=workspace,
         processing_config=config.processing,
+        models_config=config.models,
         activation_tracker=activation_tracker,
     )
     if activation_tracker is not None:
@@ -2660,24 +2700,39 @@ def build_gateway_runtime(
             output_path = None
             if str(job.payload.persona_output or "").strip():
                 output_path = Path(str(job.payload.persona_output).strip())
-            result = await run_persona_evolution_cron(
-                policy=policy_engine.policy,
-                workspace=Path(workspace),
-                persona_file=persona_file,
-                memory=memory_service,
-                speakup_log=speakup_log,
-                inbound_archive=inbound_archive,
-                window_days=max(1, int(job.payload.persona_window_days)),
-                limit=max(1, int(job.payload.persona_limit)),
-                output_path=output_path,
-                min_meaningful_messages=max(
-                    0, int(job.payload.persona_min_meaningful_messages)
-                ),
-                min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
-                max_accumulation_days=max(1, int(job.payload.persona_max_accumulation_days)),
-                proposal_ttl_seconds=max(60, int(config.persona_evolution.proposal_ttl_seconds)),
-                proposal_mode=config.persona_evolution.mode,
-            )
+            persona_speakup_log = speakup_log
+            close_persona_speakup_log = False
+            if persona_speakup_log is None:
+                from yeoman_gateway.consciousness.log import SpeakupLog
+
+                persona_speakup_log = SpeakupLog(speakup_path)
+                close_persona_speakup_log = True
+            try:
+                result = await run_persona_evolution_cron(
+                    policy=policy_engine.policy,
+                    workspace=Path(workspace),
+                    persona_file=persona_file,
+                    memory=memory_service,
+                    speakup_log=persona_speakup_log,
+                    inbound_archive=inbound_archive,
+                    window_days=max(1, int(job.payload.persona_window_days)),
+                    limit=max(1, int(job.payload.persona_limit)),
+                    output_path=output_path,
+                    min_meaningful_messages=max(
+                        0, int(job.payload.persona_min_meaningful_messages)
+                    ),
+                    min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
+                    max_accumulation_days=max(
+                        1, int(job.payload.persona_max_accumulation_days)
+                    ),
+                    proposal_ttl_seconds=max(
+                        60, int(config.persona_evolution.proposal_ttl_seconds)
+                    ),
+                    proposal_mode=config.persona_evolution.mode,
+                )
+            finally:
+                if close_persona_speakup_log:
+                    persona_speakup_log.close()
             if persona_evolution_result_needs_notification(result):
                 ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
                 try:
@@ -3170,7 +3225,6 @@ def build_gateway_runtime(
         rate_limit=ipc_config.command_rate_limit,
     )
 
-    consciousness_service = None
     lull_observer = None
     participation_maintenance = None
     if social_runtime_enabled and speakup_log is not None:
@@ -3179,60 +3233,6 @@ def build_gateway_runtime(
         from yeoman_gateway.consciousness.lull import LullObserver
         from yeoman_gateway.consciousness.participation_runtime import SourceOwner
         assert consciousness_tools is not None
-
-        if config.consciousness.enabled:
-            from yeoman_gateway.consciousness.agent import ConsciousnessAgent
-            from yeoman_gateway.consciousness.outcomes import OutcomeEnricher
-            from yeoman_gateway.consciousness.service import ConsciousnessService
-            from yeoman_gateway.consciousness.taste import TasteDistiller
-
-            async def _consciousness_route_call(route: str, prompt: str) -> str:
-                profile = model_router.resolve(route)
-                if not profile.model:
-                    raise RuntimeError(f"Consciousness route {route!r} has no model")
-                routed_provider = provider_factory.create_chat_provider(
-                    profile.model, profile.provider
-                )
-                response = await routed_provider.chat(
-                    [{"role": "user", "content": prompt}],
-                    tools=[],
-                    model=profile.model,
-                    max_tokens=profile.max_tokens or 700,
-                    temperature=(
-                        profile.temperature if profile.temperature is not None else 0.1
-                    ),
-                    reasoning=profile.reasoning,
-                )
-                return response.content or "{}"
-
-            async def _consciousness_planner(prompt: str) -> str:
-                return await _consciousness_route_call("consciousness.agent", prompt)
-
-            consciousness_agent = ConsciousnessAgent(
-                tools=consciousness_tools,
-                planner=_consciousness_planner,
-            )
-            outcome_enricher = OutcomeEnricher(
-                log=speakup_log,
-                inbound_archive=inbound_archive,
-                classifier=lambda prompt: _consciousness_route_call(
-                    "consciousness.outcome", prompt
-                ),
-            )
-            taste_distiller = TasteDistiller(
-                log=speakup_log,
-                memory=memory_service,
-                distiller=lambda prompt: _consciousness_route_call(
-                    "consciousness.taste", prompt
-                ),
-            )
-            consciousness_service = ConsciousnessService(
-                config=config,
-                agent=consciousness_agent,
-                outcome_enricher=outcome_enricher,
-                taste_distiller=taste_distiller,
-                speakup_log=speakup_log,
-            )
 
         participation_material = None
         if participation_enabled:
@@ -3452,13 +3452,7 @@ def build_gateway_runtime(
             if participation_runtime is not None and snapshot is not None:
                 if getattr(snapshot, "live", False) or getattr(snapshot, "observing", False):
                     return True
-            if consciousness_service is None:
-                return False
-            return bool(
-                await consciousness_tools.is_chat_within_opportunity_budget(
-                    channel, chat_id, trigger=trigger
-                )
-            )
+            return False
 
         def _trigger(channel: str, chat_id: str, trigger: str) -> object:
             """Route one observer trigger to its already-resolved social owner."""
@@ -3472,13 +3466,7 @@ def build_gateway_runtime(
             )
             if result is not None:
                 return result
-            if consciousness_service is None:
-                return {"status": "skipped"}
-            return consciousness_service.tick_once(
-                trigger=trigger,
-                target_channel=channel,
-                target_chat_id=chat_id,
-            )
+            return {"status": "skipped"}
 
         burst_observer = BurstObserver(
             config=config,
@@ -3519,7 +3507,6 @@ def build_gateway_runtime(
         channels=channels,
         cron=cron,
         heartbeat=heartbeat,
-        consciousness=consciousness_service,
         inbound_archive=inbound_archive,
         responder=responder,
         memory=memory_service,

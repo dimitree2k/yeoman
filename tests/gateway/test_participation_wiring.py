@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,118 @@ async def test_reconciliation_wiring_projects_participation_before_empty_return(
         assert calls == 1
     finally:
         store.close()
+
+
+def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The superseded flag is compatibility input, not a second output owner."""
+
+    class _NeverProvider:
+        async def chat(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("legacy consciousness must not call an LLM")
+
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    config = Config.model_validate(
+        {
+            "consciousness": {"enabled": True},
+            "personaEvolution": {"enabled": False},
+            "processing": {"enabled": False, "participation": {"enabled": False}},
+            "security": {"enabled": False},
+        }
+    )
+    policy = PolicyEngine(PolicyConfig(), workspace=tmp_path)
+    runtime = build_gateway_runtime(
+        config=config,
+        provider=_NeverProvider(),  # type: ignore[arg-type]
+        policy_engine=policy,
+        policy_path=None,
+        workspace=tmp_path / "workspace",
+        bus=MessageBus(),
+    )
+    try:
+        assert runtime.speakup_log is None
+        assert not hasattr(runtime, "consciousness")
+    finally:
+        runtime.inbound_archive.close()
+        runtime.chat_registry.close()
+        runtime.contacts.close()
+        runtime.memory.close()
+
+
+@pytest.mark.asyncio
+async def test_persona_evolution_lazily_reads_historical_speakup_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical social evidence stays readable after the old generator is removed."""
+
+    from yeoman_gateway.cron.types import CronJob, CronPayload
+
+    captured_logs: list[object] = []
+
+    async def fake_persona_evolution_cron(**kwargs: Any) -> str:
+        log = kwargs["speakup_log"]
+        assert await log.history("whatsapp", "group@g.us") == []
+        captured_logs.append(log)
+        return "persona_evolution no proposal: test"
+
+    monkeypatch.setattr(
+        "yeoman_gateway.app.bootstrap.run_persona_evolution_cron",
+        fake_persona_evolution_cron,
+    )
+
+    class _NeverProvider:
+        async def chat(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("opening historical evidence must not call an LLM")
+
+        def get_default_model(self) -> str:
+            return "test/provider"
+
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    config = Config.model_validate(
+        {
+            "consciousness": {"enabled": False},
+            "personaEvolution": {"enabled": True},
+            "processing": {"enabled": False, "participation": {"enabled": False}},
+            "security": {"enabled": False},
+        }
+    )
+    speakup_path = tmp_path / "data" / "consciousness" / "speakups.db"
+    runtime = build_gateway_runtime(
+        config=config,
+        provider=_NeverProvider(),  # type: ignore[arg-type]
+        policy_engine=PolicyEngine(PolicyConfig(), workspace=tmp_path),
+        policy_path=None,
+        workspace=tmp_path / "workspace",
+        bus=MessageBus(),
+    )
+    try:
+        assert runtime.speakup_log is None
+        assert not speakup_path.exists()
+        assert runtime.cron.on_job is not None
+        result = await runtime.cron.on_job(
+            CronJob(
+                id="persona-evolution",
+                name="persona evolution",
+                payload=CronPayload(
+                    kind="persona_evolution",
+                    persona_file="personas/arvid.md",
+                ),
+            )
+        )
+        assert result == "persona_evolution no proposal: test"
+        assert speakup_path.exists()
+        assert len(captured_logs) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            await captured_logs[0].history("whatsapp", "group@g.us")
+    finally:
+        runtime.inbound_archive.close()
+        runtime.chat_registry.close()
+        runtime.contacts.close()
+        runtime.memory.close()
 
 
 @pytest.mark.asyncio
@@ -125,7 +238,6 @@ async def test_failed_startup_recovery_blocks_every_ingress() -> None:
         channels=idle,  # type: ignore[arg-type]
         cron=idle,  # type: ignore[arg-type]
         heartbeat=idle,  # type: ignore[arg-type]
-        consciousness=None,
         inbound_archive=idle,  # type: ignore[arg-type]
         responder=idle,  # type: ignore[arg-type]
         memory=idle,  # type: ignore[arg-type]
@@ -427,7 +539,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
         assert runtime.processing is not None
         assert runtime.speakup_log is not None
         assert runtime.reconciliation is not None
-        assert runtime.consciousness is None
+        assert not hasattr(runtime, "consciousness")
         assert runtime.opportunity_scheduler is None
         assert runtime.participation_maintenance is None
 
@@ -613,6 +725,83 @@ async def test_admin_terminal_dispatch_finishes_exact_overlapping_direct_binding
         assert released == [("whatsapp", "group@g.us")]
     finally:
         store.close()
+
+
+def test_activation_epoch_fences_action_cap_and_writer_identity(tmp_path: Path) -> None:
+    """Old opportunities must not survive either output-authority configuration change."""
+    from yeoman_gateway.adapters.policy_engine import EnginePolicyAdapter
+    from yeoman_gateway.consciousness.log import SpeakupLog
+    from yeoman_gateway.consciousness.participation_runtime import ActivationEpochTracker
+
+    chat_id = "group@g.us"
+    target = f"whatsapp:{chat_id}"
+    config = Config.model_validate(
+        {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/v1",
+                        "provider": "openrouter",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
+            "processing": {
+                "enabled": True,
+                "chats": [target],
+                "reply_actions": {target: "answer"},
+                "participation": {
+                    "enabled": True,
+                    "judgeRoute": "participation.judge",
+                },
+            },
+        }
+    )
+    engine = PolicyEngine(
+        PolicyConfig.model_validate(
+            {
+                "channels": {
+                    "whatsapp": {
+                        "chats": {chat_id: {"participation": {"enabled": True}}}
+                    }
+                }
+            }
+        ),
+        workspace=tmp_path,
+    )
+    log = SpeakupLog(tmp_path / "speakups.db")
+    tracker = ActivationEpochTracker(store=log)
+    adapter = EnginePolicyAdapter(
+        engine=engine,
+        known_tools=set(),
+        workspace=tmp_path,
+        processing_config=config.processing,
+        models_config=config.models,
+        activation_tracker=tracker,
+    )
+
+    try:
+        state = adapter._activation_state()  # noqa: SLF001
+        assert state["participation_action_caps"] == {target: "answer"}
+        assert state["participation_writer"] == {
+            "route": "participation.writer",
+            "profile": "participation_writer",
+            "provider": "openrouter",
+            "model": "writer/v1",
+        }
+        assert tracker.refresh_activation_sync() == 1
+        assert tracker.refresh_activation_sync() == 1
+
+        config.processing.reply_actions[target] = "react"
+        assert tracker.refresh_activation_sync() == 2
+        assert tracker.refresh_activation_sync() == 2
+
+        config.models.profiles["participation_writer"].model = "writer/v2"
+        assert tracker.refresh_activation_sync() == 3
+        assert tracker.refresh_activation_sync() == 3
+    finally:
+        log.close()
 
 
 def test_restart_activation_transition_new_offers_use_new_epoch(
@@ -888,10 +1077,21 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         "yeoman_gateway.processing.model_route.RouteClient", RouteClient
     )
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
     sender = "person@s.whatsapp.net"
     config = Config.model_validate(
         {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "does_not_exist",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
             "processing": {
                 "enabled": True,
                 "chats": [f"whatsapp:{chat_id}"],
@@ -900,7 +1100,7 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
                     "shadow": False,
                     "judgeRoute": "participation.judge",
                 },
-                "reply_actions": {f"whatsapp:{chat_id}": "react"},
+                "reply_actions": {f"whatsapp:{chat_id}": "answer"},
             }
         }
     )
@@ -1006,6 +1206,8 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         policy_adapter=adapter,
     )
     decision_runtime, _reconciler = decision
+    assert decision_runtime._submission is None  # noqa: SLF001
+    assert not decision_runtime._writer_available  # noqa: SLF001
     opportunity = ParticipationOpportunity(
         opportunity_id="opportunity-reaction-1",
         channel="whatsapp",
@@ -1046,6 +1248,140 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
 
 
 @pytest.mark.asyncio
+async def test_participation_writer_uses_explicit_route_provider_and_model(
+    tmp_path: Path,
+) -> None:
+    """Using the policy/global profile here would reproduce the live wrong-provider bug."""
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.media.router import ModelRouter
+    from yeoman_gateway.processing.participation import (
+        ParticipationDecision,
+        ParticipationOpportunity,
+    )
+    from yeoman_gateway.processing.participation_runtime import (
+        ParticipationDraftError,
+    )
+    from yeoman_gateway.providers.base import LLMResponse
+
+    config = Config.model_validate(
+        {
+            "models": {
+                "profiles": {
+                    "assistant_default": {
+                        "kind": "chat",
+                        "model": "global/model",
+                        "provider": "global",
+                    },
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "openrouter",
+                        "timeout_ms": 1,
+                    },
+                },
+                "routes": {
+                    "assistant.reply": "assistant_default",
+                    "participation.writer": "participation_writer",
+                },
+            }
+        }
+    )
+    calls: list[tuple[str, str | None]] = []
+    writer_mode = "success"
+
+    class GlobalProvider:
+        async def chat(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("Participation must not use the global provider")
+
+        def get_default_model(self) -> str:
+            return "global/model"
+
+    class WriterProvider:
+        async def chat(self, *args: object, **kwargs: object) -> LLMResponse:
+            del args
+            assert kwargs["model"] == "writer/model"
+            if writer_mode == "timeout":
+                await asyncio.sleep(0.05)
+            if writer_mode == "empty":
+                return LLMResponse(content=None)
+            return LLMResponse(content="explicit writer draft")
+
+    def provider_factory(
+        model: str, provider: str | None = None
+    ) -> WriterProvider | None:
+        calls.append((model, provider))
+        if writer_mode == "unbound":
+            return None
+        return WriterProvider()
+
+    responder = LLMResponder(
+        provider=GlobalProvider(),  # type: ignore[arg-type]
+        workspace=tmp_path,
+        bus=MessageBus(),
+        model_router=ModelRouter(config.models),
+        routed_provider_factory=provider_factory,  # type: ignore[arg-type]
+    )
+    submission = _ParticipationSubmission(
+        responder=responder,
+        writer_profile="participation_writer",
+    )
+    opportunity = ParticipationOpportunity(
+        opportunity_id="writer-route",
+        channel="whatsapp",
+        chat_id="group@g.us",
+        trigger="inbound",
+        source_event_ids=("m1",),
+        observed_revision=1,
+        activation_epoch=1,
+        created_at_ms=1,
+    )
+    decision = ParticipationDecision(
+        action="comment",
+        intent="initiate",
+        reason="useful",
+        purpose="answer briefly",
+        contribution_type="observation",
+    )
+
+    try:
+        draft = await submission.generate_draft(
+            opportunity=opportunity,
+            decision=decision,
+            context={"messages": []},
+        )
+        assert draft == "explicit writer draft"
+        assert calls == [("writer/model", "openrouter")]
+
+        writer_mode = "timeout"
+        with pytest.raises(ParticipationDraftError, match="timeout"):
+            await submission.generate_draft(
+                opportunity=opportunity,
+                decision=decision,
+                context={"messages": []},
+            )
+
+        writer_mode = "empty"
+        assert await submission.generate_draft(
+            opportunity=opportunity,
+            decision=decision,
+            context={"messages": []},
+        ) is None
+
+        writer_mode = "unbound"
+        with pytest.raises(ParticipationDraftError, match="provider_error"):
+            await submission.generate_draft(
+                opportunity=opportunity,
+                decision=decision,
+                context={"messages": []},
+            )
+    finally:
+        await responder.aclose()
+
+
+@pytest.mark.asyncio
 async def test_participation_approval_rechecks_pause_and_submits_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1065,6 +1401,7 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
     from yeoman_gateway.core.models import InboundEvent as CoreInboundEvent
     from yeoman_gateway.core.models import PolicyDecision
     from yeoman_gateway.core.pipeline import PipelineContext
+    from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.pipeline.speakup_approval import SpeakupApprovalMiddleware
     from yeoman_gateway.processing.dispatch import ServiceEffectProducer
     from yeoman_gateway.processing.participation import ParticipationOpportunity
@@ -1104,11 +1441,22 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         "yeoman_gateway.processing.model_route.RouteClient", RouteClient
     )
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     chat_id = "group@g.us"
     sender = "person@s.whatsapp.net"
     owner = "owner@s.whatsapp.net"
     config = Config.model_validate(
         {
+            "models": {
+                "profiles": {
+                    "participation_writer": {
+                        "kind": "chat",
+                        "model": "writer/model",
+                        "provider": "openrouter",
+                    }
+                },
+                "routes": {"participation.writer": "participation_writer"},
+            },
             "consciousness": {
                 "enabled": False,
                 "defaultDailyCap": 2,
@@ -1197,6 +1545,8 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         workspace=tmp_path,
         bus=bus,
         service_effects=effects,
+        model_router=ModelRouter(config.models),
+        routed_provider_factory=lambda model, provider_name=None: provider,
     )
     responder = build_thread_responder(
         config,

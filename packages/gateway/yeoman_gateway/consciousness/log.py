@@ -67,6 +67,33 @@ TRANSPORT_EVIDENCE_KINDS: frozenset[str] = frozenset(
     {"transport_receipt", "probe_confirmed", "effect_sent"}
 )
 
+#: Sanitized parser/runtime details permitted in durable judge-attempt rows.
+JUDGE_DETAIL_CODES: frozenset[str] = frozenset(
+    {
+        "not_json_object",
+        "context_budget_exceeded",
+        "unknown_action",
+        "action_not_allowed",
+        "intent_not_allowed",
+        "direct_not_admitted",
+        "continuation_not_allowed",
+        "evidence_not_list",
+        "too_many_evidence",
+        "evidence_not_str",
+        "unknown_evidence_id",
+        "anchor_not_supplied",
+        "target_not_supplied",
+        "target_not_current",
+        "continuation_without_anchor",
+        "continuation_without_delivered_anchor",
+        "continuation_not_candidate",
+        "continuation_anchor_closed",
+        "contribution_type_not_allowed",
+        "purpose_required",
+        "unknown_emoji",
+    }
+)
+
 #: Evidence kinds that prove a recipient received the exact target message.
 RECIPIENT_EVIDENCE_KINDS: frozenset[str] = frozenset(
     {"recipient_delivery", "recipient_read", "quote_proof", "reaction_proof"}
@@ -330,10 +357,12 @@ class SpeakupLog:
                     hourly_limit INTEGER NOT NULL,
                     continuation_candidate INTEGER NOT NULL DEFAULT 0,
                     continuation_reserve INTEGER NOT NULL DEFAULT 0,
-                    outcome TEXT
+                    outcome TEXT,
+                    detail_code TEXT
                 )
                 """
             )
+            self._apply_judge_columns()
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_judge_attempts_chat
@@ -789,6 +818,15 @@ class SpeakupLog:
                 "UPDATE activation_state SET fingerprint = '' WHERE fingerprint IS NULL"
             )
 
+    def _apply_judge_columns(self) -> None:
+        """Additive, idempotent migration for sanitized judge details."""
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(judge_attempts)")
+        }
+        if existing and "detail_code" not in existing:
+            self._conn.execute("ALTER TABLE judge_attempts ADD COLUMN detail_code TEXT")
+
     def _set_activation_fingerprint(
         self, conn: sqlite3.Connection, scope: str, fingerprint: str
     ) -> None:
@@ -1074,11 +1112,20 @@ class SpeakupLog:
             )
         return True
 
-    async def record_judge_outcome(self, attempt_id: str, *, outcome: str) -> None:
+    async def record_judge_outcome(
+        self,
+        attempt_id: str,
+        *,
+        outcome: str,
+        detail_code: str | None = None,
+    ) -> None:
+        detail = str(detail_code or "").strip()
+        if detail not in JUDGE_DETAIL_CODES:
+            detail = ""
         with self._write() as conn:
             conn.execute(
-                "UPDATE judge_attempts SET outcome = ? WHERE attempt_id = ?",
-                (str(outcome), str(attempt_id)),
+                "UPDATE judge_attempts SET outcome = ?, detail_code = ? WHERE attempt_id = ?",
+                (str(outcome), detail or None, str(attempt_id)),
             )
 
     async def judge_attempts_since(

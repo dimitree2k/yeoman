@@ -1840,7 +1840,9 @@ class LLMResponder(ResponderPort):
         else:
             return "⚙️❓"  # max iterations reached without a text response
 
-        return final_content or "🤔❓"
+        if final_content:
+            return final_content
+        return None if (security_context or {}).get("draft_only") else "🤔❓"
 
     @staticmethod
     def _topic_tokens(text: str) -> set[str]:
@@ -2215,9 +2217,20 @@ class LLMResponder(ResponderPort):
                 chat_id=chat_id,
                 allowed_tools=set(),
             )
+            from yeoman_gateway.processing.participation_runtime import (
+                ParticipationDraftError,
+            )
+
             resolved_profile = self._profile_for_name(model_profile)
+            writer_model = str(getattr(resolved_profile, "model", "") or "").strip()
             try:
-                draft = await self._chat_loop(
+                writer_provider = self._provider_for_profile(resolved_profile)
+            except Exception as exc:  # noqa: BLE001 - route binding fails closed
+                raise ParticipationDraftError("provider_error") from exc
+            if not writer_model or writer_provider is None:
+                raise ParticipationDraftError("provider_error")
+            try:
+                generation = self._chat_loop(
                     messages=messages,
                     allowed_tools=set(),
                     security_context={
@@ -2228,8 +2241,8 @@ class LLMResponder(ResponderPort):
                         "draft_only": True,
                     },
                     is_owner=bool(is_owner),
-                    model=str(getattr(resolved_profile, "model", "") or "").strip() or None,
-                    provider=self._provider_for_profile(resolved_profile),
+                    model=writer_model,
+                    provider=writer_provider,
                     max_tokens=getattr(resolved_profile, "max_tokens", None) or 4096,
                     temperature=(
                         float(getattr(resolved_profile, "temperature"))
@@ -2255,11 +2268,22 @@ class LLMResponder(ResponderPort):
                     current_metadata=dict(metadata),
                     trace=trace,
                 )
-            except LLMProviderError:
-                logger.warning(
-                    "Provider-error draft dropped channel={} chat={}", channel, chat_id
+                timeout_ms = int(getattr(resolved_profile, "timeout_ms", 0) or 0)
+                draft = (
+                    await asyncio.wait_for(generation, timeout=timeout_ms / 1000)
+                    if timeout_ms > 0
+                    else await generation
                 )
-                draft = None
+            except TimeoutError as exc:
+                logger.warning(
+                    "Participation writer timed out channel={} chat={}", channel, chat_id
+                )
+                raise ParticipationDraftError("timeout") from exc
+            except LLMProviderError as exc:
+                logger.warning(
+                    "Participation writer provider error channel={} chat={}", channel, chat_id
+                )
+                raise ParticipationDraftError("provider_error") from exc
             lf.end_span(trace, output={"outcome": "draft" if draft else "empty"})
             return draft
         finally:
@@ -3004,6 +3028,7 @@ class LLMResponder(ResponderPort):
         *,
         purpose: str,
         context: dict[str, object],
+        model_profile: str,
     ) -> str | None:
         """Draft-only generation for unsolicited participation (spec section 8.1).
 
@@ -3039,7 +3064,7 @@ class LLMResponder(ResponderPort):
             talkative_cooldown_delay_seconds=2.5,
             talkative_cooldown_use_llm_message=False,
             is_owner=False,
-            model_profile=decision.model_profile,
+            model_profile=model_profile,
             session_history_limit=None,
             draft_only=True,
         )
