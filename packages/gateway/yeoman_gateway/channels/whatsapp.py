@@ -266,8 +266,10 @@ class WhatsAppChannel(BaseChannel):
         self._debounce_buffer_bytes: dict[str, int] = {}
         self._debounce_delays: dict[str, float] = {}
         self._debounce_tasks: dict[str, asyncio.Task[None]] = {}
-        self._debounce_flush_active: set[str] = set()
-        self._debounce_publishing: set[str] = set()
+        self._debounce_locks: dict[str, asyncio.Lock] = {}
+        self._debounce_tails: dict[str, asyncio.Task[None]] = {}
+        self._debounce_publish_tasks: set[asyncio.Task[None]] = set()
+        self._debounce_batch_sequences: dict[str, int] = {}
         self._inbound_tasks: set[asyncio.Task[None]] = set()
         self._bridge_ack_queue: asyncio.Queue[_BridgeEventWork] | None = None
         self._bridge_ack_worker: asyncio.Task[None] | None = None
@@ -484,8 +486,9 @@ class WhatsAppChannel(BaseChannel):
         self._debounce_tasks.clear()
         self._debounce_buffers.clear()
         self._debounce_buffer_bytes.clear()
-        self._debounce_flush_active.clear()
-        self._debounce_publishing.clear()
+        self._debounce_delays.clear()
+        self._debounce_tails.clear()
+        self._debounce_batch_sequences.clear()
 
         if self._media_cleanup_task:
             self._media_cleanup_task.cancel()
@@ -1266,30 +1269,34 @@ class WhatsAppChannel(BaseChannel):
 
     async def _drain_debounce_projections(self) -> None:
         """Flush acknowledged debounce batches before connection/store teardown."""
-        for key in tuple(self._debounce_buffers):
-            try:
-                await self._flush_debounce_bucket_now(key)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # The canonical row and Bridge ACK remain durable even when a
-                # legacy downstream projection fails during shutdown.
-                logger.warning(
-                    "WhatsApp debounce projection failed during shutdown error_type={}",
-                    type(exc).__name__,
-                )
+        while True:
+            timers = tuple(self._debounce_tasks.values())
+            for timer in timers:
+                if timer is not asyncio.current_task() and not timer.done():
+                    timer.cancel()
+            if timers:
+                await asyncio.gather(*timers, return_exceptions=True)
+            for key, timer in tuple(self._debounce_tasks.items()):
+                if timer.done() and self._debounce_tasks.get(key) is timer:
+                    self._debounce_tasks.pop(key, None)
 
-        tasks = tuple(self._debounce_tasks.values())
-        if not tasks:
-            return
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                logger.warning(
-                    "WhatsApp debounce task failed during shutdown error_type={}",
-                    type(result).__name__,
-                )
-        self._debounce_tasks.clear()
+            for key in tuple(self._debounce_buffers):
+                lock = self._debounce_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    events = self._detach_debounce_batch_locked(key)
+                    if events:
+                        self._schedule_debounce_publish_locked(key, events)
+
+            publishers = tuple(self._debounce_publish_tasks)
+            if publishers:
+                await asyncio.gather(*publishers, return_exceptions=True)
+                # Done callbacks remove completed tasks from the global set.  A
+                # turn gives those callbacks a chance before the final check.
+                await asyncio.sleep(0)
+                continue
+
+            if not self._debounce_tasks and not self._debounce_buffers:
+                return
 
     async def _stop_bridge_worker(self) -> None:
         worker = self._bridge_ack_worker
@@ -1652,79 +1659,53 @@ class WhatsAppChannel(BaseChannel):
             return
 
         key = f"{event.chat_jid}:{event.sender_id}"
-        if (
-            key not in self._debounce_buffers
-            and key not in self._debounce_flush_active
-            and len(self._debounce_buffers) + len(self._debounce_flush_active)
-            >= self._max_debounce_buckets
-        ):
-            self._debounce_overflow += 1
-            if self._debounce_overflow == 1 or self._debounce_overflow % 100 == 0:
-                logger.warning(
-                    "WhatsApp debounce bucket overflow: "
-                    f"dropped_batches={self._debounce_overflow} max={self._max_debounce_buckets}"
-                )
-            await self._publish_event(event)
-            return
-
         event_bytes = self._debounce_event_bytes(event)
-        bucket = self._debounce_buffers.get(key)
-        bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
-        if key in self._debounce_flush_active and bucket and (
-            len(bucket) >= self._debounce_max_items
-            or bucket_bytes + event_bytes > self._debounce_max_bytes
-        ):
-            # The current owner is publishing an older batch.  Do not start a
-            # second publisher; wait for that owner to finish before admitting
-            # the next bounded batch.
-            owner = self._debounce_tasks.get(key)
-            if owner is not None and owner is not asyncio.current_task():
-                await owner
-            bucket = self._debounce_buffers.get(key)
-            bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
-        if bucket and (
-            len(bucket) >= self._debounce_max_items
-            or bucket_bytes + event_bytes > self._debounce_max_bytes
-        ):
-            # Flush the existing acknowledged batch before admitting the next
-            # event.  This bounds both list cardinality and retained payload
-            # bytes without dropping anything already accepted by the Bridge.
-            await self._flush_debounce_bucket_now(key)
-            bucket = self._debounce_buffers.get(key)
-            bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
+        direct_publish: asyncio.Task[None] | None = None
+        lock = self._debounce_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if (
+                key not in self._debounce_buffers
+                and len(self._debounce_buffers) >= self._max_debounce_buckets
+            ):
+                self._debounce_overflow += 1
+                if self._debounce_overflow == 1 or self._debounce_overflow % 100 == 0:
+                    logger.warning(
+                        "WhatsApp debounce bucket overflow: "
+                        f"direct_batches={self._debounce_overflow} max={self._max_debounce_buckets}"
+                    )
+                direct_publish = self._schedule_debounce_publish_locked(key, [event])
+            else:
+                bucket = self._debounce_buffers.get(key)
+                bucket_bytes = self._debounce_buffer_bytes.get(key, 0)
+                if bucket and (
+                    len(bucket) >= self._debounce_max_items
+                    or bucket_bytes + event_bytes > self._debounce_max_bytes
+                    or event_bytes > self._debounce_max_bytes
+                ):
+                    self._schedule_debounce_publish_locked(
+                        key, self._detach_debounce_batch_locked(key)
+                    )
 
-        if event_bytes > self._debounce_max_bytes:
-            # A single oversized event cannot fit a bounded bucket; project it
-            # directly rather than retaining unbounded memory or dropping it.
-            if key in self._debounce_flush_active:
-                owner = self._debounce_tasks.get(key)
-                if owner is not None and owner is not asyncio.current_task():
-                    await owner
-            await self._publish_event(event)
-            return
+                if event_bytes > self._debounce_max_bytes:
+                    # A single oversized event is published directly, after
+                    # any buffered predecessor has been chained first.
+                    direct_publish = self._schedule_debounce_publish_locked(key, [event])
+                else:
+                    bucket = self._debounce_buffers.setdefault(key, [])
+                    bucket.append(event)
+                    self._debounce_buffer_bytes[key] = (
+                        self._debounce_buffer_bytes.get(key, 0) + event_bytes
+                    )
+                    self._debounce_delays[key] = min(
+                        self._debounce_delays.get(key, effective_debounce),
+                        effective_debounce,
+                    )
+                    self._schedule_debounce_timer_locked(
+                        key, self._debounce_delays[key]
+                    )
 
-        if bucket is None:
-            bucket = self._debounce_buffers.setdefault(key, [])
-        bucket.append(event)
-        self._debounce_buffer_bytes[key] = bucket_bytes + event_bytes
-        self._debounce_delays[key] = min(
-            self._debounce_delays.get(key, effective_debounce),
-            effective_debounce,
-        )
-
-        if key in self._debounce_flush_active:
-            # The owner will observe this newly appended batch after its
-            # current publication and keep the per-key ordering intact.
-            return
-
-        existing_task = self._debounce_tasks.get(key)
-        if existing_task and existing_task is not asyncio.current_task():
-            existing_task.cancel()
-            await asyncio.gather(existing_task, return_exceptions=True)
-
-        self._debounce_tasks[key] = asyncio.create_task(
-            self._flush_debounce_bucket(key, self._debounce_delays[key])
-        )
+        if direct_publish is not None:
+            await direct_publish
 
     def _on_inbound_task_done(self, task: asyncio.Task[None]) -> None:
         self._inbound_tasks.discard(task)
@@ -1741,76 +1722,115 @@ class WhatsAppChannel(BaseChannel):
         # its visible text.
         return max(1, len(repr(event).encode("utf-8")))
 
-    async def _flush_debounce_bucket_now(self, key: str) -> None:
-        task = self._debounce_tasks.get(key)
-        if key in self._debounce_flush_active:
-            if self._stopping and key not in self._debounce_publishing and task is not None:
-                task.cancel()
-            if task is not None and task is not asyncio.current_task():
-                await task
-            return
-
-        # A timer which has not taken ownership yet can be cancelled before the
-        # direct bound-triggered flush.  The owner remains tracked through its
-        # cancellation and publication handoff.
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-        events = self._debounce_buffers.pop(key, [])
+    def _detach_debounce_batch_locked(self, key: str) -> list[InboundEvent]:
+        timer = self._debounce_tasks.pop(key, None)
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
         self._debounce_buffer_bytes.pop(key, None)
         self._debounce_delays.pop(key, None)
-        if events:
-            self._debounce_flush_active.add(key)
-            self._debounce_publishing.add(key)
-            try:
-                await self._publish_debounce_batch(events)
-            finally:
-                self._debounce_publishing.discard(key)
-                self._debounce_flush_active.discard(key)
+        return self._debounce_buffers.pop(key, [])
 
-        if key in self._debounce_buffers and key not in self._debounce_tasks:
-            delay_ms = self._debounce_delays.get(key, self.config.debounce_ms)
-            self._debounce_tasks[key] = asyncio.create_task(
-                self._flush_debounce_bucket(key, delay_ms)
+    def _schedule_debounce_timer_locked(self, key: str, delay_ms: float) -> None:
+        existing = self._debounce_tasks.get(key)
+        if existing is not None and existing is not asyncio.current_task():
+            existing.cancel()
+        timer = asyncio.create_task(self._flush_debounce_bucket(key, delay_ms))
+        self._debounce_tasks[key] = timer
+        timer.add_done_callback(
+            lambda completed, timer_key=key: self._on_debounce_timer_done(
+                timer_key, completed
+            )
+        )
+
+    def _schedule_debounce_publish_locked(
+        self, key: str, events: list[InboundEvent]
+    ) -> asyncio.Task[None]:
+        if not events:
+            raise RuntimeError("cannot schedule an empty debounce batch")
+        sequence = self._debounce_batch_sequences.get(key, 0) + 1
+        self._debounce_batch_sequences[key] = sequence
+        previous = self._debounce_tails.get(key)
+        publisher = asyncio.create_task(
+            self._publish_debounce_batch_after(key, sequence, events, previous)
+        )
+        self._debounce_tails[key] = publisher
+        self._debounce_publish_tasks.add(publisher)
+        publisher.add_done_callback(
+            lambda completed, publish_key=key, publish_sequence=sequence: self._on_debounce_publish_done(
+                publish_key, publish_sequence, completed
+            )
+        )
+        return publisher
+
+    def _on_debounce_timer_done(self, key: str, task: asyncio.Task[None]) -> None:
+        if self._debounce_tasks.get(key) is task:
+            self._debounce_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.warning(
+                "WhatsApp debounce timer failed key={} error_type={}",
+                key,
+                type(error).__name__,
+            )
+
+    def _on_debounce_publish_done(
+        self, key: str, sequence: int, task: asyncio.Task[None]
+    ) -> None:
+        self._debounce_publish_tasks.discard(task)
+        if self._debounce_tails.get(key) is task:
+            self._debounce_tails.pop(key, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.warning(
+                "WhatsApp debounce publication failed key={} sequence={} error_type={}",
+                key,
+                sequence,
+                type(error).__name__,
             )
 
     async def _flush_debounce_bucket(self, key: str, delay_ms: float) -> None:
-        owner = asyncio.current_task()
         try:
+            await asyncio.sleep(delay_ms / 1000.0)
+        except asyncio.CancelledError:
+            return
+
+        lock = self._debounce_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if self._debounce_tasks.get(key) is not asyncio.current_task():
+                return
+            events = self._detach_debounce_batch_locked(key)
+            if events:
+                self._schedule_debounce_publish_locked(key, events)
+
+    async def _publish_debounce_batch_after(
+        self,
+        key: str,
+        sequence: int,
+        events: list[InboundEvent],
+        previous: asyncio.Task[None] | None,
+    ) -> None:
+        del key, sequence
+        if previous is not None:
             try:
-                await asyncio.sleep(delay_ms / 1000.0)
+                await previous
             except asyncio.CancelledError:
-                if not self._stopping:
-                    return
-
-            self._debounce_flush_active.add(key)
-            while True:
-                events = self._debounce_buffers.pop(key, [])
-                self._debounce_buffer_bytes.pop(key, None)
-                self._debounce_delays.pop(key, None)
-                if events:
-                    self._debounce_publishing.add(key)
-                    try:
-                        await self._publish_debounce_batch(events)
-                    finally:
-                        self._debounce_publishing.discard(key)
-
-                if key not in self._debounce_buffers:
-                    return
-                if self._stopping:
-                    continue
-                next_delay = self._debounce_delays.get(key, delay_ms)
-                try:
-                    await asyncio.sleep(next_delay / 1000.0)
-                except asyncio.CancelledError:
-                    if not self._stopping:
-                        raise
-        finally:
-            self._debounce_publishing.discard(key)
-            self._debounce_flush_active.discard(key)
-            if self._debounce_tasks.get(key) is owner:
-                self._debounce_tasks.pop(key, None)
+                if not previous.cancelled():
+                    raise
+            except Exception:
+                # The predecessor's done callback retrieved and logged the
+                # failure; the serialized successor must still continue.
+                pass
+        await self._publish_debounce_batch(events)
 
     async def _publish_debounce_batch(self, events: list[InboundEvent]) -> None:
         if len(events) == 1:

@@ -611,6 +611,154 @@ def test_debounce_bucket_flushes_before_item_or_byte_ceiling(tmp_path: Path) -> 
     store.close()
 
 
+def test_stop_waits_for_boundary_owned_debounce_publisher(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=60_000), MessageBus())
+    channel._chat_registry = None
+    channel._debounce_max_items = 1
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    published: list[str] = []
+
+    async def publish(event):
+        if event.message_id == "old":
+            old_started.set()
+            await release_old.wait()
+        published.append(event.message_id)
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "old", "old"))
+        boundary = asyncio.create_task(
+            channel._ingest_inbound_event(_parsed_message(channel, "new1", "new1"))
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=1)
+        stopping = asyncio.create_task(channel.stop())
+        await asyncio.sleep(0.02)
+        assert not stopping.done()
+        release_old.set()
+        await boundary
+        await stopping
+        assert published == ["old", "new1"]
+
+    asyncio.run(exercise())
+    assert not channel._debounce_publish_tasks
+    store.close()
+
+
+def test_boundary_arrivals_keep_triggering_event_before_successor(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=60_000), MessageBus())
+    channel._chat_registry = None
+    channel._debounce_max_items = 1
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+    published: list[str] = []
+
+    async def publish(event):
+        if event.message_id == "old":
+            old_started.set()
+            await release_old.wait()
+        published.extend(event.source_ids)
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "old", "old"))
+        new1 = asyncio.create_task(
+            channel._ingest_inbound_event(_parsed_message(channel, "new1", "new1"))
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=1)
+        new2 = asyncio.create_task(
+            channel._ingest_inbound_event(_parsed_message(channel, "new2", "new2"))
+        )
+        await new2
+        release_old.set()
+        await new1
+        await channel.stop()
+
+    asyncio.run(exercise())
+    assert published == ["old", "new1", "new2"]
+    assert not channel._debounce_publish_tasks
+    store.close()
+
+
+def test_timer_publish_failure_starts_successor_for_buffered_arrival(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._chat_registry = None
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    published: list[str] = []
+
+    async def publish(event):
+        if event.message_id == "old":
+            first_started.set()
+            await release_first.wait()
+            raise RuntimeError("first debounce publication failed")
+        published.append(event.message_id)
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "old", "old"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await channel._ingest_inbound_event(_parsed_message(channel, "new", "new"))
+        release_first.set()
+        await channel.stop()
+
+    asyncio.run(exercise())
+    assert published == ["new"]
+    assert not channel._debounce_publish_tasks
+    assert not channel._debounce_tasks
+    assert not channel._debounce_buffers
+    store.close()
+
+
+def test_concurrent_timer_and_boundary_admission_preserves_order_and_bounds(
+    tmp_path: Path,
+) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = WhatsAppChannel(WhatsAppConfig(debounce_ms=1), MessageBus())
+    channel._chat_registry = None
+    channel._debounce_max_items = 2
+    channel._debounce_max_bytes = 10_000
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    published: list[str] = []
+
+    async def publish(event):
+        if not published:
+            first_started.set()
+            await release_first.wait()
+        published.extend(event.source_ids)
+        await asyncio.sleep(0)
+
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        await channel._ingest_inbound_event(_parsed_message(channel, "event-0", "0"))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        arrivals = [
+            asyncio.create_task(
+                channel._ingest_inbound_event(_parsed_message(channel, f"event-{i}", str(i)))
+            )
+            for i in range(1, 9)
+        ]
+        await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(*arrivals)
+        await channel.stop()
+
+    asyncio.run(exercise())
+    assert published == [f"event-{i}" for i in range(9)]
+    assert not channel._debounce_publish_tasks
+    assert not channel._debounce_tasks
+    assert not channel._debounce_buffers
+    store.close()
+
+
 @pytest.mark.parametrize(
     "frame",
     [
