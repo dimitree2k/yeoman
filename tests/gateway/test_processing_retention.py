@@ -95,6 +95,27 @@ class _CancellableErrorStore:
         raise RuntimeError("purge failed")
 
 
+class _CloseAwareStore:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.after_close = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def purge(self, *, now_ms: int) -> PurgeReport:
+        del now_ms
+        self.calls += 1
+        self.started.set()
+        self.release.wait(timeout=2)
+        if self.closed:
+            self.after_close += 1
+        return PurgeReport()
+
+    def close(self) -> None:
+        self.closed = True
+
+
 async def _wait_for_thread_event(event: threading.Event) -> None:
     for _ in range(200):
         if event.is_set():
@@ -326,6 +347,69 @@ def test_worker_error_propagates_and_stop_is_clean() -> None:
             await sweep
         assert store.finished.is_set()
         await service.stop()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_start_is_rejected_until_stop_fence_and_restart_is_safe() -> None:
+    store = _CloseAwareStore()
+    service = ProcessingRetentionService(
+        store,
+        clock=_Clock(),
+        startup_delay_seconds=0.05,
+    )
+
+    async def scenario() -> None:
+        sweep = asyncio.create_task(service.sweep_once())
+        await _wait_for_thread_event(store.started)
+        stop = asyncio.create_task(service.stop())
+        for _ in range(200):
+            if service._stopping:
+                break
+            await asyncio.sleep(0)
+        assert service._stopping is True
+
+        try:
+            with pytest.raises(RuntimeError, match="stop is in progress"):
+                await service.start()
+        finally:
+            store.release.set()
+            await asyncio.gather(sweep, stop)
+
+        await service.start()
+        assert service.running is True
+        await service.stop()
+        store.close()
+        await asyncio.sleep(0.06)
+        assert store.after_close == 0
+
+    asyncio.run(scenario())
+
+
+def test_repeated_start_stop_leaves_no_retention_tasks_or_pending_sweeps() -> None:
+    service = ProcessingRetentionService(
+        _SlowStore(delay_seconds=0.01),
+        clock=_Clock(),
+        interval_seconds=0.05,
+        startup_delay_seconds=0.01,
+    )
+
+    async def scenario() -> None:
+        for _ in range(30):
+            await service.start()
+            await service.start()
+            await service.stop()
+            assert service.running is False
+            assert service._task is None
+            assert service._pending_sweeps == 0
+            assert service._inflight_done is None
+
+        retention_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if "ProcessingRetentionService._run_loop" in repr(task.get_coro())
+        ]
+        assert retention_tasks == []
 
     asyncio.run(scenario())
 
