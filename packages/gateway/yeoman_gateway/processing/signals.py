@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+from yeoman_shared.whatsapp_protocol import MEDIA_METADATA_FIELDS
 
 from yeoman_gateway.processing.models import (
     DELIVERED_STATUSES_TUPLE as _DELIVERED,
@@ -79,6 +80,7 @@ class JournalSignal:
             "channel": self.channel,
             "chat_id": self.chat_id,
             "occurred_ms": self.occurred_ms,
+            "source_message_id": self.source_message_id,
             "target_message_id": self.target_message_id,
         }
         body.update(dict(self.payload))
@@ -129,6 +131,36 @@ def _to_ms(value: Any) -> int | None:
     return int(number * 1000) if number < 1e11 else int(number)
 
 
+def _media_metadata(value: Any) -> dict[str, Any] | None:
+    """Keep only bounded media metadata; never copy provider bytes into the journal."""
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, Any] = {}
+    # Iterate in wire order so replayed JSON has deterministic key ordering even though
+    # the shared allowlist is a frozenset for TypeScript/Python parity.
+    for key in ("kind", "mimeType", "fileName", "bytes", "path", "ref", "sha256", "hash"):
+        if key not in MEDIA_METADATA_FIELDS:
+            continue
+        item = value.get(key)
+        if key in {"bytes"}:
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                result[key] = item
+            continue
+        if isinstance(item, str) and item.strip():
+            result[key] = item.strip()
+    return result or None
+
+
+def _revision(value: Any) -> int | str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 class WhatsAppSignalMapper:
     """Maps bridge payloads of one kind into canonical journal signals."""
 
@@ -169,6 +201,9 @@ class WhatsAppSignalMapper:
             "mentioned_bot": bool(payload.get("mentionedBot")),
             "reply_to_message_id": _first(payload, "replyToMessageId", "reply_to_message_id"),
         }
+        media = _media_metadata(payload.get("media"))
+        if media is not None:
+            body["media"] = media
         return self._signal(
             kind="message",
             event_key=event_key,
@@ -185,15 +220,22 @@ class WhatsAppSignalMapper:
         if not message_id:
             return None
         edit_ms = _to_ms(payload.get("timestamp") or payload.get("editTimestamp"))
+        revision_raw = payload.get("revision")
+        if revision_raw is None:
+            revision_raw = payload.get("editRevision")
+        revision = _revision(revision_raw)
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
-        event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{edit_ms or 0}"
+        event_key = f"{self._channel}:{chat_id}:edit:{message_id}:{revision if revision is not None else edit_ms or 0}"
+        body: dict[str, Any] = {"text": _first(payload, "text", "content") or ""}
+        if revision is not None:
+            body["revision"] = revision
         return self._signal(
             kind="edit",
             event_key=event_key,
             chat_id=chat_id,
             principal=principal,
             payload=payload,
-            body={"text": _first(payload, "text", "content") or ""},
+            body=body,
             source_message_id=message_id,
             target_message_id=message_id,
             occurred_ms=edit_ms,

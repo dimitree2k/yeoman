@@ -28,7 +28,7 @@ import {
   defaultBridgeOutboxDir,
   type ReplayableBridgeEvent,
 } from './outbox.js';
-import { WhatsAppClient, type InboundMessageV2 } from './whatsapp.js';
+import { WhatsAppClient, type InboundMedia, type InboundMessageV2 } from './whatsapp.js';
 
 type ClientMeta = {
   ws: WebSocket;
@@ -72,6 +72,19 @@ function rawDataToString(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
   if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
   return data.toString('utf8');
+}
+
+function mediaMetadata(media: InboundMedia | undefined): Record<string, unknown> | undefined {
+  if (!media) return undefined;
+  const result: Record<string, unknown> = { kind: media.kind };
+  for (const key of ['mimeType', 'fileName', 'path', 'ref', 'sha256', 'hash'] as const) {
+    const value = media[key];
+    if (typeof value === 'string' && value.trim()) result[key] = value.trim();
+  }
+  if (typeof media.bytes === 'number' && Number.isSafeInteger(media.bytes) && media.bytes >= 0) {
+    result.bytes = media.bytes;
+  }
+  return result;
 }
 
 export class BridgeServer {
@@ -533,7 +546,8 @@ export class BridgeServer {
           replyToMessageId: msg.replyToMessageId,
           replyToParticipantJid: msg.replyToParticipantJid,
           replyToText: msg.replyToText,
-          media: msg.media,
+          replyToMedia: mediaMetadata(msg.replyToMedia),
+          media: mediaMetadata(msg.media),
         },
       }),
     );

@@ -1,5 +1,26 @@
 export const PROTOCOL_VERSION = 5 as const;
 
+export const REPLAYABLE_EVENT_TYPES = [
+  'message',
+  'edit',
+  'delete',
+  'reaction',
+  'receipt',
+] as const;
+
+export const MEDIA_METADATA_FIELDS = [
+  'kind',
+  'mimeType',
+  'fileName',
+  'bytes',
+  'path',
+  'ref',
+  'sha256',
+  'hash',
+] as const;
+
+export const OUTBOUND_MESSAGE_ID_FIELDS = ['providerMessageId', 'clientMessageId'] as const;
+
 const TOKEN_JSON_RE = /("token"\s*:\s*")[^"]*(")/gi;
 const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
 
@@ -151,6 +172,24 @@ export interface BridgeEventEnvelope {
   observedAt?: number;
   requestId?: string;
   payload: Record<string, unknown>;
+}
+
+export interface BridgeMediaMetadata {
+  kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
+  mimeType?: string;
+  fileName?: string;
+  bytes?: number;
+  path?: string;
+  ref?: string;
+  sha256?: string;
+  hash?: string;
+}
+
+export interface BridgeSendResult {
+  to: string;
+  messageId?: string;
+  providerMessageId?: string;
+  clientMessageId?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

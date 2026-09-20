@@ -150,6 +150,53 @@ test('BridgeServer persists before a subscriber send and preserves pending event
   }
 });
 
+test('BridgeServer replays complete message metadata without binary payloads', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-message-payload-'));
+  try {
+    const server = makeServer(root);
+    const message = {
+      messageId: 'media-message-1',
+      chatJid: 'chat@g.us',
+      participantJid: '4915@s.whatsapp.net',
+      senderId: '4915',
+      isGroup: true,
+      text: '[Document] report',
+      timestamp: 1_700_000_000,
+      mentionedJids: [],
+      mentionedBot: false,
+      replyToBot: false,
+      replyToMedia: {
+        kind: 'document',
+        mimeType: 'application/pdf',
+        fileName: 'quoted.pdf',
+        bytes: 128,
+        path: '/safe/media/quoted.pdf',
+        sha256: 'a'.repeat(64),
+      },
+      media: {
+        kind: 'document',
+        mimeType: 'application/pdf',
+        fileName: 'report.pdf',
+        bytes: 256,
+        path: '/safe/media/report.pdf',
+        sha256: 'b'.repeat(64),
+      },
+    };
+
+    await (server as any).broadcastMessage(message);
+    const restarted = makeServer(root);
+    await (restarted as any).outbox.open();
+    const [event] = await (restarted as any).outbox.pending();
+
+    assert.deepEqual(event.payload.media, message.media);
+    assert.deepEqual(event.payload.replyToMedia, message.replyToMedia);
+    assert.equal('data' in event.payload.media, false);
+    assert.equal('base64' in event.payload.media, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('status events remain operational broadcasts and are not outbox business events', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
   try {

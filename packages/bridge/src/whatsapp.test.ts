@@ -24,6 +24,21 @@ function inboundMessage(messageId: string): Record<string, unknown> {
   };
 }
 
+function testClient(
+  onMessage: (message: any) => void | Promise<void> = () => {},
+  onSignal: (kind: string, payload: Record<string, unknown>) => void | Promise<void> = () => {},
+): WhatsAppClient {
+  return new WhatsAppClient({
+    authDir: '/tmp/yeoman-whatsapp-payload-test',
+    readReceipts: false,
+    onMessage,
+    onSignal: onSignal as any,
+    onQR: () => {},
+    onStatus: () => {},
+    onError: () => {},
+  });
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate() && Date.now() < deadline) {
@@ -106,6 +121,127 @@ test('shouldIgnoreFromMeInbound ignores bridge-sent self messages when flag enab
 test('mediaExtension preserves document file names and maps PDF mime type', () => {
   assert.equal(mediaExtension('document', 'application/pdf', undefined), '.pdf');
   assert.equal(mediaExtension('document', undefined, 'Frank Report.PDF'), '.pdf');
+});
+
+test('inbound text is not truncated at 8000 characters', async () => {
+  const text = 'x'.repeat(8_001);
+  let received: any;
+  const client = testClient((message) => {
+    received = message;
+  });
+  (client as any).sock = { readMessages: async () => undefined };
+
+  await (client as any).processInboundMessage(
+    {
+      key: { remoteJid: '12345@s.whatsapp.net', id: 'long-message' },
+      message: { conversation: text },
+      messageTimestamp: 1_700_000_000,
+    },
+    '12345@s.whatsapp.net',
+    '12345@s.whatsapp.net',
+    'long-message',
+  );
+
+  assert.equal(received.text, text);
+});
+
+test('media-only inbound messages carry metadata without binary payloads', () => {
+  const client = testClient();
+  const extracted = (client as any).extractMessageTextAndMedia({
+    message: {
+      documentMessage: {
+        mimetype: 'application/pdf',
+        fileName: 'report.pdf',
+        fileLength: '42',
+      },
+    },
+  });
+
+  assert.equal(extracted.text, '[Document]');
+  assert.deepEqual(extracted.media, {
+    kind: 'document',
+    mimeType: 'application/pdf',
+    fileName: 'report.pdf',
+    bytes: 42,
+  });
+  assert.equal('data' in extracted.media, false);
+  assert.equal('base64' in extracted.media, false);
+});
+
+test('PDF extraction is not attempted and the envelope only contains caption metadata', () => {
+  const client = testClient();
+  const extracted = (client as any).extractMessageTextAndMedia({
+    message: {
+      documentMessage: {
+        mimetype: 'application/pdf',
+        fileName: 'report.pdf',
+        caption: 'Please review page one',
+        fileLength: 128,
+        fileSha256: Buffer.from('provider-hash'),
+      },
+    },
+  });
+
+  assert.equal(extracted.text, '[Document] Please review page one');
+  assert.deepEqual(extracted.media, {
+    kind: 'document',
+    mimeType: 'application/pdf',
+    fileName: 'report.pdf',
+    bytes: 128,
+  });
+  assert.equal(Object.keys(extracted.media).some((key) => /data|buffer|base64|text/i.test(key)), false);
+});
+
+test('edit signals preserve replacement text and provider revision when present', () => {
+  const client = testClient();
+  const payload = (client as any).extractEditPayload({
+    key: {
+      remoteJid: 'chat@g.us',
+      id: 'provider-edit-id',
+      participant: '4915@s.whatsapp.net',
+    },
+    update: {
+      messageTimestamp: 1_700_000_123,
+      revision: 3,
+      message: {
+        editedMessage: {
+          message: { conversation: 'replacement text', revision: 3 },
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(payload, {
+    chatJid: 'chat@g.us',
+    messageId: 'provider-edit-id',
+    participantJid: '4915@s.whatsapp.net',
+    timestamp: 1_700_000_123,
+    text: 'replacement text',
+    revision: 3,
+  });
+});
+
+test('send results retain provider and client message ids separately', async () => {
+  const client = testClient();
+  (client as any).sock = {
+    sendMessage: async () => ({ key: { id: 'provider-message-id' } }),
+  };
+  (client as any).connected = true;
+
+  const result = await client.sendText(
+    '12345@s.whatsapp.net',
+    'hello',
+    undefined,
+    undefined,
+    'client-message-id',
+  );
+
+  assert.deepEqual(result, {
+    to: '12345@s.whatsapp.net',
+    messageId: 'provider-message-id',
+    providerMessageId: 'provider-message-id',
+    clientMessageId: 'client-message-id',
+  });
 });
 
 test('resolveWhatsAppWebVersion uses fetched latest version', async () => {

@@ -8,10 +8,18 @@ from pathlib import Path
 
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import WhatsAppChannel
-from yeoman_gateway.processing.signals import SignalJournalSink, signal_event_id
+from yeoman_gateway.processing.signals import (
+    SignalJournalSink,
+    WhatsAppSignalMapper,
+    signal_event_id,
+)
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import WhatsAppConfig
-from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
+from yeoman_shared.whatsapp_protocol import (
+    MEDIA_METADATA_FIELDS,
+    PROTOCOL_VERSION,
+    REPLAYABLE_EVENT_TYPES,
+)
 
 CHAT = "chat@g.us"
 T0 = 1_700_000_000_000
@@ -27,7 +35,7 @@ def _frame(kind: str, payload: dict, *, version: int = PROTOCOL_VERSION) -> str:
     return json.dumps({"version": version, "type": kind, "ts": T0, "accountId": "a", "payload": payload})
 
 
-def test_protocol_is_v4_and_gateway_rejects_older_frames(tmp_path: Path) -> None:
+def test_protocol_is_v5_and_gateway_rejects_older_frames(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "p.db")
     channel = _channel(store)
 
@@ -36,10 +44,100 @@ def test_protocol_is_v4_and_gateway_rejects_older_frames(tmp_path: Path) -> None
         "emoji": "🔥", "timestamp": 1_700_000_000,
     }, version=3)))
 
-    assert PROTOCOL_VERSION == 4
+    assert PROTOCOL_VERSION == 5
     # A v3 frame is dropped instead of being half understood.
     assert store.count_events() == 0
     store.close()
+
+
+def test_v5_payload_constants_match_supported_event_and_media_shapes() -> None:
+    assert REPLAYABLE_EVENT_TYPES == frozenset({"message", "edit", "delete", "reaction", "receipt"})
+    assert MEDIA_METADATA_FIELDS == frozenset(
+        {"kind", "mimeType", "fileName", "bytes", "path", "ref", "sha256", "hash"}
+    )
+
+
+def test_long_message_and_media_metadata_are_preserved_without_binary_payload() -> None:
+    text = "x" * 8_001
+    signal = WhatsAppSignalMapper().map(
+        {
+            "chatJid": CHAT,
+            "messageId": "long-media-1",
+            "senderId": "4915@s.whatsapp.net",
+            "text": text,
+            "media": {
+                "kind": "document",
+                "mimeType": "application/pdf",
+                "fileName": "report.pdf",
+                "bytes": 128,
+                "path": "/safe/media/report.pdf",
+                "sha256": "a" * 64,
+                "data": b"must-not-cross-wire",
+            },
+        },
+        kind="message",
+    )
+
+    assert signal is not None
+    body = signal.to_event_payload()
+    assert body["text"] == text
+    assert body["media"] == {
+        "kind": "document",
+        "mimeType": "application/pdf",
+        "fileName": "report.pdf",
+        "bytes": 128,
+        "path": "/safe/media/report.pdf",
+        "sha256": "a" * 64,
+    }
+    assert "data" not in body["media"]
+
+
+def test_edit_preserves_replacement_text_and_revision() -> None:
+    signal = WhatsAppSignalMapper().map(
+        {
+            "chatJid": CHAT,
+            "messageId": "edited-1",
+            "text": "replacement text",
+            "revision": 3,
+            "timestamp": 1_700_000_123,
+        },
+        kind="edit",
+    )
+
+    assert signal is not None
+    body = signal.to_event_payload()
+    assert body["text"] == "replacement text"
+    assert body["revision"] == 3
+
+
+def test_delete_reaction_and_receipt_keep_provider_references() -> None:
+    mapper = WhatsAppSignalMapper()
+    delete = mapper.map({"chatJid": CHAT, "messageId": "deleted-1"}, kind="delete")
+    reaction = mapper.map(
+        {
+            "chatJid": CHAT,
+            "targetMessageId": "reacted-1",
+            "senderId": "4915@s.whatsapp.net",
+            "emoji": "👍",
+        },
+        kind="reaction",
+    )
+    receipt = mapper.map(
+        {
+            "chatJid": CHAT,
+            "messageId": "received-1",
+            "recipientJid": "4915@s.whatsapp.net",
+            "status": "read",
+        },
+        kind="receipt",
+    )
+
+    assert delete is not None and delete.source_message_id == "deleted-1"
+    assert reaction is not None and reaction.target_message_id == "reacted-1"
+    assert receipt is not None and receipt.source_message_id == "received-1"
+    assert delete.to_event_payload()["source_message_id"] == "deleted-1"
+    assert reaction.to_event_payload()["target_message_id"] == "reacted-1"
+    assert receipt.to_event_payload()["source_message_id"] == "received-1"
 
 
 def test_every_signal_kind_reaches_the_journal(tmp_path: Path) -> None:

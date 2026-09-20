@@ -36,7 +36,10 @@ export interface InboundMedia {
   mimeType?: string;
   fileName?: string;
   path?: string;
+  ref?: string;
   bytes?: number;
+  sha256?: string;
+  hash?: string;
 }
 
 export interface InboundMessageV2 {
@@ -291,6 +294,49 @@ function limitText(value: string, max = 10_000): string {
   const text = String(value || '');
   if (text.length <= max) return text;
   return text.slice(0, max);
+}
+
+function providerMediaBytes(media: any): number | undefined {
+  const raw = media?.fileLength ?? media?.fileSize ?? media?.bytes;
+  const bytes = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : undefined;
+}
+
+function mediaSha256(buffer: Buffer): string {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+function providerMediaHash(media: any): string | undefined {
+  const raw = media?.sha256 ?? media?.hash;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
+function providerMediaMetadata(media: any): Pick<InboundMedia, 'bytes' | 'sha256'> {
+  const bytes = providerMediaBytes(media);
+  const sha256 = providerMediaHash(media);
+  return {
+    ...(bytes === undefined ? {} : { bytes }),
+    ...(sha256 === undefined ? {} : { sha256 }),
+  };
+}
+
+function sendResult(
+  to: string,
+  sent: any,
+  clientMessageId?: string,
+): {
+  to: string;
+  messageId?: string;
+  providerMessageId?: string;
+  clientMessageId?: string;
+} {
+  const providerMessageId = String(sent?.key?.id || '').trim() || undefined;
+  return {
+    to,
+    messageId: providerMessageId || clientMessageId || undefined,
+    providerMessageId,
+    clientMessageId: clientMessageId || undefined,
+  };
 }
 
 function mediaMimeFromFileName(pathOrName: string): string | undefined {
@@ -562,6 +608,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -608,6 +655,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -654,6 +702,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -700,6 +749,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -740,6 +790,7 @@ export class WhatsAppClient {
       ...media,
       path: filePath,
       bytes: buffer.length,
+      sha256: mediaSha256(buffer),
     };
   }
 
@@ -993,6 +1044,35 @@ export class WhatsAppClient {
   private markSeenInbound(key: string): void {
     this.cleanupRecentInbound();
     this.recentInbound.set(key, nowMs() + INBOUND_DEDUPE_TTL_MS);
+  }
+
+  private extractEditPayload(update: any): Record<string, unknown> | null {
+    const chatJid = normalizeJid(String(update?.key?.remoteJid || ''));
+    const messageId = String(update?.key?.id || '').trim();
+    if (!chatJid || !messageId) return null;
+
+    const payload: Record<string, unknown> = { chatJid, messageId };
+    const participantJid = normalizeJid(String(update?.key?.participant || ''));
+    if (participantJid) payload.participantJid = participantJid;
+
+    const timestamp = Number(update?.update?.messageTimestamp ?? update?.messageTimestamp ?? 0);
+    if (Number.isFinite(timestamp) && timestamp > 0) payload.timestamp = timestamp;
+
+    const edited = update?.update?.message?.editedMessage?.message;
+    if (edited) {
+      const replacement = this.extractMessageTextAndMedia({ message: edited });
+      if (replacement.text !== null) payload.text = replacement.text;
+      if (replacement.media) payload.media = replacement.media;
+    }
+
+    const revisionRaw =
+      edited?.revision ??
+      edited?.editVersion ??
+      update?.update?.revision ??
+      update?.revision;
+    const revision = Number(revisionRaw);
+    if (Number.isSafeInteger(revision) && revision >= 0) payload.revision = revision;
+    return payload;
   }
 
   private cleanupRecentOutboundSelf(): void {
@@ -1324,7 +1404,13 @@ export class WhatsAppClient {
       return undefined;
     }
 
-    return { kind: 'image', mimeType, path: filePath, bytes: buffer.length };
+    return {
+      kind: 'image',
+      mimeType,
+      path: filePath,
+      bytes: buffer.length,
+      sha256: mediaSha256(buffer),
+    };
   }
 
   private extractMentionMeta(msg: any, text: string): {
@@ -1386,6 +1472,7 @@ export class WhatsAppClient {
         media: {
           kind: 'image',
           mimeType: message.imageMessage.mimetype,
+          ...providerMediaMetadata(message.imageMessage),
         },
       };
     }
@@ -1397,6 +1484,8 @@ export class WhatsAppClient {
         media: {
           kind: 'video',
           mimeType: message.videoMessage.mimetype,
+          fileName: message.videoMessage.fileName,
+          ...providerMediaMetadata(message.videoMessage),
         },
       };
     }
@@ -1407,6 +1496,8 @@ export class WhatsAppClient {
         media: {
           kind: 'audio',
           mimeType: message.audioMessage.mimetype,
+          fileName: message.audioMessage.fileName,
+          ...providerMediaMetadata(message.audioMessage),
         },
       };
     }
@@ -1419,6 +1510,7 @@ export class WhatsAppClient {
           kind: 'document',
           mimeType: message.documentMessage.mimetype,
           fileName: message.documentMessage.fileName,
+          ...providerMediaMetadata(message.documentMessage),
         },
       };
     }
@@ -1429,6 +1521,7 @@ export class WhatsAppClient {
         media: {
           kind: 'sticker',
           mimeType: message.stickerMessage.mimetype,
+          ...providerMediaMetadata(message.stickerMessage),
         },
       };
     }
@@ -1547,7 +1640,7 @@ export class WhatsAppClient {
       lidConflict: this.isLidConflict(participantJid),
       senderName: (msg.pushName || '').trim() || undefined,
       isGroup,
-      text: limitText(extracted.text, 8_000),
+      text: extracted.text,
       timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
       mentionedJids: mention.mentionedJids,
       mentionedBot: mention.mentionedBot,
@@ -1672,11 +1765,11 @@ export class WhatsAppClient {
           }
           const edited = update?.update?.message?.editedMessage?.message;
           if (edited) {
-            this.emitSignal('edit', `${messageId}:${Number(update?.update?.messageTimestamp ?? 0)}`, {
-              chatJid,
-              messageId,
-              timestamp: Number(update?.update?.messageTimestamp ?? 0) || undefined,
-            });
+            const payload = this.extractEditPayload(update);
+            if (payload) {
+              const identity = `${messageId}:${String(payload.revision ?? payload.timestamp ?? 0)}`;
+              this.emitSignal('edit', identity, payload);
+            }
           }
         } catch (err) {
           this.lastError = err instanceof Error ? err.message : String(err);
@@ -1764,7 +1857,12 @@ export class WhatsAppClient {
     replyToMessageId?: string,
     mentions?: string[],
     clientMessageId?: string,
-  ): Promise<{ to: string; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1783,13 +1881,19 @@ export class WhatsAppClient {
       ...(clientMessageId ? { messageId: clientMessageId } : {}),
     });
     this.rememberOutboundSelfMessage(to, sent);
-    const messageId = String(sent?.key?.id || clientMessageId || '').trim() || undefined;
-    return { to, messageId };
+    return sendResult(to, sent, clientMessageId);
   }
 
   async sendMedia(
     input: SendMediaInput,
-  ): Promise<{ to: string; mimeType: string; bytes: number; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    mimeType: string;
+    bytes: number;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1837,18 +1941,23 @@ export class WhatsAppClient {
       this.rememberOutboundSelfMessage(input.to, sent);
     }
 
-    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    const ids = sendResult(input.to, sent, input.clientMessageId);
     return {
-      to: input.to,
+      ...ids,
       mimeType: media.mimeType,
       bytes: media.buffer.length,
-      messageId,
     };
   }
 
   async sendPoll(
     input: SendPollInput,
-  ): Promise<{ to: string; options: number; messageId?: string }> {
+  ): Promise<{
+    to: string;
+    options: number;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1871,13 +1980,18 @@ export class WhatsAppClient {
     );
     this.rememberOutboundSelfMessage(input.to, sent);
 
-    const messageId = String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
-    return { to: input.to, options: options.length, messageId };
+    return { ...sendResult(input.to, sent, input.clientMessageId), options: options.length };
   }
 
   async react(
     input: ReactInput,
-  ): Promise<{ chatJid: string; messageId: string; outboundMessageId?: string }> {
+  ): Promise<{
+    chatJid: string;
+    messageId: string;
+    outboundMessageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -1898,12 +2012,13 @@ export class WhatsAppClient {
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
     );
 
-    const outboundMessageId =
-      String(sent?.key?.id || input.clientMessageId || '').trim() || undefined;
+    const ids = sendResult(input.chatJid, sent, input.clientMessageId);
     return {
       chatJid: input.chatJid,
       messageId: input.messageId,
-      outboundMessageId,
+      outboundMessageId: ids.providerMessageId || ids.clientMessageId,
+      providerMessageId: ids.providerMessageId,
+      clientMessageId: ids.clientMessageId,
     };
   }
 
