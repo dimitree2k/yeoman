@@ -4,6 +4,8 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { MAX_BRIDGE_FRAME_BYTES } from './protocol.js';
+
 async function loadOutbox(): Promise<any> {
   const modulePath = './outbox.js';
   try {
@@ -34,6 +36,27 @@ async function temporaryOutbox(): Promise<{ root: string; outbox: any }> {
   const outbox = new BridgeOutbox(root);
   await outbox.open();
   return { root, outbox };
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function oversizedEvent(eventId: string, eventKey: string): Record<string, unknown> {
+  return event({
+    eventId,
+    eventKey,
+    payload: { messageId: eventId, text: 'x'.repeat(MAX_BRIDGE_FRAME_BYTES) },
+  });
+}
+
+function eventFileName(eventValue: Record<string, unknown>): string {
+  return `00000000000000000001-${encodeURIComponent(String(eventValue.eventId))}-${encodeURIComponent(String(eventValue.eventKey))}.json`;
 }
 
 test('event is durable before a subscriber callback can see it', async () => {
@@ -200,6 +223,57 @@ test('open quarantines duplicate sequence records and keeps order deterministic'
     assert.equal((outbox.diagnostics() as any).quarantined, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('reload rejection is durable before unlink for canonical and staged oversized records', async () => {
+  for (const staged of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-outbox-rejection-order-'));
+    try {
+      const oversized = oversizedEvent(
+        staged ? 'oversized-staged-event' : 'oversized-canonical-event',
+        staged ? 'oversized-staged-key' : 'oversized-canonical-key',
+      );
+      const canonicalName = eventFileName(oversized);
+      const recordPath = staged
+        ? join(root, `.${canonicalName}.aaaaaaaaaaaaaaaa.tmp`)
+        : join(root, canonicalName);
+      await writeFile(recordPath, JSON.stringify(oversized), { mode: 0o600 });
+
+      const crashing = new (await loadOutbox()).BridgeOutbox(root);
+      (crashing as any).writeRejectionDiagnostic = async () => {
+        throw new Error('crash-before-rejection-diagnostic');
+      };
+      await assert.rejects(crashing.open(), /crash-before-rejection-diagnostic/);
+      assert.equal(await pathExists(recordPath), true);
+
+      const recovery = new (await loadOutbox()).BridgeOutbox(root);
+      const serializedBytes = Buffer.byteLength(JSON.stringify(oversized), 'utf8');
+      await (recovery as any).writeRejectionDiagnostic(
+        oversized,
+        serializedBytes,
+        'serialized-size-limit',
+      );
+      assert.equal(await pathExists(recordPath), true);
+
+      const restarted = new (await loadOutbox()).BridgeOutbox(root);
+      await restarted.open();
+      assert.deepEqual(await restarted.pending(), []);
+      assert.equal(await pathExists(recordPath), false);
+      const rejectionFiles = (await readdir(join(root, 'quarantine'))).filter((name) =>
+        name.startsWith('rejected-'),
+      );
+      assert.equal(rejectionFiles.length, 1);
+
+      const secondRestart = new (await loadOutbox()).BridgeOutbox(root);
+      await secondRestart.open();
+      assert.equal(
+        (await readdir(join(root, 'quarantine'))).filter((name) => name.startsWith('rejected-')).length,
+        1,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

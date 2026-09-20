@@ -196,6 +196,34 @@ test('PDF extraction is not attempted and the envelope only contains caption met
   assert.equal(Object.keys(extracted.media).some((key) => /data|buffer|base64|text/i.test(key)), false);
 });
 
+test('media hash selection ignores invalid higher-priority values', () => {
+  const client = testClient();
+  const extracted = (client as any).extractMessageTextAndMedia({
+    message: {
+      documentMessage: {
+        mimetype: 'application/pdf',
+        fileName: 'report.pdf',
+        sha256: 'not-a-sha256',
+        hash: '',
+        fileSha256: Uint8Array.from(Buffer.alloc(32, 0xef)),
+      },
+    },
+  });
+
+  assert.equal(extracted.media.sha256, 'ef'.repeat(32));
+
+  const uppercase = (client as any).extractMessageTextAndMedia({
+    message: {
+      documentMessage: {
+        mimetype: 'application/pdf',
+        fileName: 'uppercase.pdf',
+        sha256: 'AB'.repeat(32),
+      },
+    },
+  });
+  assert.equal(uppercase.media.sha256, 'ab'.repeat(32));
+});
+
 test('edit signals preserve replacement text and provider revision when present', () => {
   const client = testClient();
   const payload = (client as any).extractEditPayload({

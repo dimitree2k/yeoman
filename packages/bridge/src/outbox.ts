@@ -59,6 +59,7 @@ const STAGED_FILE_RE = /^\.((\d+)-.+\.json)\.[0-9a-f-]+\.tmp$/;
 const QUARANTINE_DIR = 'quarantine';
 const OWNER_DIR_MODE = 0o700;
 const OWNER_FILE_MODE = 0o600;
+const DIAGNOSTIC_REASON_RE = /^[a-z0-9_-]{1,64}$/;
 
 export function defaultBridgeOutboxDir(): string {
   return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-outbox');
@@ -72,6 +73,15 @@ function eventKeyFor(event: BridgeEventEnvelope): string {
   return createHash('sha256')
     .update(JSON.stringify({ type: event.type, accountId: event.accountId, payload: event.payload }))
     .digest('hex');
+}
+
+function diagnosticIdentity(value: string): string {
+  return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`;
+}
+
+function diagnosticReason(value: string): string {
+  const reason = String(value).trim();
+  return DIAGNOSTIC_REASON_RE.test(reason) ? reason : 'rejected';
 }
 
 function asReplayableEvent(event: BridgeEventEnvelope): ReplayableBridgeEvent {
@@ -124,7 +134,7 @@ export class BridgeOutbox {
   private readonly entries = new Map<string, OutboxEntry>();
   private nextSequence = 1;
   private quarantined = 0;
-  private rejected = 0;
+  private readonly rejectionFiles = new Set<string>();
   private opened = false;
   private opening: Promise<void> | null = null;
   private writeTail: Promise<void> = Promise.resolve();
@@ -165,7 +175,7 @@ export class BridgeOutbox {
       const stats = await lstat(path);
       if (!stats.isFile()) throw new Error('Bridge outbox quarantine candidate is not a regular file');
       await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
-      if (quarantineEntry.name.startsWith('rejected-')) this.rejected += 1;
+      if (quarantineEntry.name.startsWith('rejected-')) this.rejectionFiles.add(quarantineEntry.name);
     }
 
     const files = (await readdir(this.directory, { withFileTypes: true }))
@@ -219,13 +229,13 @@ export class BridgeOutbox {
       const serialized = JSON.stringify(parsed);
       const serializedBytes = Buffer.byteLength(serialized, 'utf8');
       if (serializedBytes > MAX_BRIDGE_FRAME_BYTES) {
-        await unlink(path);
-        await syncDirectory(this.directory);
         await this.writeRejectionDiagnostic(
           asReplayableEvent(parsed),
           serializedBytes,
           'serialized-size-limit',
         );
+        await unlink(path);
+        await syncDirectory(this.directory);
         continue;
       }
       if (sequences.has(sequence)) {
@@ -267,35 +277,72 @@ export class BridgeOutbox {
     serializedBytes: number,
     reason: string,
   ): Promise<void> {
+    const normalizedReason = diagnosticReason(reason);
     const diagnostic: RejectionDiagnostic = {
-      eventId: event.eventId,
-      eventKey: event.eventKey,
+      eventId: diagnosticIdentity(event.eventId),
+      eventKey: diagnosticIdentity(event.eventKey),
       type: event.type,
       observedAt: event.observedAt,
       serializedBytes,
-      reason,
+      reason: normalizedReason,
     };
-    const fileName = `rejected-${Date.now()}-${randomUUID()}.json`;
+    const diagnosticJson = JSON.stringify(diagnostic);
+    if (Buffer.byteLength(diagnosticJson, 'utf8') > MAX_BRIDGE_FRAME_BYTES) {
+      throw new Error('rejection diagnostic exceeds frame limit');
+    }
+    const diagnosticKey = createHash('sha256')
+      .update(`${event.eventId}\u0000${event.eventKey}\u0000${normalizedReason}\u0000${serializedBytes}`)
+      .digest('hex');
+    const fileName = `rejected-${diagnosticKey}.json`;
     const finalPath = join(this.directory, QUARANTINE_DIR, fileName);
-    const temporaryPath = join(
-      this.directory,
-      QUARANTINE_DIR,
-      `.${fileName}.${randomUUID()}.tmp`,
-    );
+    const temporaryPath = join(this.directory, QUARANTINE_DIR, `.${fileName}.tmp`);
+
+    const existingFinal = await this.readRejectionDiagnostic(finalPath, diagnosticJson);
+    if (existingFinal) {
+      // A prior process may have crashed after rename but before its directory fsync. Make
+      // the already-written diagnostic durable before the caller removes the source record.
+      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      return;
+    }
+
+    const existingTemporary = await this.readRejectionDiagnostic(temporaryPath, diagnosticJson);
+    if (existingTemporary) {
+      await rename(temporaryPath, finalPath);
+      await syncDirectory(join(this.directory, QUARANTINE_DIR));
+      this.rejectionFiles.add(fileName);
+      return;
+    }
+
     let handle: Awaited<ReturnType<typeof openFile>> | undefined;
     try {
       handle = await openFile(temporaryPath, 'wx', OWNER_FILE_MODE);
-      await handle.writeFile(JSON.stringify(diagnostic), 'utf8');
+      await handle.writeFile(diagnosticJson, 'utf8');
       await handle.sync();
       await handle.close();
       handle = undefined;
       await syncDirectory(join(this.directory, QUARANTINE_DIR));
       await rename(temporaryPath, finalPath);
       await syncDirectory(join(this.directory, QUARANTINE_DIR));
-      this.rejected += 1;
+      this.rejectionFiles.add(fileName);
     } catch (error) {
       await handle?.close().catch(() => undefined);
-      await unlink(temporaryPath).catch(() => undefined);
+      if ((error as { code?: string }).code !== 'EEXIST') {
+        await unlink(temporaryPath).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  private async readRejectionDiagnostic(path: string, expected: string): Promise<boolean> {
+    try {
+      const stats = await lstat(path);
+      if (!stats.isFile()) throw new Error('Bridge rejection diagnostic is not a regular file');
+      await enforceOwnerOnly(path, stats, OWNER_FILE_MODE);
+      const actual = await readFile(path, 'utf8');
+      if (actual !== expected) throw new Error('Conflicting bridge rejection diagnostic');
+      return true;
+    } catch (error: unknown) {
+      if ((error as { code?: string }).code === 'ENOENT') return false;
       throw error;
     }
   }
@@ -467,7 +514,7 @@ export class BridgeOutbox {
       pending: this.entries.size,
       nextSequence: this.nextSequence,
       quarantined: this.quarantined,
-      rejected: this.rejected,
+      rejected: this.rejectionFiles.size,
     };
   }
 }

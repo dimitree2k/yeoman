@@ -306,11 +306,25 @@ function mediaSha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
 }
 
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+function normalizeProviderSha256(value: any): string | undefined {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return SHA256_HEX_RE.test(normalized) ? normalized.toLowerCase() : undefined;
+  }
+  if (Buffer.isBuffer(value) && value.length === 32) return value.toString('hex');
+  if (value instanceof Uint8Array && value.length === 32) {
+    return Buffer.from(value).toString('hex');
+  }
+  return undefined;
+}
+
 function providerMediaHash(media: any): string | undefined {
-  const raw = media?.sha256 ?? media?.hash ?? media?.fileSha256;
-  if (typeof raw === 'string' && raw.trim()) return raw.trim();
-  if (Buffer.isBuffer(raw) && raw.length > 0) return raw.toString('hex');
-  if (raw instanceof Uint8Array && raw.length > 0) return Buffer.from(raw).toString('hex');
+  for (const candidate of [media?.sha256, media?.hash, media?.fileSha256]) {
+    const normalized = normalizeProviderSha256(candidate);
+    if (normalized) return normalized;
+  }
   return undefined;
 }
 

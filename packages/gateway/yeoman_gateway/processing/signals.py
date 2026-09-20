@@ -142,12 +142,24 @@ def _media_metadata(value: Any) -> dict[str, Any] | None:
         if key not in MEDIA_METADATA_FIELDS:
             continue
         item = value.get(key)
-        if key in {"bytes"}:
+        if key == "bytes":
             if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
                 result[key] = item
             continue
+        if key in {"sha256", "hash"}:
+            continue
         if isinstance(item, str) and item.strip():
             result[key] = item.strip()
+    for key in ("sha256", "hash"):
+        candidate = value.get(key)
+        if not isinstance(candidate, str):
+            continue
+        normalized_hash = candidate.strip()
+        if len(normalized_hash) == 64 and all(
+            char in "0123456789abcdefABCDEF" for char in normalized_hash
+        ):
+            result["sha256"] = normalized_hash.lower()
+            break
     return result or None
 
 

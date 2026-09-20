@@ -94,6 +94,26 @@ def test_long_message_and_media_metadata_are_preserved_without_binary_payload() 
     assert "data" not in body["media"]
 
 
+def test_media_hash_mapping_keeps_only_valid_sha256_and_uses_first_valid_candidate() -> None:
+    signal = WhatsAppSignalMapper().map(
+        {
+            "chatJid": CHAT,
+            "messageId": "hash-1",
+            "text": "[Document]",
+            "media": {
+                "kind": "document",
+                "sha256": "invalid",
+                "hash": "AB" * 32,
+                "fileSha256": b"raw-provider-bytes",
+            },
+        },
+        kind="message",
+    )
+
+    assert signal is not None
+    assert signal.to_event_payload()["media"]["sha256"] == "ab" * 32
+
+
 def test_edit_preserves_replacement_text_and_revision() -> None:
     signal = WhatsAppSignalMapper().map(
         {

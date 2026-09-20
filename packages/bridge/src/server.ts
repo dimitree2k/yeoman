@@ -27,6 +27,7 @@ import {
 import {
   BridgeOutbox,
   defaultBridgeOutboxDir,
+  isReplayableEventType,
   type ReplayableBridgeEvent,
 } from './outbox.js';
 import { WhatsAppClient, type InboundMedia, type InboundMessageV2 } from './whatsapp.js';
@@ -73,6 +74,59 @@ function rawDataToString(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
   if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
   return data.toString('utf8');
+}
+
+const SAFE_FRAME_TOKEN_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function safeFrameToken(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !SAFE_FRAME_TOKEN_RE.test(value)) return undefined;
+  return value;
+}
+
+function serializeFrame(event: BridgeEventEnvelope): string | undefined {
+  try {
+    const raw = JSON.stringify(event);
+    return typeof raw === 'string' ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedFrameFallback(event: BridgeEventEnvelope): BridgeEventEnvelope {
+  return createErrorResponse({
+    requestId: safeFrameToken(event.requestId),
+    accountId: safeFrameToken(event.accountId) || 'default',
+    error: protocolError('ERR_PAYLOAD_TOO_LARGE', 'Outbound frame too large', false),
+  });
+}
+
+function sendBoundedFrame(
+  ws: WebSocket,
+  event: BridgeEventEnvelope,
+): { sent: boolean; replaced: boolean } {
+  const raw = serializeFrame(event);
+  if (raw && Buffer.byteLength(raw, 'utf8') <= MAX_BRIDGE_FRAME_BYTES) {
+    ws.send(raw);
+    return { sent: true, replaced: false };
+  }
+
+  // A replayable frame must never be replaced by an error response: doing so could mark an
+  // event delivered without delivering its canonical payload. The outbox normally rejects
+  // these before staging; this branch protects replay of legacy/tampered records too.
+  if (isReplayableEventType(event.type)) {
+    ws.close(1009, 'frame too large');
+    return { sent: false, replaced: false };
+  }
+
+  const fallback = boundedFrameFallback(event);
+  const fallbackRaw = serializeFrame(fallback);
+  if (fallbackRaw && Buffer.byteLength(fallbackRaw, 'utf8') <= MAX_BRIDGE_FRAME_BYTES) {
+    ws.send(fallbackRaw);
+    return { sent: true, replaced: true };
+  }
+
+  ws.close(1009, 'frame too large');
+  return { sent: false, replaced: false };
 }
 
 function mediaMetadata(media: InboundMedia | undefined): Record<string, unknown> | undefined {
@@ -191,7 +245,7 @@ export class BridgeServer {
           error: protocolError('ERR_AUTH', 'Bridge accepts loopback clients only', false),
           accountId: this.accountId,
         });
-        ws.send(JSON.stringify(event));
+        sendBoundedFrame(ws, event);
         ws.close(1008, 'loopback only');
         return;
       }
@@ -214,7 +268,7 @@ export class BridgeServer {
             error: protocolError('ERR_QUEUE_OVERFLOW', 'Command queue overflow', true),
             accountId: this.accountId,
           });
-          ws.send(JSON.stringify(event));
+          sendBoundedFrame(ws, event);
           return;
         }
 
@@ -224,7 +278,7 @@ export class BridgeServer {
             error: protocolError('ERR_PAYLOAD_TOO_LARGE', 'Payload too large', false),
             accountId: this.accountId,
           });
-          ws.send(JSON.stringify(event));
+          sendBoundedFrame(ws, event);
           return;
         }
 
@@ -560,8 +614,9 @@ export class BridgeServer {
       meta.droppedEvents += 1;
       return false;
     }
-    meta.ws.send(JSON.stringify(event));
-    return true;
+    const result = sendBoundedFrame(meta.ws, event);
+    if (result.replaced || !result.sent) meta.droppedEvents += 1;
+    return result.sent;
   }
 
   private broadcastEvent(event: BridgeEventEnvelope): void {

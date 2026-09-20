@@ -264,8 +264,8 @@ test('BridgeServer quarantines oversized text with a durable identity-only diagn
     assert.deepEqual(Object.keys(diagnostic).sort(), [
       'eventId', 'eventKey', 'observedAt', 'reason', 'serializedBytes', 'type',
     ]);
-    assert.equal(diagnostic.eventId, 'boundary-event-1');
-    assert.equal(diagnostic.eventKey, 'boundary-key-1');
+    assert.match(diagnostic.eventId, /^sha256:[0-9a-f]{64}$/);
+    assert.match(diagnostic.eventKey, /^sha256:[0-9a-f]{64}$/);
     assert.equal(diagnostic.type, 'message');
     assert.equal(diagnostic.serializedBytes, MAX_BRIDGE_FRAME_BYTES + 1);
     assert.equal(diagnostic.reason, 'serialized-size-limit');
@@ -274,6 +274,43 @@ test('BridgeServer quarantines oversized text with a durable identity-only diagn
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('BridgeServer bounds oversized response, status, and error frames with a safe fallback', () => {
+  const server = makeServer('/tmp/unused-bridge-frame-limit');
+  const client = fakeClient();
+  const meta = clientMeta(client.ws, true);
+  const giant = 'provider detail '.repeat(30_000);
+  const giantRequestId = 'request-id-'.repeat(30_000);
+
+  for (const event of [
+    createEventEnvelope({
+      type: 'response',
+      requestId: giantRequestId,
+      payload: { result: { providerDetail: giant } },
+    }),
+    createEventEnvelope({ type: 'status', payload: { detail: giant } }),
+    createEventEnvelope({
+      type: 'error',
+      payload: { error: { code: 'ERR_INTERNAL', message: giant, retryable: true } },
+    }),
+  ]) {
+    assert.equal((server as any).sendToClient(meta, event), true);
+    const raw = JSON.stringify(client.messages.at(-1));
+    assert.ok(Buffer.byteLength(raw, 'utf8') <= MAX_BRIDGE_FRAME_BYTES);
+    assert.equal(raw.includes(giant), false);
+    assert.equal(raw.includes(giantRequestId), false);
+    assert.equal((client.messages.at(-1) as any).type, 'response');
+    assert.equal((client.messages.at(-1) as any).payload.error.code, 'ERR_PAYLOAD_TOO_LARGE');
+  }
+
+  const safeRequest = createEventEnvelope({
+    type: 'response',
+    requestId: 'safe-request',
+    payload: { result: { providerDetail: giant } },
+  });
+  assert.equal((server as any).sendToClient(meta, safeRequest), true);
+  assert.equal((client.messages.at(-1) as any).requestId, 'safe-request');
 });
 
 test('BridgeServer quarantines oversized media metadata without a pending event or payload leak', async () => {
@@ -311,6 +348,42 @@ test('BridgeServer quarantines oversized media metadata without a pending event 
     assert.equal(diagnostic.includes(oversizedHash), false);
     assert.equal((server as any).intakeStopped, true);
     assert.equal((server as any).persistenceFailure, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('BridgeServer bounds hostile rejection identities to deterministic digests', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-event-limit-'));
+  try {
+    const server = makeServer(root);
+    const event = {
+      version: PROTOCOL_VERSION,
+      type: 'message',
+      ts: 1_700_000_000_000,
+      observedAt: 1_700_000_000_000,
+      accountId: 'default',
+      eventId: '../../event\u0000'.repeat(30_000),
+      eventKey: '../../key\u0000'.repeat(30_000),
+      payload: { messageId: 'hostile-identity-1', text: 'x'.repeat(MAX_BRIDGE_FRAME_BYTES) },
+    };
+
+    await assert.rejects(
+      (server as any).broadcastReplayable(event),
+      /serialized event exceeds 262144 bytes/,
+    );
+
+    const files = (await readdir(join(root, 'quarantine'))).filter((name) =>
+      name.startsWith('rejected-'),
+    );
+    assert.equal(files.length, 1);
+    const diagnostic = await readFile(join(root, 'quarantine', files[0]), 'utf8');
+    assert.ok(Buffer.byteLength(diagnostic, 'utf8') <= MAX_BRIDGE_FRAME_BYTES);
+    assert.equal(diagnostic.includes('../../'), false);
+    assert.equal(diagnostic.includes('\u0000'), false);
+    const parsed = JSON.parse(diagnostic);
+    assert.match(parsed.eventId, /^sha256:[0-9a-f]{64}$/);
+    assert.match(parsed.eventKey, /^sha256:[0-9a-f]{64}$/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
