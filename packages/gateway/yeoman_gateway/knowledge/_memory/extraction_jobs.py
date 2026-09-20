@@ -235,6 +235,31 @@ def screen_content(content: str) -> CandidateVerdict:
     return CandidateVerdict(True, "ok")
 
 
+def is_hedged(content: str) -> bool:
+    """True when the wording weighs a possibility instead of asserting a fact."""
+    return any(pattern.search(content) for pattern in _HEDGE_PATTERNS)
+
+
+def screen_statement_content(content: str) -> CandidateVerdict:
+    """Content screens for a *statement*, where uncertainty is kept, not erased.
+
+    The shared screens refuse a hedged sentence because a shared fact is meant to be an
+    asserted fact.  A statement has a lifecycle instead: it is stored as an assertion and
+    can never become confirmed without an explicit later confirmation.  So the same rules
+    apply here, with one deliberate difference - a hedge is not a refusal reason but an
+    uncertainty marker the caller records on the statement.  Everything that merely
+    restates the conversation is still refused, because it says nothing about the world.
+    """
+    if not content.strip():
+        return CandidateVerdict(False, "empty")
+    if is_meta_statement(content):
+        return CandidateVerdict(False, "meta_statement")
+    for pattern in _CONVERSATION_PATTERNS:
+        if pattern.search(content):
+            return CandidateVerdict(False, "conversation_reference")
+    return CandidateVerdict(True, "ok")
+
+
 def check_candidate(candidate: SharedFactCandidate) -> CandidateVerdict:
     """Deterministic screening. Uncertainty refuses the candidate instead of guessing."""
     if candidate.private_handoff:

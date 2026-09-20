@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.knowledge._contacts.service import ContactsService
     from yeoman_gateway.knowledge._memory.service import MemoryService
+    from yeoman_gateway.knowledge.models import SourceRef
     from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
@@ -2838,7 +2839,6 @@ class LLMResponder(ResponderPort):
         if register is None or not sources:
             return False
         from yeoman_gateway.knowledge._memory.read_gate import registry_members
-        from yeoman_gateway.knowledge.models import SourceRef
 
         is_direct = not str(chat_id).endswith("@g.us")
         members: frozenset[str] = frozenset()
@@ -2857,14 +2857,18 @@ class LLMResponder(ResponderPort):
         snapshot_id = f"{channel}:{chat_id}:{len(members)}"
         registered = 0
         for event_id, revision in sources:
-            source = SourceRef(
+            # Real canonical provenance: the authority row that was created when the
+            # event was journaled.  Substituting wall-clock time here conflicted with the
+            # immutable source authority (JournalConflictError on occurred_at_ms) and the
+            # audience proof was silently never registered.
+            source = self._canonical_source_ref(
                 event_id=str(event_id),
                 revision=int(revision),
                 channel=str(channel),
                 chat_id=str(chat_id),
-                author_principal=self._source_author_principal(event_id),
-                occurred_at_ms=int(time.time() * 1000),
             )
+            if source is None:
+                continue
             if register(
                 source=source,
                 verified_members=members,
@@ -2875,6 +2879,57 @@ class LLMResponder(ResponderPort):
         if registered:
             self._metric("knowledge_sources_registered", registered)
         return bool(registered)
+
+    def _canonical_source_ref(
+        self, *, event_id: str, revision: int, channel: str, chat_id: str
+    ) -> "SourceRef | None":
+        """The proven source revision of one journaled event, or ``None``.
+
+        The proof owner's own record wins: it is the revision identity the store issued
+        when the event was appended, so registering it can never contradict the row.
+        """
+        from yeoman_gateway.knowledge.models import SourceRef
+
+        sources = getattr(self.knowledge, "knowledge_sources", None)
+        issued = getattr(sources, "verify_source_ref", None)
+        if callable(issued):
+            try:
+                known = issued(str(event_id), int(revision))
+            except Exception:  # pragma: no cover - defensive
+                known = None
+            if known is not None:
+                return known
+        runtime = self._shared_fact_runtime()
+        processing = getattr(runtime, "processing", None) if runtime is not None else None
+        get_event = getattr(processing, "get_event", None)
+        if callable(get_event):
+            try:
+                event = get_event(str(event_id))
+            except Exception:  # pragma: no cover - defensive
+                event = None
+            if event is not None:
+                principal = str(getattr(event, "principal", "") or "")
+                occurred = int(getattr(event, "occurred_ms", 0) or 0)
+                if principal:
+                    return SourceRef(
+                        event_id=str(event_id),
+                        revision=int(getattr(event, "revision", revision) or revision),
+                        channel=str(getattr(event, "channel", "") or channel),
+                        chat_id=str(getattr(event, "chat_id", "") or chat_id),
+                        author_principal=principal,
+                        occurred_at_ms=occurred,
+                    )
+        principal = self._source_author_principal(event_id)
+        if not principal:
+            return None
+        return SourceRef(
+            event_id=str(event_id),
+            revision=int(revision),
+            channel=str(channel),
+            chat_id=str(chat_id),
+            author_principal=principal,
+            occurred_at_ms=0,
+        )
 
     def _source_author_principal(self, event_id: str) -> str:
         """Author principal of an archived event, read from the archive owner."""

@@ -41,6 +41,7 @@ from yeoman_gateway.cron.service import CronJobDeferredError, CronJobSkippedErro
 from yeoman_gateway.cron.types import CronJob
 from yeoman_gateway.cron.voice import evaluate_voice_quiet_gate
 from yeoman_gateway.heartbeat.service import HeartbeatService
+from yeoman_gateway.knowledge._capture import ObservedSourceRegistrar
 from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.knowledge._memory import MemoryService
 from yeoman_gateway.media.document_cache import DocumentCache
@@ -398,6 +399,7 @@ class GatewayRuntime:
     reconciliation: object | None = None
     retention: object | None = None
     shared_facts: object | None = None
+    statement_capture: object | None = None
     startup_hook: Callable[[], Awaitable[None]] | None = None
 
     async def _start_processing_services(self) -> None:
@@ -446,6 +448,8 @@ class GatewayRuntime:
                 await self.gateway_socket.start()
             if self.shared_facts is not None and hasattr(self.shared_facts, "start"):
                 self.shared_facts.start()
+            if self.statement_capture is not None and hasattr(self.statement_capture, "start"):
+                self.statement_capture.start()
             tasks = [
                 self.orchestrator.run(),
                 self.channels.start_all(),
@@ -509,6 +513,8 @@ class GatewayRuntime:
                 attempt_sync(self.chat_registry.close)
             if self.shared_facts is not None and hasattr(self.shared_facts, "stop"):
                 attempt_sync(self.shared_facts.stop)
+            if self.statement_capture is not None and hasattr(self.statement_capture, "stop"):
+                attempt_sync(self.statement_capture.stop)
             attempt_sync(self.contacts.close)
             attempt_sync(self.memory.close)
             if self.processing is not None:
@@ -709,6 +715,57 @@ def build_shared_fact_runtime(
     )
     memory.extraction = runtime.extraction
     return runtime
+
+
+def build_statement_capture(
+    config: "Config",
+    *,
+    knowledge: object | None,
+    processing: "ProcessingStore | None",
+) -> "object | None":
+    """The forward statement-promotion worker, or ``None`` when promotion is off.
+
+    The ``capture_enabled`` flag is read *here*, once, and turned into an explicit
+    constructor argument - no other module reads the config field.  When it is false this
+    returns ``None``: no worker, no job, and no boundary.  Observation is untouched: the
+    canonical journal keeps recording every event either way.
+    """
+    if knowledge is None or processing is None:
+        return None
+    if not bool(getattr(config.knowledge, "capture_enabled", False)):
+        return None
+
+    from yeoman_gateway.knowledge._capture import StatementCaptureProducer
+    from yeoman_gateway.knowledge._capture_worker import (
+        STATEMENT_EXTRACTOR_VERSION,
+        StatementCaptureWorker,
+        StatementExtractor,
+    )
+
+    knowledge_cfg = config.knowledge
+    producer = StatementCaptureProducer(
+        knowledge=knowledge,
+        processing=processing,
+        idle_ms=int(getattr(knowledge_cfg, "capture_idle_seconds", 60)) * 1000,
+        max_delay_ms=int(getattr(knowledge_cfg, "capture_max_delay_seconds", 300)) * 1000,
+        batch_max=int(getattr(knowledge_cfg, "capture_batch_max", 8)),
+        max_waiting=int(getattr(knowledge_cfg, "capture_max_waiting", 64)),
+        extractor_version=STATEMENT_EXTRACTOR_VERSION,
+    )
+    try:
+        extractor = StatementExtractor(config=config)
+    except Exception:
+        # A route that cannot be built must not silently promote nothing forever: the
+        # worker is absent and the reason is visible in the log.
+        logger.exception("statement capture extractor unavailable; promotion stays off")
+        return None
+    return StatementCaptureWorker(
+        knowledge=knowledge,
+        processing=processing,
+        extractor=extractor,
+        producer=producer,
+        poll_seconds=float(getattr(knowledge_cfg, "capture_poll_seconds", 5.0)),
+    )
 
 
 def _build_reaction_action(
@@ -1581,10 +1638,14 @@ def build_processing_gate(
     policy_adapter: "EnginePolicyAdapter | None",
     store: "ProcessingStore | None",
     threads: object | None = None,
+    source_registrar: Callable[[str], bool] | None = None,
 ):
     """Fast gate for canonical ingest -> journal -> policy, before expensive work.
 
     Returns ``None`` when the new mode is off, so the legacy path is untouched.
+    ``source_registrar`` proves the audience of every journaled event; it is called at the
+    observation boundary, so an event that earns no response turn is still a proven source
+    instead of an unknown audience.
     """
     if store is None or policy_adapter is None or not config.processing.enabled:
         return None
@@ -1614,6 +1675,7 @@ def build_processing_gate(
         evaluate=lambda request: policy_adapter.evaluate(request.event),
         threads=threads if threads is not None else build_thread_registry(config, store),
         participation=_participation_owns,
+        source_registrar=source_registrar,
     )
 
 
@@ -2204,8 +2266,23 @@ def build_gateway_runtime(
         logger.info("CalDAV service enabled for {}", _caldav_user)
 
     thread_registry = build_thread_registry(config, processing_store)
+    # Proven audience registration for observations.  It is independent of the promotion
+    # switch: observing and proving is one decision, promoting is a later one.
+    observed_sources = (
+        ObservedSourceRegistrar(
+            knowledge=knowledge_service,
+            processing=processing_store,
+            chat_registry=chat_registry,
+        )
+        if knowledge_service is not None and processing_store is not None
+        else None
+    )
     processing_gate = build_processing_gate(
-        config, policy_adapter, processing_store, thread_registry
+        config,
+        policy_adapter,
+        processing_store,
+        thread_registry,
+        source_registrar=observed_sources,
     )
     effect_router = build_effect_router(
         config,
@@ -2365,11 +2442,14 @@ def build_gateway_runtime(
             SignalJournalSink(
                 processing_store,
                 memory=memory_service,
+                sources=observed_sources,
+                statements=knowledge_service,
                 invalidator=(
                     SignalInvalidator(
                         store=processing_store,
                         actors=thread_registry,
                         memory=memory_service,
+                        statements=knowledge_service,
                     )
                     if processing_store is not None and config.processing.enabled
                     else None
@@ -3506,6 +3586,12 @@ def build_gateway_runtime(
     if shared_fact_runtime is not None:
         responder.shared_facts = shared_fact_runtime
 
+    statement_capture = build_statement_capture(
+        config,
+        knowledge=knowledge_service,
+        processing=processing_store,
+    )
+
     return GatewayRuntime(
         orchestrator=orchestrator_service,
         channels=channels,
@@ -3531,5 +3617,6 @@ def build_gateway_runtime(
         ),
         retention=build_retention_service(config, processing_store),
         shared_facts=shared_fact_runtime,
+        statement_capture=statement_capture,
         startup_hook=_notify_pending_persona_evolution_reviews,
     )

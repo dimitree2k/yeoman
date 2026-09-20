@@ -121,6 +121,11 @@ tests/gateway/*
 !tests/gateway/test_reaction_emojis.py
 !tests/gateway/test_whatsapp_implicit_address.py
 !tests/gateway/test_policy_backup_retention.py
+!tests/gateway/capture_harness.py
+!tests/gateway/test_canonical_identity_reconciliation.py
+!tests/gateway/test_knowledge_capture_end_to_end.py
+!tests/gateway/test_knowledge_source_registration.py
+!tests/gateway/test_knowledge_statement_capture.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py

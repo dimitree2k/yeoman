@@ -472,6 +472,8 @@ class SignalJournalSink:
         clock: Any = None,
         invalidator: Any | None = None,
         memory: Any | None = None,
+        sources: Any | None = None,
+        statements: Any | None = None,
     ) -> None:
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
@@ -480,6 +482,13 @@ class SignalJournalSink:
         # the turn revision, cancels stale effects and revokes derived facts.
         self._invalidator = invalidator
         self._memory = memory
+        #: Proven audience registration for a newly observed message.  It runs at the
+        #: observation boundary, so a message that never gets a response turn still owns
+        #: a proof instead of staying "unknown audience" forever.
+        self._sources = sources
+        #: Applies an arrived provider revocation to derived statements.  Without it a
+        #: published statement would outlive the delete that revoked its only source.
+        self._statements = statements
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
         return self.capture(kind, payload)
@@ -558,12 +567,15 @@ class SignalJournalSink:
                         "canonical message FTS projection failed error_type={}",
                         type(exc).__name__,
                     )
+        if signal.kind == "message":
+            self.register_observed_source(stored_event_id)
         if str(kind) in ("edit", "delete"):
             revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)
             if strict and revoked_sources:
                 self._invalidate_memory_projection(
                     signal, revoked_sources, now_ms=now
                 )
+            self.invalidate_statement_sources(revoked_sources, kind=str(kind))
         if not strict:
             self.invalidate(kind, payload)
         return stored_event_id
@@ -620,6 +632,38 @@ class SignalJournalSink:
                 "canonical source tombstone failed error_type={}",
                 type(exc).__name__,
             )
+
+    def register_observed_source(self, event_id: str | None) -> bool:
+        """Prove the audience of a just-observed message, response turn or not."""
+        registrar = self._sources
+        if registrar is None or not event_id:
+            return False
+        try:
+            return bool(registrar(str(event_id)))
+        except Exception as exc:  # projection must never block the ACK boundary
+            logger.warning(
+                "observed source registration failed error_type={}", type(exc).__name__
+            )
+            return False
+
+    def invalidate_statement_sources(
+        self, revoked_event_ids: Iterable[str], *, kind: str = "delete"
+    ) -> tuple[str, ...]:
+        """Let a projected revocation reach the statements that rest on those sources."""
+        invalidator = self._statements
+        wanted = tuple(str(item) for item in revoked_event_ids if str(item))
+        if invalidator is None or not wanted:
+            return ()
+        invalidate = getattr(invalidator, "invalidate_event_sources", None)
+        if not callable(invalidate):
+            return ()
+        try:
+            return tuple(invalidate(wanted, reason=f"source_{kind}"))
+        except Exception as exc:  # pragma: no cover - projection must not block ACK
+            logger.warning(
+                "statement revocation projection failed error_type={}", type(exc).__name__
+            )
+            return ()
 
     def index_enrichments(
         self, source_message_id: str, enrichments: Iterable[Mapping[str, Any] | object]

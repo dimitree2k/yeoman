@@ -43,6 +43,8 @@ knowledge_app = typer.Typer(help="Person knowledge: offline migration inventory 
 app.add_typer(knowledge_app, name="knowledge")
 migration_app = typer.Typer(help="Inspect, build and verify offline legacy snapshots")
 knowledge_app.add_typer(migration_app, name="migration")
+capture_app = typer.Typer(help="Statement promotion: read-only status")
+knowledge_app.add_typer(capture_app, name="capture")
 
 _FAILURE_EXIT: Final[int] = 2
 
@@ -130,6 +132,47 @@ def migration_verify(
             else:
                 detail = "integrity, foreign keys or fingerprint check failed"
         _fail("manifest_mismatch", detail)
+
+
+@capture_app.command("status")
+def capture_status(
+    target: Path = typer.Option(
+        Path("~/.yeoman/data/knowledge/knowledge.db"),
+        "--target",
+        help="Knowledge database to read",
+    ),
+) -> None:
+    """Read-only promotion counters: job states, refusal reasons, oldest wait.
+
+    No statement content is printed, and nothing is written: the command opens the store
+    read-only and reports what the promotion worker left behind.
+    """
+    from yeoman_gateway.knowledge._statements import capture_status as read_capture_status
+    from yeoman_gateway.knowledge._store import KnowledgeStore
+
+    path = target.expanduser()
+    if not path.exists():
+        _fail("source_error", f"knowledge database not found: {path}")
+    store = KnowledgeStore(path, create=False)
+    try:
+        counters = read_capture_status(store, now_ms=store.now_ms())
+    finally:
+        store.close()
+    table = Table(title="statement capture status", show_edge=False)
+    table.add_column("state")
+    table.add_column("jobs", justify="right")
+    for state in ("queued", "running", "done", "skipped", "cancelled", "failed"):
+        table.add_row(state, str(counters["states"].get(state, 0)))
+    console.print(table)
+    if counters["reasons"]:
+        reasons = Table(title="recorded reasons", show_edge=False)
+        reasons.add_column("reason")
+        reasons.add_column("jobs", justify="right")
+        for reason, count in sorted(counters["reasons"].items()):
+            reasons.add_row(reason, str(count))
+        console.print(reasons)
+    oldest = int(counters["oldest_queued_age_ms"])
+    _line(f"oldest queued job: {oldest // 1000}s")
 
 
 # ── output ───────────────────────────────────────────────────────────────────

@@ -180,6 +180,7 @@ class IngestGate:
         direct_classifier: Callable[[IngestRequest, PolicyDecision, Any], bool] | None = None,
         note_direct_admission: Callable[..., int] | None = None,
         cancel_chat: Callable[..., bool] | None = None,
+        source_registrar: Callable[[str], bool] | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -198,6 +199,10 @@ class IngestGate:
         self._direct_classifier = direct_classifier
         self._note_direct_admission = note_direct_admission
         self._cancel_chat = cancel_chat
+        #: Registers the audience proof of a newly observed message.  It runs for every
+        #: journaled event, with or without a turn: durable observation is the gate's job,
+        #: promotion is decided later and elsewhere (spec 1.4 / owner clarification).
+        self._source_registrar = source_registrar
         #: Ambient brake state, per chat: when the last unaddressed answer went out and how
         #: much the chat has moved since. In memory on purpose - after a restart the brake
         #: simply starts cold, which is the conservative direction.
@@ -575,7 +580,11 @@ class IngestGate:
             return None
         try:
             return self._threads.assign(
-                self._canonical_event(request), now_ms=now, allow_turn=allow_turn
+                self._canonical_event(
+                    request, identity=self._bridge_canonical_identity(request)
+                ),
+                now_ms=now,
+                allow_turn=allow_turn,
             )
         except Exception as exc:
             logger.warning(
@@ -717,7 +726,17 @@ class IngestGate:
             return False
         return self.reconcile_reply(event) is not None
 
-    def _canonical_event(self, request: IngestRequest) -> CanonicalEvent:
+    def _canonical_event(
+        self, request: IngestRequest, *, identity: CanonicalEvent | None = None
+    ) -> CanonicalEvent:
+        """The gate's view of one inbound message.
+
+        ``identity`` is the Bridge's canonical journal row for the same physical message,
+        when it already exists.  The gate then reuses that event id and key, so routing
+        attaches thread and turn links to the canonical identity instead of creating a
+        second, independent event for the same provider message (spec R01/R03).  The
+        payload stays the gate's own enriched view; it is never written twice.
+        """
         event = request.event
         payload: dict[str, Any] = {
             "kind": "message",
@@ -740,8 +759,8 @@ class IngestGate:
         }
         payload.update(dict(request.payload_extra))
         return CanonicalEvent(
-            event_id=request.event_id,
-            event_key=request.event_key,
+            event_id=str(identity.event_id) if identity is not None else request.event_id,
+            event_key=str(identity.event_key) if identity is not None else request.event_key,
             trace_id=request.trace_id,
             kind="message",
             origin=event.channel,
@@ -753,17 +772,76 @@ class IngestGate:
             payload=payload,
         )
 
+    def _bridge_canonical_identity(self, request: IngestRequest) -> CanonicalEvent | None:
+        """The Bridge's canonical row for this physical message, when one exists.
+
+        The Bridge sink journals every provider event before the gate sees it, so the
+        same message used to be written twice under two identities.  The gate adopts the
+        Bridge identity instead of appending a second event: one physical message is one
+        canonical event, not two independent sources.
+        """
+        if self._store is None:
+            return None
+        event = request.event
+        provider_message_id = str(getattr(event, "message_id", "") or "")
+        if not provider_message_id:
+            return None
+        resolver = getattr(self._store, "canonical_event_for_provider_message", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver(
+                channel=str(event.channel),
+                chat_id=str(event.chat_id),
+                provider_message_id=provider_message_id,
+            )
+        except Exception as exc:  # a lookup failure must not stop the gate
+            logger.warning(
+                "canonical_identity_lookup_failed event_id={} error_type={}",
+                request.event_id,
+                type(exc).__name__,
+            )
+            return None
+
     def _journal(self, request: IngestRequest, *, now: int) -> str | None:
         if self._store is None:
             return None
-        canonical = self._canonical_event(request)
-        return self._store.append_event(
-            event_key=canonical.event_key,
-            event_id=canonical.event_id,
-            trace_id=canonical.trace_id,
-            payload=canonical,
-            now_ms=now,
-        )
+        identity = self._bridge_canonical_identity(request)
+        if identity is not None:
+            # Already durable: the Bridge committed this message and the gate only adds
+            # its routing decision.  Appending here would create a second event id for
+            # one physical message, which downstream source proofs would count twice.
+            event_id = str(identity.event_id)
+        else:
+            canonical = self._canonical_event(request)
+            event_id = self._store.append_event(
+                event_key=canonical.event_key,
+                event_id=canonical.event_id,
+                trace_id=canonical.trace_id,
+                payload=canonical,
+                now_ms=now,
+            )
+        self._register_observed_source(event_id)
+        return event_id
+
+    def _register_observed_source(self, event_id: str) -> None:
+        """Prove the audience of a just-observed event, turn or no turn.
+
+        The registration is a projection on top of the durable event: it never blocks or
+        undoes the journal commit, and an unprovable audience simply stays unknown so
+        later promotion fails closed instead of guessing.
+        """
+        registrar = self._source_registrar
+        if registrar is None or not event_id:
+            return
+        try:
+            registrar(str(event_id))
+        except Exception as exc:  # noqa: BLE001 - observation outranks its projection
+            logger.warning(
+                "observed_source_registration_failed event_id={} error_type={}",
+                event_id,
+                type(exc).__name__,
+            )
 
     def _record(
         self,

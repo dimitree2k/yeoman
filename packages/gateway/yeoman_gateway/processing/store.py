@@ -1330,6 +1330,70 @@ class ProcessingStore:
             ).fetchall()
         return tuple(self._event_from_row(row) for row in rows)
 
+    def canonical_event_for_provider_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        provider_message_id: str,
+        direction: str = "in",
+    ) -> CanonicalEvent | None:
+        """The one canonical row of a physical provider message, if it exists.
+
+        Two writers journal WhatsApp messages into the same canonical log: the Bridge
+        signal sink (``CANONICAL_WHATSAPP_ORIGIN``) and the policy gate.  Only the Bridge
+        row is the canonical identity; a second writer must *adopt* it instead of
+        creating a parallel event for the same physical message (spec R01/R03).  Without
+        a Bridge row this returns ``None`` and the caller keeps its own identity, so
+        channels that have no canonical Bridge writer are unaffected.
+        """
+        candidates = self.events_by_provider_identity(
+            channel=channel,
+            chat_id=chat_id,
+            provider_message_id=provider_message_id,
+            kinds=("message",),
+        )
+        wanted_direction = str(direction or "")
+        for event in candidates:
+            if str(event.origin) != CANONICAL_WHATSAPP_ORIGIN:
+                continue
+            if wanted_direction and str(event.direction or "") != wanted_direction:
+                continue
+            return event
+        return None
+
+    def events_after(
+        self,
+        *,
+        after_ms: int,
+        after_event_id: str = "",
+        kinds: Iterable[str] = ("message",),
+        limit: int = 200,
+    ) -> tuple[CanonicalEvent, ...]:
+        """Forward window of the journal, ordered by commit order.
+
+        The pair ``(created_ms, event_id)`` is a resumable cursor: a caller that stores it
+        keeps reading *after* the last event it consumed, so a restart never re-reads or
+        silently skips the log.  Only identity and content are returned; no projection or
+        policy is applied here.
+        """
+        wanted = tuple(str(kind) for kind in kinds if str(kind))
+        if not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM events
+                 WHERE kind IN ({placeholders})
+                   AND (created_ms > ? OR (created_ms = ? AND event_id > ?))
+                 ORDER BY created_ms, event_id
+                 LIMIT ?
+                """,
+                (*wanted, int(after_ms), int(after_ms), str(after_event_id or ""), int(limit)),
+            ).fetchall()
+        return tuple(self._event_from_row(row) for row in rows)
+
     def project_source_revocation(
         self,
         event: CanonicalEvent | Mapping[str, Any],
@@ -3537,11 +3601,16 @@ class ProcessingStore:
             relations_before = int(
                 conn.execute("SELECT COUNT(*) AS n FROM event_relations").fetchone()["n"]
             )
+            # Row retention is exempted by the same *channel* boundary as the payload
+            # exemption above, and for the same reason: the canonical WhatsApp log has
+            # two concurrent writers, so an origin label cannot decide which rows are the
+            # canonical log.  Spec section 1.9 and the Phase 1 acceptance criterion say a
+            # sweep removes neither row nor payload of a canonical WhatsApp event.
             cursor = conn.execute(
                 """
                 DELETE FROM events
                  WHERE created_ms <= :metadata
-                   AND NOT (channel = 'whatsapp' AND origin = :canonical_origin)
+                   AND NOT (channel = :whatsapp)
                    AND NOT (
                      created_ms > :unresolved
                      AND event_id IN (
@@ -3552,7 +3621,7 @@ class ProcessingStore:
                 {
                     "metadata": metadata_cutoff,
                     "unresolved": unresolved_cutoff,
-                    "canonical_origin": CANONICAL_WHATSAPP_ORIGIN,
+                    "whatsapp": "whatsapp",
                 },
             )
             events_deleted = int(cursor.rowcount or 0)

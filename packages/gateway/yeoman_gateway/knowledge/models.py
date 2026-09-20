@@ -39,6 +39,7 @@ __all__ = [
     "STATEMENT_ATTRIBUTIONS",
     "STATEMENT_STATUSES",
     "CaptureJobReceipt",
+    "CaptureJobRecord",
     "CaptureResult",
     "ChangeReceipt",
     "ConversationMembership",
@@ -936,6 +937,38 @@ class CaptureJobReceipt:
             ("queued", "running", "done", "skipped", "cancelled", "failed"),
             "state",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureJobRecord:
+    """One persistent extraction job together with the sources it rests on.
+
+    Internal worker read: it carries the job's sources so a worker can re-verify them
+    against the proof owner before any provider call.  ``unresolved`` names stored source
+    keys the authority no longer issues - a job with any of those may not run.
+    """
+
+    job_id: str
+    state: str
+    reason: str = ""
+    scope_key: str = ""
+    kind: str = "statement_extraction"
+    extractor_version: str = ""
+    attempts: int = 0
+    due_ms: int = 0
+    updated_ms: int = 0
+    sources: tuple[SourceRef, ...] = ()
+    unresolved: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_id(self.job_id, "job_id"))
+        _require_choice(
+            self.state,
+            ("queued", "running", "done", "skipped", "cancelled", "failed"),
+            "state",
+        )
+        object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "unresolved", tuple(str(item) for item in self.unresolved))
 
 
 @dataclass(frozen=True, slots=True)

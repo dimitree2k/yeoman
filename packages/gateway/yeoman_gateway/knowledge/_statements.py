@@ -21,6 +21,7 @@ from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
     CaptureJobReceipt,
+    CaptureJobRecord,
     CaptureResult,
     ChangeReceipt,
     KnowledgeError,
@@ -878,6 +879,37 @@ class StatementEngine:
             changed_ids=tuple(changed) + tuple(cancelled),
         )
 
+    def invalidate_event_ids(
+        self, event_ids: Iterable[str], *, actor: str = "", reason: str = "source_revoked"
+    ) -> tuple[str, ...]:
+        """Apply an already-projected source revocation to derived statements.
+
+        The provider revocation itself was authorized and projected by the journal owner
+        before this runs; this only applies it to what was derived.  It needs no capture
+        context for that reason, and it is idempotent: a second call changes nothing.
+        """
+        wanted = [str(item) for item in event_ids if str(item)]
+        if not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        rows = self._store.query(
+            "SELECT DISTINCT statement_id, event_id, revision FROM knowledge_statement_sources"
+            f" WHERE event_id IN ({placeholders})",
+            tuple(wanted),
+        )
+        changed: list[str] = []
+        for row in rows:
+            statement_id = str(row["statement_id"])
+            try:
+                source = self._source_for(
+                    statement_id, str(row["event_id"]), int(row["revision"])
+                )
+            except KnowledgeError:  # pragma: no cover - defensive
+                continue
+            receipt = self._invalidate(source, actor=str(actor), reason=str(reason))
+            changed.extend(str(item) for item in receipt.changed_ids)
+        return tuple(dict.fromkeys(changed))
+
     def correct_statement(
         self,
         statement_id: str,
@@ -1130,6 +1162,8 @@ class StatementEngine:
         scope_key: str,
         kind: str = "statement_extraction",
         due_ms: int | None = None,
+        max_waiting: int | None = None,
+        ts_ms: int | None = None,
     ) -> CaptureJobReceipt:
         self._policy.require_capture(context)
         if not sources:
@@ -1145,20 +1179,26 @@ class StatementEngine:
             "|".join(f"{item.event_id}@{item.revision}" for item in sorted(sources, key=lambda s: s.key))
             + f"|{extractor_version}|{kind}",
         )
-        ts = now_ms()
+        ts = int(ts_ms) if ts_ms is not None else now_ms()
         existing = self._store.query_one(
             "SELECT state FROM knowledge_jobs WHERE job_id = ?", (job_id,)
         )
         if existing is not None and str(existing["state"]) in ("queued", "running", "done"):
             return CaptureJobReceipt(job_id=job_id, state=str(existing["state"]))
+        state, reason = "queued", None
+        if max_waiting is not None and self.pending_job_count() >= max(1, int(max_waiting)):
+            # Overflow is visible and recoverable: the job is recorded as ``skipped`` in
+            # the same table, and a later replay may still queue it.  The sources stay
+            # durable either way - a full queue never discards an observation.
+            state, reason = "skipped", "queue_full"
         self._store.execute(
             """
             INSERT INTO knowledge_jobs (job_id, workspace_id, scope_key, kind, sources_json,
                 extractor_version, state, reason, attempts, due_ms, created_ms, updated_ms)
-            VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
-                state = 'queued', reason = NULL, due_ms = excluded.due_ms,
-                updated_ms = excluded.updated_ms
+                state = excluded.state, reason = excluded.reason,
+                due_ms = excluded.due_ms, updated_ms = excluded.updated_ms
             """,
             (
                 job_id,
@@ -1167,12 +1207,74 @@ class StatementEngine:
                 kind,
                 json.dumps([{"event_id": s.event_id, "revision": s.revision} for s in sources]),
                 extractor_version,
+                state,
+                reason,
                 int(due_ms if due_ms is not None else ts),
                 ts,
                 ts,
             ),
         )
-        return CaptureJobReceipt(job_id=job_id, state="queued")
+        return CaptureJobReceipt(job_id=job_id, state=state, reason=str(reason or ""))
+
+    def job_record(self, job_id: str) -> CaptureJobRecord:
+        """Internal worker read: one job with its resolvable sources."""
+        row = self._store.query_one("SELECT * FROM knowledge_jobs WHERE job_id = ?", (str(job_id),))
+        if row is None:
+            raise KnowledgeError("unresolved", "unknown capture job")
+        sources: list[SourceRef] = []
+        unresolved: list[str] = []
+        for event_id, revision in _job_source_pairs(row):
+            issued = self._authority.verify_source_ref(event_id, revision)
+            if issued is None:
+                unresolved.append(f"{event_id}@{revision}")
+                continue
+            sources.append(issued)
+        return CaptureJobRecord(
+            job_id=str(row["job_id"]),
+            state=str(row["state"]),
+            reason=str(row["reason"] or ""),
+            scope_key=str(row["scope_key"]),
+            kind=str(row["kind"]),
+            extractor_version=str(row["extractor_version"]),
+            attempts=int(row["attempts"] or 0),
+            due_ms=int(row["due_ms"] or 0),
+            updated_ms=int(row["updated_ms"] or 0),
+            sources=tuple(sources),
+            unresolved=tuple(unresolved),
+        )
+
+    def stale_jobs(self, *, updated_before_ms: int, limit: int = 50) -> tuple[CaptureJobReceipt, ...]:
+        """Jobs a crash left ``running``; the worker recovers them instead of stalling."""
+        rows = self._store.query(
+            "SELECT job_id, state, reason FROM knowledge_jobs"
+            " WHERE state = 'running' AND updated_ms <= ?"
+            " ORDER BY updated_ms, job_id LIMIT ?",
+            (int(updated_before_ms), int(limit)),
+        )
+        return tuple(
+            CaptureJobReceipt(
+                job_id=str(row["job_id"]),
+                state=str(row["state"]),
+                reason=str(row["reason"] or ""),
+            )
+            for row in rows
+        )
+
+    def requeue_job(
+        self, job_id: str, *, due_ms: int, reason: str = "", ts_ms: int | None = None
+    ) -> CaptureJobReceipt:
+        """Put a job back in the queue without losing its attempt counter."""
+        ts = int(ts_ms) if ts_ms is not None else now_ms()
+        self._store.execute(
+            "UPDATE knowledge_jobs SET state = 'queued', reason = ?, due_ms = ?,"
+            " updated_ms = ? WHERE job_id = ?",
+            (str(reason or ""), int(due_ms), ts, str(job_id)),
+        )
+        return self.job_state(job_id)
+
+    def status(self, *, now_ms: int) -> dict[str, Any]:
+        """Read-only capture counters: states, refusal reasons and the oldest wait."""
+        return capture_status(self._store, now_ms=now_ms)
 
     def job_state(self, job_id: str) -> CaptureJobReceipt:
         row = self._store.query_one("SELECT * FROM knowledge_jobs WHERE job_id = ?", (str(job_id),))
@@ -1184,8 +1286,10 @@ class StatementEngine:
             reason=str(row["reason"] or ""),
         )
 
-    def set_job_state(self, job_id: str, state: str, *, reason: str = "") -> CaptureJobReceipt:
-        ts = now_ms()
+    def set_job_state(
+        self, job_id: str, state: str, *, reason: str = "", ts_ms: int | None = None
+    ) -> CaptureJobReceipt:
+        ts = int(ts_ms) if ts_ms is not None else now_ms()
         self._store.execute(
             "UPDATE knowledge_jobs SET state = ?, reason = ?, updated_ms = ?,"
             " attempts = attempts + 1 WHERE job_id = ?",
@@ -1305,6 +1409,53 @@ def _scope_key(source: SourceRef) -> str:
 
 def _content_hash(statement_id: str, content: str) -> str:
     return hashlib.sha256(f"{statement_id}\x00{content}".encode("utf-8")).hexdigest()
+
+
+def capture_status(store: KnowledgeStore, *, now_ms: int) -> dict[str, Any]:
+    """Read-only promotion counters.  Never contains statement content."""
+    states: dict[str, int] = {}
+    for row in store.query("SELECT state, COUNT(*) AS n FROM knowledge_jobs GROUP BY state"):
+        states[str(row["state"])] = int(row["n"])
+    reasons: dict[str, int] = {}
+    for row in store.query(
+        "SELECT reason, COUNT(*) AS n FROM knowledge_jobs"
+        " WHERE reason IS NOT NULL AND reason <> '' GROUP BY reason"
+    ):
+        reasons[str(row["reason"])] = int(row["n"])
+    oldest = store.query_one(
+        "SELECT MIN(due_ms) AS oldest FROM knowledge_jobs WHERE state = 'queued'"
+    )
+    oldest_due = (
+        int(oldest["oldest"]) if oldest is not None and oldest["oldest"] is not None else 0
+    )
+    return {
+        "states": states,
+        "reasons": reasons,
+        "oldest_queued_ms": oldest_due,
+        "oldest_queued_age_ms": max(0, int(now_ms) - oldest_due) if oldest_due else 0,
+    }
+
+
+def _job_source_pairs(row: Any) -> tuple[tuple[str, int], ...]:
+    """The source keys a job row stores, as plain pairs.
+
+    A job only ever stores ``(event_id, revision)``.  The provenance - channel, chat,
+    author and event time - is re-read from the proof owner on every run, so a job can
+    never carry a source identity the authority has since changed or withdrawn.
+    """
+    try:
+        stored = json.loads(str(row["sources_json"] or "[]"))
+    except (json.JSONDecodeError, TypeError, ValueError):  # pragma: no cover - defensive
+        return ()
+    pairs: list[tuple[str, int]] = []
+    for item in stored:
+        if not isinstance(item, dict):
+            continue
+        event_id = str(item.get("event_id") or "")
+        if not event_id:
+            continue
+        pairs.append((event_id, max(1, int(item.get("revision") or 1))))
+    return tuple(pairs)
 
 
 def _dedupe_key(

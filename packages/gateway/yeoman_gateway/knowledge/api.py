@@ -36,6 +36,7 @@ from yeoman_gateway.knowledge.authority import (
 )
 from yeoman_gateway.knowledge.models import (
     CaptureJobReceipt,
+    CaptureJobRecord,
     CaptureResult,
     ChangeReceipt,
     ConversationMembershipReceipt,
@@ -225,17 +226,37 @@ class _RecordingSourceAuthority:
             marker(source)
 
     def evidence_audience(self, source: SourceRef, *, basis: str) -> Any:
+        """The audience the proof owner recorded for this revision.
+
+        The owner's record wins whenever it has one: every registration passes its own
+        audience down, so an administrative note is stored as ``author_only`` there and a
+        runtime observation keeps the member list it was registered with.  Only a source
+        this wrapper registered *and* the owner never recorded falls back to the narrow
+        ``owner_note`` bucket.  Reading the wrapper's own map first silently turned every
+        proven group audience into ``author_only``, which made the audience proof
+        meaningless for promotion.
+        """
+        inner_audience = getattr(self._inner, "evidence_audience", None)
+        if callable(inner_audience):
+            found = inner_audience(source, basis=basis)
+            if found is not None:
+                return found
         if source.key in self._sources:
             from yeoman_gateway.knowledge.authority import EvidenceAudience
 
             return EvidenceAudience.author_only(snapshot_id="owner_note")
-        return self._inner.evidence_audience(source, basis=basis)
+        return None
 
 
 def _iso_from_ms(ms: int) -> str:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=UTC).isoformat(timespec="seconds")
+
+
+#: Forward cursor of statement promotion, kept in the knowledge store's meta table.
+_CAPTURE_BOUNDARY_MS = "statement_capture_boundary_ms"
+_CAPTURE_BOUNDARY_EVENT = "statement_capture_boundary_event_id"
 
 
 def _scope_of(sources: tuple[SourceRef, ...] | list[SourceRef]) -> str:
@@ -481,6 +502,18 @@ class KnowledgeService:
         with self._store.transaction():
             return self._statements.invalidate_source(source, context=context)
 
+    def invalidate_event_sources(
+        self, event_ids: Iterable[str], *, reason: str = "source_revoked"
+    ) -> tuple[str, ...]:
+        """Apply an already-projected provider revocation to derived statements.
+
+        This is the internal revocation projection, called by the journal owner *after*
+        it authorized and persisted the revocation.  It grants nothing: it only makes the
+        statements that rested on the revoked revision stop being readable.
+        """
+        with self._store.transaction():
+            return self._statements.invalidate_event_ids(event_ids, reason=str(reason))
+
     def correct_statement(
         self,
         statement_id: str,
@@ -524,14 +557,25 @@ class KnowledgeService:
     # ── jobs ─────────────────────────────────────────────────────────────────
 
     def enqueue_capture(
-        self, sources: tuple[SourceRef, ...], *, context: TrustedCaptureContext
+        self,
+        sources: tuple[SourceRef, ...],
+        *,
+        context: TrustedCaptureContext,
+        scope_key: str | None = None,
+        extractor_version: str = "pending",
+        max_waiting: int | None = None,
+        due_ms: int | None = None,
+        ts_ms: int | None = None,
     ) -> CaptureJobReceipt:
         with self._store.transaction():
             return self._statements.enqueue_job(
                 sources,
                 context=context,
-                extractor_version="pending",
-                scope_key=_scope_of(sources),
+                extractor_version=str(extractor_version),
+                scope_key=str(scope_key or _scope_of(sources)),
+                max_waiting=max_waiting,
+                due_ms=due_ms,
+                ts_ms=ts_ms,
             )
 
     def capture_job(self, job_id: str, *, context: TrustedAdminContext) -> CaptureJobReceipt:
@@ -550,6 +594,60 @@ class KnowledgeService:
     ) -> tuple[CaptureJobReceipt, ...]:
         """Internal worker read: job ids only, no statement content."""
         return self._statements.due_jobs(now=now_ms, limit=limit)
+
+    # The remaining job calls are internal worker reads and writes.  They deliberately
+    # skip the admin context: the worker is not an administrative actor, and none of them
+    # returns statement content.  ``set_capture_job_state`` above stays the audited admin
+    # path for manual intervention.
+
+    def capture_job_record(self, job_id: str) -> CaptureJobRecord:
+        """Internal worker read: one job with its resolvable sources."""
+        return self._statements.job_record(job_id)
+
+    def stale_capture_jobs(
+        self, *, updated_before_ms: int, limit: int = 50
+    ) -> tuple[CaptureJobReceipt, ...]:
+        """Internal worker read: jobs a crash left ``running``."""
+        return self._statements.stale_jobs(updated_before_ms=updated_before_ms, limit=limit)
+
+    def mark_capture_job(
+        self, job_id: str, state: str, *, reason: str = "", ts_ms: int | None = None
+    ) -> CaptureJobReceipt:
+        """Internal worker write: record the terminal state of one job."""
+        with self._store.transaction():
+            return self._statements.set_job_state(job_id, state, reason=reason, ts_ms=ts_ms)
+
+    def requeue_capture_job(
+        self, job_id: str, *, due_ms: int, reason: str = "", ts_ms: int | None = None
+    ) -> CaptureJobReceipt:
+        """Internal worker write: bounded retry of a failed job."""
+        with self._store.transaction():
+            return self._statements.requeue_job(
+                job_id, due_ms=due_ms, reason=reason, ts_ms=ts_ms
+            )
+
+    def capture_status(self, *, now_ms: int | None = None) -> dict[str, Any]:
+        """Read-only capture counters; never contains statement content."""
+        moment = int(now_ms if now_ms is not None else self._store.now_ms())
+        return self._statements.status(now_ms=moment)
+
+    def capture_boundary(self) -> tuple[int, str] | None:
+        """The durable forward cursor of statement capture, if one was set."""
+        raw_ms = self._store.get_meta(_CAPTURE_BOUNDARY_MS)
+        if raw_ms is None:
+            return None
+        try:
+            moment = int(raw_ms)
+        except (TypeError, ValueError):
+            return None
+        return (moment, str(self._store.get_meta(_CAPTURE_BOUNDARY_EVENT, "") or ""))
+
+    def set_capture_boundary(self, after_ms: int, after_event_id: str = "") -> tuple[int, str]:
+        """Persist the forward cursor.  Only the promotion worker writes it."""
+        moment = max(0, int(after_ms))
+        self._store.set_meta(_CAPTURE_BOUNDARY_MS, str(moment))
+        self._store.set_meta(_CAPTURE_BOUNDARY_EVENT, str(after_event_id or ""))
+        return (moment, str(after_event_id or ""))
 
     # ── conversation threads ─────────────────────────────────────────────────
     #

@@ -373,7 +373,15 @@ def test_purge_drops_old_metadata_but_protects_unresolved(tmp_path):
     db.close()
 
 
-def test_retention_exempts_only_marked_canonical_whatsapp_events(tmp_path):
+def test_retention_exempts_the_canonical_whatsapp_channel_not_one_origin_label(tmp_path):
+    """Two writers journal the same canonical channel, so the exemption keys on it.
+
+    The journal has been written by the Bridge signal sink and by the policy gate under
+    different origin labels.  Keying the exemption on one label deleted the other
+    writer's rows at the lineage window, which spec section 1.9 forbids: a retention sweep
+    removes neither row nor payload of a canonical WhatsApp event.  Telegram stays
+    retention-managed, so the exemption is a channel boundary, not a global one.
+    """
     now = 1_700_000_000_000
     db = ProcessingStore(tmp_path / "processing.db")
     db.append_event(
@@ -400,13 +408,26 @@ def test_retention_exempts_only_marked_canonical_whatsapp_events(tmp_path):
         },
         now_ms=now,
     )
+    db.append_event(
+        event_key="tg:operational",
+        event_id="tg-operational",
+        trace_id="trace-telegram",
+        payload={
+            "kind": "message",
+            "origin": "telegram",
+            "channel": "telegram",
+            "text": "operational",
+        },
+        now_ms=now,
+    )
 
     db.purge(now_ms=now + 31 * DAY_MS)
 
     canonical = db.get_event("wa-canonical")
     assert canonical is not None and canonical.payload is not None
     operational = db.get_event("wa-operational")
-    assert operational is None
+    assert operational is not None and operational.payload is not None
+    assert db.get_event("tg-operational") is None
     db.close()
 
 

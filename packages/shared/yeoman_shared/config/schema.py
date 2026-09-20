@@ -411,6 +411,13 @@ class KnowledgeConfig(BaseModel):
     verified offline migration produced it.  With the switch off nothing changes; with
     the switch on a missing or unverified store is a hard startup error instead of a
     silent second writer.
+
+    ``capture_enabled`` gates **promotion only**.  It is read exactly once, in the
+    composition root, and passed down as an explicit constructor argument; nothing else
+    reads the field.  ``False`` means: no promotion worker runs and no promotion job is
+    created.  It never means "stop observing" - durable observation capture through
+    ``ProcessingStore.events`` continues either way, and the observations wait for a later
+    decision.  The remaining fields tune the bounded producer and worker.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -424,6 +431,11 @@ class KnowledgeConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_KNOWLEDGE["legacy_memory_paths"])
     )
     capture_enabled: bool = False
+    capture_idle_seconds: int = 60
+    capture_max_delay_seconds: int = 300
+    capture_batch_max: int = 8
+    capture_max_waiting: int = 64
+    capture_poll_seconds: float = 5.0
 
 
 class MemoryConfig(BaseModel):

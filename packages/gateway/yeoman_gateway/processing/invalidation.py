@@ -54,12 +54,16 @@ class SignalInvalidator:
         store: Any,
         actors: Any | None = None,
         memory: Any | None = None,
+        statements: Any | None = None,
         mapper: WhatsAppSignalMapper | None = None,
         clock: Any = None,
     ) -> None:
         self._store = store
         self._actors = actors
         self._memory = memory
+        #: Statements derived from the invalidated sources.  A revocation that only
+        #: reached the memory projection would leave the statement layer readable.
+        self._statements = statements
         self._mapper = mapper or WhatsAppSignalMapper()
         self._clock = clock
 
@@ -129,6 +133,19 @@ class SignalInvalidator:
                 result.facts_revoked = tuple(getattr(report, "revoked", ()) or ())
                 result.facts_superseded = tuple(getattr(report, "superseded", ()) or ())
                 result.jobs_cancelled = int(getattr(report, "jobs_cancelled", 0) or 0)
+
+        invalidate_statements = getattr(self._statements, "invalidate_event_sources", None)
+        if callable(invalidate_statements) and result.source_event_ids:
+            try:
+                invalidate_statements(
+                    list(result.source_event_ids), reason=f"source_{kind}"
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "statement invalidation failed kind={} error_type={}",
+                    kind,
+                    type(exc).__name__,
+                )
 
         logger.info(
             "signal invalidation kind={} message={} turn={} revision={} cancelled={} "
