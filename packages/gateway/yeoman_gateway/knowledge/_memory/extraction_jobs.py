@@ -558,7 +558,12 @@ class SharedFactExtractionQueue:
         if self._embedding_queue is not None:
             # The one existing worker also drains the embedding jobs, so publishing a fact
             # never waits for a provider and no second scheduler is introduced.
-            self._embedding_queue.run_due(now_ms=int(now_ms))
+            queue = self._embedding_queue
+            published_before = int(getattr(queue, "published_sections", 0))
+            failed_before = int(getattr(queue, "failed_jobs", 0))
+            queue.run_due(now_ms=int(now_ms))
+            self.embeddings_written += int(getattr(queue, "published_sections", 0)) - published_before
+            self.embeddings_failed += int(getattr(queue, "failed_jobs", 0)) - failed_before
         return report
 
     # -- one job ----------------------------------------------------------------

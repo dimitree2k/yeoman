@@ -20,6 +20,12 @@ from typing import Any, Iterable
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
 from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._migration import (
+    LineageImportReport,
+    LineageInventory,
+    import_lineage,
+    inspect_lineage_sources,
+)
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
 from yeoman_gateway.knowledge._statements import StatementEngine, token_re
 from yeoman_gateway.knowledge._store import SCHEMA_VERSION, KnowledgeStore
@@ -63,6 +69,10 @@ from yeoman_gateway.knowledge.models import (
 __all__ = [
     "KnowledgeService",
     "KnowledgeStartupError",
+    "LineageImportReport",
+    "LineageInventory",
+    "import_lineage",
+    "inspect_lineage_sources",
     "open_knowledge_store",
     "workspace_id_for",
 ]

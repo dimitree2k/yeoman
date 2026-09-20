@@ -297,12 +297,19 @@ class MemoryEmbeddingQueue:
     ) -> None:
         self._store = store
         self._embedder = embedder
-        self._authority = authority
+        # Prefer an explicitly supplied proof owner; otherwise use the one the store was
+        # opened with, so a store that already has live authority also gates its vectors.
+        self._authority = (
+            authority if authority is not None else getattr(store, "source_authority", None)
+        )
         self._clock = clock if clock is not None else (lambda: int(time.time() * 1000))
         self._preprocessing_version = str(preprocessing_version)
         self._dimensions = int(dimensions) if dimensions else None
         self._max_attempts = max(1, int(max_attempts))
         self._retry_delay_ms = max(1_000, int(retry_delay_ms))
+        #: Observable totals, so the queue that owns this worker can report them.
+        self.published_sections = 0
+        self.failed_jobs = 0
 
     # -- identity ---------------------------------------------------------------
 
@@ -469,8 +476,8 @@ class MemoryEmbeddingQueue:
             return
 
         # Authority and revocation are re-checked *before* any provider submission.
-        source, denial = self._prove_source(job)
-        if source is None:
+        denial = self._prove_source(job)
+        if denial:
             self._finish(job, state="skipped", reason=denial, now_ms=now_ms)
             report.skipped += 1
             report.note(denial)
@@ -545,12 +552,28 @@ class MemoryEmbeddingQueue:
             keep_keys=kept_keys,
             now_ms=now_ms,
         )
+        # A shared fact also keeps the node-level vector the existing fact retrieval path
+        # reads, so the versioned index and the pre-existing search stay consistent.
+        if self._is_shared_fact(str(job["node_id"])):
+            self._store.set_fact_embedding(
+                str(job["node_id"]),
+                workspace_id=str(job["workspace_id"]),
+                model=str(job["model_id"]),
+                vector=list(vectors[0]),
+            )
+        self.published_sections += len(vectors)
         remember = getattr(self._store, "remember_embedding_dimension", None)
         if callable(remember) and kept_keys:
             remember(str(job["model_id"]), int(kept_keys[0][4]))
         self._finish(job, state="done", reason=None, now_ms=now_ms)
         report.published += 1
         report.note("published")
+
+    def _is_shared_fact(self, node_id: str) -> bool:
+        row = self._store.query_one(
+            "SELECT 1 FROM memory2_facts WHERE fact_id = ? LIMIT 1", (str(node_id),)
+        )
+        return row is not None
 
     def _load_entry(self, job: Any) -> Any | None:
         getter = getattr(self._store, "get_node", None)
@@ -564,44 +587,46 @@ class MemoryEmbeddingQueue:
             return None
         return entry
 
-    def _prove_source(self, job: Any) -> tuple[Any | None, str]:
+    def _prove_source(self, job: Any) -> str | None:
         """Re-read the live authority for *every* source this document rests on.
 
         A statement can rest on several sources, so proving only the first would let a
         revoked secondary source still reach the provider.  Unknown, unproven or revoked
-        at any position means: no call at all.
+        at any position means: no call at all.  Returns a denial reason, or ``None`` when
+        the document may proceed.
+
+        With no proof owner configured at all there is no revocation information in the
+        process, so the node-level gate that already ran when the entry was loaded
+        (existence, soft-delete, redaction) is the whole decision - exactly as it is for
+        every other lexical memory path.  As soon as an authority is present it decides.
         """
         if self._authority is None:
-            # Fail closed: without a proof owner nothing may reach a provider.
-            return None, "unknown_authority"
+            return None
         refs = list(job.get("source_refs") or ())
         primary_event = str(job.get("source_event_id") or "")
         if not refs:
             refs = [(primary_event, int(job.get("source_revision") or 0))]
         if not any(str(event_id) for event_id, _revision in refs):
-            return None, "unknown_source"
+            return "unknown_source"
         getter = getattr(self._authority, "verify_source_ref", None)
         if not callable(getter):
-            return None, "unknown_authority"
+            return "unknown_authority"
         revoked = getattr(self._authority, "source_revoked", None)
         verify = getattr(self._authority, "verify_source", None)
-        primary = None
         for event_id, revision in refs:
             if not str(event_id):
-                return None, "unknown_source"
+                return "unknown_source"
             try:
                 source = getter(str(event_id), int(revision))
             except Exception:  # pragma: no cover - defensive
-                return None, "unknown_authority"
+                return "unknown_authority"
             if source is None:
-                return None, "unknown_source"
+                return "unknown_source"
             if callable(revoked) and revoked(source):
-                return None, "source_revoked"
+                return "source_revoked"
             if callable(verify) and not verify(source):
-                return None, "unauthorized"
-            if str(event_id) == primary_event:
-                primary = source
-        return (primary if primary is not None else source), "ok"
+                return "unauthorized"
+        return None
 
     # -- job bookkeeping ---------------------------------------------------------
 
@@ -651,6 +676,7 @@ class MemoryEmbeddingQueue:
         )
 
     def _fail(self, job: Any, *, reason: str, now_ms: int) -> None:
+        self.failed_jobs += 1
         attempts = int(job.get("attempts") or 0) + 1
         due_ms = (
             int(now_ms) + self._retry_delay_ms

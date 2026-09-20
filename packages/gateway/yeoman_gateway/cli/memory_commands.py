@@ -745,7 +745,7 @@ def memory_lineage_inventory(
     provider or model call, and never a PDF parse or OCR.  Derived model work is only
     scheduled with --allow-model-jobs, whose eligible count is always reported first.
     """
-    from yeoman_gateway.knowledge._migration import import_lineage, inspect_lineage_sources
+    from yeoman_gateway.knowledge.api import import_lineage, inspect_lineage_sources
 
     inventory = inspect_lineage_sources(
         inbound_dir=inbound_dir,
