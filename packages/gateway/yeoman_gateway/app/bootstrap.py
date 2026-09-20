@@ -1927,7 +1927,6 @@ def build_gateway_runtime(
     activation_tracker = None
     if (
         social_runtime_enabled
-        or config.persona_evolution.enabled
         or (pending_participation_recovery and speakup_path.is_file())
     ):
         from yeoman_gateway.consciousness.log import SpeakupLog
@@ -2653,24 +2652,39 @@ def build_gateway_runtime(
             output_path = None
             if str(job.payload.persona_output or "").strip():
                 output_path = Path(str(job.payload.persona_output).strip())
-            result = await run_persona_evolution_cron(
-                policy=policy_engine.policy,
-                workspace=Path(workspace),
-                persona_file=persona_file,
-                memory=memory_service,
-                speakup_log=speakup_log,
-                inbound_archive=inbound_archive,
-                window_days=max(1, int(job.payload.persona_window_days)),
-                limit=max(1, int(job.payload.persona_limit)),
-                output_path=output_path,
-                min_meaningful_messages=max(
-                    0, int(job.payload.persona_min_meaningful_messages)
-                ),
-                min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
-                max_accumulation_days=max(1, int(job.payload.persona_max_accumulation_days)),
-                proposal_ttl_seconds=max(60, int(config.persona_evolution.proposal_ttl_seconds)),
-                proposal_mode=config.persona_evolution.mode,
-            )
+            persona_speakup_log = speakup_log
+            close_persona_speakup_log = False
+            if persona_speakup_log is None:
+                from yeoman_gateway.consciousness.log import SpeakupLog
+
+                persona_speakup_log = SpeakupLog(speakup_path)
+                close_persona_speakup_log = True
+            try:
+                result = await run_persona_evolution_cron(
+                    policy=policy_engine.policy,
+                    workspace=Path(workspace),
+                    persona_file=persona_file,
+                    memory=memory_service,
+                    speakup_log=persona_speakup_log,
+                    inbound_archive=inbound_archive,
+                    window_days=max(1, int(job.payload.persona_window_days)),
+                    limit=max(1, int(job.payload.persona_limit)),
+                    output_path=output_path,
+                    min_meaningful_messages=max(
+                        0, int(job.payload.persona_min_meaningful_messages)
+                    ),
+                    min_signal_score=max(0.0, float(job.payload.persona_min_signal_score)),
+                    max_accumulation_days=max(
+                        1, int(job.payload.persona_max_accumulation_days)
+                    ),
+                    proposal_ttl_seconds=max(
+                        60, int(config.persona_evolution.proposal_ttl_seconds)
+                    ),
+                    proposal_mode=config.persona_evolution.mode,
+                )
+            finally:
+                if close_persona_speakup_log:
+                    persona_speakup_log.close()
             if persona_evolution_result_needs_notification(result):
                 ledger = PersonaEvolutionLedger(persona_evolution_state_db_path)
                 try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,10 +95,26 @@ def test_legacy_consciousness_flag_does_not_build_a_social_runtime(
         runtime.memory.close()
 
 
-def test_persona_evolution_keeps_historical_speakup_log_without_participation(
+@pytest.mark.asyncio
+async def test_persona_evolution_lazily_reads_historical_speakup_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Historical social evidence stays readable after the old generator is removed."""
+
+    from yeoman_gateway.cron.types import CronJob, CronPayload
+
+    captured_logs: list[object] = []
+
+    async def fake_persona_evolution_cron(**kwargs: Any) -> str:
+        log = kwargs["speakup_log"]
+        assert await log.history("whatsapp", "group@g.us") == []
+        captured_logs.append(log)
+        return "persona_evolution no proposal: test"
+
+    monkeypatch.setattr(
+        "yeoman_gateway.app.bootstrap.run_persona_evolution_cron",
+        fake_persona_evolution_cron,
+    )
 
     class _NeverProvider:
         async def chat(self, *_args: Any, **_kwargs: Any) -> None:
@@ -115,6 +132,7 @@ def test_persona_evolution_keeps_historical_speakup_log_without_participation(
             "security": {"enabled": False},
         }
     )
+    speakup_path = tmp_path / "data" / "consciousness" / "speakups.db"
     runtime = build_gateway_runtime(
         config=config,
         provider=_NeverProvider(),  # type: ignore[arg-type]
@@ -124,10 +142,25 @@ def test_persona_evolution_keeps_historical_speakup_log_without_participation(
         bus=MessageBus(),
     )
     try:
-        assert runtime.speakup_log is not None
+        assert runtime.speakup_log is None
+        assert not speakup_path.exists()
+        assert runtime.cron.on_job is not None
+        result = await runtime.cron.on_job(
+            CronJob(
+                id="persona-evolution",
+                name="persona evolution",
+                payload=CronPayload(
+                    kind="persona_evolution",
+                    persona_file="personas/arvid.md",
+                ),
+            )
+        )
+        assert result == "persona_evolution no proposal: test"
+        assert speakup_path.exists()
+        assert len(captured_logs) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            await captured_logs[0].history("whatsapp", "group@g.us")
     finally:
-        if runtime.speakup_log is not None:
-            runtime.speakup_log.close()
         runtime.inbound_archive.close()
         runtime.chat_registry.close()
         runtime.contacts.close()
