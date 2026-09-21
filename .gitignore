@@ -143,3 +143,4 @@ node_modules/
 /workspace/
 .docs/
 .worktrees/
+.var/
