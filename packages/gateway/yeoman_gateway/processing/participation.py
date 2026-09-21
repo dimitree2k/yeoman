@@ -234,7 +234,11 @@ class ParticipationJudge:
             )
         try:
             raw = await asyncio.wait_for(
-                self._client.chat(messages, max_tokens=self._max_output_tokens),
+                self._client.chat(
+                    messages,
+                    max_tokens=self._max_output_tokens,
+                    response_format={"type": "json_object"},
+                ),
                 timeout=self._timeout_seconds,
             )
         except asyncio.CancelledError:

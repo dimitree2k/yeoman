@@ -66,11 +66,19 @@ class _Client:
         self._answer = answer
         self.calls: list[list[dict[str, str]]] = []
         self.max_tokens: list[int] = []
+        self.response_formats: list[dict[str, str] | None] = []
         self.route_key = "test.route"
 
-    async def chat(self, messages, *, max_tokens: int = 0) -> str:
+    async def chat(
+        self,
+        messages,
+        *,
+        max_tokens: int = 0,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
         self.calls.append(list(messages))
         self.max_tokens.append(int(max_tokens))
+        self.response_formats.append(response_format)
         if isinstance(self._answer, BaseException):
             raise self._answer
         return self._answer
@@ -216,8 +224,14 @@ async def test_cancellation_propagates_and_is_not_silence() -> None:
     class _Blocking:
         route_key = "test.route"
 
-        async def chat(self, messages, *, max_tokens: int = 0) -> str:
-            del messages, max_tokens
+        async def chat(
+            self,
+            messages,
+            *,
+            max_tokens: int = 0,
+            response_format: dict[str, str] | None = None,
+        ) -> str:
+            del messages, max_tokens, response_format
             await asyncio.sleep(30)
             return "{}"
 
@@ -227,6 +241,16 @@ async def test_cancellation_propagates_and_is_not_silence() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_judge_requests_json_object_response_format() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+
+    await judge.decide(_opportunity(), _context())
+
+    assert client.response_formats == [{"type": "json_object"}]
 
 
 @pytest.mark.asyncio

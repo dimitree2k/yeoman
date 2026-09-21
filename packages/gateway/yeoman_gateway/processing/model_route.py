@@ -48,7 +48,13 @@ class RouteClient:
             extra_headers=provider_cfg.extra_headers,
         )
 
-    async def chat(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         """One completion, deterministically, with the caller's token ceiling."""
         response = await self._provider.chat(
             messages=messages,
@@ -56,6 +62,7 @@ class RouteClient:
             model=self.model,
             max_tokens=max_tokens,
             temperature=0.0,
+            response_format=response_format,
         )
         return str(getattr(response, "content", "") or "")
 

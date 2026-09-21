@@ -57,8 +57,14 @@ class _ScriptedClient:
         self._answer = answer
         self.calls = 0
 
-    async def chat(self, messages, *, max_tokens: int = 0) -> str:
-        del messages, max_tokens
+    async def chat(
+        self,
+        messages,
+        *,
+        max_tokens: int = 0,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
+        del messages, max_tokens, response_format
         self.calls += 1
         return json.dumps(self._answer)
 

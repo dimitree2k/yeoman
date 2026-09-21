@@ -1055,8 +1055,14 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         def __init__(self, **_: object) -> None:
             pass
 
-        async def chat(self, messages: object, *, max_tokens: int = 0) -> str:
-            del messages, max_tokens
+        async def chat(
+            self,
+            messages: object,
+            *,
+            max_tokens: int = 0,
+            response_format: dict[str, object] | None = None,
+        ) -> str:
+            del messages, max_tokens, response_format
             return (
                 '{"action":"react","intent":"continue","reason":"ack",'
                 '"emoji":"👍","target_message_id":"source-1"}'
@@ -1416,8 +1422,14 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
         def __init__(self, **_: object) -> None:
             pass
 
-        async def chat(self, messages: object, *, max_tokens: int = 0) -> str:
-            del max_tokens
+        async def chat(
+            self,
+            messages: object,
+            *,
+            max_tokens: int = 0,
+            response_format: dict[str, object] | None = None,
+        ) -> str:
+            del max_tokens, response_format
             type(self).calls += 1
             source_id = "source-2" if "source-2" in str(messages) else "source-1"
             return (

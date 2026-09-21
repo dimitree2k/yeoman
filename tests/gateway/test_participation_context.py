@@ -177,8 +177,14 @@ async def test_newest_required_source_is_default_reaction_target(tmp_path: Path)
     class _Client:
         route_key = "test.participation"
 
-        async def chat(self, messages, *, max_tokens: int = 0) -> str:
-            del messages, max_tokens
+        async def chat(
+            self,
+            messages,
+            *,
+            max_tokens: int = 0,
+            response_format: dict[str, str] | None = None,
+        ) -> str:
+            del messages, max_tokens, response_format
             return '{"action":"react","intent":"initiate","emoji":"👍"}'
 
     decision = await ParticipationJudge(client=_Client(), allowed_emojis=("👍",)).decide(
