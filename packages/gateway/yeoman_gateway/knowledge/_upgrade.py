@@ -35,18 +35,32 @@ from typing import Any, Final
 from yeoman_gateway.knowledge._store import SCHEMA_VERSION, TOOL_VERSION, KnowledgeStore
 
 __all__ = [
+    "APPROVAL_VERSION",
+    "DEFAULT_APPROVAL_NAMESPACE",
     "UPGRADE_MANIFEST_VERSION",
+    "BindingProposal",
+    "BindingProposalReport",
     "UpgradeError",
     "UpgradeInventory",
     "UpgradeReport",
     "UpgradeVerification",
     "inspect_v1",
+    "load_binding_approvals",
+    "propose_bindings",
     "upgrade_v1",
     "upgrade_semantic_digest",
     "verify_upgrade",
 ]
 
 UPGRADE_MANIFEST_VERSION: Final[int] = 1
+
+#: Version of the operator-facing binding proposal/approval file.
+APPROVAL_VERSION: Final[int] = 1
+
+#: Namespace an approved binding carries when the file does not state one.  The live
+#: WhatsApp adapter reports the platform account and this stand reports ``default``, which
+#: is also what a v1-derived binding gets; a multi-account stand states its own.
+DEFAULT_APPROVAL_NAMESPACE: Final[str] = "default"
 
 #: Namespace of the deterministic binding ids.  Fixed forever: changing it would change
 #: every derived id of an already published upgrade.
@@ -346,12 +360,14 @@ class _Balance:
     bindings: dict[str, int] = field(default_factory=dict)
     person_roles: dict[str, int] = field(default_factory=dict)
     supersessions: dict[str, int] = field(default_factory=dict)
+    approvals: dict[str, int] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, dict[str, int]]:
         return {
             "bindings": dict(sorted(self.bindings.items())),
             "person_roles": dict(sorted(self.person_roles.items())),
             "supersessions": dict(sorted(self.supersessions.items())),
+            "approvals": dict(sorted(self.approvals.items())),
         }
 
 
@@ -377,11 +393,14 @@ def upgrade_v1(
     target: Path,
     manifest: Path,
     fail_before_publish: bool = False,
+    binding_approvals: Path | None = None,
 ) -> UpgradeReport:
     """Build a v2 target from a v1 knowledge snapshot and its processing journal.
 
     Never overwrites an existing target or manifest, never writes to either input, and
-    never marks the target complete before every check has passed.
+    never marks the target complete before every check has passed.  ``binding_approvals``
+    is an owner-reviewed proposal file (see :func:`propose_bindings`); only the entries it
+    marks ``approved`` become active bindings.
     """
     source_path = Path(source).expanduser()
     processing_path = Path(processing).expanduser()
@@ -411,12 +430,29 @@ def upgrade_v1(
                 "unsupported_source_schema",
                 f"knowledge snapshot is not schema 1: {knowledge.schema_version or 'none'}",
             )
+        # Read and validate the owner's decision before anything is built: an approval
+        # file that names the wrong person must not produce a half-migrated target.
+        approvals: tuple[dict[str, Any], ...] = ()
+        approval_digest = ""
+        approval_actor = ""
+        approval_namespace = DEFAULT_APPROVAL_NAMESPACE
+        if binding_approvals is not None:
+            (
+                approvals,
+                approval_digest,
+                approval_actor,
+                approval_namespace,
+            ) = load_binding_approvals(Path(binding_approvals))
         return _build(
             knowledge=knowledge,
             journal=journal,
             target_path=target_path,
             manifest_path=manifest_path,
             fail_before_publish=fail_before_publish,
+            approvals=approvals,
+            approval_digest=approval_digest,
+            approval_actor=approval_actor,
+            approval_namespace=approval_namespace,
         )
     finally:
         knowledge.close()
@@ -430,6 +466,10 @@ def _build(
     target_path: Path,
     manifest_path: Path,
     fail_before_publish: bool,
+    approvals: tuple[dict[str, Any], ...] = (),
+    approval_digest: str = "",
+    approval_actor: str = "",
+    approval_namespace: str = DEFAULT_APPROVAL_NAMESPACE,
 ) -> UpgradeReport:
     created_ms = int(time.time() * 1000)
     source_fingerprint = _combined(
@@ -451,12 +491,25 @@ def _build(
                 _copy_table(store, knowledge, table, created_ms)
             _rebuild_fts(store, knowledge)
             binding_ledger = _transform_bindings(store, knowledge, created_ms)
+            # Owner approvals land *between* the two transforms on purpose: the roles are
+            # re-linked from active bindings, so an approved identifier is exactly what
+            # brings the stored speaker edges of that person back to life.
+            approval_ledger = _apply_binding_approvals(
+                store,
+                knowledge,
+                approvals,
+                digest=approval_digest,
+                actor=approval_actor,
+                namespace=approval_namespace,
+                created_ms=created_ms,
+            )
             role_ledger = _transform_roles(store, knowledge, created_ms)
             reason_ledger = _transform_supersessions(store, knowledge, created_ms)
             balance = _Balance(
                 bindings=binding_ledger,
                 person_roles=role_ledger,
                 supersessions=reason_ledger,
+                approvals=approval_ledger,
             )
             _write_meta(
                 store,
@@ -465,7 +518,13 @@ def _build(
                 created_ms=created_ms,
                 balance=balance,
             )
-            _verify_staged(store, knowledge, balance)
+            _verify_staged(
+                store,
+                knowledge,
+                balance,
+                approval_digest=approval_digest,
+                approvals_applied=int(approval_ledger.get("applied", 0)),
+            )
             transformed = _transformed_outcomes(store, knowledge)
             digest = _semantic_digest(store)
             store.execute(
@@ -497,6 +556,13 @@ def _build(
             created_ms=created_ms,
             source_fingerprint=source_fingerprint,
             semantic_digest=digest,
+            approvals={
+                "file_digest": approval_digest,
+                "approved_by": approval_actor,
+                "namespace": approval_namespace if approvals else "",
+                "requested": len(approvals),
+                "applied": int(approval_ledger.get("applied", 0)),
+            },
         )
         staging.replace(target_path)
         published = True
@@ -767,6 +833,389 @@ def _transform_bindings(
     return dict(ledger)
 
 
+# ── owner-approved bindings ──────────────────────────────────────────────────
+#
+# A v1 store without identifier bindings has nothing the migration may promote, and the
+# stored person roles stay withheld with it.  The missing piece is not a wider rule but an
+# operator decision: the owner confirms which legacy identifier belongs to which person.
+# The proposal file is that decision's written form - generated read-only, carrying the
+# evidence for every row, and only rows the owner marked ``approved`` are applied.  An
+# applied approval becomes an ordinary durable binding (a ``knowledge_identity_ops`` row
+# plus ``evidence_ref = binding-op:<id>``), so it passes the same evidence rule as every
+# other binding and stays auditable after the migration.
+
+
+@dataclass(frozen=True, slots=True)
+class BindingProposal:
+    """One legacy identifier the owner may confirm, with the evidence behind it."""
+
+    person_id: str
+    display_name: str
+    channel: str
+    kind: str
+    value: str
+    namespace: str
+    journal_inbound_events: int
+    role_rows: int
+    proposed: bool
+    reason: str
+    approved: bool = False
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "person_id": self.person_id,
+            "display_name": self.display_name,
+            "channel": self.channel,
+            "kind": self.kind,
+            "value": self.value,
+            "namespace": self.namespace,
+            "journal_inbound_events": self.journal_inbound_events,
+            "role_rows": self.role_rows,
+            "proposed": self.proposed,
+            "reason": self.reason,
+            "approved": self.approved,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BindingProposalReport:
+    """What a proposal run saw, without changing either input."""
+
+    source_path: Path
+    processing_path: Path
+    out_path: Path
+    namespace: str
+    proposals: tuple[BindingProposal, ...]
+    with_journal_evidence: int
+    role_rows_covered: int
+
+    @property
+    def total(self) -> int:
+        return len(self.proposals)
+
+
+def propose_bindings(
+    *,
+    source: Path,
+    processing: Path,
+    out: Path,
+    namespace: str = DEFAULT_APPROVAL_NAMESPACE,
+) -> BindingProposalReport:
+    """Write a reviewable proposal for every legacy identifier, read-only.
+
+    The file is *private*: it names people and identifiers so the owner can check them.
+    It never contains statement text or message content.  Nothing is applied here - the
+    operator marks entries ``"approved": true`` and hands the same file to
+    :func:`upgrade_v1`.
+    """
+    source_path = Path(source).expanduser()
+    processing_path = Path(processing).expanduser()
+    out_path = Path(out).expanduser()
+    if out_path.exists():
+        raise UpgradeError("target_exists", f"refusing to overwrite {out_path}")
+    scope = str(namespace or "").strip() or DEFAULT_APPROVAL_NAMESPACE
+    knowledge = _open_readonly("knowledge", source_path)
+    journal = _open_readonly("processing", processing_path)
+    try:
+        if knowledge.schema_version != "1":
+            raise UpgradeError(
+                "unsupported_source_schema",
+                f"knowledge snapshot is not schema 1: {knowledge.schema_version or 'none'}",
+            )
+        people = {
+            str(row[0]): str(row[1] or "")
+            for row in knowledge.connection.execute(
+                "SELECT id, display_name FROM contacts"
+            )
+        }
+        identifiers = [
+            (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+            for row in knowledge.connection.execute(
+                "SELECT channel, identifier, contact_id, kind FROM contact_identifiers"
+                " ORDER BY channel, identifier"
+            )
+        ]
+        journal_counts = _inbound_principal_counts(journal)
+        role_counts = _role_rows_by_person(knowledge)
+        proposals: list[BindingProposal] = []
+        for channel, value, person_id, kind in identifiers:
+            local = value.split("@", 1)[0]
+            events = journal_counts.get(value, 0) or journal_counts.get(local, 0)
+            proposals.append(
+                BindingProposal(
+                    person_id=person_id,
+                    display_name=people.get(person_id, ""),
+                    channel=channel,
+                    kind=kind,
+                    value=value,
+                    namespace=scope,
+                    journal_inbound_events=events,
+                    role_rows=role_counts.get(person_id, 0),
+                    proposed=events > 0,
+                    reason="journal_evidence" if events > 0 else "owner_knowledge_only",
+                )
+            )
+        with_evidence = sum(1 for item in proposals if item.proposed)
+        # Distinct people, so an identifier list does not multiply the number.
+        role_rows_covered = sum(
+            role_counts.get(person_id, 0)
+            for person_id in {item.person_id for item in proposals}
+        )
+        payload = {
+            "proposal_version": APPROVAL_VERSION,
+            "generated_ms": int(time.time() * 1000),
+            "namespace": scope,
+            "approved_by": "",
+            "source_fingerprint": _fingerprint(source_path),
+            "processing_fingerprint": _fingerprint(processing_path),
+            "counts": {
+                "entries": len(proposals),
+                "with_journal_evidence": with_evidence,
+                "role_rows_covered": role_rows_covered,
+            },
+            "entries": [item.to_payload() for item in proposals],
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return BindingProposalReport(
+            source_path=source_path,
+            processing_path=processing_path,
+            out_path=out_path,
+            namespace=scope,
+            proposals=tuple(proposals),
+            with_journal_evidence=with_evidence,
+            role_rows_covered=role_rows_covered,
+        )
+    finally:
+        knowledge.close()
+        journal.close()
+
+
+def load_binding_approvals(path: Path) -> tuple[tuple[dict[str, Any], ...], str, str, str]:
+    """Read an approval file; returns (approved entries, digest, actor, namespace)."""
+    approval_path = Path(path).expanduser()
+    if not approval_path.exists():
+        raise UpgradeError("approval_file_missing", f"approval file does not exist: {path}")
+    raw = approval_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise UpgradeError("approval_file_invalid", "approval file is not readable JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise UpgradeError(
+            "approval_file_invalid", "approval file needs a top-level 'entries' list"
+        )
+    version = payload.get("proposal_version")
+    if version != APPROVAL_VERSION:
+        raise UpgradeError(
+            "approval_file_invalid",
+            f"unsupported approval file version: {version!r}",
+        )
+    actor = str(payload.get("approved_by") or "").strip()
+    if not actor:
+        raise UpgradeError(
+            "approval_file_invalid",
+            "an approval file needs 'approved_by': an approval without an actor is not auditable",
+        )
+    namespace = str(payload.get("namespace") or "").strip() or DEFAULT_APPROVAL_NAMESPACE
+    approved: list[dict[str, Any]] = []
+    for entry in payload["entries"]:
+        if not isinstance(entry, dict):
+            raise UpgradeError("approval_file_invalid", "every entry has to be an object")
+        if entry.get("approved") is not True:
+            continue
+        missing = [
+            key
+            for key in ("person_id", "channel", "kind", "value")
+            if not str(entry.get(key) or "").strip()
+        ]
+        if missing:
+            raise UpgradeError(
+                "approval_file_invalid",
+                "an approved entry is missing: " + ", ".join(missing),
+            )
+        approved.append(dict(entry))
+    return tuple(approved), digest, actor, namespace
+
+
+def _inbound_principal_counts(journal: _ReadHandle) -> dict[str, int]:
+    """How often each transport principal actually wrote to this stand."""
+    if "events" not in journal.tables:
+        return {}
+    try:
+        rows = journal.connection.execute(
+            "SELECT principal, COUNT(*) FROM events"
+            " WHERE direction = 'in' AND principal IS NOT NULL AND principal != ''"
+            " GROUP BY principal"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return {}
+    return {str(row[0]): int(row[1]) for row in rows}
+
+
+def _role_rows_by_person(knowledge: _ReadHandle) -> Counter[str]:
+    """Stored person roles per person, counting only rows whose author matches them."""
+    if "knowledge_statement_people" not in knowledge.tables:
+        return Counter()
+    index: dict[tuple[str, str], tuple[str, str]] = {}
+    for row in knowledge.connection.execute(
+        "SELECT channel, identifier, contact_id FROM contact_identifiers"
+    ):
+        person_id = str(row[2])
+        index[(str(row[0]), str(row[1]))] = (f"projection:{person_id}", person_id)
+    authors = {
+        (str(row[0]), str(row[1]), int(row[2])): str(row[3] or "")
+        for row in knowledge.connection.execute(
+            "SELECT statement_id, event_id, revision, author_principal"
+            " FROM knowledge_statement_sources"
+        )
+    } if "knowledge_statement_sources" in knowledge.tables else {}
+    counts: Counter[str] = Counter()
+    for row in knowledge.connection.execute(
+        "SELECT statement_id, person_id, evidence_source_id, evidence_revision"
+        " FROM knowledge_statement_people"
+    ):
+        person_id = str(row[1])
+        author = authors.get((str(row[0]), str(row[2]), int(row[3])))
+        linked = _person_for_author(author or "", index)
+        if linked is not None and linked[1] == person_id:
+            counts[person_id] += 1
+    return counts
+
+
+def _apply_binding_approvals(
+    store: KnowledgeStore,
+    knowledge: _ReadHandle,
+    approvals: tuple[dict[str, Any], ...],
+    *,
+    digest: str,
+    actor: str,
+    namespace: str,
+    created_ms: int,
+) -> dict[str, int]:
+    """Turn owner approvals into ordinary, durable, auditable v2 bindings.
+
+    Every approval is checked against the *source* projection before anything is written:
+    an identifier that does not exist there, or that belongs to a different person, is
+    refused.  The owner confirms a mapping, not a guess.
+    """
+    from yeoman_gateway.knowledge.models import Identifier
+
+    ledger: Counter[str] = Counter()
+    if not approvals:
+        return dict(ledger)
+    source_rows = {
+        (str(row[0]), str(row[1])): str(row[2])
+        for row in knowledge.connection.execute(
+            "SELECT channel, identifier, contact_id FROM contact_identifiers"
+        )
+    }
+    people = _known_people(knowledge)
+    seen: set[tuple[str, str, str, str]] = set()
+    for index, entry in enumerate(approvals, start=1):
+        try:
+            identifier = Identifier(
+                channel=str(entry["channel"]),
+                kind=str(entry["kind"]),
+                value=str(entry["value"]),
+                namespace=str(entry.get("namespace") or "").strip() or namespace,
+            )
+        except Exception as exc:  # model validation is the validator here
+            raise UpgradeError(
+                "approval_file_invalid",
+                f"approval #{index} is not a valid identifier: {exc}",
+            ) from exc
+        if identifier.full_key in seen:
+            raise UpgradeError(
+                "approval_duplicate", f"approval #{index} repeats an earlier identifier"
+            )
+        seen.add(identifier.full_key)
+        person_id = str(entry["person_id"]).strip()
+        owner = source_rows.get((identifier.channel, identifier.value))
+        if owner is None:
+            raise UpgradeError(
+                "approval_unknown_identifier",
+                f"approval #{index} names an identifier that is not in the v1 snapshot",
+            )
+        if owner != person_id:
+            raise UpgradeError(
+                "approval_mismatch",
+                f"approval #{index} claims an identifier that belongs to another person",
+            )
+        if person_id not in people:
+            raise UpgradeError(
+                "approval_unknown_person",
+                f"approval #{index} names a person that is not in the v1 snapshot",
+            )
+        existing = store.query_one(
+            "SELECT person_id FROM knowledge_identifier_bindings"
+            " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?"
+            " AND status = 'active' LIMIT 1",
+            identifier.full_key,
+        )
+        if existing is not None:
+            raise UpgradeError(
+                "approval_overlaps_existing_binding",
+                f"approval #{index} collides with a binding this upgrade already produced",
+            )
+        operation_id = str(
+            uuid.uuid5(
+                _BINDING_NAMESPACE,
+                "\x1f".join(("approval", digest, *identifier.full_key)),
+            )
+        )
+        store.execute(
+            "INSERT INTO knowledge_identity_ops (operation_id, kind, actor_principal,"
+            " authorization_ref, payload_json, created_ms, undone)"
+            " VALUES (?, 'binding', ?, ?, ?, ?, 0)",
+            (
+                operation_id,
+                actor,
+                digest,
+                json.dumps(
+                    {
+                        "person_id": person_id,
+                        "identifier": [
+                            identifier.channel,
+                            identifier.kind,
+                            identifier.namespace,
+                            identifier.value,
+                        ],
+                        "source": "owner-approval",
+                    },
+                    sort_keys=True,
+                ),
+                created_ms,
+            ),
+        )
+        store.execute(
+            "INSERT INTO knowledge_identifier_bindings (binding_id, channel, kind, namespace,"
+            " value, person_id, status, valid_from_ms, valid_until_ms, observed_at_ms,"
+            " evidence_ref, mapping_verified, revision, created_ms, updated_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'active', 0, 0, 0, ?, 1, 1, ?, ?)",
+            (
+                operation_id,
+                identifier.channel,
+                identifier.kind,
+                identifier.namespace,
+                identifier.value,
+                person_id,
+                # An approval is not a platform observation: the proven period is unknown
+                # (0/0), and the durable op row plus the manifest carry the time and actor.
+                # A wall-clock value here would also make the digest unreproducible.
+                f"binding-op:{operation_id}",
+                created_ms,
+                created_ms,
+            ),
+        )
+        ledger["applied"] += 1
+    ledger["requested"] = len(approvals)
+    return dict(ledger)
+
+
 def _known_people(knowledge: _ReadHandle) -> set[str]:
     if "contacts" not in knowledge.tables:
         return set()
@@ -980,7 +1429,12 @@ def _audit_reason(tokens: tuple[str, ...]) -> str:
 
 
 def _verify_staged(
-    store: KnowledgeStore, knowledge: _ReadHandle, balance: _Balance
+    store: KnowledgeStore,
+    knowledge: _ReadHandle,
+    balance: _Balance,
+    *,
+    approval_digest: str = "",
+    approvals_applied: int = 0,
 ) -> None:
     if not store.integrity_ok():
         raise UpgradeError("staged_integrity_failed", "integrity_check failed on the target")
@@ -1003,6 +1457,33 @@ def _verify_staged(
     )
     if unaccounted:
         raise UpgradeError("binding_balance_broken", "a binding has no cutover class")
+    if approvals_applied:
+        # An approval is a promise to the operator: the durable operation and the active
+        # binding it authorises have to be in the published file, or the upgrade stops.
+        recorded = int(
+            store.scalar(
+                "SELECT COUNT(*) FROM knowledge_identity_ops"
+                " WHERE kind = 'binding' AND authorization_ref = ?",
+                (approval_digest,),
+            )
+            or 0
+        )
+        bound = int(
+            store.scalar(
+                "SELECT COUNT(*) FROM knowledge_identifier_bindings b"
+                " JOIN knowledge_identity_ops o"
+                " ON b.evidence_ref = 'binding-op:' || o.operation_id"
+                " WHERE o.authorization_ref = ? AND b.status = 'active'",
+                (approval_digest,),
+            )
+            or 0
+        )
+        if recorded != approvals_applied or bound != approvals_applied:
+            raise UpgradeError(
+                "approval_not_applied",
+                f"{approvals_applied} approval(s) were applied but the target carries"
+                f" {recorded} operation(s) and {bound} active binding(s)",
+            )
     _require_source_references(store, knowledge)
 
 
@@ -1044,6 +1525,21 @@ def verify_upgrade(*, target: Path, manifest: Path) -> "UpgradeVerification":
         }
         mismatches = _count_mismatches(connection, payload)
         digest = _semantic_digest_connection(connection)
+        approved = payload.get("approvals")
+        approvals_declared = 0
+        approvals_found = 0
+        if isinstance(approved, dict) and int(approved.get("applied") or 0):
+            approvals_declared = int(approved["applied"])
+            digest_ref = str(approved.get("file_digest") or "")
+            approvals_found = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM knowledge_identifier_bindings b"
+                    " JOIN knowledge_identity_ops o"
+                    " ON b.evidence_ref = 'binding-op:' || o.operation_id"
+                    " WHERE o.authorization_ref = ? AND b.status = 'active'",
+                    (digest_ref,),
+                ).fetchone()[0]
+            )
     except sqlite3.DatabaseError as exc:
         raise UpgradeError("target_not_a_database", "target is not a readable database") from exc
     finally:
@@ -1067,6 +1563,7 @@ def verify_upgrade(*, target: Path, manifest: Path) -> "UpgradeVerification":
         balance.person_roles.get(key, 0) for key in role_classes
     )
     counts_match = not mismatches
+    approvals_ok = approvals_found == approvals_declared
     ok = (
         integrity_ok
         and foreign_keys_ok
@@ -1075,6 +1572,7 @@ def verify_upgrade(*, target: Path, manifest: Path) -> "UpgradeVerification":
         and complete
         and digest_ok
         and balance_ok
+        and approvals_ok
     )
     return UpgradeVerification(
         target_path=target_path,
@@ -1086,6 +1584,9 @@ def verify_upgrade(*, target: Path, manifest: Path) -> "UpgradeVerification":
         complete=complete,
         digest_ok=digest_ok,
         balance_ok=balance_ok,
+        approvals_ok=approvals_ok,
+        approvals_declared=approvals_declared,
+        approvals_found=approvals_found,
         verdict="ok" if ok else "failed",
         mismatches=mismatches,
         balance=balance,
@@ -1104,6 +1605,9 @@ class UpgradeVerification:
     digest_ok: bool
     balance_ok: bool
     verdict: str
+    approvals_ok: bool = True
+    approvals_declared: int = 0
+    approvals_found: int = 0
     mismatches: tuple[tuple[str, int, int], ...] = ()
     balance: _Balance = field(default_factory=_Balance)
 
@@ -1187,6 +1691,7 @@ def _manifest_payload(
     created_ms: int,
     source_fingerprint: str,
     semantic_digest: str,
+    approvals: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "upgrade_manifest_version": UPGRADE_MANIFEST_VERSION,
@@ -1221,6 +1726,14 @@ def _manifest_payload(
         "tables": [row for row in outcomes if row["status"] != "absent"],
         "transformed_tables": transformed,
         "cutover": balance.to_payload(),
+        "approvals": approvals
+        or {
+            "file_digest": "",
+            "approved_by": "",
+            "namespace": "",
+            "requested": 0,
+            "applied": 0,
+        },
         "unknown_objects": sorted(
             name
             for name in knowledge.tables
@@ -1300,6 +1813,7 @@ def _balance_from_payload(payload: dict[str, Any]) -> _Balance:
         bindings=_ints("bindings"),
         person_roles=_ints("person_roles"),
         supersessions=_ints("supersessions"),
+        approvals=_ints("approvals"),
     )
 
 

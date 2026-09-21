@@ -10,6 +10,9 @@ The surface is exactly::
     yeoman knowledge migration upgrade-v1  --source V1.db --processing PROCESSING.db \\
                                            --target NEW-V2.db --manifest NEW.json
     yeoman knowledge migration verify-v1   --target NEW-V2.db --manifest NEW.json
+    yeoman knowledge migration propose-bindings --source V1.db --processing PROCESSING.db \
+                                           --out proposals.json
+    yeoman knowledge migration upgrade-v1  ... --binding-approvals proposals.json
 
 Everything here is offline and explicit: no default paths, no provider or bootstrap
 startup, no implicit migration, no gateway and no worker.  Every failure exits non-zero
@@ -42,6 +45,7 @@ from yeoman_gateway.knowledge._migration import (
     verify_target,
 )
 from yeoman_gateway.knowledge._upgrade import (
+    DEFAULT_APPROVAL_NAMESPACE,
     UpgradeError,
     UpgradeInventory,
     UpgradeReport,
@@ -109,6 +113,15 @@ _UPGRADE_REASON_CODES: Final[dict[str, str]] = {
     "binding_balance_broken": "semantics_error",
     "orphan_source_rows": "semantics_error",
     "injected_failure": "semantics_error",
+    # An approval that does not match the snapshot is a decision error, not a source error.
+    "approval_file_missing": "approval_error",
+    "approval_file_invalid": "approval_error",
+    "approval_unknown_identifier": "approval_error",
+    "approval_unknown_person": "approval_error",
+    "approval_mismatch": "approval_error",
+    "approval_duplicate": "approval_error",
+    "approval_overlaps_existing_binding": "approval_error",
+    "approval_not_applied": "semantics_error",
 }
 
 
@@ -201,17 +214,52 @@ def migration_inspect_v1(
         _fail("unsupported_schema", inventory.reason)
 
 
+@migration_app.command("propose-bindings")
+def migration_propose_bindings(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+    out: Path = typer.Option(..., "--out", help="New proposal file for the owner to review"),
+    namespace: str = typer.Option(
+        DEFAULT_APPROVAL_NAMESPACE,
+        "--namespace",
+        help="Platform account namespace the approved bindings carry",
+    ),
+) -> None:
+    """Write a reviewable, private proposal for every legacy identifier (read-only)."""
+    from yeoman_gateway.knowledge._upgrade import propose_bindings
+
+    try:
+        report = propose_bindings(
+            source=source, processing=processing, out=out, namespace=namespace
+        )
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _line(f"proposal: {report.out_path}  (private: it names people and identifiers)")
+    _line(f"entries: {report.total}  with journal evidence: {report.with_journal_evidence}")
+    _line(f"stored role rows covered: {report.role_rows_covered}")
+    _line("nothing was applied: mark entries as approved and pass the file to upgrade-v1")
+
+
 @migration_app.command("upgrade-v1")
 def migration_upgrade_v1(
     source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
     processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
     target: Path = typer.Option(..., "--target", help="New v2 knowledge database to create"),
     manifest: Path = typer.Option(..., "--manifest", help="New upgrade manifest JSON"),
+    binding_approvals: Path | None = typer.Option(
+        None,
+        "--binding-approvals",
+        help="Owner-reviewed proposal file; only entries marked approved are applied",
+    ),
 ) -> None:
     """Build a fresh v2 target from a v1 snapshot.  Never migrates in place."""
     try:
         report = upgrade_v1(
-            source=source, processing=processing, target=target, manifest=manifest
+            source=source,
+            processing=processing,
+            target=target,
+            manifest=manifest,
+            binding_approvals=binding_approvals,
         )
     except UpgradeError as exc:
         _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
@@ -745,7 +793,7 @@ def _print_upgrade_report(report: UpgradeReport) -> None:
         table.add_row(name, str(count))
     console.print(table)
     balance = report.balance.to_payload()
-    for group in ("bindings", "person_roles", "supersessions"):
+    for group in ("bindings", "person_roles", "supersessions", "approvals"):
         rendered = "  ".join(f"{key}={value}" for key, value in balance[group].items())
         _line(f"{group}: {rendered}")
     _line(f"target: {report.target_path}")
@@ -768,6 +816,15 @@ def _print_upgrade_verification(report: UpgradeVerification) -> None:
         _line(f"  {table}: manifest says {expected} rows, target has {actual}")
     _line(f"semantic digest: {'matches manifest' if report.digest_ok else 'differs'}")
     _line(f"cutover balance: {'explains every row' if report.balance_ok else 'incomplete'}")
+    _line(
+        "owner approvals: "
+        + (
+            f"{report.approvals_found} of {report.approvals_declared} applied"
+            if report.approvals_declared
+            else "none declared"
+        )
+        + ("" if report.approvals_ok else "  (MISMATCH)")
+    )
     _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
 
 
