@@ -291,6 +291,9 @@ class WhatsAppChannel(BaseChannel):
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._recent_message_ids: dict[str, float] = {}
+        #: The platform account the bridge currently reports, carried so the identity
+        #: projection can namespace its identifiers.  Empty until the first frame.
+        self._processing_account_id: str = ""
         self._debounce_buffers: dict[str, list[InboundEvent]] = {}
         self._debounce_buffer_bytes: dict[str, int] = {}
         self._debounce_delays: dict[str, float] = {}
@@ -1100,6 +1103,8 @@ class WhatsAppChannel(BaseChannel):
         if not self._valid_root_identity(account_id):
             self._reject_replayable_frame(kind, "missing_account_id")
             return False
+        # The account namespaces every identifier this message produces.
+        self._processing_account_id = str(account_id)
         try:
             valid_observed_at = (
                 not isinstance(observed_at, bool)
@@ -1595,6 +1600,9 @@ class WhatsAppChannel(BaseChannel):
                 "media_kind": event.media_kind,
                 "is_voice": event.media_kind == "audio",
                 "sender_phone_jid": event.sender_phone_jid,
+                # The platform account that observed the message.  It namespaces the
+                # identifier, so two accounts never share one binding by accident.
+                "account_id": self._processing_account_id,
                 "lid_conflict": event.lid_conflict,
             },
         )

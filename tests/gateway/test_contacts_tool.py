@@ -16,13 +16,12 @@ def contacts(tmp_path: Path) -> ContactsService:
 
 
 @pytest.fixture
-def knowledge(contacts: ContactsService, tmp_path: Path):
-    """Public person-knowledge facade with a live delegate onto the legacy contacts.
+def knowledge(tmp_path: Path):
+    """Public person-knowledge facade over a synthetic store.
 
-    The tests keep writing people through the legacy service (that is what the runtime
-    did before the migration).  The knowledge store promotes each unknown identifier on
-    first lookup, so the facade and the legacy store stay consistent without the tests
-    reaching into either store.
+    People are created through the *public* facade with proven platform evidence - the
+    same way a channel adapter creates them.  The tests never write identity rows by
+    hand, because an unproven legacy import is deliberately not a person authority.
     """
     from yeoman_gateway.knowledge.api import open_knowledge_store
     from yeoman_gateway.knowledge.authority import (
@@ -30,8 +29,11 @@ def knowledge(contacts: ContactsService, tmp_path: Path):
         FakeSourceAuthority,
         PolicyMembership,
     )
+    from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 
-    class _PromotingPolicy(FakePolicyAuthority):
+    authority = FakeSourceAuthority()
+
+    class _ToolPolicy(FakePolicyAuthority):
         def admin_actor(self) -> str:
             return "whatsapp:owner"
 
@@ -41,73 +43,50 @@ def knowledge(contacts: ContactsService, tmp_path: Path):
     service = open_knowledge_store(
         tmp_path / "knowledge.db",
         workspace_id="contacts-tool-tests",
-        source_authority=FakeSourceAuthority(),
-        policy_authority=_PromotingPolicy(
+        source_authority=authority,
+        policy_authority=_ToolPolicy(
             admins={"whatsapp:owner"}, capture_actors={"whatsapp:owner"}
         ),
     )
 
-    def promote(contacts_service):
-        for person_id in sorted(set(contacts_service.known_jids.values())):
-            row = contacts_service.store.get_contact(person_id)
-            if row is None:
-                continue
-            service.promote_legacy_person(
-                person_id=person_id,
-                display_name=row.display_name,
-                identifiers=tuple(contacts_service.store.get_identifiers(person_id)),
-                aliases=tuple(contacts_service.store.get_aliases(person_id)),
-                fields=tuple(contacts_service.store.get_fields(person_id)),
-            )
-        for identifier, contact_id in list(contacts_service.known_jids.items()):
-            row = contacts_service.store.get_contact(contact_id)
-            if row is None:
-                continue
-            service.promote_legacy_person(
-                person_id=contact_id,
-                display_name=row.display_name,
-                identifiers=tuple(contacts_service.store.get_identifiers(contact_id)),
-                aliases=tuple(contacts_service.store.get_aliases(contact_id)),
-                fields=tuple(contacts_service.store.get_fields(contact_id)),
-            )
-    promote(contacts)
-    yield service
-    service.close()
+    counter = {"n": 0}
+
+    def issue(value: str, *, kind: str = "phone_jid", name: str | None = None) -> str:
+        """Create or find the person a verified platform observation points at."""
+        counter["n"] += 1
+        observation = TrustedIdentityObservation(
+            identifiers=(Identifier("whatsapp", kind, value, "account-tests"),),
+            evidence_ref=f"tool-observation-{counter['n']}",
+            observed_name=name,
+            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock seam
+        )
+        authority.issue_observation(observation)
+        resolved = service.resolve_observation(observation)
+        assert resolved.person_id, resolved.reason
+        return resolved.person_id
+
+    service.issue_person = issue  # type: ignore[attr-defined]
+    try:
+        yield service
+    finally:
+        service.close()
 
 
 def _promote(knowledge, contacts: ContactsService, *extra_identifiers: str) -> None:
-    """Re-run the legacy-to-knowledge promotion after a test created new people.
+    """Create the people a test just wrote into the legacy contacts store.
 
-    ``extra_identifiers`` are synthetic tokens that a test used directly; they are
-    registered so identifier lookups can find the person without a name guess.
+    The legacy store stays in the picture only for what it still owns in this test - the
+    name/field projections the tool reads back.  Identity comes from the facade, through
+    proven platform evidence, because an unproven legacy import is deliberately not a
+    person authority.
     """
     for person_id in sorted(set(contacts.known_jids.values())):
         row = contacts.store.get_contact(person_id)
         if row is None:
             continue
         knowledge.promote_legacy_person(person_id=person_id, display_name=row.display_name)
-    if extra_identifiers:
-        for person_id in {value for value in contacts.known_jids.values()}:
-            for token in extra_identifiers:
-                if contacts.known_jids.get(token) != person_id:
-                    continue
-                knowledge.bind_identifier_for_migration(
-                    person_id=person_id,
-                    channel="whatsapp",
-                    kind="phone_jid",
-                    value=token,
-                )
-    for identifier, contact_id in list(contacts.known_jids.items()):
-        row = contacts.store.get_contact(contact_id)
-        if row is None:
-            continue
-        knowledge.promote_legacy_person(
-            person_id=contact_id,
-            display_name=row.display_name,
-            identifiers=tuple(contacts.store.get_identifiers(contact_id)),
-            aliases=tuple(contacts.store.get_aliases(contact_id)),
-            fields=tuple(contacts.store.get_fields(contact_id)),
-        )
+    for token in extra_identifiers:
+        knowledge.issue_person(token)
 
 
 @pytest.fixture

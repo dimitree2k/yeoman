@@ -391,3 +391,91 @@ def test_a_message_frame_is_captured_before_the_legacy_path(tmp_path: Path) -> N
 
 async def _passthrough(event):
     return event
+
+
+# ── platform identity carried to the identity middleware ─────────────────────
+#
+# A channel adapter is the only component that may claim a platform mapping.  These
+# tests pin what it hands on: the canonical event id, the account namespace, the phone
+# JID and the LID as separate typed identifiers, the provider's mapping verdict, and the
+# push name as plain text.  A bare sender digit is never promoted to a phone JID.
+
+
+def _to_inbound(channel: WhatsAppChannel, payload: dict):
+    event = channel._parse_inbound_event(payload)  # noqa: SLF001 - adapter projection
+    assert event is not None
+    return event
+
+
+def test_a_phone_and_lid_pair_travels_as_two_typed_identifiers() -> None:
+    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity.db"))
+    event = _to_inbound(
+        channel,
+        {
+            "messageId": "m-1",
+            "chatJid": CHAT,
+            "senderId": "491111111111",
+            "senderPhoneJid": "491111111111@s.whatsapp.net",
+            "participantJid": "99999999999999@lid",
+            "senderName": "Synthetic Push",
+            "timestamp": T0,
+            "text": "synthetic",
+        },
+    )
+    assert event.sender_phone_jid == "491111111111@s.whatsapp.net"
+    assert event.participant_jid == "99999999999999@lid"
+    assert event.sender_name == "Synthetic Push"
+    # The LID and the phone JID stay distinguishable: the LID digits are never used as
+    # the phone number and the phone number is never used as a LID.
+    assert "99999999999999" not in (event.sender_phone_jid or "")
+    assert "@lid" not in (event.sender_phone_jid or "")
+
+
+def test_a_bare_sender_number_does_not_become_a_phone_jid() -> None:
+    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity-bare.db"))
+    event = _to_inbound(
+        channel,
+        {
+            "messageId": "m-2",
+            "chatJid": CHAT,
+            "senderId": "491111111111",
+            "timestamp": T0,
+            "text": "synthetic",
+        },
+    )
+    # No phone JID was issued by the bridge, so the adapter does not invent one.
+    assert event.sender_phone_jid is None
+    assert event.sender_id == "491111111111"
+
+
+def test_a_provider_mapping_conflict_is_preserved_for_the_identity_path() -> None:
+    channel = _channel(ProcessingStore(Path("/tmp") / "signal-identity-conflict.db"))
+    event = _to_inbound(
+        channel,
+        {
+            "messageId": "m-3",
+            "chatJid": CHAT,
+            "senderId": "491111111111",
+            "senderPhoneJid": "491111111111@s.whatsapp.net",
+            "participantJid": "99999999999999@lid",
+            "lidConflict": True,
+            "timestamp": T0,
+            "text": "synthetic",
+        },
+    )
+    assert event.lid_conflict is True
+
+
+def test_the_inbound_metadata_carries_the_identity_inputs(tmp_path: Path) -> None:
+    """The middleware reads these keys; a rename here must fail loudly."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "packages/gateway/yeoman_gateway/channels/whatsapp.py"
+    ).read_text(encoding="utf-8")
+    for key in (
+        '"sender_phone_jid": event.sender_phone_jid',
+        '"participant_lid": event.participant_jid if event.sender_phone_jid else None',
+        '"lid_conflict": event.lid_conflict',
+        '"sender_name": event.sender_name',
+    ):
+        assert key in source, key

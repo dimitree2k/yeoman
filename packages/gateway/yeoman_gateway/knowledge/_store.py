@@ -106,6 +106,7 @@ _CORE_SCHEMA: tuple[str, ...] = (
         supporting_statement_id TEXT,
         evidence_ref TEXT NOT NULL DEFAULT '',
         valid_until_ms INTEGER,
+        mapping_retracted INTEGER NOT NULL DEFAULT 0,
         revision INTEGER NOT NULL DEFAULT 1
     )
     """,

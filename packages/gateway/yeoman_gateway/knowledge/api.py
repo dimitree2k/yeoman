@@ -52,6 +52,7 @@ from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     KnowledgeStats,
     MaintenanceReport,
+    NameObservation,
     PersonLinkCandidate,
     PersonProfile,
     PersonResolution,
@@ -546,6 +547,170 @@ class KnowledgeService:
             return self._identity.undo_merge(
                 operation_id, expected_revision=expected_revision, context=context
             )
+
+    # ── temporal bindings, aliases and platform observations ────────────────
+
+    def resolve_observation(
+        self,
+        observation: TrustedIdentityObservation,
+        *,
+        context: TrustedReadContext | None = None,
+        create_stub: bool = True,
+    ) -> PersonResolution:
+        """Resolve a verified platform observation to exactly one person.
+
+        The public spelling of the identity path.  Ambiguity, an unproven multi-identifier
+        mapping and two people claiming one identifier are results, never a first-match
+        merge.  A verified unknown platform identity may create a stub; model text never
+        reaches this method.
+        """
+        with self._store.transaction():
+            return self._identity.resolve_observation(
+                observation, context=context, create_stub=create_stub
+            )
+
+    def resolve_identifier(
+        self, identifier: Identifier, *, at_ms: int | None = None
+    ) -> EndpointResolution:
+        """Resolve one fully typed identifier, optionally at a proven past instant."""
+        return self._identity.resolve_identifier(identifier, at_ms=at_ms)
+
+    def add_or_end_binding(
+        self,
+        *,
+        person_id: str,
+        identifier: Identifier,
+        evidence_ref: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        mapping_verified: bool = True,
+        valid_from_ms: int | None = None,
+        end_binding_id: str | None = None,
+        end_at_ms: int | None = None,
+    ) -> ChangeReceipt:
+        """Claim, extend or hand over one temporal identifier binding."""
+        with self._store.transaction():
+            return self._identity.add_or_end_binding(
+                person_id=person_id,
+                identifier=identifier,
+                evidence_ref=evidence_ref,
+                mapping_verified=mapping_verified,
+                context=context,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                valid_from_ms=valid_from_ms,
+                end_binding_id=end_binding_id,
+                end_at_ms=end_at_ms,
+            )
+
+    def end_binding(
+        self,
+        *,
+        binding_id: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        end_at_ms: int | None = None,
+    ) -> ChangeReceipt:
+        """End exactly one binding; its proven period stays as history."""
+        with self._store.transaction():
+            return self._identity.end_binding(
+                binding_id=binding_id,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                end_at_ms=end_at_ms,
+            )
+
+    def observe_alias(
+        self,
+        *,
+        person_id: str,
+        name: str,
+        alias_kind: str = "other_name",
+        scope_key: str = "",
+        evidence_ref: str = "",
+        status: str = "observed",
+        address_allowed: bool = False,
+        supporting_statement_id: str | None = None,
+        visibility: str = "public",
+        valid_until_ms: int | None = None,
+        source: str = "observed",
+    ) -> NameObservation:
+        """Record one alias with an explicit kind, context and evidence."""
+        with self._store.transaction():
+            return self._identity.observe_alias(
+                person_id=person_id,
+                name=name,
+                alias_kind=alias_kind,
+                scope_key=scope_key,
+                evidence_ref=evidence_ref,
+                status=status,
+                address_allowed=address_allowed,
+                supporting_statement_id=supporting_statement_id,
+                visibility=visibility,
+                valid_until_ms=valid_until_ms,
+                source=source,
+            )
+
+    def set_alias_preference(
+        self,
+        *,
+        alias_id: int,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        address_allowed: bool = True,
+    ) -> ChangeReceipt:
+        """Make one alias the preferred address in its own context."""
+        with self._store.transaction():
+            return self._identity.set_alias_preference(
+                alias_id=int(alias_id),
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                address_allowed=address_allowed,
+            )
+
+    def retire_alias(
+        self,
+        *,
+        alias_id: int,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        reason: str = "not_wanted",
+        correct_mapping: bool = False,
+    ) -> ChangeReceipt:
+        """Withdraw the addressing permission, or retract the mapping itself."""
+        with self._store.transaction():
+            return self._identity.retire_alias(
+                alias_id=int(alias_id),
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                reason=reason,
+                correct_mapping=correct_mapping,
+            )
+
+    def aliases_of(self, person_id: str) -> tuple[NameObservation, ...]:
+        """Every stored alias of a person, including retired ones (for inspection)."""
+        return self._identity.aliases_of(person_id)
+
+    def address_aliases_of(
+        self, person_id: str, *, scope_key: str | None = None
+    ) -> tuple[NameObservation, ...]:
+        """Aliases that may be used to address a person, preferred first."""
+        return self._identity.address_aliases_of(person_id, scope_key=scope_key)
 
     # ── statement lifecycle ──────────────────────────────────────────────────
 

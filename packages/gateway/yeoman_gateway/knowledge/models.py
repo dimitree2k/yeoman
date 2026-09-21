@@ -541,17 +541,22 @@ class PersonResolution:
 
 @dataclass(frozen=True, slots=True)
 class EndpointResolution:
-    """One proven, permitted delivery endpoint of a person."""
+    """The result of resolving one identifier, or one person's endpoint.
+
+    ``person_id`` is ``None`` whenever there is no proven person to name.  A placeholder
+    id instead would invite a caller to treat "unresolved" as a person.
+    """
 
     status: str
-    person_id: str
+    person_id: str | None
     identifier: Identifier | None
     identity_revision: int
     reason: str
 
     def __post_init__(self) -> None:
         _require_choice(self.status, CHANGE_STATUSES, "status")
-        object.__setattr__(self, "person_id", _require_id(self.person_id, "person_id"))
+        if self.person_id is not None:
+            object.__setattr__(self, "person_id", _require_id(self.person_id, "person_id"))
         object.__setattr__(
             self,
             "identity_revision",
@@ -1248,6 +1253,7 @@ class NameObservation:
     supporting_statement_id: str | None = None
     evidence_ref: str = ""
     valid_until_ms: int | None = None
+    mapping_retracted: bool = False
     revision: int = 1
 
     @property
@@ -1255,10 +1261,20 @@ class NameObservation:
         return self.status == "retired"
 
     @property
+    def findable(self) -> bool:
+        """A retracted *mapping* ("that was never me") also leaves the search.
+
+        Withdrawing the address ("please stop calling me that") does not: the name stays
+        findable inside its existing rights.
+        """
+        return not self.mapping_retracted
+
+    @property
     def usable_as_address(self) -> bool:
         return (
             self.status in ("confirmed", "observed")
             and self.address_allowed
+            and not self.mapping_retracted
             and self.valid_until_ms is None
         )
 
@@ -1319,12 +1335,17 @@ class IdentifierBinding:
         return self.status == "active" and self.valid_until_ms == 0
 
     def covers(self, at_ms: int) -> bool:
-        """True when the proven period contains ``at_ms``.
+        """True when the *proven period* contains ``at_ms``.
 
-        An unknown start (``valid_from_ms == 0``) covers nothing: it is knowledge time,
-        not a proven historical start.
+        A period is half-open ``[start, end)`` and must have a known start: an unknown
+        start is knowledge time, not a proven historical start, so it covers nothing and
+        authorizes nothing retroactively.
+
+        An ``ended`` binding still covers its own past - that is exactly what makes
+        "which person did this number belong to in March?" answerable.  ``conflict`` and
+        ``withheld`` never cover anything, because the mapping itself is unproven.
         """
-        if self.status != "active" or self.valid_from_ms <= 0:
+        if self.status not in ("active", "ended") or self.valid_from_ms <= 0:
             return False
         if at_ms < self.valid_from_ms:
             return False
