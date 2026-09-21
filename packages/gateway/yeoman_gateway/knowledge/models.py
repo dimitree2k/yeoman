@@ -76,6 +76,7 @@ __all__ = [
     "MaintenanceReport",
     "PersonLinkCandidate",
     "PersonProfile",
+    "PersonProfileView",
     "PersonResolution",
     "RecallQuery",
     "SourceRef",
@@ -919,7 +920,41 @@ class KnowledgeContext:
 
 
 @dataclass(frozen=True, slots=True)
+class PersonProfileView:
+    """A deterministic, bounded person card.
+
+    Never a stored document and never a model output: every line is derived from the
+    stored, permitted rows, so the same rows always produce the same card.  ``truncated``
+    marks a bounded selection - the stored values themselves are untouched.
+    """
+
+    person_id: str | None = None
+    display_name: str | None = None
+    card: str = ""
+    statement_ids: tuple[str, ...] = ()
+    source_refs: tuple[SourceRef, ...] = ()
+    attributes: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    aliases: tuple[str, ...] = ()
+    endpoints: tuple[Identifier, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    identity_revision: int = 0
+    acl_epoch: int = 0
+    truncated: bool = False
+    reason: str = "ok"
+    denied_count: int = 0
+
+    @property
+    def entry_count(self) -> int:
+        return len([line for line in self.card.splitlines() if line.strip()])
+
+    @property
+    def empty(self) -> bool:
+        return not self.statement_ids and not self.attributes
+
+
+@dataclass(frozen=True, slots=True)
 class PersonProfile:
+
     """A person plus the knowledge context a reader is allowed to see."""
 
     person: PersonResolution

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from yeoman_gateway.knowledge.models import (
+    KnowledgeError,
     RecallQuery,
     ValidationError,
 )
@@ -253,3 +254,139 @@ def test_profile_uses_the_same_gate_as_recall(knowledge_harness):
     )
     assert h.service.profile(alex, context=denied).context.statement_ids == ()
     assert h.service.profile(alex, context=allowed).context.statement_ids
+
+
+# ── bounded, id-based maintenance (Task 6, §8.2) ─────────────────────────────
+#
+# Maintenance accepts a concrete id, an expected revision, a change type and a trusted
+# authorization.  There is no "fill in the person's field" API and no broad erase on this
+# path, because a free-form writer is exactly how an unproven value becomes a profile.
+
+
+def test_ending_a_facet_supersedes_its_statement_without_deleting_anything(
+    knowledge_harness,
+):
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    candidate = StatementCandidate(
+        content="Alex spielt Tennis.",
+        sources=(source,),
+        people=(
+            PersonLinkCandidate(
+                person_id=alex, role="subject", source=source, attribution="extracted"
+            ),
+        ),
+        attributes=(
+            AttributeCandidate(
+                person_id=alex, attribute_key="hobby", value=AttributeValue("Tennis")
+            ),
+        ),
+        extractor_version="test-extractor-1",
+        confidence=0.5,
+    )
+    statement_id = h.service.capture(candidate, context=h.capture_context(source)).statement_ids[0]
+    assert "Tennis" in h.service.person_profile(alex, context=h.read_context(alex)).card
+
+    h.service.end_attribute(
+        statement_id=statement_id,
+        person_id=alex,
+        attribute_key="hobby",
+        context=h.admin_context(),
+        expected_revision=h.identity_revision(),
+    )
+
+    profile = h.service.person_profile(alex, context=h.read_context(alex))
+    assert "Tennis" not in profile.card
+    # The value is still stored - an end is not a delete - and the audit names the actor.
+    assert h.service._store.scalar(  # noqa: SLF001 - stored value assertion
+        "SELECT COUNT(*) FROM knowledge_person_attributes WHERE statement_id = ?",
+        (statement_id,),
+    ) == 1
+    audit = h.service._store.query_one(  # noqa: SLF001 - audit assertion
+        "SELECT operation, reason FROM knowledge_statement_audit"
+        " WHERE statement_id = ? AND operation = 'end_attribute'",
+        (statement_id,),
+    )
+    assert audit is not None and str(audit["reason"]) == "ended_by_owner"
+
+
+def test_ending_a_facet_requires_owner_and_a_matching_revision(knowledge_harness):
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+        TrustedAdminContext,
+    )
+
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    candidate = StatementCandidate(
+        content="Alex spielt Tennis.",
+        sources=(source,),
+        people=(
+            PersonLinkCandidate(
+                person_id=alex, role="subject", source=source, attribution="extracted"
+            ),
+        ),
+        attributes=(
+            AttributeCandidate(
+                person_id=alex, attribute_key="hobby", value=AttributeValue("Tennis")
+            ),
+        ),
+        extractor_version="test-extractor-1",
+        confidence=0.5,
+    )
+    statement_id = h.service.capture(candidate, context=h.capture_context(source)).statement_ids[0]
+    before = h.snapshot_counts()
+
+    with pytest.raises(KnowledgeError) as excinfo:
+        h.service.end_attribute(
+            statement_id=statement_id,
+            person_id=alex,
+            attribute_key="hobby",
+            context=h.admin_context(),
+            expected_revision=h.identity_revision() - 1,
+        )
+    assert excinfo.value.code == "stale_revision"
+
+    not_owner = TrustedAdminContext(
+        actor_principal="whatsapp:4910000000001",
+        policy_revision=1,
+        authorization_ref="ref",
+        owner=False,
+    )
+    with pytest.raises(KnowledgeError) as excinfo:
+        h.service.end_attribute(
+            statement_id=statement_id,
+            person_id=alex,
+            attribute_key="hobby",
+            context=not_owner,
+        )
+    assert excinfo.value.code == "unauthorized"
+    assert h.snapshot_counts() == before
+
+
+def test_ending_an_unknown_facet_is_refused(knowledge_harness):
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    statement_id = h.capture_text("Alex wohnt in Köln.", source, subjects=(alex,)).statement_ids[0]
+    with pytest.raises(KnowledgeError) as excinfo:
+        h.service.end_attribute(
+            statement_id=statement_id,
+            person_id=alex,
+            attribute_key="residence",
+            context=h.admin_context(),
+            expected_revision=h.identity_revision(),
+        )
+    assert excinfo.value.code == "unresolved"

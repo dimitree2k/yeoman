@@ -249,6 +249,140 @@ def migration_verify_v1(
         _fail("manifest_mismatch", detail)
 
 
+# ── read-only person inspection ──────────────────────────────────────────────
+#
+# These commands open one explicitly named database read-only.  They never start a
+# gateway, never open the live config, never write, and never print row content: counts,
+# ids, statuses and reason codes only.  Content inspection stays behind the authorized
+# runtime paths, because a CLI is not an authorization.
+
+
+def _open_readonly_connection(target: Path):
+    import sqlite3
+
+    path = Path(target).expanduser()
+    if not path.exists():
+        _fail("source_error", f"database does not exist: {path}")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:  # pragma: no cover - defensive
+        _fail("source_error", f"not a readable SQLite database: {path}")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _redacted(value: object) -> str:
+    """A stable, content-free token for a name or identifier."""
+    import hashlib
+
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+@knowledge_app.command("inspect-bindings")
+def knowledge_inspect_bindings(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    status: str = typer.Option("", "--status", help="Only bindings in this status"),
+) -> None:
+    """List identifier bindings with their cutover status.  Values stay redacted."""
+    connection = _open_readonly_connection(target)
+    try:
+        sql = (
+            "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+            " mapping_verified, valid_from_ms, valid_until_ms, evidence_ref"
+            " FROM knowledge_identifier_bindings"
+        )
+        params: tuple = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (str(status),)
+        sql += " ORDER BY channel, kind, namespace, value, binding_id"
+        rows = connection.execute(sql, params).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 binding table")
+    finally:
+        pass
+    _line("identifier bindings (values and person ids redacted)")
+    for row in rows:
+        _line(
+            f"  {row['channel']}/{row['kind']}/{row['namespace']}"
+            f"  value={_redacted(row['value'])}"
+            f"  person={_redacted(row['person_id'])}"
+            f"  status={row['status']}"
+            f"  verified={'yes' if int(row['mapping_verified'] or 0) else 'no'}"
+            f"  valid={int(row['valid_from_ms'] or 0)}..{int(row['valid_until_ms'] or 0)}"
+            f"  evidence={_redacted(row['evidence_ref'])}"
+        )
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[str(row["status"])] = counts.get(str(row["status"]), 0) + 1
+    _line("counts: " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    connection.close()
+
+
+@knowledge_app.command("inspect-roles")
+def knowledge_inspect_roles(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    status: str = typer.Option("", "--status", help="Only roles in this status"),
+) -> None:
+    """List stored person roles with their cutover verdict.  No names, no text."""
+    connection = _open_readonly_connection(target)
+    try:
+        sql = (
+            "SELECT role, status, resolution_reason, COUNT(*) AS n"
+            " FROM knowledge_statement_people"
+        )
+        params: tuple = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (str(status),)
+        sql += " GROUP BY role, status, resolution_reason ORDER BY role, status"
+        rows = connection.execute(sql, params).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 role table")
+    _line("person roles (counts only)")
+    for row in rows:
+        _line(
+            f"  {row['role']}/{row['status']}"
+            f"  reason={row['resolution_reason'] or '-'}"
+            f"  count={int(row['n'])}"
+        )
+    connection.close()
+
+
+@knowledge_app.command("inspect-unresolved")
+def knowledge_inspect_unresolved(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    limit: int = typer.Option(50, "--limit", help="Maximum rows to print"),
+) -> None:
+    """List quarantined and withheld cases: what could not be proven, and why."""
+    connection = _open_readonly_connection(target)
+    try:
+        quarantine = connection.execute(
+            "SELECT source_table, reason, COUNT(*) AS n FROM knowledge_quarantine"
+            " GROUP BY source_table, reason ORDER BY source_table, reason"
+        ).fetchall()
+        withheld = connection.execute(
+            "SELECT resolution_reason, COUNT(*) AS n FROM knowledge_statement_people"
+            " WHERE status <> 'active' GROUP BY resolution_reason ORDER BY resolution_reason"
+            " LIMIT ?",
+            (int(max(1, limit)),),
+        ).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 case tables")
+    _line("unresolved and quarantined cases (counts only)")
+    for row in quarantine:
+        _line(f"  {row['source_table']}  reason={row['reason']}  count={int(row['n'])}")
+    for row in withheld:
+        _line(
+            f"  knowledge_statement_people  reason={row['resolution_reason'] or '-'}"
+            f"  count={int(row['n'])}"
+        )
+    connection.close()
+
+
 @capture_app.command("status")
 def capture_status(    target: Path = typer.Option(
         Path("~/.yeoman/data/knowledge/knowledge.db"),

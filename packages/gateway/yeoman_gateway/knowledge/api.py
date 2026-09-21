@@ -516,6 +516,25 @@ class KnowledgeService:
         checked = self._read_context(context)
         return self._retrieval.profile(person_id, context=checked, view=view)
 
+    def person_profile(
+        self,
+        person_id: str,
+        *,
+        context: TrustedReadContext | None,
+        view: str = "current",
+        history_at_ms: int | None = None,
+    ) -> Any:
+        """The deterministic, bounded person card for one authorized reader.
+
+        Read-only by construction: no backfill, no merge, no model call, nothing stored.
+        ``history_at_ms`` renders the card as of a proven past instant, which only ever
+        shows a ``state_change`` inside its own proven period.
+        """
+        checked = None if context is None else self._read_context(context)
+        return self._retrieval.person_profile(
+            person_id, context=checked, view=view, history_at_ms=history_at_ms
+        )
+
     def revalidate(
         self, result: KnowledgeContext, *, context: TrustedReadContext
     ) -> KnowledgeContext:
@@ -762,6 +781,31 @@ class KnowledgeService:
                 expected_source=expected_source,
                 evidence_ref=evidence_ref,
                 context=context,
+            )
+
+    def end_attribute(
+        self,
+        *,
+        statement_id: str,
+        person_id: str,
+        attribute_key: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        reason: str = "ended_by_owner",
+    ) -> ChangeReceipt:
+        """End one facet by superseding the statement that carries it."""
+        with self._store.transaction():
+            return self._statements.end_attribute(
+                statement_id=statement_id,
+                person_id=person_id,
+                attribute_key=attribute_key,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                reason=reason,
             )
 
     def erase_statement(

@@ -20,7 +20,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from yeoman_gateway.knowledge import _reasons
@@ -31,6 +31,7 @@ from yeoman_gateway.knowledge.models import (
     KnowledgeContext,
     KnowledgeError,
     PersonProfile,
+    PersonProfileView,
     PersonResolution,
     RecallQuery,
     SourceRef,
@@ -600,6 +601,202 @@ class RetrievalEngine:
             RecallQuery(person_ids=(canonical,), limit=20), context=context, view=view
         )
         return PersonProfile(person=resolution, context=result)
+
+    #: Bounds of the profile card.  Both are *entry* bounds: a value is either listed in
+    #: full or not listed at all, and a cut is reported as ``truncated``.
+    MAX_PROFILE_STATEMENTS: int = 20
+    MAX_PROFILE_VALUES_PER_KEY: int = 5
+
+    def person_profile(
+        self,
+        person_id: str,
+        *,
+        context: TrustedReadContext | None,
+        view: str = "current",
+        history_at_ms: int | None = None,
+    ) -> PersonProfileView:
+        """Build the deterministic person card for one authorized reader.
+
+        Nothing is persisted and no model is called.  Without a trusted read context the
+        answer is empty - a profile is not a public document.  Conflicts stay visible
+        without leaking a name the reader may not see, and a bounded selection is marked
+        instead of silently shortened.
+        """
+        if context is None:
+            return PersonProfileView(reason="no_read_context")
+        checked = context if history_at_ms is None else replace(
+            context, now_ms=int(history_at_ms)
+        )
+        decision = self.decide(checked)
+        canonical = self._identity.canonical_id(person_id)
+        person = self._identity.get_person(canonical)
+        if person is None:
+            return PersonProfileView(
+                person_id=None,
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+                reason="unknown_person",
+            )
+        if not decision.allowed:
+            return PersonProfileView(
+                person_id=canonical,
+                identity_revision=self._store.identity_revision,
+                acl_epoch=self._store.acl_epoch,
+                reason=decision.reason,
+            )
+
+        effective_view = view
+        if history_at_ms is not None:
+            effective_view = "historic"
+        recall = self.recall(
+            RecallQuery(person_ids=(canonical,), limit=self.MAX_PROFILE_STATEMENTS),
+            context=checked,
+            view=effective_view,
+        )
+        attributes, attribute_truncated = self._profile_attributes(
+            recall.statement_ids, canonical
+        )
+        aliases = tuple(
+            item.name
+            for item in self._identity.address_aliases_of(
+                canonical, scope_key=checked.scope_key()
+            )
+        )
+        endpoints = self._profile_endpoints(canonical, checked)
+        lines = self._profile_lines(
+            display_name=self._identity.display_name(
+                canonical, context=checked, for_group=not checked.is_direct
+            ),
+            aliases=aliases,
+            endpoints=endpoints,
+            attributes=attributes,
+            statement_ids=recall.statement_ids,
+            reported=self._reported_statement_ids(recall.statement_ids),
+        )
+        return PersonProfileView(
+            person_id=canonical,
+            display_name=self._identity.display_name(
+                canonical, context=checked, for_group=not checked.is_direct
+            ),
+            card="\n".join(lines),
+            statement_ids=recall.statement_ids,
+            source_refs=recall.source_refs,
+            attributes=attributes,
+            aliases=aliases,
+            endpoints=endpoints,
+            conflicts=self._profile_conflicts(attributes),
+            identity_revision=self._store.identity_revision,
+            acl_epoch=self._store.acl_epoch,
+            truncated=attribute_truncated
+            or len(recall.statement_ids) >= self.MAX_PROFILE_STATEMENTS,
+            reason="ok" if lines else "empty",
+            denied_count=recall.denied_count,
+        )
+
+    def _profile_attributes(
+        self, statement_ids: tuple[str, ...], person_id: str
+    ) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], bool]:
+        """Facets of the permitted statements, grouped and bounded per key."""
+        if not statement_ids:
+            return (), False
+        placeholders = ",".join("?" for _ in statement_ids)
+        rows = self._store.query(
+            "SELECT a.attribute_key, a.value_json, a.polarity"
+            " FROM knowledge_person_attributes a"
+            f" WHERE a.statement_id IN ({placeholders}) AND a.person_id = ?"
+            " ORDER BY a.attribute_key, a.value_key, a.polarity",
+            (*statement_ids, person_id),
+        )
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["value_json"]))
+            except ValueError:  # pragma: no cover - a corrupt row is not a reader error
+                continue
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                continue
+            if str(row["polarity"]) == "negative":
+                text = f"nicht {text}"
+            bucket = grouped.setdefault(str(row["attribute_key"]), [])
+            if text not in bucket:
+                bucket.append(text)
+        truncated = any(
+            len(values) > self.MAX_PROFILE_VALUES_PER_KEY for values in grouped.values()
+        )
+        return (
+            tuple(
+                (key, tuple(values[: self.MAX_PROFILE_VALUES_PER_KEY]))
+                for key, values in sorted(grouped.items())
+            ),
+            truncated,
+        )
+
+    def _profile_endpoints(self, person_id: str, context: TrustedReadContext) -> tuple[Any, ...]:
+        """Proven, permitted contact ways.  Never a guessed or legacy address."""
+        out: list[Any] = []
+        for channel in ("whatsapp", "telegram"):
+            resolution = self._identity.resolve_endpoint(person_id, channel)
+            if resolution.status == "resolved" and resolution.identifier is not None:
+                out.append(resolution.identifier)
+        return tuple(out)
+
+    def _reported_statement_ids(self, statement_ids: tuple[str, ...]) -> frozenset[str]:
+        """Statements whose value was reported by somebody else, not self-stated."""
+        if not statement_ids:
+            return frozenset()
+        placeholders = ",".join("?" for _ in statement_ids)
+        rows = self._store.query(
+            "SELECT statement_id, COUNT(DISTINCT person_id) AS people,"
+            " SUM(CASE WHEN role = 'reported_speaker' THEN 1 ELSE 0 END) AS reported"
+            " FROM knowledge_statement_people"
+            f" WHERE statement_id IN ({placeholders}) AND status = 'active'"
+            " GROUP BY statement_id",
+            tuple(statement_ids),
+        )
+        return frozenset(
+            str(row["statement_id"])
+            for row in rows
+            if int(row["reported"]) > 0
+        )
+
+    def _profile_lines(
+        self,
+        *,
+        display_name: str | None,
+        aliases: tuple[str, ...],
+        endpoints: tuple[Any, ...],
+        attributes: tuple[tuple[str, tuple[str, ...]], ...],
+        statement_ids: tuple[str, ...],
+        reported: frozenset[str],
+    ) -> list[str]:
+        """Assemble the card.  Order is fixed, so two reads of the same rows agree."""
+        lines: list[str] = []
+        if display_name:
+            lines.append(f"name: {display_name}")
+        if aliases:
+            lines.append("aliases: " + ", ".join(aliases))
+        if endpoints:
+            lines.append(
+                "contact: " + ", ".join(f"{item.channel}:{item.kind}" for item in endpoints)
+            )
+        for key, values in attributes:
+            lines.append(f"{key}: " + ", ".join(values))
+        for statement_id in statement_ids:
+            row = self._store.query_one(
+                "SELECT n.content FROM memory2_nodes n WHERE n.id = ?", (statement_id,)
+            )
+            content = "" if row is None else str(row["content"] or "").strip()
+            if not content:
+                continue
+            lines.append(f"reported: {content}" if statement_id in reported else content)
+        return lines
+
+    def _profile_conflicts(
+        self, attributes: tuple[tuple[str, tuple[str, ...]], ...]
+    ) -> tuple[str, ...]:
+        """Attribute groups that carry more than one value: visible, never resolved here."""
+        return tuple(key for key, values in attributes if len(values) > 1)
 
     def revalidate(
         self, result: KnowledgeContext, *, context: TrustedReadContext

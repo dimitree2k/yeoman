@@ -535,3 +535,76 @@ def _alias_id(h, person_id: str, name: str) -> int:
     )
     assert row is not None, f"no alias {name!r} for {person_id}"
     return int(row["id"])
+
+
+def test_readonly_cli_inspection_redacts_values_and_never_writes(tmp_path: Path):
+    """A CLI is not an authorization: it prints counts, statuses and redacted tokens."""
+    import hashlib
+
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.knowledge_commands import knowledge_app
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import (
+        EvidenceAudience,
+        FakePolicyAuthority,
+        FakeSourceAuthority,
+    )
+    from yeoman_gateway.knowledge.models import (
+        Identifier,
+        SourceRef,
+        TrustedIdentityObservation,
+    )
+
+    db = tmp_path / "knowledge.db"
+    authority = FakeSourceAuthority()
+    service = open_knowledge_store(
+        db,
+        workspace_id="cli-inspect-tests",
+        source_authority=authority,
+        policy_authority=FakePolicyAuthority(
+            admins={"whatsapp:4910000000001"}, capture_actors={"whatsapp:4910000000001"}
+        ),
+    )
+    observation = TrustedIdentityObservation(
+        identifiers=(Identifier("whatsapp", "phone_jid", "49182222222@s.whatsapp.net", "acc"),),
+        evidence_ref="cli-observation-1",
+    )
+    authority.issue_observation(observation)
+    resolved = service.resolve_observation(observation)
+    assert resolved.person_id
+    source = SourceRef(
+        event_id="cli-event-1",
+        revision=1,
+        channel="whatsapp",
+        chat_id="group-a",
+        author_principal="whatsapp:49182222222",
+        occurred_at_ms=1,
+    )
+    authority.issue_source(source, EvidenceAudience.known({"whatsapp:49182222222"}))
+    service.close()
+
+    before = db.read_bytes()
+    runner = CliRunner()
+    for command, title in (
+        ("inspect-bindings", "identifier bindings"),
+        ("inspect-roles", "person roles"),
+        ("inspect-unresolved", "unresolved and quarantined"),
+    ):
+        result = runner.invoke(knowledge_app, [command, "--target", str(db)])
+        assert result.exit_code == 0, (command, result.output)
+        assert title in result.output
+        # No identifier value and no person id is ever printed verbatim.
+        assert "49182222222" not in result.output
+        assert str(resolved.person_id) not in result.output
+    # The report is still checkable: every value appears as a stable, redacted token.
+    import re
+
+    bindings_output = runner.invoke(
+        knowledge_app, ["inspect-bindings", "--target", str(db)]
+    ).output
+    assert re.search(r"\b[0-9a-f]{12}\b", bindings_output)
+    # The redaction is a one-way token of the value, not the value itself.
+    token = hashlib.sha256(b"49182222222@s.whatsapp.net").hexdigest()[:12]
+    assert f"value={token}" in bindings_output
+    # Read-only means read-only.
+    assert db.read_bytes() == before

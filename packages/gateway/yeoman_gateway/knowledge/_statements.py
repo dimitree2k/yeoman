@@ -21,6 +21,7 @@ from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._reasons import (
     SUPERSESSION_CORRECTION,
     SUPERSESSION_QUALITY_REJECTED,
+    SUPERSESSION_STATE_CHANGE,
     SUPERSESSION_UNKNOWN,
 )
 from yeoman_gateway.knowledge._store import KnowledgeStore
@@ -1119,6 +1120,68 @@ class StatementEngine:
             identity_revision=self._store.bump_identity_revision(),
             acl_epoch=self._store.bump_acl_epoch(),
             changed_ids=(statement_id,),
+        )
+
+    def end_attribute(
+        self,
+        *,
+        statement_id: str,
+        person_id: str,
+        attribute_key: str,
+        expected_revision: int,
+        context: TrustedAdminContext,
+        reason: str = "ended_by_owner",
+    ) -> ChangeReceipt:
+        """End one facet by superseding its statement, never by deleting the value.
+
+        The only way to end a facet is to end the statement that carries it, which is what
+        keeps "the annotation is part of the assertion" true: the text, the sources and
+        the audience stay, the row stops being a current value, and an authorized diagnosis
+        can still see why.
+        """
+        if not context.owner:
+            raise KnowledgeError("unauthorized", "admin context lacks owner authority")
+        self._policy.require_admin(context)
+        if int(expected_revision) != self._store.identity_revision:
+            raise KnowledgeError("stale_revision", "identity revision changed")
+        record = self.get_statement(statement_id)
+        if record is None:
+            raise KnowledgeError("unresolved", f"unknown statement: {statement_id}")
+        if record.status in ("revoked",):
+            raise KnowledgeError("source_revoked", "cannot end a revoked statement")
+        facet = self._store.query_one(
+            "SELECT COUNT(*) AS n FROM knowledge_person_attributes"
+            " WHERE statement_id = ? AND person_id = ? AND attribute_key = ?",
+            (str(statement_id), str(person_id), str(attribute_key)),
+        )
+        if facet is None or not int(facet["n"]):
+            raise KnowledgeError("unresolved", "no such attribute on this statement")
+        ts = now_ms()
+        # Status and reason together, and no invented successor: an ended attribute is a
+        # state change of the *claim*, not a correction of the person.
+        self._set_status(
+            statement_id,
+            status="superseded",
+            ts=ts,
+            superseded_by=None,
+            supersession_reason=SUPERSESSION_STATE_CHANGE,
+        )
+        self.audit(
+            statement_id,
+            operation="end_attribute",
+            actor=context.actor_principal,
+            evidence_ref=context.authorization_ref,
+            reason=str(reason),
+            detail={"person_id": str(person_id), "attribute_key": str(attribute_key)},
+            ts=ts,
+        )
+        operation_id = self._store.new_id()
+        revision = self._store.bump_identity_revision()
+        return ChangeReceipt(
+            operation_id=operation_id,
+            identity_revision=revision,
+            acl_epoch=self._store.acl_epoch,
+            changed_ids=(str(statement_id), self._identity.canonical_id(str(person_id))),
         )
 
     def erase_statement(
