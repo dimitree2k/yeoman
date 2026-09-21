@@ -1660,15 +1660,19 @@ def test_sqlite_claim_serializes_effect_across_processes(tmp_path: Path) -> None
         for _ in range(2)
     ]
 
+    # Generous timeouts on purpose: this test spawns two real interpreter processes, and
+    # on a loaded host (or a Pi) a 3 s startup budget makes it fail for load, not for
+    # behaviour.  It guards duplicate-effect suppression, so it has to stay meaningful
+    # rather than flaky.
     with FakeUnixGateway(socket_path, _success) as gateway:
         for process in processes:
             process.start()
         for _ in processes:
-            assert ready.get(timeout=3) is True
+            assert ready.get(timeout=30) is True
         start.set()
-        responses = [results.get(timeout=5) for _ in processes]
+        responses = [results.get(timeout=30) for _ in processes]
         for process in processes:
-            process.join(5)
+            process.join(30)
             assert process.exitcode == 0
 
     assert responses[0]["result"]["task"] == responses[1]["result"]["task"]
