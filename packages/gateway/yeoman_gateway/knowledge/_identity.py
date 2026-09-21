@@ -123,11 +123,19 @@ class IdentityEngine:
                 out.append(canonical)
         return tuple(out)
 
-    def people_for_statement(self, statement_id: str) -> tuple[tuple[str, str, str, int], ...]:
-        """Raw role edges of a statement: (person_id, role, evidence_event, revision)."""
+    def people_for_statement(
+        self, statement_id: str, *, roles_only_active: bool = True
+    ) -> tuple[tuple[str, str, str, int], ...]:
+        """Raw role edges of a statement: (person_id, role, evidence_event, revision).
+
+        A ``withheld`` role is history: it stays stored so the cutover is auditable, but
+        it never names a person on a read path.
+        """
+        status_clause = " AND status = 'active'" if roles_only_active else ""
         rows = self._store.query(
             "SELECT person_id, role, evidence_source_id, evidence_revision"
             " FROM knowledge_statement_people WHERE statement_id = ?"
+            f"{status_clause}"
             " ORDER BY person_id, role, evidence_source_id, evidence_revision",
             (str(statement_id),),
         )
@@ -150,7 +158,7 @@ class IdentityEngine:
         placeholders = ",".join("?" for _ in statement_ids)
         sql = (
             "SELECT DISTINCT statement_id, person_id, role FROM knowledge_statement_people"
-            f" WHERE statement_id IN ({placeholders})"
+            f" WHERE statement_id IN ({placeholders}) AND status = 'active'"
         )
         params: list[Any] = [str(item) for item in statement_ids]
         if roles:
@@ -181,7 +189,8 @@ class IdentityEngine:
         role_placeholders = ",".join("?" for _ in roles)
         rows = self._store.query(
             "SELECT DISTINCT person_id FROM knowledge_statement_people"
-            f" WHERE person_id IN ({placeholders}) AND role IN ({role_placeholders})",
+            f" WHERE person_id IN ({placeholders}) AND role IN ({role_placeholders})"
+            " AND status = 'active'",
             (*canonical, *roles),
         )
         allowed = {self.canonical_id(str(row["person_id"])) for row in rows}

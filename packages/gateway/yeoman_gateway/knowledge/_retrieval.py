@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from yeoman_gateway.knowledge import _reasons
 from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._statements import StatementEngine
 from yeoman_gateway.knowledge._store import KnowledgeStore
@@ -38,6 +39,108 @@ from yeoman_gateway.knowledge.models import (
 )
 
 MAX_CONTEXT_CHARS = 4000
+
+#: The four reasons live in :mod:`yeoman_gateway.knowledge._reasons` so the writers and
+#: the readers share one vocabulary without an import cycle.
+SUPERSESSION_STATE_CHANGE: str = _reasons.SUPERSESSION_STATE_CHANGE
+SUPERSESSION_CORRECTION: str = _reasons.SUPERSESSION_CORRECTION
+SUPERSESSION_QUALITY_REJECTED: str = _reasons.SUPERSESSION_QUALITY_REJECTED
+SUPERSESSION_UNKNOWN: str = _reasons.SUPERSESSION_UNKNOWN
+
+#: The one read contract.  Every public reader resolves to exactly one of these views,
+#: so profile, recall, roster, FTS/hybrid and model context can never disagree about a
+#: status.  See the design table in §7.5.
+STATEMENT_VIEWS: tuple[str, ...] = (
+    "current",
+    "historic",
+    "correction_audit",
+    "diagnosis",
+)
+
+#: A single-row predicate: true exactly when a statement contributes to a *current*
+#: value.  Used as the final post-filter on rows a reader already selected.
+CURRENT_STATEMENT_SQL: str = (
+    "s.status IN ('assertion','confirmed','expired')"
+    " AND s.revoked_at_ms IS NULL"
+    " AND s.superseded_by IS NULL"
+)
+
+#: A single-row predicate for the historical view, bound to two parameters
+#: (``at_ms``, ``at_ms``).  It asks one question - "does the proven period contain this
+#: instant?" - and the period is half-open ``[start, end)``: reading exactly at its start
+#: shows the value, reading at its end does not.  A period with an unknown start is never
+#: a proof of the past, so ``valid_from_ms > 0`` is part of the condition.
+HISTORIC_STATEMENT_SQL: str = (
+    "s.status = 'superseded'"
+    " AND s.superseded_by IS NULL"
+    " AND s.supersession_reason = 'state_change'"
+    " AND s.revoked_at_ms IS NULL"
+    " AND s.valid_from_ms > 0"
+    " AND s.valid_from_ms < ?"
+    " AND (s.valid_until_ms IS NULL OR s.valid_until_ms > ?)"
+)
+
+#: ``revoked`` never appears, in any view: not even a diagnosis path lifts a source
+#: revocation.  Everything else a diagnosis may see, because it is the audit surface.
+DIAGNOSIS_STATEMENT_SQL: str = "s.status <> 'revoked' AND s.revoked_at_ms IS NULL"
+
+
+def statement_visibility_clause(
+    view: str, *, at_ms: int = 0
+) -> tuple[str, tuple[Any, ...]]:
+    """The shared status/reason predicate for one read view, plus its bound parameters.
+
+    Returns a SQL fragment over the alias ``s`` and the parameters it needs, so a reader
+    can splice it into its own candidate query instead of re-deriving the rules.
+    """
+    if view not in STATEMENT_VIEWS:
+        raise ValidationError(f"unknown statement view: {view!r}")
+    if view == "current":
+        return CURRENT_STATEMENT_SQL, ()
+    if view == "historic":
+        return HISTORIC_STATEMENT_SQL, (int(at_ms), int(at_ms))
+    if view == "correction_audit":
+        return (
+            "s.status = 'superseded' AND s.superseded_by IS NULL"
+            " AND s.supersession_reason = 'correction'"
+            " AND s.revoked_at_ms IS NULL",
+            (),
+        )
+    return DIAGNOSIS_STATEMENT_SQL, ()
+
+
+def row_is_visible(view: str, row: Any, *, at_ms: int = 0) -> bool:
+    """Python twin of :func:`statement_visibility_clause`, for already-loaded rows.
+
+    Both spellings exist on purpose: SQL reduces the candidate set, and this check
+    decides the final answer on the row that is actually about to be handed out.
+    """
+    if view not in STATEMENT_VIEWS:
+        raise ValidationError(f"unknown statement view: {view!r}")
+    status = str(row["status"] or "")
+    revoked = row["revoked_at_ms"] is not None
+    superseded_by = row["superseded_by"] is not None
+    if revoked or status == "revoked":
+        return False
+    if view == "diagnosis":
+        return True
+    if status in ("assertion", "confirmed", "expired"):
+        return not superseded_by
+    if status != "superseded" or superseded_by:
+        return False
+    reason = str(row["supersession_reason"] or SUPERSESSION_UNKNOWN)
+    if view == "current":
+        return False
+    if view == "correction_audit":
+        return reason == SUPERSESSION_CORRECTION
+    # Historical: only a proven state change, and only inside its proven period.
+    if reason != SUPERSESSION_STATE_CHANGE:
+        return False
+    start = int(row["valid_from_ms"] or 0)
+    if start <= 0 or start >= int(at_ms):
+        return False
+    until = row["valid_until_ms"]
+    return until is None or int(until) > int(at_ms)
 
 
 def now_ms() -> int:
@@ -119,28 +222,47 @@ class RetrievalEngine:
 
     # ── candidate selection ──────────────────────────────────────────────────
 
-    def _gate_clause(self, context: TrustedReadContext, decision: ReadDecision) -> tuple[str, list[Any]]:
+    def _read_time_ms(self, context: TrustedReadContext, view: str) -> int:
+        """The instant a view is evaluated at.
+
+        A historical read is evaluated *at* the requested instant, so a statement whose
+        proven period contains that instant stays visible even though it has since been
+        replaced.  Every other view is evaluated now.
+        """
+        if view == "historic":
+            return int(context.now_ms)
+        return int(context.now_ms)
+
+    def _gate_clause(
+        self,
+        context: TrustedReadContext,
+        decision: ReadDecision,
+        *,
+        view: str = "current",
+    ) -> tuple[str, list[Any]]:
         """SQL candidate filter: status, validity, revocation, source chat, audience.
 
         The statement must belong to the requested chat scope and *every* verified
         recipient must be named in its audience.  Role edges never widen this: a
-        participant is not a reader.
+        participant is not a reader.  The status/reason rules come from the one shared
+        contract in :func:`statement_visibility_clause`; nothing here re-derives them.
         """
         recipients = self._acl_principals(decision)
+        at_ms = self._read_time_ms(context, view)
+        visibility, visibility_params = statement_visibility_clause(view, at_ms=at_ms)
         clauses = [
             "s.workspace_id = ?",
             "s.scope_key = ?",
-            "s.status IN ('assertion','confirmed')",
-            "s.revoked_at_ms IS NULL",
-            "s.superseded_by IS NULL",
+            f"({visibility})",
             "(s.valid_until_ms IS NULL OR s.valid_until_ms > ?)",
             "(s.valid_from_ms <= ?)",
         ]
         params: list[Any] = [
             self.workspace_id,
             context.scope_key(),
-            int(context.now_ms),
-            int(context.now_ms),
+            *visibility_params,
+            at_ms,
+            at_ms,
         ]
         # author_only means "only the author reads this" - never "nobody".  Status,
         # expiry and revocation were already checked above for every scope.
@@ -211,20 +333,23 @@ class RetrievalEngine:
             role_placeholders = ",".join("?" for _ in roles)
             role_sql = f" AND kp.role IN ({role_placeholders})"
             params.extend(roles)
+        # Only an active role links a statement to a person: a withheld cutover row must
+        # not make a statement discoverable through a person filter.
         clause = (
             "EXISTS (SELECT 1 FROM knowledge_statement_people kp"
             f" WHERE kp.statement_id = s.statement_id AND kp.person_id IN ({placeholders})"
+            " AND kp.status = 'active'"
             f"{role_sql})"
         )
         return clause, params
 
     def candidates(
-        self, query: RecallQuery, *, context: TrustedReadContext
+        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
     ) -> tuple[CandidateRows, ReadDecision]:
         decision = self.decide(context)
         if not decision.allowed:
             return CandidateRows((), 0), decision
-        clauses, params = self._gate_clause(context, decision)
+        clauses, params = self._gate_clause(context, decision, view=view)
         person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
         if person_clause:
             clauses = f"{clauses} AND {person_clause}"
@@ -266,14 +391,18 @@ class RetrievalEngine:
             or 0
         )
         person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
+        visibility, visibility_params = statement_visibility_clause("current")
         sql = (
             "SELECT COUNT(*) FROM knowledge_statements s"
-            " WHERE s.workspace_id = ? AND s.scope_key = ? AND s.revoked_at_ms IS NULL"
-            " AND s.superseded_by IS NULL"
-            " AND s.status IN ('assertion','confirmed')"
+            f" WHERE s.workspace_id = ? AND s.scope_key = ? AND ({visibility})"
             " AND (s.valid_until_ms IS NULL OR s.valid_until_ms > ?)"
         )
-        bound: list[Any] = [self.workspace_id, context.scope_key(), int(context.now_ms)]
+        bound: list[Any] = [
+            self.workspace_id,
+            context.scope_key(),
+            *visibility_params,
+            int(context.now_ms),
+        ]
         if person_clause:
             sql += f" AND {person_clause}"
             bound.extend(person_params)
@@ -317,8 +446,10 @@ class RetrievalEngine:
 
     # ── public read operations ───────────────────────────────────────────────
 
-    def recall(self, query: RecallQuery, *, context: TrustedReadContext) -> KnowledgeContext:
-        rows, decision = self.candidates(query, context=context)
+    def recall(
+        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+    ) -> KnowledgeContext:
+        rows, decision = self.candidates(query, context=context, view=view)
         if not decision.allowed:
             return KnowledgeContext(
                 text="",
@@ -329,8 +460,8 @@ class RetrievalEngine:
                 context_revision=self.context_revision(context, decision, ()),
                 reason=decision.reason,
             )
-        allowed_ids = self._recheck_ids(rows.statement_ids, context, decision)
-        text, source_refs = self._render(allowed_ids, context, decision)
+        allowed_ids = self._recheck_ids(rows.statement_ids, context, decision, view=view)
+        text, source_refs = self._render(allowed_ids, context, decision, view=view)
         revision = self.context_revision(context, decision, allowed_ids)
         return KnowledgeContext(
             text=text,
@@ -436,7 +567,9 @@ class RetrievalEngine:
         )
         return tuple(str(row["node_id"]) for row in rows)
 
-    def profile(self, person_id: str, *, context: TrustedReadContext) -> PersonProfile:
+    def profile(
+        self, person_id: str, *, context: TrustedReadContext, view: str = "current"
+    ) -> PersonProfile:
         """Profile projection: person plus the statements this reader may see."""
         decision = self.decide(context)
         canonical = self._identity.canonical_id(person_id)
@@ -463,7 +596,9 @@ class RetrievalEngine:
                     acl_epoch=self._store.acl_epoch,
                 ),
             )
-        result = self.recall(RecallQuery(person_ids=(canonical,), limit=20), context=context)
+        result = self.recall(
+            RecallQuery(person_ids=(canonical,), limit=20), context=context, view=view
+        )
         return PersonProfile(person=resolution, context=result)
 
     def revalidate(
@@ -524,12 +659,21 @@ class RetrievalEngine:
         )
 
     def _recheck_ids(
-        self, statement_ids: tuple[str, ...], context: TrustedReadContext, decision: ReadDecision
+        self,
+        statement_ids: tuple[str, ...],
+        context: TrustedReadContext,
+        decision: ReadDecision,
+        *,
+        view: str = "current",
     ) -> tuple[str, ...]:
-        """Final id recheck with *current* rows, immediately before rendering."""
+        """Final id recheck with *current* rows, immediately before rendering.
+
+        This is where a revocation or a rights change that happened while the answer was
+        being prepared wins over the already-selected candidates.
+        """
         if not decision.allowed or not statement_ids:
             return ()
-        clauses, params = self._gate_clause(context, decision)
+        clauses, params = self._gate_clause(context, decision, view=view)
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
             f"SELECT s.statement_id FROM knowledge_statements s"
@@ -544,18 +688,31 @@ class RetrievalEngine:
         statement_ids: tuple[str, ...],
         context: TrustedReadContext,
         decision: ReadDecision,
+        *,
+        view: str = "current",
     ) -> tuple[str, tuple[SourceRef, ...]]:
-        """Render permitted statements with eligible names.  Evidence ids stay structured."""
+        """Render permitted statements with eligible names.  Evidence ids stay structured.
+
+        Text is only ever read for ids that survived the gate *and* a fresh recheck, and
+        only active person roles supply labels: a withheld role never names anybody.
+        """
         if not statement_ids:
             return "", ()
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
-            "SELECT s.statement_id, s.status, n.content FROM knowledge_statements s"
+            "SELECT s.statement_id, s.status, s.superseded_by, s.supersession_reason,"
+            " s.valid_from_ms, s.valid_until_ms, s.revoked_at_ms, n.content"
+            " FROM knowledge_statements s"
             " JOIN memory2_nodes n ON n.id = s.statement_id"
             f" WHERE s.statement_id IN ({placeholders})",
             tuple(statement_ids),
         )
-        contents = {str(row["statement_id"]): str(row["content"] or "") for row in rows}
+        at_ms = self._read_time_ms(context, view)
+        contents = {
+            str(row["statement_id"]): str(row["content"] or "")
+            for row in rows
+            if row_is_visible(view, row, at_ms=at_ms)
+        }
         people = self._identity.person_ids_for_statements(statement_ids)
         names: dict[str, str | None] = {}
         lines: list[str] = []

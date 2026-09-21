@@ -474,9 +474,18 @@ class KnowledgeService:
         with self._store.transaction():
             return self._statements.capture(candidate, context=context)
 
-    def recall(self, query: RecallQuery, *, context: TrustedReadContext) -> KnowledgeContext:
+    def recall(
+        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+    ) -> KnowledgeContext:
+        """Recall under the one shared read contract.
+
+        ``view`` selects the contract row of §7.5: ``current`` (the default), ``historic``
+        (a proven earlier period of a ``state_change``), ``correction_audit`` (retracted
+        claims, for an authorized correction history) or ``diagnosis`` (authorized
+        inspection, still never ``revoked`` content).
+        """
         checked = self._read_context(context)
-        return self._retrieval.recall(query, context=checked)
+        return self._retrieval.recall(query, context=checked, view=view)
 
     def recall_hybrid(
         self,
@@ -500,9 +509,11 @@ class KnowledgeService:
             preprocessing_version=preprocessing_version,
         )
 
-    def profile(self, person_id: str, *, context: TrustedReadContext) -> PersonProfile:
+    def profile(
+        self, person_id: str, *, context: TrustedReadContext, view: str = "current"
+    ) -> PersonProfile:
         checked = self._read_context(context)
-        return self._retrieval.profile(person_id, context=checked)
+        return self._retrieval.profile(person_id, context=checked, view=view)
 
     def revalidate(
         self, result: KnowledgeContext, *, context: TrustedReadContext
@@ -1523,31 +1534,30 @@ class KnowledgeService:
         return self._identity.search_by_name(name, context=context)
 
     def person_facts(
-        self, person_id: str, *, context: TrustedReadContext | None = None
+        self,
+        person_id: str,
+        *,
+        context: TrustedReadContext | None = None,
+        limit: int = 50,
     ) -> tuple[tuple[str, str, str | None], ...]:
         """Released profile facts of a person: (kind, value, label).
 
-        This is a projection over permitted statements, never a copy stored in a
-        contact field.
+        A projection over permitted statements, never a copy stored in a contact field -
+        and never a bypass around the read gate.  Without a trusted read context there is
+        no answer at all: the previous version happily returned raw rows for any caller,
+        which is exactly the "some recall exists somewhere" hole this contract closes.
         """
-        rows = self._store.query(
-            "SELECT statement_id, status FROM knowledge_statements"
-            " WHERE speaker_person_id = ? OR statement_id IN"
-            " (SELECT statement_id FROM knowledge_statement_people WHERE person_id = ?)"
-            " ORDER BY created_ms DESC LIMIT 50",
-            (str(person_id), str(person_id)),
+        if context is None:
+            return ()
+        checked = self._read_context(context)
+        bounded = max(1, min(int(limit), 50))
+        result = self.recall(
+            RecallQuery(person_ids=(person_id,), limit=bounded), context=checked
         )
+        if not result.statement_ids:
+            return ()
         facts: list[tuple[str, str, str | None]] = []
-        for row in rows:
-            statement_id = str(row["statement_id"])
-            readable = True
-            if context is not None:
-                readable = bool(
-                    self.recall(RecallQuery(person_ids=(person_id,), limit=50), context=context)
-                    .statement_ids
-                )
-            if not readable:
-                continue
+        for statement_id in result.statement_ids:
             summary = self._statements.get_statement(statement_id)
             if summary is None or not summary.content:
                 continue

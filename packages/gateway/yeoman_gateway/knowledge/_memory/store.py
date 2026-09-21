@@ -2043,16 +2043,48 @@ class MemoryStore:
         }
 
     def reindex(self) -> None:
+        """Rebuild the lexical index without resurrecting a locked statement.
+
+        An index rebuild is a maintenance operation, not an amnesty: a row that a reader
+        may not see (superseded, revoked, expired) must not reappear in the index either,
+        because the index is also what a later re-derivation trusts.  When the store
+        carries the knowledge tables the lock is applied; on a bare memory database the
+        legacy behaviour is unchanged.
+        """
         with self._lock:
             self._conn.execute("DELETE FROM memory2_nodes_fts")
-            self._conn.execute(
-                """
-                INSERT INTO memory2_nodes_fts (entry_id, content)
-                SELECT id, content_norm
-                FROM memory2_nodes
-                WHERE is_deleted = 0
-                """
+            has_knowledge = bool(
+                self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'knowledge_statements' LIMIT 1"
+                ).fetchone()
             )
+            if has_knowledge:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory2_nodes_fts (entry_id, content)
+                    SELECT n.id, n.content_norm
+                    FROM memory2_nodes n
+                    WHERE n.is_deleted = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM knowledge_statements s
+                          WHERE s.statement_id = n.id
+                            AND (s.status IN ('superseded','revoked')
+                                 OR s.revoked_at_ms IS NOT NULL
+                                 OR s.superseded_by IS NOT NULL
+                                 OR (s.valid_until_ms IS NOT NULL AND s.valid_until_ms <= 0))
+                      )
+                    """
+                )
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory2_nodes_fts (entry_id, content)
+                    SELECT id, content_norm
+                    FROM memory2_nodes
+                    WHERE is_deleted = 0
+                    """
+                )
             self._commit_owned()
 
     def link_nodes_to_contact(self, sender_id: str, contact_id: str) -> int:

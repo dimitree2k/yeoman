@@ -15,11 +15,17 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Final, Iterable
 
 from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._reasons import (
+    SUPERSESSION_CORRECTION,
+    SUPERSESSION_QUALITY_REJECTED,
+    SUPERSESSION_UNKNOWN,
+)
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
+    SUPERSESSION_REASONS,
     CaptureJobReceipt,
     CaptureJobRecord,
     CaptureResult,
@@ -855,7 +861,16 @@ class StatementEngine:
                 (statement_id, source.event_id, int(source.revision)),
             )
             if remaining:
-                self._set_status(statement_id, status="superseded", ts=ts, superseded_by=None)
+                # The evidence behind one revision was withdrawn, so the statement stops
+                # being a current value.  That is *not* a proven state change or a
+                # correction, and the reason is deliberately not guessed.
+                self._set_status(
+                    statement_id,
+                    status="superseded",
+                    ts=ts,
+                    superseded_by=None,
+                    supersession_reason=SUPERSESSION_UNKNOWN,
+                )
             else:
                 self._redact(statement_id, ts=ts)
             self.audit(
@@ -947,7 +962,13 @@ class StatementEngine:
             )
         if self._would_cycle(statement_id, new_id):
             raise KnowledgeError("invalid_input", "supersession would create a cycle")
-        self._set_status(statement_id, status="superseded", ts=ts, superseded_by=new_id)
+        self._set_status(
+            statement_id,
+            status="superseded",
+            ts=ts,
+            superseded_by=new_id,
+            supersession_reason=SUPERSESSION_CORRECTION,
+        )
         self._store.execute(
             "UPDATE knowledge_statements SET superseded_by = ?, updated_ms = ?"
             " WHERE statement_id = ? AND superseded_by IS NULL",
@@ -1114,12 +1135,36 @@ class StatementEngine:
         status: str,
         ts: int,
         superseded_by: str | None = None,
+        supersession_reason: str = "",
     ) -> None:
+        """Write status, successor and machine-readable reason as one unit.
+
+        The reason is only meaningful for ``superseded``; it is written in the same
+        UPDATE as the status, so no reader can ever observe a superseded row without its
+        reason and no crash can split the two.
+        """
+        if supersession_reason and supersession_reason not in SUPERSESSION_REASONS:
+            raise ValidationError(
+                f"supersession_reason must be one of {SUPERSESSION_REASONS}"
+            )
         self._store.execute(
-            "UPDATE knowledge_statements SET status = ?, superseded_by = COALESCE(?, superseded_by),"
+            "UPDATE knowledge_statements SET status = ?,"
+            " superseded_by = COALESCE(?, superseded_by),"
+            " supersession_reason = CASE WHEN ? = 'superseded' THEN ?"
+            "   ELSE supersession_reason END,"
+            " revision = revision + 1,"
             " revoked_at_ms = CASE WHEN ? = 'revoked' THEN ? ELSE revoked_at_ms END,"
             " updated_ms = ? WHERE statement_id = ?",
-            (status, superseded_by, status, ts, ts, str(statement_id)),
+            (
+                status,
+                superseded_by,
+                status,
+                supersession_reason or SUPERSESSION_UNKNOWN,
+                status,
+                ts,
+                ts,
+                str(statement_id),
+            ),
         )
         self._store.execute(
             "UPDATE memory2_facts SET assertion_status = ?,"
@@ -1436,12 +1481,19 @@ class StatementRescreenReport:
         return lines
 
 
+#: Bumped whenever a candidate rule changes, so a stored rejection names the rule set
+#: that produced it.  A re-screen never revives an earlier rejection: only a fresh,
+#: re-authorized capture can do that.
+SCREEN_RULE_VERSION: Final[str] = "screen/2"
+
+
 def rescreen_statements(
     store: KnowledgeStore,
     *,
     apply: bool = False,
     limit: int = 5000,
     now_ms: int | None = None,
+    rule_version: str = SCREEN_RULE_VERSION,
 ) -> StatementRescreenReport:
     """Apply the current deterministic screens to stored statements.
 
@@ -1480,10 +1532,14 @@ def rescreen_statements(
         # database, and a single long transaction over every refused row would hold the
         # write lock until it times the other writer out.
         with store.transaction():
+            # Status, reason and audit land in one transaction.  Only currently active
+            # rows are touched: an already rejected row is never re-rejected and never
+            # reactivated, and text, sources and audience stay exactly as they were.
             cursor = store.execute(
-                "UPDATE knowledge_statements SET status = 'superseded', updated_ms = ?"
+                "UPDATE knowledge_statements SET status = 'superseded',"
+                " supersession_reason = ?, revision = revision + 1, updated_ms = ?"
                 " WHERE statement_id = ? AND status IN ('assertion','confirmed')",
-                (timestamp, statement_id),
+                (SUPERSESSION_QUALITY_REJECTED, timestamp, statement_id),
             )
             if not cursor.rowcount:
                 continue
@@ -1495,11 +1551,16 @@ def rescreen_statements(
             store.execute(
                 "INSERT INTO knowledge_statement_audit (statement_id, operation,"
                 " actor_principal, evidence_ref, reason, detail_json, created_ms)"
-                " VALUES (?, 'rescreen', '', '', ?, ?, ?)",
+                " VALUES (?, 'rescreen', '', ?, ?, ?, ?)",
                 (
                     statement_id,
+                    str(rule_version),
                     f"screen:{reason}",
-                    json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True),
+                    json.dumps(
+                        {"reason": reason, "rule_version": str(rule_version)},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                     timestamp,
                 ),
             )
