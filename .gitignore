@@ -126,6 +126,7 @@ tests/gateway/*
 !tests/gateway/test_knowledge_capture_end_to_end.py
 !tests/gateway/test_knowledge_source_registration.py
 !tests/gateway/test_knowledge_statement_capture.py
+!tests/gateway/test_statement_screen_quality.py
 !tests/shared/
 tests/shared/*
 !tests/shared/test_config_processing.py

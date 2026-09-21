@@ -72,6 +72,9 @@ Rules:
 - Never invent facts about someone who is not the author, and never merge two messages
   into one statement; use one entry per message.
 - Never write about a delivery, a read receipt or a reaction.
+- Never describe the conversation itself, not even impersonally: no "es wird gefragt",
+  "es wurde gesagt", "wurde erwähnt", "die Frage wurde gestellt". State what was said
+  about the world, or return nothing for that message.
 - "basis": exactly one of "explicit_statement", "reported_statement", "opinion",
   "speculation", "inference", "delivery_claim". Use "explicit_statement" only when the
   author states the fact plainly; use "reported_statement" when the author reports what

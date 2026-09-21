@@ -280,6 +280,34 @@ def capture_backfill(
         _line(f"  refused {reason}: {count}")
 
 
+@capture_app.command("capture-rescreen")
+def capture_rescreen(
+    limit: int = typer.Option(5000, "--limit", help="Maximum statements to examine"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Hide refused statements; without it this is a dry run"
+    ),
+) -> None:
+    """Apply the current deterministic screens to already-published statements.
+
+    A refused statement is set to ``superseded`` (unreadable, text retained, audited).
+    Sources, observations and authority records are never touched; nothing is deleted.
+    """
+    from yeoman_gateway.knowledge._statements import rescreen_statements
+
+    _config, knowledge, processing = _open_capture_runtime()
+    try:
+        report = rescreen_statements(
+            knowledge._store,  # noqa: SLF001 - offline CLI over the store owner
+            apply=bool(apply),
+            limit=int(limit),
+        )
+    finally:
+        knowledge.close()
+        processing.close()
+    for line in report.as_lines():
+        _line(line)
+
+
 # ── output ───────────────────────────────────────────────────────────────────
 
 

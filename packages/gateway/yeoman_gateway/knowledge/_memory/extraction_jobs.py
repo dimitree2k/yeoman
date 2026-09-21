@@ -216,6 +216,86 @@ _HEDGE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+#: Impersonal and passive reports of the conversation itself.  A statement must say
+#: something about the world; "es wird gefragt", "es wurde gesagt" and "wurde erwähnt"
+#: only report that something happened in the chat, often without naming anybody.  The
+#: earlier rules only caught the first-person and named-author forms, so these slipped
+#: through as durable knowledge.  Only unambiguous speech verbs are listed: verbs such as
+#: "geschrieben" or "gezeigt" also describe real documents and media and are left alone.
+_REPORTED_SPEECH_VERBS = (
+    "gefragt",
+    "nachgefragt",
+    "gesagt",
+    "erwähnt",
+    "erwaehnt",
+    "genannt",
+    "berichtet",
+    "geantwortet",
+    "diskutiert",
+    "besprochen",
+    "erzählt",
+    "erzaehlt",
+    "empfohlen",
+    "mitgeteilt",
+    "behauptet",
+    "angemerkt",
+    "geäußert",
+    "geaeussert",
+)
+
+_REPORTED_SPEECH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Auxiliary before participle: "es wird gefragt", "wurde ein Angebot genannt".  The
+    # bounded gap may not cross sentence punctuation, so an unrelated clause in the same
+    # sentence cannot be pulled in.
+    re.compile(
+        r"\b(wird|werden|wurde|wurden)\s+[^.,;:!?]{0,25}?\b("
+        + "|".join(_REPORTED_SPEECH_VERBS)
+        + r")\b",
+        re.IGNORECASE,
+    ),
+    # Participle before auxiliary: "Nachgefragt wird, ...", "Erwähnt werden muss ...".
+    re.compile(
+        r"\b("
+        + "|".join(_REPORTED_SPEECH_VERBS)
+        + r")\s+(wird|werden|wurde|wurden|ist|sind)\b",
+        re.IGNORECASE,
+    ),
+    # Named third-person reporting: "Er erwähnte, dass ...", "Man sagt, dass ...".  The
+    # same junk class as the impersonal forms, and the extractor prompt forbids it too:
+    # a statement says what is true, not who reported it.
+    re.compile(
+        r"\b(er|sie|es|man|der|die|das)\s+(sagt|sagte|fragt|fragte|erwähnt|erwähnte|"
+        r"erwaehnt|erwaehnte|berichtet|berichtete|erzählt|erzählte|erzaehlt|erzaehlte|"
+        r"meint|meinte|antwortet|antwortete|schreibt|schrieb)\b",
+        re.IGNORECASE,
+    ),
+    # A question or a statement as the subject of the sentence.
+    re.compile(
+        r"\b(die|eine|der)\s+(frage|fragen)\s+(wurde|wird|wurden|werden|ist|sind)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(es\s+ist\s+die\s+rede|die\s+rede\s+ist|zur\s+sprache\s+kam|"
+        r"es\s+wird\s+darauf\s+hingewiesen)\b",
+        re.IGNORECASE,
+    ),
+    # English equivalents.
+    re.compile(
+        r"\b(it\s+(is|was)\s+(said|asked|mentioned|reported|noted)|"
+        r"(was|were)\s+(said|asked|mentioned|reported|discussed))\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def conversation_report_reason(content: str) -> str:
+    """``conversation_report`` when the text only reports what happened in the chat."""
+    for pattern in _REPORTED_SPEECH_PATTERNS:
+        if pattern.search(content):
+            return "conversation_report"
+    return ""
+
+
 def screen_content(content: str) -> CandidateVerdict:
     """The content-only screens, shared by candidate screening and re-screening.
 
@@ -229,6 +309,9 @@ def screen_content(content: str) -> CandidateVerdict:
     for pattern in _CONVERSATION_PATTERNS:
         if pattern.search(content):
             return CandidateVerdict(False, "conversation_reference")
+    report = conversation_report_reason(content)
+    if report:
+        return CandidateVerdict(False, report)
     for pattern in _HEDGE_PATTERNS:
         if pattern.search(content):
             return CandidateVerdict(False, "hedged_statement")
@@ -257,6 +340,9 @@ def screen_statement_content(content: str) -> CandidateVerdict:
     for pattern in _CONVERSATION_PATTERNS:
         if pattern.search(content):
             return CandidateVerdict(False, "conversation_reference")
+    report = conversation_report_reason(content)
+    if report:
+        return CandidateVerdict(False, report)
     return CandidateVerdict(True, "ok")
 
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from yeoman_gateway.knowledge._identity import IdentityEngine
@@ -1413,6 +1413,96 @@ def _scope_key(source: SourceRef) -> str:
 
 def _content_hash(statement_id: str, content: str) -> str:
     return hashlib.sha256(f"{statement_id}\x00{content}".encode("utf-8")).hexdigest()
+
+
+@dataclass(slots=True)
+class StatementRescreenReport:
+    """Outcome of applying the current screens to already-published statements."""
+
+    checked: int = 0
+    kept: int = 0
+    superseded: tuple[str, ...] = ()
+    reasons: dict[str, int] = field(default_factory=dict)
+    dry_run: bool = True
+
+    def as_lines(self) -> list[str]:
+        mode = "would hide" if self.dry_run else "hid"
+        lines = [
+            f"checked {self.checked} statement(s); {mode} {len(self.superseded)};"
+            f" kept {self.kept}"
+        ]
+        for reason, count in sorted(self.reasons.items()):
+            lines.append(f"  {reason}: {count}")
+        return lines
+
+
+def rescreen_statements(
+    store: KnowledgeStore,
+    *,
+    apply: bool = False,
+    limit: int = 5000,
+    now_ms: int | None = None,
+) -> StatementRescreenReport:
+    """Apply the current deterministic screens to stored statements.
+
+    Tightening a screen has to be able to clean up after itself, otherwise a rule added
+    today only ever applies to new candidates.  A refused statement is set to
+    ``superseded`` with no replacement: it stops being readable, its text stays
+    inspectable, and its source revision is untouched, so the observation and its
+    authority record survive.  ``superseded`` is chosen over ``revoked`` on purpose -
+    revocation is the source-revocation signal and must not be reused as a quality mark.
+    """
+    from yeoman_gateway.knowledge._memory.extraction_jobs import screen_statement_content
+
+    timestamp = int(now_ms if now_ms is not None else store.now_ms())
+    report = StatementRescreenReport(dry_run=not apply)
+    rows = store.query(
+        "SELECT s.statement_id, s.status, n.content FROM knowledge_statements s"
+        " JOIN memory2_nodes n ON n.id = s.statement_id"
+        " WHERE s.status IN ('assertion','confirmed')"
+        " ORDER BY s.created_ms, s.statement_id LIMIT ?",
+        (max(1, int(limit)),),
+    )
+    for row in rows:
+        report.checked += 1
+        content = str(row["content"] or "")
+        verdict = screen_statement_content(content)
+        if verdict.accepted:
+            report.kept += 1
+            continue
+        reason = str(verdict.reason)
+        report.reasons[reason] = report.reasons.get(reason, 0) + 1
+        if not apply:
+            report.superseded += (str(row["statement_id"]),)
+            continue
+        statement_id = str(row["statement_id"])
+        cursor = store.execute(
+            "UPDATE knowledge_statements SET status = 'superseded', updated_ms = ?"
+            " WHERE statement_id = ? AND status IN ('assertion','confirmed')",
+            (timestamp, statement_id),
+        )
+        if not cursor.rowcount:
+            continue
+        store.execute(
+            "UPDATE memory2_facts SET assertion_status = 'superseded', updated_ms = ?"
+            " WHERE fact_id = ?",
+            (timestamp, statement_id),
+        )
+        store.execute(
+            "INSERT INTO knowledge_statement_audit (statement_id, operation,"
+            " actor_principal, evidence_ref, reason, detail_json, created_ms)"
+            " VALUES (?, 'rescreen', '', '', ?, ?, ?)",
+            (
+                statement_id,
+                f"screen:{reason}",
+                json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True),
+                timestamp,
+            ),
+        )
+        report.superseded += (statement_id,)
+    if apply:
+        store.commit_if_idle()
+    return report
 
 
 def capture_status(store: KnowledgeStore, *, now_ms: int) -> dict[str, Any]:
