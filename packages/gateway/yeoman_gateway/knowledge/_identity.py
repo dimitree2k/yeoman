@@ -14,6 +14,9 @@ from typing import Any, Final
 
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
+    ALIAS_STATUSES,
+    DEFAULT_NAMESPACE,
+    GLOBAL_SCOPE_KEY,
     ChangeReceipt,
     EndpointResolution,
     Identifier,
@@ -28,6 +31,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedIdentityObservation,
     TrustedReadContext,
     ValidationError,
+    normalize_alias_value,
     validate_name,
 )
 
@@ -186,19 +190,53 @@ class IdentityEngine:
     # ── identifiers ──────────────────────────────────────────────────────────
 
     def binding_for(self, identifier: Identifier) -> IdentifierBinding | None:
+        """The one *active* binding of a fully typed identifier, if any.
+
+        Ended, conflicting and withheld rows are history: they are readable by id for
+        audit, but they never resolve a current person or a delivery target.
+        """
         row = self._store.query_one(
             "SELECT * FROM knowledge_identifier_bindings"
-            " WHERE channel = ? AND kind = ? AND value = ?",
-            identifier.key,
+            " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?"
+            " AND status = 'active' LIMIT 1",
+            identifier.full_key,
         )
         if row is None:
             return None
         return self._row_to_binding(row)
 
+    def binding_by_id(self, binding_id: str) -> IdentifierBinding | None:
+        row = self._store.query_one(
+            "SELECT * FROM knowledge_identifier_bindings WHERE binding_id = ?",
+            (str(binding_id),),
+        )
+        return None if row is None else self._row_to_binding(row)
+
+    def binding_at(self, identifier: Identifier, at_ms: int) -> IdentifierBinding | None:
+        """A binding whose *proven* period contains ``at_ms``.
+
+        An unknown start proves nothing about the past, so a historical lookup never
+        falls back to "probably since forever".
+        """
+        rows = self._store.query(
+            "SELECT * FROM knowledge_identifier_bindings"
+            " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?"
+            " ORDER BY valid_from_ms, binding_id",
+            identifier.full_key,
+        )
+        matches = [
+            binding
+            for binding in (self._row_to_binding(row) for row in rows)
+            if binding.covers(int(at_ms))
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
     def bindings_of(self, person_id: str) -> tuple[IdentifierBinding, ...]:
         rows = self._store.query(
             "SELECT * FROM knowledge_identifier_bindings WHERE person_id = ?"
-            " ORDER BY channel, kind, value",
+            " ORDER BY channel, kind, value, valid_from_ms",
             (str(person_id),),
         )
         return tuple(self._row_to_binding(row) for row in rows)
@@ -211,13 +249,21 @@ class IdentityEngine:
         return IdentifierBinding(
             person_id=str(row["person_id"]),
             identifier=Identifier(
-                channel=str(row["channel"]), kind=str(row["kind"]), value=str(row["value"])
+                channel=str(row["channel"]),
+                kind=str(row["kind"]),
+                value=str(row["value"]),
+                namespace=str(row["namespace"] or DEFAULT_NAMESPACE),
             ),
             evidence_ref=str(row["evidence_ref"]),
             status=str(row["status"]),
             mapping_verified=bool(row["mapping_verified"]),
             created_ms=int(row["created_ms"]),
             updated_ms=int(row["updated_ms"]),
+            binding_id=str(row["binding_id"]),
+            valid_from_ms=int(row["valid_from_ms"] or 0),
+            valid_until_ms=int(row["valid_until_ms"] or 0),
+            observed_at_ms=int(row["observed_at_ms"] or 0),
+            revision=int(row["revision"] or 1),
         )
 
     def _bind(
@@ -228,26 +274,70 @@ class IdentityEngine:
         evidence_ref: str,
         mapping_verified: bool,
         status: str = "active",
-    ) -> None:
+        valid_from_ms: int | None = None,
+        observed_at_ms: int = 0,
+        binding_id: str = "",
+    ) -> str:
+        """Create or refresh one temporal binding.  Returns the binding id.
+
+        A binding whose proven period is still open is refreshed in place (last seen
+        wins); a caller that wants to end it must go through ``add_or_end_binding`` so
+        the previous period survives as history instead of being overwritten.
+        """
         ts = now_ms()
+        from_ms = int(valid_from_ms or 0)
+        if status == "withheld":
+            raise ValidationError(
+                "a withheld binding is recorded by record_unproven_identifier,"
+                " not by the active binding writer"
+            )
+        existing = self._store.query_one(
+            "SELECT binding_id, revision FROM knowledge_identifier_bindings"
+            " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?"
+            " AND status = 'active' LIMIT 1",
+            identifier.full_key,
+        )
+        if existing is not None and binding_id and str(existing["binding_id"]) != str(binding_id):
+            raise KnowledgeError("identity_conflict", "identifier is already actively bound")
+        target_id = str(binding_id) or (
+            str(existing["binding_id"]) if existing is not None else self._store.new_id()
+        )
+        revision = 1 if existing is None else int(existing["revision"]) + 1
         self._store.execute(
             """
             INSERT INTO knowledge_identifier_bindings
-                (channel, kind, value, person_id, status, evidence_ref,
-                 mapping_verified, created_ms, updated_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(channel, kind, value) DO UPDATE SET
+                (binding_id, channel, kind, namespace, value, person_id, status,
+                 valid_from_ms, valid_until_ms, observed_at_ms, evidence_ref,
+                 mapping_verified, revision, created_ms, updated_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(binding_id) DO UPDATE SET
+                person_id = excluded.person_id,
                 status = excluded.status,
+                valid_from_ms = CASE
+                    WHEN knowledge_identifier_bindings.valid_from_ms = 0
+                    THEN excluded.valid_from_ms
+                    ELSE knowledge_identifier_bindings.valid_from_ms END,
+                observed_at_ms = MAX(
+                    knowledge_identifier_bindings.observed_at_ms, excluded.observed_at_ms
+                ),
+                evidence_ref = excluded.evidence_ref,
+                mapping_verified = excluded.mapping_verified,
+                revision = excluded.revision,
                 updated_ms = excluded.updated_ms
             """,
             (
+                target_id,
                 identifier.channel,
                 identifier.kind,
+                identifier.namespace,
                 identifier.value,
                 person_id,
                 status,
+                from_ms,
+                int(observed_at_ms or ts),
                 evidence_ref,
                 int(mapping_verified),
+                revision,
                 ts,
                 ts,
             ),
@@ -261,6 +351,7 @@ class IdentityEngine:
             " ON CONFLICT(channel, identifier) DO NOTHING",
             (identifier.channel, identifier.value, person_id, identifier.kind),
         )
+        return target_id
 
     def _create_stub(
         self,
@@ -269,6 +360,7 @@ class IdentityEngine:
         evidence_ref: str,
         observed_name: str | None,
         mapping_verified: bool,
+        observed_at_ms: int = 0,
     ) -> str:
         person_id = self._store.new_id()
         ts = now_ms()
@@ -292,27 +384,12 @@ class IdentityEngine:
             # (the savepoint in resolve_observation rolls the contact row back too) and
             # let the caller read the winner.
             raise sqlite3.IntegrityError("identifier is already bound")
-        self._store.execute(
-            "INSERT INTO knowledge_identifier_bindings"
-            " (channel, kind, value, person_id, status, evidence_ref, mapping_verified,"
-            "  created_ms, updated_ms) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)"
-            " ON CONFLICT(channel, kind, value) DO NOTHING",
-            (
-                identifier.channel,
-                identifier.kind,
-                identifier.value,
-                person_id,
-                evidence_ref,
-                int(mapping_verified),
-                ts,
-                ts,
-            ),
-        )
         self._bind(
             person_id=person_id,
             identifier=identifier,
             evidence_ref=evidence_ref,
             mapping_verified=mapping_verified,
+            observed_at_ms=int(observed_at_ms or ts),
         )
         if observed_name:
             self._observe_name(
@@ -334,20 +411,70 @@ class IdentityEngine:
         observed_by: str,
         ts: int,
         visibility: str = "public",
+        alias_kind: str = "other_name",
+        scope_key: str = GLOBAL_SCOPE_KEY,
+        status: str = "observed",
+        address_allowed: bool = False,
+        supporting_statement_id: str | None = None,
+        evidence_ref: str = "",
     ) -> None:
+        """Record one observed name against the legacy compatibility row.
+
+        Detection is not permission: an observed or confirmed alias is searchable but is
+        only usable as an address once ``address_allowed`` was deliberately granted.
+        """
         clean = validate_name(name)
+        if status not in ALIAS_STATUSES:
+            raise ValidationError(f"alias status must be one of {ALIAS_STATUSES}")
+        normalized = normalize_alias_value(clean)
+        scope = str(scope_key or "").strip() or GLOBAL_SCOPE_KEY
         iso = _iso(ts)
         self._store.execute(
             """
             INSERT INTO contact_aliases
                 (contact_id, alias, source, first_seen, last_seen, visibility,
-                 first_seen_ms, last_seen_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 first_seen_ms, last_seen_ms, alias_kind, normalized_alias, scope_key,
+                 status, address_allowed, is_preferred, supporting_statement_id,
+                 evidence_ref, revision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1)
             ON CONFLICT(contact_id, alias, source) DO UPDATE SET
                 last_seen = excluded.last_seen,
-                last_seen_ms = excluded.last_seen_ms
+                last_seen_ms = excluded.last_seen_ms,
+                normalized_alias = excluded.normalized_alias,
+                alias_kind = excluded.alias_kind,
+                scope_key = excluded.scope_key,
+                status = CASE
+                    WHEN contact_aliases.status = 'retired' THEN 'retired'
+                    WHEN contact_aliases.status = 'confirmed' THEN 'confirmed'
+                    ELSE excluded.status END,
+                address_allowed = MAX(
+                    contact_aliases.address_allowed, excluded.address_allowed
+                ),
+                supporting_statement_id = COALESCE(
+                    contact_aliases.supporting_statement_id, excluded.supporting_statement_id
+                ),
+                evidence_ref = CASE
+                    WHEN excluded.evidence_ref = '' THEN contact_aliases.evidence_ref
+                    ELSE excluded.evidence_ref END,
+                revision = contact_aliases.revision + 1
             """,
-            (person_id, clean, source, iso, iso, visibility, ts, ts),
+            (
+                person_id,
+                clean,
+                source,
+                iso,
+                iso,
+                visibility,
+                ts,
+                ts,
+                alias_kind,
+                normalized,
+                scope,
+                status,
+                int(address_allowed),
+                supporting_statement_id,
+                evidence_ref,
+            ),
         )
         if source == "observed":
             # An observed push name must never overwrite a confirmed preferred name.
@@ -365,16 +492,27 @@ class IdentityEngine:
             "SELECT * FROM contact_aliases WHERE contact_id = ? ORDER BY alias, source",
             (str(person_id),),
         )
-        return tuple(
-            NameObservation(
-                person_id=str(row["contact_id"]),
-                name=str(row["alias"]),
-                source=str(row["source"]),
-                visibility=str(row["visibility"] or "public"),
-                first_seen_ms=int(row["first_seen_ms"] or 0),
-                last_seen_ms=int(row["last_seen_ms"] or 0),
-            )
-            for row in rows
+        return tuple(self._row_to_alias(row) for row in rows)
+
+    @staticmethod
+    def _row_to_alias(row: Any) -> NameObservation:
+        return NameObservation(
+            person_id=str(row["contact_id"]),
+            name=str(row["alias"]),
+            source=str(row["source"]),
+            visibility=str(row["visibility"] or "public"),
+            first_seen_ms=int(row["first_seen_ms"] or 0),
+            last_seen_ms=int(row["last_seen_ms"] or 0),
+            alias_kind=str(row["alias_kind"] or "other_name"),
+            normalized_alias=str(row["normalized_alias"] or ""),
+            scope_key=str(row["scope_key"] or GLOBAL_SCOPE_KEY),
+            status=str(row["status"] or "observed"),
+            address_allowed=bool(row["address_allowed"]),
+            is_preferred=bool(row["is_preferred"]),
+            supporting_statement_id=row["supporting_statement_id"],
+            evidence_ref=str(row["evidence_ref"] or ""),
+            valid_until_ms=None if row["valid_until_ms"] is None else int(row["valid_until_ms"]),
+            revision=int(row["revision"] or 1),
         )
 
     def aliases_of_many(self, person_ids: tuple[str, ...]) -> dict[str, tuple[NameObservation, ...]]:
@@ -388,16 +526,7 @@ class IdentityEngine:
         )
         out: dict[str, list[NameObservation]] = {}
         for row in rows:
-            out.setdefault(str(row["contact_id"]), []).append(
-                NameObservation(
-                    person_id=str(row["contact_id"]),
-                    name=str(row["alias"]),
-                    source=str(row["source"]),
-                    visibility=str(row["visibility"] or "public"),
-                    first_seen_ms=int(row["first_seen_ms"] or 0),
-                    last_seen_ms=int(row["last_seen_ms"] or 0),
-                )
-            )
+            out.setdefault(str(row["contact_id"]), []).append(self._row_to_alias(row))
         return {key: tuple(value) for key, value in out.items()}
 
     # ── name priority ────────────────────────────────────────────────────────
@@ -496,12 +625,13 @@ class IdentityEngine:
         """
         evidence_ref = self._authority.verify_observation(observation)
         revision = self._store.identity_revision
+        observed_at_ms = int(observation.observed_at_ms or now_ms())
 
-        existing: dict[tuple[str, str, str], IdentifierBinding] = {}
+        existing: dict[tuple[str, str, str, str], IdentifierBinding] = {}
         for identifier in observation.identifiers:
             binding = self.binding_for(identifier)
             if binding is not None and binding.status == "active":
-                existing[identifier.key] = binding
+                existing[identifier.full_key] = binding
 
         persons = {self.canonical_id(item.person_id) for item in existing.values()}
         if len(persons) > 1:
@@ -517,7 +647,7 @@ class IdentityEngine:
             person_id = persons.pop()
             if observation.mapping_verified:
                 for identifier in observation.identifiers:
-                    if identifier.key in existing:
+                    if identifier.full_key in existing:
                         continue
                     if identifier.kind in _REASSIGNABLE_KINDS:
                         # A recyclable handle is not durable identity evidence.
@@ -527,6 +657,7 @@ class IdentityEngine:
                         identifier=identifier,
                         evidence_ref=evidence_ref,
                         mapping_verified=True,
+                        observed_at_ms=observed_at_ms,
                     )
             elif len(observation.identifiers) > 1:
                 return PersonResolution(
@@ -542,7 +673,7 @@ class IdentityEngine:
                     name=observation.observed_name,
                     source="observed",
                     observed_by="channel_adapter",
-                    ts=int(observation.observed_at_ms or now_ms()),
+                    ts=observed_at_ms,
                 )
             return PersonResolution(
                 status="resolved",
@@ -578,6 +709,7 @@ class IdentityEngine:
                     evidence_ref=evidence_ref,
                     observed_name=observation.observed_name,
                     mapping_verified=observation.mapping_verified,
+                    observed_at_ms=observed_at_ms,
                 )
         except sqlite3.IntegrityError:
             # A concurrent observer won the identifier: read the winner instead of
@@ -595,7 +727,7 @@ class IdentityEngine:
             )
         if observation.mapping_verified:
             for identifier in observation.identifiers:
-                if identifier.key == primary.key:
+                if identifier.full_key == primary.full_key:
                     continue
                 if identifier.kind in _REASSIGNABLE_KINDS:
                     continue
@@ -604,6 +736,7 @@ class IdentityEngine:
                     identifier=identifier,
                     evidence_ref=evidence_ref,
                     mapping_verified=True,
+                    observed_at_ms=observed_at_ms,
                 )
         return PersonResolution(
             status="resolved",
@@ -613,8 +746,74 @@ class IdentityEngine:
             reason="created_stub_from_verified_identifier",
         )
 
-    # ── lookup by name ───────────────────────────────────────────────────────
+    # ── legacy compatibility projection ──────────────────────────────────────
 
+    def record_legacy_projection(
+        self, *, person_id: str, identifier: Identifier, evidence_ref: str
+    ) -> None:
+        """Write only the compatibility projection, never a person authority.
+
+        ``contact_identifiers`` is explicitly not an authority.  The legacy co-existence
+        path may populate it so existing name/identifier searches keep working, but it
+        must not mint an active v2 binding: an unproven import stays ``withheld`` until a
+        channel adapter or an audited admin operation proves it.
+        """
+        self._store.execute(
+            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+            " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
+            (identifier.channel, identifier.value, person_id, identifier.kind),
+        )
+
+    def record_unproven_identifier(
+        self, *, person_id: str, identifier: Identifier, evidence_ref: str
+    ) -> str:
+        """Record an unproven candidate binding, auditable but not person-effective.
+
+        Deliberately never touches an identifier that some other person already holds
+        with an *active* proven binding: a legacy import must not be able to shadow or
+        steal a live identity.  The candidate row is still written, so the case stays
+        visible in the cutover ledger.
+        """
+        ts = now_ms()
+        binding_id = self._store.new_id()
+        taken = self._store.query_one(
+            "SELECT person_id FROM knowledge_identifier_bindings"
+            " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?"
+            " AND status = 'active' LIMIT 1",
+            identifier.full_key,
+        )
+        if taken is not None and self.canonical_id(str(taken["person_id"])) != self.canonical_id(
+            person_id
+        ):
+            self.record_legacy_projection(
+                person_id=person_id, identifier=identifier, evidence_ref=evidence_ref
+            )
+            return ""
+        self._store.execute(
+            "INSERT INTO knowledge_identifier_bindings (binding_id, channel, kind,"
+            " namespace, value, person_id, status, valid_from_ms, valid_until_ms,"
+            " observed_at_ms, evidence_ref, mapping_verified, revision, created_ms,"
+            " updated_ms) VALUES (?, ?, ?, ?, ?, ?, 'withheld', 0, 0, ?, ?, 0, 1, ?, ?)"
+            " ON CONFLICT DO NOTHING",
+            (
+                binding_id,
+                identifier.channel,
+                identifier.kind,
+                identifier.namespace,
+                identifier.value,
+                person_id,
+                ts,
+                evidence_ref,
+                ts,
+                ts,
+            ),
+        )
+        self.record_legacy_projection(
+            person_id=person_id, identifier=identifier, evidence_ref=evidence_ref
+        )
+        return binding_id
+
+    # ── lookup by name ───────────────────────────────────────────────────────
     def search_by_name(
         self,
         name: str,
@@ -682,10 +881,12 @@ class IdentityEngine:
         return tuple(out)
 
     def person_id_for_principal(self, principal: str) -> str | None:
-        """Map a security principal to a person *through proven identifier bindings*.
+        """Map a security principal to a person *through proven active bindings*.
 
         Real principals are channel-qualified (``whatsapp:491...``); the mapping is a
-        lookup, never a guess from a display name.
+        lookup, never a guess from a display name.  The compatibility projection
+        ``contact_identifiers`` is deliberately *not* consulted: an unproven legacy row
+        must not resolve a person on the operational path.
         """
         token = str(principal or "").strip()
         if not token:
@@ -702,20 +903,18 @@ class IdentityEngine:
             candidates.append(("whatsapp", f"{token}@s.whatsapp.net"))
             candidates.append(("whatsapp", f"{token}@lid"))
         for candidate_channel, candidate_value in candidates:
-            row = self._store.query_one(
+            rows = self._store.query(
                 "SELECT person_id FROM knowledge_identifier_bindings"
-                " WHERE channel = ? AND value = ? AND status = 'active' LIMIT 1",
+                " WHERE channel = ? AND value = ? AND status = 'active'",
                 (candidate_channel, candidate_value),
             )
-            if row is not None:
-                return str(row["person_id"])
-            legacy = self._store.query_one(
-                "SELECT contact_id FROM contact_identifiers"
-                " WHERE channel = ? AND identifier = ? LIMIT 1",
-                (candidate_channel, candidate_value),
-            )
-            if legacy is not None:
-                return str(legacy["contact_id"])
+            owners = {self.canonical_id(str(row["person_id"])) for row in rows}
+            if len(owners) > 1:
+                # Several proven identities claim this principal: that is a conflict,
+                # not a licence to pick the first row.
+                return None
+            if owners:
+                return owners.pop()
         return None
 
     def resolve_endpoint(
@@ -724,12 +923,16 @@ class IdentityEngine:
         channel: str,
         *,
         prefer_kind: str | None = None,
+        at_ms: int | None = None,
     ) -> EndpointResolution:
         """One proven endpoint - or an explicit error, never a random match.
 
         Phone and LID have no built-in order: a caller that wants the phone JID (or the
         LID) of a person says so with ``prefer_kind``.  Without a preference, two kinds
         on the same channel stay ``ambiguous`` instead of silently picking one.
+
+        With ``at_ms`` the lookup is historical: only bindings whose proven period
+        contains that instant are candidates, and an unknown start never covers it.
         """
         canonical = self.canonical_id(person_id)
         revision = self._store.identity_revision
@@ -744,11 +947,15 @@ class IdentityEngine:
         channel_key = str(channel).strip().lower()
         rows = self._store.query(
             "SELECT * FROM knowledge_identifier_bindings"
-            " WHERE person_id = ? AND channel = ? AND status = 'active'"
-            " ORDER BY kind, value",
+            " WHERE person_id = ? AND channel = ?"
+            " ORDER BY kind, value, valid_from_ms",
             (canonical, channel_key),
         )
         bindings = [self._row_to_binding(row) for row in rows]
+        if at_ms is None:
+            bindings = [item for item in bindings if item.status == "active"]
+        else:
+            bindings = [item for item in bindings if item.covers(int(at_ms))]
         if not bindings:
             return EndpointResolution(
                 status="unresolved",

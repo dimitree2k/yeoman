@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from legacy_fixtures import legacy_snapshot_factory
+from legacy_fixtures import legacy_snapshot_factory, v1_knowledge_store_factory
 from yeoman_gateway.knowledge.api import (
     KnowledgeStartupError,
     open_knowledge_store,
@@ -100,6 +100,72 @@ def test_incompatible_schema_version_is_reported_without_writes(tmp_path: Path):
         _open(path)
     assert excinfo.value.code == "schema_incompatible"
     assert path.read_bytes() == before
+
+
+def test_v1_store_is_refused_without_changing_a_single_byte(tmp_path: Path):
+    """A v2 binary must never touch a v1 store: no tables, no meta, no mtime, no WAL.
+
+    This is the fail-closed contract of the whole migration story.  A start that
+    half-upgraded a v1 file would make the explicit snapshot upgrade unverifiable.
+    """
+    fixture = v1_knowledge_store_factory(tmp_path / "v1-knowledge.db")
+    before_hash = fixture.sha256()
+    before_mtime = fixture.mtime_ns()
+    before_tables = fixture.table_names()
+    before_meta = fixture.meta()
+
+    with pytest.raises(KnowledgeStartupError) as excinfo:
+        _open(fixture.path)
+    assert excinfo.value.code == "migration_required"
+    assert "explicit snapshot upgrade" in str(excinfo.value)
+
+    assert fixture.sha256() == before_hash
+    assert fixture.mtime_ns() == before_mtime
+    assert fixture.table_names() == before_tables
+    assert fixture.meta() == before_meta
+    # The probe used a read-only connection, so it left no WAL/journal sidecar behind.
+    assert fixture.dump_sidecars() == {}
+
+
+def test_v1_store_with_unknown_schema_version_is_refused_without_writes(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1-knowledge.db")
+    conn = sqlite3.connect(fixture.path)
+    try:
+        conn.execute("UPDATE knowledge_meta SET value = '7' WHERE key = 'schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+    before = fixture.path.read_bytes()
+    with pytest.raises(KnowledgeStartupError) as excinfo:
+        _open(fixture.path)
+    assert excinfo.value.code == "schema_incompatible"
+    assert fixture.path.read_bytes() == before
+
+
+def test_v1_store_without_complete_marker_is_refused_without_writes(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1-knowledge.db")
+    conn = sqlite3.connect(fixture.path)
+    try:
+        conn.execute("UPDATE knowledge_meta SET value = '0' WHERE key = 'migration_complete'")
+        conn.commit()
+    finally:
+        conn.close()
+    before = fixture.path.read_bytes()
+    with pytest.raises(KnowledgeStartupError) as excinfo:
+        _open(fixture.path)
+    assert excinfo.value.code == "migration_required"
+    assert fixture.path.read_bytes() == before
+
+
+def test_fresh_store_reports_the_v2_schema(tmp_path: Path):
+    from yeoman_gateway.knowledge._store import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == 2
+    service = _open(tmp_path / "knowledge.db")
+    try:
+        assert service.stats(context=_admin(service)).schema_version == 2
+    finally:
+        service.close()
 
 
 def test_knowledge_store_without_complete_marker_reports_migration_required(tmp_path: Path):

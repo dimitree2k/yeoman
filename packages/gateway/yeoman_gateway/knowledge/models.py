@@ -23,21 +23,35 @@ from dataclasses import dataclass, field
 from typing import Final
 
 __all__ = [
+    "ALIAS_KINDS",
+    "ALIAS_STATUSES",
+    "ATTRIBUTE_KEYS",
+    "ATTRIBUTE_POLARITIES",
+    "BINDING_STATUSES",
     "CHANGE_STATUSES",
     "CONVERSATION_ORIGINS",
     "CONVERSATION_RELATIONS",
     "CONVERSATION_STATUSES",
     "DAY_MS",
+    "DEFAULT_NAMESPACE",
     "EPISODE_CLOSURE_MS",
     "EPISODE_STATUSES",
     "ERROR_CODES",
+    "GLOBAL_SCOPE_KEY",
+    "MAX_ATTRIBUTE_VALUE_LENGTH",
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
     "MAX_SOURCES_PER_STATEMENT",
     "PERSON_ROLES",
+    "PERSON_ROLE_STATUSES",
     "READ_PURPOSES",
     "STATEMENT_ATTRIBUTIONS",
     "STATEMENT_STATUSES",
+    "SUPERSESSION_REASONS",
+    "TIME_BASES",
+    "TIME_PRECISIONS",
+    "AttributeCandidate",
+    "AttributeValue",
     "CaptureJobReceipt",
     "CaptureJobRecord",
     "CaptureResult",
@@ -55,6 +69,7 @@ __all__ = [
     "EpisodeSourceRef",
     "EpisodeView",
     "Identifier",
+    "IdentifierBinding",
     "KnowledgeContext",
     "KnowledgeError",
     "KnowledgeStats",
@@ -66,12 +81,19 @@ __all__ = [
     "SourceRef",
     "StatementCandidate",
     "StatementPage",
+    "StatementRecord",
     "StatementSummary",
     "TrustedAdminContext",
     "TrustedCaptureContext",
     "TrustedIdentityObservation",
     "TrustedReadContext",
     "ValidationError",
+    "normalize_alias_value",
+    "normalize_identifier_value",
+    "validate_alias_kind",
+    "validate_attribute_key",
+    "validate_attribute_value",
+    "validate_name",
 ]
 
 # ── enumerations kept as plain string tuples (validated, not enforced by typing) ──
@@ -154,7 +176,60 @@ ERROR_CODES: Final[tuple[str, ...]] = (
 
 NAME_SOURCES: Final[tuple[str, ...]] = ("owner_confirmed", "self_reported", "observed")
 
+#: Binding lifecycle.  ``ended`` keeps the proven past period readable; only ``active``
+#: authorizes current delivery and current person roles.
+BINDING_STATUSES: Final[tuple[str, ...]] = ("active", "ended", "conflict", "withheld")
+
+#: Status of one stored person role at one statement.  A statement keeps a role row even
+#: when the mapping behind it could not be proven, so the cutover stays auditable.
+PERSON_ROLE_STATUSES: Final[tuple[str, ...]] = ("active", "withheld", "conflict")
+
+#: Machine-readable reason for replacing a statement.  ``unknown`` is the honest default
+#: for legacy rows: it is never guessed from the status alone.
+SUPERSESSION_REASONS: Final[tuple[str, ...]] = (
+    "state_change",
+    "correction",
+    "quality_rejected",
+    "unknown",
+)
+
+#: How a stated time relates to the source.  ``stored`` marks the technical fallback of a
+#: row that carries no human-stated period at all.
+TIME_BASES: Final[tuple[str, ...]] = ("explicit", "source_time", "unknown", "stored")
+
+#: Precision of a stated time.  ``unknown`` must never be rendered as a certain day.
+TIME_PRECISIONS: Final[tuple[str, ...]] = ("exact", "day", "month", "year", "approximate", "unknown")
+
+ALIAS_KINDS: Final[tuple[str, ...]] = (
+    "platform_display",
+    "nickname",
+    "short_name",
+    "other_name",
+)
+
+ALIAS_STATUSES: Final[tuple[str, ...]] = ("observed", "candidate", "confirmed", "retired")
+
+#: The scope key of an alias that was explicitly released for every context.  SQLite
+#: treats NULLs as distinct in unique indexes, so a global scope needs a real value.
+GLOBAL_SCOPE_KEY: Final[str] = "global"
+
+#: V1 attribute vocabulary.  The extractor may not invent further keys.
+ATTRIBUTE_KEYS: Final[tuple[str, ...]] = (
+    "residence",
+    "hobby",
+    "interest",
+    "preference",
+    "description",
+)
+
+ATTRIBUTE_POLARITIES: Final[tuple[str, ...]] = ("positive", "negative")
+
 MAX_NAME_LENGTH: Final[int] = 200
+MAX_ATTRIBUTE_VALUE_LENGTH: Final[int] = 500
+
+#: The namespace of a channel that carries a single platform account.  A channel adapter
+#: states it explicitly; nothing derives it from a missing value.
+DEFAULT_NAMESPACE: Final[str] = "default"
 MAX_PEOPLE_PER_STATEMENT: Final[int] = 64
 MAX_SOURCES_PER_STATEMENT: Final[int] = 32
 MIN_RECALL_LIMIT: Final[int] = 1
@@ -285,8 +360,52 @@ def normalize_identifier_value(kind: str, value: str) -> str:
         return text.lstrip("@").strip()
     if kind == "telegram_username":
         return text.lstrip("@").strip().lower()
-    if kind == "email":
-        return text.lower()
+    return text
+
+
+def validate_namespace(value: object, field_name: str = "namespace") -> str:
+    """A namespace is a non-empty, bounded token that names one platform account.
+
+    It is validated like an id because it becomes part of a uniqueness key.  An empty
+    namespace must fail loudly: silently collapsing every account onto one key would let
+    two unrelated platform accounts share an identifier binding.
+    """
+    return _require_id(value, field_name).lower()
+
+
+def normalize_alias_value(value: object, field_name: str = "alias") -> str:
+    """The search form of a name.  Search only: it never confirms an identity."""
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    text = value.strip()
+    if not text:
+        raise ValidationError(f"{field_name} must not be empty")
+    if _CONTROL_CHARS.search(text):
+        raise ValidationError(f"{field_name} contains control characters")
+    if len(text) > MAX_NAME_LENGTH:
+        raise ValidationError(f"{field_name} exceeds {MAX_NAME_LENGTH} characters")
+    return " ".join(text.casefold().split())
+
+
+def validate_alias_kind(value: object) -> str:
+    return _require_choice(value, ALIAS_KINDS, "alias_kind")
+
+
+def validate_attribute_key(value: object) -> str:
+    return _require_choice(value, ATTRIBUTE_KEYS, "attribute_key")
+
+
+def validate_attribute_value(value: object, field_name: str = "attribute value") -> str:
+    """A structured attribute value is bounded text, never silently truncated."""
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    text = value.strip()
+    if not text:
+        raise ValidationError(f"{field_name} must not be empty")
+    if _CONTROL_CHARS.search(text):
+        raise ValidationError(f"{field_name} contains control characters")
+    if len(text) > MAX_ATTRIBUTE_VALUE_LENGTH:
+        raise ValidationError(f"{field_name} exceeds {MAX_ATTRIBUTE_VALUE_LENGTH} characters")
     return text
 
 
@@ -295,11 +414,18 @@ def normalize_identifier_value(kind: str, value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Identifier:
-    """One platform identifier: channel plus kind plus normalized value."""
+    """One platform identifier: channel plus namespace plus kind plus normalized value.
+
+    ``namespace`` names the platform account the identifier belongs to.  Channel
+    adapters always state it.  ``None`` means "not stated" and is normalized to
+    ``DEFAULT_NAMESPACE`` for compatibility callers; an *empty* string is a typo and is
+    rejected.  Product code never derives a namespace from a missing value.
+    """
 
     channel: str
     kind: str
     value: str
+    namespace: str | None = None
 
     def __post_init__(self) -> None:
         channel = _require_id(self.channel, "channel").lower()
@@ -307,13 +433,27 @@ class Identifier:
         if kind not in _IDENTIFIER_KINDS:
             raise ValidationError(f"unsupported identifier kind: {kind!r}")
         value = normalize_identifier_value(kind, _require_id(self.value, "identifier value"))
+        namespace = (
+            DEFAULT_NAMESPACE if self.namespace is None else validate_namespace(self.namespace)
+        )
         object.__setattr__(self, "channel", channel)
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "value", value)
+        object.__setattr__(self, "namespace", namespace)
 
     @property
     def key(self) -> tuple[str, str, str]:
+        """The legacy channel/kind/value key, kept for compatibility readers."""
         return (self.channel, self.kind, self.value)
+
+    @property
+    def full_key(self) -> tuple[str, str, str, str]:
+        """The complete uniqueness key of a temporal binding.
+
+        ``__post_init__`` always resolves the namespace to a concrete token, so the
+        fallback here is unreachable and exists only for the type checker.
+        """
+        return (self.channel, self.kind, self.namespace or DEFAULT_NAMESPACE, self.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +463,10 @@ class TrustedIdentityObservation:
     ``mapping_verified`` means the adapter proved that all given identifiers belong to
     the same platform account (for example WhatsApp PN<->LID evidence).  It never
     means the observation was authorized to create owner rights.
+
+    ``account_namespace`` names the platform account the identifiers belong to.  Every
+    identifier of one observation shares it when the caller does not set the namespace
+    on the identifier itself.
     """
 
     identifiers: tuple[Identifier, ...]
@@ -331,6 +475,7 @@ class TrustedIdentityObservation:
     observed_at_ms: int = 0
     mapping_verified: bool = False
     channel_hint: str | None = None
+    account_namespace: str = ""
 
     def __post_init__(self) -> None:
         identifiers = tuple(self.identifiers)
@@ -338,7 +483,16 @@ class TrustedIdentityObservation:
             raise ValidationError("observation needs at least one identifier")
         if len(identifiers) > 8:
             raise ValidationError("observation has too many identifiers")
-        if len({item.key for item in identifiers}) != len(identifiers):
+        if self.account_namespace:
+            namespace = validate_namespace(self.account_namespace, "account_namespace")
+            identifiers = tuple(
+                item
+                if item.namespace == namespace
+                else Identifier(item.channel, item.kind, item.value, namespace)
+                for item in identifiers
+            )
+            object.__setattr__(self, "account_namespace", namespace)
+        if len({item.full_key for item in identifiers}) != len(identifiers):
             raise ValidationError("observation contains duplicate identifiers")
         object.__setattr__(self, "identifiers", identifiers)
         object.__setattr__(self, "evidence_ref", _require_id(self.evidence_ref, "evidence_ref"))
@@ -444,19 +598,79 @@ class SourceRef:
 
 @dataclass(frozen=True, slots=True)
 class PersonLinkCandidate:
-    """One person in one role at one statement, bound to one evidence source."""
+    """One person in one role at one statement, bound to one evidence source.
+
+    ``status`` keeps the cutover auditable: a role whose principal->person mapping could
+    not be proven is stored as ``withheld`` with a ``resolution_reason`` instead of being
+    silently dropped or silently confirmed.  Only ``active`` roles feed profiles.
+    """
 
     person_id: str
     role: str
     source: SourceRef
     attribution: str
+    status: str = "active"
+    binding_id: str | None = None
+    resolution_reason: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "person_id", _require_id(self.person_id, "person_id"))
         _require_choice(self.role, PERSON_ROLES, "role")
         _require_choice(self.attribution, STATEMENT_ATTRIBUTIONS, "attribution")
+        _require_choice(self.status, PERSON_ROLE_STATUSES, "status")
         if not isinstance(self.source, SourceRef):
             raise ValidationError("link source must be a SourceRef")
+        if self.binding_id is not None:
+            object.__setattr__(
+                self, "binding_id", _require_id(self.binding_id, "binding_id")
+            )
+        if not isinstance(self.resolution_reason, str):
+            raise ValidationError("resolution_reason must be a string")
+
+
+@dataclass(frozen=True, slots=True)
+class AttributeValue:
+    """One validated structured value of a statement facet.
+
+    ``polarity`` is stored explicitly: absence of a value never means a negation.
+    """
+
+    text: str
+    precision: str = "unknown"
+    polarity: str = "positive"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "text", validate_attribute_value(self.text))
+        _require_choice(self.precision, TIME_PRECISIONS, "precision")
+        _require_choice(self.polarity, ATTRIBUTE_POLARITIES, "polarity")
+
+    @property
+    def value_key(self) -> str:
+        """Deterministic search/dedupe key.  Never an identity proof."""
+        return normalize_alias_value(self.text, "attribute value")
+
+
+@dataclass(frozen=True, slots=True)
+class AttributeCandidate:
+    """One structured facet proposed together with its statement.
+
+    It is never an independent write: the service publishes it in the same transaction
+    as the statement, and only when an active ``subject`` role for ``person_id`` exists.
+    """
+
+    person_id: str
+    attribute_key: str
+    value: AttributeValue
+    polarity: str = "positive"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "person_id", _require_id(self.person_id, "person_id"))
+        object.__setattr__(
+            self, "attribute_key", validate_attribute_key(self.attribute_key)
+        )
+        if not isinstance(self.value, AttributeValue):
+            raise ValidationError("attribute value must be an AttributeValue")
+        _require_choice(self.polarity, ATTRIBUTE_POLARITIES, "polarity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,6 +692,9 @@ class StatementCandidate:
     unresolved_mentions: tuple[str, ...] = ()
     kind: str = "fact"
     sector: str = "semantic"
+    attributes: tuple[AttributeCandidate, ...] = ()
+    time_basis: str = "unknown"
+    time_precision: str = "unknown"
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, str):
@@ -505,6 +722,15 @@ class StatementCandidate:
             raise ValidationError("duplicate person links")
         object.__setattr__(self, "people", people)
 
+        attributes = tuple(self.attributes)
+        if len(attributes) > MAX_PEOPLE_PER_STATEMENT:
+            raise ValidationError("too many attribute candidates")
+        if len({(item.person_id, item.attribute_key, item.value.value_key) for item in attributes}) != len(
+            attributes
+        ):
+            raise ValidationError("duplicate attribute candidates")
+        object.__setattr__(self, "attributes", attributes)
+
         object.__setattr__(
             self, "extractor_version", _require_id(self.extractor_version, "extractor_version")
         )
@@ -523,6 +749,8 @@ class StatementCandidate:
         object.__setattr__(self, "unresolved_mentions", mentions)
         object.__setattr__(self, "kind", _require_id(self.kind, "kind"))
         object.__setattr__(self, "sector", _require_id(self.sector, "sector"))
+        _require_choice(self.time_basis, TIME_BASES, "time_basis")
+        _require_choice(self.time_precision, TIME_PRECISIONS, "time_precision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -998,7 +1226,11 @@ class KnowledgeStats:
 
 @dataclass(frozen=True, slots=True)
 class NameObservation:
-    """Internal value object: one observed or confirmed name of a person."""
+    """Internal value object: one observed or confirmed name of a person.
+
+    ``status`` and ``address_allowed`` are the ethics of the row: recognising a name is
+    not the same as being allowed to address the person with it.
+    """
 
     person_id: str
     name: str
@@ -1007,6 +1239,28 @@ class NameObservation:
     first_seen_ms: int = 0
     last_seen_ms: int = 0
     observed_by: str = ""
+    alias_kind: str = "other_name"
+    normalized_alias: str = ""
+    scope_key: str = "global"
+    status: str = "observed"
+    address_allowed: bool = False
+    is_preferred: bool = False
+    supporting_statement_id: str | None = None
+    evidence_ref: str = ""
+    valid_until_ms: int | None = None
+    revision: int = 1
+
+    @property
+    def retired(self) -> bool:
+        return self.status == "retired"
+
+    @property
+    def usable_as_address(self) -> bool:
+        return (
+            self.status in ("confirmed", "observed")
+            and self.address_allowed
+            and self.valid_until_ms is None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1025,7 +1279,13 @@ class MergeRedirect:
 
 @dataclass(frozen=True, slots=True)
 class IdentifierBinding:
-    """Internal value object for one identifier binding row."""
+    """Internal value object for one temporal identifier binding.
+
+    ``valid_from_ms`` may be ``0`` for "unknown start": a timestamp that was never
+    observed proves nothing about the past and never authorizes a retroactive mapping.
+    ``valid_until_ms`` of ``0`` means "still open"; an ``ended`` binding always carries
+    a positive end.
+    """
 
     person_id: str
     identifier: Identifier
@@ -1034,6 +1294,41 @@ class IdentifierBinding:
     mapping_verified: bool = False
     created_ms: int = 0
     updated_ms: int = 0
+    binding_id: str = ""
+    valid_from_ms: int = 0
+    valid_until_ms: int = 0
+    observed_at_ms: int = 0
+    revision: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "person_id", _require_id(self.person_id, "person_id"))
+        if not isinstance(self.identifier, Identifier):
+            raise ValidationError("binding identifier must be an Identifier")
+        object.__setattr__(self, "evidence_ref", _require_id(self.evidence_ref, "evidence_ref"))
+        _require_choice(self.status, BINDING_STATUSES, "status")
+        object.__setattr__(
+            self, "revision", _require_int(self.revision, "revision", minimum=1)
+        )
+        for name in ("created_ms", "updated_ms", "valid_from_ms", "valid_until_ms", "observed_at_ms"):
+            object.__setattr__(
+                self, name, _require_int(getattr(self, name), name, minimum=0)
+            )
+
+    @property
+    def open_ended(self) -> bool:
+        return self.status == "active" and self.valid_until_ms == 0
+
+    def covers(self, at_ms: int) -> bool:
+        """True when the proven period contains ``at_ms``.
+
+        An unknown start (``valid_from_ms == 0``) covers nothing: it is knowledge time,
+        not a proven historical start.
+        """
+        if self.status != "active" or self.valid_from_ms <= 0:
+            return False
+        if at_ms < self.valid_from_ms:
+            return False
+        return self.valid_until_ms == 0 or at_ms < self.valid_until_ms
 
 
 @dataclass(frozen=True, slots=True)
@@ -1058,3 +1353,7 @@ class StatementRecord:
     created_ms: int = 0
     updated_ms: int = 0
     unresolved_mentions: tuple[str, ...] = ()
+    revision: int = 1
+    supersession_reason: str = ""
+    time_basis: str = "unknown"
+    time_precision: str = "unknown"

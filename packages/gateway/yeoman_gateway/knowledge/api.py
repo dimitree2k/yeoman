@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -65,6 +65,8 @@ from yeoman_gateway.knowledge.models import (
     TrustedIdentityObservation,
     TrustedReadContext,
     ValidationError,
+    normalize_alias_value,
+    validate_name,
 )
 
 __all__ = [
@@ -89,32 +91,60 @@ def workspace_id_for(workspace: Path | str) -> str:
     ]
 
 
-def _legacy_schema_names(db_path: Path) -> set[str]:
-    """Table names of an existing file, or an empty set when it is unreadable."""
+@dataclass(frozen=True, slots=True)
+class _SchemaProbe:
+    """What an existing file says about itself, read without opening it for writing."""
+
+    exists: bool
+    has_meta: bool
+    schema_version: int
+    migration_complete: bool
+
+    @property
+    def is_knowledge_store(self) -> bool:
+        return self.has_meta and self.schema_version > 0
+
+
+def _probe_schema(db_path: Path) -> _SchemaProbe:
+    """Read ``knowledge_meta`` over a read-only connection.
+
+    The probe must never touch the file: a runtime start against a v1 store has to fail
+    closed, and even opening a SQLite file read-write can create a WAL/journal and change
+    its mtime.  A missing or unreadable file therefore reports "no store", and the caller
+    decides separately whether that means "create a fresh one".
+    """
     if not db_path.exists():
-        return set()
+        return _SchemaProbe(exists=False, has_meta=False, schema_version=0, migration_complete=False)
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:  # pragma: no cover - defensive
-        return set()
+        return _SchemaProbe(exists=True, has_meta=False, schema_version=0, migration_complete=False)
     try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-    except sqlite3.Error:  # pragma: no cover - defensive
-        return set()
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_meta'"
+        ).fetchone()
+        if row is None:
+            return _SchemaProbe(
+                exists=True, has_meta=False, schema_version=0, migration_complete=False
+            )
+        values = {
+            str(key): str(value)
+            for key, value in conn.execute("SELECT key, value FROM knowledge_meta").fetchall()
+        }
+    except sqlite3.Error:
+        return _SchemaProbe(exists=True, has_meta=False, schema_version=0, migration_complete=False)
     finally:
         conn.close()
-    return {str(row[0]) for row in rows}
-
-
-def _has_legacy_schema(db_path: Path) -> bool:
-    return bool(
-        _legacy_schema_names(db_path)
-        & {"memory2_nodes", "memory2_facts", "contact_identifiers"}
+    try:
+        version = int(values.get("schema_version", "0"))
+    except ValueError:
+        version = -1
+    return _SchemaProbe(
+        exists=True,
+        has_meta=True,
+        schema_version=version,
+        migration_complete=values.get("migration_complete", "0") == "1",
     )
-
-
-def _has_knowledge_schema(db_path: Path) -> bool:
-    return bool(_legacy_schema_names(db_path) & {"knowledge_meta", "knowledge_statements"})
 
 
 def open_knowledge_store(
@@ -134,19 +164,52 @@ def open_knowledge_store(
     exists but no verified knowledge store was published, and ``schema_incompatible``
     when the file carries a different schema version.  Both are explicit states, never
     a silent fallback to an older store.
+
+    The order matters: the existing file is probed *read-only* before anything opens it
+    for writing.  A v1 store is therefore refused byte-for-byte unchanged - no tables, no
+    meta rows, no WAL side file.  Only a file that does not exist at all is created as a
+    fresh v2 store; the normal start never migrates, and it never upgrades in place.
     """
     path = Path(db_path).expanduser()
     legacy = [Path(item).expanduser() for item in legacy_sources]
-    occupied = path.exists() and not _has_knowledge_schema(path)
-    fresh = not path.exists()
-    if (fresh and any(item.exists() for item in legacy)) or occupied:
-        # Either the consolidated store is missing while legacy data exists, or the path
-        # already holds a different database (for example a legacy memory file that was
-        # configured directly).  Both mean: migrate explicitly, never write here.
+    probe = _probe_schema(path)
+    fresh = not probe.exists
+    if fresh and any(item.exists() for item in legacy):
+        # The consolidated store is missing while legacy data exists.  Migrate
+        # explicitly, never write an empty store next to the old data.
         raise KnowledgeStartupError(
             "migration_required",
             "legacy memory/contacts data exists but no verified knowledge store was built",
         )
+    if not fresh:
+        if not probe.is_knowledge_store:
+            # An occupied path without a knowledge schema is not a knowledge store: for
+            # example a legacy memory file configured directly as the target.
+            raise KnowledgeStartupError(
+                "migration_required",
+                "the target file carries no knowledge schema and was not migrated",
+            )
+        if probe.schema_version < SCHEMA_VERSION:
+            # An *older* knowledge store is not corruption: it is data that needs the
+            # explicit, audited snapshot upgrade.  Anything newer or non-numeric stays
+            # ``schema_incompatible``.
+            raise KnowledgeStartupError(
+                "migration_required",
+                f"knowledge schema version {probe.schema_version} needs an explicit"
+                f" snapshot upgrade to {SCHEMA_VERSION}; the normal start never migrates",
+            )
+        if probe.schema_version != SCHEMA_VERSION:
+            raise KnowledgeStartupError(
+                "schema_incompatible",
+                f"knowledge schema version {probe.schema_version} is not supported"
+                f" (need {SCHEMA_VERSION}); an explicit snapshot upgrade is required",
+            )
+        if not probe.migration_complete:
+            raise KnowledgeStartupError(
+                "migration_required",
+                "knowledge store exists but carries no complete migration manifest;"
+                " an explicit snapshot upgrade is required",
+            )
     try:
         store = KnowledgeStore(path, create=create)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
@@ -157,27 +220,6 @@ def open_knowledge_store(
         store.set_meta("migration_id", "fresh-install")
         store.set_meta("semantic_digest", "")
         store.commit_if_idle()
-    version = store.schema_version
-    if path.exists() and not version:
-        # An occupied path without a schema version is not a knowledge store.
-        store.close()
-        raise KnowledgeStartupError(
-            "schema_incompatible",
-            "the target file carries no knowledge schema version",
-        )
-    if version and version != SCHEMA_VERSION:
-        store.close()
-        raise KnowledgeStartupError(
-            "schema_incompatible",
-            f"knowledge schema version {version} is not supported (need {SCHEMA_VERSION})",
-        )
-    if not fresh and not store.migration_complete():
-        if _has_legacy_schema(path) or any(item.exists() for item in legacy):
-            store.close()
-            raise KnowledgeStartupError(
-                "migration_required",
-                "knowledge store exists but carries no complete migration manifest",
-            )
     return KnowledgeService(
         store=store,
         workspace_id=workspace_id,
@@ -1131,26 +1173,26 @@ class KnowledgeService:
         return tuple(keys)
 
     def bind_identifier_for_migration(
-        self, *, person_id: str, channel: str, kind: str, value: str
+        self,
+        *,
+        person_id: str,
+        channel: str,
+        kind: str,
+        value: str,
+        namespace: str | None = None,
     ) -> None:
-        """Bind one identifier during the transitional legacy co-existence.
+        """Record one identifier during the transitional legacy co-existence.
 
-        Only the composition/transitional path uses this; it records unverified,
-        non-durable evidence (``legacy-import``) so a later merge or revocation can see
-        exactly where the binding came from.
+        Only the composition/transitional path uses this.  It writes the compatibility
+        projection and an *unproven candidate* binding with ``legacy-import`` evidence; it
+        never mints an active authority, because no channel adapter proved the mapping.
+        A later audited admin operation or a real platform observation promotes it.
         """
-        ts = self._now()
-        self._store.execute(
-            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
-            " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
-            (str(channel), str(value), str(person_id), str(kind)),
+        identifier = Identifier(
+            channel=str(channel), kind=str(kind), value=str(value), namespace=namespace
         )
-        self._store.execute(
-            "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
-            " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
-            " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
-            " ON CONFLICT(channel, kind, value) DO NOTHING",
-            (str(channel), str(kind), str(value), str(person_id), ts, ts),
+        self._identity.record_unproven_identifier(
+            person_id=str(person_id), identifier=identifier, evidence_ref="legacy-import"
         )
         self._store.commit_if_idle()
 
@@ -1184,29 +1226,44 @@ class KnowledgeService:
             channel = str(getattr(item, "channel", "") or "")
             value = str(getattr(item, "identifier", "") or "")
             kind = str(getattr(item, "kind", "") or "handle")
+            namespace = str(getattr(item, "namespace", "") or "") or None
             if not channel or not value:
                 continue
-            self._store.execute(
-                "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
-                " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
-                (channel, value, str(person_id), kind),
-            )
-            self._store.execute(
-                "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
-                " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
-                " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
-                " ON CONFLICT(channel, kind, value) DO NOTHING",
-                (channel, kind, value, str(person_id), ts, ts),
+            try:
+                identifier = Identifier(
+                    channel=channel, kind=kind, value=value, namespace=namespace
+                )
+            except KnowledgeError:
+                # An unparseable legacy identifier is not silently reinterpreted.
+                continue
+            self._identity.record_unproven_identifier(
+                person_id=str(person_id),
+                identifier=identifier,
+                evidence_ref="legacy-import",
             )
         for item in aliases:
             alias = str(getattr(item, "alias", "") or "")
             source = str(getattr(item, "source", "") or "observed")
             if not alias:
                 continue
+            try:
+                clean = validate_name(alias)
+            except KnowledgeError:
+                continue
             self._store.execute(
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(contact_id, alias, source) DO NOTHING",
-                (str(person_id), alias, source, _iso_from_ms(ts), _iso_from_ms(ts)),
+                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen,"
+                " last_seen, normalized_alias, scope_key, status, address_allowed,"
+                " is_preferred, revision)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'global', 'observed', 0, 0, 1)"
+                " ON CONFLICT(contact_id, alias, source) DO NOTHING",
+                (
+                    str(person_id),
+                    clean,
+                    source,
+                    _iso_from_ms(ts),
+                    _iso_from_ms(ts),
+                    normalize_alias_value(clean),
+                ),
             )
         for item in fields:
             value = str(getattr(item, "value", "") or "")
@@ -1227,7 +1284,11 @@ class KnowledgeService:
         self._store.commit_if_idle()
 
     def person_id_for_value(self, value: str) -> str | None:
-        """Person id for a proven identifier value, searched across channels."""
+        """Person id for a proven *active* identifier value, searched across channels.
+
+        The compatibility projection ``contact_identifiers`` is deliberately not a
+        fallback here: a legacy row without a proven mapping must not resolve a person.
+        """
         token = str(value or "").strip()
         if not token:
             return None
@@ -1243,12 +1304,6 @@ class KnowledgeService:
             )
             if row is not None:
                 return self.canonical_id(str(row["person_id"]))
-            legacy = self._store.query_one(
-                "SELECT contact_id FROM contact_identifiers WHERE identifier = ? LIMIT 1",
-                (candidate,),
-            )
-            if legacy is not None:
-                return self.canonical_id(str(legacy["contact_id"]))
         return None
 
     def canonical_id(self, person_id: str) -> str:
