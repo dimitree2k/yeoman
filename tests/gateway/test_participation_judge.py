@@ -114,6 +114,19 @@ async def test_silence_is_a_valid_decision_not_a_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_judge_prompt_exposes_allowed_initiation_contributions() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+
+    await judge.decide(_opportunity(), _context())
+
+    system_prompt = client.calls[0][0]["content"]
+    user_prompt = client.calls[0][1]["content"]
+    assert "For initiation, direct address is not required" in system_prompt
+    assert "Allowed contribution types for initiation: light_humor, observation" in user_prompt
+
+
+@pytest.mark.asyncio
 async def test_reaction_needs_an_exact_target_and_an_allowed_emoji() -> None:
     judge = ParticipationJudge(client=_Client(_payload(
         action="react",
