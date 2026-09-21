@@ -163,6 +163,9 @@ five-round subagent workflows are not used automatically here.
 - Use three test tiers: targeted RED/GREEN checks while editing; the related
   suite once at task completion; the full suite once at final handoff. Do not
   rerun an unchanged suite after every agent message.
+- Use a 360-second hard timeout for targeted and related test suites; keep
+  the full-suite timeout at 1200 seconds. A longer rerun after a timeout
+  needs explicit owner authorization; do not silently retry.
 - Keep parent handoffs to ten lines plus a path to the detailed report. Do not
   copy full logs, source files, or agent reports into the parent context.
 - After dispatch, verify that the actual child model matches the requested
