@@ -597,10 +597,24 @@ def _copy_table(
 
 
 def _rebuild_fts(store: KnowledgeStore, knowledge: _ReadHandle) -> None:
+    """Rebuild the lexical index without carrying a locked statement forward.
+
+    The v1 index was built before the lifecycle columns existed, so it can hold entries
+    for statements that are now superseded or revoked.  Carrying them over would hand an
+    index-based reader a statement it may not see - and a later re-derivation would trust
+    that index.  Deleted nodes are excluded for the same reason.
+    """
     store.execute(f"DELETE FROM {_quote(_FTS_TABLE)}")
     store.execute(
         f"INSERT INTO {_quote(_FTS_TABLE)} (entry_id, content)"
-        " SELECT id, content FROM memory2_nodes WHERE is_deleted = 0"
+        " SELECT n.id, n.content FROM memory2_nodes n"
+        " WHERE n.is_deleted = 0"
+        "   AND NOT EXISTS ("
+        "       SELECT 1 FROM knowledge_statements s"
+        "       WHERE s.statement_id = n.id"
+        "         AND (s.status IN ('superseded','revoked')"
+        "              OR s.revoked_at_ms IS NOT NULL"
+        "              OR s.superseded_by IS NOT NULL))"
     )
 
 

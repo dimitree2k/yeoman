@@ -634,6 +634,27 @@ def payload_table_names(payload: dict) -> tuple[str, ...]:
     return tuple(sorted(str(entry["table"]) for entry in payload["tables"]))
 
 
+def test_upgrade_never_carries_a_locked_statement_into_the_index(
+    v1_upgrade: V1UpgradeHarness,
+):
+    """The rebuilt lexical index holds only statements a reader may actually see."""
+    report = v1_upgrade.build()
+    leaked = v1_upgrade.read(
+        report,
+        "SELECT COUNT(*) AS n FROM memory2_nodes_fts f"
+        " WHERE EXISTS (SELECT 1 FROM knowledge_statements s"
+        "   WHERE s.statement_id = f.entry_id"
+        "     AND (s.status IN ('superseded','revoked')"
+        "          OR s.revoked_at_ms IS NOT NULL"
+        "          OR s.superseded_by IS NOT NULL))",
+    )
+    assert int(leaked[0]["n"]) == 0
+    # The superseded rows still exist as statements: this is an index rule, not a delete.
+    assert v1_upgrade.read(
+        report, "SELECT COUNT(*) AS n FROM knowledge_statements WHERE status = 'superseded'"
+    )[0]["n"] == 1
+
+
 def v1_upgrade_rows(report, sql: str, params: tuple = ()) -> list[str]:
     conn = sqlite3.connect(f"file:{report.target_path}?mode=ro", uri=True)
     try:
