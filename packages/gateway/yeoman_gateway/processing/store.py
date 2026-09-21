@@ -1411,10 +1411,13 @@ class ProcessingStore:
     def unproven_event_sources(
         self, *, limit: int = 500, kinds: Iterable[str] = ("message",)
     ) -> tuple[dict[str, Any], ...]:
-        """Authority rows whose audience was never proven, oldest first.
+        """Journaled events whose audience was never proven, oldest first.
 
-        A bounded repair read: it returns only what a repair pass needs to register a
-        *provable* audience, and never touches the events themselves.
+        The projection is joined *from* the journal, not from the authority table: the
+        second journal writer appended thousands of events before the authority projection
+        existed, and a repair has to see those too.  A missing row is reported with the
+        event's own provenance, so registering the audience can create it.  Nothing here
+        touches the events themselves.
         """
         wanted = tuple(str(kind) for kind in kinds if str(kind))
         if not wanted:
@@ -1423,15 +1426,18 @@ class ProcessingStore:
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT a.event_id, a.revision, a.author_principal, a.source_channel,
-                       a.source_chat_id, a.occurred_at_ms, a.audience_status,
-                       a.audience_members_json, a.revoked_at_ms,
-                       e.kind AS kind, e.direction AS direction, e.origin AS origin
-                  FROM event_source_authority a
-                  JOIN events e ON e.event_id = a.event_id AND e.revision = a.revision
+                SELECT e.event_id, e.revision, e.channel AS source_channel,
+                       e.chat_id AS source_chat_id, e.principal AS author_principal,
+                       COALESCE(e.occurred_ms, e.created_ms) AS occurred_at_ms,
+                       a.audience_status, a.audience_members_json, a.revoked_at_ms,
+                       e.kind AS kind, e.direction AS direction, e.origin AS origin,
+                       e.created_ms AS created_ms
+                  FROM events e
+                  LEFT JOIN event_source_authority a
+                    ON a.event_id = e.event_id AND a.revision = e.revision
                  WHERE e.kind IN ({placeholders})
                    AND (a.audience_status IS NULL OR a.audience_status = 'unknown')
-                 ORDER BY a.occurred_at_ms, a.event_id
+                 ORDER BY e.created_ms, e.event_id
                  LIMIT ?
                 """,
                 (*wanted, int(limit)),

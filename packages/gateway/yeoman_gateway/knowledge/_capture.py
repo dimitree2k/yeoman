@@ -302,6 +302,7 @@ class AudienceRepairReport:
 
     examined: int = 0
     registered: int = 0
+    created: int = 0
     already_proven: int = 0
     refused: dict[str, int] = field(default_factory=dict)
     dry_run: bool = True
@@ -321,7 +322,9 @@ class HistoricAudienceRepair:
     not.  The pass is bounded, idempotent and refuses revoked revisions.
     """
 
-    def __init__(self, *, knowledge: Any, processing: Any, clock: Callable[[], int] | None = None) -> None:
+    def __init__(
+        self, *, knowledge: Any, processing: Any, clock: Callable[[], int] | None = None
+    ) -> None:
         self._knowledge = knowledge
         self._processing = processing
         self._clock = clock or (lambda: int(time.time() * 1000))
@@ -353,19 +356,17 @@ class HistoricAudienceRepair:
             if not callable(register):
                 report.refuse("knowledge_cannot_register")
                 continue
+            entry: Mapping[str, Any] | None = None
+            if callable(get_authority):
+                entry = get_authority(str(row["event_id"]), int(row.get("revision") or 1))
+            if entry is None:
+                # No projection row yet: the second journal writer predates it.  The
+                # registration below creates the row from the event's own provenance.
+                report.created += 1
             if not apply:
                 report.registered += 1
                 continue
-            if not callable(get_authority):
-                report.refuse("store_cannot_read_authority")
-                continue
-            entry = get_authority(str(row["event_id"]), int(row.get("revision") or 1))
-            if entry is None:
-                report.refuse("unknown_source")
-                continue
-            source = observed_event(
-                _RowEvent(row, entry), entry
-            ).source
+            source = observed_event(_RowEvent(row, entry or {}), entry or {}).source
             try:
                 registered = register(
                     source=source,
@@ -398,7 +399,7 @@ class _RowEvent:
         self.chat_id = str(row.get("source_chat_id") or "")
         self.principal = str(row.get("author_principal") or "")
         self.occurred_ms = int(row.get("occurred_at_ms") or 0)
-        self.created_ms = int(entry.get("created_ms") or 0)
+        self.created_ms = int(row.get("created_ms") or entry.get("created_ms") or 0)
         self.kind = str(row.get("kind") or "message")
         self.direction = str(row.get("direction") or "in")
         self.origin = str(row.get("origin") or "")
@@ -588,33 +589,42 @@ class StatementCaptureProducer:
         if not events:
             return report
         report.examined = len(events)
+        ceiling = max(1, int(max_batches))
         for batch in self._group(events, report=report).values():
             if not batch.sources:
                 continue
-            if not apply:
-                report.promoted_sources += len(batch.sources)
+            # A historic window can hold a chat's whole history at once, so the batch cap
+            # has to be enforced here exactly as the forward path enforces it: a job with
+            # hundreds of sources would silently truncate the prompt and stop being a
+            # bounded batch.  Sources are chunked in window order, after duplicates
+            # collapse, and each chunk is one idempotent job.
+            sources = collapse_provider_duplicates(batch.sources)
+            for start in range(0, len(sources), self._batch_max):
+                chunk = sources[start : start + self._batch_max]
+                refs = tuple(item.source for item in chunk)
+                if not apply:
+                    report.promoted_sources += len(refs)
+                    report.jobs += 1
+                    if report.jobs >= ceiling:
+                        return report
+                    continue
+                result = self._enqueue(refs, scope_key=batch.scope_key, now_ms=moment)
+                state = str(getattr(result, "state", "") or "")
+                reason = str(getattr(result, "reason", "") or "")
+                if state == "skipped":
+                    self.overflows += 1
+                    report.refuse(reason or "queue_full")
+                    continue
+                if state not in ("queued", "running", "done"):
+                    report.refuse(reason or "not_queued")
+                    continue
+                if reason == "already_queued":
+                    report.already_queued += 1
+                    continue
                 report.jobs += 1
-                if report.jobs >= max(1, int(max_batches)):
-                    break
-                continue
-            refs = tuple(item.source for item in collapse_provider_duplicates(batch.sources))
-            result = self._enqueue(refs, scope_key=batch.scope_key, now_ms=moment)
-            state = str(getattr(result, "state", "") or "")
-            reason = str(getattr(result, "reason", "") or "")
-            if state == "skipped":
-                self.overflows += 1
-                report.refuse(reason or "queue_full")
-                continue
-            if state not in ("queued", "running", "done"):
-                report.refuse(reason or "not_queued")
-                continue
-            if reason == "already_queued":
-                report.already_queued += 1
-                continue
-            report.jobs += 1
-            report.promoted_sources += len(refs)
-            if report.jobs >= max(1, int(max_batches)):
-                break
+                report.promoted_sources += len(refs)
+                if report.jobs >= ceiling:
+                    return report
         return report
 
     def _forward_window(self, start_ms: int, start_event_id: str) -> tuple[Any, ...]:

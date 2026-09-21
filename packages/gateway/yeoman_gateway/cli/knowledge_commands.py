@@ -229,7 +229,8 @@ def capture_audience(
         processing.close()
     _line(
         f"{'would register' if report.dry_run else 'registered'} "
-        f"{report.registered} of {report.examined} examined revision(s)"
+        f"{report.registered} of {report.examined} examined revision(s) "
+        f"({report.created} without a projection row yet)"
     )
     for reason, count in sorted(report.refused.items()):
         _line(f"  refused {reason}: {count}")

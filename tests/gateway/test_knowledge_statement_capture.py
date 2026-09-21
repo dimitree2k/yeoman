@@ -638,3 +638,26 @@ def test_historic_backfill_publishes_author_only_statements(harness: CaptureHarn
     assert report.published == 1
     row = harness.statements()[0]
     assert row["visibility_scope"] == "author_only"
+
+
+def test_historic_backfill_splits_a_whole_history_into_bounded_batches(
+    harness: CaptureHarness,
+) -> None:
+    """A historic window may hold a chat's entire history; jobs stay bounded."""
+    harness.advance(1_000)
+    for index in range(20):
+        harness.append_raw(text=f"Aussage Nummer {index}.", message_id=f"bulk-{index:02d}")
+        harness.advance(1_000)
+    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
+
+    HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store).run(
+        limit=50, apply=True
+    )
+    harness.activate()
+
+    report = harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
+
+    assert report.promoted_sources == 20
+    assert report.jobs == 3, "20 sources at a cap of 8 must be three bounded jobs"
+    sizes = sorted(len(__import__("json").loads(job["sources_json"])) for job in harness.jobs())
+    assert sizes == [4, 8, 8]
