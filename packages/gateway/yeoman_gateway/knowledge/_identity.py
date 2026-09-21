@@ -949,6 +949,58 @@ class IdentityEngine:
             out.append(item)
         return tuple(sorted(out, key=lambda item: (not item.is_preferred, item.name)))
 
+    def delivery_identifiers_for_alias(
+        self,
+        alias: str,
+        *,
+        channel: str,
+        scope_key: str | None = None,
+    ) -> tuple[Identifier, ...]:
+        """Proven delivery identifiers of the people carrying this exact alias.
+
+        Recognising a name is not permission to address somebody with it (spec 7.3), so
+        an alias counts here only while it is ``observed``/``confirmed``, explicitly
+        ``address_allowed``, neither retracted nor withdrawn, and - when a context is
+        given - inside that context or the explicitly released global one.
+
+        Every candidate is returned.  Ambiguity stays visible: the caller decides
+        "exactly one or nothing" and a first match is never a resolution.
+        """
+        query = str(alias or "").strip()
+        if not query:
+            return ()
+        channel_key = str(channel or "").strip().lower()
+        if not channel_key:
+            return ()
+        sql = (
+            "SELECT DISTINCT a.contact_id AS person_id FROM contact_aliases a"
+            " JOIN contacts c ON c.id = a.contact_id"
+            " WHERE a.alias = ? COLLATE NOCASE"
+            " AND a.status IN ('observed','confirmed')"
+            " AND a.address_allowed = 1"
+            " AND a.mapping_retracted = 0"
+            " AND a.valid_until_ms IS NULL"
+            " AND c.status = 'active'"
+        )
+        params: list[object] = [query]
+        if scope_key is not None:
+            sql += " AND (a.scope_key = ? OR a.scope_key = ?)"
+            params.extend([str(scope_key), GLOBAL_SCOPE_KEY])
+        people = [
+            self.canonical_id(str(row["person_id"]))
+            for row in self._store.query(sql, tuple(params))
+        ]
+        identifiers: list[Identifier] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for person_id in dict.fromkeys(people):
+            for binding in self.active_bindings_of(person_id):
+                identifier = binding.identifier
+                if identifier.channel != channel_key or identifier.full_key in seen:
+                    continue
+                seen.add(identifier.full_key)
+                identifiers.append(identifier)
+        return tuple(sorted(identifiers, key=lambda item: (item.kind, item.value)))
+
     # ── endpoint resolution by identifier ────────────────────────────────────
 
     def resolve_identifier(

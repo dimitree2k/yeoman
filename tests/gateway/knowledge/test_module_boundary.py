@@ -59,9 +59,34 @@ PEOPLE_MODULES = (
     "pipeline/",
     "agent/",
     "adapters/responder_llm.py",
+    "ipc/a2a_invoke.py",
     "cli/persona_evolution_commands.py",
     "persona_evolution.py",
 )
+
+#: Consumers that were cut over to the public facade.  Each one answers from knowledge
+#: whenever it is wired; the legacy cache is only the transitional answer for a
+#: composition without knowledge.
+CUT_OVER_CONSUMERS = (
+    "pipeline/reply_context.py",
+    "pipeline/outbound.py",
+    "adapters/responder_llm.py",
+    "agent/tools/summarize_history.py",
+    "agent/tools/contacts.py",
+    "agent/tools/resolve_contact.py",
+    "ipc/a2a_invoke.py",
+)
+
+#: Source fragments that mean "this consumer read the legacy contacts cache directly".
+LEGACY_CACHE_PATTERNS = ("contacts.store.", "contacts_service.store.", '"known_jids"')
+
+#: The transitional branch a consumer without a knowledge facade may still keep.  The
+#: count is fixed per file, so one more reach cannot hide behind an entry that is
+#: already listed: these numbers go to zero when the legacy cache is retired.
+LEGACY_CACHE_REACH: dict[str, int] = {
+    "agent/tools/resolve_contact.py": 9,
+    "ipc/a2a_invoke.py": 3,
+}
 
 #: Lines that may still reference a legacy helper, with the reason.  Each entry is a
 #: literal source fragment; the checker fails if the count of matches exceeds the
@@ -277,6 +302,26 @@ def test_consumers_use_typed_knowledge_operations():
     assert "self.knowledge.roster(" in source
     assert "self.contacts_service.known_jids" not in source
     assert "self.contacts.known_jids" not in source
+
+
+def test_cut_over_consumers_do_not_read_the_legacy_contacts_cache():
+    """The second half of Task 7, checked mechanically.
+
+    Every listed consumer resolves people through the public facade.  Only the
+    transitional branch for a composition *without* knowledge may still touch the legacy
+    cache, and only exactly as often as documented above - a new direct read fails here
+    instead of shipping quietly.
+    """
+    violations: list[str] = []
+    for relative in CUT_OVER_CONSUMERS:
+        source = (PACKAGE_ROOT / relative).read_text(encoding="utf-8")
+        found = sum(source.count(pattern) for pattern in LEGACY_CACHE_PATTERNS)
+        allowed = LEGACY_CACHE_REACH.get(relative, 0)
+        if found > allowed:
+            violations.append(f"{relative}: {found} legacy cache reads (allowed {allowed})")
+    assert not violations, "direct legacy contacts reads in cut-over consumers:\n" + "\n".join(
+        violations
+    )
 
 
 @pytest.mark.parametrize(

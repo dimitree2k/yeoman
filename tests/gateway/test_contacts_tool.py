@@ -192,7 +192,10 @@ class TestContactsTool:
 class TestResolveContactTool:
     @pytest.mark.asyncio
     async def test_resolves_partial_name_without_disclosing_fields(
-        self, contacts: ContactsService, chat_registry: ChatRegistry
+        self,
+        contacts: ContactsService,
+        knowledge: object,
+        chat_registry: ChatRegistry,
     ) -> None:
         contact_id = contacts.ensure_contact(
             channel="whatsapp",
@@ -205,7 +208,12 @@ class TestResolveContactTool:
             kind="note",
             value="sensitive personal note",
         )
-        resolver = ResolveContactTool(contacts=contacts, knowledge=knowledge, chat_registry=chat_registry)
+        # A proven platform observation is what makes this person resolvable; the legacy
+        # row above only proves the tool never reads its private fields.
+        knowledge.issue_person("4917632625469@s.whatsapp.net", name="Frank Taeger")
+        resolver = ResolveContactTool(
+            contacts=contacts, knowledge=knowledge, chat_registry=chat_registry
+        )
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
         result = await resolver.execute(query="Frank")
@@ -215,6 +223,39 @@ class TestResolveContactTool:
         assert payload["contact"]["display_name"] == "Frank Taeger"
         assert payload["contact"]["jid"] == "4917632625469@s.whatsapp.net"
         assert "sensitive personal note" not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unproven_legacy_contact_is_not_a_delivery_target(
+        self,
+        contacts: ContactsService,
+        knowledge: object,
+        chat_registry: ChatRegistry,
+    ) -> None:
+        """Knowledge is the sole authority: the legacy cache is not a second opinion.
+
+        The same row still resolves for a composition that has no knowledge facade at
+        all - that transitional path is the only reason the legacy cache is still wired.
+        """
+        contacts.ensure_contact(
+            channel="whatsapp",
+            identifier="4917632625469@s.whatsapp.net",
+            kind="phone_jid",
+            push_name="Frank Taeger",
+        )
+        resolver = ResolveContactTool(
+            contacts=contacts, knowledge=knowledge, chat_registry=chat_registry
+        )
+        resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
+
+        payload = json.loads(await resolver.execute(query="Frank"))
+        assert payload["ok"] is False
+        assert payload["error_code"] == "contact_not_resolved"
+
+        legacy = ResolveContactTool(contacts=contacts, chat_registry=chat_registry)
+        legacy.set_context(channel="whatsapp", chat_id="finance@g.us")
+        legacy_payload = json.loads(await legacy.execute(query="Frank"))
+        assert legacy_payload["ok"] is True
+        assert legacy_payload["contact"]["jid"] == "4917632625469@s.whatsapp.net"
 
     @pytest.mark.asyncio
     async def test_resolves_lid_mention_to_phone_jid_in_current_group(
@@ -298,6 +339,7 @@ class TestResolveContactTool:
     async def test_identifier_resolution_requires_token_boundaries(
         self,
         contacts: ContactsService,
+        knowledge: object,
         chat_registry: ChatRegistry,
         query: str,
     ) -> None:

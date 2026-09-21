@@ -14,8 +14,12 @@ class ContactsTool(Tool):
     """CRUD operations on the contacts CRM."""
 
     def __init__(
-        self, contacts: "ContactsService", knowledge: object | None = None
+        self,
+        contacts: "ContactsService | None" = None,
+        knowledge: object | None = None,
     ) -> None:
+        #: The legacy cache is kept only so the transitional composition can still build
+        #: this tool; every action below answers from the public knowledge facade.
         self._contacts = contacts
         #: Public person-knowledge facade.  Identifier lookups go through it so this
         #: tool never reads the contacts cache directly.

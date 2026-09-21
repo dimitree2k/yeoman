@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from yeoman_gateway.a2a.contracts import A2AContractValidationError, ContractSchemas
 from yeoman_gateway.core.models import InboundEvent
+from yeoman_gateway.knowledge.models import GLOBAL_SCOPE_KEY
 from yeoman_gateway.processing.dispatch import SERVICE_PRINCIPALS, EffectNotDeliveredError
 from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE, EffectReceipt
 
@@ -60,9 +61,17 @@ def resolve_whatsapp_recipient(
     alias: str,
     *,
     policy_adapter: Any,
-    contacts_service: Any,
+    knowledge: Any = None,
+    contacts_service: Any = None,
 ) -> tuple[str | None, str | None]:
-    """Resolve an exact typed alias without accepting identifiers or fuzzy matches."""
+    """Resolve an exact typed alias without accepting identifiers or fuzzy matches.
+
+    A peer request carries no conversation context, so a contact alias is an address
+    only when it was *explicitly released* as one (spec 7.3: recognising a name is not
+    permission to address somebody) in the global scope, and only when the address is an
+    active proven binding.  The legacy contacts cache answers for compositions that run
+    without knowledge; it is never consulted when knowledge is wired.
+    """
     refresh = getattr(policy_adapter, "owner_recipients", None)
     if callable(refresh):
         refresh("whatsapp")
@@ -77,18 +86,34 @@ def resolve_whatsapp_recipient(
             group_hits.append(chat_id)
 
     contact_hits: list[str] = []
-    for contact in contacts_service.store.search_by_alias(alias):
-        if not any(
-            candidate.alias == alias
-            for candidate in contacts_service.store.get_aliases(contact.id)
-        ):
-            continue
-        contact_hits.extend(
-            identifier.identifier
-            for identifier in contacts_service.store.get_identifiers(contact.id)
-            if identifier.channel == "whatsapp"
-            and not identifier.identifier.endswith("@g.us")
-        )
+    if knowledge is not None:
+        try:
+            contact_hits.extend(
+                identifier.value
+                for identifier in knowledge.delivery_identifiers_for_alias(
+                    alias, channel="whatsapp", scope_key=GLOBAL_SCOPE_KEY
+                )
+                if not identifier.value.endswith("@g.us")
+            )
+        except Exception:
+            # A knowledge outage is an unavailable recipient, not a broken interface and
+            # never a reason to fall back to the unproven legacy cache.
+            contact_hits = []
+    elif contacts_service is not None:
+        # Transitional branch: a composition without knowledge has no proven bindings to
+        # answer from, so the legacy cache still names the target it always named.
+        for contact in contacts_service.store.search_by_alias(alias):
+            if not any(
+                candidate.alias == alias
+                for candidate in contacts_service.store.get_aliases(contact.id)
+            ):
+                continue
+            contact_hits.extend(
+                identifier.identifier
+                for identifier in contacts_service.store.get_identifiers(contact.id)
+                if identifier.channel == "whatsapp"
+                and not identifier.identifier.endswith("@g.us")
+            )
 
     hits = group_hits if kind == "group" else contact_hits
     other_hits = contact_hits if kind == "group" else group_hits

@@ -1548,12 +1548,15 @@ class KnowledgeService:
         *,
         channel: str,
         prefer: tuple[str, ...] = (),
+        prefer_kind: str | None = None,
     ) -> Identifier | None:
         """One delivery identifier for an exact name or alias.
 
         Refuses ambiguity: two people with the same name yield ``None`` instead of a
         first match, and an optional ``prefer`` list narrows to identifiers already
-        present in the current conversation.
+        present in the current conversation.  ``prefer_kind`` states which proven kind
+        (for example ``phone_jid``) is the wanted address when one person has several;
+        without it, two kinds stay ambiguous.
         """
         query = str(name or "").strip()
         if not query:
@@ -1574,12 +1577,17 @@ class KnowledgeService:
         people = list(dict.fromkeys(people))
         if len(people) != 1:
             return None
-        resolution = self._identity.resolve_endpoint(people[0], str(channel))
+        resolution = self._identity.resolve_endpoint(
+            people[0], str(channel), prefer_kind=prefer_kind
+        )
         candidates = [resolution.identifier] if resolution.identifier else []
         if not candidates:
             bindings = self._identity.active_bindings_of(people[0])
             candidates = [
-                item.identifier for item in bindings if item.identifier.channel == str(channel)
+                item.identifier
+                for item in bindings
+                if item.identifier.channel == str(channel)
+                and (prefer_kind is None or item.identifier.kind == prefer_kind)
             ]
         if not candidates:
             return None
@@ -1590,6 +1598,25 @@ class KnowledgeService:
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def delivery_identifiers_for_alias(
+        self,
+        alias: str,
+        *,
+        channel: str = "whatsapp",
+        scope_key: str | None = None,
+    ) -> tuple[Identifier, ...]:
+        """Proven delivery addresses for one exact, address-allowed alias.
+
+        The delivery-side twin of :meth:`identifier_for_name`: it never guesses a person
+        from a partial name and never treats a merely recognised name as a permission to
+        address somebody (spec 7.3).  The result keeps ambiguity visible - an empty tuple
+        means "no proven address", several entries mean "more than one address", and the
+        caller must refuse rather than pick one.
+        """
+        return self._identity.delivery_identifiers_for_alias(
+            alias, channel=str(channel), scope_key=scope_key
+        )
 
     def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
         """Proven identifier bindings of a person, for diagnostics and tools."""

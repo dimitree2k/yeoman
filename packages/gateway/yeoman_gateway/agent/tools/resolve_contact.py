@@ -1,4 +1,11 @@
-"""Read-only contact resolution for delivery targets."""
+"""Read-only contact resolution for delivery targets.
+
+Person resolution has one authority at a time.  With a knowledge facade wired, a target
+exists only for a person with an *active proven* binding: an unproven legacy identifier
+never names a delivery target, and two candidates stay "unresolved" instead of becoming a
+first match.  The legacy contacts cache answers only for callers that run without
+knowledge at all - it is never a second opinion after knowledge already answered.
+"""
 
 from __future__ import annotations
 
@@ -100,43 +107,6 @@ def chat_participant_identifiers(
     return set(mapped) | set(mapped.values())
 
 
-def _display_for_identifier(
-    contacts: "ContactsService",
-    identifier: str,
-    *,
-    knowledge: object | None = None,
-) -> str | None:
-    """Released display name for an identifier, resolved through the public facade."""
-    if knowledge is not None:
-        # Knowledge is the authority whenever it is wired: a person without a proven
-        # binding has no name here, and the legacy cache is never a second opinion.
-        person_id = knowledge.person_id_for_value(identifier)
-        if person_id is None:
-            return None
-        return knowledge.person_display_name(person_id)
-    # Transitional branch: a resolver wired without the knowledge facade still answers
-    # from the contacts cache it was built with, so the remaining legacy call sites keep
-    # working until they are cut over.  This branch never widens knowledge authority -
-    # it only keeps the old one alive for callers that have not migrated.
-    contact_id = getattr(contacts, "known_jids", {}).get(identifier)
-    if not contact_id:
-        return None
-    return contacts.get_display_name(contact_id)
-
-
-def _contact_identifiers(
-    contacts: "ContactsService",
-    contact: "Contact",
-    *,
-    channel: str,
-) -> list[str]:
-    return [
-        ident.identifier
-        for ident in contacts.store.get_identifiers(contact.id)
-        if ident.channel == channel
-    ]
-
-
 def _reference_matches_labels(
     reference: str,
     labels: list[str],
@@ -155,16 +125,36 @@ def _reference_matches_labels(
     return False
 
 
+def _pick_delivery_value(identifiers: list[str]) -> str | None:
+    """One address, phone first - the historic WhatsApp delivery form."""
+    if not identifiers:
+        return None
+    phone_jid = next(
+        (item for item in identifiers if item.endswith("@s.whatsapp.net")), None
+    )
+    return phone_jid or identifiers[0]
+
+
 def resolve_contact_reference(
     *,
-    contacts: "ContactsService",
-    knowledge: object | None = None,
     reference: str,
     channel: str,
     chat_id: str,
     chat_registry: "ChatRegistry | None" = None,
+    contacts: "ContactsService | None" = None,
+    knowledge: object | None = None,
 ) -> ContactResolution | None:
-    """Resolve a human name, phone JID, or WhatsApp LID mention to one contact."""
+    """Resolve a human name, phone JID, or WhatsApp LID mention to one delivery target.
+
+    The current chat's explicit request is the addressing decision; the *proven binding*
+    is the technical question.  So this path requires an active verified identifier and
+    refuses ambiguity, but it does not require a separately released address alias -
+    that gate governs addressing that no conversation asked for (out-of-context service
+    delivery, see ``delivery_identifiers_for_alias``).
+
+    A knowledge outage resolves nothing and raises nothing: a missing person is a
+    degradation of this turn, not a failed turn.
+    """
     ref = str(reference or "").strip()
     if not ref:
         return None
@@ -172,14 +162,108 @@ def resolve_contact_reference(
     participant_map = _participant_phone_map(chat_registry, channel=channel, chat_id=chat_id)
     participant_ids = set(participant_map.keys()) | set(participant_map.values())
 
+    if knowledge is not None:
+        try:
+            return _resolve_through_knowledge(
+                knowledge,
+                ref,
+                channel=channel,
+                chat_id=chat_id,
+                participant_map=participant_map,
+                participant_ids=participant_ids,
+            )
+        except Exception:
+            # Knowledge is optional for the turn: no authority, no target.
+            return None
+    if contacts is None:
+        return None
+    return _resolve_through_legacy(
+        contacts,
+        ref,
+        channel=channel,
+        participant_map=participant_map,
+        participant_ids=participant_ids,
+    )
+
+
+def _resolve_through_knowledge(
+    knowledge: Any,
+    ref: str,
+    *,
+    channel: str,
+    chat_id: str,
+    participant_map: dict[str, str],
+    participant_ids: set[str],
+) -> ContactResolution | None:
+    """Resolve a reference through the public knowledge facade only."""
+    mention_candidates = _mention_candidates(ref)
+    if mention_candidates:
+        # A mention is an identifier, not a name: only a proven binding names a person.
+        for candidate in mention_candidates:
+            mapped = participant_map.get(candidate, candidate)
+            for identifier in (mapped, candidate):
+                person_id = knowledge.person_id_for_value(identifier)
+                if person_id is None:
+                    continue
+                display = knowledge.person_display_name(person_id)
+                if display:
+                    return ContactResolution(
+                        display_name=display,
+                        jid=mapped,
+                        matched_identifier=candidate if candidate != mapped else None,
+                    )
+        return None
+
+    candidates: list[ContactResolution] = []
+    for person in knowledge.search_people_with_policy(
+        ref, channel=channel, chat_id=chat_id
+    ):
+        labels = [knowledge.person_display_name(person.person_id) or ""]
+        labels.extend(knowledge.alias_names(person.person_id))
+        if not _reference_matches_labels(ref, [label for label in labels if label]):
+            continue
+        identifiers = [
+            item.value
+            for item in knowledge.person_identifiers(person.person_id)
+            if item.channel == channel
+        ]
+        if participant_ids:
+            identifiers = [item for item in identifiers if item in participant_ids]
+        chosen = _pick_delivery_value(identifiers)
+        if not chosen:
+            continue
+        candidates.append(
+            ContactResolution(
+                display_name=person.display_name or chosen,
+                jid=chosen,
+            )
+        )
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _resolve_through_legacy(
+    contacts: "ContactsService",
+    ref: str,
+    *,
+    channel: str,
+    participant_map: dict[str, str],
+    participant_ids: set[str],
+) -> ContactResolution | None:
+    """Transitional resolver for callers that run without a knowledge facade.
+
+    It answers from the legacy contacts cache it was built with and disappears together
+    with that cache.  It never widens knowledge authority - knowledge is not wired here.
+    """
     mention_candidates = _mention_candidates(ref)
     if mention_candidates:
         for candidate in mention_candidates:
             mapped = participant_map.get(candidate, candidate)
             for identifier in (mapped, candidate):
-                display = _display_for_identifier(
-                    contacts, identifier, knowledge=knowledge
-                )
+                contact_id = getattr(contacts, "known_jids", {}).get(identifier)
+                display = contacts.get_display_name(contact_id) if contact_id else None
                 if display:
                     return ContactResolution(
                         display_name=display,
@@ -205,19 +289,20 @@ def resolve_contact_reference(
         ]
         if not _reference_matches_labels(ref, labels):
             continue
-        identifiers = _contact_identifiers(contacts, contact, channel=channel)
-        if not identifiers:
-            continue
+        identifiers = [
+            ident.identifier
+            for ident in contacts.store.get_identifiers(contact.id)
+            if ident.channel == channel
+        ]
         if participant_ids:
             identifiers = [
                 ident for ident in identifiers
                 if ident in participant_ids or ident in participant_map.values()
             ]
-            if not identifiers:
-                continue
-        phone_jid = next((ident for ident in identifiers if ident.endswith("@s.whatsapp.net")), None)
-        jid = phone_jid or identifiers[0]
-        candidates.append(ContactResolution(display_name=contact.display_name, jid=jid))
+        chosen = _pick_delivery_value(identifiers)
+        if not chosen:
+            continue
+        candidates.append(ContactResolution(display_name=contact.display_name, jid=chosen))
 
     if len(candidates) == 1:
         return candidates[0]
@@ -226,36 +311,36 @@ def resolve_contact_reference(
 
 def contact_resolution_matches_reference(
     *,
-    contacts: "ContactsService",
     reference: str,
     resolution: ContactResolution,
+    contacts: "ContactsService | None" = None,
     knowledge: object | None = None,
 ) -> bool:
     """Check that an exact mention resolves to one candidate for a name/alias."""
-    labels: list[str] = []
     if knowledge is not None:
         person_id = knowledge.person_id_for_value(resolution.jid)
         if person_id is None and resolution.matched_identifier:
             person_id = knowledge.person_id_for_value(resolution.matched_identifier)
-        if person_id is not None:
-            labels.append(knowledge.person_display_name(person_id) or "")
-            labels.extend(knowledge.alias_names(person_id))
-    if not any(labels):
-        if knowledge is not None:
-            # With knowledge wired, an unproven person has no labels to confirm against,
-            # and the legacy cache is not a second opinion.
+        if person_id is None:
+            # An unproven person has no labels to confirm against, and the legacy cache
+            # is not a second opinion once knowledge is the authority.
             return False
-        # Transitional branch for callers that have not been cut over yet.
-        contact_id = getattr(contacts, "known_jids", {}).get(resolution.jid)
-        if not contact_id and resolution.matched_identifier:
-            contact_id = getattr(contacts, "known_jids", {}).get(resolution.matched_identifier)
-        if not contact_id:
-            return False
-        contact = contacts.store.get_contact(contact_id)
-        if contact is None:
-            return False
-        labels.append(contact.display_name)
-        labels.extend(alias.alias for alias in contacts.store.get_aliases(contact_id))
+        labels = [knowledge.person_display_name(person_id) or ""]
+        labels.extend(knowledge.alias_names(person_id))
+        return _reference_matches_labels(reference, [label for label in labels if label])
+
+    if contacts is None:
+        return False
+    contact_id = getattr(contacts, "known_jids", {}).get(resolution.jid)
+    if not contact_id and resolution.matched_identifier:
+        contact_id = getattr(contacts, "known_jids", {}).get(resolution.matched_identifier)
+    if not contact_id:
+        return False
+    contact = contacts.store.get_contact(contact_id)
+    if contact is None:
+        return False
+    labels = [contact.display_name]
+    labels.extend(alias.alias for alias in contacts.store.get_aliases(contact_id))
     return _reference_matches_labels(reference, [label for label in labels if label])
 
 
@@ -265,7 +350,7 @@ class ResolveContactTool(Tool):
     def __init__(
         self,
         *,
-        contacts: "ContactsService",
+        contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
         chat_registry: "ChatRegistry | None" = None,
     ) -> None:

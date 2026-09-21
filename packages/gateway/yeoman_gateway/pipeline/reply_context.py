@@ -202,7 +202,12 @@ class ReplyContextMiddleware:
     def _resolve_speaker(self, row: ArchivedMessage) -> str:
         if row.sender_id:
             if self._knowledge is not None:
-                name = self._knowledge.name_for_identifier(row.sender_id, for_group=True)
+                # Knowledge names the speaker whenever it can; an outage or an unproven
+                # sender is a missing name, not a missing reply context.
+                try:
+                    name = self._knowledge.name_for_identifier(row.sender_id, for_group=True)
+                except Exception:
+                    name = None
                 if name:
                     return name
             elif self._contacts is not None:
