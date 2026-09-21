@@ -439,6 +439,36 @@ async def test_guidance_is_separated_from_untrusted_chat_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_identifies_current_opportunity_sources_as_targets() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    await judge.decide(
+        _opportunity(source_event_ids=("current",)),
+        _context(
+            messages=[
+                {"event_id": "old", "sender": "anna", "text": "old", "timestamp": 1},
+                {
+                    "event_id": "current",
+                    "sender": "ben",
+                    "text": "current question",
+                    "timestamp": 2,
+                },
+            ],
+            current_source_ids=["current"],
+        ),
+    )
+
+    system = client.calls[0][0]["content"]
+    user = client.calls[0][1]["content"]
+    assert "target_message_id must be one of the CURRENT opportunity source ids" in system
+    assert (
+        'CURRENT opportunity source IDs (trusted target candidates; use only these for '
+        'react/comment): id="current"'
+        in user
+    )
+
+
+@pytest.mark.asyncio
 async def test_hostile_chat_text_is_data_not_instructions() -> None:
     client = _Client(_payload())
     judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
