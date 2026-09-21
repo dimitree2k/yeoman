@@ -305,6 +305,9 @@ class SnapshotVerification:
     restored_path: Path | None = None
     counts: tuple[tuple[str, str, int, int], ...] = ()
     reason: str = ""
+    schema_version: str = ""
+    locked_index_entries: int | None = None
+    locked_index_enforced: bool = True
 
     @property
     def ok(self) -> bool:
@@ -368,7 +371,12 @@ def verify_snapshot(*, manifest: Path, restore_dir: Path | None = None) -> Snaps
 
     counts, counts_ok = _compare_counts(copies["knowledge"], payload)
     cross_ok, rehearsal_ok = _rehearse(copies["knowledge"])
-    fts_ok = _locked_fts_ok(copies["knowledge"])
+    schema_version = _meta_value(copies["knowledge"], "schema_version")
+    locked_entries = _locked_fts_entries(copies["knowledge"])
+    # A v1 index was built before the rule existed and keeps its leftovers until the
+    # upgrade rebuilds it; the check is enforced on the schema that has to satisfy it.
+    fts_enforced = schema_version != "1"
+    fts_ok = True if locked_entries is None else (locked_entries == 0 or not fts_enforced)
     ok = integrity_ok and counts_ok and cross_ok and rehearsal_ok and fts_ok
     return SnapshotVerification(
         manifest_path=manifest_path,
@@ -381,6 +389,9 @@ def verify_snapshot(*, manifest: Path, restore_dir: Path | None = None) -> Snaps
         restored_path=copies.get("knowledge"),
         counts=counts,
         reason="" if ok else "one or more restore checks failed",
+        schema_version=schema_version,
+        locked_index_entries=locked_entries,
+        locked_index_enforced=fts_enforced,
     )
 
 
@@ -398,31 +409,60 @@ def _compare_counts(
     return tuple(rows), ok
 
 
+def _has_table(connection: sqlite3.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _has_table(connection, table):
+        return False
+    return any(
+        str(row[1]) == column for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+
+
 def _rehearse(path: Path) -> tuple[bool, bool]:
     """The restore rehearsal: corrections, attributes, bindings and revocations survive.
 
     Checks the *shape* of what survived, never a row value: that a correction is still a
     correction, an attribute still attached, a binding still temporal, and a revocation
     still a revocation.  A rehearsal that printed values would leak into a test log.
+
+    The snapshot a pre-migration backup contains is still schema 1, which has neither
+    ``knowledge_person_attributes`` nor a ``binding_id`` column: a check that cannot apply
+    to this schema is skipped, not failed - reporting a healthy v1 backup as broken would
+    be the worst outcome.
     """
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        cross = connection.execute(
-            "SELECT COUNT(*) FROM knowledge_statement_people p"
-            " WHERE NOT EXISTS (SELECT 1 FROM knowledge_statements s"
-            "   WHERE s.statement_id = p.statement_id)"
-        ).fetchone()
-        cross_ok = cross is not None and int(cross[0]) == 0
-        attributes = connection.execute(
-            "SELECT COUNT(*) FROM knowledge_person_attributes a"
-            " WHERE NOT EXISTS (SELECT 1 FROM knowledge_statements s"
-            "   WHERE s.statement_id = a.statement_id)"
-        ).fetchone()
-        cross_ok = cross_ok and attributes is not None and int(attributes[0]) == 0
-        bindings = connection.execute(
-            "SELECT COUNT(*) FROM knowledge_identifier_bindings WHERE binding_id IS NULL"
-        ).fetchone()
-        rehearsal_ok = bindings is not None and int(bindings[0]) == 0
+        cross_ok = True
+        if _has_table(connection, "knowledge_statement_people"):
+            cross = connection.execute(
+                "SELECT COUNT(*) FROM knowledge_statement_people p"
+                " WHERE NOT EXISTS (SELECT 1 FROM knowledge_statements s"
+                "   WHERE s.statement_id = p.statement_id)"
+            ).fetchone()
+            cross_ok = cross_ok and cross is not None and int(cross[0]) == 0
+        if _has_table(connection, "knowledge_person_attributes"):
+            attributes = connection.execute(
+                "SELECT COUNT(*) FROM knowledge_person_attributes a"
+                " WHERE NOT EXISTS (SELECT 1 FROM knowledge_statements s"
+                "   WHERE s.statement_id = a.statement_id)"
+            ).fetchone()
+            cross_ok = cross_ok and attributes is not None and int(attributes[0]) == 0
+        rehearsal_ok = True
+        # ``binding_id`` is itself a v2 column: the temporal identity of a binding is
+        # exactly what schema 1 did not have.
+        if _has_column(connection, "knowledge_identifier_bindings", "binding_id"):
+            bindings = connection.execute(
+                "SELECT COUNT(*) FROM knowledge_identifier_bindings WHERE binding_id IS NULL"
+            ).fetchone()
+            rehearsal_ok = rehearsal_ok and bindings is not None and int(bindings[0]) == 0
         return cross_ok, rehearsal_ok
     except sqlite3.DatabaseError:
         return False, False
@@ -430,8 +470,11 @@ def _rehearse(path: Path) -> tuple[bool, bool]:
         connection.close()
 
 
-def _locked_fts_ok(path: Path) -> bool:
-    """A restored index must not carry an entry for a statement nobody may read."""
+def _locked_fts_entries(path: Path) -> int | None:
+    """How many index entries point at a statement nobody may read.
+
+    ``None`` means the check does not apply (no index at all).
+    """
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         row = connection.execute(
@@ -442,10 +485,10 @@ def _locked_fts_ok(path: Path) -> bool:
             "          OR s.revoked_at_ms IS NOT NULL"
             "          OR s.superseded_by IS NOT NULL))"
         ).fetchone()
-        return row is not None and int(row[0]) == 0
+        return None if row is None else int(row[0])
     except sqlite3.DatabaseError:
         # No index at all is not a failed restore: there is nothing to leak.
-        return True
+        return None
     finally:
         connection.close()
 

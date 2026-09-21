@@ -359,9 +359,28 @@ def snapshot_verify(
         _fail("manifest_mismatch", exc.message, exc.code)
     _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
     _line(f"manifest hashes: {'match' if report.hashes_match else 'differ'}")
+    _line(
+        f"knowledge schema: {report.schema_version or 'unknown'}"
+        + (
+            "  (v1: attribute checks do not apply yet)"
+            if report.schema_version == "1"
+            else ""
+        )
+    )
     _line(f"cross-references: {'ok' if report.cross_references_ok else 'broken'}")
     _line(f"restore rehearsal: {'ok' if report.rehearsal_ok else 'failed'}")
-    _line(f"locked index entries: {'none' if report.fts_locked_ok else 'present'}")
+    if report.locked_index_entries is None:
+        _line("locked index entries: no index to check")
+    elif report.locked_index_enforced:
+        _line(
+            "locked index entries: "
+            + ("none" if report.locked_index_entries == 0 else f"present ({report.locked_index_entries})")
+        )
+    else:
+        _line(
+            f"locked index entries: {report.locked_index_entries} (v1 leftovers; the"
+            " upgrade rebuilds the index without them, not a backup defect)"
+        )
     _line(f"verdict: {report.verdict}", style="green" if report.ok else "red")
     if not report.ok:
         _fail("manifest_mismatch", report.reason)

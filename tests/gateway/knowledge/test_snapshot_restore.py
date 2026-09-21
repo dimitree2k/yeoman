@@ -284,3 +284,50 @@ def test_snapshot_cli_round_trip(tmp_path: Path) -> None:
     )
     assert verified.exit_code == 0, verified.output
     assert "verdict: ok" in verified.output
+
+
+def test_a_pre_migration_v1_snapshot_verifies_as_healthy(tmp_path: Path) -> None:
+    """The backup that matters most before the upgrade is schema 1.
+
+    It has no ``knowledge_person_attributes``, no ``binding_id`` and an index that still
+    carries locked leftovers from before that rule existed.  None of that is a backup
+    defect, so the verification reports it instead of failing: a healthy pre-migration
+    backup that reads as "broken" would be the worst possible signal.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from legacy_fixtures import v1_knowledge_store_factory
+
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = tmp_path / "processing.db"
+    connection = sqlite3.connect(journal)
+    try:
+        connection.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL, payload TEXT NOT NULL DEFAULT '')"
+        )
+        connection.execute(
+            "CREATE TABLE event_source_authority (event_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL, authorized INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (event_id, revision))"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = create_snapshot(
+        processing=journal,
+        knowledge=fixture.path,
+        target_dir=tmp_path / "snapshot",
+        quiesce_ref="v1-backup-test",
+    )
+    verification = verify_snapshot(manifest=report.manifest_path)
+
+    assert verification.verdict == "ok", verification.reason
+    assert verification.schema_version == "1"
+    assert verification.integrity_ok
+    assert verification.cross_references_ok
+    assert verification.rehearsal_ok
+    # The leftovers are reported, and they do not fail a v1 backup.
+    assert not verification.locked_index_enforced
