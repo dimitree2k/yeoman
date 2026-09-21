@@ -107,19 +107,13 @@ def _display_for_identifier(
     knowledge: object | None = None,
 ) -> str | None:
     """Released display name for an identifier, resolved through the public facade."""
-    knowledge_name = None
-    if knowledge is not None:
-        person_id = knowledge.person_id_for_value(identifier)
-        if person_id is not None:
-            knowledge_name = knowledge.person_display_name(person_id)
-    if knowledge_name:
-        return knowledge_name
-    # Transitional: a resolver wired before the knowledge facade still answers from the
-    # contacts cache it was built with, so delivery decisions keep working.
-    contact_id = getattr(contacts, "known_jids", {}).get(identifier)
-    if not contact_id:
+    if knowledge is None:
         return None
-    return contacts.get_display_name(contact_id)
+    person_id = knowledge.person_id_for_value(identifier)
+    if person_id is None:
+        # No proven binding means no person, and a name is not a substitute for one.
+        return None
+    return knowledge.person_display_name(person_id)
 
 
 def _contact_identifiers(
@@ -239,17 +233,9 @@ def contact_resolution_matches_reference(
             labels.append(knowledge.person_display_name(person_id) or "")
             labels.extend(knowledge.alias_names(person_id))
     if not any(labels):
-        # Transitional fallback onto the contacts cache this resolver was built with.
-        contact_id = getattr(contacts, "known_jids", {}).get(resolution.jid)
-        if not contact_id and resolution.matched_identifier:
-            contact_id = getattr(contacts, "known_jids", {}).get(resolution.matched_identifier)
-        if not contact_id:
-            return False
-        contact = contacts.store.get_contact(contact_id)
-        if contact is None:
-            return False
-        labels.append(contact.display_name)
-        labels.extend(alias.alias for alias in contacts.store.get_aliases(contact_id))
+        # The legacy contacts cache is not consulted: without a proven person there is
+        # nothing this resolver may confirm a mention against.
+        return False
     return _reference_matches_labels(reference, [label for label in labels if label])
 
 

@@ -55,6 +55,7 @@ from yeoman_gateway.knowledge.models import (
     NameObservation,
     PersonLinkCandidate,
     PersonProfile,
+    READ_PURPOSES,
     PersonResolution,
     RecallQuery,
     SourceRef,
@@ -1711,6 +1712,35 @@ class KnowledgeService:
                 context=context,
             )
 
+    def owner_read_context(
+        self,
+        *,
+        channel: str = "whatsapp",
+        chat_id: str = "cli",
+        purpose: str = "admin",
+    ) -> TrustedReadContext:
+        """Issue a read context from Policy's own owner decision.
+
+        The public twin of :meth:`admin_context_for`, needed because a profile read is a
+        *read*: it must go through the one shared read contract instead of being handed
+        raw rows.  Runtime surfaces (tools, CLI) ask here; Policy decides who the actor is.
+        """
+        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+        if not actor:
+            raise KnowledgeError("unauthorized", "no owner actor is available from policy")
+        return TrustedReadContext(
+            principal_id=str(actor),
+            channel=str(channel),
+            chat_id=str(chat_id),
+            recipient_principals=frozenset({str(actor)}),
+            membership_revision="owner",
+            policy_revision=self.policy_revision,
+            purpose=purpose if purpose in READ_PURPOSES else "admin",
+            now_ms=self._now(),
+            is_direct=True,
+            owner=True,
+        )
+
     def search_people_with_policy(
         self,
         name: str,
@@ -1720,25 +1750,8 @@ class KnowledgeService:
         purpose: str = "admin",
     ) -> tuple[PersonResolution, ...]:
         """Name lookup for authorized surfaces; several people may share a name."""
-        context = TrustedReadContext(
-            principal_id=self._policy.admin_actor()
-            if hasattr(self._policy, "admin_actor")
-            else "owner",
-            channel=str(channel),
-            chat_id=str(chat_id),
-            recipient_principals=frozenset(
-                {
-                    self._policy.admin_actor()
-                    if hasattr(self._policy, "admin_actor")
-                    else "owner"
-                }
-            ),
-            membership_revision="admin",
-            policy_revision=self.policy_revision,
-            purpose=purpose if purpose in ("reply", "proactive", "profile", "admin") else "admin",
-            now_ms=self._now(),
-            is_direct=True,
-            owner=True,
+        context = self.owner_read_context(
+            channel=channel, chat_id=chat_id, purpose=purpose
         )
         return self._identity.search_by_name(name, context=context)
 

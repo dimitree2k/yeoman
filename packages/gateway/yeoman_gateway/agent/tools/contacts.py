@@ -145,10 +145,20 @@ class ContactsTool(Tool):
         )
         if not found:
             return f"No person found with name '{name}'"
+        if len(found) > 1:
+            # Two people with one name must never resolve to "the first one".
+            return (
+                f"Error: '{name}' matches {len(found)} people; use an exact person id"
+            )
         person = found[0]
+        # Every content read uses the one shared read contract through an owner-issued
+        # context; a tool argument never becomes a read authorization.
+        context = self._knowledge.owner_read_context(
+            channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
+        )
         identifiers = self._knowledge.person_identifiers(person.person_id)
         aliases = self._knowledge.alias_names(person.person_id)
-        facts = self._knowledge.person_facts(person.person_id)
+        profile = self._knowledge.person_profile(person.person_id, context=context)
         lines = [
             f"Name: {person.display_name or person.person_id}",
             f"Person: {person.person_id}",
@@ -159,9 +169,10 @@ class ContactsTool(Tool):
             )
         if aliases:
             lines.append("Observed names: " + ", ".join(aliases))
-        for kind, value, label in facts:
-            label_str = f" ({label})" if label else ""
-            lines.append(f"{kind}{label_str}: {value}")
+        for line in profile.card.splitlines():
+            if line.startswith(("name:", "aliases:", "contact:")):
+                continue
+            lines.append(line)
         return "\n".join(lines)
 
     def _update_name(self, identifier: str, name: str) -> str:
@@ -192,12 +203,10 @@ class ContactsTool(Tool):
             return "Error: name, kind, and value are required"
         if self._knowledge is None:
             return "Error: knowledge is unavailable"
-        found = self._knowledge.search_people_with_policy(
-            name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
-        )
-        if not found:
-            return f"Error: no person found with name '{name}'"
-        person = found[0]
+        person, error = self._one_person(name)
+        if error:
+            return error
+        assert person is not None
         try:
             receipt = self._knowledge.record_note(
                 person.person_id,
@@ -219,16 +228,34 @@ class ContactsTool(Tool):
             return "Error: name, kind, and value are required"
         if self._knowledge is None:
             return "Error: knowledge is unavailable"
+        person, error = self._one_person(name)
+        if error:
+            return error
+        assert person is not None
+        # ID-based, bounded maintenance: the old broad LIKE erase is gone from this path,
+        # because "delete every statement containing X" is not a correction of a fact.
+        erased = self._knowledge.erase_matching_statements(
+            person.person_id, contains=value, reason="contacts_tool_remove_field"
+        )
+        return (
+            f"Removed {kind}: {value} from {person.display_name or person.person_id}"
+            f" ({erased} statements)"
+        )
+
+    def _one_person(self, name: str):
+        """Resolve a name to exactly one person, or an explicit error string."""
+        if self._knowledge is None:
+            return None, "Error: knowledge is unavailable"
         found = self._knowledge.search_people_with_policy(
             name, channel=self._channel or "whatsapp", chat_id=self._chat_id or "cli"
         )
         if not found:
-            return f"Error: no person found with name '{name}'"
-        person = found[0]
-        erased = self._knowledge.erase_matching_statements(
-            person.person_id, contains=value, reason="contacts_tool_remove_field"
-        )
-        return f"Removed {kind}: {value} from {person.display_name or person.person_id} ({erased} statements)"
+            return None, f"Error: no person found with name '{name}'"
+        if len(found) > 1:
+            return None, (
+                f"Error: '{name}' matches {len(found)} people; use an exact person id"
+            )
+        return found[0], ""
 
     def _merge(self, target_name: str, source_name: str) -> str:
         if not target_name or not source_name:

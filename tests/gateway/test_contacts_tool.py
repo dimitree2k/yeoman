@@ -86,7 +86,10 @@ def _promote(knowledge, contacts: ContactsService, *extra_identifiers: str) -> N
             continue
         knowledge.promote_legacy_person(person_id=person_id, display_name=row.display_name)
     for token in extra_identifiers:
-        knowledge.issue_person(token)
+        # The name the legacy store shows is what an adapter would have observed with the
+        # identifier, so it travels as the observation's display name.
+        row = contacts.store.get_contact(contacts.known_jids.get(token, ""))
+        knowledge.issue_person(token, name=None if row is None else row.display_name)
 
 
 @pytest.fixture
@@ -226,7 +229,7 @@ class TestResolveContactTool:
             kind="phone_jid",
             push_name="Frank Taeger",
         )
-        _promote(knowledge, contacts)
+        _promote(knowledge, contacts, "4917632625469@s.whatsapp.net")
         resolver = ResolveContactTool(contacts=contacts, knowledge=knowledge, chat_registry=chat_registry)
         resolver.set_context(channel="whatsapp", chat_id="finance@g.us")
 
