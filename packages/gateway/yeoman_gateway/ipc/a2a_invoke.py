@@ -9,6 +9,8 @@ from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
+from loguru import logger
+
 from yeoman_gateway.a2a.contracts import A2AContractValidationError, ContractSchemas
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.knowledge.models import GLOBAL_SCOPE_KEY
@@ -95,9 +97,14 @@ def resolve_whatsapp_recipient(
                 )
                 if not identifier.value.endswith("@g.us")
             )
-        except Exception:
+        except Exception as exc:
             # A knowledge outage is an unavailable recipient, not a broken interface and
-            # never a reason to fall back to the unproven legacy cache.
+            # never a reason to fall back to the unproven legacy cache.  It is reported,
+            # so "outage" does not look like "no such alias".
+            logger.warning(
+                "a2a recipient resolution degraded: knowledge lookup failed ({})",
+                getattr(exc, "code", type(exc).__name__),
+            )
             contact_hits = []
     elif contacts_service is not None:
         # Transitional branch: a composition without knowledge has no proven bindings to

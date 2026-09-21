@@ -531,6 +531,20 @@ def test_the_knowledge_composition_does_not_hand_the_legacy_cache_to_consumers(
         assert runtime.responder.knowledge is not None, "the facade must be the authority"
         assert runtime.responder.contacts_service is None, "no second, unproven cache"
         assert runtime.contacts is not None, "...but the service still owns its lifecycle"
+
+        # The pipeline layers are built from the same value: neither the reply-context nor
+        # the outbound middleware receives the legacy cache in this composition.
+        pipeline = runtime.orchestrator._orchestrator._pipeline  # noqa: SLF001 - wiring check
+        layers = pipeline._layers  # noqa: SLF001 - wiring check
+        people_middleware = [
+            layer
+            for layer in layers
+            if isinstance(layer, (ReplyContextMiddleware, OutboundMiddleware))
+        ]
+        assert len(people_middleware) == 2
+        for layer in people_middleware:
+            assert getattr(layer, "_knowledge", None) is not None
+            assert getattr(layer, "_contacts", None) is None
     finally:
         runtime.inbound_archive.close()
         runtime.chat_registry.close()
@@ -591,3 +605,179 @@ async def test_an_outage_still_renders_the_archive_name_in_reply_context(
 
     ambient = ctx.event.raw_metadata.get("ambient_context_window", [])
     assert ambient == ["[archive-name] hey there"]
+
+
+# ── review findings of the first cutover round ─────────────────────────────────
+
+
+def _retract(knowledge, person_id: str, name: str) -> None:
+    """Retract a name as a mapping: "that was never me" (spec 7.3)."""
+    row = knowledge._store.query_one(  # noqa: SLF001 - locating the alias under test
+        "SELECT id FROM contact_aliases WHERE contact_id = ? AND alias = ?",
+        (person_id, name),
+    )
+    assert row is not None, f"no alias {name!r} for {person_id}"
+    knowledge.retire_alias(
+        alias_id=int(row["id"]),
+        context=knowledge.admin_context_for(reason="cutover-test"),
+        correct_mapping=True,
+    )
+
+
+def test_two_proven_phone_addresses_are_ambiguous_not_a_first_match(knowledge) -> None:
+    """Spec 7.2: several equal targets are ambiguous."""
+    knowledge.issue_person(
+        FRANK_PHONE,
+        name="Frank Taeger",
+        extra=(
+            Identifier("whatsapp", "phone_jid", "4917632625470@s.whatsapp.net", "account-tests"),
+        ),
+        mapping=True,
+    )
+
+    assert (
+        resolve_contact_reference(
+            reference="Frank",
+            channel="whatsapp",
+            chat_id=CHAT,
+            knowledge=knowledge,
+            contacts=_PoisonedLegacyContacts(),
+        )
+        is None
+    )
+
+
+def test_a_conversation_address_is_preferred_over_an_unknown_one(knowledge) -> None:
+    person = knowledge.issue_person(
+        "4917632625469@s.whatsapp.net",
+        name="Frank Taeger",
+        extra=(Identifier("whatsapp", "phone_jid", "4917632625470@s.whatsapp.net", "account-tests"),),
+        mapping=True,
+    )
+    in_conversation = "4917632625470@s.whatsapp.net"
+
+    resolved = knowledge.identifier_for_name(
+        "Frank Taeger",
+        channel="whatsapp",
+        prefer=(in_conversation,),
+        prefer_kind="phone_jid",
+    )
+
+    assert resolved is not None
+    assert resolved.value == in_conversation
+    assert knowledge.person_identifiers(person)
+
+
+def test_a_retracted_name_is_not_a_delivery_target_any_more(knowledge) -> None:
+    person = knowledge.issue_person(FRANK_PHONE, name="Wimsekt")
+    knowledge.allow_address(person, "Wim")
+
+    assert (
+        resolve_contact_reference(
+            reference="Wim",
+            channel="whatsapp",
+            chat_id=CHAT,
+            knowledge=knowledge,
+            contacts=_PoisonedLegacyContacts(),
+        )
+        is not None
+    )
+
+    _retract(knowledge, person, "Wim")
+
+    assert "Wim" not in knowledge.alias_names(person)
+    assert knowledge.person_display_name(person) != "Wim"
+    assert (
+        resolve_contact_reference(
+            reference="Wim",
+            channel="whatsapp",
+            chat_id=CHAT,
+            knowledge=knowledge,
+            contacts=_PoisonedLegacyContacts(),
+        )
+        is None
+    )
+
+
+def test_a_mention_cannot_synthesise_a_whatsapp_address_from_another_channel(
+    knowledge,
+) -> None:
+    """A proven Telegram identifier is not a WhatsApp delivery target (L04/T13)."""
+    knowledge.issue_person("1234567890", kind="telegram_id", name="Telegram Person", channel="telegram")
+
+    assert (
+        resolve_contact_reference(
+            reference="@1234567890",
+            channel="whatsapp",
+            chat_id=CHAT,
+            knowledge=knowledge,
+            contacts=_PoisonedLegacyContacts(),
+        )
+        is None
+    )
+    # ...and it is still a proven person on its own channel.
+    assert knowledge.owners_of_identifier_value("1234567890", channel="telegram")
+
+
+def test_a_merge_keeps_the_released_address_of_the_merged_member(knowledge) -> None:
+    released = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
+    knowledge.allow_address(released, "Frank")
+    other = knowledge.issue_person(
+        "46918273106072@lid", kind="lid", name="Frank Zwei", mapping=True
+    )
+    knowledge.merge_people_with_policy(released, other, reason="cutover-test")
+
+    delivered = {
+        item.value
+        for item in knowledge.delivery_identifiers_for_alias("Frank", channel="whatsapp")
+    }
+
+    # A merge does not hide the merged member's proven address...
+    assert FRANK_PHONE in delivered
+    # ...and the A2A path refuses two addresses instead of picking one.
+    assert resolve_whatsapp_recipient(
+        "contact",
+        "Frank",
+        policy_adapter=_AliasPolicy(),
+        knowledge=knowledge,
+    ) == (None, "unknown")
+
+
+def test_an_unproven_legacy_projection_is_not_a_known_delivery_identifier(
+    knowledge,
+) -> None:
+    person = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
+    knowledge._store.execute(  # noqa: SLF001 - planting the unproven legacy projection
+        "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+        " VALUES ('whatsapp', '4917000000000@s.whatsapp.net', ?, 'phone_jid')",
+        (person,),
+    )
+
+    known = knowledge.known_identifier_values()
+
+    assert FRANK_PHONE in known
+    assert "4917000000000@s.whatsapp.net" not in known
+
+
+@pytest.mark.asyncio
+async def test_a_history_outage_keeps_the_archive_names(knowledge, tmp_path: Path) -> None:
+    archive = InboundArchive(db_path=tmp_path / "outage_history.db")
+    archive.record_inbound(
+        channel="whatsapp",
+        chat_id=CHAT,
+        message_id="m-1",
+        participant=None,
+        sender_id=FRANK_PHONE,
+        text="hey there",
+        timestamp=int(datetime.now(UTC).timestamp()) - 600,
+        sender_name="archive-name",
+    )
+    tool = SummarizeHistoryTool(archive, None, knowledge=_BrokenKnowledge())
+    tool.set_context("whatsapp", CHAT)
+    try:
+        result = await tool.execute(hours_back=48)
+    finally:
+        archive.close()
+
+    assert "archive-name" in result
+    assert "hey there" in result

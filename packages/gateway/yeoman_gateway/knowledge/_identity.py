@@ -596,7 +596,9 @@ class IdentityEngine:
             candidates = [
                 item
                 for item in aliases
-                if item.source == source and (item.visibility == "public" or allow_private)
+                if item.source == source
+                and item.findable
+                and (item.visibility == "public" or allow_private)
             ]
             if candidates:
                 candidates.sort(key=lambda item: (item.last_seen_ms, item.name))
@@ -993,13 +995,50 @@ class IdentityEngine:
         identifiers: list[Identifier] = []
         seen: set[tuple[str, str, str, str]] = set()
         for person_id in dict.fromkeys(people):
-            for binding in self.active_bindings_of(person_id):
-                identifier = binding.identifier
-                if identifier.channel != channel_key or identifier.full_key in seen:
-                    continue
-                seen.add(identifier.full_key)
-                identifiers.append(identifier)
+            # A merge keeps the identifier bindings on their original person row, so the
+            # bindings of every member have to be gathered, not only the canonical one.
+            for member in self.merged_member_ids(person_id):
+                for binding in self.active_bindings_of(member):
+                    identifier = binding.identifier
+                    if identifier.channel != channel_key or identifier.full_key in seen:
+                        continue
+                    seen.add(identifier.full_key)
+                    identifiers.append(identifier)
         return tuple(sorted(identifiers, key=lambda item: (item.kind, item.value)))
+
+    def owners_of_identifier_value(
+        self, value: str, *, channel: str | None = None
+    ) -> tuple[str, ...]:
+        """Canonical people with an *active proven* binding for this identifier value.
+
+        The namespace-blind twin of :meth:`resolve_identifier`, for a caller that only
+        holds a value - a mention in a message, a dialled number.  It returns every owner
+        instead of a first match, and an unproven ``contact_identifiers`` projection is
+        never an owner.
+        """
+        token = str(value or "").strip()
+        if not token:
+            return ()
+        candidates = [token]
+        local = token.split("@", 1)[0]
+        if local and local != token:
+            candidates.append(local)
+        channel_key = str(channel or "").strip().lower()
+        owners: list[str] = []
+        for candidate in dict.fromkeys(candidates):
+            sql = (
+                "SELECT person_id FROM knowledge_identifier_bindings"
+                " WHERE value = ? AND status = 'active'"
+            )
+            params: tuple[object, ...] = (candidate,)
+            if channel_key:
+                sql += " AND channel = ?"
+                params = (candidate, channel_key)
+            for row in self._store.query(sql, params):
+                canonical = self.canonical_id(str(row["person_id"]))
+                if canonical not in owners:
+                    owners.append(canonical)
+        return tuple(owners)
 
     # ── endpoint resolution by identifier ────────────────────────────────────
 

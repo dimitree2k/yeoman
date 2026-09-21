@@ -309,8 +309,9 @@ def test_cut_over_consumers_do_not_read_the_legacy_contacts_cache():
 
     Every listed consumer resolves people through the public facade.  Only the
     transitional branch for a composition *without* knowledge may still touch the legacy
-    cache, and only exactly as often as documented above - a new direct read fails here
-    instead of shipping quietly.
+    cache, and only exactly as often as documented above.  This is a *budget*: it catches
+    a growing reach, not a trade of one read for another inside a listed file - the
+    runtime guarantee comes from the tests that wire a cache which fails on any access.
     """
     violations: list[str] = []
     for relative in CUT_OVER_CONSUMERS:

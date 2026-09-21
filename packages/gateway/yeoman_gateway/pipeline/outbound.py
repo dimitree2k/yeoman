@@ -320,7 +320,11 @@ class OutboundMiddleware:
                                 prefer=tuple(seen),
                                 prefer_kind="phone_jid",
                             )
-                        except Exception:
+                        except Exception as exc:
+                            logger.warning(
+                                "mention resolution degraded: knowledge lookup failed ({})",
+                                getattr(exc, "code", type(exc).__name__),
+                            )
                             identifier = None
                         jid = None if identifier is None else identifier.value
                     elif self._contacts is not None:

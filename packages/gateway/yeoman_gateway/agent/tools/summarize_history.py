@@ -6,6 +6,8 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from loguru import logger
+
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -177,7 +179,13 @@ class SummarizeHistoryTool(Tool):
                 if person_id is None:
                     return None
                 return self._knowledge.person_display_name(person_id)
-            except Exception:
+            except Exception as exc:
+                # Visible degradation: the archive name is used, and the outage is not
+                # silently indistinguishable from "no proven person".
+                logger.warning(
+                    "history naming degraded: knowledge lookup failed ({})",
+                    getattr(exc, "code", type(exc).__name__),
+                )
                 return None
         if self._contacts is not None:
             return self._contacts.resolve_jid_to_name(identifier)

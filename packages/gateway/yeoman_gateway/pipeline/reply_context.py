@@ -11,6 +11,8 @@ import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from loguru import logger
+
 from yeoman_gateway.core.models import ArchivedMessage, InboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 from yeoman_gateway.core.ports import ReplyArchivePort
@@ -203,10 +205,15 @@ class ReplyContextMiddleware:
         if row.sender_id:
             if self._knowledge is not None:
                 # Knowledge names the speaker whenever it can; an outage or an unproven
-                # sender is a missing name, not a missing reply context.
+                # sender is a missing name, not a missing reply context - and it is
+                # reported, so it does not look like "this person has no name".
                 try:
                     name = self._knowledge.name_for_identifier(row.sender_id, for_group=True)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "reply context naming degraded: knowledge lookup failed ({})",
+                        getattr(exc, "code", type(exc).__name__),
+                    )
                     name = None
                 if name:
                     return name

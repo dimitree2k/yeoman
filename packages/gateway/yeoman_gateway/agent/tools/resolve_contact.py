@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -126,13 +128,43 @@ def _reference_matches_labels(
 
 
 def _pick_delivery_value(identifiers: list[str]) -> str | None:
-    """One address, phone first - the historic WhatsApp delivery form."""
-    if not identifiers:
+    """One address, or nothing.
+
+    Several equal addresses are ambiguous (spec 7.2), so a person with two proven phone
+    JIDs is not resolved to the first of them.  The phone JID wins only when exactly one
+    exists next to other kinds.
+    """
+    unique = list(dict.fromkeys(identifiers))
+    if len(unique) == 1:
+        return unique[0]
+    phones = [item for item in unique if item.endswith("@s.whatsapp.net")]
+    if len(phones) == 1:
+        return phones[0]
+    return None
+
+
+def _proven_mention_target(
+    knowledge: Any, *, channel: str, value: str
+) -> tuple[str, str] | None:
+    """The one person a mention value is *proven* for on this channel, if any.
+
+    A mention is text until a proven binding makes it an identifier.  The value must
+    belong to exactly one person - two owners are a conflict - and it must be one of that
+    person's own proven identifiers *on this channel*, so a mention can never synthesise
+    an address the person does not have.
+    """
+    owners = knowledge.owners_of_identifier_value(value, channel=channel)
+    if len(owners) != 1:
         return None
-    phone_jid = next(
-        (item for item in identifiers if item.endswith("@s.whatsapp.net")), None
-    )
-    return phone_jid or identifiers[0]
+    person_id = str(owners[0])
+    proven = {
+        item.value
+        for item in knowledge.person_identifiers(person_id)
+        if item.channel == channel
+    }
+    if value not in proven:
+        return None
+    return person_id, value
 
 
 def resolve_contact_reference(
@@ -172,8 +204,13 @@ def resolve_contact_reference(
                 participant_map=participant_map,
                 participant_ids=participant_ids,
             )
-        except Exception:
-            # Knowledge is optional for the turn: no authority, no target.
+        except Exception as exc:
+            # Knowledge is optional for the turn: no authority, no target.  The failure
+            # stays visible instead of looking exactly like "no proven person".
+            logger.warning(
+                "contact resolution degraded: knowledge lookup failed ({})",
+                getattr(exc, "code", type(exc).__name__),
+            )
             return None
     if contacts is None:
         return None
@@ -198,19 +235,23 @@ def _resolve_through_knowledge(
     """Resolve a reference through the public knowledge facade only."""
     mention_candidates = _mention_candidates(ref)
     if mention_candidates:
-        # A mention is an identifier, not a name: only a proven binding names a person.
+        # A mention is an identifier, not a name: only a proven binding on this channel
+        # names a person, and only with an address that person actually has.
         for candidate in mention_candidates:
             mapped = participant_map.get(candidate, candidate)
-            for identifier in (mapped, candidate):
-                person_id = knowledge.person_id_for_value(identifier)
-                if person_id is None:
+            for value in dict.fromkeys((mapped, candidate)):
+                proven = _proven_mention_target(knowledge, channel=channel, value=value)
+                if proven is None:
                     continue
+                person_id, proven_value = proven
                 display = knowledge.person_display_name(person_id)
                 if display:
                     return ContactResolution(
                         display_name=display,
-                        jid=mapped,
-                        matched_identifier=candidate if candidate != mapped else None,
+                        jid=proven_value,
+                        matched_identifier=(
+                            candidate if candidate != proven_value else None
+                        ),
                     )
         return None
 
@@ -309,6 +350,14 @@ def _resolve_through_legacy(
     return None
 
 
+def _proven_person_for_value(knowledge: Any, value: str) -> str | None:
+    """The one person a value is proven for, or nothing - never the first owner."""
+    owners = knowledge.owners_of_identifier_value(value)
+    if len(owners) != 1:
+        return None
+    return str(owners[0])
+
+
 def contact_resolution_matches_reference(
     *,
     reference: str,
@@ -318,9 +367,9 @@ def contact_resolution_matches_reference(
 ) -> bool:
     """Check that an exact mention resolves to one candidate for a name/alias."""
     if knowledge is not None:
-        person_id = knowledge.person_id_for_value(resolution.jid)
+        person_id = _proven_person_for_value(knowledge, resolution.jid)
         if person_id is None and resolution.matched_identifier:
-            person_id = knowledge.person_id_for_value(resolution.matched_identifier)
+            person_id = _proven_person_for_value(knowledge, resolution.matched_identifier)
         if person_id is None:
             # An unproven person has no labels to confirm against, and the legacy cache
             # is not a second opinion once knowledge is the authority.

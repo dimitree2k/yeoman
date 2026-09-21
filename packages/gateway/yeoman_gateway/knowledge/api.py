@@ -1553,10 +1553,10 @@ class KnowledgeService:
         """One delivery identifier for an exact name or alias.
 
         Refuses ambiguity: two people with the same name yield ``None`` instead of a
-        first match, and an optional ``prefer`` list narrows to identifiers already
-        present in the current conversation.  ``prefer_kind`` states which proven kind
-        (for example ``phone_jid``) is the wanted address when one person has several;
-        without it, two kinds stay ambiguous.
+        first match.  ``prefer_kind`` (for example ``phone_jid``) and ``prefer`` (values
+        already present in the conversation) only *narrow* the person's proven addresses;
+        whatever is left afterwards has to be exactly one, or the answer is ``None``.
+        A merge does not hide the addresses of the merged members.
         """
         query = str(name or "").strip()
         if not query:
@@ -1577,27 +1577,40 @@ class KnowledgeService:
         people = list(dict.fromkeys(people))
         if len(people) != 1:
             return None
-        resolution = self._identity.resolve_endpoint(
-            people[0], str(channel), prefer_kind=prefer_kind
-        )
-        candidates = [resolution.identifier] if resolution.identifier else []
-        if not candidates:
-            bindings = self._identity.active_bindings_of(people[0])
-            candidates = [
-                item.identifier
-                for item in bindings
-                if item.identifier.channel == str(channel)
-                and (prefer_kind is None or item.identifier.kind == prefer_kind)
-            ]
-        if not candidates:
-            return None
+        channel_key = str(channel).strip().lower()
+        candidates: list[Identifier] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for member in self._identity.merged_member_ids(people[0]):
+            for binding in self._identity.active_bindings_of(member):
+                identifier = binding.identifier
+                if identifier.channel != channel_key or identifier.full_key in seen:
+                    continue
+                seen.add(identifier.full_key)
+                candidates.append(identifier)
+        if prefer_kind is not None:
+            narrowed = [item for item in candidates if item.kind == prefer_kind]
+            if narrowed:
+                candidates = narrowed
         if prefer:
             preferred = [item for item in candidates if item.value in prefer]
-            if len(preferred) == 1:
-                return preferred[0]
+            if preferred:
+                candidates = preferred
+        # Several equal addresses are ambiguous, exactly as for any other delivery.
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def owners_of_identifier_value(
+        self, value: str, *, channel: str | None = None
+    ) -> tuple[str, ...]:
+        """Canonical people with a proven active binding for this exact identifier value.
+
+        The namespace-blind twin of :meth:`resolve_identifier`.  It is what a consumer
+        with only a value in hand (a mention, a dialled number) must use instead of
+        ``person_id_for_value`` + a guess: every owner comes back, and an unproven legacy
+        projection is not an owner at all.
+        """
+        return self._identity.owners_of_identifier_value(value, channel=channel)
 
     def delivery_identifiers_for_alias(
         self,
@@ -1868,14 +1881,16 @@ class KnowledgeService:
         return self.display_name(person_id, context=context)
 
     def known_identifier_values(self) -> tuple[str, ...]:
-        """Every identifier value the runtime knows, without exposing owner mapping.
+        """Every identifier value with a proven active binding.
 
         Used for alias matching in delivery decisions; it deliberately returns values
-        only, never the person they belong to.
+        only, never the person they belong to.  The unproven ``contact_identifiers``
+        projection is not part of it: a legacy row without a proven mapping must not make
+        a delivery target look "known".
         """
         rows = self._store.query(
             "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
-            " UNION SELECT identifier FROM contact_identifiers ORDER BY 1"
+            " ORDER BY 1"
         )
         return tuple(str(row[0]) for row in rows)
 
@@ -1915,8 +1930,12 @@ class KnowledgeService:
         return tuple(entries)
 
     def alias_names(self, person_id: str) -> tuple[str, ...]:
-        """Observed aliases of a person.  Untrusted text, for display only."""
-        return tuple(item.name for item in self._identity.aliases_of(person_id))
+        """Aliases that are still in force.  Untrusted text, for display only.
+
+        A retracted mapping ("that was never me") is not an alias any more: it stays as
+        audit history, never as a current name, and never as a way to find the person.
+        """
+        return tuple(item.name for item in self._identity.searchable_aliases_of(person_id))
 
     def source_revoked(self, source: SourceRef) -> bool:
         return bool(self._authority.source_revoked(source))
