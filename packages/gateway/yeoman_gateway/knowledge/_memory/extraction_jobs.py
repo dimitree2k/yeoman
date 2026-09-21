@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Final, Iterable, Mapping
 
 from loguru import logger
 
@@ -142,6 +142,32 @@ class SharedFactCandidate:
     @property
     def is_resolved(self) -> bool:
         return self.temporal_basis != "unresolved"
+
+
+
+#: A section shorter than this carries no proposition worth a provider call.
+_MIN_INPUT_CHARS: Final[int] = 3
+
+_CONTROL_CHARS_INPUT: Final[re.Pattern[str]] = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+#: A section that is only an ellipsis, a placeholder or a bare marker has no content.
+_PLACEHOLDER_INPUT: Final[re.Pattern[str]] = re.compile(
+    r"^(?:[\.\u2026\-\*_\s]+|<?(?:media|image|video|audio|document|sticker|attachment)>?"
+    r"|\[(?:media|image|video|audio|document|sticker|attachment)\])$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenDecision:
+    """The outcome of one deterministic screen: a verdict plus a stable reason code."""
+
+    accepted: bool
+    reason: str = "ok"
+
+    @property
+    def rejected(self) -> bool:
+        return not self.accepted
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +312,89 @@ _REPORTED_SPEECH_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
 )
+
+
+def screen_capture_input(text: str, source_context: Mapping[str, Any] | None = None) -> "ScreenDecision":
+    """The *input* screen: what may be sent to the model at all.
+
+    Deliberately weaker than the candidate screen.  It refuses only what is unusable as
+    input - an empty section, control characters, a section that is nothing but a
+    placeholder - and it must **never** refuse a section merely because it contains
+    reported speech.  "Tom erwähnte, dass Alex nach Köln gezogen ist" is a perfectly good
+    input: the sentence carries a reportable proposition, and whether it survives as a
+    statement is the candidate screen's decision, taken with the roles and sources in
+    front of it.
+
+    A rule that rejects input on the vocabulary of reporting would silently destroy the
+    proposition, and no later check could recover it.
+    """
+    context: Mapping[str, Any] = source_context or {}
+    if not isinstance(text, str):
+        return ScreenDecision(False, "invalid_input")
+    if not text.strip():
+        return ScreenDecision(False, "empty")
+    if _CONTROL_CHARS_INPUT.search(text):
+        return ScreenDecision(False, "control_characters")
+    stripped = text.strip()
+    if len(stripped) < _MIN_INPUT_CHARS:
+        return ScreenDecision(False, "too_short")
+    if _PLACEHOLDER_INPUT.match(stripped):
+        return ScreenDecision(False, "placeholder")
+    # An explicitly revoked basis never reaches a provider.
+    if str(context.get("source_status") or "") == "revoked":
+        return ScreenDecision(False, "source_revoked")
+    return ScreenDecision(True, "ok")
+
+
+def screen_statement_candidate(
+    draft: Any,
+    *,
+    allowed_people: Iterable[str] = (),
+    sources: Iterable[Any] | None = None,
+) -> "ScreenDecision":
+    """The *candidate* screen: what may become a durable statement.
+
+    This is where the reporting rules belong, together with the structural checks the
+    input screen cannot make: a proposition of its own, at least one source, and person
+    references that the runtime actually offered.  A model may neither invent a person
+    identifier nor a role.
+    """
+    content = str(getattr(draft, "content", "") or "")
+    verdict = screen_statement_content(content)
+    if verdict.rejected:
+        return ScreenDecision(False, str(verdict.reason))
+
+    basis = str(getattr(draft, "basis", "") or "").strip().lower()
+    if basis and basis in REJECT_BASES:
+        return ScreenDecision(False, basis)
+    if basis and basis not in ("explicit_statement", "reported_statement"):
+        return ScreenDecision(False, "unsupported_basis")
+
+    offered = {str(item) for item in allowed_people}
+    for reference in _candidate_person_references(draft):
+        if reference not in offered:
+            # A reference the runtime never offered is discarded, never resolved by a
+            # name lookup and never turned into a role.
+            return ScreenDecision(False, "unoffered_person_reference")
+
+    if sources is not None and not list(sources):
+        # A candidate without a source revision is not a statement; it is a claim.
+        return ScreenDecision(False, "missing_source")
+    return ScreenDecision(True, "ok")
+
+
+def _candidate_person_references(draft: Any) -> tuple[str, ...]:
+    """Person identifiers a candidate mentions, however it spells them."""
+    out: list[str] = []
+    for attribute in ("person_id", "person_ids", "subject_ids", "people"):
+        value = getattr(draft, attribute, None)
+        if value is None:
+            continue
+        for item in value if isinstance(value, (list, tuple, set)) else (value,):
+            token = str(getattr(item, "person_id", item) or "").strip()
+            if token:
+                out.append(token)
+    return tuple(dict.fromkeys(out))
 
 
 def conversation_report_reason(content: str) -> str:

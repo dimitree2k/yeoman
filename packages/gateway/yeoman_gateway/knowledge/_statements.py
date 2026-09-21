@@ -26,6 +26,7 @@ from yeoman_gateway.knowledge._reasons import (
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
     SUPERSESSION_REASONS,
+    AttributeCandidate,
     CaptureJobReceipt,
     CaptureJobRecord,
     CaptureResult,
@@ -209,6 +210,9 @@ class StatementEngine:
                 ),
                 ts=ts,
             )
+        # Structured facets are published in the same transaction as the statement and its
+        # roles, and only for a person who actually holds an *active subject* role here.
+        self._insert_attributes(statement_id, candidate.attributes, ts=ts)
         # `speaker` may already have been proposed by the extractor with the same
         # evidence; the primary key makes the second insert a no-op.
         link_rows = int(
@@ -602,6 +606,91 @@ class StatementEngine:
                 ),
             )
 
+    def _insert_attributes(
+        self,
+        statement_id: str,
+        attributes: tuple[AttributeCandidate, ...],
+        *,
+        ts: int,
+    ) -> int:
+        """Attach validated facets to a statement that carries the matching subject role.
+
+        A facet without an active ``subject`` role for the same person is dropped: the
+        speaker alone does not make a statement about the speaker, so "Alex moved to
+        Cologne" must not become a residence of whoever said it.
+        """
+        if not attributes:
+            return 0
+        subjects = {
+            str(row["person_id"])
+            for row in self._store.query(
+                "SELECT person_id FROM knowledge_statement_people"
+                " WHERE statement_id = ? AND role = 'subject' AND status = 'active'",
+                (statement_id,),
+            )
+        }
+        written = 0
+        for attribute in attributes:
+            if self._identity.canonical_id(attribute.person_id) not in subjects:
+                continue
+            payload = json.dumps(
+                {
+                    "text": attribute.value.text,
+                    "precision": attribute.value.precision,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            cursor = self._store.execute(
+                "INSERT OR IGNORE INTO knowledge_person_attributes (statement_id,"
+                " person_id, attribute_key, value_json, value_key, polarity, revision,"
+                " created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    str(statement_id),
+                    attribute.person_id,
+                    attribute.attribute_key,
+                    payload,
+                    attribute.value.value_key,
+                    attribute.polarity,
+                    ts,
+                    ts,
+                ),
+            )
+            written += 1 if cursor.rowcount else 0
+        return written
+
+    def attributes_of(
+        self, statement_id: str, *, active_only: bool = True
+    ) -> tuple[dict[str, Any], ...]:
+        """Stored facets of one statement, decoded for a reader that already passed the gate."""
+        sql = (
+            "SELECT a.* FROM knowledge_person_attributes a"
+            " JOIN knowledge_statements s ON s.statement_id = a.statement_id"
+            " WHERE a.statement_id = ?"
+        )
+        if active_only:
+            from yeoman_gateway.knowledge._retrieval import CURRENT_STATEMENT_SQL
+
+            sql += f" AND ({CURRENT_STATEMENT_SQL})"
+        sql += " ORDER BY a.attribute_key, a.value_key, a.polarity"
+        out: list[dict[str, Any]] = []
+        for row in self._store.query(sql, (str(statement_id),)):
+            try:
+                value = json.loads(str(row["value_json"]))
+            except ValueError:  # pragma: no cover - a corrupt row is not a reader error
+                continue
+            out.append(
+                {
+                    "statement_id": str(row["statement_id"]),
+                    "person_id": str(row["person_id"]),
+                    "attribute_key": str(row["attribute_key"]),
+                    "value": value,
+                    "value_key": str(row["value_key"]),
+                    "polarity": str(row["polarity"]),
+                }
+            )
+        return tuple(out)
+
     def _insert_person_link(
         self, statement_id: str, link: PersonLinkCandidate, *, ts: int
     ) -> bool:
@@ -609,8 +698,8 @@ class StatementEngine:
             """
             INSERT OR IGNORE INTO knowledge_statement_people (
                 statement_id, person_id, role, evidence_source_id, evidence_revision,
-                attribution, created_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                attribution, created_ms, status, binding_id, resolution_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 statement_id,
@@ -620,6 +709,9 @@ class StatementEngine:
                 int(link.source.revision),
                 link.attribution,
                 ts,
+                link.status,
+                link.binding_id,
+                link.resolution_reason,
             ),
         )
         return bool(cursor.rowcount)
