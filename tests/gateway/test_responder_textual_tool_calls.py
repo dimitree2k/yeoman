@@ -107,6 +107,50 @@ class _RecordingMarketIntelligenceTool(Tool):
         return '{"ok": true, "quotes": [{"symbol": "AMD", "percent_change": 3.2}]}'
 
 
+class _MarketAnswerProvider(LLMProvider):
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        super().__init__()
+        self.responses = list(responses)
+        self.calls = 0
+        self.messages: list[list[dict[str, Any]]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning: dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        del tools, model, max_tokens, temperature, reasoning, response_format
+        self.calls += 1
+        self.messages.append(messages)
+        return self.responses.pop(0)
+
+    def get_default_model(self) -> str:
+        return "dummy/model"
+
+
+class _MarketEvidenceTool(Tool):
+    name = "market_intelligence"
+    description = "return market evidence"
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    async def execute(self, **kwargs: Any) -> str:
+        del kwargs
+        return (
+            '{"ok":true,"quotes":[{"symbol":"AMD","pct":9.2}],'
+            '"news":[{"source":"Reuters","headline":"AMD rises after chip pricing report",'
+            '"summary":"A report points to higher chip prices."}],"macro_context":[]}'
+        )
+
+
 class _ReasoningToolThenAnswerProvider(LLMProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -433,9 +477,72 @@ async def test_market_intelligence_textual_tool_call_is_executed_before_reply(tm
 
     await responder.aclose()
 
-    assert out == "eBay hat genug Baustellen: Search, Fees, Seller Trust."
-    assert provider.calls == 2
+    assert out == "AMD: 3.2% | Cause not established in the available market evidence."
+    assert provider.calls == 3
     assert tool.calls == [{"query": "why is AMD moving?", "symbols": ["AMD"]}]
+
+
+@pytest.mark.asyncio
+async def test_market_intelligence_repairs_quote_only_answer_from_tool_evidence(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    provider = _MarketAnswerProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="market_call_1",
+                        name="market_intelligence",
+                        arguments={"query": "why is AMD up?"},
+                    )
+                ],
+            ),
+            LLMResponse(content="AMD is up 9.2% today."),
+            LLMResponse(
+                content=(
+                    '{"answer":"AMD is up 9.2%; a report points to higher chip prices, '
+                    'but that catalyst is not a confirmed company announcement.",'
+                    '"coverage":"catalyst",'
+                    '"evidence_ids":["market_call_1:quote:0","market_call_1:news:0"]}'
+                )
+            ),
+        ]
+    )
+    tool = _MarketEvidenceTool()
+    responder = LLMResponder(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace,
+        max_iterations=4,
+    )
+    responder.tools.register(tool)
+
+    out = await responder.generate_reply(
+        InboundEvent(
+            channel="whatsapp",
+            chat_id="group@g.us",
+            sender_id="u1",
+            content="Arvid, why is AMD up?",
+            is_group=True,
+            mentioned_bot=True,
+        ),
+        PolicyDecision(
+            accept_message=True,
+            should_respond=True,
+            allowed_tools=frozenset({"market_intelligence"}),
+            reason="test",
+        ),
+    )
+
+    await responder.aclose()
+
+    assert out == (
+        "AMD is up 9.2%; a report points to higher chip prices, but that catalyst is not "
+        "a confirmed company announcement."
+    )
+    assert provider.calls == 3
+    assert any("quote-only" in str(message) for message in provider.messages[-1])
 
 
 @pytest.mark.asyncio

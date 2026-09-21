@@ -345,6 +345,147 @@ def _strip_single_code_fence(text: str) -> str:
     return "\n".join(body).strip()
 
 
+_MARKET_ANSWER_CATALYST_KINDS = frozenset({"news", "macro", "research"})
+_MARKET_ANSWER_EVIDENCE_TOOLS = frozenset(
+    {"browse", "deep_research", "fact_check", "web_fetch", "web_search", "youtube_transcript"}
+)
+
+
+def _market_answer_contract_prompt(evidence: dict[str, dict[str, Any]]) -> str:
+    evidence_lines = "\n".join(
+        f"- {evidence_id} ({item['kind']})"
+        for evidence_id, item in evidence.items()
+    ) or "- none"
+    return (
+        "Runtime contract for this market-intelligence turn: when you are done using tools, "
+        "return exactly one JSON object and no surrounding prose with these fields: "
+        '`{"answer":"...","coverage":"catalyst|uncertain","evidence_ids":["..."]}`. '
+        "The `answer` is the user-facing text and may use the user's language. "
+        "Use `coverage=catalyst` only when the available evidence supports a catalyst; "
+        "otherwise use `coverage=uncertain` and state that the cause is unresolved. "
+        "If quote evidence exists, cite at least one quote evidence ID. "
+        "For catalyst coverage, cite at least one news, macro, or research evidence ID. "
+        "Use only the evidence IDs listed below. Do not invent sources, numbers, or claims. "
+        "The JSON envelope is internal and will be removed before delivery.\n"
+        f"Available evidence IDs:\n{evidence_lines}"
+    )
+
+
+def _annotate_market_intelligence_result(
+    result: str | None,
+    tool_call_id: str,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    if not isinstance(result, str):
+        return str(result or ""), {}
+    try:
+        payload = json.loads(result)
+    except json.JSONDecodeError:
+        return result, {}
+    if not isinstance(payload, dict):
+        return result, {}
+
+    evidence: dict[str, dict[str, Any]] = {}
+    for payload_field, kind in (("quotes", "quote"), ("news", "news"), ("macro_context", "macro")):
+        entries = payload.get(payload_field)
+        if not isinstance(entries, list):
+            continue
+        annotated_entries: list[Any] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                annotated_entries.append(entry)
+                continue
+            evidence_id = f"{tool_call_id}:{kind}:{index}"
+            annotated = dict(entry)
+            annotated["evidence_id"] = evidence_id
+            annotated_entries.append(annotated)
+            evidence[evidence_id] = {"kind": kind, "value": annotated}
+        payload[payload_field] = annotated_entries
+
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), evidence
+
+
+def _annotate_market_research_result(
+    result: str | None,
+    tool_call_id: str,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    text = str(result or "").strip()
+    if not text or text.lower().startswith(("error:", "no results")):
+        return text, {}
+    evidence_id = f"{tool_call_id}:result"
+    return (
+        f"[evidence_id={evidence_id}]\n{text}",
+        {evidence_id: {"kind": "research", "value": {"text": text}}},
+    )
+
+
+def _validate_market_answer(
+    content: str | None,
+    evidence: dict[str, dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    try:
+        parsed = json.loads(_strip_single_code_fence(str(content or "")))
+    except json.JSONDecodeError:
+        return None, "not_json_object: return the structured answer instead of a quote-only reply"
+    if not isinstance(parsed, dict):
+        return None, "not_json_object: the top-level value must be an object"
+
+    answer = parsed.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return None, "missing_answer"
+    coverage = parsed.get("coverage")
+    if coverage not in {"catalyst", "uncertain"}:
+        return None, "coverage_must_be_catalyst_or_uncertain_not_quote_only"
+    evidence_ids = parsed.get("evidence_ids")
+    if not isinstance(evidence_ids, list) or any(not isinstance(item, str) for item in evidence_ids):
+        return None, "evidence_ids_must_be_a_list_of_strings"
+    if len(set(evidence_ids)) != len(evidence_ids):
+        return None, "evidence_ids_must_not_repeat"
+    unknown_ids = [evidence_id for evidence_id in evidence_ids if evidence_id not in evidence]
+    if unknown_ids:
+        return None, "evidence_ids_contain_unknown_ids"
+
+    selected = [evidence[evidence_id] for evidence_id in evidence_ids]
+    if any(item["kind"] == "quote" for item in evidence.values()) and not any(
+        item["kind"] == "quote" for item in selected
+    ):
+        return None, "quote_evidence_is_required_when_available"
+    if coverage == "catalyst" and not any(
+        item["kind"] in _MARKET_ANSWER_CATALYST_KINDS for item in selected
+    ):
+        return None, "catalyst_evidence_is_required_for_catalyst_coverage"
+    return answer.strip(), None
+
+
+def _market_answer_fallback(evidence: dict[str, dict[str, Any]]) -> str:
+    parts: list[str] = []
+    has_catalyst_evidence = False
+    for item in evidence.values():
+        value = item.get("value")
+        if item.get("kind") == "quote" and isinstance(value, dict):
+            symbol = str(value.get("symbol") or "").strip()
+            change = value.get("pct", value.get("percent_change"))
+            if symbol and change is not None:
+                parts.append(f"{symbol}: {change}%")
+        elif item.get("kind") in _MARKET_ANSWER_CATALYST_KINDS and isinstance(value, dict):
+            has_catalyst_evidence = True
+            if item.get("kind") == "research":
+                text = str(value.get("text") or "").strip()
+                if text:
+                    parts.append(text[:600])
+                continue
+            source = str(value.get("source") or "").strip()
+            headline = str(value.get("headline") or value.get("title") or "").strip()
+            summary = str(value.get("summary") or "").strip()
+            detail = " — ".join(part for part in (headline, summary) if part)
+            if detail:
+                parts.append(" — ".join(part for part in (source, detail) if part))
+    if parts and not has_catalyst_evidence:
+        parts.append("Cause not established in the available market evidence.")
+    if parts:
+        return " | ".join(parts)
+    return "No supported catalyst was found in the available market evidence."
+
+
 def _literal_tool_args_from_ast(call: ast.Call) -> dict[str, Any] | None:
     args: dict[str, Any] = {}
     if call.args:
@@ -1498,6 +1639,10 @@ class LLMResponder(ResponderPort):
         final_content: str | None = None
         chat_provider = provider or self.provider
         deferred_work_repair_attempted = False
+        market_contract_active = False
+        market_contract_prompt_evidence_count = -1
+        market_contract_repair_attempted = False
+        market_evidence: dict[str, dict[str, Any]] = {}
         # Guard against the model looping on the same side-effecting tool call
         _sent_calls: set[tuple[str, str]] = set()
         _send_tools = frozenset({"message", "send_voice", "send_media", "delete_message"})
@@ -1803,11 +1948,25 @@ class LLMResponder(ResponderPort):
                                 arguments=tool_call.arguments,
                                 result=result,
                             )
+                        tool_result_for_model = result
+                        if tool_call.name == "market_intelligence":
+                            market_contract_active = True
+                            tool_result_for_model, new_evidence = _annotate_market_intelligence_result(
+                                result,
+                                tool_call.id,
+                            )
+                            market_evidence.update(new_evidence)
+                        elif market_contract_active and tool_call.name in _MARKET_ANSWER_EVIDENCE_TOOLS:
+                            tool_result_for_model, new_evidence = _annotate_market_research_result(
+                                result,
+                                tool_call.id,
+                            )
+                            market_evidence.update(new_evidence)
                         messages = self.context.add_tool_result(
                             messages,
                             tool_call.id,
                             tool_call.name,
-                            result,
+                            tool_result_for_model,
                         )
                         self._maybe_open_private_handoff(
                             tool_name=tool_call.name,
@@ -1838,13 +1997,54 @@ class LLMResponder(ResponderPort):
                                 f"{target_label}. Do not send it again for this request."
                             )
                             return None
+                    if market_contract_active and len(market_evidence) != market_contract_prompt_evidence_count:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": _market_answer_contract_prompt(market_evidence),
+                            }
+                        )
+                        market_contract_prompt_evidence_count = len(market_evidence)
                     continue
+
+                if market_contract_active:
+                    validated_answer, validation_error = _validate_market_answer(
+                        response.content,
+                        market_evidence,
+                    )
+                    if validated_answer is None:
+                        if market_contract_repair_attempted:
+                            logger.warning(
+                                "Market answer contract failed after repair: {}",
+                                validation_error,
+                            )
+                            final_content = _market_answer_fallback(market_evidence)
+                            break
+                        market_contract_repair_attempted = True
+                        logger.warning(
+                            "Rejecting market answer before outbound: {}",
+                            validation_error,
+                        )
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    _market_answer_contract_prompt(market_evidence)
+                                    + f"\nPrevious output was rejected: {validation_error}."
+                                ),
+                            }
+                        )
+                        continue
+                    final_content = validated_answer
+                    break
 
                 final_content = response.content
                 break
             finally:
                 lf.end_span(iter_span)
         else:
+            if market_contract_active:
+                return _market_answer_fallback(market_evidence)
             return "⚙️❓"  # max iterations reached without a text response
 
         if final_content:
