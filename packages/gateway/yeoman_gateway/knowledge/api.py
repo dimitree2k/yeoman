@@ -35,6 +35,7 @@ from yeoman_gateway.knowledge.authority import (
     wall_clock_ms,
 )
 from yeoman_gateway.knowledge.models import (
+    READ_PURPOSES,
     CaptureJobReceipt,
     CaptureJobRecord,
     CaptureResult,
@@ -55,7 +56,6 @@ from yeoman_gateway.knowledge.models import (
     NameObservation,
     PersonLinkCandidate,
     PersonProfile,
-    READ_PURPOSES,
     PersonResolution,
     RecallQuery,
     SourceRef,

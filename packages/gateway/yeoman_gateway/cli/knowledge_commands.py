@@ -249,6 +249,99 @@ def migration_verify_v1(
         _fail("manifest_mismatch", detail)
 
 
+# ── offline snapshot and benchmark ───────────────────────────────────────────
+
+snapshot_app = typer.Typer(help="Offline snapshot: copy, verify, benchmark")
+knowledge_app.add_typer(snapshot_app, name="snapshot")
+
+
+@snapshot_app.command("create")
+def snapshot_create(
+    processing: Path = typer.Option(..., "--processing", help="Processing journal database"),
+    knowledge: Path = typer.Option(..., "--knowledge", help="Knowledge database"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="New directory for the copy"),
+    quiesce_ref: Path = typer.Option(
+        ..., "--quiesce-ref", help="Reference to the authorized quiesce boundary"
+    ),
+) -> None:
+    """Copy both databases with the SQLite backup API, then describe the result."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, create_snapshot
+
+    try:
+        report = create_snapshot(
+            processing=processing,
+            knowledge=knowledge,
+            target_dir=target_dir,
+            quiesce_ref=str(quiesce_ref),
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(f"snapshot: {report.target_dir}")
+    _line(f"manifest: {report.manifest_path}")
+    _line(f"quiesce ref: {report.quiesce_ref}  (coherent live boundary: no)")
+    _line(
+        "knowledge: "
+        f"{report.knowledge_path.name} sha256:{report.knowledge_fingerprint[:12]}"
+        f" rows={sum(count for _table, count in report.knowledge_counts)}"
+    )
+    _line(
+        "processing: "
+        f"{report.processing_path.name} sha256:{report.processing_fingerprint[:12]}"
+        f" rows={sum(count for _table, count in report.processing_counts)}"
+    )
+    _line(f"media entries: {len(report.media)}")
+
+
+@snapshot_app.command("verify")
+def snapshot_verify(
+    manifest: Path = typer.Option(..., "--manifest", help="Manifest written by create"),
+    restore_dir: Path = typer.Option(
+        None, "--restore-dir", help="Directory for the isolated restore copies"
+    ),
+) -> None:
+    """Verify a snapshot on isolated restore copies.  Starts no jobs and sends nothing."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_snapshot
+
+    try:
+        report = verify_snapshot(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
+    _line(f"manifest hashes: {'match' if report.hashes_match else 'differ'}")
+    _line(f"cross-references: {'ok' if report.cross_references_ok else 'broken'}")
+    _line(f"restore rehearsal: {'ok' if report.rehearsal_ok else 'failed'}")
+    _line(f"locked index entries: {'none' if report.fts_locked_ok else 'present'}")
+    _line(f"verdict: {report.verdict}", style="green" if report.ok else "red")
+    if not report.ok:
+        _fail("manifest_mismatch", report.reason)
+
+
+@knowledge_app.command("benchmark")
+def knowledge_benchmark(
+    target: Path = typer.Option(..., "--target", help="Scratch database path to use"),
+    people: int = typer.Option(1000, "--people", help="Synthetic people to build"),
+    statements: int = typer.Option(10000, "--statements", help="Synthetic facets to build"),
+    iterations: int = typer.Option(200, "--iterations", help="Timed read rounds"),
+) -> None:
+    """Measure local profile/alias reads on synthetic data.  No network, no model."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, benchmark_profiles
+
+    try:
+        report = benchmark_profiles(
+            target=target, people=people, statements=statements, iterations=iterations
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(f"people={report.people} statements={report.statements} iterations={report.iterations}")
+    _line(f"reads p50={report.p50_ms} ms  p95={report.p95_ms} ms  max={report.max_ms} ms")
+    _line(f"peak RSS: {report.peak_rss_mib} MiB")
+    _line(f"database bytes: {report.database_bytes}")
+    _line(
+        "p95 budget (<200 ms): "
+        + ("met" if report.within_latency_budget else "exceeded - report as a deviation")
+    )
+
+
 # ── read-only person inspection ──────────────────────────────────────────────
 #
 # These commands open one explicitly named database read-only.  They never start a
