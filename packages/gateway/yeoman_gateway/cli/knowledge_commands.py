@@ -45,7 +45,6 @@ from yeoman_gateway.knowledge._migration import (
     verify_target,
 )
 from yeoman_gateway.knowledge._upgrade import (
-    DEFAULT_APPROVAL_NAMESPACE,
     UpgradeError,
     UpgradeInventory,
     UpgradeReport,
@@ -220,9 +219,9 @@ def migration_propose_bindings(
     processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
     out: Path = typer.Option(..., "--out", help="New proposal file for the owner to review"),
     namespace: str = typer.Option(
-        DEFAULT_APPROVAL_NAMESPACE,
+        "",
         "--namespace",
-        help="Platform account namespace the approved bindings carry",
+        help="Force one platform-account namespace instead of the observed per-channel one",
     ),
 ) -> None:
     """Write a reviewable, private proposal for every legacy identifier (read-only)."""
@@ -236,6 +235,10 @@ def migration_propose_bindings(
         _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
     _line(f"proposal: {report.out_path}  (private: it names people and identifiers)")
     _line(f"entries: {report.total}  with journal evidence: {report.with_journal_evidence}")
+    if report.not_a_person:
+        _line(
+            f"not a person (group/broadcast JID, never proposed): {report.not_a_person}"
+        )
     _line(f"stored role rows covered: {report.role_rows_covered}")
     _line("nothing was applied: mark entries as approved and pass the file to upgrade-v1")
 

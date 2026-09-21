@@ -57,10 +57,21 @@ UPGRADE_MANIFEST_VERSION: Final[int] = 1
 #: Version of the operator-facing binding proposal/approval file.
 APPROVAL_VERSION: Final[int] = 1
 
-#: Namespace an approved binding carries when the file does not state one.  The live
-#: WhatsApp adapter reports the platform account and this stand reports ``default``, which
-#: is also what a v1-derived binding gets; a multi-account stand states its own.
+#: Namespace an approved binding carries when nothing else is known.  A binding only
+#: matches an observation whose namespace is the same, so this has to be what the channel
+#: adapter actually reports - see :func:`_channel_namespaces`.
 DEFAULT_APPROVAL_NAMESPACE: Final[str] = "default"
+
+#: The namespace a channel's adapter uses when the platform account is not stated.  This
+#: mirrors the identity middleware; a mismatch here would silently leave an approved
+#: binding unusable.
+_CHANNEL_NAMESPACES: Final[dict[str, str]] = {
+    "whatsapp": "whatsapp",
+    "telegram": "telegram",
+}
+
+#: Identifier shapes that are a group or a broadcast, never a natural person.
+_NON_PERSON_SUFFIXES: Final[tuple[str, ...]] = ("@g.us", "@newsletter", "@broadcast")
 
 #: Namespace of the deterministic binding ids.  Fixed forever: changing it would change
 #: every derived id of an already published upgrade.
@@ -887,6 +898,7 @@ class BindingProposalReport:
     namespace: str
     proposals: tuple[BindingProposal, ...]
     with_journal_evidence: int
+    not_a_person: int
     role_rows_covered: int
 
     @property
@@ -899,7 +911,7 @@ def propose_bindings(
     source: Path,
     processing: Path,
     out: Path,
-    namespace: str = DEFAULT_APPROVAL_NAMESPACE,
+    namespace: str | None = None,
 ) -> BindingProposalReport:
     """Write a reviewable proposal for every legacy identifier, read-only.
 
@@ -907,13 +919,17 @@ def propose_bindings(
     It never contains statement text or message content.  Nothing is applied here - the
     operator marks entries ``"approved": true`` and hands the same file to
     :func:`upgrade_v1`.
+
+    Each entry carries the namespace its channel really reports (the platform account
+    seen in the journal, otherwise the adapter's fallback): a binding in the wrong
+    namespace would never match an observation.  ``namespace`` forces one for all entries.
     """
     source_path = Path(source).expanduser()
     processing_path = Path(processing).expanduser()
     out_path = Path(out).expanduser()
     if out_path.exists():
         raise UpgradeError("target_exists", f"refusing to overwrite {out_path}")
-    scope = str(namespace or "").strip() or DEFAULT_APPROVAL_NAMESPACE
+    scope = str(namespace or "").strip()
     knowledge = _open_readonly("knowledge", source_path)
     journal = _open_readonly("processing", processing_path)
     try:
@@ -936,11 +952,19 @@ def propose_bindings(
             )
         ]
         journal_counts = _inbound_principal_counts(journal)
+        journal_namespaces = _channel_namespaces(journal)
         role_counts = _role_rows_by_person(knowledge)
         proposals: list[BindingProposal] = []
         for channel, value, person_id, kind in identifiers:
             local = value.split("@", 1)[0]
             events = journal_counts.get(value, 0) or journal_counts.get(local, 0)
+            person_like = _is_person_identifier(value)
+            if not person_like:
+                reason = "not_a_person_identifier"
+            elif events > 0:
+                reason = "journal_evidence"
+            else:
+                reason = "owner_knowledge_only"
             proposals.append(
                 BindingProposal(
                     person_id=person_id,
@@ -948,14 +972,21 @@ def propose_bindings(
                     channel=channel,
                     kind=kind,
                     value=value,
-                    namespace=scope,
+                    namespace=(
+                        scope
+                        or journal_namespaces.get(channel)
+                        or _channel_namespace_fallback(channel)
+                    ),
                     journal_inbound_events=events,
                     role_rows=role_counts.get(person_id, 0),
-                    proposed=events > 0,
-                    reason="journal_evidence" if events > 0 else "owner_knowledge_only",
+                    proposed=person_like and events > 0,
+                    reason=reason,
                 )
             )
-        with_evidence = sum(1 for item in proposals if item.proposed)
+        with_evidence = sum(1 for item in proposals if item.reason == "journal_evidence")
+        not_a_person = sum(
+            1 for item in proposals if item.reason == "not_a_person_identifier"
+        )
         # Distinct people, so an identifier list does not multiply the number.
         role_rows_covered = sum(
             role_counts.get(person_id, 0)
@@ -971,6 +1002,7 @@ def propose_bindings(
             "counts": {
                 "entries": len(proposals),
                 "with_journal_evidence": with_evidence,
+                "not_a_person": not_a_person,
                 "role_rows_covered": role_rows_covered,
             },
             "entries": [item.to_payload() for item in proposals],
@@ -986,6 +1018,7 @@ def propose_bindings(
             namespace=scope,
             proposals=tuple(proposals),
             with_journal_evidence=with_evidence,
+            not_a_person=not_a_person,
             role_rows_covered=role_rows_covered,
         )
     finally:
@@ -1039,6 +1072,45 @@ def load_binding_approvals(path: Path) -> tuple[tuple[dict[str, Any], ...], str,
             )
         approved.append(dict(entry))
     return tuple(approved), digest, actor, namespace
+
+
+def _channel_namespaces(journal: _ReadHandle) -> dict[str, str]:
+    """The platform account each channel really reports, read from the journal.
+
+    A binding only matches an observation in the *same* namespace, so the proposal uses
+    the account the stand actually delivers instead of guessing one.
+    """
+    if "events" not in journal.tables:
+        return {}
+    try:
+        rows = journal.connection.execute(
+            "SELECT channel, account, COUNT(*) FROM events"
+            " WHERE account IS NOT NULL AND account != '' GROUP BY channel, account"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return {}
+    best: dict[str, tuple[int, str]] = {}
+    for row in rows:
+        channel = str(row[0] or "").strip().lower()
+        account = str(row[1]).strip()
+        if not channel or not account:
+            continue
+        count = int(row[2])
+        if channel not in best or count > best[channel][0]:
+            best[channel] = (count, account)
+    return {channel: account for channel, (_, account) in best.items()}
+
+
+def _channel_namespace_fallback(channel: str) -> str:
+    token = str(channel or "").strip().lower()
+    if not token:
+        return DEFAULT_APPROVAL_NAMESPACE
+    return _CHANNEL_NAMESPACES.get(token, token)
+
+
+def _is_person_identifier(value: str) -> bool:
+    """A group or broadcast JID is an address, not a person (spec 7.1)."""
+    return not str(value or "").strip().lower().endswith(_NON_PERSON_SUFFIXES)
 
 
 def _inbound_principal_counts(journal: _ReadHandle) -> dict[str, int]:

@@ -35,14 +35,25 @@ LEGACY_PHONE = "4910000000102@s.whatsapp.net"
 OWNER = "whatsapp:4910000000101"
 
 
-def _journal(path: Path, *, principals: tuple[str, ...] = ()) -> Path:
-    """Minimal processing journal; optional inbound principals as channel evidence."""
+def _journal(
+    path: Path,
+    *,
+    principals: tuple[str, ...] = (),
+    account: str | None = "default",
+    with_account_column: bool = True,
+) -> Path:
+    """Minimal processing journal; optional inbound principals as channel evidence.
+
+    ``account`` mirrors the live stand: WhatsApp events carry the platform account
+    ``default``, and a binding in the wrong namespace would never match an observation.
+    """
     conn = sqlite3.connect(path)
     try:
+        account_column = ", account TEXT" if with_account_column else ""
         conn.execute(
             "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
             " revision INTEGER NOT NULL, payload TEXT NOT NULL DEFAULT '',"
-            " principal TEXT, direction TEXT)"
+            f" principal TEXT, direction TEXT, channel TEXT{account_column})"
         )
         conn.execute(
             "CREATE TABLE event_source_authority (event_id TEXT NOT NULL,"
@@ -53,11 +64,18 @@ def _journal(path: Path, *, principals: tuple[str, ...] = ()) -> Path:
             "INSERT INTO events (event_id, chat_id, revision) VALUES ('event-0', 'group-x', 1)"
         )
         for index, principal in enumerate(principals, start=1):
-            conn.execute(
-                "INSERT INTO events (event_id, chat_id, revision, principal, direction)"
-                " VALUES (?, 'group-x', 1, ?, 'in')",
-                (f"evidence-{index}", principal),
-            )
+            if with_account_column:
+                conn.execute(
+                    "INSERT INTO events (event_id, chat_id, revision, principal, direction,"
+                    " channel, account) VALUES (?, 'group-x', 1, ?, 'in', 'whatsapp', ?)",
+                    (f"evidence-{index}", principal, account),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO events (event_id, chat_id, revision, principal, direction,"
+                    " channel) VALUES (?, 'group-x', 1, ?, 'in', 'whatsapp')",
+                    (f"evidence-{index}", principal),
+                )
         conn.commit()
     finally:
         conn.close()
@@ -115,6 +133,9 @@ def test_a_proposal_lists_the_legacy_identifiers_and_applies_nothing(tmp_path: P
         V1_PERSON_BOUND,
         V1_PERSON_LEGACY_ONLY,
     }
+    # Namespaces are the ones the channels really report, not one guess for all.
+    namespaces = {(entry["channel"], entry["namespace"]) for entry in payload["entries"]}
+    assert namespaces == {("whatsapp", "default"), ("telegram", "telegram")}
     # The proposal names people and identifiers, but never statement or message text.
     text = (tmp_path / "proposals.json").read_text(encoding="utf-8")
     assert "synthetic statement" not in text
@@ -427,3 +448,40 @@ def test_the_offline_cli_offers_the_proposal_and_applies_it(tmp_path: Path) -> N
     )
     assert verified.exit_code == 0, verified.output
     assert "2 of 2 applied" in verified.output
+
+
+def test_the_namespace_follows_the_channel_when_no_account_is_recorded(tmp_path: Path) -> None:
+    """Without a journal account the adapter fallback is what a binding must carry."""
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = _journal(tmp_path / "processing.db", with_account_column=False)
+    report = propose_bindings(source=fixture.path, processing=journal, out=tmp_path / "p.json")
+
+    namespaces = {(item.channel, item.namespace) for item in report.proposals}
+
+    assert namespaces == {("whatsapp", "whatsapp"), ("telegram", "telegram")}
+
+
+def test_a_group_or_broadcast_identifier_is_never_proposed_as_a_person(
+    tmp_path: Path,
+) -> None:
+    """A newsletter is an address, not a person: it is listed, flagged, not proposed."""
+    source, journal = _live_shaped(tmp_path)
+    conn = sqlite3.connect(source)
+    try:
+        conn.execute(
+            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
+            " VALUES ('whatsapp', '120363000000000000@newsletter', ?, 'phone_jid')",
+            (V1_PERSON_LEGACY_ONLY,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = propose_bindings(source=source, processing=journal, out=tmp_path / "p.json")
+
+    flagged = [item for item in report.proposals if item.reason == "not_a_person_identifier"]
+    assert len(flagged) == 1
+    assert flagged[0].proposed is False
+    assert report.not_a_person == 1
+    # It is still listed for the owner: nothing disappears, it is just not proposed.
+    assert flagged[0].value.endswith("@newsletter")
