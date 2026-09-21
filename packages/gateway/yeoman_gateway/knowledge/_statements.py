@@ -15,11 +15,19 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Final, Iterable
 
 from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._reasons import (
+    SUPERSESSION_CORRECTION,
+    SUPERSESSION_QUALITY_REJECTED,
+    SUPERSESSION_STATE_CHANGE,
+    SUPERSESSION_UNKNOWN,
+)
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
+    SUPERSESSION_REASONS,
+    AttributeCandidate,
     CaptureJobReceipt,
     CaptureJobRecord,
     CaptureResult,
@@ -203,6 +211,9 @@ class StatementEngine:
                 ),
                 ts=ts,
             )
+        # Structured facets are published in the same transaction as the statement and its
+        # roles, and only for a person who actually holds an *active subject* role here.
+        self._insert_attributes(statement_id, candidate.attributes, ts=ts)
         # `speaker` may already have been proposed by the extractor with the same
         # evidence; the primary key makes the second insert a no-op.
         link_rows = int(
@@ -596,6 +607,91 @@ class StatementEngine:
                 ),
             )
 
+    def _insert_attributes(
+        self,
+        statement_id: str,
+        attributes: tuple[AttributeCandidate, ...],
+        *,
+        ts: int,
+    ) -> int:
+        """Attach validated facets to a statement that carries the matching subject role.
+
+        A facet without an active ``subject`` role for the same person is dropped: the
+        speaker alone does not make a statement about the speaker, so "Alex moved to
+        Cologne" must not become a residence of whoever said it.
+        """
+        if not attributes:
+            return 0
+        subjects = {
+            str(row["person_id"])
+            for row in self._store.query(
+                "SELECT person_id FROM knowledge_statement_people"
+                " WHERE statement_id = ? AND role = 'subject' AND status = 'active'",
+                (statement_id,),
+            )
+        }
+        written = 0
+        for attribute in attributes:
+            if self._identity.canonical_id(attribute.person_id) not in subjects:
+                continue
+            payload = json.dumps(
+                {
+                    "text": attribute.value.text,
+                    "precision": attribute.value.precision,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            cursor = self._store.execute(
+                "INSERT OR IGNORE INTO knowledge_person_attributes (statement_id,"
+                " person_id, attribute_key, value_json, value_key, polarity, revision,"
+                " created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    str(statement_id),
+                    attribute.person_id,
+                    attribute.attribute_key,
+                    payload,
+                    attribute.value.value_key,
+                    attribute.polarity,
+                    ts,
+                    ts,
+                ),
+            )
+            written += 1 if cursor.rowcount else 0
+        return written
+
+    def attributes_of(
+        self, statement_id: str, *, active_only: bool = True
+    ) -> tuple[dict[str, Any], ...]:
+        """Stored facets of one statement, decoded for a reader that already passed the gate."""
+        sql = (
+            "SELECT a.* FROM knowledge_person_attributes a"
+            " JOIN knowledge_statements s ON s.statement_id = a.statement_id"
+            " WHERE a.statement_id = ?"
+        )
+        if active_only:
+            from yeoman_gateway.knowledge._retrieval import CURRENT_STATEMENT_SQL
+
+            sql += f" AND ({CURRENT_STATEMENT_SQL})"
+        sql += " ORDER BY a.attribute_key, a.value_key, a.polarity"
+        out: list[dict[str, Any]] = []
+        for row in self._store.query(sql, (str(statement_id),)):
+            try:
+                value = json.loads(str(row["value_json"]))
+            except ValueError:  # pragma: no cover - a corrupt row is not a reader error
+                continue
+            out.append(
+                {
+                    "statement_id": str(row["statement_id"]),
+                    "person_id": str(row["person_id"]),
+                    "attribute_key": str(row["attribute_key"]),
+                    "value": value,
+                    "value_key": str(row["value_key"]),
+                    "polarity": str(row["polarity"]),
+                }
+            )
+        return tuple(out)
+
     def _insert_person_link(
         self, statement_id: str, link: PersonLinkCandidate, *, ts: int
     ) -> bool:
@@ -603,8 +699,8 @@ class StatementEngine:
             """
             INSERT OR IGNORE INTO knowledge_statement_people (
                 statement_id, person_id, role, evidence_source_id, evidence_revision,
-                attribution, created_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                attribution, created_ms, status, binding_id, resolution_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 statement_id,
@@ -614,6 +710,9 @@ class StatementEngine:
                 int(link.source.revision),
                 link.attribution,
                 ts,
+                link.status,
+                link.binding_id,
+                link.resolution_reason,
             ),
         )
         return bool(cursor.rowcount)
@@ -855,7 +954,16 @@ class StatementEngine:
                 (statement_id, source.event_id, int(source.revision)),
             )
             if remaining:
-                self._set_status(statement_id, status="superseded", ts=ts, superseded_by=None)
+                # The evidence behind one revision was withdrawn, so the statement stops
+                # being a current value.  That is *not* a proven state change or a
+                # correction, and the reason is deliberately not guessed.
+                self._set_status(
+                    statement_id,
+                    status="superseded",
+                    ts=ts,
+                    superseded_by=None,
+                    supersession_reason=SUPERSESSION_UNKNOWN,
+                )
             else:
                 self._redact(statement_id, ts=ts)
             self.audit(
@@ -947,7 +1055,13 @@ class StatementEngine:
             )
         if self._would_cycle(statement_id, new_id):
             raise KnowledgeError("invalid_input", "supersession would create a cycle")
-        self._set_status(statement_id, status="superseded", ts=ts, superseded_by=new_id)
+        self._set_status(
+            statement_id,
+            status="superseded",
+            ts=ts,
+            superseded_by=new_id,
+            supersession_reason=SUPERSESSION_CORRECTION,
+        )
         self._store.execute(
             "UPDATE knowledge_statements SET superseded_by = ?, updated_ms = ?"
             " WHERE statement_id = ? AND superseded_by IS NULL",
@@ -1006,6 +1120,68 @@ class StatementEngine:
             identity_revision=self._store.bump_identity_revision(),
             acl_epoch=self._store.bump_acl_epoch(),
             changed_ids=(statement_id,),
+        )
+
+    def end_attribute(
+        self,
+        *,
+        statement_id: str,
+        person_id: str,
+        attribute_key: str,
+        expected_revision: int,
+        context: TrustedAdminContext,
+        reason: str = "ended_by_owner",
+    ) -> ChangeReceipt:
+        """End one facet by superseding its statement, never by deleting the value.
+
+        The only way to end a facet is to end the statement that carries it, which is what
+        keeps "the annotation is part of the assertion" true: the text, the sources and
+        the audience stay, the row stops being a current value, and an authorized diagnosis
+        can still see why.
+        """
+        if not context.owner:
+            raise KnowledgeError("unauthorized", "admin context lacks owner authority")
+        self._policy.require_admin(context)
+        if int(expected_revision) != self._store.identity_revision:
+            raise KnowledgeError("stale_revision", "identity revision changed")
+        record = self.get_statement(statement_id)
+        if record is None:
+            raise KnowledgeError("unresolved", f"unknown statement: {statement_id}")
+        if record.status in ("revoked",):
+            raise KnowledgeError("source_revoked", "cannot end a revoked statement")
+        facet = self._store.query_one(
+            "SELECT COUNT(*) AS n FROM knowledge_person_attributes"
+            " WHERE statement_id = ? AND person_id = ? AND attribute_key = ?",
+            (str(statement_id), str(person_id), str(attribute_key)),
+        )
+        if facet is None or not int(facet["n"]):
+            raise KnowledgeError("unresolved", "no such attribute on this statement")
+        ts = now_ms()
+        # Status and reason together, and no invented successor: an ended attribute is a
+        # state change of the *claim*, not a correction of the person.
+        self._set_status(
+            statement_id,
+            status="superseded",
+            ts=ts,
+            superseded_by=None,
+            supersession_reason=SUPERSESSION_STATE_CHANGE,
+        )
+        self.audit(
+            statement_id,
+            operation="end_attribute",
+            actor=context.actor_principal,
+            evidence_ref=context.authorization_ref,
+            reason=str(reason),
+            detail={"person_id": str(person_id), "attribute_key": str(attribute_key)},
+            ts=ts,
+        )
+        operation_id = self._store.new_id()
+        revision = self._store.bump_identity_revision()
+        return ChangeReceipt(
+            operation_id=operation_id,
+            identity_revision=revision,
+            acl_epoch=self._store.acl_epoch,
+            changed_ids=(str(statement_id), self._identity.canonical_id(str(person_id))),
         )
 
     def erase_statement(
@@ -1114,12 +1290,36 @@ class StatementEngine:
         status: str,
         ts: int,
         superseded_by: str | None = None,
+        supersession_reason: str = "",
     ) -> None:
+        """Write status, successor and machine-readable reason as one unit.
+
+        The reason is only meaningful for ``superseded``; it is written in the same
+        UPDATE as the status, so no reader can ever observe a superseded row without its
+        reason and no crash can split the two.
+        """
+        if supersession_reason and supersession_reason not in SUPERSESSION_REASONS:
+            raise ValidationError(
+                f"supersession_reason must be one of {SUPERSESSION_REASONS}"
+            )
         self._store.execute(
-            "UPDATE knowledge_statements SET status = ?, superseded_by = COALESCE(?, superseded_by),"
+            "UPDATE knowledge_statements SET status = ?,"
+            " superseded_by = COALESCE(?, superseded_by),"
+            " supersession_reason = CASE WHEN ? = 'superseded' THEN ?"
+            "   ELSE supersession_reason END,"
+            " revision = revision + 1,"
             " revoked_at_ms = CASE WHEN ? = 'revoked' THEN ? ELSE revoked_at_ms END,"
             " updated_ms = ? WHERE statement_id = ?",
-            (status, superseded_by, status, ts, ts, str(statement_id)),
+            (
+                status,
+                superseded_by,
+                status,
+                supersession_reason or SUPERSESSION_UNKNOWN,
+                status,
+                ts,
+                ts,
+                str(statement_id),
+            ),
         )
         self._store.execute(
             "UPDATE memory2_facts SET assertion_status = ?,"
@@ -1436,12 +1636,19 @@ class StatementRescreenReport:
         return lines
 
 
+#: Bumped whenever a candidate rule changes, so a stored rejection names the rule set
+#: that produced it.  A re-screen never revives an earlier rejection: only a fresh,
+#: re-authorized capture can do that.
+SCREEN_RULE_VERSION: Final[str] = "screen/2"
+
+
 def rescreen_statements(
     store: KnowledgeStore,
     *,
     apply: bool = False,
     limit: int = 5000,
     now_ms: int | None = None,
+    rule_version: str = SCREEN_RULE_VERSION,
 ) -> StatementRescreenReport:
     """Apply the current deterministic screens to stored statements.
 
@@ -1480,10 +1687,14 @@ def rescreen_statements(
         # database, and a single long transaction over every refused row would hold the
         # write lock until it times the other writer out.
         with store.transaction():
+            # Status, reason and audit land in one transaction.  Only currently active
+            # rows are touched: an already rejected row is never re-rejected and never
+            # reactivated, and text, sources and audience stay exactly as they were.
             cursor = store.execute(
-                "UPDATE knowledge_statements SET status = 'superseded', updated_ms = ?"
+                "UPDATE knowledge_statements SET status = 'superseded',"
+                " supersession_reason = ?, revision = revision + 1, updated_ms = ?"
                 " WHERE statement_id = ? AND status IN ('assertion','confirmed')",
-                (timestamp, statement_id),
+                (SUPERSESSION_QUALITY_REJECTED, timestamp, statement_id),
             )
             if not cursor.rowcount:
                 continue
@@ -1495,11 +1706,16 @@ def rescreen_statements(
             store.execute(
                 "INSERT INTO knowledge_statement_audit (statement_id, operation,"
                 " actor_principal, evidence_ref, reason, detail_json, created_ms)"
-                " VALUES (?, 'rescreen', '', '', ?, ?, ?)",
+                " VALUES (?, 'rescreen', '', ?, ?, ?, ?)",
                 (
                     statement_id,
+                    str(rule_version),
                     f"screen:{reason}",
-                    json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True),
+                    json.dumps(
+                        {"reason": reason, "rule_version": str(rule_version)},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                     timestamp,
                 ),
             )

@@ -6,6 +6,8 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from loguru import logger
+
 from yeoman_gateway.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -23,10 +25,15 @@ class SummarizeHistoryTool(Tool):
         self,
         archive: "InboundArchive",
         contacts: "ContactsService | None" = None,
+        *,
+        knowledge: object | None = None,
         group_resolver: "Callable[[str], tuple[str | None, str | None]] | None" = None,
     ) -> None:
         self._archive = archive
         self._contacts = contacts
+        #: Public knowledge facade: a sender name comes from a proven binding, never
+        #: from the transitional contacts cache, whenever knowledge is wired.
+        self._knowledge = knowledge
         self._group_resolver = group_resolver
         self._channel = ""
         self._chat_id = ""
@@ -149,16 +156,40 @@ class SummarizeHistoryTool(Tool):
         return "??:??"
 
     def _build_name_map(self, rows: list[dict[str, Any]]) -> dict[str, str]:
-        """Build sender_id -> display_name map from rows + contacts."""
+        """Build sender_id -> display_name map from rows + proven person bindings."""
         name_map: dict[str, str] = {}
         for row in rows:
             sid = row.get("sender_id") or ""
             if sid and sid not in name_map:
-                resolved = None
-                if self._contacts is not None:
-                    resolved = self._contacts.resolve_jid_to_name(sid)
-                name_map[sid] = resolved or row.get("sender_name") or sid
+                name_map[sid] = self._resolve_name(sid) or row.get("sender_name") or sid
         return name_map
+
+    def _resolve_name(self, identifier: str) -> str | None:
+        """One released name for one identifier, or nothing.
+
+        Knowledge is the authority whenever it is wired: a sender without a proven
+        binding keeps the archive's own name.  The legacy cache answers only for the
+        transitional callers that run without knowledge at all.  An outage resolves
+        nothing and raises nothing - a summary is still worth printing with the names
+        the archive already carries.
+        """
+        if self._knowledge is not None:
+            try:
+                person_id = self._knowledge.person_id_for_value(identifier)
+                if person_id is None:
+                    return None
+                return self._knowledge.person_display_name(person_id)
+            except Exception as exc:
+                # Visible degradation: the archive name is used, and the outage is not
+                # silently indistinguishable from "no proven person".
+                logger.warning(
+                    "history naming degraded: knowledge lookup failed ({})",
+                    getattr(exc, "code", type(exc).__name__),
+                )
+                return None
+        if self._contacts is not None:
+            return self._contacts.resolve_jid_to_name(identifier)
+        return None
 
     def _resolve_mentions(self, text: str, name_map: dict[str, str]) -> str:
         """Replace @<token> with @Name where possible."""
@@ -167,18 +198,11 @@ class SummarizeHistoryTool(Tool):
             # Direct lookup in name_map (sender_id might be bare token)
             if token in name_map:
                 return f"@{name_map[token]}"
-            # Try as phone JID
-            if self._contacts is not None:
-                phone_jid = f"{token}@s.whatsapp.net"
-                name = self._contacts.resolve_jid_to_name(phone_jid)
+            # Try as phone JID, then as LID.
+            for candidate in (f"{token}@s.whatsapp.net", f"{token}@lid"):
+                name = self._resolve_name(candidate)
                 if name:
                     name_map[token] = name  # cache for next hit
-                    return f"@{name}"
-                # Try as LID
-                lid_jid = f"{token}@lid"
-                name = self._contacts.resolve_jid_to_name(lid_jid)
-                if name:
-                    name_map[token] = name
                     return f"@{name}"
             return match.group(0)  # leave as-is
 

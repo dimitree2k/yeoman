@@ -296,3 +296,146 @@ def test_rollback_keeps_identity_and_statement_changes_together(knowledge_harnes
         )
     assert h.snapshot_counts() == before
     assert h.active_statements_for_source(source) == ()
+
+
+# ── roles, facets and the transport speaker (T11-T13, §7.4) ──────────────────
+
+
+def test_a_third_party_subject_is_not_the_speaker(knowledge_harness):
+    """T11: the authenticated sender stays ``speaker``; the subject stays the subject."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    alex = h.person("Alex")
+    source = h.source(tom)
+    statement_id = h.capture_text(
+        "Alex wohnt in Köln.", source, subjects=(alex,), reported_speakers=(tom,)
+    ).statement_ids[0]
+    links = h.links(statement_id)
+    by_role: dict[str, set[str]] = {}
+    for link in links:
+        by_role.setdefault(link.role, set()).add(link.person_id)
+    assert by_role["speaker"] == {tom}
+    assert by_role["subject"] == {alex}
+    assert by_role["reported_speaker"] == {tom}
+    # A statement about Alex is not evidence that Alex said it.
+    assert tom not in by_role["subject"]
+
+
+def test_a_facet_requires_an_active_subject_role(knowledge_harness):
+    """§7.4: the speaker alone does not make a statement about the speaker."""
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    tom = h.person("Tom")
+    alex = h.person("Alex")
+    source = h.source(tom)
+    candidate = StatementCandidate(
+        content="Alex wohnt in Köln.",
+        sources=(source,),
+        people=(
+            PersonLinkCandidate(
+                person_id=alex, role="subject", source=source, attribution="extracted"
+            ),
+        ),
+        attributes=(
+            AttributeCandidate(
+                person_id=alex,
+                attribute_key="residence",
+                value=AttributeValue("Köln", precision="exact"),
+            ),
+            # Tom is only the speaker here, so his facet must not be published.
+            AttributeCandidate(person_id=tom, attribute_key="residence", value=AttributeValue("Bonn")),
+        ),
+        extractor_version="test-extractor-1",
+        confidence=0.5,
+    )
+    result = h.service.capture(candidate, context=h.capture_context(source))
+    statement_id = result.statement_ids[0]
+    facets = h.service._statements.attributes_of(statement_id)  # noqa: SLF001
+    assert [item["person_id"] for item in facets] == [alex]
+    assert facets[0]["attribute_key"] == "residence"
+    assert facets[0]["value"] == {"text": "Köln", "precision": "exact"}
+
+
+def test_a_facet_is_unreadable_as_soon_as_its_statement_is(knowledge_harness):
+    """A revoked statement locks its facet too, before any physical index cleanup."""
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    tom = h.person("Tom")
+    alex = h.person("Alex")
+    source = h.source(tom)
+    candidate = StatementCandidate(
+        content="Alex wohnt in Köln.",
+        sources=(source,),
+        people=(
+            PersonLinkCandidate(
+                person_id=alex, role="subject", source=source, attribution="extracted"
+            ),
+        ),
+        attributes=(
+            AttributeCandidate(
+                person_id=alex, attribute_key="residence", value=AttributeValue("Köln")
+            ),
+        ),
+        extractor_version="test-extractor-1",
+        confidence=0.5,
+    )
+    statement_id = h.service.capture(candidate, context=h.capture_context(source)).statement_ids[0]
+    assert h.service._statements.attributes_of(statement_id)  # noqa: SLF001
+
+    h.service.invalidate_source(source, context=h.capture_context(source))
+    # The row is still stored (a revoke is not a delete) but no longer reader-visible.
+    assert h.service._store.scalar(  # noqa: SLF001 - white-box lock assertion
+        "SELECT COUNT(*) FROM knowledge_person_attributes WHERE statement_id = ?",
+        (statement_id,),
+    ) == 1
+    assert h.service._statements.attributes_of(statement_id) == ()  # noqa: SLF001
+
+
+def test_facets_are_published_in_one_transaction_with_the_statement(knowledge_harness):
+    """A failing commit leaves neither the statement nor its facet behind."""
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    tom = h.person("Tom")
+    alex = h.person("Alex")
+    source = h.source(tom)
+    candidate = StatementCandidate(
+        content="Alex wohnt in Köln.",
+        sources=(source,),
+        people=(
+            PersonLinkCandidate(
+                person_id=alex, role="subject", source=source, attribution="extracted"
+            ),
+        ),
+        attributes=(
+            AttributeCandidate(
+                person_id=alex, attribute_key="residence", value=AttributeValue("Köln")
+            ),
+        ),
+        extractor_version="test-extractor-1",
+        confidence=0.5,
+    )
+    before_statements = h.snapshot_counts()["knowledge_statements"]
+    h.fail_next_commit()
+    with pytest.raises(KnowledgeError):
+        h.service.capture(candidate, context=h.capture_context(source))
+    counts = h.snapshot_counts()
+    assert counts["knowledge_statements"] == before_statements
+    assert counts.get("knowledge_person_attributes", 0) == 0

@@ -23,7 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from loguru import logger
 
@@ -37,11 +37,19 @@ from yeoman_gateway.knowledge._capture import (
 from yeoman_gateway.knowledge._memory.extraction_jobs import (
     REJECT_BASES,
     is_hedged,
+    screen_capture_input,
     screen_statement_content,
 )
 from yeoman_gateway.knowledge.models import (
+    ATTRIBUTE_KEYS,
+    PERSON_ROLES,
+    TIME_BASES,
+    TIME_PRECISIONS,
+    AttributeCandidate,
+    AttributeValue,
     CaptureJobRecord,
     KnowledgeError,
+    PersonLinkCandidate,
     SourceRef,
     StatementCandidate,
     TrustedCaptureContext,
@@ -95,6 +103,13 @@ class StatementDraft:
     basis: str = "explicit_statement"
     certainty: str = "asserted"
     valid_until_ms: int | None = None
+    #: Local candidate tokens (``p0``, ``p1``, ...) the extractor used, never person ids.
+    #: The runtime maps them to people it offered; an unknown token is discarded.
+    people: tuple[tuple[str, str], ...] = ()
+    attributes: tuple[tuple[str, str, str, str], ...] = ()
+    time_basis: str = "unknown"
+    time_precision: str = "unknown"
+    unresolved_mentions: tuple[str, ...] = ()
 
     @property
     def uncertain(self) -> bool:
@@ -161,7 +176,18 @@ class StatementExtractor:
     def __call__(self, items: Sequence[ObservedEvent]) -> list[StatementDraft]:
         if not items:
             return []
-        listing = "\n".join(f"[{index}] {item.text}" for index, item in enumerate(items))[:8000]
+        usable = [
+            (original_index, item)
+            for original_index, item in enumerate(items)
+            if screen_capture_input(
+                item.text, {"source_status": "revoked" if item.revoked else "active"}
+            ).accepted
+        ]
+        if not usable:
+            return []
+        # The model sees the *original* message index, so a returned `source` maps back to
+        # the exact proven revision it was shown - never to a shifted neighbour.
+        listing = "\n".join(f"[{index}] {item.text}" for index, item in usable)
         rows = self._ask_model(listing)
         drafts: list[StatementDraft] = []
         for row in rows[: self._max_candidates]:
@@ -486,19 +512,128 @@ class StatementCaptureWorker:
         if not source.principal:
             return None
         uncertain = draft.uncertain or is_hedged(draft.content)
+        # Only people the runtime offered for *this* source may be referenced, and the
+        # transport speaker is set here - never by the model.
+        eligible = self._eligible_people(items, source)
+        links = self._links(draft, source, eligible)
+        attributes = self._attributes(draft, eligible)
         try:
             return StatementCandidate(
                 content=draft.content,
                 sources=(source.source,),
-                people=(),
+                people=links,
+                attributes=attributes,
                 extractor_version=str(record.extractor_version or STATEMENT_EXTRACTOR_VERSION),
                 confidence=0.5 if uncertain else 0.75,
                 valid_until_ms=draft.valid_until_ms,
+                unresolved_mentions=tuple(draft.unresolved_mentions),
+                time_basis=(
+                    draft.time_basis if draft.time_basis in TIME_BASES else "unknown"
+                ),
+                time_precision=(
+                    draft.time_precision
+                    if draft.time_precision in TIME_PRECISIONS
+                    else "unknown"
+                ),
                 kind="uncertain" if uncertain else "fact",
                 sector="semantic",
             )
         except ValidationError:
             return None
+
+    def _eligible_people(
+        self, items: Sequence[ObservedEvent], source: ObservedEvent
+    ) -> tuple[str, ...]:
+        """People this source may reference: its own author, plus proven chat members.
+
+        Never the global contact list: a statement may only name somebody the runtime can
+        prove was in this conversation.
+        """
+        offered: list[str] = []
+        mapping = getattr(self._knowledge, "person_for_principal", None)
+        if callable(mapping):
+            person_id = mapping(source.principal)
+            if person_id:
+                offered.append(str(person_id))
+        return tuple(dict.fromkeys(offered))
+
+    def _links(
+        self,
+        draft: StatementDraft,
+        source: ObservedEvent,
+        eligible: tuple[str, ...],
+    ) -> tuple[PersonLinkCandidate, ...]:
+        """Turn the extractor's local candidate tokens into typed role edges.
+
+        The transport speaker is added by the runtime from the source principal, so a
+        name in the text can never replace the authenticated sender.  A token the runtime
+        did not offer, an unknown role and a missing attribution are all discarded.
+        """
+        allowed = set(eligible)
+        links: list[PersonLinkCandidate] = []
+        mapping = getattr(self._knowledge, "person_for_principal", None)
+        speaker = str(mapping(source.principal) or "") if callable(mapping) else ""
+        if speaker:
+            links.append(
+                PersonLinkCandidate(
+                    person_id=speaker,
+                    role="speaker",
+                    source=source.source,
+                    attribution="transport",
+                )
+            )
+        for token, role in draft.people:
+            if role not in PERSON_ROLES or role == "speaker":
+                continue
+            person_id = str(token)
+            if person_id not in allowed:
+                # Either a token the runtime never offered or a free-form identifier from
+                # the model: discarded, never resolved by a name lookup.
+                continue
+            links.append(
+                PersonLinkCandidate(
+                    person_id=str(person_id),
+                    role=str(role),
+                    source=source.source,
+                    attribution="extracted",
+                )
+            )
+        seen: set[tuple[str, str, str, int]] = set()
+        unique: list[PersonLinkCandidate] = []
+        for link in links:
+            key = (link.person_id, link.role, link.source.event_id, link.source.revision)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(link)
+        return tuple(unique)
+
+    def _attributes(
+        self, draft: StatementDraft, eligible: tuple[str, ...]
+    ) -> tuple[AttributeCandidate, ...]:
+        """Build validated facets for people the extractor was allowed to talk about."""
+        if not draft.attributes:
+            return ()
+        allowed = set(eligible)
+        out: list[AttributeCandidate] = []
+        for person_token, key, value, polarity in draft.attributes:
+            person_id = str(person_token)
+            if person_id not in allowed:
+                continue
+            if key not in ATTRIBUTE_KEYS:
+                continue
+            try:
+                out.append(
+                    AttributeCandidate(
+                        person_id=person_id,
+                        attribute_key=str(key),
+                        value=AttributeValue(text=str(value), precision="unknown"),
+                        polarity=str(polarity) if polarity else "positive",
+                    )
+                )
+            except ValidationError:
+                continue
+        return tuple(out)
 
     def _finish(
         self,
@@ -565,6 +700,45 @@ class StatementCaptureWorker:
             logger.warning("statement revocation failed error_type={}", type(exc).__name__)
 
 
+#: Upper bound of one section handed to the extractor.  A section is a *reviewable* unit:
+#: the cursor only advances to the end that was actually read, so a bounded prompt can
+#: never mark unread original text as processed.
+MAX_SOURCE_SECTION_CHARS: Final[int] = 4000
+
+
+def split_source_sections(text: str, *, max_chars: int = MAX_SOURCE_SECTION_CHARS) -> list[str]:
+    """Split a long source at sentence and line boundaries, losing nothing.
+
+    Deliberately not a character crop: ``text[:8000]`` silently discards the rest while
+    the caller records the whole message as processed.  Here every character ends up in
+    exactly one section, a single oversized sentence is kept whole rather than cut, and
+    the caller can advance its cursor by the concatenated length.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    if not text:
+        return []
+    sections: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = _section_boundary(window)
+        sections.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        sections.append(remaining)
+    return sections
+
+
+def _section_boundary(window: str) -> int:
+    """The last natural boundary inside ``window``, or its full length."""
+    for separator in ("\n\n", "\n", ". ", "! ", "? ", "; ", ", "):
+        index = window.rfind(separator)
+        if index > 0:
+            return index + len(separator)
+    return len(window)
+
+
 def _screen(candidate: StatementCandidate) -> str:
     """Deterministic second screen, after the model proposed the statement.
 
@@ -613,5 +787,7 @@ __all__ = [
     "StatementDraft",
     "StatementExtractor",
     "WorkerReport",
+    "MAX_SOURCE_SECTION_CHARS",
     "screen_draft",
+    "split_source_sections",
 ]

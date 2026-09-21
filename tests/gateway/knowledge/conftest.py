@@ -301,6 +301,7 @@ class KnowledgeHarness:
         is_direct: bool = False,
         owner: bool = False,
         policy_revision: int | None = None,
+        now_ms: int | None = None,
     ) -> TrustedReadContext:
         principal = reader if ":" in reader else self.principal_for(reader)
         members = set(recipients) if recipients is not None else {principal}
@@ -330,7 +331,7 @@ class KnowledgeHarness:
                 self.policy.revision if policy_revision is None else policy_revision
             ),
             purpose=purpose,
-            now_ms=self.clock.now_ms(),
+            now_ms=self.clock.now_ms() if now_ms is None else int(now_ms),
             is_direct=is_direct,
             owner=owner,
         )

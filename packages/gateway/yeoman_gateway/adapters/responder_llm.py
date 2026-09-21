@@ -788,12 +788,13 @@ class LLMResponder(ResponderPort):
             cron_tool = CronTool(self.cron_service)
             self.tools.register(cron_tool)
 
-        if self.contacts_service is not None:
-            contacts_tool = ContactsTool(self.contacts_service)
+        if self.knowledge is not None or self.contacts_service is not None:
+            contacts_tool = ContactsTool(self.contacts_service, knowledge=self.knowledge)
             self.tools.register(contacts_tool)
             self.tools.register(
                 ResolveContactTool(
                     contacts=self.contacts_service,
+                    knowledge=self.knowledge,
                     chat_registry=self.chat_registry,
                 )
             )
@@ -811,6 +812,7 @@ class LLMResponder(ResponderPort):
                 SummarizeHistoryTool(
                     self.inbound_archive,
                     self.contacts_service,
+                    knowledge=self.knowledge,
                     group_resolver=self._resolve_group_reference,
                 )
             )
@@ -1295,11 +1297,12 @@ class LLMResponder(ResponderPort):
         if not target_names:
             return
         target_name = target_names[-1]
-        if self.contacts_service is not None:
+        if self.knowledge is not None or self.contacts_service is not None:
             resolved_targets: dict[str, str] = {}
             for candidate in target_names:
                 resolution = resolve_contact_reference(
                     contacts=self.contacts_service,
+                    knowledge=self.knowledge,
                     reference=candidate,
                     channel=channel,
                     chat_id=chat_id,
@@ -1366,13 +1369,14 @@ class LLMResponder(ResponderPort):
         channel: str,
         chat_id: str,
     ) -> str | None:
-        if self.contacts_service is None:
+        if self.knowledge is None and self.contacts_service is None:
             return None
         target_name = str(pending.get("target_name") or "").strip()
         if not target_name:
             return None
         expected = resolve_contact_reference(
             contacts=self.contacts_service,
+            knowledge=self.knowledge,
             reference=target_name,
             channel=channel,
             chat_id=chat_id,
@@ -1381,6 +1385,7 @@ class LLMResponder(ResponderPort):
         for mention in self._pending_delivery_mentions(content=content, metadata=metadata):
             resolution = resolve_contact_reference(
                 contacts=self.contacts_service,
+                knowledge=self.knowledge,
                 reference=mention,
                 channel=channel,
                 chat_id=chat_id,
@@ -1394,6 +1399,7 @@ class LLMResponder(ResponderPort):
                 return expected.jid
             if expected is None and contact_resolution_matches_reference(
                 contacts=self.contacts_service,
+                knowledge=self.knowledge,
                 reference=target_name,
                 resolution=resolution,
             ):

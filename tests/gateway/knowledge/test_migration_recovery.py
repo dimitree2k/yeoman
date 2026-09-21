@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
-from legacy_fixtures import legacy_snapshot_factory
+import typer
+from legacy_fixtures import legacy_snapshot_factory, v1_knowledge_store_factory
+from typer.testing import CliRunner
+from yeoman_gateway.cli.knowledge_commands import knowledge_app
+from yeoman_gateway.knowledge.models import TrustedAdminContext
 from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     _open_source,
@@ -20,6 +25,26 @@ from yeoman_gateway.knowledge._migration import (
     semantic_digest,
     verify_target,
 )
+from yeoman_gateway.knowledge._upgrade import (
+    UpgradeError,
+    upgrade_semantic_digest,
+    upgrade_v1,
+    verify_upgrade,
+)
+
+
+def processing_snapshot(path: Path) -> Path:
+    """A minimal, syntactically real processing journal (never read for content)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
 
 
 def _build_paths(tmp_path: Path, name: str = "built") -> tuple[Path, Path]:
@@ -315,3 +340,207 @@ def test_multiple_sources_are_opened_read_only(tmp_path: Path):
     finally:
         conn.close()
     assert "should_not_exist" not in names
+
+
+# ── v1 -> v2 upgrade recovery ────────────────────────────────────────────────
+
+
+def _upgrade_paths(tmp_path: Path, name: str = "upgraded") -> tuple[Path, Path]:
+    directory = tmp_path / name
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "knowledge.db", directory / "manifest.json"
+
+
+def test_upgrade_inputs_are_never_written(tmp_path: Path):
+    """Both inputs are read-only, including their sidecar files."""
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    before_knowledge = fixture.sha256()
+    before_tables = fixture.table_names()
+    before_journal = journal.read_bytes()
+
+    target, manifest = _upgrade_paths(tmp_path)
+    upgrade_v1(source=fixture.path, processing=journal, target=target, manifest=manifest)
+
+    assert fixture.sha256() == before_knowledge
+    assert fixture.table_names() == before_tables
+    assert fixture.dump_sidecars() == {}
+    assert journal.read_bytes() == before_journal
+    assert target.exists() and manifest.exists()
+
+
+def test_crash_before_publish_leaves_no_complete_target(tmp_path: Path):
+    """A crash between verification and publish must not publish anything at all."""
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    with pytest.raises(UpgradeError) as excinfo:
+        upgrade_v1(
+            source=fixture.path,
+            processing=journal,
+            target=target,
+            manifest=manifest,
+            fail_before_publish=True,
+        )
+    assert excinfo.value.code == "injected_failure"
+    # Nothing is left behind: no target, no manifest, no staging file.
+    assert not target.exists()
+    assert not manifest.exists()
+    assert list(target.parent.glob(".*")) == []
+    assert list(target.parent.iterdir()) == []
+    # And the documented failure code is what the CLI maps to a stable label.
+    from yeoman_gateway.cli.knowledge_commands import _upgrade_reason_code
+
+    assert _upgrade_reason_code("injected_failure") == "semantics_error"
+
+
+def test_verify_reports_an_unpublished_target_as_incomplete(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    report = upgrade_v1(
+        source=fixture.path, processing=journal, target=target, manifest=manifest
+    )
+
+    # Strip the completeness marker and re-verify: the database - not the manifest - is
+    # the authority on whether an upgrade finished.
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("UPDATE knowledge_meta SET value = '0' WHERE key = 'migration_complete'")
+        conn.commit()
+    finally:
+        conn.close()
+    verification = verify_upgrade(target=target, manifest=manifest)
+    assert verification.verdict == "failed"
+    assert verification.complete is False
+    assert verification.integrity_ok is True
+    assert verification.digest_ok is True
+    # The report's own digest is unchanged by the marker flip.
+    assert report.semantic_digest == upgrade_semantic_digest(target)
+
+
+def test_verify_accepts_a_freshly_published_target(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    upgrade_v1(source=fixture.path, processing=journal, target=target, manifest=manifest)
+    verification = verify_upgrade(target=target, manifest=manifest)
+    assert verification.verdict == "ok"
+    assert verification.balance_ok
+    assert verification.balance.person_roles.get("active") == 3
+    assert verification.balance.bindings.get("active") == 1
+
+
+def test_verify_detects_a_changed_target(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    upgrade_v1(source=fixture.path, processing=journal, target=target, manifest=manifest)
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("DELETE FROM knowledge_statement_principals")
+        conn.commit()
+    finally:
+        conn.close()
+    verification = verify_upgrade(target=target, manifest=manifest)
+    assert verification.verdict == "failed"
+    assert verification.counts_match is False
+    assert ("knowledge_statement_principals", 5, 0) in verification.mismatches
+
+
+def test_upgraded_target_opens_as_a_normal_v2_store(tmp_path: Path):
+    """The published target is a real knowledge store, not a migration-only artefact."""
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
+
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    upgrade_v1(source=fixture.path, processing=journal, target=target, manifest=manifest)
+
+    service = open_knowledge_store(
+        target,
+        workspace_id="ws",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=FakePolicyAuthority(
+            admins={"whatsapp:4910000000101"}, capture_actors={"whatsapp:4910000000101"}
+        ),
+    )
+    try:
+        admin = TrustedAdminContext(
+            actor_principal="whatsapp:4910000000101",
+            policy_revision=service.policy_revision,
+            authorization_ref="admin-ref-1",
+            owner=True,
+        )
+        stats = service.stats(context=admin)
+        assert stats.schema_version == 2
+        assert stats.people_count == 3
+        assert stats.statement_count == 5
+    finally:
+        service.close()
+
+
+def test_cli_upgrade_v1_and_verify_v1(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    target, manifest = _upgrade_paths(tmp_path)
+    runner = CliRunner()
+
+    built = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "upgrade-v1",
+            "--source",
+            str(fixture.path),
+            "--processing",
+            str(journal),
+            "--target",
+            str(target),
+            "--manifest",
+            str(manifest),
+        ],
+    )
+    assert built.exit_code == 0, built.output
+    assert "bindings: active=1" in built.output
+    assert "person_roles:" in built.output
+    assert "supersessions:" in built.output
+
+    verified = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "verify-v1",
+            "--target",
+            str(target),
+            "--manifest",
+            str(manifest),
+        ],
+    )
+    assert verified.exit_code == 0, verified.output
+    assert "verdict: ok" in verified.output
+    assert "cutover balance: explains every row" in verified.output
+
+    # The refused second upgrade keeps the target and manifest byte-identical.
+    before_target = target.read_bytes()
+    before_manifest = manifest.read_bytes()
+    refused = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "upgrade-v1",
+            "--source",
+            str(fixture.path),
+            "--processing",
+            str(journal),
+            "--target",
+            str(target),
+            "--manifest",
+            str(manifest),
+        ],
+    )
+    assert refused.exit_code != 0
+    assert "target_exists" in refused.output
+    assert target.read_bytes() == before_target
+    assert manifest.read_bytes() == before_manifest

@@ -30,8 +30,8 @@ from yeoman_gateway.knowledge.models import (
     ValidationError,
 )
 
-SCHEMA_VERSION: Final[int] = 1
-TOOL_VERSION: Final[str] = "knowledge/1.0.0"
+SCHEMA_VERSION: Final[int] = 2
+TOOL_VERSION: Final[str] = "knowledge/2.0.0"
 
 #: Reasons for quarantined legacy rows.  Never contains row content.
 QUARANTINE_REASONS: Final[tuple[str, ...]] = (
@@ -95,11 +95,38 @@ _CORE_SCHEMA: tuple[str, ...] = (
         visibility TEXT NOT NULL DEFAULT 'public',
         first_seen_ms INTEGER NOT NULL DEFAULT 0,
         last_seen_ms INTEGER NOT NULL DEFAULT 0,
-        UNIQUE (contact_id, alias, source)
+        alias_kind TEXT NOT NULL DEFAULT 'other_name'
+            CHECK(alias_kind IN ('platform_display','nickname','short_name','other_name')),
+        normalized_alias TEXT NOT NULL DEFAULT '',
+        scope_key TEXT NOT NULL DEFAULT 'global',
+        status TEXT NOT NULL DEFAULT 'observed'
+            CHECK(status IN ('observed','candidate','confirmed','retired')),
+        address_allowed INTEGER NOT NULL DEFAULT 0,
+        is_preferred INTEGER NOT NULL DEFAULT 0,
+        supporting_statement_id TEXT,
+        evidence_ref TEXT NOT NULL DEFAULT '',
+        valid_until_ms INTEGER,
+        mapping_retracted INTEGER NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_ca_contact ON contact_aliases (contact_id)",
     "CREATE INDEX IF NOT EXISTS idx_ca_alias ON contact_aliases (alias COLLATE NOCASE)",
+    # The legacy dedupe key stays: repeated observation of the same name from the same
+    # source updates last-seen instead of appending one row per message.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_observation
+      ON contact_aliases (contact_id, alias, source)
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ca_normalized"
+    " ON contact_aliases (normalized_alias, scope_key, status)",
+    # At most one preferred *and* address-allowed alias per person and context.  A
+    # retired or merely candidate alias is never a preference.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_preferred_scope
+      ON contact_aliases (contact_id, scope_key)
+      WHERE is_preferred = 1 AND address_allowed = 1
+    """,
     """
     CREATE TABLE IF NOT EXISTS contact_fields (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,24 +142,44 @@ _CORE_SCHEMA: tuple[str, ...] = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_cf_dedupe"
     " ON contact_fields (contact_id, kind, value)",
     # ── knowledge identity side tables ───────────────────────────────────────
+    # A binding is a *temporal* claim: one identifier of one platform account belongs to
+    # one person for one proven period.  The primary key is a stable ``binding_id`` so a
+    # later re-assignment ends the old row instead of overwriting it, and so a statement
+    # role can cite the exact binding it rests on.
     """
     CREATE TABLE IF NOT EXISTS knowledge_identifier_bindings (
+        binding_id TEXT PRIMARY KEY,
         channel TEXT NOT NULL,
         kind TEXT NOT NULL,
+        namespace TEXT NOT NULL,
         value TEXT NOT NULL,
         person_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
         status TEXT NOT NULL DEFAULT 'active'
-            CHECK(status IN ('active','conflict','withheld')),
+            CHECK(status IN ('active','ended','conflict','withheld')),
+        valid_from_ms INTEGER NOT NULL DEFAULT 0,
+        valid_until_ms INTEGER NOT NULL DEFAULT 0,
+        observed_at_ms INTEGER NOT NULL DEFAULT 0,
         evidence_ref TEXT NOT NULL,
         mapping_verified INTEGER NOT NULL DEFAULT 0,
+        revision INTEGER NOT NULL DEFAULT 1,
         created_ms INTEGER NOT NULL,
-        updated_ms INTEGER NOT NULL,
-        PRIMARY KEY (channel, kind, value)
+        updated_ms INTEGER NOT NULL
     )
+    """,
+    # At most one *active* binding per fully typed identifier.  Ended, conflicting and
+    # withheld rows coexist because they are history, not authority.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS knowledge_identifier_bindings_active
+      ON knowledge_identifier_bindings (channel, kind, namespace, value)
+      WHERE status = 'active'
     """,
     """
     CREATE INDEX IF NOT EXISTS knowledge_identifier_bindings_by_person
       ON knowledge_identifier_bindings (person_id, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS knowledge_identifier_bindings_lookup
+      ON knowledge_identifier_bindings (channel, kind, namespace, value, status)
     """,
     """
     CREATE TABLE IF NOT EXISTS knowledge_identity_redirects (
@@ -155,7 +202,9 @@ _CORE_SCHEMA: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS knowledge_identity_ops (
         operation_id TEXT PRIMARY KEY,
         kind TEXT NOT NULL
-            CHECK(kind IN ('merge','undo_merge','preferred_name','binding','correction')),
+            CHECK(kind IN ('merge','undo_merge','preferred_name','binding','correction',
+                           'binding_end','alias','alias_preference','alias_retire',
+                           'attribute_end')),
         actor_principal TEXT NOT NULL,
         authorization_ref TEXT NOT NULL,
         payload_json TEXT NOT NULL DEFAULT '{}',
@@ -189,7 +238,15 @@ _CORE_SCHEMA: tuple[str, ...] = (
         unresolved_mentions_json TEXT NOT NULL DEFAULT '[]',
         dedupe_key TEXT NOT NULL,
         created_ms INTEGER NOT NULL,
-        updated_ms INTEGER NOT NULL
+        updated_ms INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        supersession_reason TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(supersession_reason IN
+                  ('state_change','correction','quality_rejected','unknown')),
+        time_basis TEXT NOT NULL DEFAULT 'stored'
+            CHECK(time_basis IN ('explicit','source_time','unknown','stored')),
+        time_precision TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(time_precision IN ('exact','day','month','year','approximate','unknown'))
     )
     """,
     """
@@ -212,12 +269,45 @@ _CORE_SCHEMA: tuple[str, ...] = (
         attribution TEXT NOT NULL
             CHECK(attribution IN ('transport','explicit','extracted','confirmed')),
         created_ms INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK(status IN ('active','withheld','conflict')),
+        binding_id TEXT REFERENCES knowledge_identifier_bindings(binding_id),
+        resolution_reason TEXT NOT NULL DEFAULT '',
         PRIMARY KEY(statement_id, person_id, role, evidence_source_id, evidence_revision)
     )
     """,
     """
     CREATE INDEX IF NOT EXISTS knowledge_statement_people_by_person
       ON knowledge_statement_people(person_id, role, statement_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS knowledge_statement_people_by_status
+      ON knowledge_statement_people(status, role)
+    """,
+    # ── structured statement facets ──────────────────────────────────────────
+    # One small relational annotation of an existing statement.  It is never an
+    # independent writer: the row is created in the same transaction as the statement and
+    # requires an active ``subject`` role for the same person.  Text, sources and status
+    # stay in ``knowledge_statements``; there is no second JSON copy of this inventory.
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_person_attributes (
+        statement_id TEXT NOT NULL REFERENCES knowledge_statements(statement_id)
+            ON DELETE CASCADE,
+        person_id TEXT NOT NULL REFERENCES contacts(id),
+        attribute_key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        value_key TEXT NOT NULL,
+        polarity TEXT NOT NULL DEFAULT 'positive'
+            CHECK(polarity IN ('positive','negative')),
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (statement_id, person_id, attribute_key, value_key, polarity)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS knowledge_person_attributes_by_person
+      ON knowledge_person_attributes (person_id, attribute_key, statement_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS knowledge_statement_sources (

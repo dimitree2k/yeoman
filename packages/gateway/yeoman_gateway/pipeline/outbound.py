@@ -309,9 +309,23 @@ class OutboundMiddleware:
                     name = match.group(1)
                     jid: str | None = None
                     if self._knowledge is not None:
-                        identifier = self._knowledge.identifier_for_name(
-                            name, channel="whatsapp", prefer=tuple(seen)
-                        )
+                        # A mention is a delivery: exactly one proven address, and the
+                        # phone JID is the one WhatsApp addresses.  Two people with the
+                        # name, or no proven binding, means no candidate - never a guess.
+                        # A knowledge outage costs the mention, never the reply.
+                        try:
+                            identifier = self._knowledge.identifier_for_name(
+                                name,
+                                channel="whatsapp",
+                                prefer=tuple(seen),
+                                prefer_kind="phone_jid",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "mention resolution degraded: knowledge lookup failed ({})",
+                                getattr(exc, "code", type(exc).__name__),
+                            )
+                            identifier = None
                         jid = None if identifier is None else identifier.value
                     elif self._contacts is not None:
                         jid = self._contacts.resolve_name_to_jid(

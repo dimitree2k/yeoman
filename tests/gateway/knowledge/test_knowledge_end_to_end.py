@@ -497,3 +497,207 @@ def test_roster_and_recall_use_the_same_audience(e2e):
     narrow = e2e.read_context(TOM, recipients={TOM, ALEX})
     rows = e2e.knowledge.roster(context=narrow, participant_ids=tuple(sorted({TOM, ALEX})))
     assert any("roster-scoped-4455" in " ".join(facts) for _name, facts in rows)
+
+
+# ── deterministic person profile (Task 6) ────────────────────────────────────
+#
+# The profile is a projection, never a stored document: the same stored rows always
+# produce the same card, every value carries the source it came from, and the card is
+# bounded at entry boundaries instead of by slicing a string.
+
+
+def test_profile_is_deterministic_and_sourced(knowledge_harness):
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    h.capture_text("Alex wohnt in Köln.", source, subjects=(alex,))
+    context = h.read_context(alex)
+
+    first = h.service.person_profile(alex, context=context)
+    second = h.service.person_profile(alex, context=context)
+
+    assert first.card == second.card
+    assert first.person_id == alex
+    assert first.entry_count == len([line for line in first.card.splitlines() if line.strip()])
+    assert first.truncated is False
+    assert first.statement_ids
+    assert first.source_refs
+    assert any("Köln" in line for line in first.card.splitlines())
+
+
+def test_profile_without_a_read_context_delivers_nothing(knowledge_harness):
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    h.capture_text("Alex wohnt in Köln.", source, subjects=(alex,))
+    empty = h.service.person_profile(alex, context=None)
+    assert empty.card == ""
+    assert empty.statement_ids == ()
+    assert empty.reason == "no_read_context"
+
+
+def test_profile_never_shows_a_locked_statement(knowledge_harness):
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    statement_id = h.capture_text("Alex wohnt in Köln.", source, subjects=(alex,)).statement_ids[0]
+    context = h.read_context(alex)
+    assert "Köln" in h.service.person_profile(alex, context=context).card
+
+    with h.service._store.transaction():  # noqa: SLF001 - lifecycle write under test
+        h.service._store.execute(  # noqa: SLF001
+            "UPDATE knowledge_statements SET status = 'superseded',"
+            " supersession_reason = 'quality_rejected', revision = revision + 1"
+            " WHERE statement_id = ?",
+            (statement_id,),
+        )
+    blocked = h.service.person_profile(alex, context=context)
+    assert "Köln" not in blocked.card
+    assert blocked.statement_ids == ()
+
+
+def test_profile_bounds_at_entry_boundaries_not_by_slicing(knowledge_harness):
+    """Every listed entry is complete; the stored value is never modified."""
+    h = knowledge_harness
+    alex = h.person("Alex")
+    long_sentence = "Alex hat einen sehr ausführlichen Sachverhalt geschildert, " * 4
+    for index in range(30):
+        source = h.source(alex)
+        h.capture_text(
+            f"{long_sentence} Nummer {index}.", source, subjects=(alex,)
+        )
+    context = h.read_context(alex)
+    profile = h.service.person_profile(alex, context=context)
+    assert profile.truncated is True
+    assert len(profile.statement_ids) <= 20
+    # No listed line was cut in the middle: each one is present in full in the store.
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{h.service.db_path}?mode=ro", uri=True)
+    try:
+        stored = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT content FROM memory2_nodes WHERE id IN"
+                f" ({','.join('?' for _ in profile.statement_ids)})",
+                profile.statement_ids,
+            )
+        }
+    finally:
+        conn.close()
+    for statement_id in profile.statement_ids:
+        node = h.service._store.query_one(  # noqa: SLF001 - stored value assertion
+            "SELECT content FROM memory2_nodes WHERE id = ?", (statement_id,)
+        )
+        assert str(node["content"]) in "\n".join([str(item) for item in stored])
+
+
+def test_profile_keeps_at_most_five_values_per_attribute_group(knowledge_harness):
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    alex = h.person("Alex")
+    for index in range(8):
+        source = h.source(alex)
+        candidate = StatementCandidate(
+            content=f"Alex hat Interesse Nummer {index}.",
+            sources=(source,),
+            people=(
+                PersonLinkCandidate(
+                    person_id=alex, role="subject", source=source, attribution="extracted"
+                ),
+            ),
+            attributes=(
+                AttributeCandidate(
+                    person_id=alex,
+                    attribute_key="interest",
+                    value=AttributeValue(f"Interesse-{index}"),
+                ),
+            ),
+            extractor_version="test-extractor-1",
+            confidence=0.5,
+        )
+        h.service.capture(candidate, context=h.capture_context(source))
+
+    profile = h.service.person_profile(alex, context=h.read_context(alex))
+    listed = [line for line in profile.card.splitlines() if line.startswith("interest:")]
+    assert len(listed) == 1  # one group line
+    values = listed[0].split(":", 1)[1].split(",")
+    assert len(values) == 5
+    assert profile.truncated is True
+    # The stored facets are untouched: only the view is bounded.
+    total = h.service._store.scalar(  # noqa: SLF001 - stored value assertion
+        "SELECT COUNT(*) FROM knowledge_person_attributes WHERE person_id = ?", (alex,)
+    )
+    assert int(total) == 8
+
+
+def test_profile_marks_reported_values_as_reported(knowledge_harness):
+    """A value somebody else reported reads as reported, not as a self-declaration."""
+    h = knowledge_harness
+    alex = h.person("Alex")
+    tom = h.person("Tom")
+    # Tom and Alex are both in the audience, so Alex's reader may see what Tom reported.
+    audience = {h.principal_for(alex), h.principal_for(tom)}
+    source = h.source(tom, audience=audience)
+    h.capture_text(
+        "Alex wohnt in Köln.", source, subjects=(alex,), reported_speakers=(tom,)
+    )
+    profile = h.service.person_profile(
+        alex, context=h.read_context(alex, recipients=audience)
+    )
+    reported = [line for line in profile.card.splitlines() if line.startswith("reported:")]
+    assert reported == ["reported: Alex wohnt in Köln."]
+
+
+def test_profile_marks_two_values_of_one_group_as_a_conflict(knowledge_harness):
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    alex = h.person("Alex")
+    for place in ("Köln", "Bonn"):
+        source = h.source(alex)
+        candidate = StatementCandidate(
+            content=f"Alex wohnt in {place}.",
+            sources=(source,),
+            people=(
+                PersonLinkCandidate(
+                    person_id=alex, role="subject", source=source, attribution="extracted"
+                ),
+            ),
+            attributes=(
+                AttributeCandidate(
+                    person_id=alex, attribute_key="residence", value=AttributeValue(place)
+                ),
+            ),
+            extractor_version="test-extractor-1",
+            confidence=0.5,
+        )
+        h.service.capture(candidate, context=h.capture_context(source))
+
+    profile = h.service.person_profile(alex, context=h.read_context(alex))
+    assert profile.conflicts == ("residence",)
+    residence = [line for line in profile.card.splitlines() if line.startswith("residence:")]
+    # Both values stay visible: no global last-write-wins.
+    assert residence == ["residence: Bonn, Köln"]
+
+
+def test_profile_reports_the_person_and_its_addresses(knowledge_harness):
+    h = knowledge_harness
+    person = h.observe("whatsapp", "phone_jid", "49181111111@s.whatsapp.net", name="Synthetic P.")
+    h.service.set_preferred_name(person.person_id, "Synthetic Confirmed", context=h.admin_context())
+    profile = h.service.person_profile(person.person_id, context=h.read_context(person.person_id))
+    assert profile.display_name == "Synthetic Confirmed"
+    assert profile.identity_revision == h.identity_revision()
+    assert profile.acl_epoch == h.acl_epoch()
+    assert profile.reason == "ok"

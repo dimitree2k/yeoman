@@ -214,3 +214,136 @@ def test_rescreen_apply_hides_only_the_refused_statement(harness: CaptureHarness
     assert audit is not None and str(audit["reason"]) == "screen:conversation_report"
     # A superseded statement is no longer part of the ordinary read result.
     assert junk not in harness.knowledge_recall("Frage").statement_ids
+
+
+# ── two separate screens (T11-T13, T38) ──────────────────────────────────────
+#
+# The screens answer two different questions and must not be collapsed into one lexical
+# rule.  The input screen asks "may this section reach a model?"; the candidate screen
+# asks "may this proposition become durable knowledge?".  A section that *reports* what
+# somebody said is perfectly good input - the reporting vocabulary is only a reason to
+# refuse a *candidate* that turned out to be nothing but that report.
+
+from yeoman_gateway.knowledge._memory.extraction_jobs import (  # noqa: E402
+    screen_capture_input,
+    screen_statement_candidate,
+)
+
+#: Sections that contain reported speech but also a reportable proposition.
+INPUT_SECTIONS_THAT_MUST_PASS = (
+    "Tom erwähnte, dass Alex nach Köln gezogen ist",
+    "Er sagte, dass die Firma 2026 gegründet wird",
+    "Es wurde gesagt, dass das Buch 2020 geschrieben wurde",
+    "Es gibt 35.000 Euro Fixkosten pro Monat",
+)
+
+#: Sections that carry nothing at all.
+INPUT_SECTIONS_THAT_MUST_FAIL = (
+    ("   ", "empty"),
+    ("\x07", "control_characters"),
+    ("..", "too_short"),
+    ("<media>", "placeholder"),
+    ("[image]", "placeholder"),
+)
+
+
+@pytest.mark.parametrize("text", INPUT_SECTIONS_THAT_MUST_PASS)
+def test_the_input_screen_lets_reported_speech_through(text: str) -> None:
+    """T38: "er erwähnte, dass ..." must not be destroyed before the model sees it."""
+    assert screen_capture_input(text).accepted, text
+
+
+@pytest.mark.parametrize("text,reason", INPUT_SECTIONS_THAT_MUST_FAIL)
+def test_the_input_screen_refuses_only_unusable_input(text: str, reason: str) -> None:
+    verdict = screen_capture_input(text)
+    assert verdict.rejected
+    assert verdict.reason == reason
+
+
+def test_the_input_screen_never_applies_the_reporting_rule() -> None:
+    """The two screens share validation helpers, not a blanket rejection rule."""
+    report = "Es wurde gesagt, dass es nicht echt ist."
+    # The same sentence is a valid input section and an invalid candidate.
+    assert screen_capture_input(report).accepted
+    assert screen_statement_candidate(
+        StatementDraft(content=report, source_index=0)
+    ).rejected
+
+
+def test_a_revoked_source_never_reaches_a_provider() -> None:
+    verdict = screen_capture_input(
+        "Alex wohnt in Köln.", {"source_status": "revoked"}
+    )
+    assert verdict.rejected
+    assert verdict.reason == "source_revoked"
+
+
+def test_a_meta_only_candidate_still_fails_the_candidate_screen() -> None:
+    for text in ("Es wurde etwas erwähnt.", "Die Frage wurde gestellt."):
+        verdict = screen_statement_candidate(StatementDraft(content=text, source_index=0))
+        assert verdict.rejected, text
+        assert verdict.reason == "conversation_report"
+
+
+def test_a_real_third_party_report_passes_the_candidate_screen() -> None:
+    verdict = screen_statement_candidate(
+        StatementDraft(
+            content="Alex wohnt in Köln.",
+            source_index=0,
+            basis="reported_statement",
+        )
+    )
+    assert verdict.accepted
+
+
+def test_a_candidate_may_not_reference_a_person_it_was_not_offered() -> None:
+    """T13: a foreign identifier or a prompt instruction changes nothing."""
+    verdict = screen_statement_candidate(
+        StatementDraft(
+            content="Alex wohnt in Köln.",
+            source_index=0,
+            people=(("11111111-1111-4111-8111-111111111111", "subject"),),
+        ),
+        allowed_people=("22222222-2222-4222-8222-222222222222",),
+    )
+    assert verdict.rejected
+    assert verdict.reason == "unoffered_person_reference"
+
+
+def test_a_candidate_with_an_unsupported_basis_is_refused() -> None:
+    verdict = screen_statement_candidate(
+        StatementDraft(content="Alex wohnt in Köln.", source_index=0, basis="guess")
+    )
+    assert verdict.rejected
+    assert verdict.reason == "unsupported_basis"
+
+
+def test_facts_about_costs_and_dates_survive_both_screens() -> None:
+    """T38: a financial or historical fact is a fact, not a conversation report."""
+    for text in ("Es gibt 35.000 Euro Fixkosten.", "Das Buch wurde 2020 geschrieben."):
+        assert screen_capture_input(text).accepted, text
+        assert screen_statement_candidate(
+            StatementDraft(content=text, source_index=0)
+        ).accepted, text
+
+
+def test_a_long_source_is_split_into_sections_and_each_section_is_usable() -> None:
+    """A long text reaches the model in bounded sections instead of one crop."""
+    from yeoman_gateway.knowledge._capture_worker import split_source_sections
+
+    long_text = ". ".join(f"Sachverhalt Nummer {index}" for index in range(400)) + "."
+    sections = split_source_sections(long_text, max_chars=400)
+    assert len(sections) > 1
+    # No character is lost and no section is empty or over the bound.
+    assert "".join(sections) == long_text
+    assert all(0 < len(section) <= 400 for section in sections)
+    assert all(screen_capture_input(section).accepted for section in sections)
+
+
+def test_splitting_never_truncates_a_single_oversized_sentence() -> None:
+    from yeoman_gateway.knowledge._capture_worker import split_source_sections
+
+    text = "x" * 1200
+    sections = split_source_sections(text, max_chars=200)
+    assert "".join(sections) == text
+    assert all(section for section in sections)

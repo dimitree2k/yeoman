@@ -2,15 +2,23 @@
 
 The surface is exactly::
 
-    yeoman knowledge migration inspect --contacts SNAPSHOT --memory SNAPSHOT
-    yeoman knowledge migration build   --contacts SNAPSHOT --memory SNAPSHOT \\
-                                       --target NEW_DB --manifest NEW_JSON
-    yeoman knowledge migration verify  --target DB --manifest JSON
+    yeoman knowledge migration inspect     --contacts SNAPSHOT --memory SNAPSHOT
+    yeoman knowledge migration build       --contacts SNAPSHOT --memory SNAPSHOT \\
+                                           --target NEW_DB --manifest NEW_JSON
+    yeoman knowledge migration verify      --target DB --manifest JSON
+    yeoman knowledge migration inspect-v1  --source V1.db --processing PROCESSING.db
+    yeoman knowledge migration upgrade-v1  --source V1.db --processing PROCESSING.db \\
+                                           --target NEW-V2.db --manifest NEW.json
+    yeoman knowledge migration verify-v1   --target NEW-V2.db --manifest NEW.json
+    yeoman knowledge migration propose-bindings --source V1.db --processing PROCESSING.db \
+                                           --out proposals.json
+    yeoman knowledge migration upgrade-v1  ... --binding-approvals proposals.json
 
 Everything here is offline and explicit: no default paths, no provider or bootstrap
-startup, no implicit migration.  Every failure exits non-zero and prints a stable
-reason code (``source_error``, ``target_exists``, ``unsupported_schema``,
-``manifest_mismatch``); diagnostics are redacted to table names, counts and ids.
+startup, no implicit migration, no gateway and no worker.  Every failure exits non-zero
+and prints a stable reason code (``source_error``, ``target_exists``,
+``unsupported_schema``, ``manifest_mismatch``); diagnostics are redacted to table names,
+counts and ids.
 
 Registration follows the existing convention: this module imports the shared ``app``
 and attaches its sub-app at import time, and ``cli/commands.py`` imports the module
@@ -36,6 +44,15 @@ from yeoman_gateway.knowledge._migration import (
     migrate_sources,
     verify_target,
 )
+from yeoman_gateway.knowledge._upgrade import (
+    UpgradeError,
+    UpgradeInventory,
+    UpgradeReport,
+    UpgradeVerification,
+    inspect_v1,
+    upgrade_v1,
+    verify_upgrade,
+)
 
 from .core import app, console
 
@@ -60,6 +77,50 @@ _REASON_CODES: Final[dict[str, str]] = {
     "manifest_missing": "manifest_mismatch",
     "manifest_invalid": "manifest_mismatch",
     "not_a_database": "source_error",
+}
+
+#: v1->v2 upgrade reason codes.  Kept separate so the two offline paths cannot be
+#: confused by a shared code with a different meaning.
+_UPGRADE_REASON_CODES: Final[dict[str, str]] = {
+    "knowledge_missing": "source_error",
+    "knowledge_not_a_file": "source_error",
+    "knowledge_unreadable": "source_error",
+    "knowledge_not_a_database": "source_error",
+    "knowledge_integrity_failed": "source_error",
+    "processing_missing": "source_error",
+    "processing_not_a_file": "source_error",
+    "processing_unreadable": "source_error",
+    "processing_not_a_database": "source_error",
+    "processing_integrity_failed": "source_error",
+    "unsupported_source_schema": "unsupported_schema",
+    "table_shape_unknown": "unsupported_schema",
+    "target_is_source": "target_exists",
+    "target_is_manifest": "target_exists",
+    "target_exists": "target_exists",
+    "target_is_a_source": "target_exists",
+    "manifest_exists": "target_exists",
+    "manifest_missing": "manifest_mismatch",
+    "manifest_invalid": "manifest_mismatch",
+    "target_missing": "manifest_mismatch",
+    "target_not_a_database": "manifest_mismatch",
+    "binding_overlap": "semantics_error",
+    "staged_integrity_failed": "semantics_error",
+    "staged_foreign_key_failed": "semantics_error",
+    "statement_count_mismatch": "semantics_error",
+    "role_count_mismatch": "semantics_error",
+    "source_count_mismatch": "semantics_error",
+    "binding_balance_broken": "semantics_error",
+    "orphan_source_rows": "semantics_error",
+    "injected_failure": "semantics_error",
+    # An approval that does not match the snapshot is a decision error, not a source error.
+    "approval_file_missing": "approval_error",
+    "approval_file_invalid": "approval_error",
+    "approval_unknown_identifier": "approval_error",
+    "approval_unknown_person": "approval_error",
+    "approval_mismatch": "approval_error",
+    "approval_duplicate": "approval_error",
+    "approval_overlaps_existing_binding": "approval_error",
+    "approval_not_applied": "semantics_error",
 }
 
 
@@ -134,9 +195,359 @@ def migration_verify(
         _fail("manifest_mismatch", detail)
 
 
+# ── v1 -> v2 snapshot upgrade ────────────────────────────────────────────────
+
+
+@migration_app.command("inspect-v1")
+def migration_inspect_v1(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+) -> None:
+    """Read a v1 knowledge snapshot and its processing journal, read-only."""
+    try:
+        inventory = inspect_v1(source=source, processing=processing)
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_inventory(inventory)
+    if inventory.verdict != "ok":
+        _fail("unsupported_schema", inventory.reason)
+
+
+@migration_app.command("propose-bindings")
+def migration_propose_bindings(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+    out: Path = typer.Option(..., "--out", help="New proposal file for the owner to review"),
+    namespace: str = typer.Option(
+        "",
+        "--namespace",
+        help="Force one platform-account namespace instead of the observed per-channel one",
+    ),
+) -> None:
+    """Write a reviewable, private proposal for every legacy identifier (read-only)."""
+    from yeoman_gateway.knowledge._upgrade import propose_bindings
+
+    try:
+        report = propose_bindings(
+            source=source, processing=processing, out=out, namespace=namespace
+        )
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _line(f"proposal: {report.out_path}  (private: it names people and identifiers)")
+    _line(f"entries: {report.total}  with journal evidence: {report.with_journal_evidence}")
+    if report.not_a_person:
+        _line(
+            f"not a person (group/broadcast JID, never proposed): {report.not_a_person}"
+        )
+    _line(f"stored role rows covered: {report.role_rows_covered}")
+    _line("nothing was applied: mark entries as approved and pass the file to upgrade-v1")
+
+
+@migration_app.command("upgrade-v1")
+def migration_upgrade_v1(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+    target: Path = typer.Option(..., "--target", help="New v2 knowledge database to create"),
+    manifest: Path = typer.Option(..., "--manifest", help="New upgrade manifest JSON"),
+    binding_approvals: Path | None = typer.Option(
+        None,
+        "--binding-approvals",
+        help="Owner-reviewed proposal file; only entries marked approved are applied",
+    ),
+) -> None:
+    """Build a fresh v2 target from a v1 snapshot.  Never migrates in place."""
+    try:
+        report = upgrade_v1(
+            source=source,
+            processing=processing,
+            target=target,
+            manifest=manifest,
+            binding_approvals=binding_approvals,
+        )
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_report(report)
+
+
+@migration_app.command("verify-v1")
+def migration_verify_v1(
+    target: Path = typer.Option(..., "--target", help="Upgraded v2 database"),
+    manifest: Path = typer.Option(..., "--manifest", help="Manifest written by upgrade-v1"),
+) -> None:
+    """Re-read an upgraded target read-only and compare it with its manifest."""
+    try:
+        report = verify_upgrade(target=target, manifest=manifest)
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_verification(report)
+    if report.verdict != "ok":
+        detail = ", ".join(
+            f"{table} expected {expected} rows, found {actual}"
+            for table, expected, actual in report.mismatches
+        )
+        if not detail:
+            if not report.complete:
+                detail = (
+                    "target carries no complete upgrade marker; rebuild it from the"
+                    " v1 snapshot instead of using it"
+                )
+            elif not report.digest_ok:
+                detail = "target content does not match the manifest digest"
+            elif not report.balance_ok:
+                detail = "the cutover balance does not explain every stored row"
+            else:
+                detail = "integrity, foreign keys or fingerprint check failed"
+        _fail("manifest_mismatch", detail)
+
+
+# ── offline snapshot and benchmark ───────────────────────────────────────────
+
+snapshot_app = typer.Typer(help="Offline snapshot: copy, verify, benchmark")
+knowledge_app.add_typer(snapshot_app, name="snapshot")
+
+
+@snapshot_app.command("create")
+def snapshot_create(
+    processing: Path = typer.Option(..., "--processing", help="Processing journal database"),
+    knowledge: Path = typer.Option(..., "--knowledge", help="Knowledge database"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="New directory for the copy"),
+    quiesce_ref: Path = typer.Option(
+        ..., "--quiesce-ref", help="Reference to the authorized quiesce boundary"
+    ),
+) -> None:
+    """Copy both databases with the SQLite backup API, then describe the result."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, create_snapshot
+
+    try:
+        report = create_snapshot(
+            processing=processing,
+            knowledge=knowledge,
+            target_dir=target_dir,
+            quiesce_ref=str(quiesce_ref),
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(f"snapshot: {report.target_dir}")
+    _line(f"manifest: {report.manifest_path}")
+    _line(f"quiesce ref: {report.quiesce_ref}  (coherent live boundary: no)")
+    _line(
+        "knowledge: "
+        f"{report.knowledge_path.name} sha256:{report.knowledge_fingerprint[:12]}"
+        f" rows={sum(count for _table, count in report.knowledge_counts)}"
+    )
+    _line(
+        "processing: "
+        f"{report.processing_path.name} sha256:{report.processing_fingerprint[:12]}"
+        f" rows={sum(count for _table, count in report.processing_counts)}"
+    )
+    _line(f"media entries: {len(report.media)}")
+
+
+@snapshot_app.command("verify")
+def snapshot_verify(
+    manifest: Path = typer.Option(..., "--manifest", help="Manifest written by create"),
+    restore_dir: Path = typer.Option(
+        None, "--restore-dir", help="Directory for the isolated restore copies"
+    ),
+) -> None:
+    """Verify a snapshot on isolated restore copies.  Starts no jobs and sends nothing."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_snapshot
+
+    try:
+        report = verify_snapshot(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
+    _line(f"manifest hashes: {'match' if report.hashes_match else 'differ'}")
+    _line(
+        f"knowledge schema: {report.schema_version or 'unknown'}"
+        + (
+            "  (v1: attribute checks do not apply yet)"
+            if report.schema_version == "1"
+            else ""
+        )
+    )
+    _line(f"cross-references: {'ok' if report.cross_references_ok else 'broken'}")
+    _line(f"restore rehearsal: {'ok' if report.rehearsal_ok else 'failed'}")
+    if report.locked_index_entries is None:
+        _line("locked index entries: no index to check")
+    elif report.locked_index_enforced:
+        _line(
+            "locked index entries: "
+            + ("none" if report.locked_index_entries == 0 else f"present ({report.locked_index_entries})")
+        )
+    else:
+        _line(
+            f"locked index entries: {report.locked_index_entries} (v1 leftovers; the"
+            " upgrade rebuilds the index without them, not a backup defect)"
+        )
+    _line(f"verdict: {report.verdict}", style="green" if report.ok else "red")
+    if not report.ok:
+        _fail("manifest_mismatch", report.reason)
+
+
+@knowledge_app.command("benchmark")
+def knowledge_benchmark(
+    target: Path = typer.Option(..., "--target", help="Scratch database path to use"),
+    people: int = typer.Option(1000, "--people", help="Synthetic people to build"),
+    statements: int = typer.Option(10000, "--statements", help="Synthetic facets to build"),
+    iterations: int = typer.Option(200, "--iterations", help="Timed read rounds"),
+) -> None:
+    """Measure local profile/alias reads on synthetic data.  No network, no model."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, benchmark_profiles
+
+    try:
+        report = benchmark_profiles(
+            target=target, people=people, statements=statements, iterations=iterations
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(f"people={report.people} statements={report.statements} iterations={report.iterations}")
+    _line(f"reads p50={report.p50_ms} ms  p95={report.p95_ms} ms  max={report.max_ms} ms")
+    _line(f"peak RSS: {report.peak_rss_mib} MiB")
+    _line(f"database bytes: {report.database_bytes}")
+    _line(
+        "p95 budget (<200 ms): "
+        + ("met" if report.within_latency_budget else "exceeded - report as a deviation")
+    )
+
+
+# ── read-only person inspection ──────────────────────────────────────────────
+#
+# These commands open one explicitly named database read-only.  They never start a
+# gateway, never open the live config, never write, and never print row content: counts,
+# ids, statuses and reason codes only.  Content inspection stays behind the authorized
+# runtime paths, because a CLI is not an authorization.
+
+
+def _open_readonly_connection(target: Path):
+    import sqlite3
+
+    path = Path(target).expanduser()
+    if not path.exists():
+        _fail("source_error", f"database does not exist: {path}")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:  # pragma: no cover - defensive
+        _fail("source_error", f"not a readable SQLite database: {path}")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _redacted(value: object) -> str:
+    """A stable, content-free token for a name or identifier."""
+    import hashlib
+
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+@knowledge_app.command("inspect-bindings")
+def knowledge_inspect_bindings(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    status: str = typer.Option("", "--status", help="Only bindings in this status"),
+) -> None:
+    """List identifier bindings with their cutover status.  Values stay redacted."""
+    connection = _open_readonly_connection(target)
+    try:
+        sql = (
+            "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+            " mapping_verified, valid_from_ms, valid_until_ms, evidence_ref"
+            " FROM knowledge_identifier_bindings"
+        )
+        params: tuple = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (str(status),)
+        sql += " ORDER BY channel, kind, namespace, value, binding_id"
+        rows = connection.execute(sql, params).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 binding table")
+    finally:
+        pass
+    _line("identifier bindings (values and person ids redacted)")
+    for row in rows:
+        _line(
+            f"  {row['channel']}/{row['kind']}/{row['namespace']}"
+            f"  value={_redacted(row['value'])}"
+            f"  person={_redacted(row['person_id'])}"
+            f"  status={row['status']}"
+            f"  verified={'yes' if int(row['mapping_verified'] or 0) else 'no'}"
+            f"  valid={int(row['valid_from_ms'] or 0)}..{int(row['valid_until_ms'] or 0)}"
+            f"  evidence={_redacted(row['evidence_ref'])}"
+        )
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[str(row["status"])] = counts.get(str(row["status"]), 0) + 1
+    _line("counts: " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    connection.close()
+
+
+@knowledge_app.command("inspect-roles")
+def knowledge_inspect_roles(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    status: str = typer.Option("", "--status", help="Only roles in this status"),
+) -> None:
+    """List stored person roles with their cutover verdict.  No names, no text."""
+    connection = _open_readonly_connection(target)
+    try:
+        sql = (
+            "SELECT role, status, resolution_reason, COUNT(*) AS n"
+            " FROM knowledge_statement_people"
+        )
+        params: tuple = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (str(status),)
+        sql += " GROUP BY role, status, resolution_reason ORDER BY role, status"
+        rows = connection.execute(sql, params).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 role table")
+    _line("person roles (counts only)")
+    for row in rows:
+        _line(
+            f"  {row['role']}/{row['status']}"
+            f"  reason={row['resolution_reason'] or '-'}"
+            f"  count={int(row['n'])}"
+        )
+    connection.close()
+
+
+@knowledge_app.command("inspect-unresolved")
+def knowledge_inspect_unresolved(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    limit: int = typer.Option(50, "--limit", help="Maximum rows to print"),
+) -> None:
+    """List quarantined and withheld cases: what could not be proven, and why."""
+    connection = _open_readonly_connection(target)
+    try:
+        quarantine = connection.execute(
+            "SELECT source_table, reason, COUNT(*) AS n FROM knowledge_quarantine"
+            " GROUP BY source_table, reason ORDER BY source_table, reason"
+        ).fetchall()
+        withheld = connection.execute(
+            "SELECT resolution_reason, COUNT(*) AS n FROM knowledge_statement_people"
+            " WHERE status <> 'active' GROUP BY resolution_reason ORDER BY resolution_reason"
+            " LIMIT ?",
+            (int(max(1, limit)),),
+        ).fetchall()
+    except Exception:
+        connection.close()
+        _fail("source_error", "the target carries no v2 case tables")
+    _line("unresolved and quarantined cases (counts only)")
+    for row in quarantine:
+        _line(f"  {row['source_table']}  reason={row['reason']}  count={int(row['n'])}")
+    for row in withheld:
+        _line(
+            f"  knowledge_statement_people  reason={row['resolution_reason'] or '-'}"
+            f"  count={int(row['n'])}"
+        )
+    connection.close()
+
+
 @capture_app.command("status")
-def capture_status(
-    target: Path = typer.Option(
+def capture_status(    target: Path = typer.Option(
         Path("~/.yeoman/data/knowledge/knowledge.db"),
         "--target",
         help="Knowledge database to read",
@@ -367,6 +778,86 @@ def _print_verification(report: VerificationReport) -> None:
     for table, expected, actual in report.mismatches:
         _line(f"  {table}: manifest says {expected} rows, target has {actual}")
     _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
+
+
+def _print_upgrade_inventory(inventory: UpgradeInventory) -> None:
+    _line(f"knowledge snapshot: {inventory.knowledge_path}")
+    _line(f"  schema version: {inventory.knowledge_schema_version or 'none'}")
+    _line(f"  tables: {len(inventory.knowledge_tables)}")
+    _line(f"processing snapshot: {inventory.processing_path}")
+    _line(f"  tables: {len(inventory.processing_tables)}")
+    table = Table(title=Text("v1 knowledge rows (redacted counts)"))
+    table.add_column("table")
+    table.add_column("rows", justify="right")
+    for name, count in inventory.counts:
+        table.add_row(name, str(count))
+    console.print(table)
+    _line(f"identifier conflicts: {inventory.identifier_conflicts}")
+    _line(f"orphaned source references: {inventory.orphan_sources}")
+    _line(f"alias collisions: {inventory.alias_collisions}")
+    if inventory.unknown_objects:
+        # Object *names* only: an unknown table is unknown precisely because its content
+        # was never interpreted, so nothing from it is printed.
+        _line(f"unknown objects: {', '.join(inventory.unknown_objects)}", style="yellow")
+    if inventory.missing_required_tables:
+        _line(
+            "missing required tables: " + ", ".join(inventory.missing_required_tables),
+            style="red",
+        )
+    _line(f"verdict: {inventory.verdict}", style="green" if inventory.verdict == "ok" else "red")
+
+
+def _print_upgrade_report(report: UpgradeReport) -> None:
+    table = Table(title=Text(f"upgraded into {report.target_path.name}"))
+    table.add_column("table")
+    table.add_column("imported rows", justify="right")
+    for name, count in report.counts:
+        table.add_row(name, str(count))
+    console.print(table)
+    balance = report.balance.to_payload()
+    for group in ("bindings", "person_roles", "supersessions", "approvals"):
+        rendered = "  ".join(f"{key}={value}" for key, value in balance[group].items())
+        _line(f"{group}: {rendered}")
+    _line(f"target: {report.target_path}")
+    _line(f"manifest: {report.manifest_path}")
+    _line(f"semantic digest: {report.semantic_digest}")
+
+
+def _print_upgrade_verification(report: UpgradeVerification) -> None:
+    _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
+    _line(f"foreign_key_check: {'ok' if report.foreign_keys_ok else 'failed'}")
+    _line(
+        "target fingerprint: "
+        + ("matches manifest" if report.fingerprint_ok else "does not match manifest")
+    )
+    _line(
+        f"table counts: {'match manifest' if report.counts_match else 'differ'} "
+        f"({len(report.mismatches)} mismatches)"
+    )
+    for table, expected, actual in report.mismatches:
+        _line(f"  {table}: manifest says {expected} rows, target has {actual}")
+    _line(f"semantic digest: {'matches manifest' if report.digest_ok else 'differs'}")
+    _line(f"cutover balance: {'explains every row' if report.balance_ok else 'incomplete'}")
+    _line(
+        "owner approvals: "
+        + (
+            f"{report.approvals_found} of {report.approvals_declared} applied"
+            if report.approvals_declared
+            else "none declared"
+        )
+        + ("" if report.approvals_ok else "  (MISMATCH)")
+    )
+    _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
+
+
+def _upgrade_reason_code(code: str) -> str:
+    if code in _UPGRADE_REASON_CODES:
+        return _UPGRADE_REASON_CODES[code]
+    if code.startswith("manifest"):
+        return "manifest_mismatch"
+    if code.startswith("target"):
+        return "target_exists"
+    return "source_error"
 
 
 def _line(message: str, *, style: str = "") -> None:

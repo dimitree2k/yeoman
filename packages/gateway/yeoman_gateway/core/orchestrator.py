@@ -100,8 +100,11 @@ class Orchestrator:
             DeduplicationMiddleware(ttl_seconds=dedupe_ttl_seconds),
             ArchiveMiddleware(archive=reply_archive),
         ]
-        if contacts is not None:
-            layers.append(ContactsMiddleware(contacts=contacts))
+        # Identity resolution goes through the public knowledge facade, never through a
+        # private contacts writer.  Without knowledge the middleware is a no-op: the
+        # observation is already durable in the processing journal.
+        if knowledge is not None:
+            layers.append(ContactsMiddleware(knowledge=knowledge))
         layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,

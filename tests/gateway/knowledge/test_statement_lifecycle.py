@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
+from typing import Final
+
 import pytest
 from yeoman_gateway.knowledge.models import (
     KnowledgeError,
+    RecallQuery,
     StatementCandidate,
 )
 
@@ -315,3 +319,296 @@ def test_identical_correction_is_refused_and_the_chain_stays_acyclic(knowledge_h
     assert excinfo.value.code == "identity_conflict"
     assert h.statement(first).status == "superseded"
     assert h.statement(second).status == "assertion"
+
+
+# ── one shared lifecycle and read contract (T14-T21, T39) ────────────────────
+#
+# Every consumer resolves a status through the same table.  These tests drive each
+# public path - recall, profile, person_facts, roster, FTS and the model context - and
+# prove they agree, because a disagreement between two readers is exactly how a
+# retracted claim survives in one corner of the product.
+
+
+def _statement_row(h, statement_id: str) -> sqlite3.Row:
+    return h.service._store.query_one(  # noqa: SLF001 - asserting the stored contract
+        "SELECT status, superseded_by, supersession_reason, valid_from_ms, valid_until_ms,"
+        " revoked_at_ms FROM knowledge_statements WHERE statement_id = ?",
+        (statement_id,),
+    )
+
+
+#: The proven period is anchored on the harness clock so the read instants below are
+#: unambiguous: reading inside the period shows the value, before or after it does not.
+_PERIOD_AHEAD_MS: Final[int] = 12 * 60 * 60 * 1000
+
+
+def _set_period(h, statement_id: str) -> tuple[int, int]:
+    """Give a statement a proven period that the historical tests read inside."""
+    start = h.clock.now_ms()
+    end = start + _PERIOD_AHEAD_MS
+    with h.service._store.transaction():  # noqa: SLF001
+        h.service._store.execute(  # noqa: SLF001
+            "UPDATE knowledge_statements SET valid_from_ms = ?, valid_until_ms = ?"
+            " WHERE statement_id = ?",
+            (start, end, statement_id),
+        )
+    return start, end
+
+
+def _mark(h, statement_id: str, *, status: str, reason: str = "unknown") -> None:
+    """Write a lifecycle outcome the way a real operation would (status + reason together)."""
+    with h.service._store.transaction():  # noqa: SLF001
+        h.service._store.execute(  # noqa: SLF001
+            "UPDATE knowledge_statements SET status = ?, supersession_reason = ?,"
+            " revision = revision + 1 WHERE statement_id = ?",
+            (status, reason, statement_id),
+        )
+
+
+def test_current_view_hides_a_state_change_but_the_past_still_shows_it(
+    knowledge_harness,
+):
+    """T15: a move is history; a retraction is not."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    # The proven period of the earlier residence.
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    period_start, period_end = _set_period(h, statement_id)
+    _mark(h, statement_id, status="superseded", reason="state_change")
+
+    context = h.read_context(tom)
+    assert h.recall_person(tom, context).statement_ids == ()
+    # Historical retrieval at an instant inside the proven period shows the old value.
+    historical = h.service.recall(
+        RecallQuery(person_ids=(tom,), limit=10),
+        context=h.read_context(tom, now_ms=period_start + 1000),
+        view="historic",
+    )
+    assert historical.statement_ids == (statement_id,)
+    # Outside the proven period there is nothing to show.
+    outside = h.service.recall(
+        RecallQuery(person_ids=(tom,), limit=10),
+        context=h.read_context(tom, now_ms=period_end + 1000),
+        view="historic",
+    )
+    assert outside.statement_ids == ()
+
+
+def test_a_correction_is_never_presented_as_previously_true(knowledge_harness):
+    """T15: ``correction`` is only visible in an authorized correction audit."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    period_start, period_end = _set_period(h, statement_id)
+    _mark(h, statement_id, status="superseded", reason="correction")
+
+    context = h.read_context(tom)
+    assert h.recall_person(tom, context).statement_ids == ()
+    assert (
+        h.service.recall(
+            RecallQuery(person_ids=(tom,), limit=10),
+            context=h.read_context(tom, now_ms=period_start + 1000),
+            view="historic",
+        ).statement_ids
+        == ()
+    )
+    audit = h.service.recall(
+        RecallQuery(person_ids=(tom,), limit=10),
+        context=h.read_context(tom, now_ms=period_start + 1000),
+        view="correction_audit",
+    )
+    assert audit.statement_ids == (statement_id,)
+
+
+def test_quality_rejected_and_unknown_are_excluded_from_every_read(knowledge_harness):
+    """T39: a rejection and an unclassified legacy reason behave identically."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    first = h.source(tom)
+    second = h.source(tom)
+    rejected = h.capture_text("Tom wohnt in Bonn.", first).statement_ids[0]
+    unknown = h.capture_text("Tom wohnt in Kiel.", second).statement_ids[0]
+    period_start, _period_end = _set_period(h, rejected)
+    _set_period(h, unknown)
+    for statement_id, reason in ((rejected, "quality_rejected"), (unknown, "unknown")):
+        _set_period(h, statement_id)
+        _mark(h, statement_id, status="superseded", reason=reason)
+
+    context = h.read_context(tom)
+    for view in ("current", "historic", "correction_audit"):
+        result = h.service.recall(
+            RecallQuery(person_ids=(tom,), limit=10),
+            context=h.read_context(tom, now_ms=period_start + 1000),
+            view=view,
+        )
+        assert result.statement_ids == (), (view, result.statement_ids)
+    # Only an explicit diagnosis sees them, and it still sees the reason.
+    diagnosis = h.service.recall(
+        RecallQuery(person_ids=(tom,), limit=10),
+        context=h.read_context(tom, now_ms=period_start + 1000),
+        view="diagnosis",
+    )
+    assert set(diagnosis.statement_ids) == {rejected, unknown}
+
+
+def test_revoked_content_is_not_readable_even_for_a_diagnosis(knowledge_harness):
+    """T39/§7.5: no view lifts a source revocation, not even the audit surface."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    period_start, _period_end = _set_period(h, statement_id)
+    with h.service._store.transaction():  # noqa: SLF001
+        h.service._store.execute(  # noqa: SLF001
+            "UPDATE knowledge_statements SET status = 'revoked', revoked_at_ms = 1"
+            " WHERE statement_id = ?",
+            (statement_id,),
+        )
+    for view in ("current", "historic", "correction_audit", "diagnosis"):
+        result = h.service.recall(
+            RecallQuery(person_ids=(tom,), limit=10),
+            context=h.read_context(tom, now_ms=period_start + 1000),
+            view=view,
+        )
+        assert result.statement_ids == (), (view, result.statement_ids)
+        assert "Bonn" not in result.text
+
+
+def test_person_facts_without_a_read_context_delivers_nothing(knowledge_harness):
+    """The raw-SQL bypass is closed: no context, no content."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    h.capture_text("Tom wohnt in Bonn.", source)
+    assert h.service.person_facts(tom) == ()
+    with_context = h.service.person_facts(tom, context=h.read_context(tom))
+    assert any("Bonn" in value for _kind, value, _label in with_context)
+
+
+def test_person_facts_obeys_the_same_status_contract(knowledge_harness):
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    context = h.read_context(tom)
+    assert h.service.person_facts(tom, context=context)
+    _mark(h, statement_id, status="superseded", reason="quality_rejected")
+    assert h.service.person_facts(tom, context=context) == ()
+
+
+def test_profile_recall_and_model_context_agree_on_every_view(knowledge_harness):
+    """One contract, five readers: a disagreement here is the bug this task closes."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    period_start, period_end = _set_period(h, statement_id)
+
+    def readers(reason: str) -> dict[str, tuple[str, ...]]:
+        _mark(h, statement_id, status="superseded", reason=reason)
+        context = h.read_context(tom, now_ms=period_start + 1000)
+        recall = h.service.recall(
+            RecallQuery(person_ids=(tom,), limit=10), context=context
+        )
+        profile = h.service.profile(tom, context=context)
+        facts = h.service.person_facts(tom, context=context)
+        roster = h.service.roster(context=context, participant_ids=(h.principal_for(tom),))
+        hybrid = h.service.recall_hybrid(
+            RecallQuery(person_ids=(tom,), limit=10), context=context
+        )
+        return {
+            "recall": recall.statement_ids,
+            "profile": profile.context.statement_ids,
+            "facts": tuple(value for _kind, value, _label in facts),
+            "roster": tuple(line for _name, lines in roster for line in lines),
+            "hybrid": hybrid.statement_ids,
+        }
+
+    state_change = readers("state_change")
+    assert state_change["recall"] == ()
+    assert state_change["profile"] == ()
+    assert state_change["facts"] == ()
+    assert state_change["roster"] == ()
+    assert state_change["hybrid"] == ()
+
+    correction = readers("correction")
+    assert correction["recall"] == ()
+    assert correction["profile"] == ()
+    assert correction["facts"] == ()
+    assert correction["roster"] == ()
+    assert correction["hybrid"] == ()
+
+
+def test_historic_view_is_still_gated_by_audience_and_revocation(knowledge_harness):
+    """A historical instant is not a way around today's rights."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    maria = h.person("Maria")
+    source = h.source(tom, audience={h.principal_for(tom)})
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    period_start, period_end = _set_period(h, statement_id)
+    _mark(h, statement_id, status="superseded", reason="state_change")
+    # A reader who was never in the audience sees nothing, even historically.
+    outsider = h.read_context(maria, now_ms=period_start + 1000)
+    assert (
+        h.service.recall(
+            RecallQuery(person_ids=(tom,), limit=10), context=outsider, view="historic"
+        ).statement_ids
+        == ()
+    )
+
+
+def test_only_active_roles_name_people_on_a_read(knowledge_harness):
+    """A withheld cutover role must not surface a person in a rendered line."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    alex = h.person("Alex")
+    # The statement must not be the speaker's own claim, or the role filter would be
+    # satisfied by the transport speaker instead of the withheld subject.
+    source = h.source(alex)
+    statement_id = h.capture_text(
+        "Der Wohnort hat sich geändert.", source, subjects=(tom,)
+    ).statement_ids[0]
+    with h.service._store.transaction():  # noqa: SLF001
+        h.service._store.execute(  # noqa: SLF001
+            "UPDATE knowledge_statement_people SET status = 'withheld',"
+            " resolution_reason = 'no_proven_mapping_for_principal'"
+            " WHERE statement_id = ? AND person_id = ?",
+            (statement_id, tom),
+        )
+    context = h.read_context(alex)
+    # The statement is readable through its still-active transport speaker role.
+    unfiltered = h.service.recall(RecallQuery(limit=10), context=context)
+    assert statement_id in unfiltered.statement_ids
+    # The text is still there, but the withheld role supplied no name label for the
+    # subject: the only label is the still-active transport speaker.
+    assert unfiltered.text == "Der Wohnort hat sich geändert. (Alex)"
+
+    # And the person filter does not find the statement through a withheld role.
+    filtered = h.service.recall(
+        RecallQuery(person_ids=(tom,), limit=10), context=context
+    )
+    assert filtered.statement_ids == ()
+
+
+def test_a_rebuild_does_not_resurrect_a_locked_statement(knowledge_harness):
+    """An index rebuild is maintenance, not an amnesty (§7.5, T39)."""
+    h = knowledge_harness
+    tom = h.person("Tom")
+    source = h.source(tom)
+    statement_id = h.capture_text("Tom wohnt in Bonn.", source).statement_ids[0]
+    _mark(h, statement_id, status="superseded", reason="quality_rejected")
+
+    memory = h.service.memory_store()
+    memory.reindex()
+
+    indexed = h.service._store.scalar(  # noqa: SLF001 - asserting the index contract
+        "SELECT COUNT(*) FROM memory2_nodes_fts WHERE entry_id = ?", (statement_id,)
+    )
+    assert indexed == 0
+    # And the reader still sees nothing for the statement.
+    context = h.read_context(tom)
+    assert h.recall_person(tom, context).statement_ids == ()
+    assert h.service.recall(RecallQuery(text="Bonn"), context=context).statement_ids == ()

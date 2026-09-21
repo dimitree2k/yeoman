@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +35,7 @@ from yeoman_gateway.knowledge.authority import (
     wall_clock_ms,
 )
 from yeoman_gateway.knowledge.models import (
+    READ_PURPOSES,
     CaptureJobReceipt,
     CaptureJobRecord,
     CaptureResult,
@@ -52,6 +53,7 @@ from yeoman_gateway.knowledge.models import (
     KnowledgeError,
     KnowledgeStats,
     MaintenanceReport,
+    NameObservation,
     PersonLinkCandidate,
     PersonProfile,
     PersonResolution,
@@ -65,6 +67,8 @@ from yeoman_gateway.knowledge.models import (
     TrustedIdentityObservation,
     TrustedReadContext,
     ValidationError,
+    normalize_alias_value,
+    validate_name,
 )
 
 __all__ = [
@@ -89,32 +93,60 @@ def workspace_id_for(workspace: Path | str) -> str:
     ]
 
 
-def _legacy_schema_names(db_path: Path) -> set[str]:
-    """Table names of an existing file, or an empty set when it is unreadable."""
+@dataclass(frozen=True, slots=True)
+class _SchemaProbe:
+    """What an existing file says about itself, read without opening it for writing."""
+
+    exists: bool
+    has_meta: bool
+    schema_version: int
+    migration_complete: bool
+
+    @property
+    def is_knowledge_store(self) -> bool:
+        return self.has_meta and self.schema_version > 0
+
+
+def _probe_schema(db_path: Path) -> _SchemaProbe:
+    """Read ``knowledge_meta`` over a read-only connection.
+
+    The probe must never touch the file: a runtime start against a v1 store has to fail
+    closed, and even opening a SQLite file read-write can create a WAL/journal and change
+    its mtime.  A missing or unreadable file therefore reports "no store", and the caller
+    decides separately whether that means "create a fresh one".
+    """
     if not db_path.exists():
-        return set()
+        return _SchemaProbe(exists=False, has_meta=False, schema_version=0, migration_complete=False)
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:  # pragma: no cover - defensive
-        return set()
+        return _SchemaProbe(exists=True, has_meta=False, schema_version=0, migration_complete=False)
     try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-    except sqlite3.Error:  # pragma: no cover - defensive
-        return set()
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_meta'"
+        ).fetchone()
+        if row is None:
+            return _SchemaProbe(
+                exists=True, has_meta=False, schema_version=0, migration_complete=False
+            )
+        values = {
+            str(key): str(value)
+            for key, value in conn.execute("SELECT key, value FROM knowledge_meta").fetchall()
+        }
+    except sqlite3.Error:
+        return _SchemaProbe(exists=True, has_meta=False, schema_version=0, migration_complete=False)
     finally:
         conn.close()
-    return {str(row[0]) for row in rows}
-
-
-def _has_legacy_schema(db_path: Path) -> bool:
-    return bool(
-        _legacy_schema_names(db_path)
-        & {"memory2_nodes", "memory2_facts", "contact_identifiers"}
+    try:
+        version = int(values.get("schema_version", "0"))
+    except ValueError:
+        version = -1
+    return _SchemaProbe(
+        exists=True,
+        has_meta=True,
+        schema_version=version,
+        migration_complete=values.get("migration_complete", "0") == "1",
     )
-
-
-def _has_knowledge_schema(db_path: Path) -> bool:
-    return bool(_legacy_schema_names(db_path) & {"knowledge_meta", "knowledge_statements"})
 
 
 def open_knowledge_store(
@@ -134,19 +166,52 @@ def open_knowledge_store(
     exists but no verified knowledge store was published, and ``schema_incompatible``
     when the file carries a different schema version.  Both are explicit states, never
     a silent fallback to an older store.
+
+    The order matters: the existing file is probed *read-only* before anything opens it
+    for writing.  A v1 store is therefore refused byte-for-byte unchanged - no tables, no
+    meta rows, no WAL side file.  Only a file that does not exist at all is created as a
+    fresh v2 store; the normal start never migrates, and it never upgrades in place.
     """
     path = Path(db_path).expanduser()
     legacy = [Path(item).expanduser() for item in legacy_sources]
-    occupied = path.exists() and not _has_knowledge_schema(path)
-    fresh = not path.exists()
-    if (fresh and any(item.exists() for item in legacy)) or occupied:
-        # Either the consolidated store is missing while legacy data exists, or the path
-        # already holds a different database (for example a legacy memory file that was
-        # configured directly).  Both mean: migrate explicitly, never write here.
+    probe = _probe_schema(path)
+    fresh = not probe.exists
+    if fresh and any(item.exists() for item in legacy):
+        # The consolidated store is missing while legacy data exists.  Migrate
+        # explicitly, never write an empty store next to the old data.
         raise KnowledgeStartupError(
             "migration_required",
             "legacy memory/contacts data exists but no verified knowledge store was built",
         )
+    if not fresh:
+        if not probe.is_knowledge_store:
+            # An occupied path without a knowledge schema is not a knowledge store: for
+            # example a legacy memory file configured directly as the target.
+            raise KnowledgeStartupError(
+                "migration_required",
+                "the target file carries no knowledge schema and was not migrated",
+            )
+        if probe.schema_version < SCHEMA_VERSION:
+            # An *older* knowledge store is not corruption: it is data that needs the
+            # explicit, audited snapshot upgrade.  Anything newer or non-numeric stays
+            # ``schema_incompatible``.
+            raise KnowledgeStartupError(
+                "migration_required",
+                f"knowledge schema version {probe.schema_version} needs an explicit"
+                f" snapshot upgrade to {SCHEMA_VERSION}; the normal start never migrates",
+            )
+        if probe.schema_version != SCHEMA_VERSION:
+            raise KnowledgeStartupError(
+                "schema_incompatible",
+                f"knowledge schema version {probe.schema_version} is not supported"
+                f" (need {SCHEMA_VERSION}); an explicit snapshot upgrade is required",
+            )
+        if not probe.migration_complete:
+            raise KnowledgeStartupError(
+                "migration_required",
+                "knowledge store exists but carries no complete migration manifest;"
+                " an explicit snapshot upgrade is required",
+            )
     try:
         store = KnowledgeStore(path, create=create)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
@@ -157,27 +222,6 @@ def open_knowledge_store(
         store.set_meta("migration_id", "fresh-install")
         store.set_meta("semantic_digest", "")
         store.commit_if_idle()
-    version = store.schema_version
-    if path.exists() and not version:
-        # An occupied path without a schema version is not a knowledge store.
-        store.close()
-        raise KnowledgeStartupError(
-            "schema_incompatible",
-            "the target file carries no knowledge schema version",
-        )
-    if version and version != SCHEMA_VERSION:
-        store.close()
-        raise KnowledgeStartupError(
-            "schema_incompatible",
-            f"knowledge schema version {version} is not supported (need {SCHEMA_VERSION})",
-        )
-    if not fresh and not store.migration_complete():
-        if _has_legacy_schema(path) or any(item.exists() for item in legacy):
-            store.close()
-            raise KnowledgeStartupError(
-                "migration_required",
-                "knowledge store exists but carries no complete migration manifest",
-            )
     return KnowledgeService(
         store=store,
         workspace_id=workspace_id,
@@ -432,9 +476,18 @@ class KnowledgeService:
         with self._store.transaction():
             return self._statements.capture(candidate, context=context)
 
-    def recall(self, query: RecallQuery, *, context: TrustedReadContext) -> KnowledgeContext:
+    def recall(
+        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+    ) -> KnowledgeContext:
+        """Recall under the one shared read contract.
+
+        ``view`` selects the contract row of §7.5: ``current`` (the default), ``historic``
+        (a proven earlier period of a ``state_change``), ``correction_audit`` (retracted
+        claims, for an authorized correction history) or ``diagnosis`` (authorized
+        inspection, still never ``revoked`` content).
+        """
         checked = self._read_context(context)
-        return self._retrieval.recall(query, context=checked)
+        return self._retrieval.recall(query, context=checked, view=view)
 
     def recall_hybrid(
         self,
@@ -458,9 +511,30 @@ class KnowledgeService:
             preprocessing_version=preprocessing_version,
         )
 
-    def profile(self, person_id: str, *, context: TrustedReadContext) -> PersonProfile:
+    def profile(
+        self, person_id: str, *, context: TrustedReadContext, view: str = "current"
+    ) -> PersonProfile:
         checked = self._read_context(context)
-        return self._retrieval.profile(person_id, context=checked)
+        return self._retrieval.profile(person_id, context=checked, view=view)
+
+    def person_profile(
+        self,
+        person_id: str,
+        *,
+        context: TrustedReadContext | None,
+        view: str = "current",
+        history_at_ms: int | None = None,
+    ) -> Any:
+        """The deterministic, bounded person card for one authorized reader.
+
+        Read-only by construction: no backfill, no merge, no model call, nothing stored.
+        ``history_at_ms`` renders the card as of a proven past instant, which only ever
+        shows a ``state_change`` inside its own proven period.
+        """
+        checked = None if context is None else self._read_context(context)
+        return self._retrieval.person_profile(
+            person_id, context=checked, view=view, history_at_ms=history_at_ms
+        )
 
     def revalidate(
         self, result: KnowledgeContext, *, context: TrustedReadContext
@@ -493,6 +567,170 @@ class KnowledgeService:
             return self._identity.undo_merge(
                 operation_id, expected_revision=expected_revision, context=context
             )
+
+    # ── temporal bindings, aliases and platform observations ────────────────
+
+    def resolve_observation(
+        self,
+        observation: TrustedIdentityObservation,
+        *,
+        context: TrustedReadContext | None = None,
+        create_stub: bool = True,
+    ) -> PersonResolution:
+        """Resolve a verified platform observation to exactly one person.
+
+        The public spelling of the identity path.  Ambiguity, an unproven multi-identifier
+        mapping and two people claiming one identifier are results, never a first-match
+        merge.  A verified unknown platform identity may create a stub; model text never
+        reaches this method.
+        """
+        with self._store.transaction():
+            return self._identity.resolve_observation(
+                observation, context=context, create_stub=create_stub
+            )
+
+    def resolve_identifier(
+        self, identifier: Identifier, *, at_ms: int | None = None
+    ) -> EndpointResolution:
+        """Resolve one fully typed identifier, optionally at a proven past instant."""
+        return self._identity.resolve_identifier(identifier, at_ms=at_ms)
+
+    def add_or_end_binding(
+        self,
+        *,
+        person_id: str,
+        identifier: Identifier,
+        evidence_ref: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        mapping_verified: bool = True,
+        valid_from_ms: int | None = None,
+        end_binding_id: str | None = None,
+        end_at_ms: int | None = None,
+    ) -> ChangeReceipt:
+        """Claim, extend or hand over one temporal identifier binding."""
+        with self._store.transaction():
+            return self._identity.add_or_end_binding(
+                person_id=person_id,
+                identifier=identifier,
+                evidence_ref=evidence_ref,
+                mapping_verified=mapping_verified,
+                context=context,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                valid_from_ms=valid_from_ms,
+                end_binding_id=end_binding_id,
+                end_at_ms=end_at_ms,
+            )
+
+    def end_binding(
+        self,
+        *,
+        binding_id: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        end_at_ms: int | None = None,
+    ) -> ChangeReceipt:
+        """End exactly one binding; its proven period stays as history."""
+        with self._store.transaction():
+            return self._identity.end_binding(
+                binding_id=binding_id,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                end_at_ms=end_at_ms,
+            )
+
+    def observe_alias(
+        self,
+        *,
+        person_id: str,
+        name: str,
+        alias_kind: str = "other_name",
+        scope_key: str = "",
+        evidence_ref: str = "",
+        status: str = "observed",
+        address_allowed: bool = False,
+        supporting_statement_id: str | None = None,
+        visibility: str = "public",
+        valid_until_ms: int | None = None,
+        source: str = "observed",
+    ) -> NameObservation:
+        """Record one alias with an explicit kind, context and evidence."""
+        with self._store.transaction():
+            return self._identity.observe_alias(
+                person_id=person_id,
+                name=name,
+                alias_kind=alias_kind,
+                scope_key=scope_key,
+                evidence_ref=evidence_ref,
+                status=status,
+                address_allowed=address_allowed,
+                supporting_statement_id=supporting_statement_id,
+                visibility=visibility,
+                valid_until_ms=valid_until_ms,
+                source=source,
+            )
+
+    def set_alias_preference(
+        self,
+        *,
+        alias_id: int,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        address_allowed: bool = True,
+    ) -> ChangeReceipt:
+        """Make one alias the preferred address in its own context."""
+        with self._store.transaction():
+            return self._identity.set_alias_preference(
+                alias_id=int(alias_id),
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                address_allowed=address_allowed,
+            )
+
+    def retire_alias(
+        self,
+        *,
+        alias_id: int,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        reason: str = "not_wanted",
+        correct_mapping: bool = False,
+    ) -> ChangeReceipt:
+        """Withdraw the addressing permission, or retract the mapping itself."""
+        with self._store.transaction():
+            return self._identity.retire_alias(
+                alias_id=int(alias_id),
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                reason=reason,
+                correct_mapping=correct_mapping,
+            )
+
+    def aliases_of(self, person_id: str) -> tuple[NameObservation, ...]:
+        """Every stored alias of a person, including retired ones (for inspection)."""
+        return self._identity.aliases_of(person_id)
+
+    def address_aliases_of(
+        self, person_id: str, *, scope_key: str | None = None
+    ) -> tuple[NameObservation, ...]:
+        """Aliases that may be used to address a person, preferred first."""
+        return self._identity.address_aliases_of(person_id, scope_key=scope_key)
 
     # ── statement lifecycle ──────────────────────────────────────────────────
 
@@ -544,6 +782,31 @@ class KnowledgeService:
                 expected_source=expected_source,
                 evidence_ref=evidence_ref,
                 context=context,
+            )
+
+    def end_attribute(
+        self,
+        *,
+        statement_id: str,
+        person_id: str,
+        attribute_key: str,
+        context: TrustedAdminContext,
+        expected_revision: int | None = None,
+        reason: str = "ended_by_owner",
+    ) -> ChangeReceipt:
+        """End one facet by superseding the statement that carries it."""
+        with self._store.transaction():
+            return self._statements.end_attribute(
+                statement_id=statement_id,
+                person_id=person_id,
+                attribute_key=attribute_key,
+                expected_revision=(
+                    self._store.identity_revision
+                    if expected_revision is None
+                    else int(expected_revision)
+                ),
+                context=context,
+                reason=reason,
             )
 
     def erase_statement(
@@ -1131,26 +1394,26 @@ class KnowledgeService:
         return tuple(keys)
 
     def bind_identifier_for_migration(
-        self, *, person_id: str, channel: str, kind: str, value: str
+        self,
+        *,
+        person_id: str,
+        channel: str,
+        kind: str,
+        value: str,
+        namespace: str | None = None,
     ) -> None:
-        """Bind one identifier during the transitional legacy co-existence.
+        """Record one identifier during the transitional legacy co-existence.
 
-        Only the composition/transitional path uses this; it records unverified,
-        non-durable evidence (``legacy-import``) so a later merge or revocation can see
-        exactly where the binding came from.
+        Only the composition/transitional path uses this.  It writes the compatibility
+        projection and an *unproven candidate* binding with ``legacy-import`` evidence; it
+        never mints an active authority, because no channel adapter proved the mapping.
+        A later audited admin operation or a real platform observation promotes it.
         """
-        ts = self._now()
-        self._store.execute(
-            "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
-            " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
-            (str(channel), str(value), str(person_id), str(kind)),
+        identifier = Identifier(
+            channel=str(channel), kind=str(kind), value=str(value), namespace=namespace
         )
-        self._store.execute(
-            "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
-            " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
-            " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
-            " ON CONFLICT(channel, kind, value) DO NOTHING",
-            (str(channel), str(kind), str(value), str(person_id), ts, ts),
+        self._identity.record_unproven_identifier(
+            person_id=str(person_id), identifier=identifier, evidence_ref="legacy-import"
         )
         self._store.commit_if_idle()
 
@@ -1184,29 +1447,44 @@ class KnowledgeService:
             channel = str(getattr(item, "channel", "") or "")
             value = str(getattr(item, "identifier", "") or "")
             kind = str(getattr(item, "kind", "") or "handle")
+            namespace = str(getattr(item, "namespace", "") or "") or None
             if not channel or not value:
                 continue
-            self._store.execute(
-                "INSERT INTO contact_identifiers (channel, identifier, contact_id, kind)"
-                " VALUES (?, ?, ?, ?) ON CONFLICT(channel, identifier) DO NOTHING",
-                (channel, value, str(person_id), kind),
-            )
-            self._store.execute(
-                "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
-                " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
-                " VALUES (?, ?, ?, ?, 'active', 'legacy-import', 0, ?, ?)"
-                " ON CONFLICT(channel, kind, value) DO NOTHING",
-                (channel, kind, value, str(person_id), ts, ts),
+            try:
+                identifier = Identifier(
+                    channel=channel, kind=kind, value=value, namespace=namespace
+                )
+            except KnowledgeError:
+                # An unparseable legacy identifier is not silently reinterpreted.
+                continue
+            self._identity.record_unproven_identifier(
+                person_id=str(person_id),
+                identifier=identifier,
+                evidence_ref="legacy-import",
             )
         for item in aliases:
             alias = str(getattr(item, "alias", "") or "")
             source = str(getattr(item, "source", "") or "observed")
             if not alias:
                 continue
+            try:
+                clean = validate_name(alias)
+            except KnowledgeError:
+                continue
             self._store.execute(
-                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(contact_id, alias, source) DO NOTHING",
-                (str(person_id), alias, source, _iso_from_ms(ts), _iso_from_ms(ts)),
+                "INSERT INTO contact_aliases (contact_id, alias, source, first_seen,"
+                " last_seen, normalized_alias, scope_key, status, address_allowed,"
+                " is_preferred, revision)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'global', 'observed', 0, 0, 1)"
+                " ON CONFLICT(contact_id, alias, source) DO NOTHING",
+                (
+                    str(person_id),
+                    clean,
+                    source,
+                    _iso_from_ms(ts),
+                    _iso_from_ms(ts),
+                    normalize_alias_value(clean),
+                ),
             )
         for item in fields:
             value = str(getattr(item, "value", "") or "")
@@ -1227,7 +1505,11 @@ class KnowledgeService:
         self._store.commit_if_idle()
 
     def person_id_for_value(self, value: str) -> str | None:
-        """Person id for a proven identifier value, searched across channels."""
+        """Person id for a proven *active* identifier value, searched across channels.
+
+        The compatibility projection ``contact_identifiers`` is deliberately not a
+        fallback here: a legacy row without a proven mapping must not resolve a person.
+        """
         token = str(value or "").strip()
         if not token:
             return None
@@ -1243,12 +1525,6 @@ class KnowledgeService:
             )
             if row is not None:
                 return self.canonical_id(str(row["person_id"]))
-            legacy = self._store.query_one(
-                "SELECT contact_id FROM contact_identifiers WHERE identifier = ? LIMIT 1",
-                (candidate,),
-            )
-            if legacy is not None:
-                return self.canonical_id(str(legacy["contact_id"]))
         return None
 
     def canonical_id(self, person_id: str) -> str:
@@ -1272,12 +1548,15 @@ class KnowledgeService:
         *,
         channel: str,
         prefer: tuple[str, ...] = (),
+        prefer_kind: str | None = None,
     ) -> Identifier | None:
         """One delivery identifier for an exact name or alias.
 
         Refuses ambiguity: two people with the same name yield ``None`` instead of a
-        first match, and an optional ``prefer`` list narrows to identifiers already
-        present in the current conversation.
+        first match.  ``prefer_kind`` (for example ``phone_jid``) and ``prefer`` (values
+        already present in the conversation) only *narrow* the person's proven addresses;
+        whatever is left afterwards has to be exactly one, or the answer is ``None``.
+        A merge does not hide the addresses of the merged members.
         """
         query = str(name or "").strip()
         if not query:
@@ -1298,22 +1577,59 @@ class KnowledgeService:
         people = list(dict.fromkeys(people))
         if len(people) != 1:
             return None
-        resolution = self._identity.resolve_endpoint(people[0], str(channel))
-        candidates = [resolution.identifier] if resolution.identifier else []
-        if not candidates:
-            bindings = self._identity.active_bindings_of(people[0])
-            candidates = [
-                item.identifier for item in bindings if item.identifier.channel == str(channel)
-            ]
-        if not candidates:
-            return None
+        channel_key = str(channel).strip().lower()
+        candidates: list[Identifier] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for member in self._identity.merged_member_ids(people[0]):
+            for binding in self._identity.active_bindings_of(member):
+                identifier = binding.identifier
+                if identifier.channel != channel_key or identifier.full_key in seen:
+                    continue
+                seen.add(identifier.full_key)
+                candidates.append(identifier)
+        if prefer_kind is not None:
+            narrowed = [item for item in candidates if item.kind == prefer_kind]
+            if narrowed:
+                candidates = narrowed
         if prefer:
             preferred = [item for item in candidates if item.value in prefer]
-            if len(preferred) == 1:
-                return preferred[0]
+            if preferred:
+                candidates = preferred
+        # Several equal addresses are ambiguous, exactly as for any other delivery.
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def owners_of_identifier_value(
+        self, value: str, *, channel: str | None = None
+    ) -> tuple[str, ...]:
+        """Canonical people with a proven active binding for this exact identifier value.
+
+        The namespace-blind twin of :meth:`resolve_identifier`.  It is what a consumer
+        with only a value in hand (a mention, a dialled number) must use instead of
+        ``person_id_for_value`` + a guess: every owner comes back, and an unproven legacy
+        projection is not an owner at all.
+        """
+        return self._identity.owners_of_identifier_value(value, channel=channel)
+
+    def delivery_identifiers_for_alias(
+        self,
+        alias: str,
+        *,
+        channel: str = "whatsapp",
+        scope_key: str | None = None,
+    ) -> tuple[Identifier, ...]:
+        """Proven delivery addresses for one exact, address-allowed alias.
+
+        The delivery-side twin of :meth:`identifier_for_name`: it never guesses a person
+        from a partial name and never treats a merely recognised name as a permission to
+        address somebody (spec 7.3).  The result keeps ambiguity visible - an empty tuple
+        means "no proven address", several entries mean "more than one address", and the
+        caller must refuse rather than pick one.
+        """
+        return self._identity.delivery_identifiers_for_alias(
+            alias, channel=str(channel), scope_key=scope_key
+        )
 
     def person_identifiers(self, person_id: str) -> tuple[Identifier, ...]:
         """Proven identifier bindings of a person, for diagnostics and tools."""
@@ -1436,6 +1752,35 @@ class KnowledgeService:
                 context=context,
             )
 
+    def owner_read_context(
+        self,
+        *,
+        channel: str = "whatsapp",
+        chat_id: str = "cli",
+        purpose: str = "admin",
+    ) -> TrustedReadContext:
+        """Issue a read context from Policy's own owner decision.
+
+        The public twin of :meth:`admin_context_for`, needed because a profile read is a
+        *read*: it must go through the one shared read contract instead of being handed
+        raw rows.  Runtime surfaces (tools, CLI) ask here; Policy decides who the actor is.
+        """
+        actor = self._policy.admin_actor() if hasattr(self._policy, "admin_actor") else ""
+        if not actor:
+            raise KnowledgeError("unauthorized", "no owner actor is available from policy")
+        return TrustedReadContext(
+            principal_id=str(actor),
+            channel=str(channel),
+            chat_id=str(chat_id),
+            recipient_principals=frozenset({str(actor)}),
+            membership_revision="owner",
+            policy_revision=self.policy_revision,
+            purpose=purpose if purpose in READ_PURPOSES else "admin",
+            now_ms=self._now(),
+            is_direct=True,
+            owner=True,
+        )
+
     def search_people_with_policy(
         self,
         name: str,
@@ -1445,54 +1790,36 @@ class KnowledgeService:
         purpose: str = "admin",
     ) -> tuple[PersonResolution, ...]:
         """Name lookup for authorized surfaces; several people may share a name."""
-        context = TrustedReadContext(
-            principal_id=self._policy.admin_actor()
-            if hasattr(self._policy, "admin_actor")
-            else "owner",
-            channel=str(channel),
-            chat_id=str(chat_id),
-            recipient_principals=frozenset(
-                {
-                    self._policy.admin_actor()
-                    if hasattr(self._policy, "admin_actor")
-                    else "owner"
-                }
-            ),
-            membership_revision="admin",
-            policy_revision=self.policy_revision,
-            purpose=purpose if purpose in ("reply", "proactive", "profile", "admin") else "admin",
-            now_ms=self._now(),
-            is_direct=True,
-            owner=True,
+        context = self.owner_read_context(
+            channel=channel, chat_id=chat_id, purpose=purpose
         )
         return self._identity.search_by_name(name, context=context)
 
     def person_facts(
-        self, person_id: str, *, context: TrustedReadContext | None = None
+        self,
+        person_id: str,
+        *,
+        context: TrustedReadContext | None = None,
+        limit: int = 50,
     ) -> tuple[tuple[str, str, str | None], ...]:
         """Released profile facts of a person: (kind, value, label).
 
-        This is a projection over permitted statements, never a copy stored in a
-        contact field.
+        A projection over permitted statements, never a copy stored in a contact field -
+        and never a bypass around the read gate.  Without a trusted read context there is
+        no answer at all: the previous version happily returned raw rows for any caller,
+        which is exactly the "some recall exists somewhere" hole this contract closes.
         """
-        rows = self._store.query(
-            "SELECT statement_id, status FROM knowledge_statements"
-            " WHERE speaker_person_id = ? OR statement_id IN"
-            " (SELECT statement_id FROM knowledge_statement_people WHERE person_id = ?)"
-            " ORDER BY created_ms DESC LIMIT 50",
-            (str(person_id), str(person_id)),
+        if context is None:
+            return ()
+        checked = self._read_context(context)
+        bounded = max(1, min(int(limit), 50))
+        result = self.recall(
+            RecallQuery(person_ids=(person_id,), limit=bounded), context=checked
         )
+        if not result.statement_ids:
+            return ()
         facts: list[tuple[str, str, str | None]] = []
-        for row in rows:
-            statement_id = str(row["statement_id"])
-            readable = True
-            if context is not None:
-                readable = bool(
-                    self.recall(RecallQuery(person_ids=(person_id,), limit=50), context=context)
-                    .statement_ids
-                )
-            if not readable:
-                continue
+        for statement_id in result.statement_ids:
             summary = self._statements.get_statement(statement_id)
             if summary is None or not summary.content:
                 continue
@@ -1554,14 +1881,16 @@ class KnowledgeService:
         return self.display_name(person_id, context=context)
 
     def known_identifier_values(self) -> tuple[str, ...]:
-        """Every identifier value the runtime knows, without exposing owner mapping.
+        """Every identifier value with a proven active binding.
 
         Used for alias matching in delivery decisions; it deliberately returns values
-        only, never the person they belong to.
+        only, never the person they belong to.  The unproven ``contact_identifiers``
+        projection is not part of it: a legacy row without a proven mapping must not make
+        a delivery target look "known".
         """
         rows = self._store.query(
             "SELECT value FROM knowledge_identifier_bindings WHERE status = 'active'"
-            " UNION SELECT identifier FROM contact_identifiers ORDER BY 1"
+            " ORDER BY 1"
         )
         return tuple(str(row[0]) for row in rows)
 
@@ -1601,8 +1930,12 @@ class KnowledgeService:
         return tuple(entries)
 
     def alias_names(self, person_id: str) -> tuple[str, ...]:
-        """Observed aliases of a person.  Untrusted text, for display only."""
-        return tuple(item.name for item in self._identity.aliases_of(person_id))
+        """Aliases that are still in force.  Untrusted text, for display only.
+
+        A retracted mapping ("that was never me") is not an alias any more: it stays as
+        audit history, never as a current name, and never as a way to find the person.
+        """
+        return tuple(item.name for item in self._identity.searchable_aliases_of(person_id))
 
     def source_revoked(self, source: SourceRef) -> bool:
         return bool(self._authority.source_revoked(source))

@@ -2194,6 +2194,13 @@ def build_gateway_runtime(
         except Exception as e:
             logger.warning("contacts: memory backfill failed: {}", e)
 
+    # Cut-over consumers resolve people through the knowledge facade, so they receive the
+    # legacy cache only in a composition that has no facade at all: with knowledge open, a
+    # second, unproven cache must not be reachable from those call sites.  The service
+    # itself stays constructed - it still owns the memory scoping and the shutdown path,
+    # and it is retired only together with its last consumer, after the migration.
+    consumer_contacts = None if knowledge_service is not None else contacts_service
+
     try:
         imported = memory_service.backfill_from_workspace_files(force=False)
         if imported > 0:
@@ -2360,7 +2367,7 @@ def build_gateway_runtime(
         telemetry=telemetry,
         security=security,
         cron_service=cron,
-        contacts_service=contacts_service,
+        contacts_service=consumer_contacts,
         chat_registry=chat_registry,
         caldav_service=_caldav_service,
         owner_alert_resolver=policy_adapter.owner_recipients,
@@ -2591,7 +2598,7 @@ def build_gateway_runtime(
         policy=policy_adapter,
         responder=thread_responder or responder,
         reply_archive=archive_adapter,
-        contacts=contacts_service,
+        contacts=consumer_contacts,
         knowledge=knowledge_service,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
@@ -3261,7 +3268,8 @@ def build_gateway_runtime(
             recipient_resolver=partial(
                 resolve_whatsapp_recipient,
                 policy_adapter=policy_adapter,
-                contacts_service=contacts_service,
+                knowledge=knowledge_service,
+                contacts_service=consumer_contacts,
             ),
             effects=service_effects,
             effect_store=processing_store,
