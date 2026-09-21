@@ -12,7 +12,18 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from legacy_fixtures import legacy_snapshot_factory
+from legacy_fixtures import (
+    V1_PERSON_BOUND,
+    V1_PERSON_LEGACY_ONLY,
+    V1_PERSON_NO_PRINCIPAL,
+    V1_STATEMENT_ONE,
+    V1_STATEMENT_REVOKED,
+    V1_STATEMENT_SUPERSEDED,
+    V1_STATEMENT_THREE,
+    V1_STATEMENT_TWO,
+    legacy_snapshot_factory,
+    v1_knowledge_store_factory,
+)
 from yeoman_gateway.knowledge._migration import (
     LEGACY_NO_FACT_REASON,
     LEGACY_PROFILE_REASON,
@@ -21,6 +32,25 @@ from yeoman_gateway.knowledge._migration import (
     semantic_digest,
 )
 from yeoman_gateway.knowledge._store import QUARANTINE_REASONS
+from yeoman_gateway.knowledge._upgrade import (
+    UpgradeError,
+    upgrade_semantic_digest,
+    upgrade_v1,
+)
+
+
+def processing_snapshot(path: Path) -> Path:
+    """A minimal, syntactically real processing journal (never read for content)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
 
 
 class MigrationHarness:
@@ -305,3 +335,308 @@ def test_imported_ids_survive_a_second_build(migration_harness):
     assert h.imported_person_ids(first) == h.imported_person_ids(second)
     assert h.imported_node_ids(first) == h.imported_node_ids(second)
     assert first.migration_id != second.migration_id
+
+
+# ── v1 -> v2 cutover semantics (T28-T30, T40) ────────────────────────────────
+#
+# The old audit reason for a superseded statement is evidence, not a default.  A role
+# backed by a proven active binding stays active; everything else is *withheld* and
+# counted, and a role whose authoritative principal is missing is quarantined.  No row
+# disappears, and repeating the upgrade cannot change a single decision.
+
+
+class V1UpgradeHarness:
+    """Drives the real v1 -> v2 upgrade over a synthetic v1 knowledge snapshot."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+        self.journal = processing_snapshot(tmp_path / "processing.db")
+
+    def build(self, *, name: str = "built", fail_before_publish: bool = False):
+        directory = self.tmp_path / name
+        directory.mkdir(parents=True, exist_ok=True)
+        return upgrade_v1(
+            source=self.fixture.path,
+            processing=self.journal,
+            target=directory / "knowledge.db",
+            manifest=directory / "manifest.json",
+            fail_before_publish=fail_before_publish,
+        )
+
+    def read(self, report, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        conn = sqlite3.connect(f"file:{report.target_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return list(conn.execute(sql, params))
+        finally:
+            conn.close()
+
+    def table_names(self, report) -> tuple[str, ...]:
+        return tuple(
+            str(row["name"]) for row in self.read(
+                report, "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+
+
+@pytest.fixture
+def v1_upgrade(tmp_path: Path) -> V1UpgradeHarness:
+    return V1UpgradeHarness(tmp_path)
+
+
+def test_two_upgrades_of_one_input_are_identical(v1_upgrade: V1UpgradeHarness):
+    """T28: identical ids, statuses, digests and balances - twice over."""
+    first = v1_upgrade.build(name="first")
+    second = v1_upgrade.build(name="second")
+
+    assert first.semantic_digest == second.semantic_digest
+    assert first.migration_id == second.migration_id
+    assert first.balance.to_payload() == second.balance.to_payload()
+    assert upgrade_semantic_digest(first.target_path) == first.semantic_digest
+
+    rows = v1_upgrade.read(
+        first, "SELECT binding_id, person_id, status FROM knowledge_identifier_bindings"
+        " ORDER BY binding_id"
+    )
+    other = v1_upgrade.read(
+        second, "SELECT binding_id, person_id, status FROM knowledge_identifier_bindings"
+        " ORDER BY binding_id"
+    )
+    assert [tuple(row) for row in rows] == [tuple(row) for row in other]
+    assert [str(row["binding_id"]) for row in rows]
+
+
+def test_proven_binding_stays_active_and_unproven_becomes_withheld(
+    v1_upgrade: V1UpgradeHarness,
+):
+    """One verified binding citing a durable operation, two rows that prove nothing."""
+    report = v1_upgrade.build()
+    balance = report.balance
+    assert balance.bindings.get("active") == 1
+    assert balance.bindings.get("withheld") == 2
+    rows = v1_upgrade.read(
+        report,
+        "SELECT status, COUNT(*) AS n FROM knowledge_identifier_bindings GROUP BY status",
+    )
+    by_status = {str(row["status"]): int(row["n"]) for row in rows}
+    assert by_status == {"active": 1, "withheld": 2}
+
+    active = v1_upgrade.read(
+        report, "SELECT * FROM knowledge_identifier_bindings WHERE status = 'active'"
+    )
+    assert len(active) == 1
+    assert str(active[0]["mapping_verified"]) == "1"
+    assert str(active[0]["evidence_ref"]).startswith("binding-op:")
+    assert str(active[0]["person_id"]) == V1_PERSON_BOUND
+
+    # A withheld row keeps its candidate person id and its original evidence reference,
+    # so the cutover stays auditable, but it is not person-effective.
+    withheld = v1_upgrade.read(
+        report, "SELECT * FROM knowledge_identifier_bindings WHERE status = 'withheld'"
+        " ORDER BY channel, kind"
+    )
+    assert len(withheld) == 2
+    assert {str(row["person_id"]) for row in withheld} == {V1_PERSON_LEGACY_ONLY}
+    assert {str(row["evidence_ref"]) for row in withheld} == {
+        "binding-op:00000000-0000-4000-8000-0000000000ff",
+        "legacy-import",
+    }
+    # No active binding claims a value that only ever had an unproven candidate.
+    active_values = {
+        (str(row["channel"]), str(row["value"]))
+        for row in v1_upgrade.read(
+            report, "SELECT channel, value FROM knowledge_identifier_bindings"
+            " WHERE status = 'active'"
+        )
+    }
+    assert ("telegram", "4910000000102") not in active_values
+    assert ("whatsapp", "4910000000103") not in active_values
+
+
+def test_person_roles_follow_the_proven_mapping(v1_upgrade: V1UpgradeHarness):
+    """T40: proven roles stay, unproven roles are withheld, missing principals quarantined."""
+    report = v1_upgrade.build()
+    roles = report.balance.person_roles
+    # Three roles cite the proven WhatsApp binding - including the one merged revision -
+    # one cites a principal whose binding stayed withheld, and one has no principal.
+    assert roles.get("active") == 3
+    assert roles.get("withheld") == 1
+    assert roles.get("quarantined") == 1
+
+    rows = v1_upgrade.read(
+        report,
+        "SELECT status, COUNT(*) AS n FROM knowledge_statement_people GROUP BY status",
+    )
+    # No row disappeared: the withheld and quarantined roles are still there.
+    assert sum(int(row["n"]) for row in rows) == 5
+
+    quarantined = v1_upgrade.read(
+        report,
+        "SELECT p.statement_id, p.resolution_reason FROM knowledge_statement_people p"
+        " WHERE p.status = 'withheld' AND p.resolution_reason = 'no_authoritative_principal'",
+    )
+    assert quarantined
+    # The original principal and source rows are untouched by the quarantine.
+    for row in quarantined:
+        sources = v1_upgrade.read(
+            report,
+            "SELECT author_principal FROM knowledge_statement_sources WHERE statement_id = ?",
+            (str(row["statement_id"]),),
+        )
+        assert sources and str(sources[0]["author_principal"]) == ""
+
+
+def test_withheld_roles_never_carry_a_binding(v1_upgrade: V1UpgradeHarness):
+    report = v1_upgrade.build()
+    rows = v1_upgrade.read(
+        report,
+        "SELECT COUNT(*) AS n FROM knowledge_statement_people"
+        " WHERE status != 'active' AND binding_id IS NOT NULL",
+    )
+    assert int(rows[0]["n"]) == 0
+
+
+def test_supersession_reason_comes_only_from_concrete_audit_evidence(
+    v1_upgrade: V1UpgradeHarness,
+):
+    """Missing or ambiguous evidence stays ``unknown`` - it is never guessed."""
+    report = v1_upgrade.build()
+    assert report.balance.supersessions.get("unknown") == 1
+    rows = v1_upgrade.read(
+        report,
+        "SELECT supersession_reason FROM knowledge_statements WHERE status = 'superseded'",
+    )
+    assert [str(row["supersession_reason"]) for row in rows] == ["unknown"]
+    # A statement that is not superseded carries no invented reason either.
+    other = v1_upgrade.read(
+        report,
+        "SELECT DISTINCT supersession_reason FROM knowledge_statements WHERE status != 'superseded'",
+    )
+    assert {str(row["supersession_reason"]) for row in other} == {"unknown"}
+
+
+def test_a_concrete_rescreen_audit_becomes_quality_rejected(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    conn = sqlite3.connect(fixture.path)
+    try:
+        conn.execute(
+            "INSERT INTO knowledge_statement_audit (statement_id, operation,"
+            " actor_principal, evidence_ref, reason, detail_json, created_ms)"
+            " VALUES (?, 'rescreen', 'whatsapp:4910000000101', 'admin-ref',"
+            " 'quality_rejected', '{}', 1)",
+            (V1_STATEMENT_SUPERSEDED,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    report = upgrade_v1(
+        source=fixture.path,
+        processing=journal,
+        target=tmp_path / "out" / "knowledge.db",
+        manifest=tmp_path / "out" / "manifest.json",
+    )
+    assert report.balance.supersessions.get("quality_rejected") == 1
+    rows = v1_upgrade_rows(report, "SELECT supersession_reason FROM knowledge_statements"
+                                  " WHERE status = 'superseded'")
+    assert rows == ["quality_rejected"]
+
+
+def test_row_counts_and_original_ids_survive(v1_upgrade: V1UpgradeHarness):
+    report = v1_upgrade.build()
+    assert dict(report.counts)["knowledge_statements"] == 5
+    assert dict(report.counts)["knowledge_statement_people"] == 5
+    assert dict(report.counts)["contacts"] == 3
+    assert dict(report.counts)["contact_aliases"] == 1
+    assert dict(report.counts)["contact_identifiers"] == 4
+    ids = v1_upgrade.read(report, "SELECT statement_id FROM knowledge_statements ORDER BY 1")
+    assert {str(row["statement_id"]) for row in ids} == {
+        V1_STATEMENT_ONE,
+        V1_STATEMENT_TWO,
+        V1_STATEMENT_THREE,
+        V1_STATEMENT_SUPERSEDED,
+        V1_STATEMENT_REVOKED,
+    }
+    # An unknown source object is reported in the manifest, never silently carried over
+    # and never dropped without a trace.
+    payload = json.loads(report.manifest_path.read_text(encoding="utf-8"))
+    assert payload["unknown_objects"] == ["synthetic_unknown_object"]
+    assert "synthetic_unknown_object" not in v1_upgrade.table_names(report)
+    # The manifest inventory accounts for every ordinary target table (the SQLite-managed
+    # FTS shadow tables are deliberately not inventoried as data).
+    inventoried = set(payload_table_names(payload))
+    ordinary = {
+        name
+        for name in v1_upgrade.table_names(report)
+        if not name.startswith("memory2_nodes_fts_") and not name.startswith("sqlite_")
+    }
+    assert inventoried == ordinary
+
+
+def test_missing_principal_quarantines_without_inventing_a_person(
+    v1_upgrade: V1UpgradeHarness,
+):
+    """No contact row is consulted to fill a missing authoritative principal."""
+    report = v1_upgrade.build()
+    rows = v1_upgrade.read(
+        report,
+        "SELECT DISTINCT p.person_id FROM knowledge_statement_people p"
+        " WHERE p.resolution_reason = 'no_authoritative_principal'",
+    )
+    # The original person id is preserved in the ledger, not dropped and not replaced.
+    assert {str(row["person_id"]) for row in rows} == {V1_PERSON_NO_PRINCIPAL}
+    quarantined = v1_upgrade.read(
+        report,
+        "SELECT reason, COUNT(*) AS n FROM knowledge_quarantine"
+        " WHERE source_table = 'knowledge_statement_people' GROUP BY reason",
+    )
+    assert {str(row["reason"]) for row in quarantined} == {"unproven-role"}
+
+
+def test_legacy_fields_stay_locked_and_are_never_promoted(
+    v1_upgrade: V1UpgradeHarness,
+):
+    """T29: an unproven legacy presentation field never becomes an active profile value."""
+    report = v1_upgrade.build()
+    # No attribute facets are invented from legacy profile text.
+    assert v1_upgrade.read(report, "SELECT COUNT(*) AS n FROM knowledge_person_attributes")[
+        0
+    ]["n"] == 0
+    # The legacy row itself is preserved in its own table, still unread by profiles.
+    assert v1_upgrade.read(report, "SELECT COUNT(*) AS n FROM contact_fields")[0]["n"] == 1
+    # And no alias was granted address permission.
+    assert v1_upgrade.read(
+        report, "SELECT COUNT(*) AS n FROM contact_aliases WHERE address_allowed = 1"
+    )[0]["n"] == 0
+
+
+def test_upgrade_never_overwrites_an_existing_target_or_manifest(
+    v1_upgrade: V1UpgradeHarness,
+):
+    first = v1_upgrade.build(name="first")
+    before_target = first.target_path.read_bytes()
+    before_manifest = first.manifest_path.read_bytes()
+    with pytest.raises(UpgradeError) as excinfo:
+        upgrade_v1(
+            source=v1_upgrade.fixture.path,
+            processing=v1_upgrade.journal,
+            target=first.target_path,
+            manifest=first.manifest_path,
+        )
+    assert excinfo.value.code == "target_exists"
+    assert first.target_path.read_bytes() == before_target
+    assert first.manifest_path.read_bytes() == before_manifest
+
+
+def payload_table_names(payload: dict) -> tuple[str, ...]:
+    """The target table names a manifest accounts for, in sorted order."""
+    return tuple(sorted(str(entry["table"]) for entry in payload["tables"]))
+
+
+def v1_upgrade_rows(report, sql: str, params: tuple = ()) -> list[str]:
+    conn = sqlite3.connect(f"file:{report.target_path}?mode=ro", uri=True)
+    try:
+        return [str(row[0]) for row in conn.execute(sql, params)]
+    finally:
+        conn.close()

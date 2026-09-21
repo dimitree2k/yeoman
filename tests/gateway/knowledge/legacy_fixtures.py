@@ -1145,6 +1145,23 @@ def v1_knowledge_store_factory(path: Path) -> V1KnowledgeStore:
             " VALUES ('00000000-0000-4000-8000-0000000000a2', 'preferred_name',"
             " 'whatsapp:4910000000101', 'admin-ref-v1', '{}', 1, 0)",
         )
+        # (b) Two unproven rows for the same person: one claims verification but cites a
+        # binding operation that does not exist, one is a plain legacy import.  Neither
+        # may become an active v2 binding.
+        conn.execute(
+            "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
+            " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
+            " VALUES ('telegram', 'telegram_id', '4910000000102', ?, 'active',"
+            " 'binding-op:00000000-0000-4000-8000-0000000000ff', 1, 1, 1)",
+            (V1_PERSON_LEGACY_ONLY,),
+        )
+        conn.execute(
+            "INSERT INTO knowledge_identifier_bindings (channel, kind, value, person_id,"
+            " status, evidence_ref, mapping_verified, created_ms, updated_ms)"
+            " VALUES ('whatsapp', 'handle', '4910000000103', ?, 'active',"
+            " 'legacy-import', 0, 1, 1)",
+            (V1_PERSON_LEGACY_ONLY,),
+        )
         conn.executemany(
             "INSERT INTO memory2_nodes (id, workspace_id, scope_type, scope_key, channel,"
             " chat_id, sender_id, contact_id, sector, kind, content, content_norm,"

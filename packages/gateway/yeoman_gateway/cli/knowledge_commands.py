@@ -2,15 +2,20 @@
 
 The surface is exactly::
 
-    yeoman knowledge migration inspect --contacts SNAPSHOT --memory SNAPSHOT
-    yeoman knowledge migration build   --contacts SNAPSHOT --memory SNAPSHOT \\
-                                       --target NEW_DB --manifest NEW_JSON
-    yeoman knowledge migration verify  --target DB --manifest JSON
+    yeoman knowledge migration inspect     --contacts SNAPSHOT --memory SNAPSHOT
+    yeoman knowledge migration build       --contacts SNAPSHOT --memory SNAPSHOT \\
+                                           --target NEW_DB --manifest NEW_JSON
+    yeoman knowledge migration verify      --target DB --manifest JSON
+    yeoman knowledge migration inspect-v1  --source V1.db --processing PROCESSING.db
+    yeoman knowledge migration upgrade-v1  --source V1.db --processing PROCESSING.db \\
+                                           --target NEW-V2.db --manifest NEW.json
+    yeoman knowledge migration verify-v1   --target NEW-V2.db --manifest NEW.json
 
 Everything here is offline and explicit: no default paths, no provider or bootstrap
-startup, no implicit migration.  Every failure exits non-zero and prints a stable
-reason code (``source_error``, ``target_exists``, ``unsupported_schema``,
-``manifest_mismatch``); diagnostics are redacted to table names, counts and ids.
+startup, no implicit migration, no gateway and no worker.  Every failure exits non-zero
+and prints a stable reason code (``source_error``, ``target_exists``,
+``unsupported_schema``, ``manifest_mismatch``); diagnostics are redacted to table names,
+counts and ids.
 
 Registration follows the existing convention: this module imports the shared ``app``
 and attaches its sub-app at import time, and ``cli/commands.py`` imports the module
@@ -36,6 +41,15 @@ from yeoman_gateway.knowledge._migration import (
     migrate_sources,
     verify_target,
 )
+from yeoman_gateway.knowledge._upgrade import (
+    UpgradeError,
+    UpgradeInventory,
+    UpgradeReport,
+    UpgradeVerification,
+    inspect_v1,
+    upgrade_v1,
+    verify_upgrade,
+)
 
 from .core import app, console
 
@@ -60,6 +74,41 @@ _REASON_CODES: Final[dict[str, str]] = {
     "manifest_missing": "manifest_mismatch",
     "manifest_invalid": "manifest_mismatch",
     "not_a_database": "source_error",
+}
+
+#: v1->v2 upgrade reason codes.  Kept separate so the two offline paths cannot be
+#: confused by a shared code with a different meaning.
+_UPGRADE_REASON_CODES: Final[dict[str, str]] = {
+    "knowledge_missing": "source_error",
+    "knowledge_not_a_file": "source_error",
+    "knowledge_unreadable": "source_error",
+    "knowledge_not_a_database": "source_error",
+    "knowledge_integrity_failed": "source_error",
+    "processing_missing": "source_error",
+    "processing_not_a_file": "source_error",
+    "processing_unreadable": "source_error",
+    "processing_not_a_database": "source_error",
+    "processing_integrity_failed": "source_error",
+    "unsupported_source_schema": "unsupported_schema",
+    "table_shape_unknown": "unsupported_schema",
+    "target_is_source": "target_exists",
+    "target_is_manifest": "target_exists",
+    "target_exists": "target_exists",
+    "target_is_a_source": "target_exists",
+    "manifest_exists": "target_exists",
+    "manifest_missing": "manifest_mismatch",
+    "manifest_invalid": "manifest_mismatch",
+    "target_missing": "manifest_mismatch",
+    "target_not_a_database": "manifest_mismatch",
+    "binding_overlap": "semantics_error",
+    "staged_integrity_failed": "semantics_error",
+    "staged_foreign_key_failed": "semantics_error",
+    "statement_count_mismatch": "semantics_error",
+    "role_count_mismatch": "semantics_error",
+    "source_count_mismatch": "semantics_error",
+    "binding_balance_broken": "semantics_error",
+    "orphan_source_rows": "semantics_error",
+    "injected_failure": "semantics_error",
 }
 
 
@@ -134,9 +183,74 @@ def migration_verify(
         _fail("manifest_mismatch", detail)
 
 
+# ── v1 -> v2 snapshot upgrade ────────────────────────────────────────────────
+
+
+@migration_app.command("inspect-v1")
+def migration_inspect_v1(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+) -> None:
+    """Read a v1 knowledge snapshot and its processing journal, read-only."""
+    try:
+        inventory = inspect_v1(source=source, processing=processing)
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_inventory(inventory)
+    if inventory.verdict != "ok":
+        _fail("unsupported_schema", inventory.reason)
+
+
+@migration_app.command("upgrade-v1")
+def migration_upgrade_v1(
+    source: Path = typer.Option(..., "--source", help="Existing v1 knowledge snapshot"),
+    processing: Path = typer.Option(..., "--processing", help="Processing journal snapshot"),
+    target: Path = typer.Option(..., "--target", help="New v2 knowledge database to create"),
+    manifest: Path = typer.Option(..., "--manifest", help="New upgrade manifest JSON"),
+) -> None:
+    """Build a fresh v2 target from a v1 snapshot.  Never migrates in place."""
+    try:
+        report = upgrade_v1(
+            source=source, processing=processing, target=target, manifest=manifest
+        )
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_report(report)
+
+
+@migration_app.command("verify-v1")
+def migration_verify_v1(
+    target: Path = typer.Option(..., "--target", help="Upgraded v2 database"),
+    manifest: Path = typer.Option(..., "--manifest", help="Manifest written by upgrade-v1"),
+) -> None:
+    """Re-read an upgraded target read-only and compare it with its manifest."""
+    try:
+        report = verify_upgrade(target=target, manifest=manifest)
+    except UpgradeError as exc:
+        _fail(_upgrade_reason_code(exc.code), exc.message, exc.code)
+    _print_upgrade_verification(report)
+    if report.verdict != "ok":
+        detail = ", ".join(
+            f"{table} expected {expected} rows, found {actual}"
+            for table, expected, actual in report.mismatches
+        )
+        if not detail:
+            if not report.complete:
+                detail = (
+                    "target carries no complete upgrade marker; rebuild it from the"
+                    " v1 snapshot instead of using it"
+                )
+            elif not report.digest_ok:
+                detail = "target content does not match the manifest digest"
+            elif not report.balance_ok:
+                detail = "the cutover balance does not explain every stored row"
+            else:
+                detail = "integrity, foreign keys or fingerprint check failed"
+        _fail("manifest_mismatch", detail)
+
+
 @capture_app.command("status")
-def capture_status(
-    target: Path = typer.Option(
+def capture_status(    target: Path = typer.Option(
         Path("~/.yeoman/data/knowledge/knowledge.db"),
         "--target",
         help="Knowledge database to read",
@@ -367,6 +481,77 @@ def _print_verification(report: VerificationReport) -> None:
     for table, expected, actual in report.mismatches:
         _line(f"  {table}: manifest says {expected} rows, target has {actual}")
     _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
+
+
+def _print_upgrade_inventory(inventory: UpgradeInventory) -> None:
+    _line(f"knowledge snapshot: {inventory.knowledge_path}")
+    _line(f"  schema version: {inventory.knowledge_schema_version or 'none'}")
+    _line(f"  tables: {len(inventory.knowledge_tables)}")
+    _line(f"processing snapshot: {inventory.processing_path}")
+    _line(f"  tables: {len(inventory.processing_tables)}")
+    table = Table(title=Text("v1 knowledge rows (redacted counts)"))
+    table.add_column("table")
+    table.add_column("rows", justify="right")
+    for name, count in inventory.counts:
+        table.add_row(name, str(count))
+    console.print(table)
+    _line(f"identifier conflicts: {inventory.identifier_conflicts}")
+    _line(f"orphaned source references: {inventory.orphan_sources}")
+    _line(f"alias collisions: {inventory.alias_collisions}")
+    if inventory.unknown_objects:
+        # Object *names* only: an unknown table is unknown precisely because its content
+        # was never interpreted, so nothing from it is printed.
+        _line(f"unknown objects: {', '.join(inventory.unknown_objects)}", style="yellow")
+    if inventory.missing_required_tables:
+        _line(
+            "missing required tables: " + ", ".join(inventory.missing_required_tables),
+            style="red",
+        )
+    _line(f"verdict: {inventory.verdict}", style="green" if inventory.verdict == "ok" else "red")
+
+
+def _print_upgrade_report(report: UpgradeReport) -> None:
+    table = Table(title=Text(f"upgraded into {report.target_path.name}"))
+    table.add_column("table")
+    table.add_column("imported rows", justify="right")
+    for name, count in report.counts:
+        table.add_row(name, str(count))
+    console.print(table)
+    balance = report.balance.to_payload()
+    for group in ("bindings", "person_roles", "supersessions"):
+        rendered = "  ".join(f"{key}={value}" for key, value in balance[group].items())
+        _line(f"{group}: {rendered}")
+    _line(f"target: {report.target_path}")
+    _line(f"manifest: {report.manifest_path}")
+    _line(f"semantic digest: {report.semantic_digest}")
+
+
+def _print_upgrade_verification(report: UpgradeVerification) -> None:
+    _line(f"integrity_check: {'ok' if report.integrity_ok else 'failed'}")
+    _line(f"foreign_key_check: {'ok' if report.foreign_keys_ok else 'failed'}")
+    _line(
+        "target fingerprint: "
+        + ("matches manifest" if report.fingerprint_ok else "does not match manifest")
+    )
+    _line(
+        f"table counts: {'match manifest' if report.counts_match else 'differ'} "
+        f"({len(report.mismatches)} mismatches)"
+    )
+    for table, expected, actual in report.mismatches:
+        _line(f"  {table}: manifest says {expected} rows, target has {actual}")
+    _line(f"semantic digest: {'matches manifest' if report.digest_ok else 'differs'}")
+    _line(f"cutover balance: {'explains every row' if report.balance_ok else 'incomplete'}")
+    _line(f"verdict: {report.verdict}", style="green" if report.verdict == "ok" else "red")
+
+
+def _upgrade_reason_code(code: str) -> str:
+    if code in _UPGRADE_REASON_CODES:
+        return _UPGRADE_REASON_CODES[code]
+    if code.startswith("manifest"):
+        return "manifest_mismatch"
+    if code.startswith("target"):
+        return "target_exists"
+    return "source_error"
 
 
 def _line(message: str, *, style: str = "") -> None:

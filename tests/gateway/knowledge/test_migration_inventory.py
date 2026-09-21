@@ -24,7 +24,9 @@ from legacy_fixtures import (
     OWNER_CONTACT_ID,
     SECOND_CONTACT_ID,
     THIRD_CONTACT_ID,
+    V1_KNOWLEDGE_SCHEMA_VERSION,
     legacy_snapshot_factory,
+    v1_knowledge_store_factory,
 )
 from typer.testing import CliRunner
 from yeoman_gateway.cli.knowledge_commands import knowledge_app
@@ -37,6 +39,7 @@ from yeoman_gateway.knowledge._migration import (
     verify_target,
 )
 from yeoman_gateway.knowledge._store import QUARANTINE_REASONS, TOOL_VERSION
+from yeoman_gateway.knowledge._upgrade import UpgradeError, inspect_v1, upgrade_v1
 
 CONTACTS_TABLES = ("contact_aliases", "contact_fields", "contact_identifiers", "contacts")
 MEMORY_TABLES = (
@@ -656,3 +659,151 @@ def test_cli_failure_paths_create_nothing(tmp_path: Path) -> None:
     assert inspect_missing_result.exit_code != 0
     assert "source_error" in inspect_missing_result.output
     assert not target.exists() and not manifest.exists()
+
+
+# ── v1 -> v2 upgrade inventory ───────────────────────────────────────────────
+#
+# The inventory of an existing *knowledge* snapshot is a different question from the
+# legacy contacts/memory inventory above: here the data already has the v1 knowledge
+# shape and the question is what the v2 contract can prove about it.
+
+
+def processing_snapshot(path: Path) -> Path:
+    """A minimal, syntactically real processing journal (never read for content)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL, payload TEXT NOT NULL DEFAULT '')"
+        )
+        conn.execute(
+            "CREATE TABLE event_source_authority (event_id TEXT NOT NULL,"
+            " revision INTEGER NOT NULL, authorized INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (event_id, revision))"
+        )
+        conn.execute(
+            "INSERT INTO events (event_id, chat_id, revision) VALUES ('event-0', 'group-x', 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_v1_inventory_reports_the_shape_without_touching_anything(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    before_knowledge = fixture.sha256()
+    before_journal = journal.read_bytes()
+
+    inventory = inspect_v1(source=fixture.path, processing=journal)
+
+    assert inventory.verdict == "ok"
+    assert inventory.knowledge_schema_version == V1_KNOWLEDGE_SCHEMA_VERSION
+    assert dict(inventory.counts)["contacts"] == 3
+    assert dict(inventory.counts)["knowledge_statements"] == 5
+    assert dict(inventory.counts)["knowledge_statement_people"] == 5
+    assert "synthetic_unknown_object" in inventory.unknown_objects
+    assert "events" in inventory.processing_tables
+    assert inventory.identifier_conflicts == 0
+    assert inventory.orphan_sources == 0
+
+    # Read-only means read-only: no sidecar, no byte, no mtime changed.
+    assert fixture.sha256() == before_knowledge
+    assert fixture.dump_sidecars() == {}
+    assert journal.read_bytes() == before_journal
+
+
+def test_v1_inventory_never_carries_row_content(tmp_path: Path):
+    """The report is counts and object names.  Nothing that could be personal data."""
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    inventory = inspect_v1(source=fixture.path, processing=journal)
+    blob = repr(inventory.to_payload())
+    for secret in (
+        "Synthetic Bound",
+        "Boundy",
+        "synthetic statement one",
+        "4910000000101",
+        "synthetic legacy field",
+    ):
+        assert secret not in blob
+
+
+def test_v1_inventory_refuses_a_v2_snapshot(tmp_path: Path):
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
+
+    journal = processing_snapshot(tmp_path / "processing.db")
+    v2 = tmp_path / "v2.db"
+    service = open_knowledge_store(
+        v2,
+        workspace_id="ws",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=FakePolicyAuthority(),
+    )
+    service.close()
+    inventory = inspect_v1(source=v2, processing=journal)
+    assert inventory.verdict == "refused"
+    assert inventory.knowledge_schema_version == "2"
+
+
+def test_v1_inventory_reports_a_missing_input_as_a_stable_error(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    with pytest.raises(UpgradeError) as excinfo:
+        inspect_v1(source=tmp_path / "absent.db", processing=journal)
+    assert excinfo.value.code == "knowledge_missing"
+    with pytest.raises(UpgradeError) as excinfo:
+        inspect_v1(source=fixture.path, processing=tmp_path / "absent.db")
+    assert excinfo.value.code == "processing_missing"
+
+
+def test_v1_upgrade_refuses_a_non_v1_source_without_creating_a_target(tmp_path: Path):
+    from yeoman_gateway.knowledge.api import open_knowledge_store
+    from yeoman_gateway.knowledge.authority import FakePolicyAuthority, FakeSourceAuthority
+
+    journal = processing_snapshot(tmp_path / "processing.db")
+    v2 = tmp_path / "v2.db"
+    service = open_knowledge_store(
+        v2,
+        workspace_id="ws",
+        source_authority=FakeSourceAuthority(),
+        policy_authority=FakePolicyAuthority(),
+    )
+    service.close()
+    target = tmp_path / "target.db"
+    manifest = tmp_path / "manifest.json"
+    with pytest.raises(UpgradeError) as excinfo:
+        upgrade_v1(source=v2, processing=journal, target=target, manifest=manifest)
+    assert excinfo.value.code == "unsupported_source_schema"
+    assert not target.exists()
+    assert not manifest.exists()
+
+
+def test_cli_inspect_v1_reports_counts_and_never_writes(tmp_path: Path):
+    fixture = v1_knowledge_store_factory(tmp_path / "v1.db")
+    journal = processing_snapshot(tmp_path / "processing.db")
+    before = fixture.sha256()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "inspect-v1",
+            "--source",
+            str(fixture.path),
+            "--processing",
+            str(journal),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "schema version: 1" in result.output
+    assert "identifier conflicts: 0" in result.output
+    assert "synthetic_unknown_object" in result.output
+    # Object names only: no person name, no statement text, no identifier value.
+    assert "Synthetic Bound" not in result.output
+    assert "synthetic statement one" not in result.output
+    assert fixture.sha256() == before
+    assert fixture.dump_sidecars() == {}
