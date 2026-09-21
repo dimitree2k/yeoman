@@ -297,12 +297,123 @@ class ObservedSourceRegistrar:
 
 
 @dataclass(slots=True)
+class AudienceRepairReport:
+    """Counted outcome of one historic audience-repair pass."""
+
+    examined: int = 0
+    registered: int = 0
+    already_proven: int = 0
+    refused: dict[str, int] = field(default_factory=dict)
+    dry_run: bool = True
+
+    def refuse(self, reason: str) -> None:
+        if reason:
+            self.refused[reason] = self.refused.get(reason, 0) + 1
+
+
+class HistoricAudienceRepair:
+    """Registers a *provable* audience for revisions that were journaled without one.
+
+    Historic rows carry no source-time membership snapshot.  The registry knows today's
+    members, not who was in the group when the message was written, so registering the
+    current list would hand a later member a right that was never proven.  A historic
+    revision therefore becomes ``author_only``: the author is provable, the reader list is
+    not.  The pass is bounded, idempotent and refuses revoked revisions.
+    """
+
+    def __init__(self, *, knowledge: Any, processing: Any, clock: Callable[[], int] | None = None) -> None:
+        self._knowledge = knowledge
+        self._processing = processing
+        self._clock = clock or (lambda: int(time.time() * 1000))
+
+    def run(self, *, limit: int = 500, apply: bool = False) -> AudienceRepairReport:
+        report = AudienceRepairReport(dry_run=not apply)
+        reader = getattr(self._processing, "unproven_event_sources", None)
+        if not callable(reader):
+            report.refuse("store_cannot_list_unproven_sources")
+            return report
+        rows = reader(limit=max(1, int(limit)))
+        register = getattr(self._knowledge, "register_turn_source", None)
+        get_authority = getattr(self._processing, "get_event_source_authority", None)
+        for row in rows:
+            report.examined += 1
+            if str(row.get("direction") or "in") != "in":
+                report.refuse("not_inbound")
+                continue
+            if row.get("revoked_at_ms") is not None:
+                report.refuse("source_revoked")
+                continue
+            principal = str(row.get("author_principal") or "")
+            if not principal:
+                report.refuse("missing_author")
+                continue
+            if str(row.get("audience_status") or "unknown") != "unknown":
+                report.already_proven += 1
+                continue
+            if not callable(register):
+                report.refuse("knowledge_cannot_register")
+                continue
+            if not apply:
+                report.registered += 1
+                continue
+            if not callable(get_authority):
+                report.refuse("store_cannot_read_authority")
+                continue
+            entry = get_authority(str(row["event_id"]), int(row.get("revision") or 1))
+            if entry is None:
+                report.refuse("unknown_source")
+                continue
+            source = observed_event(
+                _RowEvent(row, entry), entry
+            ).source
+            try:
+                registered = register(
+                    source=source,
+                    verified_members=frozenset({principal}),
+                    snapshot_id=f"historic:{source.channel}:{source.chat_id}",
+                    author_only=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "historic audience repair failed event_id={} error_type={}",
+                    row.get("event_id"),
+                    type(exc).__name__,
+                )
+                report.refuse("registration_failed")
+                continue
+            if registered:
+                report.registered += 1
+            else:
+                report.refuse("registration_refused")
+        return report
+
+
+class _RowEvent:
+    """The journal fields an authority row already carries, without reading the event."""
+
+    def __init__(self, row: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        self.event_id = str(row.get("event_id") or "")
+        self.revision = int(row.get("revision") or 1)
+        self.channel = str(row.get("source_channel") or "")
+        self.chat_id = str(row.get("source_chat_id") or "")
+        self.principal = str(row.get("author_principal") or "")
+        self.occurred_ms = int(row.get("occurred_at_ms") or 0)
+        self.created_ms = int(entry.get("created_ms") or 0)
+        self.kind = str(row.get("kind") or "message")
+        self.direction = str(row.get("direction") or "in")
+        self.origin = str(row.get("origin") or "")
+        self.source_message_id = ""
+        self.payload: Mapping[str, Any] = {}
+
+
+@dataclass(slots=True)
 class CaptureReport:
     """Counted outcome of one promotion pass. Never contains statement content."""
 
     examined: int = 0
     promoted_sources: int = 0
     jobs: int = 0
+    already_queued: int = 0
     refusals: dict[str, int] = field(default_factory=dict)
 
     def refuse(self, reason: str) -> None:
@@ -381,24 +492,7 @@ class StatementCaptureProducer:
         report.examined = len(events)
         truncated = len(events) >= self._window_limit
 
-        # First pass: group the forward window per chat.  A batch is decided once, after
-        # the whole window is known - deciding per event would promote the first message of
-        # a conversation before its neighbour was even read.
-        batches: dict[tuple[str, str], SourceBatch] = {}
-        for index, event in enumerate(events):
-            item = observed_event(event, self._authority_for(event))
-            batch = batches.get((item.channel, item.chat_id))
-            if batch is None:
-                batch = SourceBatch(channel=item.channel, chat_id=item.chat_id)
-                batches[(item.channel, item.chat_id)] = batch
-            batch.indexes.append(index)
-            reason = promoter_reason(item)
-            if reason:
-                # Refusal is a promotion decision only: the event stays in the journal.
-                batch.refusal(reason)
-                report.refuse(reason)
-            else:
-                batch.sources.append(item)
+        batches = self._group(events, report=report)
 
         # Second pass: close every batch that is due and may be closed.
         consumed = [False] * len(events)
@@ -436,6 +530,91 @@ class StatementCaptureProducer:
                 int(getattr(last, "created_ms", 0) or 0),
                 str(getattr(last, "event_id", "") or ""),
             )
+        return report
+
+    def _group(
+        self, events: Sequence[Any], *, report: CaptureReport
+    ) -> dict[tuple[str, str], SourceBatch]:
+        """Group a window per chat.
+
+        A batch is decided once, after the whole window is known: deciding per event would
+        promote the first message of a conversation before its neighbour was even read.
+        Refusals are counted here and never remove the observation.
+        """
+        batches: dict[tuple[str, str], SourceBatch] = {}
+        for index, event in enumerate(events):
+            item = observed_event(event, self._authority_for(event))
+            key = (item.channel, item.chat_id)
+            batch = batches.get(key)
+            if batch is None:
+                batch = SourceBatch(channel=item.channel, chat_id=item.chat_id)
+                batches[key] = batch
+            batch.indexes.append(index)
+            reason = promoter_reason(item)
+            if reason:
+                batch.refusal(reason)
+                report.refuse(reason)
+            else:
+                batch.sources.append(item)
+        return batches
+
+    def run_historical(
+        self,
+        *,
+        before_ms: int,
+        max_batches: int = 20,
+        scan_limit: int = 2000,
+        apply: bool = False,
+    ) -> CaptureReport:
+        """Bounded promotion of a historic window.  The forward boundary never moves.
+
+        Historic promotion is an explicit, owner-authorized operation: it is dry-run by
+        default, it stops after ``max_batches`` *new* jobs, and a batch that is already
+        queued is skipped instead of counted, so repeated passes walk forward instead of
+        re-reporting the same work.
+        """
+        moment = int(self._clock())
+        report = CaptureReport()
+        reader = getattr(self._processing, "events_after", None)
+        if not callable(reader):
+            return report
+        try:
+            events = tuple(
+                reader(after_ms=0, before_ms=int(before_ms), limit=max(1, int(scan_limit)))
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("historic capture window read failed error_type={}", type(exc).__name__)
+            return report
+        if not events:
+            return report
+        report.examined = len(events)
+        for batch in self._group(events, report=report).values():
+            if not batch.sources:
+                continue
+            if not apply:
+                report.promoted_sources += len(batch.sources)
+                report.jobs += 1
+                if report.jobs >= max(1, int(max_batches)):
+                    break
+                continue
+            refs = tuple(item.source for item in collapse_provider_duplicates(batch.sources))
+            result = self._enqueue(refs, scope_key=batch.scope_key, now_ms=moment)
+            state = str(getattr(result, "state", "") or "")
+            reason = str(getattr(result, "reason", "") or "")
+            if state == "skipped":
+                self.overflows += 1
+                report.refuse(reason or "queue_full")
+                continue
+            if state not in ("queued", "running", "done"):
+                report.refuse(reason or "not_queued")
+                continue
+            if reason == "already_queued":
+                report.already_queued += 1
+                continue
+            report.jobs += 1
+            report.promoted_sources += len(refs)
+            if report.jobs >= max(1, int(max_batches)):
+                break
         return report
 
     def _forward_window(self, start_ms: int, start_event_id: str) -> tuple[Any, ...]:

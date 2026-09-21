@@ -1367,6 +1367,7 @@ class ProcessingStore:
         *,
         after_ms: int,
         after_event_id: str = "",
+        before_ms: int | None = None,
         kinds: Iterable[str] = ("message",),
         limit: int = 200,
     ) -> tuple[CanonicalEvent, ...]:
@@ -1381,18 +1382,61 @@ class ProcessingStore:
         if not wanted:
             return ()
         placeholders = ",".join("?" for _ in wanted)
+        params: list[Any] = [
+            *wanted,
+            int(after_ms),
+            int(after_ms),
+            str(after_event_id or ""),
+        ]
+        upper = ""
+        if before_ms is not None:
+            # An upper bound turns the same reader into a bounded *historic* window: the
+            # forward cursor is never involved, so a backfill cannot move it.
+            upper = " AND created_ms < ?"
+            params.append(int(before_ms))
+        params.append(int(limit))
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM events
                  WHERE kind IN ({placeholders})
-                   AND (created_ms > ? OR (created_ms = ? AND event_id > ?))
+                   AND (created_ms > ? OR (created_ms = ? AND event_id > ?)){upper}
                  ORDER BY created_ms, event_id
                  LIMIT ?
                 """,
-                (*wanted, int(after_ms), int(after_ms), str(after_event_id or ""), int(limit)),
+                tuple(params),
             ).fetchall()
         return tuple(self._event_from_row(row) for row in rows)
+
+    def unproven_event_sources(
+        self, *, limit: int = 500, kinds: Iterable[str] = ("message",)
+    ) -> tuple[dict[str, Any], ...]:
+        """Authority rows whose audience was never proven, oldest first.
+
+        A bounded repair read: it returns only what a repair pass needs to register a
+        *provable* audience, and never touches the events themselves.
+        """
+        wanted = tuple(str(kind) for kind in kinds if str(kind))
+        if not wanted:
+            return ()
+        placeholders = ",".join("?" for _ in wanted)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT a.event_id, a.revision, a.author_principal, a.source_channel,
+                       a.source_chat_id, a.occurred_at_ms, a.audience_status,
+                       a.audience_members_json, a.revoked_at_ms,
+                       e.kind AS kind, e.direction AS direction, e.origin AS origin
+                  FROM event_source_authority a
+                  JOIN events e ON e.event_id = a.event_id AND e.revision = a.revision
+                 WHERE e.kind IN ({placeholders})
+                   AND (a.audience_status IS NULL OR a.audience_status = 'unknown')
+                 ORDER BY a.occurred_at_ms, a.event_id
+                 LIMIT ?
+                """,
+                (*wanted, int(limit)),
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
 
     def project_source_revocation(
         self,
@@ -1427,8 +1471,12 @@ class ProcessingStore:
             ]
             params: list[Any] = [channel, chat_id, provider_id]
             if account:
-                conditions.append("account = ?")
-                params.append(account)
+                # A row written by the second journal writer may carry no account at all;
+                # an empty account means "not recorded", not "a different account", so the
+                # correlation boundary stays channel/chat/provider-id.  Filtering strictly
+                # on the signal's account left those duplicate rows unrevoked.
+                conditions.append("(account = ? OR account = '' OR account IS NULL)")
+                params.append(str(account))
             rows = conn.execute(
                 "SELECT * FROM events WHERE " + " AND ".join(conditions) + " "
                 "ORDER BY revision, created_ms, event_id",

@@ -1184,7 +1184,11 @@ class StatementEngine:
             "SELECT state FROM knowledge_jobs WHERE job_id = ?", (job_id,)
         )
         if existing is not None and str(existing["state"]) in ("queued", "running", "done"):
-            return CaptureJobReceipt(job_id=job_id, state=str(existing["state"]))
+            # ``already_queued`` lets a bounded historic pass skip this batch and keep
+            # walking instead of stopping on work that is already in the queue.
+            return CaptureJobReceipt(
+                job_id=job_id, state=str(existing["state"]), reason="already_queued"
+            )
         state, reason = "queued", None
         if max_waiting is not None and self.pending_job_count() >= max(1, int(max_waiting)):
             # Overflow is visible and recoverable: the job is recorded as ``skipped`` in

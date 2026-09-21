@@ -3591,6 +3591,13 @@ def build_gateway_runtime(
         knowledge=knowledge_service,
         processing=processing_store,
     )
+    # One startup line the owner can check: observation and proof are wired whenever the
+    # knowledge store is open, promotion only when the switch is on.
+    logger.info(
+        "statement capture promotion={} observed_source_proof={}",
+        "on" if statement_capture is not None else "off",
+        "on" if observed_sources is not None else "off",
+    )
 
     return GatewayRuntime(
         orchestrator=orchestrator_service,

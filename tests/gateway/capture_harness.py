@@ -185,6 +185,7 @@ class CaptureHarness:
         principal: str = AUTHOR,
         kind: str = "message",
         direction: str = "in",
+        account: str = "default",
         extra: dict[str, Any] | None = None,
     ) -> str:
         """Journal one event directly, for shapes the Bridge sink does not produce.
@@ -198,8 +199,12 @@ class CaptureHarness:
             "origin": "whatsapp_bridge",
             "channel": "whatsapp",
             "chat_id": chat_id,
+            "principal": principal,
             "text": text,
         }
+        if kind == "message":
+            # A provider identity, so a delete signal can find the row again.
+            payload["source_message_id"] = f"raw-provider-{message_id}"
         payload.update(extra or {})
         stored = self.store.append_event(
             event_key=f"raw:{chat_id}:{kind}:{message_id}",
@@ -207,6 +212,7 @@ class CaptureHarness:
             trace_id=f"raw:{chat_id}:{message_id}",
             payload=payload,
             now_ms=self.now,
+            account=account,
             direction=direction,
         )
         assert stored == event_id

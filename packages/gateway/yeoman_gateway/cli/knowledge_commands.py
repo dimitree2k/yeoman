@@ -20,7 +20,7 @@ next to the other command modules.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final, NoReturn
+from typing import Any, Final, NoReturn
 
 import typer
 from rich.table import Table
@@ -173,6 +173,110 @@ def capture_status(
         console.print(reasons)
     oldest = int(counters["oldest_queued_age_ms"])
     _line(f"oldest queued job: {oldest // 1000}s")
+
+
+def _open_capture_runtime() -> tuple[Any, Any, Any]:
+    """Open the live stores for a bounded capture command.
+
+    Offline by construction: config, the canonical journal and the knowledge store, and
+    nothing else - no channels, no policy engine, no responder.  Both stores stay owned by
+    this process and are closed by the caller.
+    """
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.app.bootstrap import _processing_store_path
+    from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
+    from yeoman_gateway.knowledge.runtime import (
+        RuntimeKnowledgePolicy,
+        RuntimeKnowledgeSources,
+    )
+    from yeoman_gateway.processing.store import ProcessingStore
+
+    config = load_config()
+    processing = ProcessingStore(_processing_store_path(config))
+    sources = RuntimeKnowledgeSources(processing_store=processing)
+    knowledge = open_knowledge_store(
+        Path(config.knowledge.db_path).expanduser(),
+        workspace_id=workspace_id_for(config.workspace_path),
+        source_authority=sources,
+        policy_authority=RuntimeKnowledgePolicy(engine=None, policy_revision=1),
+        create=False,
+    )
+    return config, knowledge, processing
+
+
+@capture_app.command("capture-audience")
+def capture_audience(
+    limit: int = typer.Option(500, "--limit", help="Maximum revisions to examine"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the proof; without it this is a dry run"
+    ),
+) -> None:
+    """Register the provable audience of historic sources (dry run by default).
+
+    A historic revision has no source-time membership snapshot, so it is registered
+    ``author_only``: the author is provable, the reader list is not.  Nothing is ever
+    widened to today's group members.
+    """
+    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
+
+    _config, knowledge, processing = _open_capture_runtime()
+    try:
+        repair = HistoricAudienceRepair(knowledge=knowledge, processing=processing)
+        report = repair.run(limit=int(limit), apply=bool(apply))
+    finally:
+        knowledge.close()
+        processing.close()
+    _line(
+        f"{'would register' if report.dry_run else 'registered'} "
+        f"{report.registered} of {report.examined} examined revision(s)"
+    )
+    for reason, count in sorted(report.refused.items()):
+        _line(f"  refused {reason}: {count}")
+
+
+@capture_app.command("capture-backfill")
+def capture_backfill(
+    limit: int = typer.Option(20, "--limit", help="Maximum new jobs per run"),
+    before_ms: int = typer.Option(
+        0, "--before-ms", help="Window end (default: the forward boundary)"
+    ),
+    scan: int = typer.Option(2000, "--scan", help="Maximum journal events scanned"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Queue the jobs; without it this is a dry run"
+    ),
+) -> None:
+    """Queue bounded promotion jobs for observations *before* the forward boundary.
+
+    The forward boundary never moves, so forward capture is unaffected.  Jobs are drained
+    by the running promotion worker; batching and job keys are the same as forward
+    capture, so a repeated run is idempotent.
+    """
+    from yeoman_gateway.knowledge._capture import StatementCaptureProducer
+
+    _config, knowledge, processing = _open_capture_runtime()
+    try:
+        boundary_ms, _boundary_id = knowledge.capture_boundary() or (0, "")
+        end_ms = int(before_ms) if int(before_ms) > 0 else int(boundary_ms)
+        if end_ms <= 0:
+            _fail("source_error", "no forward boundary yet; forward capture never started")
+        producer = StatementCaptureProducer(knowledge=knowledge, processing=processing)
+        report = producer.run_historical(
+            before_ms=end_ms,
+            max_batches=int(limit),
+            scan_limit=int(scan),
+            apply=bool(apply),
+        )
+    finally:
+        knowledge.close()
+        processing.close()
+    _line(
+        f"scanned {report.examined} event(s); "
+        f"{'queued' if apply else 'would queue'} {report.jobs} job(s); "
+        f"{report.promoted_sources} source(s); already queued {report.already_queued}"
+    )
+    for reason, count in sorted(report.refusals.items()):
+        _line(f"  refused {reason}: {count}")
 
 
 # ── output ───────────────────────────────────────────────────────────────────

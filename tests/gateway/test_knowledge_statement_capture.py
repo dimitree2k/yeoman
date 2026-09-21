@@ -548,3 +548,93 @@ def test_cli_capture_status_is_read_only(tmp_path: Path, harness: CaptureHarness
     assert result.exit_code == 0, result.output
     assert "queued" in result.output
     assert "Treffen" not in result.output
+
+
+# ── historic repair and bounded backfill (owner-authorized operations) ───────
+
+
+def test_historic_audience_repair_registers_author_only_and_is_idempotent(
+    harness: CaptureHarness,
+) -> None:
+    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
+
+    # An observation whose audience was never proven (as every historic row is).
+    event_id = harness.append_raw(text="Alter Satz.", message_id="hist-1")
+    assert harness.source_row(event_id)["audience_status"] == "unknown"
+
+    repair = HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store)
+    dry = repair.run(limit=10, apply=False)
+    assert dry.dry_run and dry.registered == 1
+    assert harness.source_row(event_id)["audience_status"] == "unknown", "dry run writes nothing"
+
+    applied = repair.run(limit=10, apply=True)
+    assert applied.registered == 1
+    row = harness.source_row(event_id)
+    assert row["audience_status"] == "author_only"
+    # The current group members were deliberately *not* granted: a later member must not
+    # inherit a right that was never proven for this revision.
+    assert not row["audience_members"]
+
+    again = repair.run(limit=10, apply=True)
+    assert again.registered == 0 and again.examined == 0
+
+
+def test_historic_audience_repair_skips_revoked_sources(harness: CaptureHarness) -> None:
+    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
+
+    event_id = harness.append_raw(text="Ein widerrufener Satz.", message_id="3EB0800")
+    harness.delete("raw-provider-3EB0800")
+
+    repair = HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store)
+    report = repair.run(limit=10, apply=True)
+
+    assert report.registered == 0
+    assert report.refused.get("source_revoked") == 1
+    assert harness.source_row(event_id)["audience_status"] == "unknown"
+
+
+def test_historic_backfill_is_dry_run_first_and_never_moves_the_boundary(
+    harness: CaptureHarness,
+) -> None:
+    # Two historic observations, then activation: forward capture starts after them.
+    harness.observe("Erster alter Satz.", message_id="3EB0900")
+    harness.advance(1_000)
+    harness.observe("Zweiter alter Satz.", message_id="3EB0901")
+    harness.advance(IDLE + 1)
+    harness.activate()
+    boundary = harness.producer.boundary()
+    assert boundary[0] > 0
+
+    dry = harness.producer.run_historical(before_ms=boundary[0], apply=False)
+    assert dry.jobs == 1 and dry.promoted_sources == 2
+    assert harness.jobs() == []
+    assert harness.producer.boundary() == boundary
+
+    applied = harness.producer.run_historical(before_ms=boundary[0], apply=True)
+    assert applied.jobs == 1 and applied.promoted_sources == 2
+    assert harness.producer.boundary() == boundary, "a backfill may not move the cursor"
+    assert len(harness.jobs()) == 1
+
+    replay = harness.producer.run_historical(before_ms=boundary[0], apply=True)
+    assert replay.jobs == 0 and replay.already_queued == 1
+
+
+def test_historic_backfill_publishes_author_only_statements(harness: CaptureHarness) -> None:
+    harness.advance(1_000)
+    # A historic row: journaled without an audience proof, as the backlog is.
+    harness.append_raw(text="Der alte Satz.", message_id="3EB0910")
+    harness.advance(IDLE + 1)
+    harness.activate()
+    from yeoman_gateway.knowledge._capture import HistoricAudienceRepair
+
+    HistoricAudienceRepair(knowledge=harness.knowledge, processing=harness.store).run(
+        limit=10, apply=True
+    )
+    harness.producer.run_historical(before_ms=harness.producer.boundary()[0], apply=True)
+    harness.drafts = [StatementDraft(content="Der alte Satz.", source_index=0)]
+
+    report = harness.run_capture()
+
+    assert report.published == 1
+    row = harness.statements()[0]
+    assert row["visibility_scope"] == "author_only"
