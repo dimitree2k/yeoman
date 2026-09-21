@@ -1476,32 +1476,34 @@ def rescreen_statements(
             report.superseded += (str(row["statement_id"]),)
             continue
         statement_id = str(row["statement_id"])
-        cursor = store.execute(
-            "UPDATE knowledge_statements SET status = 'superseded', updated_ms = ?"
-            " WHERE statement_id = ? AND status IN ('assertion','confirmed')",
-            (timestamp, statement_id),
-        )
-        if not cursor.rowcount:
-            continue
-        store.execute(
-            "UPDATE memory2_facts SET assertion_status = 'superseded', updated_ms = ?"
-            " WHERE fact_id = ?",
-            (timestamp, statement_id),
-        )
-        store.execute(
-            "INSERT INTO knowledge_statement_audit (statement_id, operation,"
-            " actor_principal, evidence_ref, reason, detail_json, created_ms)"
-            " VALUES (?, 'rescreen', '', '', ?, ?, ?)",
-            (
-                statement_id,
-                f"screen:{reason}",
-                json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True),
-                timestamp,
-            ),
-        )
+        # One short transaction per statement: the live capture worker writes to the same
+        # database, and a single long transaction over every refused row would hold the
+        # write lock until it times the other writer out.
+        with store.transaction():
+            cursor = store.execute(
+                "UPDATE knowledge_statements SET status = 'superseded', updated_ms = ?"
+                " WHERE statement_id = ? AND status IN ('assertion','confirmed')",
+                (timestamp, statement_id),
+            )
+            if not cursor.rowcount:
+                continue
+            store.execute(
+                "UPDATE memory2_facts SET assertion_status = 'superseded', updated_ms = ?"
+                " WHERE fact_id = ?",
+                (timestamp, statement_id),
+            )
+            store.execute(
+                "INSERT INTO knowledge_statement_audit (statement_id, operation,"
+                " actor_principal, evidence_ref, reason, detail_json, created_ms)"
+                " VALUES (?, 'rescreen', '', '', ?, ?, ?)",
+                (
+                    statement_id,
+                    f"screen:{reason}",
+                    json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                ),
+            )
         report.superseded += (statement_id,)
-    if apply:
-        store.commit_if_idle()
     return report
 
 
