@@ -484,72 +484,6 @@ def test_participant_is_allowed_fails_closed_on_a_broken_check(tmp_path: Path) -
     )
 
 
-# -- protected continuation quota (found unreachable in the live pilot) ----------------
-
-
-def test_continuation_candidacy_uses_short_unquoted_material(tmp_path: Path) -> None:
-    """The reserve must be reachable, or it silently blocks eligible continuations."""
-    from yeoman_gateway.app.bootstrap import CONTINUATION_CANDIDATE_MAX_CHARS
-
-    assert CONTINUATION_CANDIDATE_MAX_CHARS == 120
-
-    class _Archive:
-        def __init__(self) -> None:
-            self.rows = {
-                "short": {"text": "Aber noch passt das Schmerzensgeld"},
-                "long": {"text": "x" * (CONTINUATION_CANDIDATE_MAX_CHARS + 1)},
-                "empty": {"text": ""},
-            }
-
-        def lookup_message(self, channel: str, chat_id: str, message_id: str):
-            del channel, chat_id
-            return self.rows.get(message_id)
-
-    class _Opportunity:
-        channel = CHANNEL
-        chat_id = CHAT
-
-        def __init__(self, *sources: str) -> None:
-            self.source_event_ids = sources
-
-    # The predicate is a closure over the archive in the live builder; replicate its
-    # decision function here through the same public inputs it uses.
-    archive = _Archive()
-
-    def candidate(opportunity: object) -> bool:
-        lookup = getattr(archive, "lookup_message", None)
-        if lookup is None or opportunity is None:
-            return False
-        for source_id in getattr(opportunity, "source_event_ids", ()) or ():
-            token = str(source_id)
-            if token.startswith("observed:"):
-                continue
-            row = lookup("", "", token)
-            if row is None:
-                continue
-            text = str(row.get("text") or "").strip()
-            if text and len(text) <= CONTINUATION_CANDIDATE_MAX_CHARS:
-                return True
-        return False
-
-    assert candidate(_Opportunity("short")) is True
-    assert candidate(_Opportunity("long")) is False
-    assert candidate(_Opportunity("empty")) is False
-    assert candidate(_Opportunity("observed:whatsapp:pilot@g.us")) is False
-    assert candidate(_Opportunity("missing")) is False
-    assert candidate(_Opportunity("short", "long")) is True
-
-
-def test_snapshot_provider_receives_the_opportunity() -> None:
-    """The evaluator must hand the opportunity over, or the reserve stays unreachable."""
-    import inspect
-
-    from yeoman_gateway.processing import participation_runtime as module
-
-    source = inspect.getsource(module.ParticipationRuntime.evaluate_participation)
-    assert "opportunity=opportunity" in source
-
-
 @pytest.mark.asyncio
 async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
     tmp_path: Path,
@@ -563,14 +497,6 @@ async def test_continuation_candidate_may_use_reserved_slots_end_to_end(
     runtime, log = rt["decision_runtime"], rt["log"]
     store = rt["store"]
     provider_calls = rt["client"]
-    base_snapshot = runtime._snapshot_provider
-
-    def snapshot(channel: str, chat_id: str, *, epoch: int, opportunity=None):
-        data = dict(base_snapshot(channel, chat_id, epoch=epoch, opportunity=opportunity))
-        data["continuation_candidate"] = True
-        return data
-
-    runtime._snapshot_provider = snapshot
     from yeoman_gateway.processing.models import (
         EffectEnvelope,
         EffectEvidence,

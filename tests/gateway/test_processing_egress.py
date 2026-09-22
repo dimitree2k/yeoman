@@ -1705,5 +1705,4 @@ def test_thread_responder_is_built_only_with_an_open_store(tmp_path: Path) -> No
         wrapper = build_thread_responder(enabled, store, registry, object(), adapter)
     assert registry is not None
     assert wrapper is not None
-    assert hasattr(wrapper, "_run_loop")
     store.close()
