@@ -21,6 +21,7 @@ from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
 from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._migration import (
+    LegacyCanonicalApplyReport,
     LegacyLinkApplyReport,
     LegacyLinkCandidate,
     LegacyLinkManifest,
@@ -33,6 +34,7 @@ from yeoman_gateway.knowledge._migration import (
     inspect_legacy_nodes,
     inspect_lineage_sources,
     propose_legacy_links,
+    reconstruct_legacy_statements,
 )
 from yeoman_gateway.knowledge._retrieval import RetrievalEngine
 from yeoman_gateway.knowledge._statements import StatementEngine, token_re
@@ -83,6 +85,7 @@ __all__ = [
     "KnowledgeService",
     "KnowledgeStartupError",
     "LegacyLinkApplyReport",
+    "LegacyCanonicalApplyReport",
     "LegacyLinkCandidate",
     "LegacyLinkManifest",
     "LegacyNodeInventory",
@@ -93,6 +96,7 @@ __all__ = [
     "inspect_legacy_nodes",
     "inspect_lineage_sources",
     "apply_legacy_link_decisions",
+    "reconstruct_legacy_statements",
     "propose_legacy_links",
     "open_knowledge_store",
     "workspace_id_for",

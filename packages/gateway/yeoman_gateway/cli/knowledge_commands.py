@@ -48,6 +48,7 @@ from yeoman_gateway.knowledge._migration import (
     inspect_legacy_nodes,
     inspect_sources,
     migrate_sources,
+    reconstruct_legacy_statements,
     verify_target,
 )
 from yeoman_gateway.knowledge._upgrade import (
@@ -91,6 +92,7 @@ _REASON_CODES: Final[dict[str, str]] = {
     "apply_target_missing": "semantics_error",
     "apply_conflict": "semantics_error",
     "apply_checkpoint_failed": "semantics_error",
+    "canonical_conflict": "semantics_error",
 }
 
 #: v1->v2 upgrade reason codes.  Kept separate so the two offline paths cannot be
@@ -315,6 +317,65 @@ def migration_apply_legacy_link_decisions(
     _line(f"applied ledger decisions: {report.applied}")
     _line(f"already applied: {report.already_applied}")
     _line("statement rows changed: 0  speaker roles changed: 0")
+    _line(f"apply audit: {output}  (private; node text omitted)")
+
+
+@migration_app.command("reconstruct-legacy-statements")
+def migration_reconstruct_legacy_statements(
+    candidates: Path = typer.Option(..., "--candidates", help="Private candidate manifest JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge database or snapshot to update"),
+    out: Path = typer.Option(..., "--out", help="New private reconstruction audit JSON"),
+    approval_ref: str = typer.Option(..., "--approval-ref", help="Owner approval reference"),
+) -> None:
+    """Reconstruct canonical facts and verified speaker roles for linked candidates."""
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("target_exists", f"reconstruction audit already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot reserve reconstruction audit: {output}: {exc}")
+
+    try:
+        report = reconstruct_legacy_statements(
+            candidates,
+            target,
+            approval_ref=approval_ref,
+        )
+    except MigrationSourceError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(report.to_json())
+            handle.write("\n")
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail("source_error", f"cannot write reconstruction audit: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    _line(f"linked candidates: {report.linked_candidates}")
+    _line(f"reconstructed statements: {report.reconstructed}")
+    _line(f"already reconstructed: {report.already_reconstructed}")
+    _line(f"fact rows created: {report.fact_rows_created}")
+    _line(f"speaker roles created: {report.speaker_roles_created}")
+    _line(f"other roles created: {report.other_roles_created}")
+    _line(f"untouched candidates: {report.untouched_candidates}")
     _line(f"apply audit: {output}  (private; node text omitted)")
 
 
