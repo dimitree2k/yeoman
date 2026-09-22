@@ -115,3 +115,39 @@ def test_real_engine_omits_service_capability_when_validation_excludes_it(tmp_pa
 
     assert "message" in decision.allowed_tools
     assert "send_media" not in decision.allowed_tools
+
+
+def test_owner_forward_command_is_addressed_in_mention_only_group(tmp_path: Path) -> None:
+    policy = PolicyConfig.model_validate(
+        {
+            "owners": {"whatsapp": ["owner@s.whatsapp.net"]},
+            "defaults": {
+                "allowedTools": {"mode": "allowlist", "tools": ["forward_message"]},
+            },
+            "channels": {
+                "whatsapp": {
+                    "default": {
+                        "whenToReply": {"mode": "mention_only"},
+                        "toolAccess": {"forward_message": {"mode": "owner_only"}},
+                    }
+                }
+            },
+        }
+    )
+    engine = PolicyEngine(policy, apply_channels={"whatsapp"}, workspace=tmp_path)
+    actor = ActorContext(
+        channel="whatsapp",
+        chat_id="group@g.us",
+        sender_primary="owner@s.whatsapp.net",
+        sender_aliases=[],
+        is_group=True,
+        mentioned_bot=False,
+        reply_to_bot=False,
+        content="/forward Ente",
+    )
+
+    decision = engine.evaluate(actor, {"forward_message"})
+
+    assert decision.should_respond is True
+    assert "forward_message" in decision.allowed_tools
+    assert decision.reason.endswith("when_to_reply:explicit_command")

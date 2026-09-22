@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,9 @@ def _wake_phrase_match(content: str, wake_phrases: frozenset[str]) -> bool:
         if needle in haystack:
             return True
     return False
+
+
+_FORWARD_COMMAND = re.compile(r"^/?forward(?:\s+.+)?$", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -791,6 +795,8 @@ class PolicyEngine:
         if mode == "mention_only":
             if not actor.is_group:
                 return True, "when_to_reply:mention_only_dm"
+            if _FORWARD_COMMAND.fullmatch(str(actor.content or "").strip()):
+                return True, "when_to_reply:explicit_command"
             if actor.mentioned_bot or actor.reply_to_bot:
                 return True, "when_to_reply:mention_only_group"
             if actor.is_voice and _wake_phrase_match(actor.content, policy.voice_input_wake_phrases):
