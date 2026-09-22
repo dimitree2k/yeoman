@@ -33,6 +33,7 @@ import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -42,7 +43,11 @@ from yeoman_gateway.knowledge._store import (
     KnowledgeStore,
     open_readonly,
 )
-from yeoman_gateway.knowledge.models import ValidationError, normalize_identifier_value
+from yeoman_gateway.knowledge.models import (
+    DEFAULT_NAMESPACE,
+    ValidationError,
+    normalize_identifier_value,
+)
 
 __all__ = [
     "LEGACY_FTS_TABLE",
@@ -50,7 +55,14 @@ __all__ = [
     "LEGACY_NO_FACT_REASON",
     "LEGACY_PROFILE_REASON",
     "LEGACY_UNPROVEN_REASON",
+    "LEGACY_NODE_SOURCE_STATUSES",
     "MANIFEST_VERSION",
+    "LegacyNodeInventory",
+    "LegacyNodeRecord",
+    "LegacyLinkCandidate",
+    "LegacyLinkManifest",
+    "LegacyLinkApplyReport",
+    "LegacyCanonicalApplyReport",
     "MigrationInventory",
     "MigrationReport",
     "MigrationSourceError",
@@ -63,8 +75,10 @@ __all__ = [
     "LineageImportReport",
     "LineageInventory",
     "import_lineage",
+    "inspect_legacy_nodes",
     "inspect_lineage_sources",
     "inspect_sources",
+    "propose_legacy_links",
     "lineage_fingerprint",
     "semantic_digest",
     "migrate_sources",
@@ -1355,8 +1369,1569 @@ def _jsonable(value: Any) -> Any:
 LEGACY_UNPROVEN_REASON: Final[str] = "unproven-role"
 LEGACY_PROFILE_REASON: Final[str] = "profile-without-source"
 LEGACY_NO_FACT_REASON: Final[str] = "legacy-node-without-fact-shell"
+LEGACY_NODE_SOURCE_STATUSES: Final[tuple[str, ...]] = (
+    "unverified",
+    "partial",
+    "missing",
+    "conflict",
+)
+
+_LEGACY_NODE_REQUIRED_TABLES: Final[tuple[str, ...]] = (
+    "memory2_nodes",
+    "memory2_facts",
+    "knowledge_statements",
+    "knowledge_quarantine",
+)
+_LEGACY_NODE_REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "memory2_nodes": (
+        "id",
+        "kind",
+        "sector",
+        "scope_type",
+        "scope_key",
+        "channel",
+        "chat_id",
+        "sender_id",
+        "contact_id",
+        "source_message_id",
+        "source_role",
+        "is_deleted",
+    ),
+    "memory2_facts": ("fact_id",),
+    "knowledge_statements": ("statement_id",),
+    "knowledge_quarantine": ("source_table", "source_pk", "reason"),
+}
 
 _SCOPE_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^([a-z0-9_]+):(.+)$")
+
+_LEGACY_LINK_AUDIT_STATUSES: Final[frozenset[str]] = frozenset(
+    (*LEGACY_NODE_SOURCE_STATUSES, "resolved")
+)
+_LEGACY_LINK_REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "contacts": ("id", "display_name", "preferred_name", "status"),
+    "contact_identifiers": ("channel", "kind", "identifier", "contact_id"),
+    "contact_aliases": (
+        "contact_id",
+        "alias",
+        "source",
+        "alias_kind",
+        "scope_key",
+        "status",
+        "evidence_ref",
+    ),
+    "knowledge_identifier_bindings": (
+        "binding_id",
+        "channel",
+        "kind",
+        "namespace",
+        "value",
+        "person_id",
+        "status",
+        "mapping_verified",
+        "evidence_ref",
+        "valid_from_ms",
+        "valid_until_ms",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyLinkCandidate:
+    """One text-free, owner-reviewable candidate for one legacy node."""
+
+    legacy_node_id: str
+    kind: str
+    sector: str
+    scope_type: str
+    scope_key: str
+    channel: str | None
+    chat_id: str | None
+    sender_id: str | None
+    contact_id: str | None
+    source_message_id: str | None
+    source_role: str | None
+    source_status: str
+    source_classes: tuple[str, ...]
+    source_event_ids: tuple[str, ...]
+    is_deleted: bool
+    has_fact_shell: bool
+    has_statement: bool
+    quarantine_reasons: tuple[str, ...]
+    speaker_candidates: tuple[dict[str, Any], ...]
+    contact_context: dict[str, Any] | None
+    candidate_state: str
+    reason_codes: tuple[str, ...]
+    proposed_disposition: str
+    requires_owner_review: bool = True
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "legacy_node_id": self.legacy_node_id,
+            "kind": self.kind,
+            "sector": self.sector,
+            "scope_type": self.scope_type,
+            "scope_key": self.scope_key,
+            "channel": self.channel,
+            "chat_id": self.chat_id,
+            "sender_id": self.sender_id,
+            "contact_id": self.contact_id,
+            "source_message_id": self.source_message_id,
+            "source_role": self.source_role,
+            "source_status": self.source_status,
+            "source_classes": list(self.source_classes),
+            "source_event_ids": list(self.source_event_ids),
+            "is_deleted": self.is_deleted,
+            "has_fact_shell": self.has_fact_shell,
+            "has_statement": self.has_statement,
+            "quarantine_reasons": list(self.quarantine_reasons),
+            "speaker_candidates": [dict(item) for item in self.speaker_candidates],
+            "contact_context": self.contact_context,
+            "candidate_state": self.candidate_state,
+            "reason_codes": list(self.reason_codes),
+            "proposed_disposition": self.proposed_disposition,
+            "requires_owner_review": self.requires_owner_review,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyLinkManifest:
+    """Deterministic, private candidate rows for one audit and one target snapshot."""
+
+    manifest_version: int
+    audit_manifest_fingerprint: str
+    target_fingerprint: str
+    counts: dict[str, int]
+    source_status_counts: dict[str, int]
+    candidate_state_counts: dict[str, int]
+    reason_counts: dict[str, int]
+    disposition_counts: dict[str, int]
+    candidates: tuple[LegacyLinkCandidate, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "manifest_version": self.manifest_version,
+            "audit_manifest_fingerprint": self.audit_manifest_fingerprint,
+            "target_fingerprint": self.target_fingerprint,
+            "counts": dict(self.counts),
+            "source_status_counts": dict(self.source_status_counts),
+            "candidate_state_counts": dict(self.candidate_state_counts),
+            "reason_counts": dict(self.reason_counts),
+            "disposition_counts": dict(self.disposition_counts),
+            "candidates": [item.to_payload() for item in self.candidates],
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyLinkApplyReport:
+    """Counts and fingerprints for a text-free, reversible ledger apply."""
+
+    target_path: Path
+    target_manifest_fingerprint: str
+    before_target_fingerprint: str
+    after_target_fingerprint: str
+    approval_ref: str
+    total_candidates: int
+    linked_candidates: int
+    applied: int
+    already_applied: int
+    statement_rows_changed: int
+    speaker_roles_changed: int
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "target_path": str(self.target_path),
+            "target_manifest_fingerprint": self.target_manifest_fingerprint,
+            "before_target_fingerprint": self.before_target_fingerprint,
+            "after_target_fingerprint": self.after_target_fingerprint,
+            "approval_ref": self.approval_ref,
+            "total_candidates": self.total_candidates,
+            "linked_candidates": self.linked_candidates,
+            "applied": self.applied,
+            "already_applied": self.already_applied,
+            "statement_rows_changed": self.statement_rows_changed,
+            "speaker_roles_changed": self.speaker_roles_changed,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyCanonicalApplyReport:
+    """Counts and fingerprints for canonical shells on existing legacy nodes."""
+
+    target_path: Path
+    target_manifest_fingerprint: str
+    before_target_fingerprint: str
+    after_target_fingerprint: str
+    approval_ref: str
+    total_candidates: int
+    linked_candidates: int
+    untouched_candidates: int
+    reconstructed: int
+    already_reconstructed: int
+    statement_rows_created: int
+    fact_rows_created: int
+    source_rows_created: int
+    fact_source_rows_created: int
+    speaker_roles_created: int
+    other_roles_created: int
+    revoked_statements: int
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "target_path": str(self.target_path),
+            "target_manifest_fingerprint": self.target_manifest_fingerprint,
+            "before_target_fingerprint": self.before_target_fingerprint,
+            "after_target_fingerprint": self.after_target_fingerprint,
+            "approval_ref": self.approval_ref,
+            "total_candidates": self.total_candidates,
+            "linked_candidates": self.linked_candidates,
+            "untouched_candidates": self.untouched_candidates,
+            "reconstructed": self.reconstructed,
+            "already_reconstructed": self.already_reconstructed,
+            "statement_rows_created": self.statement_rows_created,
+            "fact_rows_created": self.fact_rows_created,
+            "source_rows_created": self.source_rows_created,
+            "fact_source_rows_created": self.fact_source_rows_created,
+            "speaker_roles_created": self.speaker_roles_created,
+            "other_roles_created": self.other_roles_created,
+            "revoked_statements": self.revoked_statements,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyLinkIndexes:
+    contacts: dict[str, dict[str, Any]]
+    identifiers: dict[str, tuple[dict[str, Any], ...]]
+    aliases: dict[str, tuple[dict[str, Any], ...]]
+    bindings: dict[tuple[str, str, str], tuple[dict[str, Any], ...]]
+
+
+def propose_legacy_links(
+    audit_manifest: Path | str,
+    target: Path | str,
+) -> LegacyLinkManifest:
+    """Build text-free legacy-link candidates from two consistent read-only inputs."""
+    audit_path = _expand(audit_manifest)
+    target_path = _expand(target)
+    audit_payload, audit_fingerprint = _read_legacy_link_audit(audit_path)
+    _require_snapshot_file(target_path)
+    expected_target_fingerprint = str(audit_payload["target_fingerprint"])
+    target_fingerprint = file_fingerprint(target_path)
+    if target_fingerprint != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "audit target fingerprint does not match the knowledge snapshot",
+        )
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        indexes = _read_legacy_link_indexes(connection, target_path)
+        candidates = tuple(
+            _legacy_link_candidate(row, indexes)
+            for row in audit_payload["nodes"]
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    if file_fingerprint(target_path) != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "knowledge snapshot changed while candidates were being read",
+        )
+
+    source_status_counts = Counter(item.source_status for item in candidates)
+    candidate_state_counts = Counter(item.candidate_state for item in candidates)
+    reason_counts = Counter(
+        reason for item in candidates for reason in item.reason_codes
+    )
+    disposition_counts = Counter(item.proposed_disposition for item in candidates)
+    counts = {
+        "nodes": len(candidates),
+        "speaker_candidates": sum(len(item.speaker_candidates) for item in candidates),
+        "requires_owner_review": sum(item.requires_owner_review for item in candidates),
+    }
+    return LegacyLinkManifest(
+        manifest_version=MANIFEST_VERSION,
+        audit_manifest_fingerprint=audit_fingerprint,
+        target_fingerprint=target_fingerprint,
+        counts=counts,
+        source_status_counts=dict(sorted(source_status_counts.items())),
+        candidate_state_counts=dict(sorted(candidate_state_counts.items())),
+        reason_counts=dict(sorted(reason_counts.items())),
+        disposition_counts=dict(sorted(disposition_counts.items())),
+        candidates=candidates,
+    )
+
+
+def apply_legacy_link_decisions(
+    candidates: Path | str,
+    target: Path | str,
+    *,
+    approval_ref: str,
+) -> LegacyLinkApplyReport:
+    """Record verified transport decisions in the existing quarantine ledger.
+
+    This is deliberately not a statement or role writer.  It updates only the
+    ``detail_json`` of the existing ``memory2_nodes`` quarantine rows, after rechecking
+    the target binding and contact.  The candidate manifest's target fingerprint is a
+    one-shot write fence: a fresh manifest is required after any target change.
+    """
+    candidate_path = _expand(candidates)
+    target_path = _expand(target)
+    approval = str(approval_ref or "").strip()
+    if not approval:
+        raise MigrationSourceError("apply_invalid", "approval_ref is required")
+    payload, _manifest_fingerprint = _read_legacy_link_candidates(candidate_path)
+    _require_snapshot_file(target_path)
+    expected_target_fingerprint = str(payload["target_fingerprint"])
+    before_fingerprint = file_fingerprint(target_path)
+    if before_fingerprint != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "candidate target fingerprint does not match the knowledge database",
+        )
+
+    rows = payload["candidates"]
+    linked = [
+        row
+        for row in rows
+        if row.get("candidate_state") == "deterministic"
+        and row.get("proposed_disposition") == "linked"
+    ]
+    resolution_ref = "legacy-link-apply:" + hashlib.sha256(
+        approval.encode("utf-8")
+    ).hexdigest()[:32]
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    pending: list[tuple[str, str, str]] = []
+    already_applied = 0
+    statement_rows = 0
+    speaker_roles = 0
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        statement_rows = int(
+            connection.execute("SELECT COUNT(*) FROM knowledge_statements").fetchone()[0]
+        )
+        speaker_roles = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM knowledge_statement_people WHERE role = 'speaker'"
+            ).fetchone()[0]
+        )
+        for row in linked:
+            person_id, binding_id = _validate_legacy_apply_candidate(connection, row)
+            quarantine = connection.execute(
+                "SELECT detail_json FROM knowledge_quarantine"
+                " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                " AND reason = 'legacy-node-without-fact-shell'",
+                (str(row["legacy_node_id"]),),
+            ).fetchall()
+            if len(quarantine) != 1:
+                raise MigrationSourceError(
+                    "apply_target_missing",
+                    "linked candidate has no unique legacy quarantine row",
+                )
+            try:
+                detail = json.loads(str(quarantine[0][0] or "{}"))
+            except (TypeError, ValueError) as exc:
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine detail is not JSON"
+                ) from exc
+            current = detail.get("legacy_reconciliation")
+            if current is not None:
+                if current == {
+                    "status": "applied",
+                    "resolution_ref": resolution_ref,
+                    "person_id": person_id,
+                    "binding_id": binding_id,
+                    "attribution": "transport",
+                    "evidence_kind": "verified_identifier_binding",
+                }:
+                    already_applied += 1
+                    continue
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine row already has another resolution"
+                )
+            if detail != {}:
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine detail is not empty"
+                )
+            pending.append(
+                (
+                    json.dumps(
+                        {
+                            "legacy_reconciliation": {
+                                "status": "applied",
+                                "resolution_ref": resolution_ref,
+                                "person_id": person_id,
+                                "binding_id": binding_id,
+                                "attribution": "transport",
+                                "evidence_kind": "verified_identifier_binding",
+                            }
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    str(row["legacy_node_id"]),
+                    resolution_ref,
+                )
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    if file_fingerprint(target_path) != before_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch", "knowledge database changed during apply validation"
+        )
+
+    applied = 0
+    if pending:
+        connection = sqlite3.connect(str(target_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            if file_fingerprint(target_path) != before_fingerprint:
+                raise MigrationSourceError(
+                    "manifest_mismatch", "knowledge database changed before apply"
+                )
+            for detail_json, node_id, _resolution in pending:
+                cursor = connection.execute(
+                    "UPDATE knowledge_quarantine SET detail_json = ?"
+                    " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                    " AND reason = 'legacy-node-without-fact-shell' AND detail_json = '{}'",
+                    (detail_json, node_id),
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationSourceError(
+                        "apply_conflict", "legacy quarantine row changed during apply"
+                    )
+                applied += 1
+            connection.commit()
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None and int(checkpoint[0]) != 0:
+                raise MigrationSourceError(
+                    "apply_checkpoint_failed", "knowledge database WAL checkpoint was busy"
+                )
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    after_fingerprint = file_fingerprint(target_path)
+    check_sidecars = _read_sidecars(target_path)
+    connection = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        after_statement_rows = int(
+            connection.execute("SELECT COUNT(*) FROM knowledge_statements").fetchone()[0]
+        )
+        after_speaker_roles = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM knowledge_statement_people WHERE role = 'speaker'"
+            ).fetchone()[0]
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, check_sidecars)
+    if after_statement_rows != statement_rows or after_speaker_roles != speaker_roles:
+        raise MigrationSourceError(
+            "apply_conflict", "apply changed statement or role rows unexpectedly"
+        )
+    return LegacyLinkApplyReport(
+        target_path=target_path,
+        target_manifest_fingerprint=expected_target_fingerprint,
+        before_target_fingerprint=before_fingerprint,
+        after_target_fingerprint=after_fingerprint,
+        approval_ref=approval,
+        total_candidates=len(rows),
+        linked_candidates=len(linked),
+        applied=applied,
+        already_applied=already_applied,
+        statement_rows_changed=0,
+        speaker_roles_changed=0,
+    )
+
+
+def reconstruct_legacy_statements(
+    candidates: Path | str,
+    target: Path | str,
+    *,
+    approval_ref: str,
+) -> LegacyCanonicalApplyReport:
+    """Add canonical shells around existing legacy nodes, never duplicate their text.
+
+    The source audience is deliberately fail-closed: without a proven historical
+    audience snapshot, the fact is ``author_only`` and its source status is ``unknown``.
+    The only person edge written is the exact verified transport speaker from the
+    candidate manifest.
+    """
+    candidate_path = _expand(candidates)
+    target_path = _expand(target)
+    approval = str(approval_ref or "").strip()
+    if not approval:
+        raise MigrationSourceError("apply_invalid", "approval_ref is required")
+    payload, _ = _read_legacy_link_candidates(candidate_path)
+    _require_snapshot_file(target_path)
+    expected_target = str(payload["target_fingerprint"])
+    before_target = file_fingerprint(target_path)
+    if before_target != expected_target:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "candidate target fingerprint does not match the knowledge database",
+        )
+
+    rows = payload["candidates"]
+    linked = [
+        row
+        for row in rows
+        if row.get("candidate_state") == "deterministic"
+        and row.get("proposed_disposition") == "linked"
+    ]
+    counts = payload.get("counts")
+    if not isinstance(counts, dict) or int(counts.get("speaker_candidates", -1)) != len(linked):
+        raise MigrationSourceError(
+            "manifest_invalid", "candidate speaker count does not match linked rows"
+        )
+    for row in rows:
+        if row.get("requires_owner_review") is not True:
+            raise MigrationSourceError(
+                "manifest_invalid", "every candidate must retain owner review"
+            )
+
+    protected_before: tuple[tuple[str, str], ...]
+    plans: list[dict[str, Any]] = []
+    unchanged_quarantine: dict[str, str] = {}
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        _require_legacy_canonical_tables(connection, target_path)
+        protected_before = _legacy_protected_digests(connection)
+        linked_ids = {str(row["legacy_node_id"]) for row in linked}
+        for row in rows:
+            node_id = str(row["legacy_node_id"])
+            if node_id not in linked_ids:
+                quarantine = connection.execute(
+                    "SELECT detail_json FROM knowledge_quarantine"
+                    " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                    " AND reason = 'legacy-node-without-fact-shell'",
+                    (node_id,),
+                ).fetchone()
+                if quarantine is None:
+                    raise MigrationSourceError(
+                        "apply_target_missing", "candidate has no legacy quarantine row"
+                    )
+                unchanged_quarantine[node_id] = str(quarantine[0])
+                continue
+
+            person_id, binding_id = _validate_legacy_apply_candidate(connection, row)
+            binding = connection.execute(
+                "SELECT channel, kind, namespace, value FROM knowledge_identifier_bindings"
+                " WHERE binding_id = ?",
+                (binding_id,),
+            ).fetchone()
+            node = connection.execute(
+                "SELECT id, workspace_id, scope_key, channel, chat_id, sender_id,"
+                " source_message_id, created_at, valid_from, valid_to, is_deleted,"
+                " content_hash FROM memory2_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if binding is None or node is None:
+                raise MigrationSourceError(
+                    "apply_target_missing", "linked candidate has no canonical source row"
+                )
+            quarantine = connection.execute(
+                "SELECT detail_json FROM knowledge_quarantine"
+                " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                " AND reason = 'legacy-node-without-fact-shell'",
+                (node_id,),
+            ).fetchall()
+            if len(quarantine) != 1:
+                raise MigrationSourceError(
+                    "apply_target_missing", "linked candidate has no unique quarantine row"
+                )
+            try:
+                detail = json.loads(str(quarantine[0][0] or "{}"))
+            except (TypeError, ValueError) as exc:
+                raise MigrationSourceError(
+                    "canonical_conflict", "legacy quarantine detail is not JSON"
+                ) from exc
+            current_marker = detail.get("canonical_reconstruction")
+            plan = _legacy_canonical_plan(
+                node=node,
+                binding=binding,
+                person_id=person_id,
+                binding_id=binding_id,
+                source_status=str(row.get("source_status") or "missing"),
+                target_fingerprint=expected_target,
+            )
+            plan["detail"] = detail
+            plan["current_marker"] = current_marker
+            plan["state"] = _legacy_canonical_existing_state(connection, plan)
+            if current_marker is not None and current_marker != _legacy_canonical_marker(plan):
+                raise MigrationSourceError(
+                    "canonical_conflict", "legacy row already has another reconstruction"
+                )
+            if plan["state"] == "conflict":
+                raise MigrationSourceError(
+                    "canonical_conflict", "canonical row set is incomplete or differs"
+                )
+            plans.append(plan)
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    if file_fingerprint(target_path) != before_target:
+        raise MigrationSourceError(
+            "manifest_mismatch", "knowledge database changed during apply validation"
+        )
+
+    new_plans = [item for item in plans if item["state"] == "new"]
+    already_plans = [item for item in plans if item["state"] == "already"]
+    connection = sqlite3.connect(str(target_path))
+    connection.row_factory = sqlite3.Row
+    inserted = 0
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN IMMEDIATE")
+        if file_fingerprint(target_path) != before_target:
+            raise MigrationSourceError(
+                "manifest_mismatch", "knowledge database changed before apply"
+            )
+        for item in new_plans:
+            connection.execute(
+                "INSERT INTO memory2_facts (fact_id, workspace_id, chat_scope_key,"
+                " author_principal, assertion_status, visibility_scope, group_rule,"
+                " audience_snapshot_id, valid_from_ms, valid_until_ms, revoked_at_ms,"
+                " extractor_version, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?,"
+                " 'author_only', 'author_only', NULL, ?, ?, ?, ?, ?, ?)",
+                (
+                    item["node_id"],
+                    item["workspace_id"],
+                    item["scope_key"],
+                    item["author_principal"],
+                    item["status"],
+                    item["valid_from_ms"],
+                    item["valid_until_ms"],
+                    item["revoked_at_ms"],
+                    item["extractor_version"],
+                    item["created_ms"],
+                    item["created_ms"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO knowledge_statements (statement_id, workspace_id, scope_key,"
+                " author_principal, speaker_person_id, status, visibility_scope, group_rule,"
+                " source_chat_id, source_channel, audience_snapshot_id, valid_from_ms,"
+                " valid_until_ms, revoked_at_ms, extractor_version, content_hash,"
+                " unresolved_mentions_json, dedupe_key, created_ms, updated_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'author_only', 'author_only', ?, ?, NULL,"
+                " ?, ?, ?, ?, ?, '[]', ?, ?, ?)",
+                (
+                    item["node_id"],
+                    item["workspace_id"],
+                    item["scope_key"],
+                    item["author_principal"],
+                    item["person_id"],
+                    item["status"],
+                    item["chat_id"],
+                    item["channel"],
+                    item["valid_from_ms"],
+                    item["valid_until_ms"],
+                    item["revoked_at_ms"],
+                    item["extractor_version"],
+                    item["content_hash"],
+                    item["dedupe_key"],
+                    item["created_ms"],
+                    item["created_ms"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO memory2_fact_sources (fact_id, source_event_id,"
+                " source_revision, source_trace_id, author_principal, source_channel,"
+                " source_chat_id, occurred_ms) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                (
+                    item["node_id"],
+                    item["source_ref"],
+                    item["source_trace_id"],
+                    item["author_principal"],
+                    item["channel"],
+                    item["chat_id"],
+                    item["valid_from_ms"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO knowledge_statement_sources (statement_id, event_id,"
+                " revision, channel, chat_id, author_principal, occurred_at_ms,"
+                " source_audience_json, snapshot_id, status) VALUES (?, ?, 1, ?, ?, ?,"
+                " ?, NULL, ?, 'unknown')",
+                (
+                    item["node_id"],
+                    item["source_ref"],
+                    item["channel"],
+                    item["chat_id"],
+                    item["author_principal"],
+                    item["valid_from_ms"],
+                    item["source_snapshot"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO knowledge_statement_people (statement_id, person_id, role,"
+                " evidence_source_id, evidence_revision, attribution, created_ms, status,"
+                " binding_id, resolution_reason) VALUES (?, ?, 'speaker', ?, 1,"
+                " 'transport', ?, 'active', ?, 'verified_identifier_binding')",
+                (
+                    item["node_id"],
+                    item["person_id"],
+                    item["source_ref"],
+                    item["created_ms"],
+                    item["binding_id"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO knowledge_statement_audit (statement_id, operation,"
+                " actor_principal, evidence_ref, reason, detail_json, created_ms)"
+                " VALUES (?, 'legacy_reconstruction', ?, ?, 'verified_transport_binding',"
+                " ?, ?)",
+                (
+                    item["node_id"],
+                    "legacy-reconciliation",
+                    item["binding_id"],
+                    json.dumps(
+                        {
+                            "source_status": item["source_status"],
+                            "source_ref": item["source_ref"],
+                            "visibility": "author_only",
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    item["created_ms"],
+                ),
+            )
+            inserted += 1
+
+        for item in plans:
+            current = connection.execute(
+                "SELECT detail_json FROM knowledge_quarantine"
+                " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                " AND reason = 'legacy-node-without-fact-shell'",
+                (item["node_id"],),
+            ).fetchone()
+            if current is None:
+                raise MigrationSourceError(
+                    "apply_target_missing", "legacy quarantine row changed during apply"
+                )
+            detail = json.loads(str(current[0] or "{}"))
+            marker = detail.get("canonical_reconstruction")
+            expected_marker = _legacy_canonical_marker(item)
+            if marker is not None and marker != expected_marker:
+                raise MigrationSourceError(
+                    "canonical_conflict", "legacy reconstruction marker changed during apply"
+                )
+            if marker is None:
+                detail["canonical_reconstruction"] = expected_marker
+                cursor = connection.execute(
+                    "UPDATE knowledge_quarantine SET detail_json = ?"
+                    " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                    " AND reason = 'legacy-node-without-fact-shell' AND detail_json = ?",
+                    (
+                        json.dumps(detail, separators=(",", ":"), sort_keys=True),
+                        item["node_id"],
+                        str(current[0]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationSourceError(
+                        "canonical_conflict", "legacy quarantine row changed during apply"
+                    )
+
+        if _legacy_protected_digests(connection) != protected_before:
+            raise MigrationSourceError(
+                "canonical_conflict", "legacy node, FTS or embedding rows changed"
+            )
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise MigrationSourceError("canonical_conflict", "foreign key check failed")
+        connection.commit()
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0]) != 0:
+            raise MigrationSourceError(
+                "apply_checkpoint_failed", "knowledge database WAL checkpoint was busy"
+            )
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    after_target = file_fingerprint(target_path)
+    sidecars_after = _read_sidecars(target_path)
+    connection = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        if _legacy_protected_digests(connection) != protected_before:
+            raise MigrationSourceError(
+                "canonical_conflict", "protected legacy rows changed after apply"
+            )
+        for node_id, before_detail in unchanged_quarantine.items():
+            after_detail = connection.execute(
+                "SELECT detail_json FROM knowledge_quarantine"
+                " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                " AND reason = 'legacy-node-without-fact-shell'",
+                (node_id,),
+            ).fetchone()
+            if after_detail is None or str(after_detail[0]) != before_detail:
+                raise MigrationSourceError(
+                    "canonical_conflict", "unlinked quarantine row changed"
+                )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_after)
+
+    return LegacyCanonicalApplyReport(
+        target_path=target_path,
+        target_manifest_fingerprint=expected_target,
+        before_target_fingerprint=before_target,
+        after_target_fingerprint=after_target,
+        approval_ref=approval,
+        total_candidates=len(rows),
+        linked_candidates=len(linked),
+        untouched_candidates=len(rows) - len(linked),
+        reconstructed=len(new_plans),
+        already_reconstructed=len(already_plans),
+        statement_rows_created=inserted,
+        fact_rows_created=inserted,
+        source_rows_created=inserted,
+        fact_source_rows_created=inserted,
+        speaker_roles_created=inserted,
+        other_roles_created=0,
+        revoked_statements=sum(bool(item["is_deleted"]) for item in plans),
+    )
+
+
+def _require_legacy_canonical_tables(
+    connection: sqlite3.Connection, path: Path
+) -> None:
+    required = {
+        "memory2_nodes",
+        "memory2_facts",
+        "memory2_fact_sources",
+        "knowledge_statements",
+        "knowledge_statement_sources",
+        "knowledge_statement_people",
+        "knowledge_statement_audit",
+        "knowledge_quarantine",
+        "knowledge_identifier_bindings",
+        "contacts",
+    }
+    missing = sorted(required - set(_table_names(connection)))
+    if missing:
+        raise MigrationSourceError(
+            "missing_required_table", f"canonical reconstruction requires: {', '.join(missing)}"
+        )
+
+
+def _legacy_ms(value: object) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
+
+
+def _legacy_principal(binding: sqlite3.Row) -> str:
+    channel = str(binding["channel"] or "").strip().lower()
+    value = str(binding["value"] or "").strip()
+    if channel == "whatsapp" and "@" in value:
+        value = value.split("@", 1)[0]
+    return f"{channel}:{value}"
+
+
+def _legacy_canonical_plan(
+    *,
+    node: sqlite3.Row,
+    binding: sqlite3.Row,
+    person_id: str,
+    binding_id: str,
+    source_status: str,
+    target_fingerprint: str,
+) -> dict[str, Any]:
+    created_ms = _legacy_ms(node["created_at"]) or _legacy_ms(node["valid_from"])
+    valid_until = _legacy_ms(node["valid_to"]) or None
+    channel = str(node["channel"] or binding["channel"] or "").strip().lower()
+    chat_id = str(node["chat_id"] or "").strip()
+    workspace_id = str(node["workspace_id"] or "").strip()
+    scope_key = str(node["scope_key"] or "").strip()
+    content_hash = str(node["content_hash"] or "").strip()
+    if not channel or not chat_id or not workspace_id or not scope_key or not content_hash:
+        raise MigrationSourceError(
+            "apply_invalid", "legacy node lacks canonical scope or content identity"
+        )
+    deleted = bool(node["is_deleted"])
+    source_ref = f"legacy-node:{node['id']}"
+    return {
+        "node_id": str(node["id"]),
+        "workspace_id": workspace_id,
+        "scope_key": scope_key,
+        "channel": channel,
+        "chat_id": chat_id,
+        "person_id": str(person_id),
+        "binding_id": str(binding_id),
+        "author_principal": _legacy_principal(binding),
+        "status": "revoked" if deleted else "assertion",
+        "is_deleted": deleted,
+        "valid_from_ms": created_ms,
+        "valid_until_ms": valid_until,
+        "revoked_at_ms": created_ms if deleted else None,
+        "extractor_version": "legacy-reconciliation-v1",
+        "content_hash": content_hash,
+        "dedupe_key": f"legacy-reconciliation:{node['id']}",
+        "source_ref": source_ref,
+        "source_trace_id": f"legacy-reconciliation:{node['id']}",
+        "source_snapshot": f"legacy-reconciliation:{target_fingerprint}",
+        "source_status": source_status,
+        "created_ms": created_ms,
+    }
+
+
+def _legacy_canonical_marker(plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "reconstructed",
+        "statement_id": str(plan["node_id"]),
+        "source_ref": str(plan["source_ref"]),
+        "binding_id": str(plan["binding_id"]),
+        "person_id": str(plan["person_id"]),
+        "source_status": str(plan["source_status"]),
+        "visibility": "author_only",
+    }
+
+
+def _legacy_canonical_existing_state(
+    connection: sqlite3.Connection, plan: Mapping[str, Any]
+) -> str:
+    statement = connection.execute(
+        "SELECT workspace_id, scope_key, author_principal, speaker_person_id, status,"
+        " visibility_scope, group_rule, source_chat_id, source_channel, valid_from_ms,"
+        " valid_until_ms, revoked_at_ms, extractor_version, content_hash,"
+        " unresolved_mentions_json, dedupe_key, created_ms, updated_ms"
+        " FROM knowledge_statements WHERE statement_id = ?",
+        (plan["node_id"],),
+    ).fetchone()
+    fact = connection.execute(
+        "SELECT workspace_id, chat_scope_key, author_principal, assertion_status,"
+        " visibility_scope, group_rule, valid_from_ms, valid_until_ms, revoked_at_ms,"
+        " extractor_version, created_ms, updated_ms FROM memory2_facts WHERE fact_id = ?",
+        (plan["node_id"],),
+    ).fetchone()
+    sources = connection.execute(
+        "SELECT event_id, revision, channel, chat_id, author_principal, occurred_at_ms,"
+        " source_audience_json, snapshot_id, status FROM knowledge_statement_sources"
+        " WHERE statement_id = ?",
+        (plan["node_id"],),
+    ).fetchall()
+    fact_sources = connection.execute(
+        "SELECT source_event_id, source_revision, source_trace_id, author_principal,"
+        " source_channel, source_chat_id, occurred_ms FROM memory2_fact_sources"
+        " WHERE fact_id = ?",
+        (plan["node_id"],),
+    ).fetchall()
+    people = connection.execute(
+        "SELECT person_id, role, evidence_source_id, evidence_revision, attribution,"
+        " status, binding_id, resolution_reason FROM knowledge_statement_people"
+        " WHERE statement_id = ?",
+        (plan["node_id"],),
+    ).fetchall()
+    principals = connection.execute(
+        "SELECT COUNT(*) FROM knowledge_statement_principals WHERE statement_id = ?",
+        (plan["node_id"],),
+    ).fetchone()[0]
+    attributes = connection.execute(
+        "SELECT COUNT(*) FROM knowledge_person_attributes WHERE statement_id = ?",
+        (plan["node_id"],),
+    ).fetchone()[0]
+    present = (statement is not None, fact is not None, bool(sources), bool(fact_sources), bool(people))
+    if not any(present):
+        return "new"
+    expected_statement = (
+        plan["workspace_id"], plan["scope_key"], plan["author_principal"], plan["person_id"],
+        plan["status"], "author_only", "author_only", plan["chat_id"], plan["channel"],
+        plan["valid_from_ms"], plan["valid_until_ms"], plan["revoked_at_ms"],
+        plan["extractor_version"], plan["content_hash"], "[]", plan["dedupe_key"],
+        plan["created_ms"], plan["created_ms"],
+    )
+    expected_fact = (
+        plan["workspace_id"], plan["scope_key"], plan["author_principal"], plan["status"],
+        "author_only", "author_only", plan["valid_from_ms"], plan["valid_until_ms"],
+        plan["revoked_at_ms"], plan["extractor_version"], plan["created_ms"], plan["created_ms"],
+    )
+    expected_source = (
+        plan["source_ref"], 1, plan["channel"], plan["chat_id"], plan["author_principal"],
+        plan["valid_from_ms"], None, plan["source_snapshot"], "unknown",
+    )
+    expected_fact_source = (
+        plan["source_ref"], 1, plan["source_trace_id"], plan["author_principal"],
+        plan["channel"], plan["chat_id"], plan["valid_from_ms"],
+    )
+    expected_person = (
+        plan["person_id"], "speaker", plan["source_ref"], 1, "transport", "active",
+        plan["binding_id"], "verified_identifier_binding",
+    )
+    source_matches = False
+    if len(sources) == 1:
+        actual_source = tuple(sources[0])
+        source_matches = actual_source[:7] == expected_source[:7] and (
+            str(actual_source[7] or "").startswith("legacy-reconciliation:")
+            and actual_source[8] == expected_source[8]
+        )
+    if (
+        statement is not None
+        and fact is not None
+        and tuple(statement) == expected_statement
+        and tuple(fact) == expected_fact
+        and source_matches
+        and len(fact_sources) == 1
+        and tuple(fact_sources[0]) == expected_fact_source
+        and len(people) == 1
+        and tuple(people[0]) == expected_person
+        and principals == 0
+        and attributes == 0
+    ):
+        return "already"
+    return "conflict"
+
+
+def _legacy_protected_digests(connection: sqlite3.Connection) -> tuple[tuple[str, str], ...]:
+    tables = (
+        "memory2_nodes",
+        "memory2_nodes_fts_data",
+        "memory2_nodes_fts_content",
+        "memory2_nodes_fts_docsize",
+        "memory2_nodes_fts_idx",
+        "memory2_nodes_fts_config",
+        "memory2_embeddings",
+        "memory2_embedding_jobs",
+    )
+    present = set(_table_names(connection))
+    output: list[tuple[str, str]] = []
+    for table in tables:
+        if table not in present:
+            continue
+        digest = hashlib.sha256()
+        for row in connection.execute(f"SELECT * FROM {_quote_ident(table)}"):
+            digest.update(repr(tuple(row)).encode("utf-8"))
+            digest.update(b"\n")
+        output.append((table, digest.hexdigest()))
+    return tuple(output)
+
+
+def _read_legacy_link_candidates(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists() or not path.is_file():
+        raise MigrationSourceError("manifest_missing", "candidate manifest does not exist")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest is not JSON") from exc
+    if not isinstance(payload, dict) or payload.get("manifest_version") != MANIFEST_VERSION:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest version is unsupported")
+    target_fingerprint = payload.get("target_fingerprint")
+    rows = payload.get("candidates")
+    if not isinstance(target_fingerprint, str) or not target_fingerprint:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest has no target fingerprint")
+    if not isinstance(rows, list):
+        raise MigrationSourceError("manifest_invalid", "candidate manifest has no candidate rows")
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise MigrationSourceError("manifest_invalid", "candidate row is not an object")
+        node_id = str(row.get("legacy_node_id") or "").strip()
+        if not node_id or node_id in seen:
+            raise MigrationSourceError("manifest_invalid", "candidate node ids are not unique")
+        seen.add(node_id)
+        if _contains_forbidden_candidate_key(row):
+            raise MigrationSourceError("manifest_invalid", "candidate manifest contains forbidden text fields")
+    counts = payload.get("counts")
+    if not isinstance(counts, dict) or int(counts.get("nodes", -1)) != len(rows):
+        raise MigrationSourceError("manifest_invalid", "candidate count does not match rows")
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _contains_forbidden_candidate_key(value: object) -> bool:
+    if isinstance(value, dict):
+        if set(value).intersection({"content", "meta_json", "subjects"}):
+            return True
+        return any(_contains_forbidden_candidate_key(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_forbidden_candidate_key(item) for item in value)
+    return False
+
+
+def _validate_legacy_apply_candidate(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> tuple[str, str]:
+    speakers = row.get("speaker_candidates")
+    if (
+        row.get("candidate_state") != "deterministic"
+        or row.get("proposed_disposition") != "linked"
+        or row.get("requires_owner_review") is not True
+        or not isinstance(speakers, list)
+        or len(speakers) != 1
+    ):
+        raise MigrationSourceError("apply_invalid", "linked candidate does not meet the exact binding contract")
+    speaker = speakers[0]
+    if not isinstance(speaker, dict) or {
+        speaker.get("role"),
+        speaker.get("attribution"),
+        speaker.get("evidence_kind"),
+    } != {"speaker", "transport", "verified_identifier_binding"}:
+        raise MigrationSourceError("apply_invalid", "candidate is not a transport binding")
+    person_id = str(speaker.get("person_id") or "").strip()
+    binding_id = str(speaker.get("binding_id") or "").strip()
+    if not person_id or not binding_id:
+        raise MigrationSourceError("apply_invalid", "candidate has no person or binding id")
+    binding_rows = connection.execute(
+        "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+        " mapping_verified, valid_until_ms FROM knowledge_identifier_bindings"
+        " WHERE binding_id = ?",
+        (binding_id,),
+    ).fetchall()
+    if len(binding_rows) != 1:
+        raise MigrationSourceError("apply_binding_missing", "candidate binding is not present")
+    binding = binding_rows[0]
+    sender_shape = _legacy_sender_shape(str(row.get("channel") or ""), str(row.get("sender_id") or ""))
+    if sender_shape is None or (str(binding["kind"]), str(binding["value"])) != sender_shape:
+        raise MigrationSourceError("apply_binding_conflict", "candidate binding does not match sender")
+    matching = connection.execute(
+        "SELECT status, mapping_verified, person_id FROM knowledge_identifier_bindings"
+        " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?",
+        (str(binding["channel"]), str(binding["kind"]), str(binding["namespace"]), str(binding["value"])),
+    ).fetchall()
+    if len(matching) != 1 or not (
+        str(binding["status"]) == "active"
+        and int(binding["mapping_verified"]) == 1
+        and int(binding["valid_until_ms"] or 0) == 0
+        and str(binding["person_id"]) == person_id
+        and str(matching[0]["status"]) == "active"
+        and int(matching[0]["mapping_verified"]) == 1
+    ):
+        raise MigrationSourceError("apply_binding_conflict", "candidate binding is not uniquely active and verified")
+    contact = connection.execute(
+        "SELECT status FROM contacts WHERE id = ?", (person_id,)
+    ).fetchone()
+    if contact is None or str(contact[0]).lower() != "active":
+        raise MigrationSourceError("apply_contact_missing", "candidate target contact is not active")
+    return person_id, binding_id
+
+
+def _read_legacy_link_audit(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists():
+        raise MigrationSourceError("manifest_missing", f"audit manifest does not exist: {path}")
+    if not path.is_file():
+        raise MigrationSourceError("manifest_invalid", f"audit manifest is not a file: {path}")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MigrationSourceError(
+            "manifest_invalid", f"audit manifest is not readable JSON: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MigrationSourceError("manifest_invalid", "audit manifest must be a JSON object")
+    if payload.get("manifest_version") != MANIFEST_VERSION:
+        raise MigrationSourceError(
+            "manifest_invalid", "audit manifest version is not supported"
+        )
+    target_fingerprint = payload.get("target_fingerprint")
+    if not isinstance(target_fingerprint, str) or not target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_invalid", "audit manifest has no target fingerprint"
+        )
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        raise MigrationSourceError("manifest_invalid", "audit manifest has no node rows")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in nodes:
+        if not isinstance(row, dict):
+            raise MigrationSourceError("manifest_invalid", "audit node row is not an object")
+        node_id = _audit_required_text(row, "legacy_node_id")
+        if node_id in seen:
+            raise MigrationSourceError(
+                "manifest_invalid", "audit manifest contains duplicate legacy node ids"
+            )
+        seen.add(node_id)
+        source_status = _audit_required_text(row, "source_status")
+        if source_status not in _LEGACY_LINK_AUDIT_STATUSES:
+            raise MigrationSourceError(
+                "manifest_invalid", "audit node has an unsupported source status"
+            )
+        normalized.append(
+            {
+                "legacy_node_id": node_id,
+                "kind": _audit_optional_text(row, "kind") or "",
+                "sector": _audit_optional_text(row, "sector") or "",
+                "scope_type": _audit_optional_text(row, "scope_type") or "",
+                "scope_key": _audit_optional_text(row, "scope_key") or "",
+                "channel": _audit_optional_text(row, "channel"),
+                "chat_id": _audit_optional_text(row, "chat_id"),
+                "sender_id": _audit_optional_text(row, "sender_id"),
+                "contact_id": _audit_optional_text(row, "contact_id"),
+                "source_message_id": _audit_optional_text(row, "source_message_id"),
+                "source_role": _audit_optional_text(row, "source_role"),
+                "source_status": source_status,
+                "source_classes": _audit_text_list(row, "source_classes"),
+                "source_event_ids": _audit_text_list(row, "source_event_ids"),
+                "is_deleted": bool(row.get("is_deleted", False)),
+                "has_fact_shell": bool(row.get("has_fact_shell", False)),
+                "has_statement": bool(row.get("has_statement", False)),
+                "quarantine_reasons": _audit_text_list(row, "quarantine_reasons"),
+            }
+        )
+    normalized.sort(key=lambda item: item["legacy_node_id"])
+    payload["nodes"] = normalized
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _audit_required_text(row: Mapping[str, Any], key: str) -> str:
+    value = _audit_optional_text(row, key)
+    if value is None:
+        raise MigrationSourceError("manifest_invalid", f"audit node is missing {key}")
+    return value
+
+
+def _audit_optional_text(row: Mapping[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    if isinstance(value, (dict, list, tuple, set)):
+        raise MigrationSourceError("manifest_invalid", f"audit field {key} is not scalar")
+    text = str(value).strip()
+    return text or None
+
+
+def _audit_text_list(row: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = row.get(key, [])
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise MigrationSourceError("manifest_invalid", f"audit field {key} is not a list")
+    return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _read_legacy_link_indexes(
+    connection: sqlite3.Connection,
+    path: Path,
+) -> _LegacyLinkIndexes:
+    tables = set(_table_names(connection))
+    missing_tables = sorted(set(_LEGACY_LINK_REQUIRED_COLUMNS) - tables)
+    if missing_tables:
+        raise MigrationSourceError(
+            "missing_required_table",
+            f"candidate snapshot requires: {', '.join(missing_tables)}",
+        )
+    for table, required in _LEGACY_LINK_REQUIRED_COLUMNS.items():
+        missing_columns = sorted(set(required) - set(_column_names(connection, table)))
+        if missing_columns:
+            raise MigrationSourceError(
+                "missing_required_column",
+                f"{table} missing: {', '.join(missing_columns)}",
+            )
+
+    contacts = {
+        str(row["id"]): {
+            "contact_id": str(row["id"]),
+            "display_name": str(row["display_name"] or ""),
+            "preferred_name": _text_or_none(row["preferred_name"]),
+            "status": str(row["status"] or ""),
+        }
+        for row in connection.execute(
+            "SELECT id, display_name, preferred_name, status FROM contacts ORDER BY id"
+        )
+    }
+    identifiers: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT channel, kind, identifier, contact_id FROM contact_identifiers"
+        " ORDER BY contact_id, channel, kind, identifier"
+    ):
+        contact_id = str(row["contact_id"])
+        identifiers.setdefault(contact_id, []).append(
+            {
+                "channel": str(row["channel"] or ""),
+                "kind": str(row["kind"] or ""),
+                "identifier": str(row["identifier"] or ""),
+            }
+        )
+    aliases: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT contact_id, alias, source, alias_kind, scope_key, status, evidence_ref"
+        " FROM contact_aliases ORDER BY contact_id, alias, source, id"
+    ):
+        alias = _text_or_none(row["alias"])
+        if alias is None:
+            continue
+        contact_id = str(row["contact_id"])
+        aliases.setdefault(contact_id, []).append(
+            {
+                "value": alias,
+                "source": str(row["source"] or ""),
+                "alias_kind": str(row["alias_kind"] or ""),
+                "scope_key": str(row["scope_key"] or ""),
+                "status": str(row["status"] or ""),
+                "evidence_ref": str(row["evidence_ref"] or ""),
+            }
+        )
+    bindings: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+        " mapping_verified, evidence_ref, valid_from_ms, valid_until_ms"
+        " FROM knowledge_identifier_bindings"
+        " ORDER BY channel, kind, namespace, value, binding_id"
+    ):
+        channel = str(row["channel"] or "").strip().lower()
+        kind = str(row["kind"] or "").strip().lower()
+        value = str(row["value"] or "").strip()
+        try:
+            normalized_value = normalize_identifier_value(kind, value)
+        except ValidationError:
+            normalized_value = value
+        key = (channel, kind, normalized_value)
+        bindings.setdefault(key, []).append(
+            {
+                "binding_id": str(row["binding_id"]),
+                "channel": channel,
+                "kind": kind,
+                "namespace": str(row["namespace"] or DEFAULT_NAMESPACE),
+                "value": normalized_value,
+                "person_id": str(row["person_id"]),
+                "status": str(row["status"] or ""),
+                "mapping_verified": row["mapping_verified"] == 1,
+                "evidence_ref": str(row["evidence_ref"] or ""),
+                "valid_from_ms": int(row["valid_from_ms"] or 0),
+                "valid_until_ms": int(row["valid_until_ms"] or 0),
+            }
+        )
+    return _LegacyLinkIndexes(
+        contacts=contacts,
+        identifiers={key: tuple(value) for key, value in identifiers.items()},
+        aliases={key: tuple(value) for key, value in aliases.items()},
+        bindings={key: tuple(value) for key, value in bindings.items()},
+    )
+
+
+def _legacy_link_candidate(
+    row: Mapping[str, Any],
+    indexes: _LegacyLinkIndexes,
+) -> LegacyLinkCandidate:
+    reasons: list[str] = []
+    if row["source_status"] != "resolved":
+        reasons.append("source_not_resolved")
+    contact_context = _legacy_contact_context(row["contact_id"], indexes)
+    contact = indexes.contacts.get(str(row["contact_id"] or ""))
+    contact_active = contact is not None and contact["status"].lower() == "active"
+    speaker_candidates: tuple[dict[str, Any], ...] = ()
+
+    binding, binding_state, binding_reason = _legacy_sender_binding(row, indexes)
+    if binding_reason:
+        reasons.append(binding_reason)
+
+    if (
+        binding_state == "deterministic"
+        and binding is not None
+        and row["contact_id"]
+        and contact is not None
+        and not contact_active
+    ):
+        candidate_state = "conflict"
+        disposition = "quarantined"
+        reasons.append("contact_not_active")
+    elif binding_state == "deterministic" and binding is not None:
+        person = indexes.contacts.get(binding["person_id"])
+        assert person is not None  # enforced by _legacy_sender_binding
+        speaker_candidates = (
+            {
+                "person_id": binding["person_id"],
+                "role": "speaker",
+                "attribution": "transport",
+                "evidence_kind": "verified_identifier_binding",
+                "binding_id": binding["binding_id"],
+                "evidence_ref": binding["evidence_ref"],
+                "channel": binding["channel"],
+                "kind": binding["kind"],
+                "namespace": binding["namespace"],
+                "identifier": binding["value"],
+                "labels": {
+                    "display_name": person["display_name"],
+                    "preferred_name": person["preferred_name"],
+                    "observed_aliases": list(indexes.aliases.get(binding["person_id"], ())),
+                },
+            },
+        )
+        candidate_state = "deterministic"
+        disposition = "linked"
+        if row["contact_id"] and row["contact_id"] != binding["person_id"]:
+            reasons.append("contact_reference_only")
+    elif binding_state == "conflict":
+        candidate_state = "conflict"
+        disposition = "quarantined"
+    elif binding_state == "unsupported":
+        candidate_state = "unresolved"
+        disposition = "quarantined"
+    elif binding_state == "unbound" and contact_active:
+        candidate_state = "review"
+        disposition = "raw_only"
+        reasons.append("contact_reference_only")
+    elif binding_state == "unbound" and contact is not None:
+        candidate_state = "conflict"
+        disposition = "quarantined"
+        reasons.append("contact_not_active")
+    else:
+        candidate_state = "unresolved"
+        disposition = "quarantined"
+
+    return LegacyLinkCandidate(
+        legacy_node_id=str(row["legacy_node_id"]),
+        kind=str(row["kind"]),
+        sector=str(row["sector"]),
+        scope_type=str(row["scope_type"]),
+        scope_key=str(row["scope_key"]),
+        channel=row["channel"],
+        chat_id=row["chat_id"],
+        sender_id=row["sender_id"],
+        contact_id=row["contact_id"],
+        source_message_id=row["source_message_id"],
+        source_role=row["source_role"],
+        source_status=str(row["source_status"]),
+        source_classes=tuple(row["source_classes"]),
+        source_event_ids=tuple(row["source_event_ids"]),
+        is_deleted=bool(row["is_deleted"]),
+        has_fact_shell=bool(row["has_fact_shell"]),
+        has_statement=bool(row["has_statement"]),
+        quarantine_reasons=tuple(row["quarantine_reasons"]),
+        speaker_candidates=speaker_candidates,
+        contact_context=contact_context,
+        candidate_state=candidate_state,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+        proposed_disposition=disposition,
+    )
+
+
+def _legacy_contact_context(
+    contact_id: str | None,
+    indexes: _LegacyLinkIndexes,
+) -> dict[str, Any] | None:
+    if not contact_id:
+        return None
+    contact = indexes.contacts.get(contact_id)
+    if contact is None:
+        return {"contact_id": contact_id, "exists": False}
+    return {
+        "contact_id": contact_id,
+        "exists": True,
+        "status": contact["status"],
+        "display_name": contact["display_name"],
+        "preferred_name": contact["preferred_name"],
+        "observed_identifiers": list(indexes.identifiers.get(contact_id, ())),
+        "observed_aliases": list(indexes.aliases.get(contact_id, ())),
+    }
+
+
+def _legacy_sender_binding(
+    row: Mapping[str, Any],
+    indexes: _LegacyLinkIndexes,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    sender = str(row["sender_id"] or "").strip()
+    channel = str(row["channel"] or "").strip().lower()
+    if not sender:
+        return None, "unbound", "sender_unbound"
+    shape = _legacy_sender_shape(channel, sender)
+    if shape is None:
+        return None, "unsupported", "unsupported_identifier_context"
+    kind, value = shape
+    all_bindings = indexes.bindings.get((channel, kind, value), ())
+    if not all_bindings:
+        return None, "unbound", "sender_unbound"
+    expected = tuple(
+        item for item in all_bindings if item["namespace"] == DEFAULT_NAMESPACE
+    )
+    if len(expected) != len(all_bindings) or not expected:
+        return None, "unsupported", "unsupported_identifier_context"
+    valid = tuple(
+        item
+        for item in expected
+        if (
+            item["status"] == "active"
+            and item["mapping_verified"]
+            and item["valid_until_ms"] == 0
+        )
+    )
+    if (
+        len(expected) != 1
+        or len(valid) != 1
+        or valid[0]["person_id"] not in indexes.contacts
+        or indexes.contacts[valid[0]["person_id"]]["status"].lower() != "active"
+    ):
+        return None, "conflict", "conflicting_bindings"
+    return valid[0], "deterministic", "verified_sender_binding"
+
+
+def _legacy_sender_shape(channel: str, sender: str) -> tuple[str, str] | None:
+    if channel != "whatsapp":
+        return None
+    lowered = sender.lower()
+    if "@" in lowered:
+        domain = lowered.rsplit("@", 1)[1]
+        if domain not in ("s.whatsapp.net", "lid"):
+            return None
+        kind = "lid" if domain == "lid" else "phone_jid"
+        try:
+            value = normalize_identifier_value(kind, lowered)
+        except ValidationError:
+            return None
+        return kind, value
+    try:
+        value = normalize_identifier_value("phone_jid", sender)
+    except ValidationError:
+        return None
+    return "phone_jid", f"{value}@s.whatsapp.net"
+
+
+def _text_or_none(value: object) -> str | None:
+    text = "" if value is None else str(value).strip()
+    return text or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1515,6 +3090,364 @@ def _resolve_legacy_rows(store: KnowledgeStore, *, created_ms: int) -> _LegacyRe
         unresolved_mentions=unresolved_mentions,
         kept_unproven=kept_unproven,
         notes=tuple(notes),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyNodeRecord:
+    """Private, text-free review row for one retained legacy node."""
+
+    legacy_node_id: str
+    kind: str
+    sector: str
+    scope_type: str
+    scope_key: str
+    channel: str | None
+    chat_id: str | None
+    sender_id: str | None
+    contact_id: str | None
+    source_message_id: str | None
+    source_role: str | None
+    is_deleted: bool
+    has_fact_shell: bool
+    has_statement: bool
+    quarantine_reasons: tuple[str, ...]
+    source_status: str
+    source_classes: tuple[str, ...]
+    source_event_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyNodeInventory:
+    """Aggregate plus private row metadata for the legacy-node audit."""
+
+    target_path: Path
+    target_fingerprint: str
+    population_reason: str
+    nodes: tuple[LegacyNodeRecord, ...]
+    by_kind: tuple[tuple[str, int, int], ...]
+    quarantine_reasons: tuple[tuple[str, int], ...]
+    source_status_counts: tuple[tuple[str, int], ...]
+    orphan_quarantine_rows: int = 0
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "nodes": len(self.nodes),
+            "active": sum(not node.is_deleted for node in self.nodes),
+            "with_source_message_id": sum(bool(node.source_message_id) for node in self.nodes),
+            "with_sender_id": sum(bool(node.sender_id) for node in self.nodes),
+            "with_contact_id": sum(bool(node.contact_id) for node in self.nodes),
+            "with_fact_shell": sum(node.has_fact_shell for node in self.nodes),
+            "with_statement": sum(node.has_statement for node in self.nodes),
+            "orphan_quarantine_rows": self.orphan_quarantine_rows,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "manifest_version": 1,
+                "target_path": str(self.target_path),
+                "target_fingerprint": self.target_fingerprint,
+                "population_reason": self.population_reason,
+                "counts": self.counts(),
+                "by_kind": [list(item) for item in self.by_kind],
+                "quarantine_reasons": [list(item) for item in self.quarantine_reasons],
+                "source_status_counts": [list(item) for item in self.source_status_counts],
+                "nodes": [_jsonable(node) for node in self.nodes],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def _legacy_text_or_none(value: object) -> str | None:
+    text = "" if value is None else str(value).strip()
+    return text or None
+
+
+def _legacy_source_index(
+    *,
+    inbound_dir: Path | None,
+    processing_db: Path | None,
+) -> tuple[
+    dict[tuple[str, str], set[str]],
+    dict[str, set[str]],
+    dict[str, set[str]],
+]:
+    """Index source identities without carrying source content into the audit."""
+    variants: dict[tuple[str, str], set[str]] = {}
+    classes: dict[str, set[str]] = {}
+    event_ids: dict[str, set[str]] = {}
+    if processing_db is not None:
+        sidecars_before = _read_sidecars(processing_db)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = _connect_readonly(processing_db)
+            _require_integrity(connection, processing_db)
+            tables = set(_table_names(connection))
+            if "events" not in tables:
+                raise MigrationSourceError(
+                    "missing_required_table", "processing source requires an events table"
+                )
+            columns = set(_columns(connection, "events"))
+            required = {
+                "event_id",
+                "source_message_id",
+                "kind",
+                "revision",
+                "chat_id",
+                "principal",
+                "channel",
+                "occurred_ms",
+            }
+            missing = sorted(required - columns)
+            if missing:
+                raise MigrationSourceError(
+                    "missing_required_column",
+                    "processing events missing: " + ", ".join(missing),
+                )
+            try:
+                rows = connection.execute(
+                    "SELECT event_id, source_message_id, kind, revision, chat_id, principal, channel,"
+                    " occurred_ms FROM events WHERE source_message_id IS NOT NULL"
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise MigrationSourceError(
+                    "unsupported_schema", "could not read processing source events"
+                ) from exc
+            for row in rows:
+                source_ref = _legacy_text_or_none(row["source_message_id"])
+                if source_ref is None:
+                    continue
+                source_class = "processing_events"
+                variants.setdefault((source_class, source_ref), set()).add(
+                    lineage_fingerprint(
+                        source_class,
+                        source_ref,
+                        row["kind"],
+                        row["revision"],
+                        row["chat_id"],
+                        row["principal"],
+                        row["channel"],
+                        row["occurred_ms"],
+                    )
+                )
+                classes.setdefault(source_ref, set()).add(source_class)
+                event_id = _legacy_text_or_none(row["event_id"])
+                if event_id is not None:
+                    event_ids.setdefault(source_ref, set()).add(event_id)
+        finally:
+            if connection is not None:
+                connection.close()
+            _remove_read_sidecars(processing_db, sidecars_before)
+
+    if inbound_dir is not None:
+        for path in sorted(inbound_dir.glob("*.jsonl")):
+            chat_key = path.stem
+            for index, record in enumerate(_iter_jsonl(path)):
+                if index == 0 and "chat_id" in record:
+                    continue
+                source_ref = _legacy_text_or_none(
+                    record.get("message_id") or record.get("id")
+                )
+                if source_ref is None:
+                    continue
+                source_class = "inbound_archive"
+                variants.setdefault((source_class, source_ref), set()).add(
+                    lineage_fingerprint(
+                        source_class,
+                        source_ref,
+                        record.get("timestamp"),
+                        chat_key,
+                        record.get("from") or record.get("sender"),
+                        record.get("role"),
+                    )
+                )
+                classes.setdefault(source_ref, set()).add(source_class)
+    return variants, classes, event_ids
+
+
+def _legacy_source_status(
+    source_message_id: str | None,
+    *,
+    source_checked: bool,
+    variants: Mapping[tuple[str, str], set[str]],
+    classes: Mapping[str, set[str]],
+    event_ids: Mapping[str, set[str]],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    if not source_message_id:
+        return "missing", (), ()
+    if not source_checked:
+        return "unverified", (), ()
+    source_classes = tuple(sorted(classes.get(source_message_id, set())))
+    source_event_ids = tuple(sorted(event_ids.get(source_message_id, set())))
+    matching_variants = [
+        fingerprints
+        for (source_class, source_ref), fingerprints in variants.items()
+        if source_ref == source_message_id
+    ]
+    if not matching_variants:
+        return "missing", source_classes, source_event_ids
+    if any(len(fingerprints) > 1 for fingerprints in matching_variants):
+        return "conflict", source_classes, source_event_ids
+    # An id-only match is deliberately not a resolved attribution.  Chat, sender,
+    # timestamp and revision matching belongs to the next audit phase.
+    return "partial", source_classes, source_event_ids
+
+
+def inspect_legacy_nodes(
+    target: Path | str,
+    *,
+    inbound_dir: Path | str | None = None,
+    processing_db: Path | str | None = None,
+) -> LegacyNodeInventory:
+    """Inventory all nodes quarantined without a fact shell, read-only and text-free."""
+    target_path = _expand(target)
+    _require_snapshot_file(target_path)
+    inbound_path = _expand(inbound_dir) if inbound_dir is not None else None
+    processing_path = _expand(processing_db) if processing_db is not None else None
+    if inbound_path is not None and not inbound_path.is_dir():
+        raise MigrationSourceError(
+            "missing_source", f"inbound source is not a directory: {inbound_path}"
+        )
+    if processing_path is not None:
+        _require_snapshot_file(processing_path)
+
+    source_checked = inbound_path is not None or processing_path is not None
+    variants: dict[tuple[str, str], set[str]] = {}
+    source_classes: dict[str, set[str]] = {}
+    source_event_ids: dict[str, set[str]] = {}
+    if source_checked:
+        variants, source_classes, source_event_ids = _legacy_source_index(
+            inbound_dir=inbound_path,
+            processing_db=processing_path,
+        )
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        tables = set(_table_names(connection))
+        missing = sorted(set(_LEGACY_NODE_REQUIRED_TABLES) - tables)
+        if missing:
+            raise MigrationSourceError(
+                "missing_required_table",
+                f"legacy node audit requires: {', '.join(missing)}",
+            )
+        for table, required_columns in _LEGACY_NODE_REQUIRED_COLUMNS.items():
+            missing_columns = sorted(
+                set(required_columns) - set(_columns(connection, table))
+            )
+            if missing_columns:
+                raise MigrationSourceError(
+                    "missing_required_column",
+                    f"{table} missing: {', '.join(missing_columns)}",
+                )
+
+        try:
+            quarantine_rows = connection.execute(
+                "SELECT source_pk, reason FROM knowledge_quarantine"
+                " WHERE source_table = ? ORDER BY source_pk, reason",
+                ("memory2_nodes",),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not read legacy node quarantine rows"
+            ) from exc
+        reasons_by_node: dict[str, list[str]] = {}
+        for row in quarantine_rows:
+            reasons_by_node.setdefault(str(row["source_pk"]), []).append(str(row["reason"]))
+        legacy_ids = tuple(
+            sorted(
+                node_id
+                for node_id, reasons in reasons_by_node.items()
+                if LEGACY_NO_FACT_REASON in reasons
+            )
+        )
+        if legacy_ids:
+            placeholders = ", ".join("?" for _ in legacy_ids)
+            try:
+                rows = connection.execute(
+                    "SELECT n.id, n.kind, n.sector, n.scope_type, n.scope_key, n.channel,"
+                    " n.chat_id, n.sender_id, n.contact_id, n.source_message_id, n.source_role,"
+                    " n.is_deleted, CASE WHEN f.fact_id IS NULL THEN 0 ELSE 1 END AS has_fact_shell,"
+                    " CASE WHEN s.statement_id IS NULL THEN 0 ELSE 1 END AS has_statement"
+                    " FROM memory2_nodes AS n"
+                    " LEFT JOIN memory2_facts AS f ON f.fact_id = n.id"
+                    " LEFT JOIN knowledge_statements AS s ON s.statement_id = n.id"
+                    f" WHERE n.id IN ({placeholders}) ORDER BY n.id",
+                    legacy_ids,
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise MigrationSourceError(
+                    "unsupported_schema", "could not read legacy node metadata"
+                ) from exc
+        else:
+            rows = []
+        if len(rows) != len(legacy_ids):
+            raise MigrationSourceError(
+                "orphan_legacy_node",
+                f"quarantine references {len(legacy_ids) - len(rows)} missing node(s)",
+            )
+
+        records: list[LegacyNodeRecord] = []
+        for row in rows:
+            source_message_id = _legacy_text_or_none(row["source_message_id"])
+            source_status, matched_classes, matched_event_ids = _legacy_source_status(
+                source_message_id,
+                source_checked=source_checked,
+                variants=variants,
+                classes=source_classes,
+                event_ids=source_event_ids,
+            )
+            records.append(
+                LegacyNodeRecord(
+                    legacy_node_id=str(row["id"]),
+                    kind=str(row["kind"]),
+                    sector=str(row["sector"]),
+                    scope_type=str(row["scope_type"]),
+                    scope_key=str(row["scope_key"]),
+                    channel=_legacy_text_or_none(row["channel"]),
+                    chat_id=_legacy_text_or_none(row["chat_id"]),
+                    sender_id=_legacy_text_or_none(row["sender_id"]),
+                    contact_id=_legacy_text_or_none(row["contact_id"]),
+                    source_message_id=source_message_id,
+                    source_role=_legacy_text_or_none(row["source_role"]),
+                    is_deleted=bool(row["is_deleted"]),
+                    has_fact_shell=bool(row["has_fact_shell"]),
+                    has_statement=bool(row["has_statement"]),
+                    quarantine_reasons=tuple(reasons_by_node[str(row["id"])]),
+                    source_status=source_status,
+                    source_classes=matched_classes,
+                    source_event_ids=matched_event_ids,
+                )
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    kind_counts: dict[str, list[int]] = {}
+    reason_counts: Counter[str] = Counter()
+    source_status_counts: Counter[str] = Counter()
+    for node in records:
+        counts = kind_counts.setdefault(node.kind, [0, 0])
+        counts[0] += 1
+        counts[1] += int(not node.is_deleted)
+        reason_counts.update(node.quarantine_reasons)
+        source_status_counts[node.source_status] += 1
+
+    return LegacyNodeInventory(
+        target_path=target_path,
+        target_fingerprint=file_fingerprint(target_path),
+        population_reason=LEGACY_NO_FACT_REASON,
+        nodes=tuple(records),
+        by_kind=tuple(
+            (kind, counts[0], counts[1]) for kind, counts in sorted(kind_counts.items())
+        ),
+        quarantine_reasons=tuple(sorted(reason_counts.items())),
+        source_status_counts=tuple(sorted(source_status_counts.items())),
     )
 
 
@@ -1714,6 +3647,48 @@ def _columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
         return ()
 
 
+def _read_processing_lineage_rows(
+    path: Path,
+) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    """Read the lineage metadata contract without leaving read sidecars."""
+    _require_snapshot_file(path)
+    sidecars_before = _read_sidecars(path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(path)
+        _require_integrity(connection, path)
+        try:
+            tables = _table_names(connection)
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not inspect processing source tables"
+            ) from exc
+        if "events" not in tables:
+            raise MigrationSourceError(
+                "missing_required_table", "processing source requires an events table"
+            )
+        required = {"event_id", "kind", "revision", "direction", "chat_id", "account"}
+        missing = sorted(required - set(_columns(connection, "events")))
+        if missing:
+            raise MigrationSourceError(
+                "missing_required_column",
+                "processing events missing: " + ", ".join(missing),
+            )
+        try:
+            rows = connection.execute(
+                "SELECT event_id, kind, revision, direction, chat_id, account FROM events"
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not read processing lineage events"
+            ) from exc
+        return tables, tuple({key: row[key] for key in row.keys()} for row in rows)
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(path, sidecars_before)
+
+
 def inspect_lineage_sources(
     *,
     inbound_dir: Path | str | None = None,
@@ -1734,39 +3709,30 @@ def inspect_lineage_sources(
 
     # ── processing store ─────────────────────────────────────────────────────
     if processing_db is not None and Path(processing_db).exists():
-        connection = _connect_readonly(Path(processing_db))
-        try:
-            tables = _table_names(connection)
-            schema.append(("processing", ",".join(tables)))
-            if "events" in tables:
-                rows = connection.execute(
-                    "SELECT event_id, kind, revision, direction, chat_id, account FROM events"
-                ).fetchall()
-                for row in rows:
-                    record = {key: row[key] for key in row.keys()}
-                    decision, reason = _decide_event(record)
-                    if decision == "import":
-                        eligible_jobs += 1
-                    decisions.append(
-                        LineageDecision(
-                            source_class="processing_events",
-                            source_ref=str(record.get("event_id") or ""),
-                            decision=decision,
-                            reason=reason,
-                            fingerprint=lineage_fingerprint(
-                                "processing_events",
-                                record.get("event_id"),
-                                record.get("kind"),
-                                record.get("revision"),
-                            ),
-                        )
-                    )
-            statements.append(
-                f"processing: {len(tables)} table(s), "
-                f"{sum(1 for item in decisions if item.source_class == 'processing_events')} event(s)"
+        tables, rows = _read_processing_lineage_rows(_expand(processing_db))
+        schema.append(("processing", ",".join(tables)))
+        for record in rows:
+            decision, reason = _decide_event(record)
+            if decision == "import":
+                eligible_jobs += 1
+            decisions.append(
+                LineageDecision(
+                    source_class="processing_events",
+                    source_ref=str(record.get("event_id") or ""),
+                    decision=decision,
+                    reason=reason,
+                    fingerprint=lineage_fingerprint(
+                        "processing_events",
+                        record.get("event_id"),
+                        record.get("kind"),
+                        record.get("revision"),
+                    ),
+                )
             )
-        finally:
-            connection.close()
+        statements.append(
+            f"processing: {len(tables)} table(s), "
+            f"{sum(1 for item in decisions if item.source_class == 'processing_events')} event(s)"
+        )
 
     # ── inbound archives ─────────────────────────────────────────────────────
     if inbound_dir is not None and Path(inbound_dir).exists():

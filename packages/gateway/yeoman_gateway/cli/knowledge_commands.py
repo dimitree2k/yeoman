@@ -5,6 +5,7 @@ The surface is exactly::
     yeoman knowledge migration inspect     --contacts SNAPSHOT --memory SNAPSHOT
     yeoman knowledge migration build       --contacts SNAPSHOT --memory SNAPSHOT \\
                                            --target NEW_DB --manifest NEW_JSON
+    yeoman knowledge migration inspect-legacy-nodes --target KNOWLEDGE_DB --out AUDIT_JSON
     yeoman knowledge migration verify      --target DB --manifest JSON
     yeoman knowledge migration inspect-v1  --source V1.db --processing PROCESSING.db
     yeoman knowledge migration upgrade-v1  --source V1.db --processing PROCESSING.db \\
@@ -12,6 +13,8 @@ The surface is exactly::
     yeoman knowledge migration verify-v1   --target NEW-V2.db --manifest NEW.json
     yeoman knowledge migration propose-bindings --source V1.db --processing PROCESSING.db \
                                            --out proposals.json
+    yeoman knowledge migration propose-legacy-links --audit AUDIT_JSON \
+                                           --target KNOWLEDGE_SNAPSHOT --out candidates.json
     yeoman knowledge migration upgrade-v1  ... --binding-approvals proposals.json
 
 Everything here is offline and explicit: no default paths, no provider or bootstrap
@@ -27,6 +30,7 @@ next to the other command modules.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Final, NoReturn
 
@@ -40,8 +44,11 @@ from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     UnsupportedSchema,
     VerificationReport,
+    apply_legacy_link_decisions,
+    inspect_legacy_nodes,
     inspect_sources,
     migrate_sources,
+    reconstruct_legacy_statements,
     verify_target,
 )
 from yeoman_gateway.knowledge._upgrade import (
@@ -53,6 +60,7 @@ from yeoman_gateway.knowledge._upgrade import (
     upgrade_v1,
     verify_upgrade,
 )
+from yeoman_gateway.knowledge.api import propose_legacy_links
 
 from .core import app, console
 
@@ -77,6 +85,14 @@ _REASON_CODES: Final[dict[str, str]] = {
     "manifest_missing": "manifest_mismatch",
     "manifest_invalid": "manifest_mismatch",
     "not_a_database": "source_error",
+    "apply_invalid": "approval_error",
+    "apply_binding_missing": "semantics_error",
+    "apply_binding_conflict": "semantics_error",
+    "apply_contact_missing": "semantics_error",
+    "apply_target_missing": "semantics_error",
+    "apply_conflict": "semantics_error",
+    "apply_checkpoint_failed": "semantics_error",
+    "canonical_conflict": "semantics_error",
 }
 
 #: v1->v2 upgrade reason codes.  Kept separate so the two offline paths cannot be
@@ -140,6 +156,227 @@ def migration_inspect(
     except MigrationSourceError as exc:
         _fail(_reason_code(exc.reason), exc.detail, exc.reason)
     _print_inventory(inventory)
+
+
+@migration_app.command("inspect-legacy-nodes")
+def migration_inspect_legacy_nodes(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    out: Path = typer.Option(..., "--out", help="New private, text-free audit manifest"),
+    inbound_dir: Path | None = typer.Option(
+        None, "--inbound-dir", help="Optional inbound JSONL source directory"
+    ),
+    processing_db: Path | None = typer.Option(
+        None, "--processing-db", help="Optional ProcessingStore source database"
+    ),
+) -> None:
+    """Inventory every legacy node without writing the database or reading node text."""
+    try:
+        inventory = inspect_legacy_nodes(
+            target=target,
+            inbound_dir=inbound_dir,
+            processing_db=processing_db,
+        )
+    except MigrationSourceError as exc:
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(inventory.to_json())
+            handle.write("\n")
+    except FileExistsError:
+        _fail("target_exists", f"audit manifest already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot write audit manifest: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    counts = inventory.counts()
+    _line(
+        f"legacy nodes: {counts['nodes']}  active: {counts['active']}"
+        f"  source ids: {counts['with_source_message_id']}"
+        f"  senders: {counts['with_sender_id']}"
+        f"  contacts: {counts['with_contact_id']}"
+    )
+    _line(
+        f"fact shells: {counts['with_fact_shell']}"
+        f"  statements: {counts['with_statement']}"
+    )
+    source_status = "  ".join(
+        f"{status}={count}" for status, count in inventory.source_status_counts
+    ) or "none"
+    _line(
+        "source status: " + source_status
+    )
+    _line(f"manifest: {output}  (private; node text omitted)")
+
+
+@migration_app.command("propose-legacy-links")
+def migration_propose_legacy_links(
+    audit: Path = typer.Option(..., "--audit", help="Private legacy-node audit JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge snapshot to read"),
+    out: Path = typer.Option(..., "--out", help="New private candidate manifest JSON"),
+) -> None:
+    """Write one text-free owner-review candidate row per audited legacy node."""
+    try:
+        manifest = propose_legacy_links(audit, target)
+    except MigrationSourceError as exc:
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(manifest.to_json())
+            handle.write("\n")
+    except FileExistsError:
+        _fail("target_exists", f"candidate manifest already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot write candidate manifest: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    states = "  ".join(
+        f"{state}={count}" for state, count in manifest.candidate_state_counts.items()
+    ) or "none"
+    dispositions = "  ".join(
+        f"{disposition}={count}"
+        for disposition, count in manifest.disposition_counts.items()
+    ) or "none"
+    _line(f"candidate nodes: {manifest.counts['nodes']}")
+    _line("candidate states: " + states)
+    _line("dispositions: " + dispositions)
+    _line(f"manifest: {output}  (private; node text omitted)")
+
+
+@migration_app.command("apply-legacy-link-decisions")
+def migration_apply_legacy_link_decisions(
+    candidates: Path = typer.Option(..., "--candidates", help="Private candidate manifest JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge database or snapshot to update"),
+    out: Path = typer.Option(..., "--out", help="New private apply audit JSON"),
+    approval_ref: str = typer.Option(..., "--approval-ref", help="Owner approval reference"),
+) -> None:
+    """Apply verified transport decisions to existing quarantine rows only."""
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("target_exists", f"apply audit already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot reserve apply audit: {output}: {exc}")
+
+    try:
+        report = apply_legacy_link_decisions(
+            candidates,
+            target,
+            approval_ref=approval_ref,
+        )
+    except MigrationSourceError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(report.to_json())
+            handle.write("\n")
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail("source_error", f"cannot write apply audit: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    _line(f"linked candidates: {report.linked_candidates}")
+    _line(f"applied ledger decisions: {report.applied}")
+    _line(f"already applied: {report.already_applied}")
+    _line("statement rows changed: 0  speaker roles changed: 0")
+    _line(f"apply audit: {output}  (private; node text omitted)")
+
+
+@migration_app.command("reconstruct-legacy-statements")
+def migration_reconstruct_legacy_statements(
+    candidates: Path = typer.Option(..., "--candidates", help="Private candidate manifest JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge database or snapshot to update"),
+    out: Path = typer.Option(..., "--out", help="New private reconstruction audit JSON"),
+    approval_ref: str = typer.Option(..., "--approval-ref", help="Owner approval reference"),
+) -> None:
+    """Reconstruct canonical facts and verified speaker roles for linked candidates."""
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("target_exists", f"reconstruction audit already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot reserve reconstruction audit: {output}: {exc}")
+
+    try:
+        report = reconstruct_legacy_statements(
+            candidates,
+            target,
+            approval_ref=approval_ref,
+        )
+    except MigrationSourceError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(report.to_json())
+            handle.write("\n")
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail("source_error", f"cannot write reconstruction audit: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    _line(f"linked candidates: {report.linked_candidates}")
+    _line(f"reconstructed statements: {report.reconstructed}")
+    _line(f"already reconstructed: {report.already_reconstructed}")
+    _line(f"fact rows created: {report.fact_rows_created}")
+    _line(f"speaker roles created: {report.speaker_roles_created}")
+    _line(f"other roles created: {report.other_roles_created}")
+    _line(f"untouched candidates: {report.untouched_candidates}")
+    _line(f"apply audit: {output}  (private; node text omitted)")
 
 
 @migration_app.command("build")

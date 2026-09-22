@@ -109,6 +109,30 @@ class TestPersistCandidatePersonProfile:
         assert any("Frank" in h.entry.content for h in hits)
         assert contacts.store.get_fields(contact_id) == []
 
+    def test_person_profile_capture_does_not_write_legacy_field(
+        self, tmp_path: Path
+    ) -> None:
+        jid = "491786@s.whatsapp.net"
+        svc = _service_with_contact(tmp_path, jid, "frank-uuid-001")
+
+        candidate = ExtractedCandidate(
+            sector="semantic",
+            kind="person_profile",
+            content="Frank: is a doctor",
+            salience=0.9,
+            confidence=0.9,
+        )
+        assert svc._persist_candidate(
+            channel="whatsapp",
+            chat_id="group-a",
+            sender_id=jid,
+            role="user",
+            source_message_id=None,
+            candidate=candidate,
+        )
+
+        svc._contacts.upsert_field.assert_not_called()
+
     def test_person_profile_falls_back_to_user_scope_when_no_contact(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)  # no contacts wired
 
