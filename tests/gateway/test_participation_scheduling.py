@@ -19,11 +19,6 @@ CHAT = "synthetic@g.us"
 OTHER = "other@g.us"
 
 
-#: Newly created opportunities in these tests are "now"; only the expiry test moves
-#: the clock forward explicitly.
-_NOW_MS = int(time.time() * 1000)
-
-
 def _opportunity(
     *,
     chat_id: str = CHAT,
@@ -31,7 +26,7 @@ def _opportunity(
     revision: int = 1,
     trigger: str = "inbound",
     epoch: int = 1,
-    created_ms: int = _NOW_MS,
+    created_ms: int | None = None,
 ) -> ParticipationOpportunity:
     return ParticipationOpportunity(
         opportunity_id=opportunity_id_for(
@@ -48,7 +43,7 @@ def _opportunity(
         source_event_ids=sources,
         observed_revision=revision,
         activation_epoch=epoch,
-        created_at_ms=created_ms,
+        created_at_ms=int(time.time() * 1000) if created_ms is None else created_ms,
     )
 
 
@@ -64,7 +59,10 @@ class _Recorder:
 
 
 @pytest.mark.asyncio
-async def test_offer_returns_while_the_handler_is_blocked() -> None:
+async def test_offer_returns_while_the_handler_is_blocked(monkeypatch) -> None:
+    # Simulate collection taking longer than the scheduler's 120-second TTL.
+    now = time.time() + 121
+    monkeypatch.setattr(time, "time", lambda: now)
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def handle(opportunity):
@@ -413,7 +411,7 @@ async def test_shutdown_awaits_running_handlers() -> None:
 @pytest.mark.asyncio
 async def test_stale_candidate_is_dropped_at_dequeue() -> None:
     recorder = _Recorder()
-    clock = {"now": _NOW_MS}
+    clock = {"now": 1_000}
     calls: list[str] = []
 
     async def handle(opportunity):
@@ -426,8 +424,8 @@ async def test_stale_candidate_is_dropped_at_dequeue() -> None:
         clock_ms=lambda: clock["now"],
     )
     # Not started yet: the candidate waits, then time passes beyond its TTL.
-    assert scheduler.offer(_opportunity(created_ms=_NOW_MS)) is True
-    clock["now"] = _NOW_MS + 60_000
+    assert scheduler.offer(_opportunity(created_ms=clock["now"])) is True
+    clock["now"] += 60_000
     await scheduler.start()
     try:
         for _ in range(50):
