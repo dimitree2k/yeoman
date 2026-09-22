@@ -35,7 +35,7 @@ from yeoman_gateway.core.intents import (
     SendReactionIntent,
     SetTypingIntent,
 )
-from yeoman_gateway.core.models import InboundEvent
+from yeoman_gateway.core.models import InboundEvent, OutboundEvent
 from yeoman_gateway.core.orchestrator import Orchestrator
 from yeoman_gateway.cron.service import CronJobDeferredError, CronJobSkippedError, CronService
 from yeoman_gateway.cron.types import CronJob
@@ -62,6 +62,7 @@ from yeoman_gateway.policy.capabilities import policy_known_tools
 from yeoman_gateway.policy.persona import load_persona_text
 from yeoman_gateway.processing.dispatch import (
     SERVICE_PRINCIPALS,
+    ForwardDispatchError,
     ServiceEffectProducer,
     disable_non_migrated_tools,
 )
@@ -309,10 +310,32 @@ class OrchestratorService:
                 case SetTypingIntent():
                     await self._typing_adapter(intent.channel, intent.chat_id, intent.enabled)
                 case SendOutboundIntent():
-                    if self._effect_router is not None and await self._effect_router.submit_outbound(
-                        intent, principal=principal
-                    ):
-                        continue
+                    if self._effect_router is not None:
+                        try:
+                            if await self._effect_router.submit_outbound(
+                                intent, principal=principal
+                            ):
+                                continue
+                        except ForwardDispatchError as exc:
+                            error_intent = SendOutboundIntent(
+                                event=OutboundEvent(
+                                    channel="whatsapp",
+                                    chat_id=exc.source_chat_id,
+                                    content=exc.user_message,
+                                    reply_to=exc.source_message_id,
+                                    metadata={"message_id": exc.source_message_id},
+                                )
+                            )
+                            managed = await self._effect_router.submit_outbound(
+                                error_intent, principal=principal
+                            )
+                            if not managed:
+                                logger.warning(
+                                    "forward_error_not_managed chat={} source_message_id={}",
+                                    exc.source_chat_id,
+                                    exc.source_message_id,
+                                )
+                            continue
                     await self._bus.publish_outbound(
                         OutboundMessage(
                             channel=intent.event.channel,
@@ -2629,6 +2652,8 @@ def build_gateway_runtime(
         persona_evolution_state_db_path=persona_evolution_state_db_path,
         session_manager=session_manager,
         service_effects=service_effects,
+        forward_target_resolver=policy_adapter.resolve_whatsapp_group,
+        forward_source_lookup=channels.lookup_message,
     )
 
     def _choose_voice_phrase(job: CronJob, phrases: list[str]) -> str:

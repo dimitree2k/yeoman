@@ -10,6 +10,7 @@ from yeoman_gateway.app.bootstrap import OrchestratorService
 from yeoman_gateway.bus.events import InboundMessage, OutboundMessage
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import OutboundEvent
+from yeoman_gateway.processing.dispatch import ForwardDispatchError
 from yeoman_shared.telemetry import InMemoryTelemetry
 
 
@@ -42,6 +43,18 @@ class _Bus:
 
 class _Memory:
     pass
+
+
+class _ForwardRouter:
+    def __init__(self) -> None:
+        self.calls: list[SendOutboundIntent] = []
+
+    async def submit_outbound(self, intent: SendOutboundIntent, *, principal: str) -> bool:
+        del principal
+        self.calls.append(intent)
+        if "forward_message" in intent.event.metadata:
+            raise ForwardDispatchError("source@g.us", "source-1", "safe forward error")
+        return True
 
 
 class _RaiseThenReply:
@@ -139,6 +152,46 @@ async def test_partial_dispatch_does_not_replay_or_publish_error_text() -> None:
 
     assert [message.content for message in bus.outbound] == ["first intent"]
     assert all(not message.content.startswith("Sorry, I encountered an error:") for message in bus.outbound)
+
+
+@pytest.mark.asyncio
+async def test_forward_dispatch_failure_is_reported_through_managed_text() -> None:
+    bus = _Bus([])
+    router = _ForwardRouter()
+    service = OrchestratorService(
+        bus=bus,
+        orchestrator=None,  # type: ignore[arg-type]
+        typing_adapter=lambda channel, chat_id, enabled: None,
+        telemetry=InMemoryTelemetry(),
+        memory=_Memory(),
+        effect_router=router,  # type: ignore[arg-type]
+    )
+
+    await service._dispatch_intents(
+        [
+            SendOutboundIntent(
+                event=OutboundEvent(
+                    channel="whatsapp",
+                    chat_id="target@g.us",
+                    content="",
+                    metadata={
+                        "message_id": "command-1",
+                        "forward_message": {
+                            "source_chat_id": "source@g.us",
+                            "source_message_id": "source-1",
+                        },
+                    },
+                )
+            )
+        ],
+        principal="owner",
+    )
+
+    assert len(router.calls) == 2
+    assert router.calls[1].event.chat_id == "source@g.us"
+    assert router.calls[1].event.content == "safe forward error"
+    assert "forward_message" not in router.calls[1].event.metadata
+    assert bus.outbound == []
 
 
 @pytest.mark.asyncio

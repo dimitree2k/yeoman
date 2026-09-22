@@ -22,6 +22,11 @@ from yeoman_gateway.pipeline.approval import ApprovalMiddleware
 from yeoman_gateway.pipeline.archive import ArchiveMiddleware
 from yeoman_gateway.pipeline.contacts import ContactsMiddleware
 from yeoman_gateway.pipeline.dedup import DeduplicationMiddleware
+from yeoman_gateway.pipeline.forward import (
+    ForwardCommandMiddleware,
+    ForwardSourceLookup,
+    ForwardTargetResolver,
+)
 from yeoman_gateway.pipeline.idea_capture import IdeaCaptureMiddleware
 from yeoman_gateway.pipeline.implicit_address import ImplicitBotAddressMiddleware
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware
@@ -94,6 +99,8 @@ class Orchestrator:
         persona_evolution_state_db_path: Path | None = None,
         session_manager: "SessionManager | None" = None,
         service_effects: object | None = None,
+        forward_target_resolver: ForwardTargetResolver | None = None,
+        forward_source_lookup: ForwardSourceLookup | None = None,
     ) -> None:
         layers: list[Middleware] = [
             NormalizationMiddleware(),
@@ -116,6 +123,10 @@ class Orchestrator:
             ),
             AdminCommandMiddleware(handler=policy_admin_handler),
             PolicyMiddleware(policy=policy),
+            ForwardCommandMiddleware(
+                target_resolver=forward_target_resolver,
+                source_lookup=forward_source_lookup,
+            ),
             ImplicitBotAddressMiddleware(session_manager=session_manager),
             ReplyBudgetMiddleware(),
         ])
