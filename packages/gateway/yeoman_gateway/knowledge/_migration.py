@@ -1372,6 +1372,25 @@ _LEGACY_NODE_REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "knowledge_statements",
     "knowledge_quarantine",
 )
+_LEGACY_NODE_REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "memory2_nodes": (
+        "id",
+        "kind",
+        "sector",
+        "scope_type",
+        "scope_key",
+        "channel",
+        "chat_id",
+        "sender_id",
+        "contact_id",
+        "source_message_id",
+        "source_role",
+        "is_deleted",
+    ),
+    "memory2_facts": ("fact_id",),
+    "knowledge_statements": ("statement_id",),
+    "knowledge_quarantine": ("source_table", "source_pk", "reason"),
+}
 
 _SCOPE_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^([a-z0-9_]+):(.+)$")
 
@@ -1569,7 +1588,6 @@ class LegacyNodeInventory:
     by_kind: tuple[tuple[str, int, int], ...]
     quarantine_reasons: tuple[tuple[str, int], ...]
     source_status_counts: tuple[tuple[str, int], ...]
-    orphan_quarantine_rows: int = 0
 
     def counts(self) -> dict[str, int]:
         return {
@@ -1580,7 +1598,6 @@ class LegacyNodeInventory:
             "with_contact_id": sum(bool(node.contact_id) for node in self.nodes),
             "with_fact_shell": sum(node.has_fact_shell for node in self.nodes),
             "with_statement": sum(node.has_statement for node in self.nodes),
-            "orphan_quarantine_rows": self.orphan_quarantine_rows,
         }
 
     def to_json(self) -> str:
@@ -1610,41 +1627,111 @@ def _legacy_source_index(
     *,
     inbound_dir: Path | None,
     processing_db: Path | None,
-) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
     """Index source identities without carrying source content into the audit."""
-    fingerprints: dict[str, set[str]] = {}
+    variants: dict[tuple[str, str], set[str]] = {}
     classes: dict[str, set[str]] = {}
-    inventory = inspect_lineage_sources(
-        inbound_dir=inbound_dir,
-        processing_db=processing_db,
-    )
-    for decision in inventory.decisions:
-        if decision.source_class not in {"inbound_archive", "processing_events"}:
-            continue
-        source_ref = decision.source_ref.strip()
-        if not source_ref:
-            continue
-        fingerprints.setdefault(source_ref, set()).add(decision.fingerprint)
-        classes.setdefault(source_ref, set()).add(decision.source_class)
-    return fingerprints, classes
+    if processing_db is not None:
+        sidecars_before = _read_sidecars(processing_db)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = _connect_readonly(processing_db)
+            _require_integrity(connection, processing_db)
+            tables = set(_table_names(connection))
+            if "events" not in tables:
+                raise MigrationSourceError(
+                    "missing_required_table", "processing source requires an events table"
+                )
+            columns = set(_columns(connection, "events"))
+            required = {
+                "event_id",
+                "source_message_id",
+                "kind",
+                "revision",
+                "chat_id",
+                "principal",
+                "channel",
+                "occurred_ms",
+            }
+            missing = sorted(required - columns)
+            if missing:
+                raise MigrationSourceError(
+                    "missing_required_column",
+                    "processing events missing: " + ", ".join(missing),
+                )
+            rows = connection.execute(
+                "SELECT source_message_id, kind, revision, chat_id, principal, channel,"
+                " occurred_ms FROM events WHERE source_message_id IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                source_ref = _legacy_text_or_none(row["source_message_id"])
+                if source_ref is None:
+                    continue
+                source_class = "processing_events"
+                variants.setdefault((source_class, source_ref), set()).add(
+                    lineage_fingerprint(
+                        source_class,
+                        source_ref,
+                        row["kind"],
+                        row["revision"],
+                        row["chat_id"],
+                        row["principal"],
+                        row["channel"],
+                        row["occurred_ms"],
+                    )
+                )
+                classes.setdefault(source_ref, set()).add(source_class)
+        finally:
+            if connection is not None:
+                connection.close()
+            _remove_read_sidecars(processing_db, sidecars_before)
+
+    if inbound_dir is not None:
+        for path in sorted(inbound_dir.glob("*.jsonl")):
+            chat_key = path.stem
+            for index, record in enumerate(_iter_jsonl(path)):
+                if index == 0 and "chat_id" in record:
+                    continue
+                source_ref = _legacy_text_or_none(
+                    record.get("message_id") or record.get("id")
+                )
+                if source_ref is None:
+                    continue
+                source_class = "inbound_archive"
+                variants.setdefault((source_class, source_ref), set()).add(
+                    lineage_fingerprint(
+                        source_class,
+                        source_ref,
+                        record.get("timestamp"),
+                        chat_key,
+                        record.get("from") or record.get("sender"),
+                        record.get("role"),
+                    )
+                )
+                classes.setdefault(source_ref, set()).add(source_class)
+    return variants, classes
 
 
 def _legacy_source_status(
     source_message_id: str | None,
     *,
     source_checked: bool,
-    fingerprints: Mapping[str, set[str]],
+    variants: Mapping[tuple[str, str], set[str]],
     classes: Mapping[str, set[str]],
 ) -> tuple[str, tuple[str, ...]]:
     if not source_message_id:
         return "missing", ()
     if not source_checked:
         return "unverified", ()
-    source_fingerprints = fingerprints.get(source_message_id, set())
     source_classes = tuple(sorted(classes.get(source_message_id, set())))
-    if not source_fingerprints:
+    matching_variants = [
+        fingerprints
+        for (source_class, source_ref), fingerprints in variants.items()
+        if source_ref == source_message_id
+    ]
+    if not matching_variants:
         return "missing", source_classes
-    if len(source_fingerprints) > 1:
+    if any(len(fingerprints) > 1 for fingerprints in matching_variants):
         return "conflict", source_classes
     # An id-only match is deliberately not a resolved attribution.  Chat, sender,
     # timestamp and revision matching belongs to the next audit phase.
@@ -1670,10 +1757,10 @@ def inspect_legacy_nodes(
         _require_snapshot_file(processing_path)
 
     source_checked = inbound_path is not None or processing_path is not None
-    fingerprints: dict[str, set[str]] = {}
+    variants: dict[tuple[str, str], set[str]] = {}
     source_classes: dict[str, set[str]] = {}
     if source_checked:
-        fingerprints, source_classes = _legacy_source_index(
+        variants, source_classes = _legacy_source_index(
             inbound_dir=inbound_path,
             processing_db=processing_path,
         )
@@ -1690,12 +1777,26 @@ def inspect_legacy_nodes(
                 "missing_required_table",
                 f"legacy node audit requires: {', '.join(missing)}",
             )
+        for table, required_columns in _LEGACY_NODE_REQUIRED_COLUMNS.items():
+            missing_columns = sorted(
+                set(required_columns) - set(_columns(connection, table))
+            )
+            if missing_columns:
+                raise MigrationSourceError(
+                    "missing_required_column",
+                    f"{table} missing: {', '.join(missing_columns)}",
+                )
 
-        quarantine_rows = connection.execute(
-            "SELECT source_pk, reason FROM knowledge_quarantine"
-            " WHERE source_table = ? ORDER BY source_pk, reason",
-            ("memory2_nodes",),
-        ).fetchall()
+        try:
+            quarantine_rows = connection.execute(
+                "SELECT source_pk, reason FROM knowledge_quarantine"
+                " WHERE source_table = ? ORDER BY source_pk, reason",
+                ("memory2_nodes",),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not read legacy node quarantine rows"
+            ) from exc
         reasons_by_node: dict[str, list[str]] = {}
         for row in quarantine_rows:
             reasons_by_node.setdefault(str(row["source_pk"]), []).append(str(row["reason"]))
@@ -1706,24 +1807,26 @@ def inspect_legacy_nodes(
                 if LEGACY_NO_FACT_REASON in reasons
             )
         )
-        if not legacy_ids:
-            raise MigrationSourceError(
-                "empty_population",
-                f"no nodes carry quarantine reason {LEGACY_NO_FACT_REASON}",
-            )
-
-        placeholders = ", ".join("?" for _ in legacy_ids)
-        rows = connection.execute(
-            "SELECT n.id, n.kind, n.sector, n.scope_type, n.scope_key, n.channel,"
-            " n.chat_id, n.sender_id, n.contact_id, n.source_message_id, n.source_role,"
-            " n.is_deleted, CASE WHEN f.fact_id IS NULL THEN 0 ELSE 1 END AS has_fact_shell,"
-            " CASE WHEN s.statement_id IS NULL THEN 0 ELSE 1 END AS has_statement"
-            " FROM memory2_nodes AS n"
-            " LEFT JOIN memory2_facts AS f ON f.fact_id = n.id"
-            " LEFT JOIN knowledge_statements AS s ON s.statement_id = n.id"
-            f" WHERE n.id IN ({placeholders}) ORDER BY n.id",
-            legacy_ids,
-        ).fetchall()
+        if legacy_ids:
+            placeholders = ", ".join("?" for _ in legacy_ids)
+            try:
+                rows = connection.execute(
+                    "SELECT n.id, n.kind, n.sector, n.scope_type, n.scope_key, n.channel,"
+                    " n.chat_id, n.sender_id, n.contact_id, n.source_message_id, n.source_role,"
+                    " n.is_deleted, CASE WHEN f.fact_id IS NULL THEN 0 ELSE 1 END AS has_fact_shell,"
+                    " CASE WHEN s.statement_id IS NULL THEN 0 ELSE 1 END AS has_statement"
+                    " FROM memory2_nodes AS n"
+                    " LEFT JOIN memory2_facts AS f ON f.fact_id = n.id"
+                    " LEFT JOIN knowledge_statements AS s ON s.statement_id = n.id"
+                    f" WHERE n.id IN ({placeholders}) ORDER BY n.id",
+                    legacy_ids,
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise MigrationSourceError(
+                    "unsupported_schema", "could not read legacy node metadata"
+                ) from exc
+        else:
+            rows = []
         if len(rows) != len(legacy_ids):
             raise MigrationSourceError(
                 "orphan_legacy_node",
@@ -1736,7 +1839,7 @@ def inspect_legacy_nodes(
             source_status, matched_classes = _legacy_source_status(
                 source_message_id,
                 source_checked=source_checked,
-                fingerprints=fingerprints,
+                variants=variants,
                 classes=source_classes,
             )
             records.append(

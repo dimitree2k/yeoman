@@ -28,6 +28,7 @@ next to the other command modules.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Final, NoReturn
 
@@ -166,14 +167,24 @@ def migration_inspect_legacy_nodes(
         _fail(_reason_code(exc.reason), exc.detail, exc.reason)
 
     output = out.expanduser()
+    descriptor: int | None = None
     try:
-        with output.open("x", encoding="utf-8") as handle:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
             handle.write(inventory.to_json())
             handle.write("\n")
     except FileExistsError:
         _fail("target_exists", f"audit manifest already exists: {output}")
     except OSError as exc:
         _fail("source_error", f"cannot write audit manifest: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
     counts = inventory.counts()
     _line(
@@ -185,11 +196,12 @@ def migration_inspect_legacy_nodes(
     _line(
         f"fact shells: {counts['with_fact_shell']}"
         f"  statements: {counts['with_statement']}"
-        f"  orphan quarantine rows: {counts['orphan_quarantine_rows']}"
     )
+    source_status = "  ".join(
+        f"{status}={count}" for status, count in inventory.source_status_counts
+    ) or "none"
     _line(
-        "source status: "
-        + "  ".join(f"{status}={count}" for status, count in inventory.source_status_counts)
+        "source status: " + source_status
     )
     _line(f"manifest: {output}  (private; node text omitted)")
 

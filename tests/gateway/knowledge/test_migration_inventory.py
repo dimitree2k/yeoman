@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -401,23 +402,64 @@ def test_inspect_legacy_nodes_marks_id_only_source_matches_partial(tmp_path: Pat
     connection = sqlite3.connect(processing)
     try:
         connection.execute(
-            "CREATE TABLE events (event_id TEXT PRIMARY KEY, kind TEXT, revision INTEGER,"
-            " direction TEXT, chat_id TEXT, account TEXT)"
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, source_message_id TEXT,"
+            " kind TEXT, revision INTEGER, direction TEXT, chat_id TEXT, principal TEXT,"
+            " channel TEXT, occurred_ms INTEGER)"
         )
         connection.execute(
-            "INSERT INTO events VALUES (?, 'message', 1, 'in', 'group-synthetic', 'default')",
-            ("message-aaaa",),
+            "INSERT INTO events VALUES (?, ?, 'message', 1, 'in', 'group-synthetic',"
+            " '4910000000001', 'whatsapp', 1)",
+            ("event-aaaa", "message-aaaa"),
         )
         connection.commit()
     finally:
         connection.close()
 
+    processing_before = sorted(item.name for item in processing.parent.iterdir())
     inventory = inspect_legacy_nodes(target, processing_db=processing)
 
     assert dict(inventory.source_status_counts) == {"missing": 2, "partial": 1}
     matched = next(node for node in inventory.nodes if node.source_message_id == "message-aaaa")
     assert matched.source_status == "partial"
     assert matched.source_classes == ("processing_events",)
+    assert sorted(item.name for item in processing.parent.iterdir()) == processing_before
+
+    inbound = tmp_path / "inbound"
+    inbound.mkdir()
+    (inbound / "whatsapp_group-synthetic.jsonl").write_text(
+        '{"message_id":"message-aaaa","timestamp":1,"from":"4910000000001",'
+        '"role":"user"}\n',
+        encoding="utf-8",
+    )
+    inventory = inspect_legacy_nodes(
+        target,
+        inbound_dir=inbound,
+        processing_db=processing,
+    )
+    matched = next(node for node in inventory.nodes if node.source_message_id == "message-aaaa")
+    assert matched.source_status == "partial"
+    assert matched.source_classes == ("inbound_archive", "processing_events")
+
+
+def test_inspect_legacy_nodes_rejects_incomplete_required_columns(tmp_path: Path) -> None:
+    target = tmp_path / "malformed.db"
+    connection = sqlite3.connect(target)
+    try:
+        connection.execute("CREATE TABLE memory2_nodes (id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE memory2_facts (fact_id TEXT PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE knowledge_statements (statement_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            "CREATE TABLE knowledge_quarantine (source_table TEXT, source_pk TEXT, reason TEXT)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(MigrationSourceError) as error:
+        inspect_legacy_nodes(target)
+    assert error.value.reason == "missing_required_column"
 
 
 def test_inspect_legacy_nodes_cli_writes_private_manifest(tmp_path: Path) -> None:
@@ -450,6 +492,7 @@ def test_inspect_legacy_nodes_cli_writes_private_manifest(tmp_path: Path) -> Non
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["counts"]["nodes"] == 3
     assert "synthetic note one" not in output.read_text(encoding="utf-8")
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert _stat(target) == before
 
     repeated = runner.invoke(
