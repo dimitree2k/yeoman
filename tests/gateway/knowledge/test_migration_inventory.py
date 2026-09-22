@@ -33,6 +33,7 @@ from yeoman_gateway.cli.knowledge_commands import knowledge_app
 from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     UnsupportedSchema,
+    inspect_legacy_nodes,
     inspect_sources,
     migrate_sources,
     semantic_digest,
@@ -338,6 +339,132 @@ def test_manifest_lists_every_source_table(tmp_path: Path) -> None:
     assert verification.counts_match
     assert verification.mismatches == ()
     assert _stat(target) == before  # verify never writes to the target
+
+
+def test_inspect_legacy_nodes_is_read_only_and_omits_content(tmp_path: Path) -> None:
+    sources = legacy_snapshot_factory(tmp_path)
+    target, manifest = _build_paths(tmp_path)
+    migrate_sources(
+        contacts_path=sources.contacts,
+        memory_path=sources.memory,
+        target=target,
+        manifest=manifest,
+    )
+    before = _stat(target)
+    inventory = inspect_legacy_nodes(target)
+
+    counts = inventory.counts()
+    assert counts["nodes"] == 3
+    assert counts["active"] == 2
+    assert counts["with_source_message_id"] == 3
+    assert counts["with_sender_id"] == 3
+    assert counts["with_contact_id"] == 1
+    assert counts["with_fact_shell"] == 0
+    assert counts["with_statement"] == 0
+    assert len(inventory.nodes) == counts["nodes"]
+    assert dict(inventory.source_status_counts) == {"unverified": 3}
+    assert dict(inventory.quarantine_reasons)["legacy-node-without-fact-shell"] == 3
+
+    payload = json.loads(inventory.to_json())
+    assert len(payload["nodes"]) == 3
+    assert all("content" not in row for row in payload["nodes"])
+    assert "synthetic note one" not in inventory.to_json()
+    assert _stat(target) == before
+    assert target.with_name(target.name + "-wal").exists() is False
+    assert target.with_name(target.name + "-shm").exists() is False
+
+
+def test_inspect_legacy_nodes_rejects_missing_required_tables(tmp_path: Path) -> None:
+    target = tmp_path / "incomplete.db"
+    connection = sqlite3.connect(target)
+    try:
+        connection.execute("CREATE TABLE memory2_nodes (id TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(MigrationSourceError) as error:
+        inspect_legacy_nodes(target)
+    assert error.value.reason == "missing_required_table"
+
+
+def test_inspect_legacy_nodes_marks_id_only_source_matches_partial(tmp_path: Path) -> None:
+    sources = legacy_snapshot_factory(tmp_path)
+    target, manifest = _build_paths(tmp_path)
+    migrate_sources(
+        contacts_path=sources.contacts,
+        memory_path=sources.memory,
+        target=target,
+        manifest=manifest,
+    )
+    processing = tmp_path / "processing.db"
+    connection = sqlite3.connect(processing)
+    try:
+        connection.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, kind TEXT, revision INTEGER,"
+            " direction TEXT, chat_id TEXT, account TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events VALUES (?, 'message', 1, 'in', 'group-synthetic', 'default')",
+            ("message-aaaa",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    inventory = inspect_legacy_nodes(target, processing_db=processing)
+
+    assert dict(inventory.source_status_counts) == {"missing": 2, "partial": 1}
+    matched = next(node for node in inventory.nodes if node.source_message_id == "message-aaaa")
+    assert matched.source_status == "partial"
+    assert matched.source_classes == ("processing_events",)
+
+
+def test_inspect_legacy_nodes_cli_writes_private_manifest(tmp_path: Path) -> None:
+    sources = legacy_snapshot_factory(tmp_path)
+    target, manifest = _build_paths(tmp_path)
+    migrate_sources(
+        contacts_path=sources.contacts,
+        memory_path=sources.memory,
+        target=target,
+        manifest=manifest,
+    )
+    output = tmp_path / "legacy-node-audit.json"
+    before = _stat(target)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "inspect-legacy-nodes",
+            "--target",
+            str(target),
+            "--out",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "legacy nodes: 3" in result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["counts"]["nodes"] == 3
+    assert "synthetic note one" not in output.read_text(encoding="utf-8")
+    assert _stat(target) == before
+
+    repeated = runner.invoke(
+        knowledge_app,
+        [
+            "migration",
+            "inspect-legacy-nodes",
+            "--target",
+            str(target),
+            "--out",
+            str(output),
+        ],
+    )
+    assert repeated.exit_code != 0
+    assert "target_exists" in repeated.output
 
 
 def test_imported_primary_keys_are_unchanged(tmp_path: Path) -> None:

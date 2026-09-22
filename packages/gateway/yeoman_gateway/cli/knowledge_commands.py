@@ -5,6 +5,7 @@ The surface is exactly::
     yeoman knowledge migration inspect     --contacts SNAPSHOT --memory SNAPSHOT
     yeoman knowledge migration build       --contacts SNAPSHOT --memory SNAPSHOT \\
                                            --target NEW_DB --manifest NEW_JSON
+    yeoman knowledge migration inspect-legacy-nodes --target KNOWLEDGE_DB --out AUDIT_JSON
     yeoman knowledge migration verify      --target DB --manifest JSON
     yeoman knowledge migration inspect-v1  --source V1.db --processing PROCESSING.db
     yeoman knowledge migration upgrade-v1  --source V1.db --processing PROCESSING.db \\
@@ -40,6 +41,7 @@ from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     UnsupportedSchema,
     VerificationReport,
+    inspect_legacy_nodes,
     inspect_sources,
     migrate_sources,
     verify_target,
@@ -140,6 +142,56 @@ def migration_inspect(
     except MigrationSourceError as exc:
         _fail(_reason_code(exc.reason), exc.detail, exc.reason)
     _print_inventory(inventory)
+
+
+@migration_app.command("inspect-legacy-nodes")
+def migration_inspect_legacy_nodes(
+    target: Path = typer.Option(..., "--target", help="Knowledge database to read"),
+    out: Path = typer.Option(..., "--out", help="New private, text-free audit manifest"),
+    inbound_dir: Path | None = typer.Option(
+        None, "--inbound-dir", help="Optional inbound JSONL source directory"
+    ),
+    processing_db: Path | None = typer.Option(
+        None, "--processing-db", help="Optional ProcessingStore source database"
+    ),
+) -> None:
+    """Inventory every legacy node without writing the database or reading node text."""
+    try:
+        inventory = inspect_legacy_nodes(
+            target=target,
+            inbound_dir=inbound_dir,
+            processing_db=processing_db,
+        )
+    except MigrationSourceError as exc:
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    output = out.expanduser()
+    try:
+        with output.open("x", encoding="utf-8") as handle:
+            handle.write(inventory.to_json())
+            handle.write("\n")
+    except FileExistsError:
+        _fail("target_exists", f"audit manifest already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot write audit manifest: {output}: {exc}")
+
+    counts = inventory.counts()
+    _line(
+        f"legacy nodes: {counts['nodes']}  active: {counts['active']}"
+        f"  source ids: {counts['with_source_message_id']}"
+        f"  senders: {counts['with_sender_id']}"
+        f"  contacts: {counts['with_contact_id']}"
+    )
+    _line(
+        f"fact shells: {counts['with_fact_shell']}"
+        f"  statements: {counts['with_statement']}"
+        f"  orphan quarantine rows: {counts['orphan_quarantine_rows']}"
+    )
+    _line(
+        "source status: "
+        + "  ".join(f"{status}={count}" for status, count in inventory.source_status_counts)
+    )
+    _line(f"manifest: {output}  (private; node text omitted)")
 
 
 @migration_app.command("build")

@@ -50,7 +50,10 @@ __all__ = [
     "LEGACY_NO_FACT_REASON",
     "LEGACY_PROFILE_REASON",
     "LEGACY_UNPROVEN_REASON",
+    "LEGACY_NODE_SOURCE_STATUSES",
     "MANIFEST_VERSION",
+    "LegacyNodeInventory",
+    "LegacyNodeRecord",
     "MigrationInventory",
     "MigrationReport",
     "MigrationSourceError",
@@ -63,6 +66,7 @@ __all__ = [
     "LineageImportReport",
     "LineageInventory",
     "import_lineage",
+    "inspect_legacy_nodes",
     "inspect_lineage_sources",
     "inspect_sources",
     "lineage_fingerprint",
@@ -1355,6 +1359,19 @@ def _jsonable(value: Any) -> Any:
 LEGACY_UNPROVEN_REASON: Final[str] = "unproven-role"
 LEGACY_PROFILE_REASON: Final[str] = "profile-without-source"
 LEGACY_NO_FACT_REASON: Final[str] = "legacy-node-without-fact-shell"
+LEGACY_NODE_SOURCE_STATUSES: Final[tuple[str, ...]] = (
+    "unverified",
+    "partial",
+    "missing",
+    "conflict",
+)
+
+_LEGACY_NODE_REQUIRED_TABLES: Final[tuple[str, ...]] = (
+    "memory2_nodes",
+    "memory2_facts",
+    "knowledge_statements",
+    "knowledge_quarantine",
+)
 
 _SCOPE_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^([a-z0-9_]+):(.+)$")
 
@@ -1515,6 +1532,259 @@ def _resolve_legacy_rows(store: KnowledgeStore, *, created_ms: int) -> _LegacyRe
         unresolved_mentions=unresolved_mentions,
         kept_unproven=kept_unproven,
         notes=tuple(notes),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyNodeRecord:
+    """Private, text-free review row for one retained legacy node."""
+
+    legacy_node_id: str
+    kind: str
+    sector: str
+    scope_type: str
+    scope_key: str
+    channel: str | None
+    chat_id: str | None
+    sender_id: str | None
+    contact_id: str | None
+    source_message_id: str | None
+    source_role: str | None
+    is_deleted: bool
+    has_fact_shell: bool
+    has_statement: bool
+    quarantine_reasons: tuple[str, ...]
+    source_status: str
+    source_classes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyNodeInventory:
+    """Aggregate plus private row metadata for the legacy-node audit."""
+
+    target_path: Path
+    target_fingerprint: str
+    population_reason: str
+    nodes: tuple[LegacyNodeRecord, ...]
+    by_kind: tuple[tuple[str, int, int], ...]
+    quarantine_reasons: tuple[tuple[str, int], ...]
+    source_status_counts: tuple[tuple[str, int], ...]
+    orphan_quarantine_rows: int = 0
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "nodes": len(self.nodes),
+            "active": sum(not node.is_deleted for node in self.nodes),
+            "with_source_message_id": sum(bool(node.source_message_id) for node in self.nodes),
+            "with_sender_id": sum(bool(node.sender_id) for node in self.nodes),
+            "with_contact_id": sum(bool(node.contact_id) for node in self.nodes),
+            "with_fact_shell": sum(node.has_fact_shell for node in self.nodes),
+            "with_statement": sum(node.has_statement for node in self.nodes),
+            "orphan_quarantine_rows": self.orphan_quarantine_rows,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "manifest_version": 1,
+                "target_path": str(self.target_path),
+                "target_fingerprint": self.target_fingerprint,
+                "population_reason": self.population_reason,
+                "counts": self.counts(),
+                "by_kind": [list(item) for item in self.by_kind],
+                "quarantine_reasons": [list(item) for item in self.quarantine_reasons],
+                "source_status_counts": [list(item) for item in self.source_status_counts],
+                "nodes": [_jsonable(node) for node in self.nodes],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def _legacy_text_or_none(value: object) -> str | None:
+    text = "" if value is None else str(value).strip()
+    return text or None
+
+
+def _legacy_source_index(
+    *,
+    inbound_dir: Path | None,
+    processing_db: Path | None,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Index source identities without carrying source content into the audit."""
+    fingerprints: dict[str, set[str]] = {}
+    classes: dict[str, set[str]] = {}
+    inventory = inspect_lineage_sources(
+        inbound_dir=inbound_dir,
+        processing_db=processing_db,
+    )
+    for decision in inventory.decisions:
+        if decision.source_class not in {"inbound_archive", "processing_events"}:
+            continue
+        source_ref = decision.source_ref.strip()
+        if not source_ref:
+            continue
+        fingerprints.setdefault(source_ref, set()).add(decision.fingerprint)
+        classes.setdefault(source_ref, set()).add(decision.source_class)
+    return fingerprints, classes
+
+
+def _legacy_source_status(
+    source_message_id: str | None,
+    *,
+    source_checked: bool,
+    fingerprints: Mapping[str, set[str]],
+    classes: Mapping[str, set[str]],
+) -> tuple[str, tuple[str, ...]]:
+    if not source_message_id:
+        return "missing", ()
+    if not source_checked:
+        return "unverified", ()
+    source_fingerprints = fingerprints.get(source_message_id, set())
+    source_classes = tuple(sorted(classes.get(source_message_id, set())))
+    if not source_fingerprints:
+        return "missing", source_classes
+    if len(source_fingerprints) > 1:
+        return "conflict", source_classes
+    # An id-only match is deliberately not a resolved attribution.  Chat, sender,
+    # timestamp and revision matching belongs to the next audit phase.
+    return "partial", source_classes
+
+
+def inspect_legacy_nodes(
+    target: Path | str,
+    *,
+    inbound_dir: Path | str | None = None,
+    processing_db: Path | str | None = None,
+) -> LegacyNodeInventory:
+    """Inventory all nodes quarantined without a fact shell, read-only and text-free."""
+    target_path = _expand(target)
+    _require_snapshot_file(target_path)
+    inbound_path = _expand(inbound_dir) if inbound_dir is not None else None
+    processing_path = _expand(processing_db) if processing_db is not None else None
+    if inbound_path is not None and not inbound_path.is_dir():
+        raise MigrationSourceError(
+            "missing_source", f"inbound source is not a directory: {inbound_path}"
+        )
+    if processing_path is not None:
+        _require_snapshot_file(processing_path)
+
+    source_checked = inbound_path is not None or processing_path is not None
+    fingerprints: dict[str, set[str]] = {}
+    source_classes: dict[str, set[str]] = {}
+    if source_checked:
+        fingerprints, source_classes = _legacy_source_index(
+            inbound_dir=inbound_path,
+            processing_db=processing_path,
+        )
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        tables = set(_table_names(connection))
+        missing = sorted(set(_LEGACY_NODE_REQUIRED_TABLES) - tables)
+        if missing:
+            raise MigrationSourceError(
+                "missing_required_table",
+                f"legacy node audit requires: {', '.join(missing)}",
+            )
+
+        quarantine_rows = connection.execute(
+            "SELECT source_pk, reason FROM knowledge_quarantine"
+            " WHERE source_table = ? ORDER BY source_pk, reason",
+            ("memory2_nodes",),
+        ).fetchall()
+        reasons_by_node: dict[str, list[str]] = {}
+        for row in quarantine_rows:
+            reasons_by_node.setdefault(str(row["source_pk"]), []).append(str(row["reason"]))
+        legacy_ids = tuple(
+            sorted(
+                node_id
+                for node_id, reasons in reasons_by_node.items()
+                if LEGACY_NO_FACT_REASON in reasons
+            )
+        )
+        if not legacy_ids:
+            raise MigrationSourceError(
+                "empty_population",
+                f"no nodes carry quarantine reason {LEGACY_NO_FACT_REASON}",
+            )
+
+        placeholders = ", ".join("?" for _ in legacy_ids)
+        rows = connection.execute(
+            "SELECT n.id, n.kind, n.sector, n.scope_type, n.scope_key, n.channel,"
+            " n.chat_id, n.sender_id, n.contact_id, n.source_message_id, n.source_role,"
+            " n.is_deleted, CASE WHEN f.fact_id IS NULL THEN 0 ELSE 1 END AS has_fact_shell,"
+            " CASE WHEN s.statement_id IS NULL THEN 0 ELSE 1 END AS has_statement"
+            " FROM memory2_nodes AS n"
+            " LEFT JOIN memory2_facts AS f ON f.fact_id = n.id"
+            " LEFT JOIN knowledge_statements AS s ON s.statement_id = n.id"
+            f" WHERE n.id IN ({placeholders}) ORDER BY n.id",
+            legacy_ids,
+        ).fetchall()
+        if len(rows) != len(legacy_ids):
+            raise MigrationSourceError(
+                "orphan_legacy_node",
+                f"quarantine references {len(legacy_ids) - len(rows)} missing node(s)",
+            )
+
+        records: list[LegacyNodeRecord] = []
+        for row in rows:
+            source_message_id = _legacy_text_or_none(row["source_message_id"])
+            source_status, matched_classes = _legacy_source_status(
+                source_message_id,
+                source_checked=source_checked,
+                fingerprints=fingerprints,
+                classes=source_classes,
+            )
+            records.append(
+                LegacyNodeRecord(
+                    legacy_node_id=str(row["id"]),
+                    kind=str(row["kind"]),
+                    sector=str(row["sector"]),
+                    scope_type=str(row["scope_type"]),
+                    scope_key=str(row["scope_key"]),
+                    channel=_legacy_text_or_none(row["channel"]),
+                    chat_id=_legacy_text_or_none(row["chat_id"]),
+                    sender_id=_legacy_text_or_none(row["sender_id"]),
+                    contact_id=_legacy_text_or_none(row["contact_id"]),
+                    source_message_id=source_message_id,
+                    source_role=_legacy_text_or_none(row["source_role"]),
+                    is_deleted=bool(row["is_deleted"]),
+                    has_fact_shell=bool(row["has_fact_shell"]),
+                    has_statement=bool(row["has_statement"]),
+                    quarantine_reasons=tuple(reasons_by_node[str(row["id"])]),
+                    source_status=source_status,
+                    source_classes=matched_classes,
+                )
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    kind_counts: dict[str, list[int]] = {}
+    reason_counts: Counter[str] = Counter()
+    source_status_counts: Counter[str] = Counter()
+    for node in records:
+        counts = kind_counts.setdefault(node.kind, [0, 0])
+        counts[0] += 1
+        counts[1] += int(not node.is_deleted)
+        reason_counts.update(node.quarantine_reasons)
+        source_status_counts[node.source_status] += 1
+
+    return LegacyNodeInventory(
+        target_path=target_path,
+        target_fingerprint=file_fingerprint(target_path),
+        population_reason=LEGACY_NO_FACT_REASON,
+        nodes=tuple(records),
+        by_kind=tuple(
+            (kind, counts[0], counts[1]) for kind, counts in sorted(kind_counts.items())
+        ),
+        quarantine_reasons=tuple(sorted(reason_counts.items())),
+        source_status_counts=tuple(sorted(source_status_counts.items())),
     )
 
 
