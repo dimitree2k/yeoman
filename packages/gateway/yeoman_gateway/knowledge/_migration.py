@@ -60,6 +60,7 @@ __all__ = [
     "LegacyNodeRecord",
     "LegacyLinkCandidate",
     "LegacyLinkManifest",
+    "LegacyLinkApplyReport",
     "MigrationInventory",
     "MigrationReport",
     "MigrationSourceError",
@@ -1522,6 +1523,41 @@ class LegacyLinkManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class LegacyLinkApplyReport:
+    """Counts and fingerprints for a text-free, reversible ledger apply."""
+
+    target_path: Path
+    target_manifest_fingerprint: str
+    before_target_fingerprint: str
+    after_target_fingerprint: str
+    approval_ref: str
+    total_candidates: int
+    linked_candidates: int
+    applied: int
+    already_applied: int
+    statement_rows_changed: int
+    speaker_roles_changed: int
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "target_path": str(self.target_path),
+            "target_manifest_fingerprint": self.target_manifest_fingerprint,
+            "before_target_fingerprint": self.before_target_fingerprint,
+            "after_target_fingerprint": self.after_target_fingerprint,
+            "approval_ref": self.approval_ref,
+            "total_candidates": self.total_candidates,
+            "linked_candidates": self.linked_candidates,
+            "applied": self.applied,
+            "already_applied": self.already_applied,
+            "statement_rows_changed": self.statement_rows_changed,
+            "speaker_roles_changed": self.speaker_roles_changed,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+
+@dataclass(frozen=True, slots=True)
 class _LegacyLinkIndexes:
     contacts: dict[str, dict[str, Any]]
     identifiers: dict[str, tuple[dict[str, Any], ...]]
@@ -1589,6 +1625,303 @@ def propose_legacy_links(
         disposition_counts=dict(sorted(disposition_counts.items())),
         candidates=candidates,
     )
+
+
+def apply_legacy_link_decisions(
+    candidates: Path | str,
+    target: Path | str,
+    *,
+    approval_ref: str,
+) -> LegacyLinkApplyReport:
+    """Record verified transport decisions in the existing quarantine ledger.
+
+    This is deliberately not a statement or role writer.  It updates only the
+    ``detail_json`` of the existing ``memory2_nodes`` quarantine rows, after rechecking
+    the target binding and contact.  The candidate manifest's target fingerprint is a
+    one-shot write fence: a fresh manifest is required after any target change.
+    """
+    candidate_path = _expand(candidates)
+    target_path = _expand(target)
+    approval = str(approval_ref or "").strip()
+    if not approval:
+        raise MigrationSourceError("apply_invalid", "approval_ref is required")
+    payload, _manifest_fingerprint = _read_legacy_link_candidates(candidate_path)
+    _require_snapshot_file(target_path)
+    expected_target_fingerprint = str(payload["target_fingerprint"])
+    before_fingerprint = file_fingerprint(target_path)
+    if before_fingerprint != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "candidate target fingerprint does not match the knowledge database",
+        )
+
+    rows = payload["candidates"]
+    linked = [
+        row
+        for row in rows
+        if row.get("candidate_state") == "deterministic"
+        and row.get("proposed_disposition") == "linked"
+    ]
+    resolution_ref = "legacy-link-apply:" + hashlib.sha256(
+        approval.encode("utf-8")
+    ).hexdigest()[:32]
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    pending: list[tuple[str, str, str]] = []
+    already_applied = 0
+    statement_rows = 0
+    speaker_roles = 0
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        statement_rows = int(
+            connection.execute("SELECT COUNT(*) FROM knowledge_statements").fetchone()[0]
+        )
+        speaker_roles = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM knowledge_statement_people WHERE role = 'speaker'"
+            ).fetchone()[0]
+        )
+        for row in linked:
+            person_id, binding_id = _validate_legacy_apply_candidate(connection, row)
+            quarantine = connection.execute(
+                "SELECT detail_json FROM knowledge_quarantine"
+                " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                " AND reason = 'legacy-node-without-fact-shell'",
+                (str(row["legacy_node_id"]),),
+            ).fetchall()
+            if len(quarantine) != 1:
+                raise MigrationSourceError(
+                    "apply_target_missing",
+                    "linked candidate has no unique legacy quarantine row",
+                )
+            try:
+                detail = json.loads(str(quarantine[0][0] or "{}"))
+            except (TypeError, ValueError) as exc:
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine detail is not JSON"
+                ) from exc
+            current = detail.get("legacy_reconciliation")
+            if current is not None:
+                if current == {
+                    "status": "applied",
+                    "resolution_ref": resolution_ref,
+                    "person_id": person_id,
+                    "binding_id": binding_id,
+                    "attribution": "transport",
+                    "evidence_kind": "verified_identifier_binding",
+                }:
+                    already_applied += 1
+                    continue
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine row already has another resolution"
+                )
+            if detail != {}:
+                raise MigrationSourceError(
+                    "apply_conflict", "legacy quarantine detail is not empty"
+                )
+            pending.append(
+                (
+                    json.dumps(
+                        {
+                            "legacy_reconciliation": {
+                                "status": "applied",
+                                "resolution_ref": resolution_ref,
+                                "person_id": person_id,
+                                "binding_id": binding_id,
+                                "attribution": "transport",
+                                "evidence_kind": "verified_identifier_binding",
+                            }
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    str(row["legacy_node_id"]),
+                    resolution_ref,
+                )
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    if file_fingerprint(target_path) != before_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch", "knowledge database changed during apply validation"
+        )
+
+    applied = 0
+    if pending:
+        connection = sqlite3.connect(str(target_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            if file_fingerprint(target_path) != before_fingerprint:
+                raise MigrationSourceError(
+                    "manifest_mismatch", "knowledge database changed before apply"
+                )
+            for detail_json, node_id, _resolution in pending:
+                cursor = connection.execute(
+                    "UPDATE knowledge_quarantine SET detail_json = ?"
+                    " WHERE source_table = 'memory2_nodes' AND source_pk = ?"
+                    " AND reason = 'legacy-node-without-fact-shell' AND detail_json = '{}'",
+                    (detail_json, node_id),
+                )
+                if cursor.rowcount != 1:
+                    raise MigrationSourceError(
+                        "apply_conflict", "legacy quarantine row changed during apply"
+                    )
+                applied += 1
+            connection.commit()
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None and int(checkpoint[0]) != 0:
+                raise MigrationSourceError(
+                    "apply_checkpoint_failed", "knowledge database WAL checkpoint was busy"
+                )
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    after_fingerprint = file_fingerprint(target_path)
+    check_sidecars = _read_sidecars(target_path)
+    connection = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        after_statement_rows = int(
+            connection.execute("SELECT COUNT(*) FROM knowledge_statements").fetchone()[0]
+        )
+        after_speaker_roles = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM knowledge_statement_people WHERE role = 'speaker'"
+            ).fetchone()[0]
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, check_sidecars)
+    if after_statement_rows != statement_rows or after_speaker_roles != speaker_roles:
+        raise MigrationSourceError(
+            "apply_conflict", "apply changed statement or role rows unexpectedly"
+        )
+    return LegacyLinkApplyReport(
+        target_path=target_path,
+        target_manifest_fingerprint=expected_target_fingerprint,
+        before_target_fingerprint=before_fingerprint,
+        after_target_fingerprint=after_fingerprint,
+        approval_ref=approval,
+        total_candidates=len(rows),
+        linked_candidates=len(linked),
+        applied=applied,
+        already_applied=already_applied,
+        statement_rows_changed=0,
+        speaker_roles_changed=0,
+    )
+
+
+def _read_legacy_link_candidates(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists() or not path.is_file():
+        raise MigrationSourceError("manifest_missing", "candidate manifest does not exist")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest is not JSON") from exc
+    if not isinstance(payload, dict) or payload.get("manifest_version") != MANIFEST_VERSION:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest version is unsupported")
+    target_fingerprint = payload.get("target_fingerprint")
+    rows = payload.get("candidates")
+    if not isinstance(target_fingerprint, str) or not target_fingerprint:
+        raise MigrationSourceError("manifest_invalid", "candidate manifest has no target fingerprint")
+    if not isinstance(rows, list):
+        raise MigrationSourceError("manifest_invalid", "candidate manifest has no candidate rows")
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise MigrationSourceError("manifest_invalid", "candidate row is not an object")
+        node_id = str(row.get("legacy_node_id") or "").strip()
+        if not node_id or node_id in seen:
+            raise MigrationSourceError("manifest_invalid", "candidate node ids are not unique")
+        seen.add(node_id)
+        if _contains_forbidden_candidate_key(row):
+            raise MigrationSourceError("manifest_invalid", "candidate manifest contains forbidden text fields")
+    counts = payload.get("counts")
+    if not isinstance(counts, dict) or int(counts.get("nodes", -1)) != len(rows):
+        raise MigrationSourceError("manifest_invalid", "candidate count does not match rows")
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _contains_forbidden_candidate_key(value: object) -> bool:
+    if isinstance(value, dict):
+        if set(value).intersection({"content", "meta_json", "subjects"}):
+            return True
+        return any(_contains_forbidden_candidate_key(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_forbidden_candidate_key(item) for item in value)
+    return False
+
+
+def _validate_legacy_apply_candidate(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> tuple[str, str]:
+    speakers = row.get("speaker_candidates")
+    if (
+        row.get("candidate_state") != "deterministic"
+        or row.get("proposed_disposition") != "linked"
+        or row.get("requires_owner_review") is not True
+        or not isinstance(speakers, list)
+        or len(speakers) != 1
+    ):
+        raise MigrationSourceError("apply_invalid", "linked candidate does not meet the exact binding contract")
+    speaker = speakers[0]
+    if not isinstance(speaker, dict) or {
+        speaker.get("role"),
+        speaker.get("attribution"),
+        speaker.get("evidence_kind"),
+    } != {"speaker", "transport", "verified_identifier_binding"}:
+        raise MigrationSourceError("apply_invalid", "candidate is not a transport binding")
+    person_id = str(speaker.get("person_id") or "").strip()
+    binding_id = str(speaker.get("binding_id") or "").strip()
+    if not person_id or not binding_id:
+        raise MigrationSourceError("apply_invalid", "candidate has no person or binding id")
+    binding_rows = connection.execute(
+        "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+        " mapping_verified, valid_until_ms FROM knowledge_identifier_bindings"
+        " WHERE binding_id = ?",
+        (binding_id,),
+    ).fetchall()
+    if len(binding_rows) != 1:
+        raise MigrationSourceError("apply_binding_missing", "candidate binding is not present")
+    binding = binding_rows[0]
+    sender_shape = _legacy_sender_shape(str(row.get("channel") or ""), str(row.get("sender_id") or ""))
+    if sender_shape is None or (str(binding["kind"]), str(binding["value"])) != sender_shape:
+        raise MigrationSourceError("apply_binding_conflict", "candidate binding does not match sender")
+    matching = connection.execute(
+        "SELECT status, mapping_verified, person_id FROM knowledge_identifier_bindings"
+        " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ?",
+        (str(binding["channel"]), str(binding["kind"]), str(binding["namespace"]), str(binding["value"])),
+    ).fetchall()
+    if len(matching) != 1 or not (
+        str(binding["status"]) == "active"
+        and int(binding["mapping_verified"]) == 1
+        and int(binding["valid_until_ms"] or 0) == 0
+        and str(binding["person_id"]) == person_id
+        and str(matching[0]["status"]) == "active"
+        and int(matching[0]["mapping_verified"]) == 1
+    ):
+        raise MigrationSourceError("apply_binding_conflict", "candidate binding is not uniquely active and verified")
+    contact = connection.execute(
+        "SELECT status FROM contacts WHERE id = ?", (person_id,)
+    ).fetchone()
+    if contact is None or str(contact[0]).lower() != "active":
+        raise MigrationSourceError("apply_contact_missing", "candidate target contact is not active")
+    return person_id, binding_id
 
 
 def _read_legacy_link_audit(path: Path) -> tuple[dict[str, Any], str]:

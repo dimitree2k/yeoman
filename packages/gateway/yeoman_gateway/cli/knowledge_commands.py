@@ -44,6 +44,7 @@ from yeoman_gateway.knowledge._migration import (
     MigrationSourceError,
     UnsupportedSchema,
     VerificationReport,
+    apply_legacy_link_decisions,
     inspect_legacy_nodes,
     inspect_sources,
     migrate_sources,
@@ -83,6 +84,13 @@ _REASON_CODES: Final[dict[str, str]] = {
     "manifest_missing": "manifest_mismatch",
     "manifest_invalid": "manifest_mismatch",
     "not_a_database": "source_error",
+    "apply_invalid": "approval_error",
+    "apply_binding_missing": "semantics_error",
+    "apply_binding_conflict": "semantics_error",
+    "apply_contact_missing": "semantics_error",
+    "apply_target_missing": "semantics_error",
+    "apply_conflict": "semantics_error",
+    "apply_checkpoint_failed": "semantics_error",
 }
 
 #: v1->v2 upgrade reason codes.  Kept separate so the two offline paths cannot be
@@ -252,6 +260,62 @@ def migration_propose_legacy_links(
     _line("candidate states: " + states)
     _line("dispositions: " + dispositions)
     _line(f"manifest: {output}  (private; node text omitted)")
+
+
+@migration_app.command("apply-legacy-link-decisions")
+def migration_apply_legacy_link_decisions(
+    candidates: Path = typer.Option(..., "--candidates", help="Private candidate manifest JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge database or snapshot to update"),
+    out: Path = typer.Option(..., "--out", help="New private apply audit JSON"),
+    approval_ref: str = typer.Option(..., "--approval-ref", help="Owner approval reference"),
+) -> None:
+    """Apply verified transport decisions to existing quarantine rows only."""
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        _fail("target_exists", f"apply audit already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot reserve apply audit: {output}: {exc}")
+
+    try:
+        report = apply_legacy_link_decisions(
+            candidates,
+            target,
+            approval_ref=approval_ref,
+        )
+    except MigrationSourceError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(report.to_json())
+            handle.write("\n")
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        output.unlink(missing_ok=True)
+        _fail("source_error", f"cannot write apply audit: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    _line(f"linked candidates: {report.linked_candidates}")
+    _line(f"applied ledger decisions: {report.applied}")
+    _line(f"already applied: {report.already_applied}")
+    _line("statement rows changed: 0  speaker roles changed: 0")
+    _line(f"apply audit: {output}  (private; node text omitted)")
 
 
 @migration_app.command("build")
