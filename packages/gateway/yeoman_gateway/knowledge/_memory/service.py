@@ -1325,16 +1325,6 @@ class MemoryService:
             embedding=embedding,
             contact_id=self._resolve_contact_id(sender_id),
         )
-        if candidate.kind == "person_profile" and contact_id and self._contacts is not None:
-            try:
-                self._contacts.upsert_field(
-                    contact_id=contact_id,
-                    kind="person_profile",
-                    value=compact,
-                    label="profile",
-                )
-            except Exception as exc:
-                logger.warning("contact_fields upsert failed: {}", exc)
         return True
 
     def _heuristic_candidate(self, text: str) -> ExtractedCandidate:

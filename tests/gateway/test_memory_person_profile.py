@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from yeoman_gateway.knowledge._contacts.service import ContactsService
 from yeoman_gateway.knowledge._memory.extractor import ExtractedCandidate
 from yeoman_gateway.knowledge._memory.service import MemoryService
 from yeoman_shared.config.schema import MemoryAclConfig, MemoryConfig
@@ -74,10 +75,14 @@ class TestLearnedChatTaste:
 
 
 class TestPersistCandidatePersonProfile:
-    def test_person_profile_stored_under_contact_scope(self, tmp_path: Path) -> None:
+    def test_person_profile_stored_without_legacy_field_copy(self, tmp_path: Path) -> None:
         jid = "491786@s.whatsapp.net"
-        contact_id = "frank-uuid-001"
-        svc = _service_with_contact(tmp_path, jid, contact_id)
+        contacts = ContactsService(db_path=tmp_path / "contacts.db")
+        contact_id = contacts.ensure_contact(
+            channel="whatsapp", identifier=jid, kind="phone_jid", push_name="Frank",
+        )
+        svc = _service(tmp_path)
+        svc.set_contacts(contacts)
 
         candidate = ExtractedCandidate(
             sector="semantic",
@@ -102,6 +107,7 @@ class TestPersistCandidatePersonProfile:
             limit=5,
         )
         assert any("Frank" in h.entry.content for h in hits)
+        assert contacts.store.get_fields(contact_id) == []
 
     def test_person_profile_falls_back_to_user_scope_when_no_contact(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)  # no contacts wired
