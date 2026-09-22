@@ -257,20 +257,31 @@ def test_vector_candidates_never_widen_the_read_gate(h: HybridHarness) -> None:
     """A foreign vector row must not become a hit for a reader outside its chat.
 
     The query shares no token with the statement, so only the vector path could ever
-    produce the id; the scope clause is therefore genuinely load-bearing here.
+    produce the id; both the vector candidate query and the public recall gate are
+    therefore genuinely load-bearing here.
     """
     statement_id, _source = h.capture("alpha bravo charlie")
     h.publish_vector(statement_id)
+    query = RecallQuery(text="delta echo foxtrot", limit=10)
+
+    assert h.service._retrieval._vector_candidates(  # noqa: SLF001 - vector path check
+        query,
+        context=h.read_context(),
+        embedder=h.embedder,
+    ) == (statement_id,)
 
     assert h.service.recall_hybrid(
-        RecallQuery(text="delta echo foxtrot", limit=10),
+        query,
         context=h.read_context(),
         embedder=h.embedder,
     ).statement_ids == (statement_id,)
 
     other = h.read_context(chat="group-b")
+    assert h.service._retrieval._vector_candidates(  # noqa: SLF001
+        query, context=other, embedder=h.embedder
+    ) == ()
     result = h.service.recall_hybrid(
-        RecallQuery(text="delta echo foxtrot", limit=10), context=other, embedder=h.embedder
+        query, context=other, embedder=h.embedder
     )
     assert result.statement_ids == ()
     assert result.text == ""
@@ -322,25 +333,3 @@ def test_vector_candidates_are_scored_and_dimension_bound(h: HybridHarness) -> N
     )
     assert still == (statement_id,)
     assert other not in still
-
-
-def test_vector_candidates_never_widen_the_read_gate(h: HybridHarness) -> None:
-    """A foreign vector row must not become a candidate for another chat's reader."""
-    statement_id, _source = h.capture("alpha bravo charlie")
-    h.publish_vector(statement_id)
-    query = RecallQuery(text="delta echo foxtrot", limit=10)
-
-    assert h.service._retrieval._vector_candidates(  # noqa: SLF001 - vector path check
-        query, context=h.read_context(), embedder=h.embedder
-    ) == (statement_id,)
-
-    foreign = h.service._retrieval._vector_candidates(  # noqa: SLF001
-        query, context=h.read_context(chat="group-b"), embedder=h.embedder
-    )
-    assert foreign == ()
-
-    result = h.service.recall_hybrid(
-        query, context=h.read_context(chat="group-b"), embedder=h.embedder
-    )
-    assert result.statement_ids == ()
-    assert result.text == ""

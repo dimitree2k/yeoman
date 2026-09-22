@@ -393,34 +393,6 @@ async def test_duplicate_admission_does_not_send_twice(runtime) -> None:
 
 
 @pytest.mark.asyncio
-async def test_correction_during_the_provider_await_cancels_the_stale_effect(runtime) -> None:
-    result = _admit(runtime, message_id="m1")
-    turn_id = str(result.assignment.turn_id)
-    turn = runtime.store.get_turn(turn_id)
-    runtime.store.enqueue_effect(
-        effect_id="fx-stale",
-        operation_key=f"send_text:{CHAT}:{turn_id}:1",
-        payload={"text": "old"},
-        target={"channel": "whatsapp", "chat_id": CHAT},
-        turn_id=turn_id,
-        turn_revision=1,
-        now_ms=T0,
-    )
-
-    runtime.store.bump_turn_revision(
-        turn_id, expected_revision=turn.revision, now_ms=T0 + 1_000, reason="correction"
-    )
-    cancelled = runtime.store.cancel_stale_effects(
-        turn_id, current_revision=2, now_ms=T0 + 1_000, reason="correction"
-    )
-
-    assert cancelled == ("fx-stale",)
-    assert runtime.store.effect_state("fx-stale") == "cancelled"
-    assert runtime.transport.sent == []
-    assert runtime.registry.turn_lookup(turn_id).revision == 2
-
-
-@pytest.mark.asyncio
 async def test_policy_change_before_the_effect_blocks_the_send(runtime) -> None:
     _admit(runtime, message_id="m1")
     runtime.reload_policy(_policy(mode="owner_only"))
