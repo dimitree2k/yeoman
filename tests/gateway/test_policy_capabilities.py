@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -151,3 +152,9 @@ def test_owner_forward_command_is_addressed_in_mention_only_group(tmp_path: Path
     assert decision.should_respond is True
     assert "forward_message" in decision.allowed_tools
     assert decision.reason.endswith("when_to_reply:explicit_command")
+
+    non_owner = engine.evaluate(
+        replace(actor, sender_primary="member@s.whatsapp.net"),
+        {"forward_message"},
+    )
+    assert "forward_message" not in non_owner.allowed_tools
