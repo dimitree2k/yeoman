@@ -330,6 +330,17 @@ class ChannelManager:
             raise RuntimeError(f"channel does not support reactions: {message.channel}")
         return await sender(message)
 
+    async def lookup_message(
+        self, channel: str, chat_id: str, message_id: str
+    ) -> dict[str, object]:
+        """Resolve one exact provider message through a channel that supports lookup."""
+        target = self.channels.get(channel)
+        lookup = getattr(target, "lookup_message", None) if target is not None else None
+        if not callable(lookup):
+            return {"status": "unsupported"}
+        result = await lookup(chat_id, message_id)
+        return result if isinstance(result, dict) else {"status": "unsupported"}
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)

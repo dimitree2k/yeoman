@@ -35,6 +35,7 @@ from yeoman_gateway.processing.models import (
     EffectReceipt,
     EffectTarget,
     ExternalActionPayload,
+    ForwardPayload,
     MediaPayload,
     ParticipationPreDispatchDenied,
     ProcessingError,
@@ -58,6 +59,7 @@ EFFECT_PROVENANCE_KEY = "processing_effect"
 CAPABILITY_BY_KIND: Mapping[str, str] = {
     "text": "send_text",
     "media": "send_media",
+    "forward": "forward_message",
     "reaction": "send_reaction",
     "delete": "delete_message",
     "external_action": "external_action",
@@ -89,6 +91,11 @@ def validate_payload(envelope: EffectEnvelope) -> None:
                 raise EffectPayloadRejectedError("media payload has no media references")
             if any(not str(item).strip() for item in payload.media):
                 raise EffectPayloadRejectedError("media payload contains an empty reference")
+        case ForwardPayload():
+            if not payload.source_chat_id.strip() or not payload.source_message_id.strip():
+                raise EffectPayloadRejectedError(
+                    "forward payload requires source_chat_id and source_message_id"
+                )
         case ReactionPayload():
             if not payload.message_id or not payload.emoji:
                 raise EffectPayloadRejectedError("reaction payload requires message_id and emoji")
@@ -222,6 +229,21 @@ class BusEffectExecutor:
             )
             self._check_participation_pre_dispatch(dispatch_envelope)
             receipt = await self._deliver(message)
+        elif isinstance(payload, ForwardPayload):
+            message = OutboundMessage(
+                channel=target.channel,
+                chat_id=target.chat_id,
+                content="",
+                metadata={
+                    **provenance,
+                    "forward_message": {
+                        "source_chat_id": payload.source_chat_id,
+                        "source_message_id": payload.source_message_id,
+                    },
+                },
+            )
+            self._check_participation_pre_dispatch(envelope)
+            receipt = await self._deliver(message)
         elif isinstance(payload, MediaPayload):
             caption = self._guard_text(envelope, payload.caption or "")
             dispatch_envelope = envelope
@@ -333,6 +355,16 @@ class EffectNotDeliveredError(ProcessingError):
     """
 
 
+class ForwardDispatchError(EffectNotDeliveredError):
+    """A forward was proven unavailable before provider dispatch."""
+
+    def __init__(self, source_chat_id: str, source_message_id: str, user_message: str) -> None:
+        super().__init__(user_message)
+        self.source_chat_id = source_chat_id
+        self.source_message_id = source_message_id
+        self.user_message = user_message
+
+
 #: Principal that caused the tool call currently running. Set by the responder, never
 #: read from model arguments.
 CURRENT_PRINCIPAL: ContextVar[str] = ContextVar("yeoman_effect_principal", default="")
@@ -348,6 +380,12 @@ def classify_outbound(message: OutboundMessage) -> tuple[str, Any]:
     delete = metadata.get("delete_message")
     if isinstance(delete, Mapping) and delete.get("message_id"):
         return "delete_message", DeletePayload(message_id=str(delete["message_id"]))
+    forward = metadata.get("forward_message")
+    if isinstance(forward, Mapping):
+        return "forward_message", ForwardPayload(
+            source_chat_id=str(forward.get("source_chat_id") or ""),
+            source_message_id=str(forward.get("source_message_id") or ""),
+        )
     if message.media:
         return "send_media", MediaPayload(
             media=tuple(str(item) for item in message.media),
@@ -778,15 +816,20 @@ class IntentEffectRouter:
         event = intent.event
         if not self.manages(event.channel, event.chat_id):
             return False
-        media = list(event.media or [])
-        payload: Any = (
-            MediaPayload(media=tuple(media), caption=event.content or None)
-            if media
-            else TextPayload(text=event.content, reply_to=event.reply_to)
-        )
         metadata = dict(event.metadata or {})
+        forward = metadata.get("forward_message")
+        media = list(event.media or [])
+        if isinstance(forward, Mapping):
+            payload: Any = ForwardPayload(
+                source_chat_id=str(forward.get("source_chat_id") or ""),
+                source_message_id=str(forward.get("source_message_id") or ""),
+            )
+        elif media:
+            payload = MediaPayload(media=tuple(media), caption=event.content or None)
+        else:
+            payload = TextPayload(text=event.content, reply_to=event.reply_to)
         source = str(metadata.get("message_id") or "turn")
-        await self._run(
+        result = await self._run(
             channel=event.channel,
             chat_id=event.chat_id,
             principal=principal,
@@ -800,6 +843,17 @@ class IntentEffectRouter:
             trace_id=str(metadata.get("trace_id") or source),
             deadline_key="reactive_ms",
         )
+        if isinstance(payload, ForwardPayload) and result.state in {
+            "failed",
+            "blocked",
+            "expired",
+            "cancelled",
+        }:
+            raise ForwardDispatchError(
+                payload.source_chat_id,
+                payload.source_message_id,
+                "Die Originalnachricht ist nicht verfügbar; der Forward wurde nicht gesendet.",
+            )
         return True
 
     async def submit_reaction(self, intent: SendReactionIntent, *, principal: str) -> bool:

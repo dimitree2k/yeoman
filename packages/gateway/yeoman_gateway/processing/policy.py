@@ -45,6 +45,7 @@ TRANSPORT_CAPABILITIES = frozenset({"send_text", "send_media", "send_reaction"})
 TOOL_CAPABILITIES: Mapping[str, str] = {
     "send_voice": "send_voice",
     "delete_message": "delete_message",
+    "forward_message": "forward_message",
     "message": "message",
 }
 #: Everything else must be named here or it is refused: no capability falls through.

@@ -28,6 +28,7 @@ from yeoman_gateway.processing.store import ProcessingStore
 #: else is treated as an unproven outcome, because a failure after the frame was written
 #: cannot be distinguished from a success (spec R06, R07).
 PRE_DISPATCH_ERROR_MARKERS: tuple[str, ...] = (
+    "err_forward_unavailable",
     "not connected",
     "channel not available",
     "channel does not support",

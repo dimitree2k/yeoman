@@ -548,6 +548,28 @@ class WhatsAppChannel(BaseChannel):
 
         await self._stop_typing(msg.chat_id)
 
+        forward_request = (
+            msg.metadata.get("forward_message") if isinstance(msg.metadata, dict) else None
+        )
+        if forward_request is not None:
+            if not isinstance(forward_request, dict):
+                raise RuntimeError("WhatsApp forward request is invalid")
+            source_chat_jid = str(forward_request.get("source_chat_id") or "").strip()
+            source_message_id = str(forward_request.get("source_message_id") or "").strip()
+            if not source_chat_jid or not source_message_id:
+                raise RuntimeError("WhatsApp forward request missing source")
+            result = await self._send_command_with_retry(
+                "forward_message",
+                {
+                    "to": msg.chat_id,
+                    "sourceChatJid": source_chat_jid,
+                    "sourceMessageId": source_message_id,
+                },
+                timeout_seconds=20.0,
+                max_attempts=self._send_attempts(msg.metadata),
+            )
+            return _receipt_from_bridge(result)
+
         delete_request = (
             msg.metadata.get("delete_message") if isinstance(msg.metadata, dict) else None
         )
@@ -725,6 +747,20 @@ class WhatsAppChannel(BaseChannel):
             max_attempts=self._send_attempts(msg.metadata),
         )
         return _receipt_from_bridge(result, target_message_id=msg.message_id)
+
+    async def lookup_message(self, chat_id: str, message_id: str) -> dict[str, object]:
+        """Look up one exact locally retained provider message reference."""
+        if not self._connected:
+            connected = await self._wait_connected_for_send(SEND_CONNECT_WAIT_SECONDS)
+            if not connected:
+                return {"status": "unsupported"}
+        result = await self._send_command_with_retry(
+            "lookup_message",
+            {"chatJid": str(chat_id), "messageId": str(message_id)},
+            timeout_seconds=12.0,
+            max_attempts=SEND_MAX_ATTEMPTS,
+        )
+        return result if isinstance(result, dict) else {"status": "unsupported"}
 
     async def _verify_bridge_health(self, token: str, timeout_seconds: float) -> None:
         response = await self._send_command(
@@ -2629,6 +2665,10 @@ class WhatsAppChannel(BaseChannel):
             summary["chat_jid"] = "[REDACTED]" if payload.get("chatJid") else None
             summary["message_id"] = payload.get("messageId")
             return summary
+        if command_type == "forward_message":
+            summary["source_chat_jid"] = "[REDACTED]" if payload.get("sourceChatJid") else None
+            summary["source_message_id"] = "[REDACTED]" if payload.get("sourceMessageId") else None
+            return summary
         return summary
 
     @staticmethod
@@ -2812,7 +2852,7 @@ class WhatsAppChannel(BaseChannel):
 
 
 #: The named envelopes the bridge wraps its command results in.
-_BRIDGE_ENVELOPE_KEYS = ("sent", "reacted", "deleted", "presence")
+_BRIDGE_ENVELOPE_KEYS = ("sent", "forwarded", "reacted", "deleted", "presence")
 
 
 def _receipt_from_bridge(

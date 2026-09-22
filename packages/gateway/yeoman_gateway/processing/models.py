@@ -39,7 +39,7 @@ EffectState = Literal[
     "unknown",
     "unknown_nonrepeatable",
 ]
-EffectPayloadKind = Literal["text", "media", "reaction", "delete", "external_action"]
+EffectPayloadKind = Literal["text", "media", "forward", "reaction", "delete", "external_action"]
 DecisionOutcome = Literal["allow", "deny"]
 DecisionStage = Literal["fast", "final", "admin"]
 
@@ -160,6 +160,23 @@ class MediaPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class ForwardPayload:
+    """Native provider forward of one exact source message."""
+
+    source_chat_id: str
+    source_message_id: str
+
+    kind: ClassVar[str] = "forward"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "source_chat_id": self.source_chat_id,
+            "source_message_id": self.source_message_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ReactionPayload:
     """Semantic reaction on an existing message."""
 
@@ -206,11 +223,17 @@ class ExternalActionPayload:
 
 
 EffectPayload = (
-    TextPayload | MediaPayload | ReactionPayload | DeletePayload | ExternalActionPayload
+    TextPayload
+    | MediaPayload
+    | ForwardPayload
+    | ReactionPayload
+    | DeletePayload
+    | ExternalActionPayload
 )
 
 _KIND_INFERENCE: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("external_action", ("action",)),
+    ("forward", ("source_chat_id", "source_message_id")),
     ("reaction", ("emoji",)),
     ("delete", ("message_id",)),
     ("media", ("media",)),
@@ -246,6 +269,11 @@ def payload_from_mapping(data: Mapping[str, Any]) -> EffectPayload:
             return MediaPayload(
                 media=tuple(str(item) for item in raw_media),
                 caption=_opt_str(data.get("caption")),
+            )
+        case "forward":
+            return ForwardPayload(
+                source_chat_id=str(data.get("source_chat_id") or ""),
+                source_message_id=str(data.get("source_message_id") or ""),
             )
         case "reaction":
             return ReactionPayload(

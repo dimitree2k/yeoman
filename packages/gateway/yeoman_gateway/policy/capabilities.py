@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SERVICE_POLICY_CAPABILITIES = frozenset({"send_media"})
+SERVICE_POLICY_CAPABILITIES = frozenset({"send_media", "forward_message"})
 
 
 def policy_known_tools(tool_names: set[str]) -> set[str]:
