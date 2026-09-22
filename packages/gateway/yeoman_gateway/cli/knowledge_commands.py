@@ -13,6 +13,8 @@ The surface is exactly::
     yeoman knowledge migration verify-v1   --target NEW-V2.db --manifest NEW.json
     yeoman knowledge migration propose-bindings --source V1.db --processing PROCESSING.db \
                                            --out proposals.json
+    yeoman knowledge migration propose-legacy-links --audit AUDIT_JSON \
+                                           --target KNOWLEDGE_SNAPSHOT --out candidates.json
     yeoman knowledge migration upgrade-v1  ... --binding-approvals proposals.json
 
 Everything here is offline and explicit: no default paths, no provider or bootstrap
@@ -56,6 +58,7 @@ from yeoman_gateway.knowledge._upgrade import (
     upgrade_v1,
     verify_upgrade,
 )
+from yeoman_gateway.knowledge.api import propose_legacy_links
 
 from .core import app, console
 
@@ -203,6 +206,51 @@ def migration_inspect_legacy_nodes(
     _line(
         "source status: " + source_status
     )
+    _line(f"manifest: {output}  (private; node text omitted)")
+
+
+@migration_app.command("propose-legacy-links")
+def migration_propose_legacy_links(
+    audit: Path = typer.Option(..., "--audit", help="Private legacy-node audit JSON"),
+    target: Path = typer.Option(..., "--target", help="Knowledge snapshot to read"),
+    out: Path = typer.Option(..., "--out", help="New private candidate manifest JSON"),
+) -> None:
+    """Write one text-free owner-review candidate row per audited legacy node."""
+    try:
+        manifest = propose_legacy_links(audit, target)
+    except MigrationSourceError as exc:
+        _fail(_reason_code(exc.reason), exc.detail, exc.reason)
+
+    output = out.expanduser()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(manifest.to_json())
+            handle.write("\n")
+    except FileExistsError:
+        _fail("target_exists", f"candidate manifest already exists: {output}")
+    except OSError as exc:
+        _fail("source_error", f"cannot write candidate manifest: {output}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    states = "  ".join(
+        f"{state}={count}" for state, count in manifest.candidate_state_counts.items()
+    ) or "none"
+    dispositions = "  ".join(
+        f"{disposition}={count}"
+        for disposition, count in manifest.disposition_counts.items()
+    ) or "none"
+    _line(f"candidate nodes: {manifest.counts['nodes']}")
+    _line("candidate states: " + states)
+    _line("dispositions: " + dispositions)
     _line(f"manifest: {output}  (private; node text omitted)")
 
 

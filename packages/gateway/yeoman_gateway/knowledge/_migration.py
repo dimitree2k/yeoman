@@ -42,7 +42,11 @@ from yeoman_gateway.knowledge._store import (
     KnowledgeStore,
     open_readonly,
 )
-from yeoman_gateway.knowledge.models import ValidationError, normalize_identifier_value
+from yeoman_gateway.knowledge.models import (
+    DEFAULT_NAMESPACE,
+    ValidationError,
+    normalize_identifier_value,
+)
 
 __all__ = [
     "LEGACY_FTS_TABLE",
@@ -54,6 +58,8 @@ __all__ = [
     "MANIFEST_VERSION",
     "LegacyNodeInventory",
     "LegacyNodeRecord",
+    "LegacyLinkCandidate",
+    "LegacyLinkManifest",
     "MigrationInventory",
     "MigrationReport",
     "MigrationSourceError",
@@ -69,6 +75,7 @@ __all__ = [
     "inspect_legacy_nodes",
     "inspect_lineage_sources",
     "inspect_sources",
+    "propose_legacy_links",
     "lineage_fingerprint",
     "semantic_digest",
     "migrate_sources",
@@ -1393,6 +1400,572 @@ _LEGACY_NODE_REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
 }
 
 _SCOPE_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^([a-z0-9_]+):(.+)$")
+
+_LEGACY_LINK_AUDIT_STATUSES: Final[frozenset[str]] = frozenset(
+    (*LEGACY_NODE_SOURCE_STATUSES, "resolved")
+)
+_LEGACY_LINK_REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "contacts": ("id", "display_name", "preferred_name", "status"),
+    "contact_identifiers": ("channel", "kind", "identifier", "contact_id"),
+    "contact_aliases": (
+        "contact_id",
+        "alias",
+        "source",
+        "alias_kind",
+        "scope_key",
+        "status",
+        "evidence_ref",
+    ),
+    "knowledge_identifier_bindings": (
+        "binding_id",
+        "channel",
+        "kind",
+        "namespace",
+        "value",
+        "person_id",
+        "status",
+        "mapping_verified",
+        "evidence_ref",
+        "valid_from_ms",
+        "valid_until_ms",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyLinkCandidate:
+    """One text-free, owner-reviewable candidate for one legacy node."""
+
+    legacy_node_id: str
+    kind: str
+    sector: str
+    scope_type: str
+    scope_key: str
+    channel: str | None
+    chat_id: str | None
+    sender_id: str | None
+    contact_id: str | None
+    source_message_id: str | None
+    source_role: str | None
+    source_status: str
+    source_classes: tuple[str, ...]
+    source_event_ids: tuple[str, ...]
+    is_deleted: bool
+    has_fact_shell: bool
+    has_statement: bool
+    quarantine_reasons: tuple[str, ...]
+    speaker_candidates: tuple[dict[str, Any], ...]
+    contact_context: dict[str, Any] | None
+    candidate_state: str
+    reason_codes: tuple[str, ...]
+    proposed_disposition: str
+    requires_owner_review: bool = True
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "legacy_node_id": self.legacy_node_id,
+            "kind": self.kind,
+            "sector": self.sector,
+            "scope_type": self.scope_type,
+            "scope_key": self.scope_key,
+            "channel": self.channel,
+            "chat_id": self.chat_id,
+            "sender_id": self.sender_id,
+            "contact_id": self.contact_id,
+            "source_message_id": self.source_message_id,
+            "source_role": self.source_role,
+            "source_status": self.source_status,
+            "source_classes": list(self.source_classes),
+            "source_event_ids": list(self.source_event_ids),
+            "is_deleted": self.is_deleted,
+            "has_fact_shell": self.has_fact_shell,
+            "has_statement": self.has_statement,
+            "quarantine_reasons": list(self.quarantine_reasons),
+            "speaker_candidates": [dict(item) for item in self.speaker_candidates],
+            "contact_context": self.contact_context,
+            "candidate_state": self.candidate_state,
+            "reason_codes": list(self.reason_codes),
+            "proposed_disposition": self.proposed_disposition,
+            "requires_owner_review": self.requires_owner_review,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyLinkManifest:
+    """Deterministic, private candidate rows for one audit and one target snapshot."""
+
+    manifest_version: int
+    audit_manifest_fingerprint: str
+    target_fingerprint: str
+    counts: dict[str, int]
+    source_status_counts: dict[str, int]
+    candidate_state_counts: dict[str, int]
+    reason_counts: dict[str, int]
+    disposition_counts: dict[str, int]
+    candidates: tuple[LegacyLinkCandidate, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "manifest_version": self.manifest_version,
+            "audit_manifest_fingerprint": self.audit_manifest_fingerprint,
+            "target_fingerprint": self.target_fingerprint,
+            "counts": dict(self.counts),
+            "source_status_counts": dict(self.source_status_counts),
+            "candidate_state_counts": dict(self.candidate_state_counts),
+            "reason_counts": dict(self.reason_counts),
+            "disposition_counts": dict(self.disposition_counts),
+            "candidates": [item.to_payload() for item in self.candidates],
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_payload(), indent=2, sort_keys=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyLinkIndexes:
+    contacts: dict[str, dict[str, Any]]
+    identifiers: dict[str, tuple[dict[str, Any], ...]]
+    aliases: dict[str, tuple[dict[str, Any], ...]]
+    bindings: dict[tuple[str, str, str], tuple[dict[str, Any], ...]]
+
+
+def propose_legacy_links(
+    audit_manifest: Path | str,
+    target: Path | str,
+) -> LegacyLinkManifest:
+    """Build text-free legacy-link candidates from two consistent read-only inputs."""
+    audit_path = _expand(audit_manifest)
+    target_path = _expand(target)
+    audit_payload, audit_fingerprint = _read_legacy_link_audit(audit_path)
+    _require_snapshot_file(target_path)
+    expected_target_fingerprint = str(audit_payload["target_fingerprint"])
+    target_fingerprint = file_fingerprint(target_path)
+    if target_fingerprint != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "audit target fingerprint does not match the knowledge snapshot",
+        )
+
+    sidecars_before = _read_sidecars(target_path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(target_path)
+        _require_integrity(connection, target_path)
+        indexes = _read_legacy_link_indexes(connection, target_path)
+        candidates = tuple(
+            _legacy_link_candidate(row, indexes)
+            for row in audit_payload["nodes"]
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(target_path, sidecars_before)
+
+    if file_fingerprint(target_path) != expected_target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_mismatch",
+            "knowledge snapshot changed while candidates were being read",
+        )
+
+    source_status_counts = Counter(item.source_status for item in candidates)
+    candidate_state_counts = Counter(item.candidate_state for item in candidates)
+    reason_counts = Counter(
+        reason for item in candidates for reason in item.reason_codes
+    )
+    disposition_counts = Counter(item.proposed_disposition for item in candidates)
+    counts = {
+        "nodes": len(candidates),
+        "speaker_candidates": sum(len(item.speaker_candidates) for item in candidates),
+        "requires_owner_review": sum(item.requires_owner_review for item in candidates),
+    }
+    return LegacyLinkManifest(
+        manifest_version=MANIFEST_VERSION,
+        audit_manifest_fingerprint=audit_fingerprint,
+        target_fingerprint=target_fingerprint,
+        counts=counts,
+        source_status_counts=dict(sorted(source_status_counts.items())),
+        candidate_state_counts=dict(sorted(candidate_state_counts.items())),
+        reason_counts=dict(sorted(reason_counts.items())),
+        disposition_counts=dict(sorted(disposition_counts.items())),
+        candidates=candidates,
+    )
+
+
+def _read_legacy_link_audit(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.exists():
+        raise MigrationSourceError("manifest_missing", f"audit manifest does not exist: {path}")
+    if not path.is_file():
+        raise MigrationSourceError("manifest_invalid", f"audit manifest is not a file: {path}")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MigrationSourceError(
+            "manifest_invalid", f"audit manifest is not readable JSON: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MigrationSourceError("manifest_invalid", "audit manifest must be a JSON object")
+    if payload.get("manifest_version") != MANIFEST_VERSION:
+        raise MigrationSourceError(
+            "manifest_invalid", "audit manifest version is not supported"
+        )
+    target_fingerprint = payload.get("target_fingerprint")
+    if not isinstance(target_fingerprint, str) or not target_fingerprint:
+        raise MigrationSourceError(
+            "manifest_invalid", "audit manifest has no target fingerprint"
+        )
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        raise MigrationSourceError("manifest_invalid", "audit manifest has no node rows")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in nodes:
+        if not isinstance(row, dict):
+            raise MigrationSourceError("manifest_invalid", "audit node row is not an object")
+        node_id = _audit_required_text(row, "legacy_node_id")
+        if node_id in seen:
+            raise MigrationSourceError(
+                "manifest_invalid", "audit manifest contains duplicate legacy node ids"
+            )
+        seen.add(node_id)
+        source_status = _audit_required_text(row, "source_status")
+        if source_status not in _LEGACY_LINK_AUDIT_STATUSES:
+            raise MigrationSourceError(
+                "manifest_invalid", "audit node has an unsupported source status"
+            )
+        normalized.append(
+            {
+                "legacy_node_id": node_id,
+                "kind": _audit_optional_text(row, "kind") or "",
+                "sector": _audit_optional_text(row, "sector") or "",
+                "scope_type": _audit_optional_text(row, "scope_type") or "",
+                "scope_key": _audit_optional_text(row, "scope_key") or "",
+                "channel": _audit_optional_text(row, "channel"),
+                "chat_id": _audit_optional_text(row, "chat_id"),
+                "sender_id": _audit_optional_text(row, "sender_id"),
+                "contact_id": _audit_optional_text(row, "contact_id"),
+                "source_message_id": _audit_optional_text(row, "source_message_id"),
+                "source_role": _audit_optional_text(row, "source_role"),
+                "source_status": source_status,
+                "source_classes": _audit_text_list(row, "source_classes"),
+                "source_event_ids": _audit_text_list(row, "source_event_ids"),
+                "is_deleted": bool(row.get("is_deleted", False)),
+                "has_fact_shell": bool(row.get("has_fact_shell", False)),
+                "has_statement": bool(row.get("has_statement", False)),
+                "quarantine_reasons": _audit_text_list(row, "quarantine_reasons"),
+            }
+        )
+    normalized.sort(key=lambda item: item["legacy_node_id"])
+    payload["nodes"] = normalized
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _audit_required_text(row: Mapping[str, Any], key: str) -> str:
+    value = _audit_optional_text(row, key)
+    if value is None:
+        raise MigrationSourceError("manifest_invalid", f"audit node is missing {key}")
+    return value
+
+
+def _audit_optional_text(row: Mapping[str, Any], key: str) -> str | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    if isinstance(value, (dict, list, tuple, set)):
+        raise MigrationSourceError("manifest_invalid", f"audit field {key} is not scalar")
+    text = str(value).strip()
+    return text or None
+
+
+def _audit_text_list(row: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = row.get(key, [])
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise MigrationSourceError("manifest_invalid", f"audit field {key} is not a list")
+    return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _read_legacy_link_indexes(
+    connection: sqlite3.Connection,
+    path: Path,
+) -> _LegacyLinkIndexes:
+    tables = set(_table_names(connection))
+    missing_tables = sorted(set(_LEGACY_LINK_REQUIRED_COLUMNS) - tables)
+    if missing_tables:
+        raise MigrationSourceError(
+            "missing_required_table",
+            f"candidate snapshot requires: {', '.join(missing_tables)}",
+        )
+    for table, required in _LEGACY_LINK_REQUIRED_COLUMNS.items():
+        missing_columns = sorted(set(required) - set(_column_names(connection, table)))
+        if missing_columns:
+            raise MigrationSourceError(
+                "missing_required_column",
+                f"{table} missing: {', '.join(missing_columns)}",
+            )
+
+    contacts = {
+        str(row["id"]): {
+            "contact_id": str(row["id"]),
+            "display_name": str(row["display_name"] or ""),
+            "preferred_name": _text_or_none(row["preferred_name"]),
+            "status": str(row["status"] or ""),
+        }
+        for row in connection.execute(
+            "SELECT id, display_name, preferred_name, status FROM contacts ORDER BY id"
+        )
+    }
+    identifiers: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT channel, kind, identifier, contact_id FROM contact_identifiers"
+        " ORDER BY contact_id, channel, kind, identifier"
+    ):
+        contact_id = str(row["contact_id"])
+        identifiers.setdefault(contact_id, []).append(
+            {
+                "channel": str(row["channel"] or ""),
+                "kind": str(row["kind"] or ""),
+                "identifier": str(row["identifier"] or ""),
+            }
+        )
+    aliases: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT contact_id, alias, source, alias_kind, scope_key, status, evidence_ref"
+        " FROM contact_aliases ORDER BY contact_id, alias, source, id"
+    ):
+        alias = _text_or_none(row["alias"])
+        if alias is None:
+            continue
+        contact_id = str(row["contact_id"])
+        aliases.setdefault(contact_id, []).append(
+            {
+                "value": alias,
+                "source": str(row["source"] or ""),
+                "alias_kind": str(row["alias_kind"] or ""),
+                "scope_key": str(row["scope_key"] or ""),
+                "status": str(row["status"] or ""),
+                "evidence_ref": str(row["evidence_ref"] or ""),
+            }
+        )
+    bindings: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        "SELECT binding_id, channel, kind, namespace, value, person_id, status,"
+        " mapping_verified, evidence_ref, valid_from_ms, valid_until_ms"
+        " FROM knowledge_identifier_bindings"
+        " ORDER BY channel, kind, namespace, value, binding_id"
+    ):
+        channel = str(row["channel"] or "").strip().lower()
+        kind = str(row["kind"] or "").strip().lower()
+        value = str(row["value"] or "").strip()
+        try:
+            normalized_value = normalize_identifier_value(kind, value)
+        except ValidationError:
+            normalized_value = value
+        key = (channel, kind, normalized_value)
+        bindings.setdefault(key, []).append(
+            {
+                "binding_id": str(row["binding_id"]),
+                "channel": channel,
+                "kind": kind,
+                "namespace": str(row["namespace"] or DEFAULT_NAMESPACE),
+                "value": normalized_value,
+                "person_id": str(row["person_id"]),
+                "status": str(row["status"] or ""),
+                "mapping_verified": row["mapping_verified"] == 1,
+                "evidence_ref": str(row["evidence_ref"] or ""),
+                "valid_from_ms": int(row["valid_from_ms"] or 0),
+                "valid_until_ms": int(row["valid_until_ms"] or 0),
+            }
+        )
+    return _LegacyLinkIndexes(
+        contacts=contacts,
+        identifiers={key: tuple(value) for key, value in identifiers.items()},
+        aliases={key: tuple(value) for key, value in aliases.items()},
+        bindings={key: tuple(value) for key, value in bindings.items()},
+    )
+
+
+def _legacy_link_candidate(
+    row: Mapping[str, Any],
+    indexes: _LegacyLinkIndexes,
+) -> LegacyLinkCandidate:
+    reasons: list[str] = []
+    if row["source_status"] != "resolved":
+        reasons.append("source_not_resolved")
+    contact_context = _legacy_contact_context(row["contact_id"], indexes)
+    contact = indexes.contacts.get(str(row["contact_id"] or ""))
+    contact_active = contact is not None and contact["status"].lower() == "active"
+    speaker_candidates: tuple[dict[str, Any], ...] = ()
+
+    binding, binding_state, binding_reason = _legacy_sender_binding(row, indexes)
+    if binding_reason:
+        reasons.append(binding_reason)
+
+    if (
+        binding_state == "deterministic"
+        and binding is not None
+        and row["contact_id"]
+        and contact is not None
+        and not contact_active
+    ):
+        candidate_state = "conflict"
+        disposition = "quarantined"
+        reasons.append("contact_not_active")
+    elif binding_state == "deterministic" and binding is not None:
+        person = indexes.contacts.get(binding["person_id"])
+        assert person is not None  # enforced by _legacy_sender_binding
+        speaker_candidates = (
+            {
+                "person_id": binding["person_id"],
+                "role": "speaker",
+                "attribution": "transport",
+                "evidence_kind": "verified_identifier_binding",
+                "binding_id": binding["binding_id"],
+                "evidence_ref": binding["evidence_ref"],
+                "channel": binding["channel"],
+                "kind": binding["kind"],
+                "namespace": binding["namespace"],
+                "identifier": binding["value"],
+                "labels": {
+                    "display_name": person["display_name"],
+                    "preferred_name": person["preferred_name"],
+                    "observed_aliases": list(indexes.aliases.get(binding["person_id"], ())),
+                },
+            },
+        )
+        candidate_state = "deterministic"
+        disposition = "linked"
+        if row["contact_id"] and row["contact_id"] != binding["person_id"]:
+            reasons.append("contact_reference_only")
+    elif binding_state == "conflict":
+        candidate_state = "conflict"
+        disposition = "quarantined"
+    elif binding_state == "unsupported":
+        candidate_state = "unresolved"
+        disposition = "quarantined"
+    elif binding_state == "unbound" and contact_active:
+        candidate_state = "review"
+        disposition = "raw_only"
+        reasons.append("contact_reference_only")
+    elif binding_state == "unbound" and contact is not None:
+        candidate_state = "conflict"
+        disposition = "quarantined"
+        reasons.append("contact_not_active")
+    else:
+        candidate_state = "unresolved"
+        disposition = "quarantined"
+
+    return LegacyLinkCandidate(
+        legacy_node_id=str(row["legacy_node_id"]),
+        kind=str(row["kind"]),
+        sector=str(row["sector"]),
+        scope_type=str(row["scope_type"]),
+        scope_key=str(row["scope_key"]),
+        channel=row["channel"],
+        chat_id=row["chat_id"],
+        sender_id=row["sender_id"],
+        contact_id=row["contact_id"],
+        source_message_id=row["source_message_id"],
+        source_role=row["source_role"],
+        source_status=str(row["source_status"]),
+        source_classes=tuple(row["source_classes"]),
+        source_event_ids=tuple(row["source_event_ids"]),
+        is_deleted=bool(row["is_deleted"]),
+        has_fact_shell=bool(row["has_fact_shell"]),
+        has_statement=bool(row["has_statement"]),
+        quarantine_reasons=tuple(row["quarantine_reasons"]),
+        speaker_candidates=speaker_candidates,
+        contact_context=contact_context,
+        candidate_state=candidate_state,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+        proposed_disposition=disposition,
+    )
+
+
+def _legacy_contact_context(
+    contact_id: str | None,
+    indexes: _LegacyLinkIndexes,
+) -> dict[str, Any] | None:
+    if not contact_id:
+        return None
+    contact = indexes.contacts.get(contact_id)
+    if contact is None:
+        return {"contact_id": contact_id, "exists": False}
+    return {
+        "contact_id": contact_id,
+        "exists": True,
+        "status": contact["status"],
+        "display_name": contact["display_name"],
+        "preferred_name": contact["preferred_name"],
+        "observed_identifiers": list(indexes.identifiers.get(contact_id, ())),
+        "observed_aliases": list(indexes.aliases.get(contact_id, ())),
+    }
+
+
+def _legacy_sender_binding(
+    row: Mapping[str, Any],
+    indexes: _LegacyLinkIndexes,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    sender = str(row["sender_id"] or "").strip()
+    channel = str(row["channel"] or "").strip().lower()
+    if not sender:
+        return None, "unbound", "sender_unbound"
+    shape = _legacy_sender_shape(channel, sender)
+    if shape is None:
+        return None, "unsupported", "unsupported_identifier_context"
+    kind, value = shape
+    all_bindings = indexes.bindings.get((channel, kind, value), ())
+    if not all_bindings:
+        return None, "unbound", "sender_unbound"
+    expected = tuple(
+        item for item in all_bindings if item["namespace"] == DEFAULT_NAMESPACE
+    )
+    if len(expected) != len(all_bindings) or not expected:
+        return None, "unsupported", "unsupported_identifier_context"
+    valid = tuple(
+        item
+        for item in expected
+        if (
+            item["status"] == "active"
+            and item["mapping_verified"]
+            and item["valid_until_ms"] == 0
+        )
+    )
+    if (
+        len(expected) != 1
+        or len(valid) != 1
+        or valid[0]["person_id"] not in indexes.contacts
+        or indexes.contacts[valid[0]["person_id"]]["status"].lower() != "active"
+    ):
+        return None, "conflict", "conflicting_bindings"
+    return valid[0], "deterministic", "verified_sender_binding"
+
+
+def _legacy_sender_shape(channel: str, sender: str) -> tuple[str, str] | None:
+    if channel != "whatsapp":
+        return None
+    lowered = sender.lower()
+    if "@" in lowered:
+        domain = lowered.rsplit("@", 1)[1]
+        if domain not in ("s.whatsapp.net", "lid"):
+            return None
+        kind = "lid" if domain == "lid" else "phone_jid"
+        try:
+            value = normalize_identifier_value(kind, lowered)
+        except ValidationError:
+            return None
+        return kind, value
+    try:
+        value = normalize_identifier_value("phone_jid", sender)
+    except ValidationError:
+        return None
+    return "phone_jid", f"{value}@s.whatsapp.net"
+
+
+def _text_or_none(value: object) -> str | None:
+    text = "" if value is None else str(value).strip()
+    return text or None
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,6 +19,7 @@ from legacy_fixtures import (
     ACTIVE_NODE_ID,
     CONFLICT_CONTACT_ID,
     CONTACTS_TABLE_ROWS,
+    DELETED_NODE_ID,
     LEGACY_SCHEMA_VERSION,
     LINKED_NODE_ID,
     MEMORY_TABLE_ROWS,
@@ -97,6 +98,85 @@ def _stat(path: Path) -> tuple[int, int, str]:
 
 def _build_paths(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "built" / "knowledge.db", tmp_path / "built" / "manifest.json"
+
+
+def _build_knowledge_snapshot(tmp_path: Path) -> Path:
+    sources = legacy_snapshot_factory(tmp_path)
+    target, manifest = _build_paths(tmp_path)
+    migrate_sources(
+        contacts_path=sources.contacts,
+        memory_path=sources.memory,
+        target=target,
+        manifest=manifest,
+    )
+    return target
+
+
+def _write_legacy_audit(
+    target: Path,
+    tmp_path: Path,
+    *,
+    processing_db: Path | None = None,
+    name: str = "legacy-audit.json",
+) -> Path:
+    inventory = inspect_legacy_nodes(target, processing_db=processing_db)
+    audit = tmp_path / name
+    audit.write_text(inventory.to_json() + "\n", encoding="utf-8")
+    return audit
+
+
+def _propose_legacy_links(audit: Path, target: Path):
+    from yeoman_gateway.knowledge.api import propose_legacy_links
+
+    return propose_legacy_links(audit, target)
+
+
+def _insert_binding(
+    target: Path,
+    *,
+    binding_id: str,
+    person_id: str,
+    value: str = "4910000000001@s.whatsapp.net",
+    status: str = "active",
+    mapping_verified: int = 1,
+    valid_until_ms: int = 0,
+) -> None:
+    connection = sqlite3.connect(target)
+    try:
+        connection.execute(
+            "INSERT INTO knowledge_identifier_bindings (binding_id, channel, kind,"
+            " namespace, value, person_id, status, valid_from_ms, valid_until_ms,"
+            " observed_at_ms, evidence_ref, mapping_verified, revision, created_ms,"
+            " updated_ms) VALUES (?, 'whatsapp', 'phone_jid', 'default', ?, ?, ?,"
+            " 1, ?, 1, 'synthetic-binding-evidence', ?, 1, 1, 1)",
+            (binding_id, value, person_id, status, valid_until_ms, mapping_verified),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _processing_snapshot_for_source_statuses(path: Path) -> Path:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, source_message_id TEXT,"
+            " kind TEXT, revision INTEGER, direction TEXT, chat_id TEXT, principal TEXT,"
+            " channel TEXT, occurred_ms INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO events VALUES (?, ?, 'message', ?, 'in', 'group-synthetic',"
+            " '4910000000001', 'whatsapp', ?)",
+            [
+                ("event-partial", "message-aaaa", 1, 1),
+                ("event-conflict-a", "message-bbbb", 1, 2),
+                ("event-conflict-b", "message-bbbb", 2, 3),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
 
 
 # ── inventory ────────────────────────────────────────────────────────────────
@@ -389,6 +469,219 @@ def test_inspect_legacy_nodes_rejects_missing_required_tables(tmp_path: Path) ->
     assert error.value.reason == "missing_required_table"
 
 
+# ── legacy reconciliation candidates ────────────────────────────────────────
+
+
+def test_legacy_link_verified_sender_binding_becomes_one_transport_speaker_candidate(
+    tmp_path: Path,
+):
+    target = _build_knowledge_snapshot(tmp_path)
+    _insert_binding(
+        target,
+        binding_id="binding-verified-sender",
+        person_id=OWNER_CONTACT_ID,
+    )
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == LINKED_NODE_ID)
+
+    assert len(row.speaker_candidates) == 1
+    candidate = row.speaker_candidates[0]
+    assert candidate["person_id"] == OWNER_CONTACT_ID
+    assert candidate["role"] == "speaker"
+    assert candidate["attribution"] == "transport"
+    assert candidate["binding_id"] == "binding-verified-sender"
+    assert candidate["evidence_kind"] == "verified_identifier_binding"
+    assert row.candidate_state == "deterministic"
+    assert row.proposed_disposition == "linked"
+    assert row.requires_owner_review is True
+    assert row.contact_context["observed_aliases"][0]["value"] == "synthetic-owner"
+
+
+def test_legacy_link_requires_exact_mapping_verified_value_one(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    _insert_binding(
+        target,
+        binding_id="binding-invalid-verification",
+        person_id=OWNER_CONTACT_ID,
+        mapping_verified=2,
+    )
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == ACTIVE_NODE_ID)
+
+    assert row.candidate_state == "conflict"
+    assert row.speaker_candidates == ()
+    assert "conflicting_bindings" in row.reason_codes
+
+
+def test_legacy_link_contact_id_without_verified_binding_stays_context_only(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == LINKED_NODE_ID)
+
+    assert row.speaker_candidates == ()
+    assert row.candidate_state == "review"
+    assert row.proposed_disposition == "raw_only"
+    assert row.contact_context["contact_id"] == OWNER_CONTACT_ID
+    assert "contact_reference_only" in row.reason_codes
+
+
+def test_legacy_link_source_statuses_are_preserved_independently_of_identity(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    processing = _processing_snapshot_for_source_statuses(tmp_path / "processing.db")
+    audit = _write_legacy_audit(target, tmp_path, processing_db=processing)
+
+    manifest = _propose_legacy_links(audit, target)
+    rows = {item.legacy_node_id: item for item in manifest.candidates}
+
+    assert rows[ACTIVE_NODE_ID].source_status == "partial"
+    assert rows[DELETED_NODE_ID].source_status == "conflict"
+    assert rows[LINKED_NODE_ID].source_status == "missing"
+    assert rows[LINKED_NODE_ID].sender_id == "4910000000001"
+    assert "source_not_resolved" in rows[LINKED_NODE_ID].reason_codes
+
+
+def test_legacy_link_competing_bindings_never_select_a_person(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    _insert_binding(
+        target,
+        binding_id="binding-verified-sender",
+        person_id=OWNER_CONTACT_ID,
+    )
+    _insert_binding(
+        target,
+        binding_id="binding-conflicting-sender",
+        person_id=SECOND_CONTACT_ID,
+        status="conflict",
+        mapping_verified=1,
+    )
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == ACTIVE_NODE_ID)
+
+    assert row.candidate_state == "conflict"
+    assert row.speaker_candidates == ()
+    assert row.proposed_disposition == "quarantined"
+    assert "conflicting_bindings" in row.reason_codes
+
+
+def test_legacy_link_ended_binding_never_selects_a_person(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    _insert_binding(
+        target,
+        binding_id="binding-ended-sender",
+        person_id=OWNER_CONTACT_ID,
+        valid_until_ms=1700000000000,
+    )
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == ACTIVE_NODE_ID)
+
+    assert row.candidate_state == "conflict"
+    assert row.speaker_candidates == ()
+    assert "conflicting_bindings" in row.reason_codes
+
+
+def test_legacy_link_inactive_contact_context_never_selects_a_person(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    _insert_binding(
+        target,
+        binding_id="binding-verified-sender",
+        person_id=OWNER_CONTACT_ID,
+    )
+    connection = sqlite3.connect(target)
+    try:
+        connection.execute(
+            "UPDATE memory2_nodes SET contact_id = ? WHERE id = ?",
+            (SECOND_CONTACT_ID, LINKED_NODE_ID),
+        )
+        connection.execute(
+            "UPDATE contacts SET status = 'retired' WHERE id = ?",
+            (SECOND_CONTACT_ID,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == LINKED_NODE_ID)
+
+    assert row.candidate_state == "conflict"
+    assert row.speaker_candidates == ()
+    assert "contact_not_active" in row.reason_codes
+
+
+def test_legacy_link_missing_sender_stays_unresolved(tmp_path: Path):
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+    payload = json.loads(audit.read_text(encoding="utf-8"))
+    next(row for row in payload["nodes"] if row["legacy_node_id"] == ACTIVE_NODE_ID)[
+        "sender_id"
+    ] = None
+    audit.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    manifest = _propose_legacy_links(audit, target)
+    row = next(item for item in manifest.candidates if item.legacy_node_id == ACTIVE_NODE_ID)
+
+    assert row.candidate_state == "unresolved"
+    assert row.speaker_candidates == ()
+    assert "sender_unbound" in row.reason_codes
+
+
+def test_reconciliation_candidate_output_is_text_free_and_has_one_row_per_audit_node(
+    tmp_path: Path,
+):
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+
+    manifest = _propose_legacy_links(audit, target)
+    payload = json.loads(manifest.to_json())
+    output = manifest.to_json()
+
+    assert len(manifest.candidates) == 3
+    assert len({item.legacy_node_id for item in manifest.candidates}) == 3
+    assert payload["counts"]["nodes"] == 3
+    assert all("content" not in item for item in payload["candidates"])
+    assert "synthetic note one" not in output
+    assert "meta_json" not in output
+    assert "subjects" not in output
+
+
+def test_reconciliation_candidate_audit_target_fingerprint_mismatch_is_rejected_without_writing_target(
+    tmp_path: Path,
+):
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+    payload = json.loads(audit.read_text(encoding="utf-8"))
+    payload["target_fingerprint"] = "0" * 64
+    audit.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target_before = target.read_bytes()
+    sidecars_before = {
+        suffix: target.with_name(target.name + suffix).read_bytes()
+        for suffix in ("-wal", "-shm", "-journal")
+        if target.with_name(target.name + suffix).exists()
+    }
+
+    with pytest.raises(MigrationSourceError) as error:
+        _propose_legacy_links(audit, target)
+
+    assert error.value.reason == "manifest_mismatch"
+    assert target.read_bytes() == target_before
+    assert sidecars_before == {
+        suffix: target.with_name(target.name + suffix).read_bytes()
+        for suffix in ("-wal", "-shm", "-journal")
+        if target.with_name(target.name + suffix).exists()
+    }
+
+
 def test_inspect_legacy_nodes_marks_id_only_source_matches_partial(tmp_path: Path) -> None:
     sources = legacy_snapshot_factory(tmp_path)
     target, manifest = _build_paths(tmp_path)
@@ -511,6 +804,95 @@ def test_inspect_legacy_nodes_cli_writes_private_manifest(tmp_path: Path) -> Non
     )
     assert repeated.exit_code != 0
     assert "target_exists" in repeated.output
+
+
+def test_propose_legacy_links_cli_writes_private_candidates_read_only(tmp_path: Path) -> None:
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+    output = tmp_path / "legacy-candidates.json"
+    target_before = target.read_bytes()
+    sidecars_before = {
+        suffix: target.with_name(target.name + suffix).read_bytes()
+        for suffix in ("-wal", "-shm", "-journal")
+        if target.with_name(target.name + suffix).exists()
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(
+        _cli_app(),
+        [
+            "knowledge",
+            "migration",
+            "propose-legacy-links",
+            "--audit",
+            str(audit),
+            "--target",
+            str(target),
+            "--out",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "candidate nodes: 3" in result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["counts"]["nodes"] == 3
+    assert all("content" not in row for row in payload["candidates"])
+    assert "synthetic note one" not in output.read_text(encoding="utf-8")
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert target.read_bytes() == target_before
+    assert sidecars_before == {
+        suffix: target.with_name(target.name + suffix).read_bytes()
+        for suffix in ("-wal", "-shm", "-journal")
+        if target.with_name(target.name + suffix).exists()
+    }
+
+    output_before = output.read_bytes()
+    repeated = runner.invoke(
+        _cli_app(),
+        [
+            "knowledge",
+            "migration",
+            "propose-legacy-links",
+            "--audit",
+            str(audit),
+            "--target",
+            str(target),
+            "--out",
+            str(output),
+        ],
+    )
+    assert repeated.exit_code != 0
+    assert "target_exists" in repeated.output
+    assert output.read_bytes() == output_before
+
+
+def test_propose_legacy_links_cli_reports_manifest_mismatch(tmp_path: Path) -> None:
+    target = _build_knowledge_snapshot(tmp_path)
+    audit = _write_legacy_audit(target, tmp_path)
+    payload = json.loads(audit.read_text(encoding="utf-8"))
+    payload["target_fingerprint"] = "0" * 64
+    audit.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output = tmp_path / "legacy-candidates.json"
+
+    result = CliRunner().invoke(
+        _cli_app(),
+        [
+            "knowledge",
+            "migration",
+            "propose-legacy-links",
+            "--audit",
+            str(audit),
+            "--target",
+            str(target),
+            "--out",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "manifest_mismatch" in result.output
+    assert not output.exists()
 
 
 def test_imported_primary_keys_are_unchanged(tmp_path: Path) -> None:
