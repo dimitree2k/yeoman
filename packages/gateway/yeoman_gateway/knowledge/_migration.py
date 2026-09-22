@@ -1575,6 +1575,7 @@ class LegacyNodeRecord:
     quarantine_reasons: tuple[str, ...]
     source_status: str
     source_classes: tuple[str, ...]
+    source_event_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1627,10 +1628,15 @@ def _legacy_source_index(
     *,
     inbound_dir: Path | None,
     processing_db: Path | None,
-) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
+) -> tuple[
+    dict[tuple[str, str], set[str]],
+    dict[str, set[str]],
+    dict[str, set[str]],
+]:
     """Index source identities without carrying source content into the audit."""
     variants: dict[tuple[str, str], set[str]] = {}
     classes: dict[str, set[str]] = {}
+    event_ids: dict[str, set[str]] = {}
     if processing_db is not None:
         sidecars_before = _read_sidecars(processing_db)
         connection: sqlite3.Connection | None = None
@@ -1660,7 +1666,7 @@ def _legacy_source_index(
                     "processing events missing: " + ", ".join(missing),
                 )
             rows = connection.execute(
-                "SELECT source_message_id, kind, revision, chat_id, principal, channel,"
+                "SELECT event_id, source_message_id, kind, revision, chat_id, principal, channel,"
                 " occurred_ms FROM events WHERE source_message_id IS NOT NULL"
             ).fetchall()
             for row in rows:
@@ -1681,6 +1687,9 @@ def _legacy_source_index(
                     )
                 )
                 classes.setdefault(source_ref, set()).add(source_class)
+                event_id = _legacy_text_or_none(row["event_id"])
+                if event_id is not None:
+                    event_ids.setdefault(source_ref, set()).add(event_id)
         finally:
             if connection is not None:
                 connection.close()
@@ -1709,7 +1718,7 @@ def _legacy_source_index(
                     )
                 )
                 classes.setdefault(source_ref, set()).add(source_class)
-    return variants, classes
+    return variants, classes, event_ids
 
 
 def _legacy_source_status(
@@ -1718,24 +1727,26 @@ def _legacy_source_status(
     source_checked: bool,
     variants: Mapping[tuple[str, str], set[str]],
     classes: Mapping[str, set[str]],
-) -> tuple[str, tuple[str, ...]]:
+    event_ids: Mapping[str, set[str]],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     if not source_message_id:
-        return "missing", ()
+        return "missing", (), ()
     if not source_checked:
-        return "unverified", ()
+        return "unverified", (), ()
     source_classes = tuple(sorted(classes.get(source_message_id, set())))
+    source_event_ids = tuple(sorted(event_ids.get(source_message_id, set())))
     matching_variants = [
         fingerprints
         for (source_class, source_ref), fingerprints in variants.items()
         if source_ref == source_message_id
     ]
     if not matching_variants:
-        return "missing", source_classes
+        return "missing", source_classes, source_event_ids
     if any(len(fingerprints) > 1 for fingerprints in matching_variants):
-        return "conflict", source_classes
+        return "conflict", source_classes, source_event_ids
     # An id-only match is deliberately not a resolved attribution.  Chat, sender,
     # timestamp and revision matching belongs to the next audit phase.
-    return "partial", source_classes
+    return "partial", source_classes, source_event_ids
 
 
 def inspect_legacy_nodes(
@@ -1759,8 +1770,9 @@ def inspect_legacy_nodes(
     source_checked = inbound_path is not None or processing_path is not None
     variants: dict[tuple[str, str], set[str]] = {}
     source_classes: dict[str, set[str]] = {}
+    source_event_ids: dict[str, set[str]] = {}
     if source_checked:
-        variants, source_classes = _legacy_source_index(
+        variants, source_classes, source_event_ids = _legacy_source_index(
             inbound_dir=inbound_path,
             processing_db=processing_path,
         )
@@ -1836,11 +1848,12 @@ def inspect_legacy_nodes(
         records: list[LegacyNodeRecord] = []
         for row in rows:
             source_message_id = _legacy_text_or_none(row["source_message_id"])
-            source_status, matched_classes = _legacy_source_status(
+            source_status, matched_classes, matched_event_ids = _legacy_source_status(
                 source_message_id,
                 source_checked=source_checked,
                 variants=variants,
                 classes=source_classes,
+                event_ids=source_event_ids,
             )
             records.append(
                 LegacyNodeRecord(
@@ -1861,6 +1874,7 @@ def inspect_legacy_nodes(
                     quarantine_reasons=tuple(reasons_by_node[str(row["id"])]),
                     source_status=source_status,
                     source_classes=matched_classes,
+                    source_event_ids=matched_event_ids,
                 )
             )
     finally:

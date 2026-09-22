@@ -422,6 +422,7 @@ def test_inspect_legacy_nodes_marks_id_only_source_matches_partial(tmp_path: Pat
     matched = next(node for node in inventory.nodes if node.source_message_id == "message-aaaa")
     assert matched.source_status == "partial"
     assert matched.source_classes == ("processing_events",)
+    assert matched.source_event_ids == ("event-aaaa",)
     assert sorted(item.name for item in processing.parent.iterdir()) == processing_before
 
     inbound = tmp_path / "inbound"
@@ -439,6 +440,7 @@ def test_inspect_legacy_nodes_marks_id_only_source_matches_partial(tmp_path: Pat
     matched = next(node for node in inventory.nodes if node.source_message_id == "message-aaaa")
     assert matched.source_status == "partial"
     assert matched.source_classes == ("inbound_archive", "processing_events")
+    assert matched.source_event_ids == ("event-aaaa",)
 
 
 def test_inspect_legacy_nodes_rejects_incomplete_required_columns(tmp_path: Path) -> None:
