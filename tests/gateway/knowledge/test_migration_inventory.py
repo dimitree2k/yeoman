@@ -493,6 +493,7 @@ def test_inspect_legacy_nodes_cli_writes_private_manifest(tmp_path: Path) -> Non
     assert "legacy nodes: 3" in result.output
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["counts"]["nodes"] == 3
+    assert payload["counts"]["orphan_quarantine_rows"] == 0
     assert "synthetic note one" not in output.read_text(encoding="utf-8")
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert _stat(target) == before

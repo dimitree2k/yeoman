@@ -1589,6 +1589,7 @@ class LegacyNodeInventory:
     by_kind: tuple[tuple[str, int, int], ...]
     quarantine_reasons: tuple[tuple[str, int], ...]
     source_status_counts: tuple[tuple[str, int], ...]
+    orphan_quarantine_rows: int = 0
 
     def counts(self) -> dict[str, int]:
         return {
@@ -1599,6 +1600,7 @@ class LegacyNodeInventory:
             "with_contact_id": sum(bool(node.contact_id) for node in self.nodes),
             "with_fact_shell": sum(node.has_fact_shell for node in self.nodes),
             "with_statement": sum(node.has_statement for node in self.nodes),
+            "orphan_quarantine_rows": self.orphan_quarantine_rows,
         }
 
     def to_json(self) -> str:
@@ -1665,10 +1667,15 @@ def _legacy_source_index(
                     "missing_required_column",
                     "processing events missing: " + ", ".join(missing),
                 )
-            rows = connection.execute(
-                "SELECT event_id, source_message_id, kind, revision, chat_id, principal, channel,"
-                " occurred_ms FROM events WHERE source_message_id IS NOT NULL"
-            ).fetchall()
+            try:
+                rows = connection.execute(
+                    "SELECT event_id, source_message_id, kind, revision, chat_id, principal, channel,"
+                    " occurred_ms FROM events WHERE source_message_id IS NOT NULL"
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise MigrationSourceError(
+                    "unsupported_schema", "could not read processing source events"
+                ) from exc
             for row in rows:
                 source_ref = _legacy_text_or_none(row["source_message_id"])
                 if source_ref is None:
@@ -2101,6 +2108,48 @@ def _columns(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
         return ()
 
 
+def _read_processing_lineage_rows(
+    path: Path,
+) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    """Read the lineage metadata contract without leaving read sidecars."""
+    _require_snapshot_file(path)
+    sidecars_before = _read_sidecars(path)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect_readonly(path)
+        _require_integrity(connection, path)
+        try:
+            tables = _table_names(connection)
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not inspect processing source tables"
+            ) from exc
+        if "events" not in tables:
+            raise MigrationSourceError(
+                "missing_required_table", "processing source requires an events table"
+            )
+        required = {"event_id", "kind", "revision", "direction", "chat_id", "account"}
+        missing = sorted(required - set(_columns(connection, "events")))
+        if missing:
+            raise MigrationSourceError(
+                "missing_required_column",
+                "processing events missing: " + ", ".join(missing),
+            )
+        try:
+            rows = connection.execute(
+                "SELECT event_id, kind, revision, direction, chat_id, account FROM events"
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise MigrationSourceError(
+                "unsupported_schema", "could not read processing lineage events"
+            ) from exc
+        return tables, tuple({key: row[key] for key in row.keys()} for row in rows)
+    finally:
+        if connection is not None:
+            connection.close()
+        _remove_read_sidecars(path, sidecars_before)
+
+
 def inspect_lineage_sources(
     *,
     inbound_dir: Path | str | None = None,
@@ -2121,39 +2170,30 @@ def inspect_lineage_sources(
 
     # ── processing store ─────────────────────────────────────────────────────
     if processing_db is not None and Path(processing_db).exists():
-        connection = _connect_readonly(Path(processing_db))
-        try:
-            tables = _table_names(connection)
-            schema.append(("processing", ",".join(tables)))
-            if "events" in tables:
-                rows = connection.execute(
-                    "SELECT event_id, kind, revision, direction, chat_id, account FROM events"
-                ).fetchall()
-                for row in rows:
-                    record = {key: row[key] for key in row.keys()}
-                    decision, reason = _decide_event(record)
-                    if decision == "import":
-                        eligible_jobs += 1
-                    decisions.append(
-                        LineageDecision(
-                            source_class="processing_events",
-                            source_ref=str(record.get("event_id") or ""),
-                            decision=decision,
-                            reason=reason,
-                            fingerprint=lineage_fingerprint(
-                                "processing_events",
-                                record.get("event_id"),
-                                record.get("kind"),
-                                record.get("revision"),
-                            ),
-                        )
-                    )
-            statements.append(
-                f"processing: {len(tables)} table(s), "
-                f"{sum(1 for item in decisions if item.source_class == 'processing_events')} event(s)"
+        tables, rows = _read_processing_lineage_rows(_expand(processing_db))
+        schema.append(("processing", ",".join(tables)))
+        for record in rows:
+            decision, reason = _decide_event(record)
+            if decision == "import":
+                eligible_jobs += 1
+            decisions.append(
+                LineageDecision(
+                    source_class="processing_events",
+                    source_ref=str(record.get("event_id") or ""),
+                    decision=decision,
+                    reason=reason,
+                    fingerprint=lineage_fingerprint(
+                        "processing_events",
+                        record.get("event_id"),
+                        record.get("kind"),
+                        record.get("revision"),
+                    ),
+                )
             )
-        finally:
-            connection.close()
+        statements.append(
+            f"processing: {len(tables)} table(s), "
+            f"{sum(1 for item in decisions if item.source_class == 'processing_events')} event(s)"
+        )
 
     # ── inbound archives ─────────────────────────────────────────────────────
     if inbound_dir is not None and Path(inbound_dir).exists():

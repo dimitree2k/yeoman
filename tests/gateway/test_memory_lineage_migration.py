@@ -11,6 +11,7 @@ Offline and synthetic: temporary fixtures only.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,6 +20,7 @@ from yeoman_gateway.knowledge._migration import (
     LINEAGE_DECISIONS,
     LINEAGE_SOURCE_CLASSES,
     LineageInventory,
+    MigrationSourceError,
     import_lineage,
     inspect_lineage_sources,
     lineage_fingerprint,
@@ -185,6 +187,20 @@ def test_fingerprints_are_stable_across_runs(fixtures) -> None:
         item.fingerprint for item in second.decisions
     ]
     assert first.counts() == second.counts()
+
+
+def test_processing_lineage_rejects_an_incomplete_events_schema(tmp_path: Path) -> None:
+    database = tmp_path / "processing.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(MigrationSourceError) as error:
+        inspect_lineage_sources(processing_db=database)
+    assert error.value.reason == "missing_required_column"
     assert lineage_fingerprint("a", "b") == lineage_fingerprint("a", "b")
     assert lineage_fingerprint("a", "b") != lineage_fingerprint("b", "a")
 
