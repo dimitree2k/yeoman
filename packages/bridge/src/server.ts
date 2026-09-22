@@ -12,6 +12,7 @@ import {
   parseBridgeCommand,
   parseDeleteMessagePayload,
   parseAckEventPayload,
+  parseForwardMessagePayload,
   parseListGroupsPayload,
   parseLoginStartPayload,
   parseLoginWaitPayload,
@@ -31,6 +32,7 @@ import {
   isReplayableEventType,
   type ReplayableBridgeEvent,
 } from './outbox.js';
+import { defaultMessageReferenceDir } from './message_reference_store.js';
 import { WhatsAppClient, type InboundMedia, type InboundMessageV2 } from './whatsapp.js';
 
 type ClientMeta = {
@@ -169,6 +171,7 @@ export class BridgeServer {
     private readonly readReceipts: boolean,
     private readonly accountId = 'default',
     outboxDir = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir(),
+    private readonly messageReferenceDir = process.env.BRIDGE_MESSAGE_REFERENCE_DIR || defaultMessageReferenceDir(),
   ) {
     this.outbox = new BridgeOutbox(outboxDir);
   }
@@ -193,6 +196,7 @@ export class BridgeServer {
       persistInboundAudio: this.persistInboundAudio,
       persistInboundDocument: this.persistInboundDocuments,
       acceptFromMe: this.acceptFromMe,
+      messageReferenceDir: this.messageReferenceDir,
       readReceipts: this.readReceipts,
       accountId: this.accountId,
       onMessage: (msg) => {
@@ -457,6 +461,12 @@ export class BridgeServer {
       const parsed = parseSendMediaPayload(payload);
       const sent = await this.wa.sendMedia(parsed);
       return { sent };
+    }
+
+    if (type === 'forward_message') {
+      const parsed = parseForwardMessagePayload(payload);
+      const forwarded = await this.wa.forwardMessage(parsed);
+      return { forwarded };
     }
 
     if (type === 'send_poll') {

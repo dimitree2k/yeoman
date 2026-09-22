@@ -11,6 +11,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
@@ -21,6 +22,10 @@ const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 20_000;
 const DEFAULT_MAX_RECORD_BYTES = 256 * 1024;
 const RECORD_FILE_RE = /^[0-9a-f]{64}\.json$/;
+
+export function defaultMessageReferenceDir(): string {
+  return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-message-references');
+}
 
 type StoredReference = {
   chatJid: string;

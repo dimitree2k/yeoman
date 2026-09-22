@@ -74,6 +74,46 @@ test('parseBridgeCommand accepts delete_message with an exact target', () => {
   }
 });
 
+test('parseBridgeCommand accepts native forward_message with an exact source', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'forward_message',
+    token: 'secret',
+    requestId: 'req-forward-1',
+    payload: {
+      to: 'target@g.us',
+      sourceChatJid: 'source@g.us',
+      sourceMessageId: 'SRC-1',
+    },
+  });
+
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) {
+    assert.equal(parsed.command.type, 'forward_message');
+    assert.deepEqual(parsed.command.payload, {
+      to: 'target@g.us',
+      sourceChatJid: 'source@g.us',
+      sourceMessageId: 'SRC-1',
+    });
+  }
+});
+
+test('parseBridgeCommand rejects forward_message with empty identities', () => {
+  const parsed = parseBridgeCommand({
+    version: PROTOCOL_VERSION,
+    type: 'forward_message',
+    token: 'secret',
+    payload: {
+      to: 'target@g.us',
+      sourceChatJid: ' ',
+      sourceMessageId: '',
+    },
+  });
+
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) assert.equal(parsed.error.code, 'ERR_SCHEMA');
+});
+
 test('parseBridgeCommand rejects delete_message without a message id', () => {
   const parsed = parseBridgeCommand({
     version: PROTOCOL_VERSION,

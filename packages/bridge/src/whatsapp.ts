@@ -14,6 +14,11 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
+import {
+  defaultMessageReferenceDir,
+  MessageReferenceStore,
+} from './message_reference_store.js';
+
 const VERSION = '0.2.0';
 const INBOUND_DEDUPE_TTL_MS = 20 * 60_000;
 const INBOUND_DEDUPE_MAX = 5_000;
@@ -122,6 +127,13 @@ export interface DeleteMessageInput {
   messageId: string;
 }
 
+export interface ForwardMessageInput {
+  to: string;
+  sourceChatJid: string;
+  sourceMessageId: string;
+  clientMessageId?: string;
+}
+
 export type PresenceState = 'available' | 'unavailable' | 'composing' | 'paused' | 'recording';
 
 export interface PresenceUpdateInput {
@@ -131,6 +143,10 @@ export interface PresenceUpdateInput {
 
 export interface WhatsAppClientOptions {
   authDir: string;
+  messageReferenceDir?: string;
+  messageReferenceRetentionMs?: number;
+  messageReferenceMaxEntries?: number;
+  messageReferenceMaxRecordBytes?: number;
   mediaIncomingDir?: string;
   mediaOutgoingDir?: string;
   persistInboundAudio?: boolean;
@@ -217,6 +233,13 @@ function safeErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return String(err);
+}
+
+function forwardUnavailable(message: string): Error & { code: 'ERR_FORWARD_UNAVAILABLE'; retryable: false } {
+  const error = new Error(message) as Error & { code: 'ERR_FORWARD_UNAVAILABLE'; retryable: false };
+  error.code = 'ERR_FORWARD_UNAVAILABLE';
+  error.retryable = false;
+  return error;
 }
 
 function decodeDownloadedMedia(downloaded: unknown): Buffer | null {
@@ -526,6 +549,7 @@ export interface GroupMetadataResult extends GroupMetadata {
 
 export class WhatsAppClient {
   private readonly options: WhatsAppClientOptions;
+  private readonly referenceStore: MessageReferenceStore;
   private sock: any = null;
   private running = false;
   private loopTask: Promise<void> | null = null;
@@ -561,6 +585,14 @@ export class WhatsAppClient {
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
+    this.referenceStore = new MessageReferenceStore(
+      options.messageReferenceDir || defaultMessageReferenceDir(),
+      {
+        retentionMs: options.messageReferenceRetentionMs,
+        maxEntries: options.messageReferenceMaxEntries,
+        maxRecordBytes: options.messageReferenceMaxRecordBytes,
+      },
+    );
   }
 
   private get mediaIncomingDir(): string {
@@ -813,6 +845,7 @@ export class WhatsAppClient {
 
   async start(): Promise<void> {
     if (this.running) return;
+    await this.referenceStore.open();
     await this.ensureMediaDirs();
     this.acceptingProviderEvents = true;
     this.running = true;
@@ -1131,15 +1164,11 @@ export class WhatsAppClient {
     });
   }
 
-  /**
-   * Answer a lookup from proven local sources only: the inbound quote cache and the
-   * outbound self-message map. Anything else is ``unsupported`` - the bridge has no
-   * authority over server-side truth and never claims a message is absent.
-   */
-  lookupMessage(input: { chatJid: string; messageId: string }): {
+  /** Answer a lookup from the exact local reference and outbound-self stores. */
+  async lookupMessage(input: { chatJid: string; messageId: string }): Promise<{
     status: 'found' | 'absent' | 'unsupported';
     messageId?: string;
-  } {
+  }> {
     const chatJid = normalizeJid(input.chatJid);
     const messageId = String(input.messageId || '').trim();
     if (!chatJid || !messageId) return { status: 'unsupported' };
@@ -1151,7 +1180,14 @@ export class WhatsAppClient {
     if (outboundKey && this.recentOutboundSelf.has(outboundKey)) {
       return { status: 'found', messageId };
     }
-    return { status: 'unsupported' };
+    try {
+      return (await this.referenceStore.has(chatJid, messageId))
+        ? { status: 'found', messageId }
+        : { status: 'absent' };
+    } catch (error) {
+      this.reportReferenceFailure(error);
+      return { status: 'unsupported' };
+    }
   }
 
   private outboundSelfKey(chatJidRaw: string, messageIdRaw: string): string | null {
@@ -1213,7 +1249,7 @@ export class WhatsAppClient {
     }
   }
 
-  private resolveQuotedMessage(chatJidRaw: string, replyToMessageId: string | undefined): any | undefined {
+  private async resolveQuotedMessage(chatJidRaw: string, replyToMessageId: string | undefined): Promise<any | undefined> {
     const chatJid = normalizeJid(chatJidRaw);
     const messageId = String(replyToMessageId || '').trim();
     if (!chatJid || !messageId) return undefined;
@@ -1221,12 +1257,29 @@ export class WhatsAppClient {
     const now = nowMs();
     const key = this.quoteKey(chatJid, messageId);
     const entry = this.quoteCache.get(key);
-    if (!entry) return undefined;
-    if (entry.expiresAt <= now) {
+    if (entry && entry.expiresAt <= now) {
       this.quoteCache.delete(key);
-      return undefined;
+    } else if (entry) {
+      return entry.msg;
     }
-    return entry.msg;
+    return this.referenceStore.get(chatJid, messageId).catch((error: unknown) => {
+      this.reportReferenceFailure(error);
+      return undefined;
+    });
+  }
+
+  private reportReferenceFailure(error: unknown): void {
+    this.lastError = safeErrorMessage(error);
+    this.options.onError(`message_reference_store_failed: ${this.lastError}`);
+  }
+
+  private async persistMessageReference(chatJid: string, messageId: string, message: unknown): Promise<void> {
+    try {
+      if (await this.referenceStore.put(chatJid, messageId, message)) return;
+      this.options.onError('message_reference_store_rejected');
+    } catch (error) {
+      this.reportReferenceFailure(error);
+    }
   }
 
   private extractContextInfo(msg: any): any {
@@ -1298,6 +1351,35 @@ export class WhatsAppClient {
     return null;
   }
 
+  private isCompleteQuotedMessage(quotedRaw: any): boolean {
+    const message = this.unwrapNestedMessage(quotedRaw);
+    if (!message || typeof message !== 'object' || Object.keys(message).length === 0) return false;
+    for (const kind of ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage']) {
+      if (message[kind] !== undefined) {
+        return Boolean(message[kind]) && Object.keys(message[kind]).length > 0;
+      }
+    }
+    return true;
+  }
+
+  private async backfillQuotedMessage(
+    chatJid: string,
+    messageId: string,
+    participant: string | undefined,
+    quotedMessage: any,
+  ): Promise<void> {
+    if (!this.isCompleteQuotedMessage(quotedMessage)) return;
+    try {
+      if (await this.referenceStore.has(chatJid, messageId)) return;
+      await this.persistMessageReference(chatJid, messageId, {
+        key: { remoteJid: chatJid, id: messageId, fromMe: false, participant },
+        message: quotedMessage,
+      });
+    } catch (error) {
+      this.reportReferenceFailure(error);
+    }
+  }
+
   private async buildReplyMeta(msg: any, chatJid: string): Promise<{
     replyToMessageId?: string;
     replyToParticipantJid?: string;
@@ -1312,6 +1394,15 @@ export class WhatsAppClient {
     const replyToMessageId = replyToMessageIdRaw || undefined;
     const replyToParticipantJid = replyToParticipantJidRaw || undefined;
     const replyToText = replyToTextRaw || undefined;
+
+    if (replyToMessageId && context.quotedMessage) {
+      await this.backfillQuotedMessage(
+        chatJid,
+        replyToMessageId,
+        replyToParticipantJid,
+        context.quotedMessage,
+      );
+    }
 
     let replyToMedia: InboundMedia | undefined;
     if (replyToMessageId && context.quotedMessage) {
@@ -1558,8 +1649,8 @@ export class WhatsAppClient {
     this.connectWaiters.clear();
   }
 
-  private handleInboundMessage(msg: any): Promise<void> | undefined {
-    if (!this.acceptingProviderEvents) return undefined;
+  private async handleInboundMessage(msg: any): Promise<void> {
+    if (!this.acceptingProviderEvents) return;
     const remoteJidRaw = String(msg?.key?.remoteJid || '');
     if (!remoteJidRaw || remoteJidRaw === 'status@broadcast' || remoteJidRaw.endsWith('@newsletter')) return;
 
@@ -1573,6 +1664,7 @@ export class WhatsAppClient {
     if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) return;
 
     this.storeInboundForQuote(chatJid, messageId, msg);
+    await this.persistMessageReference(chatJid, messageId, msg);
 
     const extracted = this.extractMessageTextAndMedia(msg);
     const providerContent = JSON.stringify({
@@ -1585,13 +1677,14 @@ export class WhatsAppClient {
     const dedupeKey = createHash('sha1')
       .update(`${chatJid}:${messageId}:${providerContent}`)
       .digest('hex');
-    return this.admitDedupeEvent(
+    const task = this.admitDedupeEvent(
       dedupeKey,
       () => this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
       () => {
         this.droppedInboundDuplicates += 1;
       },
     );
+    if (task) await task;
   }
 
   private async processInboundMessage(
@@ -1893,7 +1986,7 @@ export class WhatsAppClient {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
-    const quoted = this.resolveQuotedMessage(to, replyToMessageId);
+    const quoted = await this.resolveQuotedMessage(to, replyToMessageId);
     const { jids: translatedMentions, textReplacements } = this.translateMentions(normalizeMentions(mentions));
     let finalText = limitText(text, 8_000);
     for (const [lidToken, phoneToken] of textReplacements) {
@@ -1911,6 +2004,39 @@ export class WhatsAppClient {
     return sendResult(to, sent, clientMessageId);
   }
 
+  async forwardMessage(input: ForwardMessageInput): Promise<{
+    to: string;
+    messageId?: string;
+    providerMessageId?: string;
+    clientMessageId?: string;
+  }> {
+    if (!this.sock || !this.connected) {
+      throw new Error('Not connected');
+    }
+    const sourceChatJid = normalizeJid(input.sourceChatJid);
+    const sourceMessageId = String(input.sourceMessageId || '').trim();
+    if (!sourceChatJid || !sourceMessageId) {
+      throw forwardUnavailable('native forward source unavailable');
+    }
+
+    let source: any;
+    try {
+      source = await this.referenceStore.get(sourceChatJid, sourceMessageId);
+    } catch (error) {
+      this.reportReferenceFailure(error);
+      throw forwardUnavailable('native forward source unavailable');
+    }
+    if (!source?.message) throw forwardUnavailable('native forward source unavailable');
+
+    const sent = await this.sock.sendMessage(
+      input.to,
+      { forward: source },
+      input.clientMessageId ? { messageId: input.clientMessageId } : {},
+    );
+    this.rememberOutboundSelfMessage(input.to, sent);
+    return sendResult(input.to, sent, input.clientMessageId);
+  }
+
   async sendMedia(
     input: SendMediaInput,
   ): Promise<{
@@ -1925,7 +2051,7 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
-    const quoted = this.resolveQuotedMessage(input.to, input.replyToMessageId);
+    const quoted = await this.resolveQuotedMessage(input.to, input.replyToMessageId);
     const media = await loadMediaSource(input, {
       allowedLocalMediaRoots: [this.mediaOutgoingDir],
     });

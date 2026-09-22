@@ -30,6 +30,7 @@ const TOKEN_ENV_RE = /(BRIDGE_TOKEN=)[^\s]+/gi;
 export type BridgeCommandType =
   | 'send_text'
   | 'send_media'
+  | 'forward_message'
   | 'send_poll'
   | 'delete_message'
   | 'react'
@@ -62,6 +63,7 @@ export interface ProtocolError {
     | 'ERR_UNSUPPORTED'
     | 'ERR_PAYLOAD_TOO_LARGE'
     | 'ERR_QUEUE_OVERFLOW'
+    | 'ERR_FORWARD_UNAVAILABLE'
     | 'ERR_INTERNAL';
   message: string;
   retryable: boolean;
@@ -85,6 +87,13 @@ export interface SendMediaPayload {
   caption?: string;
   replyToMessageId?: string;
   mentions?: string[];
+  clientMessageId?: string;
+}
+
+export interface ForwardMessagePayload {
+  to: string;
+  sourceChatJid: string;
+  sourceMessageId: string;
   clientMessageId?: string;
 }
 
@@ -347,6 +356,15 @@ function parseSendMedia(payload: Record<string, unknown>): SendMediaPayload | nu
   };
 }
 
+function parseForwardMessage(payload: Record<string, unknown>): ForwardMessagePayload | null {
+  const to = asString(payload.to);
+  const sourceChatJid = asString(payload.sourceChatJid);
+  const sourceMessageId = asString(payload.sourceMessageId);
+  const clientMessageId = asOptionalClientMessageId(payload.clientMessageId);
+  if (!to || !sourceChatJid || !sourceMessageId || clientMessageId === null) return null;
+  return { to, sourceChatJid, sourceMessageId, clientMessageId };
+}
+
 function parseSendPoll(payload: Record<string, unknown>): SendPollPayload | null {
   const to = asString(payload.to);
   const question = asString(payload.question);
@@ -469,6 +487,7 @@ export function parseBridgeCommand(
 
   if (typed === 'send_text') validPayload = Boolean(parseSendText(payload));
   else if (typed === 'send_media') validPayload = Boolean(parseSendMedia(payload));
+  else if (typed === 'forward_message') validPayload = Boolean(parseForwardMessage(payload));
   else if (typed === 'send_poll') validPayload = Boolean(parseSendPoll(payload));
   else if (typed === 'delete_message') validPayload = Boolean(parseDeleteMessage(payload));
   else if (typed === 'react') validPayload = Boolean(parseReact(payload));
@@ -511,6 +530,12 @@ export function parseSendTextPayload(payload: Record<string, unknown>): SendText
 export function parseSendMediaPayload(payload: Record<string, unknown>): SendMediaPayload {
   const parsed = parseSendMedia(payload);
   if (!parsed) throw new Error('Invalid send_media payload');
+  return parsed;
+}
+
+export function parseForwardMessagePayload(payload: Record<string, unknown>): ForwardMessagePayload {
+  const parsed = parseForwardMessage(payload);
+  if (!parsed) throw new Error('Invalid forward_message payload');
   return parsed;
 }
 

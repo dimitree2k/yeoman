@@ -15,6 +15,7 @@ import {
 import { BridgeServer } from './server.js';
 import { BridgeOutbox } from './outbox.js';
 import { createEventEnvelope } from './protocol.js';
+import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
 function inboundMessage(messageId: string): Record<string, unknown> {
   return {
@@ -311,6 +312,183 @@ test('send results retain provider and client message ids separately', async () 
     providerMessageId: 'provider-message-id',
     clientMessageId: 'client-message-id',
   });
+});
+
+test('native forward passes the stored WAMessage to Baileys', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
+  try {
+    const source = proto.WebMessageInfo.fromObject({
+      key: { remoteJid: 'source@g.us', id: 'SRC-1' },
+      message: { imageMessage: { mimetype: 'image/jpeg', caption: 'image' } },
+    });
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    await (client as any).referenceStore.open();
+    assert.equal(await (client as any).referenceStore.put('source@g.us', 'SRC-1', source), true);
+
+    const calls: unknown[][] = [];
+    (client as any).sock = {
+      sendMessage: async (...args: unknown[]) => {
+        calls.push(args);
+        return { key: { id: 'OUT-1' } };
+      },
+    };
+    (client as any).connected = true;
+
+    await client.forwardMessage({
+      to: 'target@g.us',
+      sourceChatJid: 'source@g.us',
+      sourceMessageId: 'SRC-1',
+    });
+
+    assert.deepEqual(calls, [['target@g.us', { forward: source }, {}]]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('lookupMessage survives a store restart and reports a missing exact source', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
+  try {
+    const options = {
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    };
+    const source = proto.WebMessageInfo.fromObject({
+      key: { remoteJid: 'source@g.us', id: 'SRC-2' },
+      message: { conversation: 'stored' },
+    });
+    const first = new WhatsAppClient(options);
+    await (first as any).referenceStore.open();
+    assert.equal(await (first as any).referenceStore.put('source@g.us', 'SRC-2', source), true);
+
+    const restarted = new WhatsAppClient(options);
+    assert.deepEqual(await restarted.lookupMessage({ chatJid: 'source@g.us', messageId: 'SRC-2' }), {
+      status: 'found',
+      messageId: 'SRC-2',
+    });
+    assert.deepEqual(await restarted.lookupMessage({ chatJid: 'source@g.us', messageId: 'MISSING' }), {
+      status: 'absent',
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native forward fails closed without sending when the exact source is missing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
+  try {
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    const calls: unknown[] = [];
+    (client as any).sock = {
+      sendMessage: async (...args: unknown[]) => {
+        calls.push(args);
+        return { key: { id: 'never-sent' } };
+      },
+    };
+    (client as any).connected = true;
+
+    await assert.rejects(
+      client.forwardMessage({
+        to: 'target@g.us',
+        sourceChatJid: 'source@g.us',
+        sourceMessageId: 'MISSING',
+      }),
+      (error: any) => error.code === 'ERR_FORWARD_UNAVAILABLE' && error.retryable === false,
+    );
+    assert.deepEqual(calls, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('quoted-message backfill stores a complete exact provider envelope', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
+  try {
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    await (client as any).referenceStore.open();
+    await (client as any).buildReplyMeta({
+      message: {
+        extendedTextMessage: {
+          text: 'reply',
+          contextInfo: {
+            stanzaId: 'SRC-3',
+            participant: 'sender@s.whatsapp.net',
+            quotedMessage: { conversation: 'quoted source' },
+          },
+        },
+      },
+    }, 'source@g.us');
+
+    const restored = await (client as any).referenceStore.get('source@g.us', 'SRC-3');
+    assert.equal(restored.key.remoteJid, 'source@g.us');
+    assert.equal(restored.key.participant, 'sender@s.whatsapp.net');
+    assert.equal(restored.message.conversation, 'quoted source');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('sendText resolves a durable quote after the in-memory quote window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
+  try {
+    const source = proto.WebMessageInfo.fromObject({
+      key: { remoteJid: 'source@g.us', id: 'SRC-4' },
+      message: { conversation: 'yesterday' },
+    });
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    await (client as any).referenceStore.open();
+    assert.equal(await (client as any).referenceStore.put('source@g.us', 'SRC-4', source), true);
+    const calls: unknown[][] = [];
+    (client as any).sock = {
+      sendMessage: async (...args: unknown[]) => {
+        calls.push(args);
+        return { key: { id: 'OUT-4' } };
+      },
+    };
+    (client as any).connected = true;
+
+    await client.sendText('source@g.us', 'answer @12345', 'SRC-4', ['12345@s.whatsapp.net']);
+
+    assert.equal((calls[0][2] as any).quoted.message.conversation, 'yesterday');
+    assert.deepEqual(calls[0][1], {
+      text: 'answer @12345',
+      mentions: ['12345@s.whatsapp.net'],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('resolveWhatsAppWebVersion uses fetched latest version', async () => {

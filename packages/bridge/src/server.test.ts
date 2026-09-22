@@ -105,6 +105,45 @@ test('BridgeServer dispatches delete_message to the WhatsApp client', async () =
   assert.deepEqual(calls, [deleted]);
 });
 
+test('BridgeServer dispatches forward_message with exact source identities', async () => {
+  const server = new BridgeServer(
+    '127.0.0.1',
+    0,
+    '',
+    '',
+    '',
+    false,
+    false,
+    false,
+    'secret',
+    '0.2.0',
+    'test-build',
+    true,
+  );
+  const calls: unknown[] = [];
+  const forwarded = { to: 'target@g.us', messageId: 'OUT-1' };
+  (server as any).wa = {
+    forwardMessage: async (payload: unknown) => {
+      calls.push(payload);
+      return forwarded;
+    },
+  };
+
+  const result = await (server as any).executeCommand('forward_message', {
+    to: 'target@g.us',
+    sourceChatJid: 'source@g.us',
+    sourceMessageId: 'SRC-1',
+  });
+
+  assert.deepEqual(result, { forwarded });
+  assert.deepEqual(calls, [{
+    to: 'target@g.us',
+    sourceChatJid: 'source@g.us',
+    sourceMessageId: 'SRC-1',
+    clientMessageId: undefined,
+  }]);
+});
+
 test('BridgeServer sends replayable events only after authenticated subscription', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-bridge-server-'));
   try {
