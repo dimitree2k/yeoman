@@ -8,13 +8,10 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from loguru import logger
-
 from yeoman_shared.reactions import MODEL_ORIGIN, SYSTEM_ORIGIN
 
 from yeoman_gateway.core.intents import SendReactionIntent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
-from yeoman_gateway.short_reply.reactor import ReactorRequest
-from yeoman_gateway.short_reply.signals import compute_signals
 from yeoman_gateway.implicit_addressing import (
     ConversationState,
     SessionManagerLike,
@@ -22,6 +19,8 @@ from yeoman_gateway.implicit_addressing import (
     reaction_for_name_mention,
     reaction_for_reply_ack,
 )
+from yeoman_gateway.short_reply.reactor import ReactorRequest
+from yeoman_gateway.short_reply.signals import compute_signals
 
 if TYPE_CHECKING:
     from yeoman_gateway.short_reply.reactor import ShortReplyReactor

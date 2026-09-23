@@ -735,6 +735,7 @@ def test_recent_reactions_lists_a_chats_reactions_newest_first(tmp_path):
 
 def test_short_reply_rate_claim_is_atomic_across_connections(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
+
     from yeoman_gateway.processing.models import ReactionPayload
 
     path = tmp_path / "processing.db"
