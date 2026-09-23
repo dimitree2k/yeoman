@@ -183,7 +183,12 @@ class _Reactor:
         )
 
 
-def _policy(*, opted_in: bool = True, participation: dict | None = None) -> PolicyConfig:
+def _policy(
+    *,
+    opted_in: bool = True,
+    participation: dict | None = None,
+    persona_file: str | None = None,
+) -> PolicyConfig:
     block: dict[str, object] = {"enabled": opted_in}
     if participation:
         block.update(participation)
@@ -194,6 +199,7 @@ def _policy(*, opted_in: bool = True, participation: dict | None = None) -> Poli
                     "chats": {
                         CHAT: {
                             "whoCanTalk": {"mode": "everyone"},
+                            **({"personaFile": persona_file} if persona_file else {}),
                             "participation": block,
                             "spontaneity": {
                                 "enabled": True,
@@ -2004,6 +2010,91 @@ async def test_submission_passes_selected_target_to_writer_context() -> None:
     )
 
     assert captured["target_message_id"] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_submission_passes_policy_persona_to_writer(tmp_path: Path) -> None:
+    """A participation draft is written with the persona comments use (spec section 8)."""
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+
+    (tmp_path / "personas").mkdir()
+    (tmp_path / "personas" / "arvid.md").write_text(
+        "# Synthetic persona\nSpeak only in this voice.\n", encoding="utf-8"
+    )
+    engine = PolicyEngine(
+        _policy(persona_file="personas/arvid.md"), workspace=tmp_path
+    )
+
+    class _Adapter:
+        def policy_engine(self) -> PolicyEngine:
+            return engine
+
+    captured: dict[str, object] = {}
+
+    class _Responder:
+        async def generate_participation_draft(
+            self, event: object, decision: object, **kwargs: object
+        ) -> str:
+            del event, kwargs
+            captured["persona_text"] = getattr(decision, "persona_text", None)
+            return "draft"
+
+    submission = _ParticipationSubmission(
+        responder=_Responder(),
+        writer_profile="participation_writer",
+        policy_adapter=_Adapter(),
+    )
+    await submission.generate_draft(
+        opportunity=_opportunity("m1", "m2"),
+        decision=replace(COMMENT, target_message_id="m2"),
+        context={"current_source_ids": ["m1", "m2"], "messages": []},
+    )
+
+    resolved = engine.resolve_policy(CHANNEL, CHAT)
+    assert resolved.persona_file == "personas/arvid.md"
+    assert captured["persona_text"] == engine.persona_text(resolved.persona_file)
+    assert captured["persona_text"] == (
+        "# Synthetic persona\nSpeak only in this voice.\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_submission_without_resolvable_persona_still_drafts(tmp_path: Path) -> None:
+    """A missing persona file costs the draft its persona, never the comment."""
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+
+    engine = PolicyEngine(
+        _policy(persona_file="personas/missing.md"), workspace=tmp_path
+    )
+
+    class _Adapter:
+        def policy_engine(self) -> PolicyEngine:
+            return engine
+
+    captured: dict[str, object] = {}
+
+    class _Responder:
+        async def generate_participation_draft(
+            self, event: object, decision: object, **kwargs: object
+        ) -> str:
+            del event, kwargs
+            captured["persona_text"] = getattr(decision, "persona_text", None)
+            return "draft"
+
+    submission = _ParticipationSubmission(
+        responder=_Responder(),
+        writer_profile="participation_writer",
+        policy_adapter=_Adapter(),
+    )
+
+    draft = await submission.generate_draft(
+        opportunity=_opportunity(),
+        decision=COMMENT,
+        context={"messages": []},
+    )
+
+    assert draft == "draft"
+    assert captured["persona_text"] is None
 
 
 @pytest.mark.asyncio

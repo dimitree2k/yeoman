@@ -1311,6 +1311,7 @@ def _build_participation_runtime(
             responder=responder,
             approval_tools=approval_tools,
             writer_profile=writer_profile,
+            policy_adapter=policy_adapter,
         )
         if writer_profile
         else None
@@ -1393,10 +1394,12 @@ class _ParticipationSubmission:
         responder: object | None,
         writer_profile: str,
         approval_tools: object | None = None,
+        policy_adapter: object | None = None,
     ) -> None:
         self._responder = responder
         self._writer_profile = str(writer_profile)
         self._approval_tools = approval_tools
+        self._policy_adapter = policy_adapter
 
     async def generate_draft(
         self, *, opportunity: object, decision: object, context: object
@@ -1404,7 +1407,15 @@ class _ParticipationSubmission:
         generator = getattr(self._responder, "generate_participation_draft", None)
         if generator is None:
             return None
-        event, policy_decision = _participation_event(opportunity, decision)
+        event, policy_decision = _participation_event(
+            opportunity,
+            decision,
+            persona_text=_participation_persona_text(
+                self._policy_adapter,
+                str(getattr(opportunity, "channel", "")),
+                str(getattr(opportunity, "chat_id", "")),
+            ),
+        )
         writer_context = dict(context or {})
         writer_context["target_message_id"] = getattr(
             decision, "target_message_id", None
@@ -1492,7 +1503,37 @@ class _ParticipationOutcome:
     status: str
 
 
-def _participation_event(opportunity: object, decision: object) -> tuple[object, object]:
+def _participation_persona_text(
+    policy_adapter: object | None, channel: str, chat_id: str
+) -> str | None:
+    """Persona text for one participation draft, resolved exactly as a comment is.
+
+    The engine is read through the adapter at draft time so a policy reload is picked
+    up like it is for direct replies. Resolution is fail-safe: a missing adapter,
+    engine, persona file or unreadable file leaves the draft persona-less instead of
+    costing the chat its comment.
+    """
+    provider = getattr(policy_adapter, "policy_engine", None)
+    if not callable(provider):
+        return None
+    try:
+        engine = provider()
+        if engine is None:
+            return None
+        resolved = engine.resolve_policy(channel, chat_id)
+        return engine.persona_text(getattr(resolved, "persona_file", None))
+    except Exception as exc:  # noqa: BLE001 - an unreadable persona must not lose a draft
+        logger.warning(
+            "participation persona resolution failed chat={} error_type={}",
+            str(chat_id)[:24],
+            type(exc).__name__,
+        )
+        return None
+
+
+def _participation_event(
+    opportunity: object, decision: object, *, persona_text: str | None = None
+) -> tuple[object, object]:
     """Build the synthetic inbound event and policy decision for one draft.
 
     The event carries the admitted target only: no task, thread or turn identity, and
@@ -1518,7 +1559,7 @@ def _participation_event(opportunity: object, decision: object) -> tuple[object,
         should_respond=False,
         allowed_tools=frozenset(),
         reason="participation_draft_only",
-        persona_text=None,
+        persona_text=persona_text,
     )
     return event, policy_decision
 
