@@ -23,7 +23,11 @@ from yeoman_gateway.processing.models import (
     EffectTarget,
     ExternalActionPayload,
 )
-from yeoman_gateway.processing.tool_context import current_tool_context
+from yeoman_gateway.processing.tool_context import (
+    ASYNC_HANDOFF_SIGNAL,
+    current_tool_context,
+    publish_turn_signal,
+)
 
 from .a2a_research import A2AResearchStore, PendingResearch, sibling_path
 
@@ -39,6 +43,25 @@ DELEGATION_LEASE_MS = 900_000
 RESEARCH_POLL_EXTENSIONS = 3
 ASYNC_RESEARCH_SKILLS = frozenset({"research.deep", "trading.analyze"})
 POLL_TIMEOUT_CONTENT = "error=POLL_TIMEOUT retryable=True"
+
+#: What the model needs to know the moment an asynchronous task is accepted. This is a
+#: contract, not a message: the acknowledgement itself is written by the model, in the
+#: chat's language and persona.
+DELEGATION_ACCEPTED_CONTRACT = (
+    "Runtime note: this task is accepted and runs in the background. Its result is "
+    "delivered to this chat as its own message, so this turn does not produce the "
+    "answer. Reply now with a brief acknowledgement in your own words: what you "
+    "started and that the result follows here. Do not research further, do not report "
+    "partial findings, do not restate the request, and expect no further tool calls in "
+    "this turn."
+)
+
+#: The same contract for a call that started nothing because the work is already running.
+DELEGATION_DUPLICATE_CONTRACT = (
+    "Runtime note: no new task was started, because an identical delegation for this "
+    "request is already running or already settled. Reply in one short line in your own "
+    "words and do not retry."
+)
 
 #: The worker wraps its answer in a reasoning preamble and returns it as JSON. Neither belongs
 #: in a chat message, so the delivery path renders the structured payload into chat text.
@@ -592,6 +615,14 @@ class A2ADelegateTool(Tool):
                 )
         allowed, note, effect_id = self._claim(worker, skill, input)
         if not allowed:
+            if note == "duplicate":
+                # The requester is waiting for a result that is already on its way; the turn
+                # is an acknowledgement, not an answer.
+                publish_turn_signal(
+                    ASYNC_HANDOFF_SIGNAL,
+                    {"state": "duplicate", "worker": worker, "skill": skill},
+                )
+                return f"[{worker} | not-sent | {note}]\n{DELEGATION_DUPLICATE_CONTRACT}"
             return f"[{worker} | not-sent | {note}]"
         quota = None
         if self._quota_governance is not None:
@@ -647,10 +678,21 @@ class A2ADelegateTool(Tool):
             )
             raise
         self._settle(effect_id, "sent")
+        handed_off = False
         if skill in ASYNC_RESEARCH_SKILLS and result.state in {
             "TASK_STATE_SUBMITTED",
             "TASK_STATE_WORKING",
         }:
+            handed_off = True
+            publish_turn_signal(
+                ASYNC_HANDOFF_SIGNAL,
+                {
+                    "state": "accepted",
+                    "worker": worker,
+                    "skill": skill,
+                    "task_id": result.task_id,
+                },
+            )
             turn = current_tool_context()
             channel = turn.channel if turn is not None else self._channel
             chat_id = turn.chat_id if turn is not None else self._chat_id
@@ -692,7 +734,10 @@ class A2ADelegateTool(Tool):
                 else ""
             )
         )
-        return f"[{result.worker} | {result.skill} | {result.state} | {result.task_id}]\n{output}".rstrip()
+        result_text = f"[{result.worker} | {result.skill} | {result.state} | {result.task_id}]\n{output}".rstrip()
+        if handed_off:
+            result_text = f"{result_text}\n\n{DELEGATION_ACCEPTED_CONTRACT}"
+        return result_text
 
     async def _poll_research(
         self,

@@ -1287,3 +1287,123 @@ def test_card_mode_keeps_errors_and_short_answers_unchanged() -> None:
     )
     short = "Der Markt ist zu; ORCL schloss bei 150,28 USD."
     assert render_research_output({"report": short}, mode="card").startswith(short)
+
+
+class _HandoffStore:
+    """A store that collapses every delegation onto an existing effect."""
+
+    def __init__(self, stored_id: str = "existing-effect") -> None:
+        self.stored = stored_id
+
+    def enqueue_effect(self, **kwargs: object) -> str:
+        del kwargs
+        return self.stored
+
+    def claim_effect(self, *args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    def transition(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    def effect_state(self, effect_id: str) -> str:
+        del effect_id
+        return "queued"
+
+
+@pytest.mark.asyncio
+async def test_accepted_research_publishes_handoff_signal_and_ack_contract() -> None:
+    """The accepted delegation tells the turn to acknowledge, not to answer."""
+    from yeoman_gateway.agent.tools.a2a import DELEGATION_ACCEPTED_CONTRACT
+    from yeoman_gateway.processing.tool_context import (
+        ASYNC_HANDOFF_SIGNAL,
+        reset_turn_signals,
+        set_turn_signals,
+    )
+
+    class Client:
+        async def invoke_skill(self, skill, input, *, context_id=None, reference_task_ids=()):
+            del input
+            return A2AWorkerResult(
+                "hermes",
+                "research-1",
+                context_id or "ctx-1",
+                "TASK_STATE_WORKING",
+                skill,
+                reference_task_ids=tuple(reference_task_ids),
+            )
+
+        async def poll_task(self, task_id, *, skill, context_id, reference_task_ids=()):
+            del reference_task_ids
+            return A2AWorkerResult(
+                "hermes", task_id, context_id, "TASK_STATE_COMPLETED", skill, {"report": "done"}
+            )
+
+    class Delivery:
+        async def send(self, **kwargs: object) -> None:
+            del kwargs
+
+    tool = A2ADelegateTool(
+        A2AWorkerRegistry(
+            [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+            client_factory=lambda _: Client(),
+        ),
+        delivery=Delivery(),
+    )
+    tool.set_context("whatsapp", "chat@g.us")
+
+    signals: dict[str, object] = {}
+    token = set_turn_signals(signals)
+    try:
+        result = await tool.execute(
+            worker="hermes", skill="research.deep", input={"question": "q", "idempotency_key": "r1"}
+        )
+        while tool._background:
+            await asyncio.sleep(0)
+    finally:
+        reset_turn_signals(token)
+
+    handoff = signals[ASYNC_HANDOFF_SIGNAL]
+    assert isinstance(handoff, dict)
+    assert handoff["state"] == "accepted"
+    assert handoff["task_id"] == "research-1"
+    assert DELEGATION_ACCEPTED_CONTRACT in result
+    assert "TASK_STATE_WORKING" in result
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delegation_publishes_handoff_signal_without_starting_work() -> None:
+    """An already running task is still a handoff: the turn owes a short status line."""
+    from yeoman_gateway.agent.tools.a2a import DELEGATION_DUPLICATE_CONTRACT
+    from yeoman_gateway.processing.tool_context import (
+        ASYNC_HANDOFF_SIGNAL,
+        reset_turn_signals,
+        set_turn_signals,
+    )
+
+    class Client:
+        async def invoke_skill(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("a duplicate must not reach the worker")
+
+    tool = A2ADelegateTool(
+        A2AWorkerRegistry(
+            [A2AWorker(name="hermes", url="http://127.0.0.1:9900")],
+            client_factory=lambda _: Client(),
+        ),
+        store=_HandoffStore(),
+    )
+
+    signals: dict[str, object] = {}
+    token = set_turn_signals(signals)
+    try:
+        result = await tool.execute(
+            worker="hermes", skill="research.deep", input={"question": "q", "idempotency_key": "r1"}
+        )
+    finally:
+        reset_turn_signals(token)
+
+    handoff = signals[ASYNC_HANDOFF_SIGNAL]
+    assert isinstance(handoff, dict)
+    assert handoff["state"] == "duplicate"
+    assert "[hermes | not-sent | duplicate]" in result
+    assert DELEGATION_DUPLICATE_CONTRACT in result

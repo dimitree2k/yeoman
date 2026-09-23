@@ -14,6 +14,9 @@ DEFAULT_REPLY_BUDGET_TARGETS: dict[str, int] = {
     "short_take": 420,
     "repair": 700,
     "researched_answer": 1200,
+    #: A turn that only acknowledges handed-off or already running work. Its answer is a
+    #: status line, never the work itself, so it is budgeted far below a short take.
+    "ack": 180,
 }
 DEFAULT_REPLY_BUDGET_HARD_MAX_CHARS = 600
 DEFAULT_REPLY_BUDGET_LONG_FORM_MAX_CHARS = 2200

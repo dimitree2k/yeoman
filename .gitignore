@@ -76,6 +76,7 @@ tests/gateway/*
 !tests/gateway/test_whatsapp_chat_registry.py
 !tests/gateway/test_responder_social_holdback.py
 !tests/gateway/test_responder_textual_tool_calls.py
+!tests/gateway/test_responder_async_handoff.py
 !tests/gateway/test_memory_cli.py
 !tests/gateway/test_memory_session_state.py
 !tests/gateway/test_whatsapp_runtime.py

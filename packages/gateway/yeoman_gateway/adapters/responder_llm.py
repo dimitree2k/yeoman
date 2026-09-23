@@ -60,6 +60,10 @@ from yeoman_gateway.media.tts import (
     write_tts_audio_file,
 )
 from yeoman_gateway.policy.identity import normalize_sender_list
+from yeoman_gateway.processing.tool_context import (
+    ASYNC_HANDOFF_SIGNAL,
+    set_turn_signals,
+)
 from yeoman_gateway.providers.base import LLMProvider, LLMProviderError, ToolCallRequest
 from yeoman_gateway.reply_budget import derive_reply_budget, enforce_reply_budget
 from yeoman_gateway.session.manager import SessionManager
@@ -1663,12 +1667,16 @@ class LLMResponder(ResponderPort):
         current_is_group: bool = False,
         current_origin_label: str = "",
         current_metadata: dict[str, object] | None = None,
+        turn_signals: dict[str, object] | None = None,
         trace: Any = None,
     ) -> str | None:
         iteration = 0
         final_content: str | None = None
         chat_provider = provider or self.provider
         deferred_work_repair_attempted = False
+        #: Set once a tool handed work off to run in the background. From that point the
+        #: turn owes the chat one acknowledgement, so no further tool call is executed.
+        async_handoff: dict[str, object] | None = None
         market_contract_active = False
         market_contract_prompt_evidence_count = -1
         market_contract_repair_attempted = False
@@ -1678,6 +1686,8 @@ class LLMResponder(ResponderPort):
         _send_tools = frozenset({"message", "send_voice", "send_media", "delete_message"})
         while iteration < self.max_iterations:
             iteration += 1
+            # A turn that already handed work off answers only; the provider sees no tools.
+            active_tools = set() if async_handoff is not None else allowed_tools
             iter_span = lf.start_span(
                 trace=trace,
                 name=f"iteration-{iteration}",
@@ -1688,7 +1698,7 @@ class LLMResponder(ResponderPort):
                 model=model or self.model,
                 input={
                     "message_count": len(messages),
-                    "has_tools": bool(self._tool_definitions(allowed_tools)),
+                    "has_tools": bool(self._tool_definitions(active_tools)),
                 },
                 model_parameters={
                     "temperature": temperature if temperature is not None else 0.7,
@@ -1699,7 +1709,7 @@ class LLMResponder(ResponderPort):
             try:
                 response = await chat_provider.chat(
                     messages=messages,
-                    tools=self._tool_definitions(allowed_tools),
+                    tools=self._tool_definitions(active_tools),
                     model=model or self.model,
                     temperature=temperature if temperature is not None else 0.7,
                     reasoning=reasoning,
@@ -1731,7 +1741,7 @@ class LLMResponder(ResponderPort):
                 if not tool_calls:
                     textual_tool_call = self._parse_textual_tool_call(
                         response.content,
-                        allowed_tools=allowed_tools,
+                        allowed_tools=active_tools,
                     )
                     if textual_tool_call is not None:
                         if textual_tool_call.name in _TEXTUAL_TOOL_COERCION_SAFE_TOOLS:
@@ -1761,7 +1771,8 @@ class LLMResponder(ResponderPort):
 
                 if (
                     not tool_calls
-                    and allowed_tools
+                    and active_tools
+                    and async_handoff is None
                     and _looks_like_deferred_work_promise(response.content)
                 ):
                     if deferred_work_repair_attempted:
@@ -1815,6 +1826,21 @@ class LLMResponder(ResponderPort):
                             tool_call.name,
                             tool_call.arguments,
                         )
+                        if async_handoff is not None:
+                            # Work is already running in the background: this call would only
+                            # duplicate or delay it. Every call still needs a result, so the
+                            # model is told why it was not executed instead of silently dropped.
+                            messages = self.context.add_tool_result(
+                                messages,
+                                tool_call.id,
+                                tool_call.name,
+                                "Not executed: this turn already handed the work off to run "
+                                "in the background. Answer the chat with the acknowledgement.",
+                            )
+                            logger.info(
+                                "Skipping tool call after async handoff: {}", tool_call.name
+                            )
+                            continue
                         logger.info("Tool call: {}({})", tool_call.name, observability_args[:200])
                         tool_span = lf.start_span(
                             trace=trace,
@@ -1998,6 +2024,18 @@ class LLMResponder(ResponderPort):
                             tool_call.name,
                             tool_result_for_model,
                         )
+                        if async_handoff is None and turn_signals is not None:
+                            handoff_signal = turn_signals.get(ASYNC_HANDOFF_SIGNAL)
+                            if isinstance(handoff_signal, dict):
+                                async_handoff = handoff_signal
+                                logger.info(
+                                    "Async handoff in turn chat={} worker={} skill={} state={} "
+                                    "— remaining tool calls are skipped",
+                                    current_chat_id,
+                                    handoff_signal.get("worker"),
+                                    handoff_signal.get("skill"),
+                                    handoff_signal.get("state"),
+                                )
                         self._maybe_open_private_handoff(
                             tool_name=tool_call.name,
                             arguments=tool_call.arguments,
@@ -2615,6 +2653,10 @@ class LLMResponder(ResponderPort):
             ),
             request_text=content,
         )
+        # A fresh signal bag per turn: tools publish facts about this turn only, and the
+        # reply path reads them back after the tool loop (see processing.tool_context).
+        turn_signals: dict[str, object] = {}
+        set_turn_signals(turn_signals)
 
         if await self._maybe_complete_pending_delivery(
             session=session,
@@ -2814,6 +2856,7 @@ class LLMResponder(ResponderPort):
                         or chat_id
                     ),
                     current_metadata=metadata,
+                    turn_signals=turn_signals,
                     trace=trace,
                 )
             except LLMProviderError:
@@ -2832,9 +2875,31 @@ class LLMResponder(ResponderPort):
             return None
 
         final_content = self._normalize_social_question_ending(final_content, metadata)
+        # A turn that handed work off owes the chat an acknowledgement, not an answer. Its
+        # budget is re-derived here, because the classification that chose the answer shape
+        # only saw the request: a research request is uncapped by design, while its
+        # acknowledgement must stay short, whatever shape the request was filed under.
+        handoff_signal = turn_signals.get(ASYNC_HANDOFF_SIGNAL)
+        budget_metadata = metadata.get("reply_budget")
+        if isinstance(handoff_signal, dict):
+            acknowledgement_budget = derive_reply_budget(
+                policy=metadata.get("reply_budget_policy"),
+                answer_shape="ack",
+                content="",
+                is_owner=False,
+            )
+            if acknowledgement_budget is not None:
+                budget_metadata = acknowledgement_budget.as_metadata()
+                metadata["reply_budget"] = budget_metadata
+                logger.info(
+                    "async handoff reply budget chat={} state={} target_chars={}",
+                    chat_id,
+                    handoff_signal.get("state"),
+                    budget_metadata.get("target_chars"),
+                )
         final_content, budget_result = enforce_reply_budget(
             final_content,
-            metadata.get("reply_budget"),
+            budget_metadata,
             user_content=content,
             tool_used=bool(metadata.get("reply_budget_tool_used", False)),
         )
@@ -3255,6 +3320,9 @@ class LLMResponder(ResponderPort):
             )
             if budget is not None:
                 metadata["reply_budget"] = budget.as_metadata()
+                # The raw policy stays with the turn so a later, better-informed shape
+                # (an acknowledgement after an async handoff) can be derived from it.
+                metadata["reply_budget_policy"] = dict(decision.reply_budget)
         if self._voice_reply_expected(
             event=event,
             decision=decision,

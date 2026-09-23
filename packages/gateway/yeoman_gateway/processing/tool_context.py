@@ -36,6 +36,18 @@ CURRENT_TOOL_CONTEXT: ContextVar[ToolInvocationContext | None] = ContextVar(
     "yeoman_tool_invocation_context", default=None
 )
 
+#: Signal a tool publishes when it handed work off to run in the background. The turn
+#: reads it to answer with an acknowledgement instead of an answer.
+ASYNC_HANDOFF_SIGNAL = "async_handoff"
+
+#: Per-turn signal bag. A tool publishes a fact about the turn it is running in (for
+#: example "an asynchronous task was accepted"), and the turn reads it back after the
+#: tool loop. The responder installs a fresh dict per turn, so a signal can never leak
+#: into another turn; a tool outside a turn has no reader and publishing is a no-op.
+CURRENT_TURN_SIGNALS: ContextVar[dict[str, object] | None] = ContextVar(
+    "yeoman_turn_signals", default=None
+)
+
 
 def current_tool_context() -> ToolInvocationContext | None:
     """The context of the tool call currently running, if the caller set one."""
@@ -51,6 +63,27 @@ def reset_tool_context(token) -> None:
     CURRENT_TOOL_CONTEXT.reset(token)
 
 
+def set_turn_signals(signals: dict[str, object]):
+    """Install the signal bag of the current turn; the token restores the previous one."""
+    return CURRENT_TURN_SIGNALS.set(signals)
+
+
+def reset_turn_signals(token) -> None:
+    CURRENT_TURN_SIGNALS.reset(token)
+
+
+def current_turn_signals() -> dict[str, object] | None:
+    """The signal bag of the turn currently running, if the caller installed one."""
+    return CURRENT_TURN_SIGNALS.get()
+
+
+def publish_turn_signal(name: str, value: object = True) -> None:
+    """Publish one fact about the current turn. Silent when no turn installed a bag."""
+    signals = CURRENT_TURN_SIGNALS.get()
+    if signals is not None:
+        signals[str(name)] = value
+
+
 def tool_target(*, default_channel: str = "", default_chat_id: str = "") -> tuple[str, str]:
     """Resolve (channel, chat_id) for a tool, preferring the per-turn context.
 
@@ -63,10 +96,16 @@ def tool_target(*, default_channel: str = "", default_chat_id: str = "") -> tupl
 
 
 __all__ = [
+    "ASYNC_HANDOFF_SIGNAL",
     "CURRENT_TOOL_CONTEXT",
+    "CURRENT_TURN_SIGNALS",
     "ToolInvocationContext",
     "current_tool_context",
+    "current_turn_signals",
+    "publish_turn_signal",
     "reset_tool_context",
+    "reset_turn_signals",
     "set_tool_context",
+    "set_turn_signals",
     "tool_target",
 ]
