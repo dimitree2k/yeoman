@@ -198,6 +198,19 @@ class ReactionPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class RecentReaction:
+    """One confirmed reaction Arvid sent in a chat, for variety."""
+
+    emoji: str
+    created_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ShortReplyClaim:
+    status: Literal["claimed", "duplicate", "cooldown"]
+
+
+@dataclass(frozen=True, slots=True)
 class DeletePayload:
     """Deletion of an existing own message."""
 

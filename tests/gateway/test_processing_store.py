@@ -691,3 +691,167 @@ def test_retention_keeps_open_probes_and_drops_finished_ones(tmp_path):
     assert db.transport_receipts("fx1") == ()
     assert report.probes_deleted == 1 and report.receipts_deleted == 1
     db.close()
+
+
+def test_recent_reactions_lists_a_chats_reactions_newest_first(tmp_path):
+    from yeoman_gateway.processing.models import ReactionPayload, canonical_hash, canonical_json
+
+    db = ProcessingStore(tmp_path / "processing.db")
+
+    def react(effect_id, chat, emoji, now, state="sent", origin="legacy"):
+        admission_id = None
+        if origin == "participation":
+            admission_id = f"admission:{effect_id}"
+            payload_hash = canonical_hash(ReactionPayload(message_id=effect_id, emoji=emoji).to_dict())
+            with db._write() as conn:
+                conn.execute(
+                    "INSERT INTO participation_admissions VALUES (?, ?, ?)",
+                    (admission_id, canonical_json({"channel": "whatsapp", "chat_id": chat,
+                                                   "payload_hash": payload_hash}), now),
+                )
+        db.enqueue_effect(
+            effect_id=effect_id,
+            operation_key=f"reaction:whatsapp:{chat}:{effect_id}:{emoji}",
+            payload=ReactionPayload(message_id=effect_id, emoji=emoji),
+            now_ms=now,
+            capability="send_reaction",
+            target={"channel": "whatsapp", "chat_id": chat},
+            state=state,
+            origin=origin,
+            admission_id=admission_id,
+        )
+
+    react("e1", "a@g.us", "👀", 1_000)
+    react("e2", "a@g.us", "😂", 2_000, origin="participation")
+    react("e3", "b@g.us", "🔥", 3_000)
+    react("e4", "a@g.us", "👍", 4_000, state="failed")
+    react("e5", "a@g.us", "🤙", 500)
+
+    recent = db.recent_reactions(channel="whatsapp", chat_id="a@g.us", since_ms=900, limit=10)
+    assert [(item.emoji, item.created_ms) for item in recent] == [("😂", 2_000), ("👀", 1_000)]
+    assert len(db.recent_reactions(channel="whatsapp", chat_id="a@g.us", since_ms=0, limit=1)) == 1
+    db.close()
+
+
+def test_short_reply_rate_claim_is_atomic_across_connections(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from yeoman_gateway.processing.models import ReactionPayload
+
+    path = tmp_path / "processing.db"
+    seed = ProcessingStore(path)
+    seed.enqueue_effect(
+        effect_id="e1", operation_key="reaction:whatsapp:a@g.us:m0:👍",
+        payload=ReactionPayload(message_id="m0", emoji="👍"), now_ms=9_000,
+        trace_id="m0", capability="send_reaction",
+        target={"channel": "whatsapp", "chat_id": "a@g.us"}, state="sent",
+    )
+    seed.close()
+
+    def claim(message_id):
+        store = ProcessingStore(path)
+        try:
+            return store.claim_short_reply(
+                channel="whatsapp", chat_id="a@g.us", message_id=message_id,
+                now_ms=10_000, count=2, window_seconds=120, cooldown_seconds=600,
+            ).status
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(claim, ("m1", "m2")))
+    assert sorted(statuses) == ["claimed", "cooldown"]
+
+
+def test_message_claim_survives_reopen_and_more_than_1024_other_messages(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    claim = db.claim_short_reply(
+        channel="whatsapp", chat_id="a@g.us", message_id="same",
+        now_ms=10_000, count=20, window_seconds=120, cooldown_seconds=600,
+    )
+    assert claim.status == "claimed"
+    db.complete_short_reply(
+        channel="whatsapp", chat_id="a@g.us", message_id="same",
+        outcome="silence", emoji=None, now_ms=10_001,
+    )
+    for index in range(1025):
+        db.claim_short_reply(
+            channel="whatsapp", chat_id="a@g.us", message_id=f"other-{index}",
+            now_ms=20_000 + index, count=20, window_seconds=120, cooldown_seconds=600,
+        )
+    db.close()
+    reopened = ProcessingStore(tmp_path / "processing.db")
+    duplicate = reopened.claim_short_reply(
+        channel="whatsapp", chat_id="a@g.us", message_id="same",
+        now_ms=30_000, count=20, window_seconds=120, cooldown_seconds=600,
+    )
+    assert duplicate.status == "duplicate"
+    reopened.close()
+
+
+_CLAIM = dict(channel="whatsapp", chat_id="a@g.us", count=2, window_seconds=120,
+              cooldown_seconds=600)
+
+
+def test_short_reply_completed_live_reactions_count_before_their_effects_exist(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    for message_id, now in (("m1", 10_000), ("m2", 10_002)):
+        assert db.claim_short_reply(message_id=message_id, now_ms=now, **_CLAIM).status == "claimed"
+        db.complete_short_reply(channel="whatsapp", chat_id="a@g.us", message_id=message_id,
+                                outcome="react", emoji="😄", now_ms=now + 1)
+    assert db.claim_short_reply(message_id="m3", now_ms=10_004, **_CLAIM).status == "cooldown"
+    db.close()
+
+
+def test_short_reply_shadow_and_non_reaction_claims_free_their_slot(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    for index, (mode, outcome) in enumerate(
+        (("shadow", "react"), ("live", "silence"), ("live", "answer"))
+    ):
+        message_id = f"s{index}"
+        claim = db.claim_short_reply(message_id=message_id, now_ms=10_000 + index, mode=mode, **_CLAIM)
+        assert claim.status == "claimed"
+        db.complete_short_reply(channel="whatsapp", chat_id="a@g.us", message_id=message_id,
+                                outcome=outcome, emoji="😂" if outcome == "react" else None,
+                                now_ms=10_000 + index)
+    assert db.claim_short_reply(message_id="next", now_ms=10_010, **_CLAIM).status == "claimed"
+    db.close()
+
+
+def test_short_reply_effect_and_claim_of_one_message_count_once(tmp_path):
+    from yeoman_gateway.processing.models import ReactionPayload
+
+    db = ProcessingStore(tmp_path / "processing.db")
+    assert db.claim_short_reply(message_id="m1", now_ms=10_000, **_CLAIM).status == "claimed"
+    db.complete_short_reply(channel="whatsapp", chat_id="a@g.us", message_id="m1",
+                            outcome="react", emoji="👍", now_ms=10_001)
+    db.enqueue_effect(
+        effect_id="e1", operation_key="reaction:whatsapp:a@g.us:m1:👍",
+        payload=ReactionPayload(message_id="m1", emoji="👍"), now_ms=10_001,
+        trace_id="m1", capability="send_reaction",
+        target={"channel": "whatsapp", "chat_id": "a@g.us"}, state="sent",
+    )
+    assert db.claim_short_reply(message_id="m2", now_ms=10_002, **_CLAIM).status == "claimed"
+    db.close()
+
+
+def test_short_reply_rate_claim_counts_unknown_nonrepeatable_effects(tmp_path):
+    from yeoman_gateway.processing.models import ReactionPayload
+
+    db = ProcessingStore(tmp_path / "processing.db")
+    for effect_id, state, now in (
+        ("sent", "sent", 10_000),
+        ("unknown", "unknown_nonrepeatable", 10_001),
+    ):
+        db.enqueue_effect(
+            effect_id=effect_id,
+            operation_key=f"reaction:whatsapp:a@g.us:{effect_id}:👍",
+            payload=ReactionPayload(message_id=effect_id, emoji="👍"),
+            now_ms=now,
+            capability="send_reaction",
+            target={"channel": "whatsapp", "chat_id": "a@g.us"},
+            state=state,
+        )
+
+    assert db.claim_short_reply(message_id="next", now_ms=10_002, **_CLAIM).status == "cooldown"
+    db.close()

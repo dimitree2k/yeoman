@@ -45,12 +45,14 @@ from yeoman_gateway.processing.models import (
     ProbeRecord,
     ProcessingError,
     PurgeReport,
+    RecentReaction,
     RelationMeta,
     RetainedAttemptMeta,
     RetainedEffectMeta,
     RetainedEventMeta,
     RetainedEvidenceMeta,
     RetentionSettings,
+    ShortReplyClaim,
     SourceRef,
     StoredEffect,
     StoredThread,
@@ -283,6 +285,21 @@ _SCHEMA = (
     "ON direct_admissions(channel, chat_id, state, created_ms)",
     "CREATE INDEX IF NOT EXISTS idx_direct_admissions_turn "
     "ON direct_admissions(turn_id, state)",
+    """
+    CREATE TABLE IF NOT EXISTS short_reply_decisions (
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'live',
+      status TEXT NOT NULL,
+      emoji TEXT,
+      created_ms INTEGER NOT NULL,
+      updated_ms INTEGER NOT NULL,
+      PRIMARY KEY (channel, chat_id, message_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_short_reply_decisions_chat "
+    "ON short_reply_decisions(channel, chat_id, created_ms)",
 )
 
 
@@ -1606,6 +1623,106 @@ class ProcessingStore:
                 for row in rows
             )
         return effects
+
+    def recent_reactions(
+        self, *, channel: str, chat_id: str, since_ms: int, limit: int
+    ) -> tuple[RecentReaction, ...]:
+        """Confirmed reactions sent in one chat since ``since_ms``, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json, created_ms FROM effects "
+                "WHERE capability = 'send_reaction' AND state = 'sent' "
+                "AND json_extract(target_json, '$.channel') = ? "
+                "AND json_extract(target_json, '$.chat_id') = ? "
+                "AND created_ms >= ? "
+                "ORDER BY created_ms DESC, effect_id DESC LIMIT ?",
+                (str(channel), str(chat_id), int(since_ms), max(1, int(limit))),
+            ).fetchall()
+        reactions: list[RecentReaction] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            emoji = str(payload.get("emoji") or "") if isinstance(payload, dict) else ""
+            if emoji:
+                reactions.append(RecentReaction(emoji=emoji, created_ms=int(row["created_ms"])))
+        return tuple(reactions)
+
+    def claim_short_reply(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        message_id: str,
+        now_ms: int,
+        count: int,
+        window_seconds: int,
+        cooldown_seconds: int,
+        mode: str = "live",
+    ) -> ShortReplyClaim:
+        """Claim a message and reserve its burst slot in one write transaction."""
+        now = int(now_ms)
+        horizon = now - (int(window_seconds) + int(cooldown_seconds)) * 1000
+        key = (str(channel), str(chat_id), str(message_id))
+        with self._write() as conn:
+            if conn.execute(
+                "SELECT 1 FROM short_reply_decisions "
+                "WHERE channel = ? AND chat_id = ? AND message_id = ?",
+                key,
+            ).fetchone() is not None:
+                return ShortReplyClaim("duplicate")
+            effects = conn.execute(
+                "SELECT json_extract(payload_json, '$.message_id') AS message_id, created_ms "
+                "FROM effects WHERE capability = 'send_reaction' "
+                "AND state IN ('planned', 'queued', 'executing', 'sent', "
+                "'unknown', 'unknown_nonrepeatable') "
+                "AND json_extract(target_json, '$.channel') = ? "
+                "AND json_extract(target_json, '$.chat_id') = ? AND created_ms >= ?",
+                (key[0], key[1], horizon),
+            ).fetchall()
+            claims = conn.execute(
+                "SELECT message_id, created_ms FROM short_reply_decisions "
+                "WHERE channel = ? AND chat_id = ? AND created_ms >= ? "
+                "AND (status = 'pending' OR (status = 'react' AND mode = 'live'))",
+                (key[0], key[1], horizon),
+            ).fetchall()
+            latest: dict[str, int] = {}
+            for row in (*effects, *claims):
+                source = str(row["message_id"] or "") or f"effect@{row['created_ms']}"
+                latest[source] = max(latest.get(source, 0), int(row["created_ms"]))
+            times = sorted(latest.values(), reverse=True)
+            cooling = (
+                count >= 1
+                and len(times) >= count
+                and times[0] - times[count - 1] <= int(window_seconds) * 1000
+                and now - times[0] < int(cooldown_seconds) * 1000
+            )
+            conn.execute(
+                "INSERT INTO short_reply_decisions "
+                "(channel, chat_id, message_id, mode, status, emoji, created_ms, updated_ms) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+                (*key, str(mode), "cooldown" if cooling else "pending", now, now),
+            )
+        return ShortReplyClaim("cooldown" if cooling else "claimed")
+
+    def complete_short_reply(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        message_id: str,
+        outcome: str,
+        emoji: str | None,
+        now_ms: int,
+    ) -> None:
+        """Record the final outcome of a pending claim."""
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE short_reply_decisions SET status = ?, emoji = ?, updated_ms = ? "
+                "WHERE channel = ? AND chat_id = ? AND message_id = ? AND status = 'pending'",
+                (str(outcome), emoji, int(now_ms), str(channel), str(chat_id), str(message_id)),
+            )
 
     def count_effects(self) -> int:
         with self._lock:

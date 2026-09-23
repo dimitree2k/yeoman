@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
     from yeoman_gateway.processing.store import ProcessingStore
     from yeoman_gateway.providers.base import LLMProvider
+    from yeoman_gateway.short_reply.reactor import ShortReplyReactor
 
 
 #: Character boundary for the cheap continuation-candidate heuristic (spec section 7.1).
@@ -876,6 +877,68 @@ def _build_ambient_judge(config: "Config"):
         min_confidence=settings.judge_min_confidence,
         timeout_seconds=settings.judge_timeout_seconds,
     )
+
+
+def _build_short_reply_reactor(
+    config: "Config", store: object | None
+) -> "ShortReplyReactor | None":
+    """Build the optional short-reply decision without widening managed chat access."""
+    settings = config.processing.short_reply
+    if not config.processing.enabled or store is None or settings.mode == "off":
+        return None
+
+    managed = {entry.strip() for entry in config.processing.chats if entry.strip()}
+    requested = {entry.strip() for entry in settings.chats if entry.strip()}
+    effective = managed if not requested else managed & requested
+    if not effective:
+        logger.error("short_reply disabled: no processing-managed chats")
+        return None
+    settings = settings.model_copy(update={"chats": sorted(effective)})
+
+    from yeoman_gateway.processing import model_route
+    from yeoman_gateway.short_reply.decider import ShortReplyDecider
+    from yeoman_gateway.short_reply.reactor import ShortReplyReactor
+
+    route = "reaction.decide"
+    profile_name = config.models.routes.get(route)
+    profile = config.models.profiles.get(profile_name or "")
+    if (
+        settings.route not in {"", route}
+        or profile_name != "reaction_decide"
+        or profile is None
+        or profile.model != "openai/gpt-6-luna"
+        or profile.provider != "openrouter"
+    ):
+        logger.error(
+            "short_reply disabled: reaction.decide must use openai/gpt-6-luna via openrouter"
+        )
+        return None
+
+    try:
+        client = model_route.RouteClient(config=config, route_key=route)
+    except model_route.RouteUnavailableError as exc:
+        logger.error("short_reply disabled: route={} detail={}", route, str(exc)[:160])
+        return None
+    if getattr(client, "model", None) != "openai/gpt-6-luna":
+        logger.error("short_reply disabled: resolved model does not match reactionDecide")
+        return None
+
+    decider = ShortReplyDecider(
+        client=client,
+        allowed_emojis=tuple(config.processing.reaction_emojis),
+        max_candidates=settings.max_candidates,
+        timeout_seconds=settings.timeout_seconds,
+        max_output_tokens=settings.max_output_tokens,
+    )
+    logger.info(
+        "short_reply enabled mode={} route={} model={} chats={} fallback={}",
+        settings.mode,
+        route,
+        getattr(client, "model", "-"),
+        len(effective),
+        settings.fallback,
+    )
+    return ShortReplyReactor(decider=decider, history=store, settings=settings)
 
 
 def _offer_participation_trigger(
@@ -2654,6 +2717,7 @@ def build_gateway_runtime(
         service_effects=service_effects,
         forward_target_resolver=policy_adapter.resolve_whatsapp_group,
         forward_source_lookup=channels.lookup_message,
+        short_reply_reactor=_build_short_reply_reactor(config, processing_store),
     )
 
     def _choose_voice_phrase(job: CronJob, phrases: list[str]) -> str:

@@ -830,6 +830,57 @@ class ProcessingParticipationMaintenanceConfig(BaseModel):
     batch_size: int = Field(default=20, alias="batchSize", gt=0, le=100)
 
 
+class ProcessingShortReplyRateLimitConfig(BaseModel):
+    """Burst guard for short-reply reactions, read from durable effect history."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    count: int = Field(default=2, ge=1, le=20)
+    window_seconds: int = Field(default=120, alias="windowSeconds", ge=1, le=3600)
+    cooldown_seconds: int = Field(default=600, alias="cooldownSeconds", ge=0, le=86_400)
+
+
+class ProcessingShortReplyConfig(BaseModel):
+    """Short replies to the bot: one small decision instead of a fixed face.
+
+    Spec: ``docs/superpowers/specs/2026-09-22-multilingual-reaction-decision-design.md``
+    in the runtime repository. ``off`` keeps today's behaviour exactly.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mode: Literal["off", "shadow", "live"] = "off"
+    route: str = "reaction.decide"
+    max_chars: int = Field(default=80, alias="maxChars", ge=1, le=400)
+    timeout_seconds: float = Field(default=6.0, alias="timeoutSeconds", gt=0, le=30)
+    max_output_tokens: int = Field(default=48, alias="maxOutputTokens", ge=16, le=1024)
+    allow_answer: bool = Field(default=True, alias="allowAnswer")
+    max_candidates: int = Field(default=3, alias="maxCandidates", ge=1, le=5)
+    variety_window_minutes: int = Field(
+        default=30, alias="varietyWindowMinutes", ge=1, le=1440
+    )
+    variety_history: int = Field(default=5, alias="varietyHistory", ge=1, le=50)
+    fallback: Literal["neutral_rotation", "silence"] = "neutral_rotation"
+    fallback_emojis: list[str] = Field(
+        default_factory=lambda: ["👍", "🤙", "😄"], alias="fallbackEmojis"
+    )
+    rate_limit: ProcessingShortReplyRateLimitConfig = Field(
+        default_factory=ProcessingShortReplyRateLimitConfig, alias="rateLimit"
+    )
+    chats: list[str] = Field(default_factory=list)
+
+    def mode_for(self, channel: str, chat_id: str) -> str:
+        """The effective mode for one chat: an allowlist narrows, it never widens."""
+        if self.mode == "off":
+            return "off"
+        wanted = {str(entry).strip() for entry in self.chats if str(entry).strip()}
+        # Bootstrap fills this with processing.chats ∩ shortReply.chats before wiring.
+        # An empty set is fail-closed; it never means every chat visible to middleware.
+        if not wanted or f"{channel}:{chat_id}" not in wanted:
+            return "off"
+        return self.mode
+
+
 class ProcessingConfig(BaseModel):
     """State-aware message processing (spec section 4).
 
@@ -859,6 +910,10 @@ class ProcessingConfig(BaseModel):
     #: in, one emoji out - it should stay a cheap, fast chat route. Empty means "use the
     #: memory capture route", which is already a small extraction model.
     reaction_route: str = ""
+    #: Short replies to the bot (react / answer / silence), off by default.
+    short_reply: ProcessingShortReplyConfig = Field(
+        default_factory=ProcessingShortReplyConfig, alias="shortReply"
+    )
     #: Joining a conversation unaddressed: how often, and how sure the judge must be.
     ambient: ProcessingAmbientConfig = Field(default_factory=ProcessingAmbientConfig)
     participation: ProcessingParticipationConfig = Field(
@@ -896,6 +951,21 @@ class ProcessingConfig(BaseModel):
                 )
             approved.append(entry)
         return approved
+
+    @model_validator(mode="after")
+    def _validate_short_reply_fallback(self) -> "ProcessingConfig":
+        """Fallback reactions must also be in the owner-approved vocabulary."""
+        if self.short_reply.mode == "off" or self.short_reply.fallback != "neutral_rotation":
+            return self
+        approved = set(self.reaction_emojis)
+        for value in self.short_reply.fallback_emojis:
+            entry = str(value).strip()
+            if not looks_like_emoji(entry) or entry not in approved:
+                raise ValueError(
+                    "processing.shortReply.fallbackEmojis must be emojis from "
+                    f"processing.reactionEmojis; {value!r} is not"
+                )
+        return self
 
     def is_chat_enabled(self, channel: str, chat_id: str) -> bool:
         """True when the new mode owns this exact chat (effects are allowed)."""
