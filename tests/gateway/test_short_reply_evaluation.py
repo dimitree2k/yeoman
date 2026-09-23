@@ -209,3 +209,51 @@ def test_synthetic_rows_are_marked_and_labelled(tmp_path: Path) -> None:
     assert rows[0].synthetic is True and rows[0].chat == "synthetic-ja"
     assert labels[rows[0].row_id].emojis == ("🙏", "🤙")
     assert json.dumps(rows[0].text, ensure_ascii=False) == '"ありがとう！"'
+
+
+async def test_simulation_varies_faces_per_chat_and_skips_bot_questions() -> None:
+    from yeoman_gateway.short_reply.decider import ShortReplyVerdict
+    from yeoman_gateway.short_reply.evaluation import ReplayRow, simulate_decisions
+    from yeoman_shared.config.schema import ProcessingShortReplyConfig
+
+    class _Decider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def decide(self, request):
+            self.calls += 1
+            return ShortReplyVerdict(
+                action="react", emojis=("😂", "💀", "😄"),
+                usage={"prompt_tokens": 100, "completion_tokens": 10}, latency_ms=7,
+            )
+
+    def row(
+        index: int, text: str, bot_text: str = "Starker Trade.", priority_mode: str = ""
+    ) -> ReplayRow:
+        return ReplayRow(
+            row_id=f"c:{index}", chat="c", chat_id="c@g.us", message_id=str(index),
+            timestamp=1_000 + index * 600, text=text, bot_text=bot_text, graphemes=len(text),
+            question=False, bot_asked=bot_text.endswith("?"), legacy_mode="low_content_reply",
+            media_kind="", media_text="", media_metadata_available=True,
+            priority_mode=priority_mode, candidate=True,
+            legacy_emoji="👀", actual="none",
+        )
+
+    decider = _Decider()
+    settings = ProcessingShortReplyConfig.model_validate(
+        {"mode": "live", "rateLimit": {"count": 10}}
+    )
+    decisions = await simulate_decisions(
+        [row(1, "lol"), row(2, "haha"), row(3, "ok", bot_text="Wirklich?"), row(4, "xD")],
+        decider,
+        settings,
+    )
+    assert [d.chosen for d in decisions] == ["😂", "💀", "", "😄"]
+    assert decisions[2].kind == "answer" and decisions[2].source == "rule"
+    assert decider.calls == 3
+    assert decisions[0].prompt_tokens == 100 and decisions[0].model_latency_ms == 7
+
+    protected = row(5, "Danke", priority_mode="repair_feedback")
+    skipped = await simulate_decisions([protected], decider, settings)
+    assert skipped[0].reason == "legacy_precedence" and not skipped[0].model_called
+    assert decider.calls == 3

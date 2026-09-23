@@ -18,6 +18,7 @@ from collections.abc import Collection, Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from yeoman_gateway.implicit_addressing import (
     looks_like_low_content_reply,
@@ -26,7 +27,10 @@ from yeoman_gateway.implicit_addressing import (
     looks_like_reply_ack,
     reaction_for_reply_ack,
 )
+from yeoman_gateway.processing.models import RecentReaction, ShortReplyClaim
+from yeoman_gateway.short_reply.reactor import ReactorRequest, ShortReplyReactor
 from yeoman_gateway.short_reply.signals import compute_signals
+from yeoman_gateway.short_reply.variety import cooldown_active
 
 LABEL_FIELDS: tuple[str, ...] = (
     "row_id", "chat", "timestamp", "bot_text", "text", "graphemes", "question",
@@ -400,3 +404,154 @@ def load_effect_sequences(processing_db: Path, *, since_ms: int, chat_id: str | 
         elif row["capability"] == "send_text" and payload.get("text"):
             texts.append((target_chat_id, timestamp, str(payload["text"])))
     return reactions, texts
+
+
+@dataclass(frozen=True, slots=True)
+class SimDecision:
+    row_id: str
+    timestamp: int
+    kind: str
+    chosen: str
+    source: str
+    reason: str
+    verdict_action: str
+    verdict_emojis: tuple[str, ...]
+    error: str
+    model_called: bool
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    model_latency_ms: int
+
+
+class _SimHistory:
+    """The chat history the simulated reactor itself produced, newest first."""
+
+    def __init__(self) -> None:
+        self._rows: dict[str, list[RecentReaction]] = defaultdict(list)
+        self._claims: set[tuple[str, str, str]] = set()
+
+    def claim_short_reply(self, *, channel, chat_id, message_id, now_ms,
+                          count, window_seconds, cooldown_seconds, mode="live"):
+        key = (channel, chat_id, message_id)
+        if key in self._claims:
+            return ShortReplyClaim("duplicate")
+        self._claims.add(key)
+        if cooldown_active(
+            [row.created_ms for row in self._rows[chat_id]], now_ms=now_ms,
+            count=count, window_seconds=window_seconds, cooldown_seconds=cooldown_seconds,
+        ):
+            return ShortReplyClaim("cooldown")
+        return ShortReplyClaim("claimed")
+
+    def recent_reactions(self, *, channel: str, chat_id: str, since_ms: int, limit: int):
+        return tuple(r for r in self._rows[chat_id] if r.created_ms >= since_ms)[:limit]
+
+    def add(self, chat_id: str, emoji: str, created_ms: int) -> None:
+        self._rows[chat_id].insert(0, RecentReaction(emoji=emoji, created_ms=created_ms))
+
+    def complete_short_reply(self, *, channel, chat_id, message_id, outcome, emoji, now_ms):
+        if outcome == "react" and emoji:
+            self.add(chat_id, emoji, now_ms)
+
+
+class _Recording:
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.last: Any = None
+        self.calls = 0
+
+    async def decide(self, request: Any) -> Any:
+        self.calls += 1
+        self.last = await self.inner.decide(request)
+        return self.last
+
+
+async def simulate_decisions(
+    rows: Sequence[ReplayRow], decider: Any, settings: Any
+) -> list[SimDecision]:
+    """Run the real reactor over the rows in time order, one simulated history per chat."""
+    history = _SimHistory()
+    recorder = _Recording(decider)
+    now = [0]
+    reactor = ShortReplyReactor(
+        decider=recorder, history=history, settings=settings, clock=lambda: now[0]
+    )
+    decisions: list[SimDecision] = []
+    for row in sorted(rows, key=lambda item: (item.timestamp, item.row_id)):
+        now[0] = row.timestamp * 1000
+        signals = compute_signals(
+            content=row.text,
+            reply_to_bot=True,
+            reply_to_text=row.bot_text,
+            metadata={
+                "media_kind": row.media_kind,
+                "media_description": row.media_text if row.media_kind != "audio" else "",
+                "voice_transcript": row.media_text if row.media_kind == "audio" else "",
+            },
+        )
+        if signals.bot_asked or signals.has_question_punct:
+            decisions.append(
+                SimDecision(
+                    row_id=row.row_id, timestamp=row.timestamp, kind="answer",
+                    chosen="", source="rule",
+                    reason="deterministic", verdict_action="-", verdict_emojis=(),
+                    error="", model_called=False, prompt_tokens=None,
+                    completion_tokens=None, model_latency_ms=0,
+                )
+            )
+            continue
+        if not _row_is_candidate(row, max_chars=reactor.max_chars):
+            protected = row.priority_mode in {"repair_feedback", "group_member_bait"}
+            decisions.append(
+                SimDecision(
+                    row_id=row.row_id, timestamp=row.timestamp,
+                    kind="silence" if protected else "answer", chosen="",
+                    source="legacy" if protected else "rule",
+                    reason="legacy_precedence" if protected else "not_candidate",
+                    verdict_action="-", verdict_emojis=(), error="",
+                    model_called=False, prompt_tokens=None,
+                    completion_tokens=None, model_latency_ms=0,
+                )
+            )
+            continue
+        recorder.last = None
+        calls_before = recorder.calls
+        outcome = await reactor.decide(
+            ReactorRequest(
+                channel="whatsapp", chat_id=row.chat_id, message_id=row.message_id,
+                thread_id="", turn_id="", signals=signals, bot_text=row.bot_text,
+            )
+        )
+        verdict = recorder.last
+        model_called = recorder.calls > calls_before
+        usage = dict(getattr(verdict, "usage", {}) or {})
+        decisions.append(
+            SimDecision(
+                row_id=row.row_id,
+                timestamp=row.timestamp,
+                kind=outcome.kind,
+                chosen=outcome.emoji or "",
+                source=outcome.source,
+                reason=outcome.reason,
+                verdict_action=str(getattr(verdict, "action", "-")),
+                verdict_emojis=tuple(getattr(verdict, "emojis", ()) or ()),
+                error=str(getattr(verdict, "error", "") or ""),
+                model_called=model_called,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                model_latency_ms=int(getattr(verdict, "latency_ms", 0) or 0),
+            )
+        )
+    return decisions
+
+
+def decisions_to_jsonl(decisions: Sequence[SimDecision], path: Path) -> None:
+    with _private_text_file(path) as handle:
+        for decision in decisions:
+            handle.write(json.dumps(asdict(decision), ensure_ascii=False) + "\n")
+
+
+def decisions_from_jsonl(path: Path) -> list[SimDecision]:
+    with path.open(encoding="utf-8") as handle:
+        items = [json.loads(line) for line in handle if line.strip()]
+    return [SimDecision(**{**item, "verdict_emojis": tuple(item["verdict_emojis"])}) for item in items]
