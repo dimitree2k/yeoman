@@ -5,11 +5,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
-from yeoman_shared.reactions import SYSTEM_ORIGIN
+from loguru import logger
+
+from yeoman_shared.reactions import MODEL_ORIGIN, SYSTEM_ORIGIN
 
 from yeoman_gateway.core.intents import SendReactionIntent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
+from yeoman_gateway.short_reply.reactor import ReactorRequest
+from yeoman_gateway.short_reply.signals import compute_signals
 from yeoman_gateway.implicit_addressing import (
     ConversationState,
     SessionManagerLike,
@@ -17,6 +22,9 @@ from yeoman_gateway.implicit_addressing import (
     reaction_for_name_mention,
     reaction_for_reply_ack,
 )
+
+if TYPE_CHECKING:
+    from yeoman_gateway.short_reply.reactor import ShortReplyReactor
 
 
 def _processing_owns_outcome(event: object) -> bool:
@@ -47,6 +55,7 @@ class ImplicitBotAddressMiddleware:
         bait_reaction_streak_threshold: int = 2,
         bait_reaction_window_seconds: float = 120.0,
         bait_reaction_cooldown_seconds: float = 600.0,
+        short_reply_reactor: ShortReplyReactor | None = None,
     ) -> None:
         self._session_manager = session_manager
         self._bot_name_aliases = tuple(
@@ -58,6 +67,7 @@ class ImplicitBotAddressMiddleware:
         self._bait_reaction_cooldown_seconds = max(0.0, float(bait_reaction_cooldown_seconds))
         self._bait_reaction_events: dict[str, list[datetime]] = {}
         self._bait_reaction_cooldowns: dict[str, datetime] = {}
+        self._short_reply_reactor = short_reply_reactor
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         decision = ctx.decision
@@ -101,6 +111,8 @@ class ImplicitBotAddressMiddleware:
         state_mode = str(
             state_raw.get("address_mode") if isinstance(state_raw, dict) else ""
         )
+        if await self._handle_short_reply(ctx, state_mode, next):
+            return
         if state_mode == "reply_ack":
             self._react_or_silence_bait(
                 ctx,
@@ -174,6 +186,128 @@ class ImplicitBotAddressMiddleware:
             return
 
         await next(ctx)
+
+    #: Modes whose meaning the short-reply path must not override (spec §6.1).
+    _SHORT_REPLY_KEEPS: frozenset[str] = frozenset(
+        {"from_me", "repair_feedback", "group_member_bait"}
+    )
+
+    async def _handle_short_reply(
+        self, ctx: PipelineContext, state_mode: str, next: NextFn
+    ) -> bool:
+        """True when the short-reply path owned this message (spec 2026-09-22 §6.4).
+
+        Every direct reply in the reactor's scope leaves exactly one data-sparse
+        ``reaction_decision`` line - decided, bypassed or not a candidate - with every
+        provider id of a debounced batch, so shadow coverage reconciles exactly.
+        """
+        reactor = self._short_reply_reactor
+        event = ctx.event
+        if reactor is None or not event.reply_to_bot or not event.message_id:
+            return False
+        mode = reactor.mode_for(event.channel, event.chat_id)
+        if mode == "off":
+            return False
+        metadata = dict(event.raw_metadata or {})
+        source_ids = tuple(
+            str(item) for item in (metadata.get("source_event_ids") or ()) if str(item)
+        ) or (str(event.message_id),)
+        signals = compute_signals(
+            content=str(event.content or ""),
+            reply_to_bot=True,
+            reply_to_text=event.reply_to_text,
+            metadata=metadata,
+        )
+        candidate = signals.is_candidate(max_chars=reactor.max_chars)
+
+        def bypass(outcome: str, reason: str) -> None:
+            logger.info(
+                "reaction_decision mode={} chat={} message_id={} source_ids={} "
+                "outcome={} reason={}",
+                mode, event.chat_id, event.message_id, ",".join(source_ids), outcome, reason,
+            )
+
+        if state_mode in self._SHORT_REPLY_KEEPS:
+            bypass("legacy", "legacy_precedence")
+            return False
+        request = ReactorRequest(
+            channel=event.channel,
+            chat_id=event.chat_id,
+            message_id=str(event.message_id),
+            thread_id=str(metadata.get("thread_id") or ""),
+            turn_id=str(metadata.get("turn_id") or ""),
+            signals=signals,
+            bot_text=str(event.reply_to_text or ""),
+            source_ids=source_ids,
+        )
+        if mode == "shadow":
+            if not candidate:
+                bypass("legacy", "not_candidate")
+            elif signals.bot_asked:
+                bypass("legacy", "bot_asked")
+            else:
+                reactor.shadow(request)
+            return False
+        if not candidate or signals.bot_asked:
+            reason = "bot_asked" if candidate else "not_candidate"
+            if state_mode in {"reply_ack", "low_content_reply"}:
+                bypass("answer", reason)
+                self._set_answer_state(ctx)
+                await next(ctx)
+                return True
+            bypass("legacy", reason)
+            return False
+        outcome = await reactor.decide(request)
+        if outcome.kind == "answer":
+            self._set_answer_state(ctx)
+            await next(ctx)
+            return True
+        if outcome.kind == "react" and outcome.emoji:
+            ctx.intents.append(
+                SendReactionIntent(
+                    channel=event.channel,
+                    chat_id=event.chat_id,
+                    message_id=str(event.message_id),
+                    emoji=outcome.emoji,
+                    participant_jid=event.reaction_participant_jid,
+                    origin=MODEL_ORIGIN,
+                    reason="short_reply" if outcome.source == "model" else "short_reply_fallback",
+                )
+            )
+            ctx.metric(
+                "short_reply_reaction",
+                labels=(("channel", event.channel), ("source", outcome.source)),
+            )
+        else:
+            silence_mode = (
+                "bait_cooldown" if outcome.reason == "cooldown" else "short_reply_silence"
+            )
+            self._set_conversation_state_mode(
+                ctx, silence_mode, preferred_action="silence"
+            )
+        ctx.halt()
+        return True
+
+    def _set_answer_state(self, ctx: PipelineContext) -> None:
+        """A short reply that deserves words: continue like any reply to the bot."""
+        raw = dict(ctx.event.raw_metadata or {})
+        state_raw = raw.get("conversation_state")
+        state = dict(state_raw) if isinstance(state_raw, dict) else {}
+        state.update(
+            {
+                "address_mode": "reply_to_bot",
+                "preferred_action": "answer",
+                "answer_shape": "short_take",
+                "addressed_to_bot": True,
+                "direct_bot_interaction": True,
+            }
+        )
+        raw["conversation_state"] = state
+        ctx.event = replace(ctx.event, raw_metadata=raw)
+        if ctx.decision is not None and not ctx.decision.should_respond:
+            ctx.decision = replace(
+                ctx.decision, should_respond=True, reason="when_to_reply:short_reply_answer"
+            )
 
     def _apply_conversation_state(
         self,
