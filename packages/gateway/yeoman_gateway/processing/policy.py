@@ -385,6 +385,7 @@ class IngestGate:
             logger.info(
                 "routing_decision chat={} event_id={} classification={} candidates={} "
                 "eligible={} topic_break={} continuity={} evidence={} outcome={} "
+                "respond={} react_action={} "
                 "reply_action={} thread_id={} turn_id={} rule={} reason={}",
                 event.chat_id,
                 request.event_id,
@@ -395,6 +396,8 @@ class IngestGate:
                 getattr(assignment, "continuity_kind", "none"),
                 ",".join(getattr(assignment, "continuity_evidence", ()) or ()) or "-",
                 outcome.value,
+                "true" if decision.should_respond else "false",
+                "true" if react else "false",
                 self._reply_action(request),
                 assignment.thread_id or "-",
                 assignment.turn_id or "-",
