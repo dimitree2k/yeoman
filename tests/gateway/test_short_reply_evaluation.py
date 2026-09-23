@@ -257,3 +257,156 @@ async def test_simulation_varies_faces_per_chat_and_skips_bot_questions() -> Non
     skipped = await simulate_decisions([protected], decider, settings)
     assert skipped[0].reason == "legacy_precedence" and not skipped[0].model_called
     assert decider.calls == 3
+
+
+def _rows_and_labels():
+    from yeoman_gateway.short_reply.evaluation import Label, ReplayRow, SimDecision
+
+    def row(index, text, graphemes, legacy_emoji="👀", question=False):
+        return ReplayRow(
+            row_id=f"c:{index}", chat="c", chat_id="c@g.us", message_id=str(index),
+            timestamp=1_000 + index * 60, text=text, bot_text="x", graphemes=graphemes,
+            question=question, bot_asked=False,
+            media_kind="", media_text="", media_metadata_available=True,
+            priority_mode="", candidate=True,
+            legacy_mode="low_content_reply" if legacy_emoji else "reply_to_bot",
+            legacy_emoji=legacy_emoji,
+            actual=("text" if index == 3 else f"reaction:{legacy_emoji}" if legacy_emoji else "none"),
+        )
+
+    rows = [row(1, "lol", 3), row(2, "danke", 5), row(3, "long correction", 95, ""),
+            row(4, "k", 1)]
+    labels = {
+        "c:1": Label("react", ("😂", "💀")),
+        "c:2": Label("react", ("🙏",)),
+        "c:3": Label("answer", ()),
+        "c:4": Label("none", ()),
+    }
+
+    def dec(row_id, kind, chosen="", emojis=()):
+        return SimDecision(row_id, 1_000, kind, chosen, "model", "model", kind,
+                           emojis, "", True, 100, 10, 50)
+
+    decisions = [
+        dec("c:1", "react", "💀", ("😂", "💀")),
+        dec("c:2", "react", "🙏", ("🙏",)),
+        dec("c:3", "answer"),
+        dec("c:4", "silence"),
+    ]
+    return rows, labels, decisions
+
+
+def test_labelled_quality_metrics_use_actual_legacy_baseline() -> None:
+    from yeoman_gateway.short_reply.evaluation import evaluate, go_no_go
+
+    rows, labels, decisions = _rows_and_labels()
+    metrics = evaluate(rows, labels, decisions, max_chars=80)
+    v2 = metrics["V2_varied"]
+    assert v2.action_accuracy == 1.0 and v2.emoji_fit == 1.0
+    assert v2.lost_answers == 0.0 and v2.unnecessary_reactions == 0.0
+    v1 = metrics["V1_first_candidate"]
+    assert v1.emoji_fit == 1.0  # 😂 is also in the label set
+    v0 = metrics["V0_legacy"]
+    assert v0.emoji_fit == 0.0  # 👀 fits nothing here
+    assert v0.unnecessary_reactions == 0.25  # "k" was labelled none but got 👀
+    ok, reasons = go_no_go(metrics)
+    assert ok is False and any("shadow" in reason for reason in reasons)
+
+
+def test_rows_above_max_chars_are_answered_in_model_variants() -> None:
+    from yeoman_gateway.short_reply.evaluation import evaluate
+
+    rows, labels, decisions = _rows_and_labels()
+    tight = evaluate(rows, labels, decisions, max_chars=2)["V2_varied"]
+    # "lol" (3) and "danke" (5) now exceed 2 graphemes -> normal answer path
+    assert tight.unnecessary_answers == 0.5
+
+
+def test_usage_summary_reports_tokens_and_only_supplied_prices() -> None:
+    from yeoman_gateway.short_reply.evaluation import usage_summary
+
+    _rows, _labels, decisions = _rows_and_labels()
+    summary = usage_summary(decisions)
+    assert summary["calls"] == 4 and summary["prompt_tokens_sum"] == 400
+    assert "cost_usd" not in summary
+    priced = usage_summary(decisions, price_in_per_mtok=1.0, price_out_per_mtok=2.0)
+    assert priced["cost_usd"] == (400 * 1.0 + 40 * 2.0) / 1_000_000
+    assert sum(usage_summary(decisions)["calls_per_day_europe_berlin"].values()) == 4
+
+
+def test_full_sequence_metrics_group_share_by_chat_and_iso_week() -> None:
+    from yeoman_gateway.short_reply.evaluation import sequence_metrics
+
+    events = [("c@g.us", 1_790_000_000 + index, emoji) for index, emoji in enumerate(
+        ["😂", "😂", "😂", "👍", "👍"]
+    )]
+    text_events = [("c@g.us", 1_790_000_000, "Danke 😂")]
+    metrics = sequence_metrics(events, text_events)
+    assert list(metrics.top_share_by_chat_week.values()) == [0.6]
+    assert round(list(metrics.entropy_bits_by_chat_week.values())[0], 3) == 0.971
+    assert metrics.triple_repeats == 1
+    assert metrics.max_reactions_per_10min == 5
+    assert metrics.max_reactions_per_hour == 5
+
+
+def test_text_markers_do_not_count_and_one_emoji_per_message() -> None:
+    from yeoman_gateway.short_reply.evaluation import message_emoji, sequence_metrics
+
+    assert message_emoji("🟢 Kaufen\n🟢 Halten\n- ⚠️ Risiko") is None
+    assert message_emoji("🟢 Kaufen, klar 😎") == "😎"
+    assert message_emoji("Danke 😂😂😂") == "😂"
+    assert message_emoji("😄") == "😄"
+    metrics = sequence_metrics([], [
+        ("c@g.us", 1_790_000_000, "🟢 Kaufen\n🟢 Halten\n🟢 Beobachten"),
+        ("c@g.us", 1_790_000_001, "Danke 😂😂😂"),
+        ("c@g.us", 1_790_000_002, "😄"),
+    ])
+    assert metrics.text_emoji_count == 2
+    assert metrics.text_triple_repeats == 0
+
+
+def test_the_same_emoji_in_three_consecutive_texts_is_a_triple() -> None:
+    from yeoman_gateway.short_reply.evaluation import sequence_metrics
+
+    metrics = sequence_metrics([], [
+        ("c@g.us", 1_790_000_000 + index, text)
+        for index, text in enumerate(("gut 😂", "lol 😂", "😂"))
+    ])
+    assert metrics.text_triple_repeats == 1
+
+
+def test_history_unavailable_is_not_counted_as_a_provider_call() -> None:
+    from yeoman_gateway.short_reply.evaluation import SimDecision, usage_summary
+
+    skipped = SimDecision(
+        row_id="c:1", timestamp=1_000, kind="silence", chosen="", source="none",
+        reason="history_unavailable", verdict_action="-", verdict_emojis=(),
+        error="history_unavailable", model_called=False, prompt_tokens=None,
+        completion_tokens=None, model_latency_ms=0,
+    )
+    assert usage_summary([skipped])["calls"] == 0
+
+
+def test_final_gate_rejects_incomplete_receipts_and_offline_fallbacks() -> None:
+    from yeoman_gateway.short_reply.evaluation import (
+        RolloutMetrics, evaluate, go_no_go, sequence_metrics,
+    )
+
+    rows, labels, decisions = _rows_and_labels()
+    metrics = evaluate(rows, labels, decisions, max_chars=80)
+    events = [
+        ("c@g.us", 1_790_000_000 + index * 3_600, emoji)
+        for index, emoji in enumerate(("😂", "👍", "🙏", "🤙", "😄"))
+    ]
+    sequence = sequence_metrics(events, [])
+    rollout = RolloutMetrics(
+        baseline=sequence, shadow=sequence, baseline_receipts_complete=False,
+        offline_failures=1, observed_days=3, expected_candidates=5,
+        logged_candidates=5, shadow_dropped=0, provider_errors=0,
+        invalid_json=0, truncated=0, fallbacks=0,
+    )
+    probe = [decisions[0]] * 5
+    ok, reasons = go_no_go(metrics, rollout=rollout, probe=probe)
+    assert ok is False
+    assert any("receipt coverage" in reason for reason in reasons)
+    assert any("offline model errors/fallbacks" in reason for reason in reasons)
