@@ -1025,6 +1025,22 @@ async def test_new_confirmation_survives_the_manual_boundary(runtime) -> None:
     assert runtime.transport.sent == ["👍"]
 
 
+@pytest.mark.asyncio
+async def test_a_reaction_effect_stores_its_reason(runtime) -> None:
+    from yeoman_gateway.core.intents import SendReactionIntent
+
+    _admit(runtime, message_id="m1")
+    assert await runtime.router.submit_reaction(
+        SendReactionIntent(
+            channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍", reason="reply_ack"
+        ),
+        principal="orderer@s.whatsapp.net",
+    )
+    effect = runtime.store.get_effect(runtime.store.list_effects()[0].effect_id)
+    assert effect is not None and effect.payload is not None
+    assert effect.payload.reason == "reply_ack"
+
+
 # the ambient brake ---------------------------------------------------------------------
 
 

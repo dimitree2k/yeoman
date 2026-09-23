@@ -919,3 +919,22 @@ async def test_old_assistant_reply_does_not_wake_followup() -> None:
     assert ctx.event.reply_to_bot is False
     assert ctx.decision is not None
     assert ctx.decision.should_respond is False
+
+
+@pytest.mark.asyncio
+async def test_middleware_reactions_name_their_reason() -> None:
+    ctx = PipelineContext(
+        event=_event(
+            content="Jepp, hatte Glück",
+            reply_to_bot=True,
+            reply_to_text="Starker Trade.",
+        ),
+        decision=_mention_only_decision(should_respond=True),
+    )
+
+    await ImplicitBotAddressMiddleware()(ctx, _noop_next)
+
+    reactions = [intent for intent in ctx.intents if isinstance(intent, SendReactionIntent)]
+    assert len(reactions) == 1
+    assert reactions[0].emoji == "👀"
+    assert reactions[0].reason == "low_content_reply"
