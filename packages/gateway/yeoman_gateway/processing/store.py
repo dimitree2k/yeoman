@@ -2644,10 +2644,26 @@ class ProcessingStore:
             )
 
     def event_assignment(self, event_id: str) -> tuple[str | None, str | None] | None:
+        """``(thread_id, turn_id)`` of a journaled event, by event id or provider id.
+
+        Canonical WhatsApp events carry their own ``wa_…`` id and keep the provider
+        message id in ``source_message_id``. A reaction only knows the provider id, so
+        when no event has that id (or it is unassigned) the newest *assigned* event with
+        that provider id is its lineage (routing spec, criterion 8).
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT thread_id, turn_id FROM events WHERE event_id = ?", (event_id,)
             ).fetchone()
+            if row is None or (row["thread_id"] is None and row["turn_id"] is None):
+                fallback = self._conn.execute(
+                    "SELECT thread_id, turn_id FROM events WHERE source_message_id = ? "
+                    "AND (thread_id IS NOT NULL OR turn_id IS NOT NULL) "
+                    "ORDER BY created_ms DESC, event_id DESC LIMIT 1",
+                    (event_id,),
+                ).fetchone()
+                if fallback is not None:
+                    row = fallback
         if row is None:
             return None
         return (

@@ -143,6 +143,58 @@ def test_canonical_event_roundtrip_keeps_metadata_and_hash(tmp_path):
     db.close()
 
 
+def _canonical(event_id: str, provider_id: str, chat: str = "g@g.us") -> CanonicalEvent:
+    return CanonicalEvent(
+        event_id=event_id,
+        event_key=f"whatsapp:{chat}:{event_id}",
+        trace_id=provider_id,
+        kind="message",
+        origin="whatsapp_canonical",
+        channel="whatsapp",
+        chat_id=chat,
+        source_message_id=provider_id,
+        payload={"kind": "message", "text": "x"},
+    )
+
+
+def test_event_assignment_resolves_a_provider_id_of_a_canonical_event(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    event = _canonical("wa_1", "AC01")
+    db.append_event(
+        event_key=event.event_key, event_id=event.event_id, trace_id=event.trace_id,
+        payload=event, now_ms=1,
+    )
+    db.attach_event_assignment(event_id="wa_1", thread_id="th_1", turn_id="tu_1", now_ms=2)
+
+    assert db.event_assignment("wa_1") == ("th_1", "tu_1")
+    assert db.event_assignment("AC01") == ("th_1", "tu_1")
+    assert db.event_assignment("unknown") is None
+    db.close()
+
+
+def test_event_assignment_prefers_the_newest_assigned_event_for_a_provider_id(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    for event_id, now in (("wa_old", 1), ("wa_new", 5), ("wa_unassigned", 9)):
+        event = _canonical(event_id, "AC02")
+        db.append_event(
+            event_key=event.event_key, event_id=event.event_id, trace_id=event.trace_id,
+            payload=event, now_ms=now,
+        )
+    db.attach_event_assignment(event_id="wa_old", thread_id="th_a", turn_id="tu_a", now_ms=6)
+    db.attach_event_assignment(event_id="wa_new", thread_id="th_b", turn_id="tu_b", now_ms=7)
+
+    assert db.event_assignment("AC02") == ("th_b", "tu_b")
+    db.close()
+
+
+def test_event_assignment_keeps_plain_event_ids_working(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(event_key="wa:m1", event_id="m1", trace_id="m1", payload={"kind": "message"})
+    db.attach_event_assignment(event_id="m1", thread_id="th_1", turn_id="tu_1", now_ms=2)
+    assert db.event_assignment("m1") == ("th_1", "tu_1")
+    db.close()
+
+
 def test_long_payload_roundtrip_keeps_canonical_json_bytes(tmp_path):
     from yeoman_gateway.processing.models import canonical_json
 
