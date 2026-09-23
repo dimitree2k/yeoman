@@ -188,6 +188,7 @@ def _policy(
     opted_in: bool = True,
     participation: dict | None = None,
     persona_file: str | None = None,
+    reply_budget: dict | None = None,
 ) -> PolicyConfig:
     block: dict[str, object] = {"enabled": opted_in}
     if participation:
@@ -200,6 +201,7 @@ def _policy(
                         CHAT: {
                             "whoCanTalk": {"mode": "everyone"},
                             **({"personaFile": persona_file} if persona_file else {}),
+                            **({"replyBudget": reply_budget} if reply_budget else {}),
                             "participation": block,
                             "spontaneity": {
                                 "enabled": True,
@@ -2153,6 +2155,166 @@ async def test_writer_prompt_marks_only_selected_current_target() -> None:
     assert "[CURRENT] Ben: JEV needs a concrete use case" in responder.prompt
     assert "[CURRENT] Anna" not in responder.prompt
     assert "Answer only the [CURRENT] message" in responder.prompt
+
+
+@pytest.mark.asyncio
+async def test_writer_prompt_subordinates_purpose_below_persona_and_transcript() -> None:
+    """The judge's purpose is a note after the transcript, never the opening order."""
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+
+    class _PromptSpy(LLMResponder):
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        def _metadata_for_event(self, event: InboundEvent) -> dict[str, object]:
+            del event
+            return {}
+
+        async def _generate(self, **kwargs: object) -> str:
+            self.prompt = str(kwargs["content"])
+            return "draft"
+
+    responder = _PromptSpy()
+    await responder.generate_participation_draft(
+        InboundEvent(
+            channel=CHANNEL,
+            chat_id=CHAT,
+            sender_id="",
+            content="",
+            is_group=True,
+        ),
+        PolicyDecision(
+            accept_message=False,
+            should_respond=False,
+            allowed_tools=frozenset(),
+            reason="participation_draft_only",
+        ),
+        purpose="Explain the current JEV use case.",
+        context={
+            "target_message_id": "selected",
+            "messages": [
+                {
+                    "event_id": "selected",
+                    "sender": "Ben",
+                    "text": "JEV needs a concrete use case",
+                },
+            ],
+        },
+        model_profile="participation_writer",
+    )
+
+    assert not responder.prompt.startswith("Explain the current JEV use case.")
+    assert responder.prompt.index("[CURRENT] Ben") < responder.prompt.index(
+        "Explain the current JEV use case."
+    )
+    assert "persona and its voice rules outrank" in responder.prompt
+    assert "no tools in this mode" in responder.prompt
+
+
+@pytest.mark.asyncio
+async def test_writer_draft_is_held_to_the_chat_reply_budget() -> None:
+    """A draft over the chat's budget is compressed, as a direct reply would be."""
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+
+    class _LongDraft(LLMResponder):
+        def __init__(self) -> None:
+            self.metadata: dict[str, object] = {}
+            self.telemetry = None
+
+        def _metadata_for_event(self, event: InboundEvent) -> dict[str, object]:
+            del event
+            return {}
+
+        async def _generate(self, **kwargs: object) -> str:
+            self.metadata = dict(kwargs["metadata"])  # type: ignore[arg-type]
+            return "Kurz: das ist der Punkt. " + ("y" * 900)
+
+    responder = _LongDraft()
+    draft = await responder.generate_participation_draft(
+        InboundEvent(
+            channel=CHANNEL,
+            chat_id=CHAT,
+            sender_id="",
+            content="",
+            is_group=True,
+        ),
+        PolicyDecision(
+            accept_message=False,
+            should_respond=False,
+            allowed_tools=frozenset(),
+            reason="participation_draft_only",
+            reply_budget={
+                "enabled": True,
+                "targets": {"short_take": 380},
+                "hard_max_chars": 560,
+                "long_form_max_chars": 2000,
+                "long_form_bypass": "owner_only",
+            },
+        ),
+        purpose="Answer the goalkeeper question in full detail.",
+        context={
+            "target_message_id": "selected",
+            "messages": [
+                {"event_id": "selected", "sender": "Ben", "text": "who is in goal?"},
+            ],
+        },
+        model_profile="participation_writer",
+    )
+
+    budget = responder.metadata["reply_budget"]
+    assert isinstance(budget, dict)
+    assert budget["target_chars"] == 380
+    assert budget["hard_cap_enabled"] is True
+    assert draft == "Kurz: das ist der Punkt."
+
+
+@pytest.mark.asyncio
+async def test_submission_passes_policy_reply_budget_to_writer(tmp_path: Path) -> None:
+    """The draft decision carries the chat's budget, so the writer can be held to it."""
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+
+    engine = PolicyEngine(
+        _policy(
+            reply_budget={
+                "enabled": True,
+                "targets": {"short_take": 380},
+                "hardMaxChars": 560,
+            }
+        ),
+        workspace=tmp_path,
+    )
+
+    class _Adapter:
+        def policy_engine(self) -> PolicyEngine:
+            return engine
+
+    captured: dict[str, object] = {}
+
+    class _Responder:
+        async def generate_participation_draft(
+            self, event: object, decision: object, **kwargs: object
+        ) -> str:
+            del event, kwargs
+            captured["reply_budget"] = getattr(decision, "reply_budget", None)
+            return "draft"
+
+    submission = _ParticipationSubmission(
+        responder=_Responder(),
+        writer_profile="participation_writer",
+        policy_adapter=_Adapter(),
+    )
+    await submission.generate_draft(
+        opportunity=_opportunity("m1"),
+        decision=COMMENT,
+        context={"messages": []},
+    )
+
+    budget = captured["reply_budget"]
+    assert isinstance(budget, dict)
+    assert budget["enabled"] is True
+    assert budget["hard_max_chars"] == 560
 
 
 def test_writer_transcript_keeps_selected_target_when_context_exceeds_limit() -> None:

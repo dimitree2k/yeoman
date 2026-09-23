@@ -1415,6 +1415,11 @@ class _ParticipationSubmission:
                 str(getattr(opportunity, "channel", "")),
                 str(getattr(opportunity, "chat_id", "")),
             ),
+            reply_budget=_participation_reply_budget(
+                self._policy_adapter,
+                str(getattr(opportunity, "channel", "")),
+                str(getattr(opportunity, "chat_id", "")),
+            ),
         )
         writer_context = dict(context or {})
         writer_context["target_message_id"] = getattr(
@@ -1531,13 +1536,47 @@ def _participation_persona_text(
         return None
 
 
+def _participation_reply_budget(
+    policy_adapter: object | None, channel: str, chat_id: str
+) -> dict[str, object]:
+    """Reply-budget policy for one participation draft, resolved like a reply's.
+
+    An unsolicited comment is held to the same per-chat budget as a direct answer.
+    Resolution is fail-safe: a missing adapter, engine or budget leaves the draft
+    unconstrained instead of costing the chat its comment.
+    """
+    provider = getattr(policy_adapter, "policy_engine", None)
+    if not callable(provider):
+        return {}
+    try:
+        engine = provider()
+        if engine is None:
+            return {}
+        resolved = engine.resolve_policy(channel, chat_id)
+        budget = getattr(resolved, "reply_budget", None)
+        return dict(budget) if isinstance(budget, dict) else {}
+    except Exception as exc:  # noqa: BLE001 - an unreadable budget must not lose a draft
+        logger.warning(
+            "participation reply budget resolution failed chat={} error_type={}",
+            str(chat_id)[:24],
+            type(exc).__name__,
+        )
+        return {}
+
+
 def _participation_event(
-    opportunity: object, decision: object, *, persona_text: str | None = None
+    opportunity: object,
+    decision: object,
+    *,
+    persona_text: str | None = None,
+    reply_budget: dict[str, object] | None = None,
 ) -> tuple[object, object]:
     """Build the synthetic inbound event and policy decision for one draft.
 
     The event carries the admitted target only: no task, thread or turn identity, and
-    its allowed tool set is empty. Direct requests never come through here.
+    its allowed tool set is empty. Direct requests never come through here. The chat's
+    reply budget travels with the decision so the draft path can hold the comment to
+    the same length a direct reply would get.
     """
     from datetime import UTC, datetime
 
@@ -1560,6 +1599,7 @@ def _participation_event(
         allowed_tools=frozenset(),
         reason="participation_draft_only",
         persona_text=persona_text,
+        reply_budget=dict(reply_budget or {}),
     )
     return event, policy_decision
 
