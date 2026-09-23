@@ -163,6 +163,12 @@ five-round subagent workflows are not used automatically here.
 - Use three test tiers: targeted RED/GREEN checks while editing; the related
   suite once at task completion; the full suite once at final handoff. Do not
   rerun an unchanged suite after every agent message.
+- During iteration, run Ruff on changed files and Mypy only on affected
+  strict targets (or where the plan explicitly requires it). Run broader
+  Ruff/Mypy checks once at the applicable plan/final gate. After a failure,
+  rerun only the failed or affected check; do not repeat passing lint/type
+  checks after unrelated edits or agent messages unless later changes could
+  invalidate them.
 - Use a 360-second hard timeout for targeted and related test suites; keep
   the full-suite timeout at 1200 seconds. A longer rerun after a timeout
   needs explicit owner authorization; do not silently retry.
