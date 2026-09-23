@@ -101,6 +101,7 @@ class Orchestrator:
         service_effects: object | None = None,
         forward_target_resolver: ForwardTargetResolver | None = None,
         forward_source_lookup: ForwardSourceLookup | None = None,
+        short_reply_reactor: object | None = None,
     ) -> None:
         layers: list[Middleware] = [
             NormalizationMiddleware(),
@@ -127,7 +128,10 @@ class Orchestrator:
                 target_resolver=forward_target_resolver,
                 source_lookup=forward_source_lookup,
             ),
-            ImplicitBotAddressMiddleware(session_manager=session_manager),
+            ImplicitBotAddressMiddleware(
+                session_manager=session_manager,
+                short_reply_reactor=short_reply_reactor,  # type: ignore[arg-type]
+            ),
             ReplyBudgetMiddleware(),
         ])
         if bus is not None and speakup_approval_store is not None and speakup_log is not None and security is not None:
