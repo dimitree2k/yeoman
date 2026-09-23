@@ -102,15 +102,19 @@ class ImplicitBotAddressMiddleware:
             state_raw.get("address_mode") if isinstance(state_raw, dict) else ""
         )
         if state_mode == "reply_ack":
-            self._react_or_silence_bait(ctx, emoji=reaction_for_reply_ack(str(event.content or "")))
+            self._react_or_silence_bait(
+                ctx,
+                emoji=reaction_for_reply_ack(str(event.content or "")),
+                reason="reply_ack",
+            )
             return
 
         if state_mode == "group_member_bait":
-            self._react_or_silence_bait(ctx, emoji="🙄")
+            self._react_or_silence_bait(ctx, emoji="🙄", reason="group_member_bait")
             return
 
         if state_mode == "low_content_reply":
-            self._react_or_silence_bait(ctx, emoji="👀")
+            self._react_or_silence_bait(ctx, emoji="👀", reason="low_content_reply")
             return
 
         if not decision.accept_message or decision.should_respond:
@@ -157,6 +161,7 @@ class ImplicitBotAddressMiddleware:
                         emoji=reaction_for_name_mention(content),
                         participant_jid=event.reaction_participant_jid,
                         origin=SYSTEM_ORIGIN,
+                        reason="name_mention",
                     )
                 )
                 ctx.metric("implicit_bot_address_reaction", labels=(("channel", event.channel),))
@@ -203,7 +208,7 @@ class ImplicitBotAddressMiddleware:
             )
         ctx.metric("implicit_bot_address_reply", labels=(("channel", ctx.event.channel),))
 
-    def _react_or_silence_bait(self, ctx: PipelineContext, *, emoji: str) -> None:
+    def _react_or_silence_bait(self, ctx: PipelineContext, *, emoji: str, reason: str) -> None:
         if self._bait_cooldown_active(ctx):
             self._set_conversation_state_mode(ctx, "bait_cooldown", preferred_action="silence")
             ctx.metric("implicit_bot_address_bait_cooldown", labels=(("channel", ctx.event.channel),))
@@ -220,6 +225,7 @@ class ImplicitBotAddressMiddleware:
                     emoji=emoji,
                     participant_jid=event.reaction_participant_jid,
                     origin=SYSTEM_ORIGIN,
+                    reason=reason,
                 )
             )
             ctx.metric("implicit_bot_address_reaction", labels=(("channel", event.channel),))

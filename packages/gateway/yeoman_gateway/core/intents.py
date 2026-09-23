@@ -82,6 +82,8 @@ class SendReactionIntent:
     #: "model" for an emoji the language model chose - it must be one the owner approved -
     #: or "system" for a confirmation the gateway decides itself.
     origin: ReactionOrigin = MODEL_ORIGIN
+    #: Why this reaction exists. Stored on the effect for diagnosis; never sent to chat.
+    reason: str = ""
 
 
 type OrchestratorIntent = (

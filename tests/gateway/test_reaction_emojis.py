@@ -330,3 +330,16 @@ def test_a_provider_message_id_is_read_from_the_bridge_envelope() -> None:
     ) == {"provider_message_id": "M2"}
     assert _receipt_from_bridge({"sent": {"to": "x"}}) is None
     assert _receipt_from_bridge(None) is None
+
+
+def test_a_reaction_payload_keeps_its_reason_and_reads_old_rows() -> None:
+    from yeoman_gateway.processing.models import ReactionPayload, payload_from_mapping
+
+    with_reason = ReactionPayload(message_id="m1", emoji="👍", reason="short_reply")
+    assert with_reason.to_dict()["reason"] == "short_reply"
+    assert payload_from_mapping(with_reason.to_dict()) == with_reason
+
+    old_row = {"kind": "reaction", "message_id": "m1", "emoji": "👍"}
+    restored = payload_from_mapping(old_row)
+    assert restored.reason is None
+    assert "reason" not in ReactionPayload(message_id="m1", emoji="👍").to_dict()

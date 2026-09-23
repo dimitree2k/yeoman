@@ -7,7 +7,21 @@ here so neither caller has to grow its own copy of it.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class RouteReply:
+    """One completion with the evidence needed to talk about its cost."""
+
+    content: str
+    usage: Mapping[str, int] = field(default_factory=dict)
+    model: str = ""
+    latency_ms: int = 0
+    finish_reason: str = ""
 
 
 class RouteUnavailableError(RuntimeError):
@@ -48,6 +62,39 @@ class RouteClient:
             extra_headers=provider_cfg.extra_headers,
         )
 
+    async def chat_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        response_format: dict[str, Any] | None = None,
+        max_retries: int | None = None,
+    ) -> RouteReply:
+        """Completion plus provider usage/status; None preserves the global retry default."""
+        started = time.monotonic()
+        response = await self._provider.chat(
+            messages=messages,
+            tools=None,
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            response_format=response_format,
+            max_retries=max_retries,
+        )
+        raw_usage = getattr(response, "usage", None) or {}
+        usage = {
+            str(key): int(value)
+            for key, value in dict(raw_usage).items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        return RouteReply(
+            content=str(getattr(response, "content", "") or ""),
+            usage=usage,
+            model=self.model,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            finish_reason=str(getattr(response, "finish_reason", "") or ""),
+        )
+
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -56,15 +103,10 @@ class RouteClient:
         response_format: dict[str, Any] | None = None,
     ) -> str:
         """One completion, deterministically, with the caller's token ceiling."""
-        response = await self._provider.chat(
-            messages=messages,
-            tools=None,
-            model=self.model,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            response_format=response_format,
+        reply = await self.chat_with_usage(
+            messages, max_tokens=max_tokens, response_format=response_format
         )
-        return str(getattr(response, "content", "") or "")
+        return reply.content
 
 
 def resolve_route_key(config: Any, *candidates: str) -> str:
@@ -77,4 +119,4 @@ def resolve_route_key(config: Any, *candidates: str) -> str:
     return str(candidates[-1] or "")
 
 
-__all__ = ["RouteClient", "RouteUnavailableError", "resolve_route_key"]
+__all__ = ["RouteClient", "RouteReply", "RouteUnavailableError", "resolve_route_key"]

@@ -183,6 +183,8 @@ class ReactionPayload:
     message_id: str
     emoji: str
     participant_jid: str | None = None
+    #: Diagnostic provenance of the choice; the transport never sees it.
+    reason: str | None = None
 
     kind: ClassVar[str] = "reaction"
 
@@ -190,6 +192,8 @@ class ReactionPayload:
         data = {"kind": self.kind, "message_id": self.message_id, "emoji": self.emoji}
         if self.participant_jid:
             data["participant_jid"] = self.participant_jid
+        if self.reason:
+            data["reason"] = self.reason
         return data
 
 
@@ -280,6 +284,7 @@ def payload_from_mapping(data: Mapping[str, Any]) -> EffectPayload:
                 message_id=str(data.get("message_id") or ""),
                 emoji=str(data.get("emoji") or ""),
                 participant_jid=_opt_str(data.get("participant_jid")),
+                reason=_opt_str(data.get("reason")),
             )
         case "delete":
             return DeletePayload(message_id=str(data.get("message_id") or ""))

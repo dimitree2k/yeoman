@@ -888,6 +888,7 @@ class IntentEffectRouter:
                 message_id=intent.message_id,
                 emoji=emoji,
                 participant_jid=intent.participant_jid,
+                reason=str(intent.reason or "") or None,
             ),
             operation_key=f"reaction:{intent.channel}:{intent.chat_id}:{intent.message_id}:{emoji}",
             trace_id=intent.message_id,

@@ -1025,6 +1025,22 @@ async def test_new_confirmation_survives_the_manual_boundary(runtime) -> None:
     assert runtime.transport.sent == ["👍"]
 
 
+@pytest.mark.asyncio
+async def test_a_reaction_effect_stores_its_reason(runtime) -> None:
+    from yeoman_gateway.core.intents import SendReactionIntent
+
+    _admit(runtime, message_id="m1")
+    assert await runtime.router.submit_reaction(
+        SendReactionIntent(
+            channel="whatsapp", chat_id=CHAT, message_id="m1", emoji="👍", reason="reply_ack"
+        ),
+        principal="orderer@s.whatsapp.net",
+    )
+    effect = runtime.store.get_effect(runtime.store.list_effects()[0].effect_id)
+    assert effect is not None and effect.payload is not None
+    assert effect.payload.reason == "reply_ack"
+
+
 # the ambient brake ---------------------------------------------------------------------
 
 
@@ -1274,3 +1290,38 @@ def test_the_journal_keeps_the_reply_target() -> None:
     assert payload["reply_to_message_id"] == "TARGET-1"
     assert payload["reply_to_bot"] is True
     assert payload["reply_to_text"] == "die Antwort davor"
+
+
+def test_the_routing_line_separates_respond_from_reaction(runtime) -> None:
+    from loguru import logger
+
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        _admit(runtime, message_id="m1", content="Wie wird morgen das Wetter?")
+    finally:
+        logger.remove(sink)
+
+    lines = [record for record in records if "routing_decision" in record]
+    assert lines, records
+    assert "respond=true" in lines[0], lines[0]
+    assert "react_action=false" in lines[0], lines[0]
+
+
+def test_the_routing_line_shows_a_withdrawn_answer_as_reaction(tmp_path) -> None:
+    from loguru import logger
+
+    runtime = _make_runtime(tmp_path / "react", chats=(CHAT,))
+    records: list[str] = []
+    sink = logger.add(lambda message: records.append(message.record["message"]), level="INFO")
+    try:
+        runtime.config.processing.reply_actions = {f"whatsapp:{CHAT}": "react"}
+        _admit(runtime, message_id="m1", content="Arvid, was hältst du davon?")
+    finally:
+        logger.remove(sink)
+        runtime.store.close()
+
+    lines = [record for record in records if "routing_decision" in record]
+    assert lines, records
+    assert "outcome=observe" in lines[0], lines[0]
+    assert "respond=true" in lines[0] and "react_action=true" in lines[0], lines[0]
