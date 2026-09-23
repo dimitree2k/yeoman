@@ -151,7 +151,9 @@ TYPING_MAX_DURATION_SECONDS = 45.0
 SEND_CONNECT_WAIT_SECONDS = 8.0
 SEND_MAX_ATTEMPTS = 3
 SEND_RETRY_BASE_DELAY_SECONDS = 0.6
-BRIDGE_ACK_QUEUE_MAXSIZE = 128
+BRIDGE_ACK_QUEUE_MAXSIZE = 2048
+#: A long outage leaves the bridge with a large unacknowledged backlog; the replay must be
+#: able to journal and queue it in one pass instead of closing the intake on queue pressure.
 BRIDGE_ACK_TIMEOUT_SECONDS = 20.0
 # A single sender/chat must not be able to retain an unbounded acknowledged burst while
 # the legacy debounce timer is repeatedly reset.  Oversized/overflowing buckets are

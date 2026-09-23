@@ -243,7 +243,68 @@ def test_replay_with_new_bridge_observation_is_idempotent_after_ack(tmp_path: Pa
     store.close()
 
 
-def test_append_failure_emits_no_ack_and_invokes_no_downstream(tmp_path: Path) -> None:
+def test_replay_with_a_shifted_source_timestamp_is_idempotent(tmp_path: Path) -> None:
+    """A replayed frame whose only difference is the source timestamp is the same event.
+
+    WhatsApp/the bridge can revise the message timestamp of an already journaled message;
+    the journal row stays authoritative (first write wins) and the replay must be
+    acknowledged instead of failing the intake closed.  A real content change still fails
+    closed (see ``test_conflicting_replay_fails_closed_without_ack_or_downstream``).
+    """
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = _channel(store)
+    acknowledgements: list[dict] = []
+    published: list[str] = []
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del timeout_seconds, kwargs
+        assert command_type == "ack_event"
+        acknowledgements.append(payload)
+        return {"acknowledged": True}
+
+    async def publish(event):
+        published.append(event.message_id)
+
+    channel._send_command = ack  # type: ignore[method-assign]
+    channel._publish_event = publish  # type: ignore[method-assign]
+
+    base = {
+        "chatJid": CHAT,
+        "messageId": "message-retimestamp",
+        "senderId": "4915@s.whatsapp.net",
+        "text": "same text, revised timestamp",
+        "timestamp": 1_700_000_000,
+    }
+    first = _frame(
+        "message", base, event_id="event-retimestamp", event_key="wa:account-a:message-retimestamp"
+    )
+    # Same message, same id, same text - but the bridge now reports a later source time.
+    shifted = _frame(
+        "message",
+        {**base, "timestamp": 1_700_000_005},
+        event_id="event-retimestamp",
+        event_key="wa:account-a:message-retimestamp",
+        ts=NOW + 50,
+        observed_at=NOW + 50,
+    )
+
+    asyncio.run(channel._handle_bridge_message(first))
+    _drain_inbound(channel)
+    asyncio.run(channel._handle_bridge_message(shifted))
+    _drain_inbound(channel)
+
+    assert acknowledgements == [{"eventId": "event-retimestamp"}] * 2
+    assert published == ["message-retimestamp"]
+    assert store.count_events() == 1
+    event = store.get_event("event-retimestamp")
+    assert event is not None
+    assert event.payload is not None
+    # The first observation stays authoritative.
+    assert event.payload["occurred_ms"] == 1_700_000_000 * 1000
+    store.close()
+
+
+
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
     downstream: list[str] = []

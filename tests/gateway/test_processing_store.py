@@ -46,6 +46,52 @@ def test_event_payload_conflict_is_rejected(tmp_path):
     db.close()
 
 
+def test_replay_differing_only_in_timing_keeps_the_first_row(tmp_path):
+    """A replayed provider event with revised timing is the same event, not a conflict.
+
+    Observed in production on 2026-09-23: the bridge re-reported an already journaled
+    WhatsApp message with a five-second `occurred_ms` shift, `append_event` raised
+    `JournalConflictError`, and the channel closed its intake on every start - a
+    seven-and-a-half-hour ingest outage.  The first write stays authoritative.
+    """
+    db = ProcessingStore(tmp_path / "processing.db")
+    base = {"kind": "message", "text": "same", "occurred_ms": 1_000, "observed_at_ms": 2_000}
+    assert (
+        db.append_event(event_key="wa:timing", event_id="e1", trace_id="tr1", payload=base)
+        == "e1"
+    )
+
+    replayed = {**base, "occurred_ms": 5_000, "observed_at_ms": 9_000}
+    assert (
+        db.append_event(event_key="wa:timing", event_id="e1", trace_id="tr1", payload=replayed)
+        == "e1"
+    )
+
+    assert len(db.get_lineage("tr1").events) == 1
+    stored = db.get_event("e1")
+    assert stored is not None and stored.payload is not None
+    assert stored.payload["occurred_ms"] == 1_000
+    db.close()
+
+
+def test_replay_with_timing_and_content_change_is_still_rejected(tmp_path):
+    db = ProcessingStore(tmp_path / "processing.db")
+    db.append_event(
+        event_key="wa:timing-content",
+        event_id="e1",
+        trace_id="tr1",
+        payload={"kind": "message", "text": "first", "occurred_ms": 1_000},
+    )
+    with pytest.raises(ValueError):
+        db.append_event(
+            event_key="wa:timing-content",
+            event_id="e1",
+            trace_id="tr1",
+            payload={"kind": "message", "text": "second", "occurred_ms": 5_000},
+        )
+    db.close()
+
+
 def test_event_metadata_conflict_is_rejected_even_when_payload_matches(tmp_path):
     db = ProcessingStore(tmp_path / "processing.db")
     payload = {

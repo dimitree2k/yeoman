@@ -27,6 +27,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
     CLAIMABLE_EFFECT_STATES,
@@ -108,6 +110,30 @@ def _canonical_event_value(value: Any) -> Any:
 
 def _event_payload_hash(payload: Any) -> str:
     return canonical_hash(_canonical_event_value(payload))
+
+
+#: Timing-only payload keys.  A replay that differs solely in these is the same event:
+#: the bridge can re-report an already journaled message with a revised source or
+#: observation timestamp (observed in production on 2026-09-23, where a five-second
+#: `occurred_ms` shift on an otherwise identical message wedged WhatsApp ingest).
+_TIMING_EVENT_PAYLOAD_KEYS = _VOLATILE_EVENT_PAYLOAD_KEYS | frozenset(
+    {"occurred_ms", "occurredAt", "timestamp", "ts"}
+)
+
+
+def _differs_only_in_timing(stored: Any, incoming: Any) -> bool:
+    """True when two payloads are equal apart from timing/observation fields."""
+    if not isinstance(stored, Mapping) or not isinstance(incoming, Mapping):
+        return False
+
+    def _stripped(value: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            str(key): _canonical_event_value(item)
+            for key, item in value.items()
+            if str(key) not in _TIMING_EVENT_PAYLOAD_KEYS
+        }
+
+    return _stripped(stored) == _stripped(incoming)
 
 
 _AUDIENCE_STATUSES = frozenset({"known", "author_only", "unknown"})
@@ -888,6 +914,19 @@ class ProcessingStore:
             if row["payload_json"] is None or (
                 existing_payload_hash == event.payload_hash and same_metadata
             ):
+                self._ensure_event_source_authority_connection(conn, event)
+                return str(row["event_id"])
+            if same_metadata and _differs_only_in_timing(
+                json.loads(row["payload_json"]), event.payload
+            ):
+                # Same provider identity, same content, revised timing: WhatsApp/the
+                # bridge can re-report an already journaled message with a shifted
+                # source/observation timestamp, and the replay must not fail the
+                # intake closed.  The first write stays authoritative.
+                logger.info(
+                    "canonical event {} replayed with revised timing; keeping the stored row",
+                    event.event_id,
+                )
                 self._ensure_event_source_authority_connection(conn, event)
                 return str(row["event_id"])
             raise JournalConflictError(
