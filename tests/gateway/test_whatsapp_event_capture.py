@@ -100,16 +100,25 @@ def test_message_is_committed_before_ack_archive_or_routing(tmp_path: Path) -> N
     store.close()
 
 
-def test_conflicting_replay_fails_closed_without_ack_or_downstream(tmp_path: Path) -> None:
+def test_conflicting_replay_is_acknowledged_without_overwriting_the_journal(tmp_path: Path) -> None:
+    """A changed payload under a known provider identity must not wedge the intake.
+
+    WhatsApp revises events under a stable provider identity (an edited message, a
+    reaction moved to another emoji) and the bridge replays its unacknowledged queue on
+    every subscribe.  Refusing to acknowledge such a frame left it in the queue forever,
+    so every start replayed it, closed the intake and killed WhatsApp ingest for a day
+    (2026-09-24/25).  The stored row stays authoritative, the frame is acknowledged, and
+    no second route is published.
+    """
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
-    acknowledgements: list[str] = []
+    acknowledgements: list[dict] = []
     published: list[str] = []
 
-    async def ack(*args, **kwargs):
-        del args, kwargs
-        acknowledgements.append("ack")
-        return {}
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del timeout_seconds, kwargs
+        acknowledgements.append(payload)
+        return {"acknowledged": True}
 
     async def publish(event):
         published.append(event.message_id)
@@ -143,10 +152,14 @@ def test_conflicting_replay_fails_closed_without_ack_or_downstream(tmp_path: Pat
         event_key="wa:account-a:message-2",
     )
     asyncio.run(channel._handle_bridge_message(conflicting))
+    _drain_inbound(channel)
 
-    assert acknowledgements == ["ack"]
+    assert acknowledgements == [{"eventId": "event-2"}] * 2
     assert published == ["message-2"]
     assert store.count_events() == 1
+    event = store.get_event("event-2")
+    assert event is not None and event.payload is not None
+    assert event.payload["text"] == "first"
     store.close()
 
 

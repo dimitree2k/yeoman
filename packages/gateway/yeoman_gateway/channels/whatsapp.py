@@ -32,6 +32,7 @@ from yeoman_gateway.implicit_addressing import (
 from yeoman_gateway.media.asr import ASRTranscriber
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.media.vision import VisionDescriber
+from yeoman_gateway.processing.models import JournalConflictError
 
 _VOLATILE_PROVIDER_FIELDS = frozenset(
     {
@@ -1214,11 +1215,33 @@ class WhatsAppChannel(BaseChannel):
                 account=account_id,
                 observed_at_ms=int(observed_at),
             )
-        except Exception as exc:
+        except JournalConflictError as exc:
+            # The provider identity is already journaled with different content: WhatsApp
+            # revised the event (an edited message, a reaction moved to another emoji) or
+            # the bridge re-derived its payload.  The stored row stays authoritative and
+            # the frame must still be acknowledged - a frame left unacknowledged is
+            # replayed on every subscribe, which wedged WhatsApp ingest for a day
+            # (2026-09-24/25).  Downstream deduplicates on the provider message id.
             logger.warning(
-                "WhatsApp canonical capture failed type={} error_type={}",
+                "WhatsApp canonical capture conflict type={} detail={} event_id={} "
+                "event_key={}; acknowledging the stored version",
+                kind,
+                str(exc)[:400],
+                str(locals().get("event_id", ""))[:64],
+                str(locals().get("event_key", ""))[:200],
+            )
+        except Exception as exc:
+            # A capture failure closes the whole intake and stops WhatsApp ingest until
+            # the next restart, so the reason must be visible without a debugger: log
+            # the exception text and the frame identity that produced it.
+            logger.warning(
+                "WhatsApp canonical capture failed type={} error_type={} detail={} "
+                "event_id={} event_key={}",
                 kind,
                 type(exc).__name__,
+                str(exc)[:400],
+                str(locals().get("event_id", ""))[:64],
+                str(locals().get("event_key", ""))[:200],
             )
             await self._forget_bridge_work(work)
             if self._ws is not None:

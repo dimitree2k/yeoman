@@ -1263,11 +1263,24 @@ class ProcessingStore:
                     ("occurred_at_ms", occurred),
                 ):
                     current = row[column]
-                    if current not in (None, "", 0) and value not in (None, "", 0):
-                        if str(current) != str(value):
-                            raise JournalConflictError(
-                                f"source authority {event_token!r}:{revision} conflicts on {column}"
-                            )
+                    if current in (None, "", 0) or value in (None, "", 0):
+                        continue
+                    if str(current) == str(value):
+                        continue
+                    if column == "occurred_at_ms":
+                        # A replayed frame may carry a revised source time for an
+                        # identity we already know (same tolerance as the payload
+                        # check in append_event).  The stored time stays authoritative.
+                        logger.info(
+                            "source authority {}:{} replayed with revised timing; "
+                            "keeping the stored row",
+                            event_token,
+                            revision,
+                        )
+                        continue
+                    raise JournalConflictError(
+                        f"source authority {event_token!r}:{revision} conflicts on {column}"
+                    )
                 if explicit_audience:
                     conn.execute(
                         """
