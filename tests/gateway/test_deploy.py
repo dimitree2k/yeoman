@@ -146,10 +146,14 @@ def test_whatsapp_qr_reconnect_script_resolves_repo_root() -> None:
 class _FakeSystemctl:
     """In-memory stand-in for ``systemctl --user`` on the deploy restart path."""
 
-    def __init__(self, *, available: bool = True, active=(), fail_restart=()) -> None:
+    def __init__(
+        self, *, available: bool = True, active=(), fail_restart=(), enabled=None
+    ) -> None:
         self.available = available
         self.active = set(active)
         self.fail_restart = set(fail_restart)
+        # Default: every installed unit is enabled, as on the live install.
+        self.enabled = set(active) if enabled is None else set(enabled)
         self.calls: list[list[str]] = []
 
     def is_available(self) -> bool:
@@ -159,8 +163,13 @@ class _FakeSystemctl:
         self.calls.append(["is-active", unit])
         return unit in self.active
 
+    def is_enabled(self, unit: str) -> bool:
+        self.calls.append(["is-enabled", unit])
+        return unit in self.enabled
+
     def restart(self, unit: str) -> bool:
         self.calls.append(["restart", unit])
+        self.enabled.add(unit)
         if unit in self.fail_restart:
             return False
         self.active.add(unit)
@@ -170,6 +179,7 @@ class _FakeSystemctl:
         self.calls.append(["stop", unit])
         self.active.discard(unit)
         return True
+
 
     def actions(self, verb: str) -> list[str]:
         return [call[1] for call in self.calls if call[0] == verb]
@@ -293,3 +303,33 @@ def test_overseer_stopped_for_reinstall_comes_back_under_systemd(monkeypatch) ->
     assert systemctl.actions("restart") == [unit]
     assert systemctl.is_active(unit) is True
     assert cli_calls == []
+
+
+def test_enabled_but_down_unit_is_started_not_skipped(monkeypatch, capsys) -> None:
+    """A deploy must not report "ok" and leave an enabled service stopped.
+
+    Seen live: the overseer unit was inactive when a deploy started, so the restart
+    step skipped it and the whole supervisor stayed down.
+    """
+    from yeoman_gateway.cli import deploy_commands
+
+    unit = "yeoman-overseer.service"
+    systemctl = _FakeSystemctl(active=set(), enabled={unit})
+
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    assert systemctl.actions("restart") == [unit]
+    assert systemctl.is_active(unit) is True
+    assert "started" in capsys.readouterr().out
+
+
+def test_disabled_unit_is_left_alone(monkeypatch, capsys) -> None:
+    """An operator who disabled a unit must not have it silently resurrected."""
+    from yeoman_gateway.cli import deploy_commands
+
+    systemctl = _FakeSystemctl(active=set(), enabled=set())
+
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    assert systemctl.actions("restart") == []
+    assert "not enabled" in capsys.readouterr().out

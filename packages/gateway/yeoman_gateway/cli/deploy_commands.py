@@ -208,18 +208,16 @@ def _restart_running_services(
         stopped_before_reinstall = name == "overseer" and overseer_was_running
 
         if use_units:
-            # A service worth restarting is either live under systemd or one we just
-            # took down ourselves - never one that was already absent.
+            # Restart what systemd had live, plus anything this deploy took down on
+            # purpose. A unit that is enabled but down was meant to run, so the deploy
+            # raises it rather than leaving a service stopped behind an "ok".
             if control.is_active(unit) or stopped_before_reinstall:
-                console.print(f"  Restarting {name} ({unit})...")
-                if not control.restart(unit):
-                    console.print(
-                        f"  {name}: [red]systemctl restart failed[/red] — "
-                        f"{unit} is not active after restart"
-                    )
-                else:
-                    console.print(f"  {name}: restarted")
+                _reload_unit(control, name, unit, verb="Restarting")
                 continue
+            if control.is_enabled(unit):
+                _reload_unit(control, name, unit, verb="Starting")
+                continue
+            console.print(f"  {name}: unit not enabled (skipped)")
 
         # No systemd, or nothing of this service is running: process-managed path.
         if not (is_running or stopped_before_reinstall):
@@ -244,6 +242,17 @@ def _restart_running_services(
             console.print(f"  {name}: restarted")
         else:
             console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
+
+
+def _reload_unit(control: "Systemctl", name: str, unit: str, *, verb: str) -> None:
+    """Bring one unit back through systemd and report what actually happened."""
+    console.print(f"  {verb} {name} ({unit})...")
+    if not control.restart(unit):
+        console.print(
+            f"  {name}: [red]systemctl failed[/red] — {unit} is not active afterwards"
+        )
+    else:
+        console.print(f"  {name}: {'restarted' if verb == 'Restarting' else 'started'}")
 
 
 def _start_overseer_process(yeoman_bin: str) -> None:

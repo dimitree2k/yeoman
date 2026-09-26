@@ -58,6 +58,19 @@ class Systemctl:
             return False
         return proc.returncode == 0
 
+    def is_enabled(self, unit: str) -> bool:
+        """Whether the unit is meant to be running. False = not installed/disabled."""
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-enabled", "--quiet", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return False
+        return proc.returncode == 0
+
     def stop(self, unit: str) -> bool:
         """Stop the unit. Idempotent: an already-inactive unit counts as stopped."""
         try:
