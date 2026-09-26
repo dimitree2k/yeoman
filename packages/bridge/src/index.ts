@@ -54,7 +54,7 @@ const BRIDGE_TOKEN = (
 const MANIFEST_PATH = process.env.BRIDGE_MANIFEST_PATH || join(process.cwd(), 'bridge.manifest.json');
 const READ_RECEIPTS = parseBoolEnv(process.env.WHATSAPP_READ_RECEIPTS, true);
 const BRIDGE_OUTBOX_DIR = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir();
-const BRIDGE_MESSAGE_REFERENCE_DIR = process.env.BRIDGE_MESSAGE_REFERENCE_DIR || defaultMessageReferenceDir();
+const BRIDGE_MESSAGE_REFERENCE_DIR = defaultMessageReferenceDir();
 
 function loadManifestIdentity(path: string): { bridgeVersion: string; buildId: string } {
   try {

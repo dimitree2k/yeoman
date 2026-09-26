@@ -24,6 +24,11 @@ const DEFAULT_MAX_RECORD_BYTES = 256 * 1024;
 const RECORD_FILE_RE = /^[0-9a-f]{64}\.json$/;
 
 export function defaultMessageReferenceDir(): string {
+  // The override keeps a caller without an explicit `messageReferenceDir` - a test most
+  // of all - out of the live runtime store the real bridge writes to. An empty value
+  // means "unset", never "the working directory".
+  const override = (process.env.BRIDGE_MESSAGE_REFERENCE_DIR || '').trim();
+  if (override) return override;
   return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-message-references');
 }
 

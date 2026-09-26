@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -76,6 +76,34 @@ test('resolveParticipantJid falls back to remote JID in groups when participant 
 
   const resolved = resolveParticipantJid(msg, '491786127564-1611913127@g.us', true);
   assert.equal(resolved, '491786127564-1611913127@g.us');
+});
+
+test('a client without an explicit reference dir honours BRIDGE_MESSAGE_REFERENCE_DIR', async (t) => {
+  const previous = process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
+  const override = await mkdtemp(join(tmpdir(), 'yeoman-default-refdir-'));
+  t.after(async () => {
+    if (previous === undefined) delete process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
+    else process.env.BRIDGE_MESSAGE_REFERENCE_DIR = previous;
+    await rm(override, { recursive: true, force: true });
+  });
+  process.env.BRIDGE_MESSAGE_REFERENCE_DIR = override;
+
+  // Without the override this resolves to the live runtime store; an earlier run left
+  // six synthetic records there because exactly this client took the default path.
+  const client = new WhatsAppClient({
+    authDir: join(override, 'auth'),
+    onMessage: () => {},
+    onQR: () => {},
+    onStatus: () => {},
+    onError: () => {},
+  });
+  assert.equal((client as any).referenceStore.directory, override);
+  await (client as any).referenceStore.open();
+  assert.equal(
+    await (client as any).referenceStore.put('123@g.us', 'ENV-1', inboundMessage('ENV-1')),
+    true,
+  );
+  assert.ok((await readdir(override)).length > 0);
 });
 
 test('refreshLidCache keeps conflicting mappings blocked instead of overwriting', async () => {

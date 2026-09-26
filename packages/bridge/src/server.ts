@@ -171,7 +171,7 @@ export class BridgeServer {
     private readonly readReceipts: boolean,
     private readonly accountId = 'default',
     outboxDir = process.env.BRIDGE_OUTBOX_DIR || defaultBridgeOutboxDir(),
-    private readonly messageReferenceDir = process.env.BRIDGE_MESSAGE_REFERENCE_DIR || defaultMessageReferenceDir(),
+    private readonly messageReferenceDir = defaultMessageReferenceDir(),
   ) {
     this.outbox = new BridgeOutbox(outboxDir);
   }

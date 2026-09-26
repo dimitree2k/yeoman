@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
-import { MessageReferenceStore } from './message_reference_store.js';
+import { MessageReferenceStore, defaultMessageReferenceDir } from './message_reference_store.js';
 
 function message(conversation = 'hello') {
   return proto.WebMessageInfo.fromObject({
@@ -70,4 +70,26 @@ test('message reference directory and records are owner-only', async () => {
   const [record] = await readdir(root);
   assert.ok(record);
   assert.equal((await stat(join(root, record))).mode & 0o777, 0o600);
+});
+
+test('default message reference directory honours BRIDGE_MESSAGE_REFERENCE_DIR', async (t) => {
+  const previous = process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
+  const override = await mkdtemp(join(tmpdir(), 'yeoman-refdir-env-'));
+  t.after(() => {
+    if (previous === undefined) delete process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
+    else process.env.BRIDGE_MESSAGE_REFERENCE_DIR = previous;
+  });
+
+  // Without the override a bare WhatsAppClient writes into the live runtime store: an
+  // earlier bridge run left six synthetic records there for the test chat.
+  delete process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
+  const fallback = defaultMessageReferenceDir();
+  assert.equal(fallback, join(process.env.HOME ?? '', '.yeoman', 'data', 'bridge', 'whatsapp-message-references'));
+
+  process.env.BRIDGE_MESSAGE_REFERENCE_DIR = override;
+  assert.equal(defaultMessageReferenceDir(), override);
+
+  // An empty value means "unset" and must not resolve to the working directory.
+  process.env.BRIDGE_MESSAGE_REFERENCE_DIR = '';
+  assert.equal(defaultMessageReferenceDir(), fallback);
 });

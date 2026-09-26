@@ -8,7 +8,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
-    "test": "npm run build && node --test dist/**/*.test.js"
+    "test": "npm run build && BRIDGE_MESSAGE_REFERENCE_DIR=\"${TMPDIR:-/tmp}/yeoman-bridge-test-references\" node --test dist/**/*.test.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc13",
