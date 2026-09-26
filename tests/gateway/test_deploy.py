@@ -166,6 +166,11 @@ class _FakeSystemctl:
         self.active.add(unit)
         return True
 
+    def stop(self, unit: str) -> bool:
+        self.calls.append(["stop", unit])
+        self.active.discard(unit)
+        return True
+
     def actions(self, verb: str) -> list[str]:
         return [call[1] for call in self.calls if call[0] == verb]
 
@@ -256,3 +261,35 @@ def test_failed_restart_is_reported_without_claiming_success(monkeypatch, capsys
     printed = capsys.readouterr().out
     assert "bridge" in printed
     assert "failed" in printed.lower()
+
+
+def test_overseer_stopped_for_reinstall_comes_back_under_systemd(monkeypatch) -> None:
+    """A CLI-started overseer next to an active unit leaves systemd blind to it.
+
+    That is not a theoretical worry: the first deploy with the systemd-aware restart
+    fell back to ``yeoman overseer start`` while the unit was stopped for the
+    reinstall, and the service then ran unmanaged until the unit was started by hand.
+    """
+    from yeoman_gateway.cli import deploy_commands
+
+    unit = "yeoman-overseer.service"
+    systemctl = _FakeSystemctl(active={unit})
+
+    # Step 4 of the deploy: take the overseer down before the tool env is replaced.
+    owed = deploy_commands._stop_overseer_for_reinstall(systemctl=systemctl)
+    assert owed is True
+    assert systemctl.actions("stop") == [unit]
+    assert systemctl.is_active(unit) is False
+
+    # Step 6: the owed restart goes back through systemd, not through the CLI.
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_commands.subprocess,
+        "run",
+        lambda cmd, **kwargs: cli_calls.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    deploy_commands._restart_running_services(True, systemctl=systemctl)
+
+    assert systemctl.actions("restart") == [unit]
+    assert systemctl.is_active(unit) is True
+    assert cli_calls == []

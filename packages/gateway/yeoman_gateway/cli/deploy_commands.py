@@ -116,15 +116,7 @@ def deploy(
     # Step 4: Stop overseer before reinstall (binary gets replaced)
     _overseer_was_running = False
     if not dry_run:
-        from yeoman_gateway.cli.systemd_control import Systemctl
-
-        _control = Systemctl()
-        if _control.is_available() and _control.is_active("yeoman-overseer.service"):
-            _overseer_was_running = True
-            subprocess.run(
-                ["systemctl", "--user", "stop", "yeoman-overseer.service"],
-                capture_output=True,
-            )
+        _overseer_was_running = _stop_overseer_for_reinstall()
 
     # Step 5: uv tool install
     console.print("Reinstalling tool env (uv tool install)...")
@@ -153,6 +145,30 @@ def deploy(
         _verify_deploy(bridge_src, bridge_dist)
 
     console.print("\n[bold green]yeoman deploy — ok[/bold green]")
+
+
+def _stop_overseer_for_reinstall(*, systemctl: "Systemctl | None" = None) -> bool:
+    """Take the overseer down before ``uv tool install`` replaces its files.
+
+    Returns True when a restart is owed. A systemd-managed install stops the unit so
+    systemd brings it back; a process-managed one is stopped here and started again by
+    :func:`_restart_running_services`. Either way the restart goes through the same
+    supervisor that owns the process - a CLI-started overseer next to an active unit
+    would leave systemd blind to a running service.
+    """
+    from yeoman_gateway.cli.systemd_control import Systemctl
+
+    control = systemctl if systemctl is not None else Systemctl()
+    if control.is_available() and control.is_active("yeoman-overseer.service"):
+        if not control.stop("yeoman-overseer.service"):
+            console.print("[yellow]Warning:[/yellow] could not stop yeoman-overseer.service")
+        return True
+
+    yeoman_bin = shutil.which("yeoman")
+    if yeoman_bin is None:
+        return False
+    result = subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, text=True)
+    return result.returncode == 0
 
 
 #: Services a deploy restarts, in restart order. The order is load-bearing twice
@@ -185,24 +201,28 @@ def _restart_running_services(
     use_units = control.is_available()
 
     for name, unit, pid_file in _DEPLOY_SERVICES:
-        if use_units and control.is_active(unit):
-            console.print(f"  Restarting {name} ({unit})...")
-            if not control.restart(unit):
-                console.print(
-                    f"  {name}: [red]systemctl restart failed[/red] — "
-                    f"{unit} is not active after restart"
-                )
-            else:
-                console.print(f"  {name}: restarted")
-            continue
-
-        # No systemd, or the unit is not active: fall back to the process-managed path.
         pid = read_pid_file(run_dir / pid_file)
+        # Process-managed state. The overseer was stopped on purpose before the tool
+        # env was replaced, so that restart is still owed.
         is_running = bool(pid and pid_alive(pid))
-        if not is_running and name == "overseer":
-            # Stopped on purpose before the tool env was replaced.
-            is_running = overseer_was_running
-        if not is_running:
+        stopped_before_reinstall = name == "overseer" and overseer_was_running
+
+        if use_units:
+            # A service worth restarting is either live under systemd or one we just
+            # took down ourselves - never one that was already absent.
+            if control.is_active(unit) or stopped_before_reinstall:
+                console.print(f"  Restarting {name} ({unit})...")
+                if not control.restart(unit):
+                    console.print(
+                        f"  {name}: [red]systemctl restart failed[/red] — "
+                        f"{unit} is not active after restart"
+                    )
+                else:
+                    console.print(f"  {name}: restarted")
+                continue
+
+        # No systemd, or nothing of this service is running: process-managed path.
+        if not (is_running or stopped_before_reinstall):
             console.print(f"  {name}: not running (skipped)")
             continue
 
@@ -210,20 +230,7 @@ def _restart_running_services(
             console.print(f"  {name}: [yellow]yeoman not on PATH — skipped[/yellow]")
             continue
         if name == "overseer":
-            subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, check=False)
-            time.sleep(0.5)
-            proc = subprocess.Popen(
-                [yeoman_bin, "overseer", "start"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            time.sleep(1.0)
-            if proc.poll() is not None:
-                console.print(f"  {name}: [red]restart failed[/red] (exited immediately)")
-            else:
-                console.print(f"  {name}: restarted (PID {proc.pid})")
+            _start_overseer_process(yeoman_bin)
             continue
 
         restart_cmd = (
@@ -237,6 +244,24 @@ def _restart_running_services(
             console.print(f"  {name}: restarted")
         else:
             console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
+
+
+def _start_overseer_process(yeoman_bin: str) -> None:
+    """Process-managed fallback: the CLI starts the overseer without systemd."""
+    subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, check=False)
+    time.sleep(0.5)
+    proc = subprocess.Popen(
+        [yeoman_bin, "overseer", "start"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    time.sleep(1.0)
+    if proc.poll() is not None:
+        console.print("  overseer: [red]restart failed[/red] (exited immediately)")
+    else:
+        console.print(f"  overseer: restarted (PID {proc.pid})")
 
 
 def _report_running_services(*, systemctl: "Systemctl | None" = None) -> None:
