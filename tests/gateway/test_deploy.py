@@ -1,7 +1,9 @@
 """Tests for yeoman deploy utilities."""
 
-from pathlib import Path
 import importlib.util
+import os
+import subprocess
+from pathlib import Path
 
 
 def _make_bridge(tmp_path: Path) -> Path:
@@ -118,10 +120,6 @@ class TestFindSourceRepo:
         assert find_source_repo() is None
 
 
-import os
-import subprocess
-
-
 def test_deploy_dry_run_exits_zero() -> None:
     """Integration test: yeoman deploy --dry-run should succeed."""
     result = subprocess.run(
@@ -143,3 +141,118 @@ def test_whatsapp_qr_reconnect_script_resolves_repo_root() -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.repo_root() == repo
+
+
+class _FakeSystemctl:
+    """In-memory stand-in for ``systemctl --user`` on the deploy restart path."""
+
+    def __init__(self, *, available: bool = True, active=(), fail_restart=()) -> None:
+        self.available = available
+        self.active = set(active)
+        self.fail_restart = set(fail_restart)
+        self.calls: list[list[str]] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def is_active(self, unit: str) -> bool:
+        self.calls.append(["is-active", unit])
+        return unit in self.active
+
+    def restart(self, unit: str) -> bool:
+        self.calls.append(["restart", unit])
+        if unit in self.fail_restart:
+            return False
+        self.active.add(unit)
+        return True
+
+    def actions(self, verb: str) -> list[str]:
+        return [call[1] for call in self.calls if call[0] == verb]
+
+
+def test_restart_uses_systemd_when_the_units_are_active(monkeypatch) -> None:
+    """A systemd-managed install must be restarted through its own supervisor.
+
+    Deciding from ``run/*.pid`` skipped every service, because systemd units never
+    write those files - and the CLI fallback would have started a *second* process
+    next to the unit's own.
+    """
+    from yeoman_gateway.cli import deploy_commands
+
+    systemctl = _FakeSystemctl(active={
+        "yeoman-gateway.service",
+        "yeoman-bridge.service",
+        "yeoman-overseer.service",
+    })
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    assert systemctl.actions("restart") == [
+        "yeoman-gateway.service",
+        "yeoman-bridge.service",
+        "yeoman-overseer.service",
+    ]
+
+
+def test_bridge_is_restarted_after_the_gateway(monkeypatch) -> None:
+    """Order matters: the gateway refreshes the bridge cache on its way up."""
+    from yeoman_gateway.cli import deploy_commands
+
+    systemctl = _FakeSystemctl(active={"yeoman-gateway.service", "yeoman-bridge.service"})
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    restarted = systemctl.actions("restart")
+    assert restarted.index("yeoman-gateway.service") < restarted.index("yeoman-bridge.service")
+
+
+def test_inactive_unit_falls_back_to_the_pid_file_path(tmp_path, monkeypatch) -> None:
+    """Without an active unit nothing is started that systemd does not manage."""
+    from yeoman_gateway.cli import deploy_commands
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    systemctl = _FakeSystemctl(active=set())
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_commands.subprocess,
+        "run",
+        lambda cmd, **kwargs: cli_calls.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    assert systemctl.actions("restart") == []
+    assert cli_calls == []  # no pid file -> nothing to restart
+
+
+def test_missing_systemd_keeps_the_pid_file_path(tmp_path, monkeypatch) -> None:
+    from yeoman_gateway.cli import deploy_commands
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    systemctl = _FakeSystemctl(available=False)
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_commands.subprocess,
+        "run",
+        lambda cmd, **kwargs: cli_calls.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    assert systemctl.calls == []
+    assert cli_calls == []
+
+
+def test_failed_restart_is_reported_without_claiming_success(monkeypatch, capsys) -> None:
+    from yeoman_gateway.cli import deploy_commands
+
+    systemctl = _FakeSystemctl(
+        active={"yeoman-bridge.service"}, fail_restart={"yeoman-bridge.service"}
+    )
+    deploy_commands._restart_running_services(systemctl=systemctl)
+
+    printed = capsys.readouterr().out
+    assert "bridge" in printed
+    assert "failed" in printed.lower()

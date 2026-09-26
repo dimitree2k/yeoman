@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
 from yeoman_gateway.cli.core import app, console
 from yeoman_gateway.deploy import bridge_is_stale, find_source_repo, hash_bridge_sources
+
+if TYPE_CHECKING:
+    from yeoman_gateway.cli.systemd_control import Systemctl
 
 
 @app.command()
@@ -81,7 +86,23 @@ def deploy(
         stored = hash_file.read_text().strip()[:12] if hash_file.exists() else "?"
         console.print(f"  bridge: current (hash {stored})")
 
-    # Step 2: uv sync
+    # Step 2: refresh the bridge runtime the systemd unit starts from.
+    # Must happen before any restart: the unit loads var/cache/bridge directly and
+    # never calls ensure_runtime() itself.
+    if not dry_run:
+        try:
+            from yeoman_gateway.channels.whatsapp_runtime import WhatsAppRuntimeManager
+
+            runtime_dir = WhatsAppRuntimeManager().ensure_runtime()
+            console.print(f"  bridge runtime: {runtime_dir}")
+        except Exception as exc:  # noqa: BLE001 - deploy continues, restart follows
+            console.print(
+                f"  [yellow]bridge runtime refresh failed:[/yellow] {exc}\n"
+                "  The gateway refreshes it on start, so the bridge restart below "
+                "must wait for the gateway."
+            )
+
+    # Step 3: uv sync
     console.print("Syncing dev venv (uv sync)...")
     if not dry_run:
         result = subprocess.run([uv, "sync"], cwd=repo, capture_output=True, text=True)
@@ -92,21 +113,20 @@ def deploy(
     else:
         console.print("  venv: [yellow]would sync[/yellow]")
 
-    # Step 3: Stop overseer before reinstall (binary gets replaced)
+    # Step 4: Stop overseer before reinstall (binary gets replaced)
     _overseer_was_running = False
     if not dry_run:
-        unit_active = subprocess.run(
-            ["systemctl", "--user", "is-active", "yeoman-overseer.service"],
-            capture_output=True, text=True,
-        )
-        if unit_active.returncode == 0:
+        from yeoman_gateway.cli.systemd_control import Systemctl
+
+        _control = Systemctl()
+        if _control.is_available() and _control.is_active("yeoman-overseer.service"):
             _overseer_was_running = True
             subprocess.run(
                 ["systemctl", "--user", "stop", "yeoman-overseer.service"],
                 capture_output=True,
             )
 
-    # Step 4: uv tool install
+    # Step 5: uv tool install
     console.print("Reinstalling tool env (uv tool install)...")
     if not dry_run:
         result = subprocess.run(
@@ -122,111 +142,121 @@ def deploy(
     else:
         console.print("  tool env: [yellow]would reinstall[/yellow]")
 
-    # Step 4: Restart running services
+    # Step 6: Restart running services
     if not dry_run:
         _restart_running_services(_overseer_was_running)
     else:
         _report_running_services()
 
-    # Step 5: Post-deploy verification
+    # Step 7: Post-deploy verification
     if not dry_run:
         _verify_deploy(bridge_src, bridge_dist)
 
     console.print("\n[bold green]yeoman deploy — ok[/bold green]")
 
 
-def _restart_running_services(overseer_was_running: bool = False) -> None:
-    """Restart services that are currently running."""
+#: Services a deploy restarts, in restart order. The order is load-bearing twice
+#: over: the gateway refreshes the bridge runtime on its way up, so it goes first,
+#: and the overseer was stopped before the tool env was replaced, so it comes last.
+_DEPLOY_SERVICES = (
+    ("gateway", "yeoman-gateway.service", "gateway.pid"),
+    ("bridge", "yeoman-bridge.service", "whatsapp-bridge.pid"),
+    ("overseer", "yeoman-overseer.service", "overseer.pid"),
+)
+
+
+def _restart_running_services(
+    overseer_was_running: bool = False, *, systemctl: "Systemctl | None" = None
+) -> None:
+    """Restart every service that is running, through whatever supervises it.
+
+    A systemd-managed service is restarted through ``systemctl --user``, the same
+    primitive the overseer uses for its own repairs. Only when there is no systemd at
+    all does this fall back to the process-managed path.
+    """
     from yeoman_shared.utils.helpers import get_run_path
     from yeoman_shared.utils.process import pid_alive, read_pid_file
 
+    from yeoman_gateway.cli.systemd_control import Systemctl
+
+    control = systemctl if systemctl is not None else Systemctl()
     run_dir = get_run_path()
     yeoman_bin = shutil.which("yeoman")
-    if not yeoman_bin:
-        console.print("  [yellow]yeoman not on PATH — skipping service restarts[/yellow]")
-        return
+    use_units = control.is_available()
 
-    services = [
-        ("gateway", "gateway.pid", [yeoman_bin, "gateway", "restart"]),
-        ("bridge", "whatsapp-bridge.pid", [yeoman_bin, "channels", "bridge", "restart"]),
-        ("overseer", "overseer.pid", None),
-    ]
+    for name, unit, pid_file in _DEPLOY_SERVICES:
+        if use_units and control.is_active(unit):
+            console.print(f"  Restarting {name} ({unit})...")
+            if not control.restart(unit):
+                console.print(
+                    f"  {name}: [red]systemctl restart failed[/red] — "
+                    f"{unit} is not active after restart"
+                )
+            else:
+                console.print(f"  {name}: restarted")
+            continue
 
-    for name, pid_file, restart_cmd in services:
+        # No systemd, or the unit is not active: fall back to the process-managed path.
         pid = read_pid_file(run_dir / pid_file)
-        is_running = pid and pid_alive(pid)
-        # For overseer, also check if it was stopped pre-reinstall
+        is_running = bool(pid and pid_alive(pid))
         if not is_running and name == "overseer":
+            # Stopped on purpose before the tool env was replaced.
             is_running = overseer_was_running
         if not is_running:
             console.print(f"  {name}: not running (skipped)")
             continue
 
-        console.print(f"  Restarting {name}...")
+        if yeoman_bin is None:
+            console.print(f"  {name}: [yellow]yeoman not on PATH — skipped[/yellow]")
+            continue
         if name == "overseer":
-            # Prefer systemctl if the unit is enabled, otherwise fall back to CLI
-            unit_check = subprocess.run(
-                ["systemctl", "--user", "is-enabled", "yeoman-overseer.service"],
-                capture_output=True, text=True,
+            subprocess.run([yeoman_bin, "overseer", "stop"], capture_output=True, check=False)
+            time.sleep(0.5)
+            proc = subprocess.Popen(
+                [yeoman_bin, "overseer", "start"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
-            if unit_check.returncode == 0:
-                result = subprocess.run(
-                    ["systemctl", "--user", "restart", "yeoman-overseer.service"],
-                    capture_output=True, text=True,
-                )
-                if result.returncode == 0:
-                    # Read PID from systemd
-                    show = subprocess.run(
-                        ["systemctl", "--user", "show", "-p", "MainPID",
-                         "yeoman-overseer.service"],
-                        capture_output=True, text=True,
-                    )
-                    svc_pid = show.stdout.strip().split("=")[-1] if show.returncode == 0 else "?"
-                    console.print(f"  {name}: restarted (PID {svc_pid})")
-                else:
-                    console.print(
-                        f"  {name}: [red]systemctl restart failed[/red]"
-                        f" — {result.stderr[:200]}"
-                    )
+            time.sleep(1.0)
+            if proc.poll() is not None:
+                console.print(f"  {name}: [red]restart failed[/red] (exited immediately)")
             else:
-                subprocess.run(
-                    [yeoman_bin, "overseer", "stop"], capture_output=True, check=False,
-                )
-                import time
-                time.sleep(0.5)
-                proc = subprocess.Popen(
-                    [yeoman_bin, "overseer", "start"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                time.sleep(1.0)
-                if proc.poll() is not None:
-                    console.print(
-                        f"  {name}: [red]restart failed[/red] (exited immediately)"
-                    )
-                else:
-                    console.print(f"  {name}: restarted (PID {proc.pid})")
+                console.print(f"  {name}: restarted (PID {proc.pid})")
+            continue
+
+        restart_cmd = (
+            [yeoman_bin, "gateway", "restart"]
+            if name == "gateway"
+            else [yeoman_bin, "channels", "bridge", "restart"]
+        )
+        console.print(f"  Restarting {name}...")
+        result = subprocess.run(restart_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            console.print(f"  {name}: restarted")
         else:
-            result = subprocess.run(restart_cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                console.print(f"  {name}: restarted")
-            else:
-                console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
+            console.print(f"  {name}: [red]restart failed[/red] — {result.stderr[:200]}")
 
 
-def _report_running_services() -> None:
-    """Dry-run: report which services would be restarted."""
+def _report_running_services(*, systemctl: "Systemctl | None" = None) -> None:
+    """Dry-run: report which services a real deploy would restart."""
     from yeoman_shared.utils.helpers import get_run_path
     from yeoman_shared.utils.process import pid_alive, read_pid_file
 
+    from yeoman_gateway.cli.systemd_control import Systemctl
+
+    control = systemctl if systemctl is not None else Systemctl()
     run_dir = get_run_path()
-    for name, pid_file in [
-        ("gateway", "gateway.pid"),
-        ("bridge", "whatsapp-bridge.pid"),
-        ("overseer", "overseer.pid"),
+    use_units = control.is_available()
+    for name, unit, pid_file in [
+        ("gateway", "yeoman-gateway.service", "gateway.pid"),
+        ("bridge", "yeoman-bridge.service", "whatsapp-bridge.pid"),
+        ("overseer", "yeoman-overseer.service", "overseer.pid"),
     ]:
+        if use_units and control.is_active(unit):
+            console.print(f"  {name}: [yellow]would restart[/yellow] ({unit})")
+            continue
         pid = read_pid_file(run_dir / pid_file)
         if pid and pid_alive(pid):
             console.print(f"  {name}: [yellow]would restart[/yellow] (PID {pid})")
