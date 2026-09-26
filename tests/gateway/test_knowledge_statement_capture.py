@@ -8,6 +8,7 @@ the observation.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,105 @@ def test_batch_waits_for_quiescence_and_replay_creates_no_second_job(
     # A replay of the same window is idempotent: no second job, no second source set.
     harness.promote()
     assert len(harness.jobs()) == 1
+
+
+def test_forward_capture_chunks_large_chat_and_continues_to_another_chat(
+    tmp_path: Path,
+) -> None:
+    second_chat = 'another-group@g.us'
+    harness = CaptureHarness(
+        tmp_path,
+        idle_ms=IDLE,
+        batch_max=8,
+        max_waiting=64,
+        registry=Registry({
+            ('whatsapp', GROUP): [AUTHOR],
+            ('whatsapp', second_chat): [AUTHOR],
+        }),
+    )
+    try:
+        harness.activate()
+        expected_sources = []
+        for index in range(35):
+            expected_sources.append(
+                harness.observe(f'Bulk statement {index}.', message_id=f'bulk-{index:02d}')
+            )
+            harness.advance(1)
+        last_event = harness.observe('Second chat statement.', chat_id=second_chat, message_id='second-001')
+        expected_sources.append(last_event)
+        harness.advance(IDLE + 1)
+
+        report = harness.promote()
+
+        jobs = harness.jobs()
+        grouped_sources = [
+            source['event_id']
+            for job in jobs
+            for source in json.loads(str(job['sources_json']))
+        ]
+        assert report.jobs == 6
+        assert report.promoted_sources == 36
+        assert sorted(len(json.loads(str(job['sources_json']))) for job in jobs) == [1, 3, 8, 8, 8, 8]
+        assert sorted(grouped_sources) == sorted(expected_sources)
+        assert harness.producer.boundary()[1] == last_event
+    finally:
+        harness.close()
+
+
+def test_forward_capture_retries_partial_chunk_enqueue_without_losing_cursor(
+    tmp_path: Path,
+) -> None:
+    second_chat = 'another-group@g.us'
+    harness = CaptureHarness(
+        tmp_path,
+        idle_ms=IDLE,
+        batch_max=8,
+        max_waiting=2,
+        registry=Registry({
+            ('whatsapp', GROUP): [AUTHOR],
+            ('whatsapp', second_chat): [AUTHOR],
+        }),
+    )
+    try:
+        harness.activate()
+        first_sources = []
+        for index in range(17):
+            first_sources.append(
+                harness.observe(f'First chat statement {index}.', message_id=f'partial-{index:02d}')
+            )
+            harness.advance(1)
+        last_event = harness.observe('Second chat statement.', chat_id=second_chat, message_id='retry-001')
+        all_sources = [*first_sources, last_event]
+        harness.advance(IDLE + 1)
+        boundary = harness.producer.boundary()
+
+        report = harness.promote()
+
+        assert report.jobs == 2
+        assert harness.producer.boundary() == boundary
+        jobs = harness.jobs()
+        assert sorted(len(json.loads(str(job['sources_json']))) for job in jobs) == [1, 1, 8, 8]
+        assert sum(job['state'] == 'queued' for job in jobs) == 2
+        assert sum(job['state'] == 'skipped' for job in jobs) == 2
+
+        # Complete the first two chunks so the next pass can retry the overflow jobs.
+        harness.build_worker().run_due(now_ms=harness.now)
+        assert sum(job['state'] == 'done' for job in harness.jobs()) == 2
+
+        harness.promote()
+
+        jobs = harness.jobs()
+        grouped_sources = [
+            source['event_id']
+            for job in jobs
+            for source in json.loads(str(job['sources_json']))
+        ]
+        assert len(jobs) == 4, 'retries must reuse each chunk job id'
+        assert sorted(grouped_sources) == sorted(all_sources)
+        assert len(set(grouped_sources)) == len(grouped_sources)
+        assert harness.producer.boundary()[1] == last_event
+    finally:
+        harness.close()
 
 
 def test_the_forward_boundary_survives_a_restart_without_promoting_history(

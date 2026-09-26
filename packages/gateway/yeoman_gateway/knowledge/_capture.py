@@ -29,6 +29,7 @@ from typing import Any
 from loguru import logger
 
 from yeoman_gateway.knowledge.models import (
+    MAX_SOURCES_PER_STATEMENT,
     SourceRef,
     TrustedCaptureContext,
 )
@@ -451,7 +452,7 @@ class StatementCaptureProducer:
         self._processing = processing
         self._idle_ms = max(1, int(idle_ms))
         self._max_delay_ms = max(self._idle_ms, int(max_delay_ms))
-        self._batch_max = max(1, int(batch_max))
+        self._batch_max = min(MAX_SOURCES_PER_STATEMENT, max(1, int(batch_max)))
         self._max_waiting = max(1, int(max_waiting))
         self._window_limit = max(1, int(window_limit))
         self._extractor_version = str(extractor_version)
@@ -666,21 +667,23 @@ class StatementCaptureProducer:
         return bool(oldest) and now_ms - oldest >= self._max_delay_ms
 
     def _promote(self, batch: SourceBatch, *, report: CaptureReport, now_ms: int) -> bool:
-        """Queue one batch.  Returns False when the queue was full and nothing was queued."""
+        """Queue bounded chunks; leave the window unconsumed if any chunk cannot queue."""
         sources = collapse_provider_duplicates(batch.sources)
         if not sources:
             return True
-        refs = tuple(item.source for item in sources)
-        report.promoted_sources += len(refs)
-        result = self._enqueue(refs, scope_key=batch.scope_key, now_ms=now_ms)
-        state = str(getattr(result, "state", "") or "")
-        if state in ("queued", "running", "done"):
-            report.jobs += 1
-            return True
-        if state == "skipped":
-            self.overflows += 1
-            report.refuse(str(getattr(result, "reason", "") or "queue_full"))
-        return False
+        for start in range(0, len(sources), self._batch_max):
+            refs = tuple(item.source for item in sources[start : start + self._batch_max])
+            result = self._enqueue(refs, scope_key=batch.scope_key, now_ms=now_ms)
+            state = str(getattr(result, "state", "") or "")
+            if state in ("queued", "running", "done"):
+                report.jobs += 1
+                report.promoted_sources += len(refs)
+                continue
+            if state == "skipped":
+                self.overflows += 1
+                report.refuse(str(getattr(result, "reason", "") or "queue_full"))
+            return False
+        return True
 
     def _enqueue(self, refs: tuple[SourceRef, ...], *, scope_key: str, now_ms: int) -> Any:
         enqueue = getattr(self._knowledge, "enqueue_capture", None)
