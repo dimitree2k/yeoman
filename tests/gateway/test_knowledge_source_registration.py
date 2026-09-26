@@ -154,7 +154,23 @@ def test_registration_uses_the_real_event_time_not_the_wall_clock(tmp_path: Path
         issued = runtime.knowledge.knowledge_sources.verify_source_ref(event_id, 1)
         assert issued is not None and issued.occurred_at_ms == NOW
 
-        # Substituting the current time contradicts the immutable authority row.
+        # A replayed frame may carry a revised source time. Refusing it used to close the
+        # WhatsApp intake and killed ingest for 25 hours on 2026-09-24, so the stored time
+        # stays authoritative instead of raising.
+        runtime.store.upsert_event_source_authority(
+            source=SourceRef(
+                event_id=event_id,
+                revision=1,
+                channel="whatsapp",
+                chat_id=GROUP,
+                author_principal=SENDER,
+                occurred_at_ms=NOW + 60_000,
+            ),
+            audience={"status": "known", "members": [SENDER]},
+        )
+        assert _authority(runtime, event_id)["occurred_at_ms"] == NOW
+
+        # Tolerance covers the timing only: a different author is still a real conflict.
         with pytest.raises(JournalConflictError):
             runtime.store.upsert_event_source_authority(
                 source=SourceRef(
@@ -162,10 +178,9 @@ def test_registration_uses_the_real_event_time_not_the_wall_clock(tmp_path: Path
                     revision=1,
                     channel="whatsapp",
                     chat_id=GROUP,
-                    author_principal=SENDER,
-                    occurred_at_ms=NOW + 60_000,
+                    author_principal="499999999999",
+                    occurred_at_ms=NOW,
                 ),
-                audience={"status": "known", "members": [SENDER]},
             )
 
         # The canonical provenance registers cleanly and proves the audience.
