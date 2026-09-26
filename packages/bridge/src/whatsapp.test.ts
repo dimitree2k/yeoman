@@ -654,6 +654,7 @@ test('fatal persistence failure halts provider intake before another event enter
     );
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: (message) =>
         (server as any).trackProviderEvent((server as any).broadcastMessage(message)),
@@ -711,6 +712,7 @@ test('message handler forwards same provider identity conflicts to the outbox', 
     );
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: (message) =>
         (server as any).trackProviderEvent((server as any).broadcastMessage(message)),
@@ -754,6 +756,7 @@ test('stop waits for an admitted provider handler before returning', async () =>
     });
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: async () => {
         markCallbackStarted();
@@ -801,6 +804,7 @@ test('concurrent duplicate messages retry after the leading handler fails', asyn
     let callbacks = 0;
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: async () => {
         callbacks += 1;
@@ -845,6 +849,7 @@ test('pre-callback message failure clears dedupe state for redelivery', async ()
     let callbacks = 0;
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: async () => {
         callbacks += 1;
@@ -896,6 +901,7 @@ test('concurrent duplicate signals retry after the leading handler fails', async
     let callbacks = 0;
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       onMessage: () => {},
       onSignal: async () => {
         callbacks += 1;
@@ -958,6 +964,7 @@ test('registered duplicate message survives fatal pre-rename failure for restart
     let callbacks = 0;
     const client = new WhatsAppClient({
       authDir: root,
+      messageReferenceDir: root,
       readReceipts: false,
       onMessage: (message) => {
         callbacks += 1;
