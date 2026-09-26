@@ -580,6 +580,7 @@ the protocol version.
 | `yeoman agent` | Interactive chat |
 | `yeoman gateway` | Start all enabled channels |
 | `yeoman status` | Runtime status |
+| `yeoman deploy` | Build, install and restart from source. Restarts active systemd units through `systemctl --user`, refreshes the bridge runtime it starts from, and falls back to PID-file daemons only when there is no systemd. |
 | `yeoman env` | Show active launcher and Python environment |
 | `yeoman doctor` | Run health checks and report issues |
 | `yeoman a2a serve` | Run the standalone authenticated A2A relay |
