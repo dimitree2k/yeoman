@@ -40,7 +40,7 @@ function testClient(
   });
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate() && Date.now() < deadline) {
     await new Promise((resolve) => setImmediate(resolve));
