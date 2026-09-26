@@ -2149,17 +2149,32 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
+    let key = {
+      remoteJid: input.chatJid,
+      id: input.messageId,
+      fromMe: Boolean(input.fromMe),
+      participant: input.participantJid,
+    };
+    if (normalizeJid(input.chatJid).endsWith('@g.us')) {
+      const sourceKey = (await this.resolveQuotedMessage(input.chatJid, input.messageId))?.key;
+      const participant = normalizeJid(String(sourceKey?.participant || ''));
+      if (
+        normalizeJid(String(sourceKey?.remoteJid || '')) !== normalizeJid(input.chatJid) ||
+        sourceKey?.id !== input.messageId ||
+        typeof sourceKey?.fromMe !== 'boolean' ||
+        (!sourceKey.fromMe && (!participant || participant.endsWith('@g.us')))
+      ) {
+        throw new Error('group reaction target unavailable');
+      }
+      key = sourceKey;
+    }
+
     const sent = await this.sock.sendMessage(
       input.chatJid,
       {
         react: {
           text: input.emoji,
-          key: {
-            remoteJid: input.chatJid,
-            id: input.messageId,
-            fromMe: Boolean(input.fromMe),
-            participant: input.participantJid,
-          },
+          key,
         },
       },
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,

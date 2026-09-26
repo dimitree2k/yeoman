@@ -385,6 +385,131 @@ test('lookupMessage survives a store restart and reports a missing exact source'
   }
 });
 
+test('group reaction uses the exact retained source key', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-reaction-'));
+  try {
+    const chatJid = 'group@g.us';
+    const messageId = 'REACTION-SOURCE-1';
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    const source = proto.WebMessageInfo.fromObject({
+      key: {
+        remoteJid: chatJid,
+        id: messageId,
+        fromMe: false,
+        participant: 'sender@lid',
+      },
+      message: { conversation: 'source message' },
+    });
+    await (client as any).referenceStore.open();
+    assert.equal(await (client as any).referenceStore.put(chatJid, messageId, source), true);
+    const calls: unknown[][] = [];
+    (client as any).sock = {
+      sendMessage: async (...args: unknown[]) => {
+        calls.push(args);
+        return { key: { id: 'REACTION-OUT-1' } };
+      },
+    };
+    (client as any).connected = true;
+
+    await client.react({ chatJid, messageId, emoji: '👍' });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.[0], chatJid);
+    const payload = calls[0]?.[1] as { react: { key: Record<string, unknown>; text: string } };
+    assert.equal(payload.react.text, '👍');
+    assert.deepEqual({ ...payload.react.key }, {
+      remoteJid: chatJid,
+      id: messageId,
+      fromMe: false,
+      participant: 'sender@lid',
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('group reaction fails closed when its exact retained source is missing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-reaction-'));
+  try {
+    const source = proto.WebMessageInfo.fromObject({
+      key: {
+        remoteJid: 'other-group@g.us',
+        id: 'SHARED-ID',
+        fromMe: false,
+        participant: 'other-sender@lid',
+      },
+      message: { conversation: 'message from another chat' },
+    });
+    const client = new WhatsAppClient({
+      authDir: join(root, 'auth'),
+      messageReferenceDir: root,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    await (client as any).referenceStore.open();
+    assert.equal(await (client as any).referenceStore.put('other-group@g.us', 'SHARED-ID', source), true);
+    const calls: unknown[][] = [];
+    (client as any).sock = {
+      sendMessage: async (...args: unknown[]) => {
+        calls.push(args);
+        return { key: { id: 'SHOULD-NOT-SEND' } };
+      },
+    };
+    (client as any).connected = true;
+
+    await assert.rejects(
+      client.react({ chatJid: 'requested-group@g.us', messageId: 'SHARED-ID', emoji: '👍' }),
+    );
+    assert.deepEqual(calls, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('direct reaction still works without a retained source', async () => {
+  const client = testClient();
+  const calls: unknown[][] = [];
+  (client as any).sock = {
+    sendMessage: async (...args: unknown[]) => {
+      calls.push(args);
+      return { key: { id: 'DIRECT-REACTION-OUT' } };
+    },
+  };
+  (client as any).connected = true;
+
+  await client.react({
+    chatJid: '12345@s.whatsapp.net',
+    messageId: 'DIRECT-SOURCE',
+    emoji: '👍',
+    fromMe: true,
+  });
+
+  assert.deepEqual(calls, [[
+    '12345@s.whatsapp.net',
+    {
+      react: {
+        text: '👍',
+        key: {
+          remoteJid: '12345@s.whatsapp.net',
+          id: 'DIRECT-SOURCE',
+          fromMe: true,
+          participant: undefined,
+        },
+      },
+    },
+    undefined,
+  ]]);
+});
+
 test('native forward fails closed without sending when the exact source is missing', async () => {
   const root = await mkdtemp(join(tmpdir(), 'yeoman-forward-'));
   try {
