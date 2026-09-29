@@ -97,6 +97,25 @@ async def test_criterion_5_a_message_without_the_name_stays_unaddressed(monkeypa
     assert request.event.mentioned_bot is False
 
 
+async def test_confirmed_semantic_continuation_reaches_pipeline_as_direct(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    channel, gate = _channel(monkeypatch, tmp_path)
+    channel.config.debounce_ms = 0
+    channel.bus.publish_inbound = AsyncMock()
+    gate.admit_async = AsyncMock(return_value=SimpleNamespace(
+        denied=False, continuation_anchor_id="bot-1", react=False, ambient_candidate=False,
+        assignment=SimpleNamespace(thread_id="thread-1", turn_id="turn-2", source_message_ids=("m1",)),
+    ))
+    await channel._ingest_inbound_event(_event(content="295k. 330k kredit"))
+    assert gate.admit_async.await_count == 1
+    message = channel.bus.publish_inbound.call_args.args[0]
+    assert message.metadata["mentioned_bot"] is True
+    assert message.metadata["processing_answer_granted"] is True
+    assert message.metadata["thread_id"] == "thread-1"
+
+
 @pytest.mark.asyncio
 async def test_criterion_5_a_real_mention_is_left_alone(monkeypatch, tmp_path) -> None:
     channel, gate = _channel(monkeypatch, tmp_path)

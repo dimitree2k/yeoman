@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -151,6 +151,7 @@ class FastGateResult:
     direct_turn_id: str | None = None
     #: Per-chat arbitration revision returned by the durable direct fence.
     arbitration_revision: int = 0
+    continuation_anchor_id: str | None = None
 
     @property
     def denied(self) -> bool:
@@ -182,6 +183,7 @@ class IngestGate:
         note_direct_admission: Callable[..., int] | None = None,
         cancel_chat: Callable[..., bool] | None = None,
         source_registrar: Callable[[str], bool] | None = None,
+        continuation: Any = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -204,6 +206,7 @@ class IngestGate:
         #: journaled event, with or without a turn: durable observation is the gate's job,
         #: promotion is decided later and elsewhere (spec 1.4 / owner clarification).
         self._source_registrar = source_registrar
+        self._continuation = continuation
         #: Ambient brake state, per chat: when the last unaddressed answer went out and how
         #: much the chat has moved since. In memory on purpose - after a restart the brake
         #: simply starts cold, which is the conservative direction.
@@ -248,7 +251,52 @@ class IngestGate:
         self._note_direct_admission = note
         self._cancel_chat = cancel
 
-    def admit(self, request: IngestRequest) -> FastGateResult | None:
+    async def admit_async(self, request: IngestRequest) -> FastGateResult | None:
+        """Resolve free-form continuations after durable observation and access checks."""
+        event = request.event
+        if (self._continuation is None or not self.enabled_for(event.channel, event.chat_id)
+                or self.shadowed(event.channel, event.chat_id) or not event.is_group
+                or event.reply_to_message_id or event.reply_to_bot
+                or not event.content.strip() or event.content.lstrip().startswith("/")
+                or event.raw_metadata.get("topic_break")
+                or event.raw_metadata.get("media_kind")):
+            return self.admit(request)
+        self._journal(request, now=self._clock())
+        # An inferred address must not bypass access, off/owner-only or sender policy.
+        probe = self._evaluate(replace(request, event=replace(event, reply_to_bot=True)))
+        if (not self._snapshots.snapshot().healthy or not probe.accept_message
+                or not probe.should_respond or self._reply_action(request) != "answer"):
+            return self.admit(request)
+        identity = self._bridge_canonical_identity(request)
+        canonical = self._canonical_event(request, identity=identity)
+        assigned = self._store.event_assignment(canonical.event_id)
+        if assigned and assigned[1]:
+            return self.admit(request)
+        aliases = (identity.principal,) if identity else ()
+
+        def source_authorized(source: CanonicalEvent) -> bool:
+            # Observation is durable even when processing is denied. Reuse the current
+            # access policy per source, without borrowing the current actor's identity.
+            sender = (event.sender_id if source.principal in {canonical.principal, *aliases}
+                      else source.principal)
+            source_event = InboundEvent(
+                channel=source.channel, chat_id=source.chat_id, sender_id=sender,
+                content=str((source.payload or {}).get("text") or ""),
+                is_group=event.is_group,
+            )
+            return self._evaluate(replace(request, event=source_event)).accept_message
+
+        try:
+            anchor = await self._continuation.resolve(
+                canonical, aliases=aliases, now_ms=self._clock(),
+                source_authorized=source_authorized,
+            )
+        except Exception as exc:
+            logger.warning("continuation_resolution_failed error_type={}", type(exc).__name__)
+            anchor = None
+        return self.admit(request, continuation=anchor)
+
+    def admit(self, request: IngestRequest, *, continuation: Any = None) -> FastGateResult | None:
         """Journal the event and decide before any enrichment. ``None`` = not managed.
 
         A shadow chat is journaled and decided like a managed one, but the verdict never
@@ -263,6 +311,25 @@ class IngestGate:
         now = self._clock()
         snapshot = self._snapshots.snapshot()
         journaled = self._journal(request, now=now)
+        continuation_id = None
+        if continuation is not None and self._continuation is not None and snapshot.healthy:
+            identity = self._bridge_canonical_identity(request)
+            current = self._continuation.candidates(
+                self._canonical_event(request, identity=identity),
+                aliases=(identity.principal,) if identity else (), now_ms=now,
+            )
+            promoted = replace(request, event=replace(
+                event, reply_to_bot=True, reply_to_message_id=continuation.message_id,
+                reply_to_text=continuation.text,
+            ))
+            permission = self._evaluate(promoted)
+            if (continuation in current and permission.accept_message and permission.should_respond
+                    and self._reply_action(request) == "answer" and not shadow):
+                self._continuation.bind(continuation, principal=event.sender_id, now_ms=now)
+                continuation_id = continuation.message_id
+                request, event = promoted, promoted.event
+                logger.info("semantic_continuation chat={} event_id={} anchor={}",
+                            event.chat_id, request.event_id, continuation_id)
 
         if shadow:
             decision = self._evaluate(request) if snapshot.healthy else None
@@ -404,11 +471,12 @@ class IngestGate:
                 assignment.rule,
                 getattr(assignment, "reason", "") or "-",
             )
-        return self._record(
+        result = self._record(
             request,
             snapshot,
             outcome=outcome,
-            reason="allow" if decision.should_respond else "observe",
+            reason=(f"semantic_continuation:{continuation_id}" if continuation_id
+                    else "allow" if decision.should_respond else "observe"),
             policy_decision=decision,
             journaled=journaled,
             now=now,
@@ -420,6 +488,7 @@ class IngestGate:
             direct_turn_id=direct_turn_id,
             arbitration_revision=arbitration_revision,
         )
+        return replace(result, continuation_anchor_id=continuation_id)
 
     # -- internals ---------------------------------------------------------------------
 

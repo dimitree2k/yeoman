@@ -1835,14 +1835,31 @@ def build_processing_gate(
             return False
         return bool(resolved)
 
+    registry = threads if threads is not None else build_thread_registry(config, store)
+    continuation = None
+    route = config.processing.participation.judge_route or config.processing.ambient.judge_route
+    if registry is not None and route:
+        from yeoman_gateway.processing.continuation import ContinuationJudge, ContinuationResolver
+        from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
+
+        try:
+            continuation = ContinuationResolver(
+                store=store, threads=registry,
+                judge=ContinuationJudge(client=RouteClient(config=config, route_key=route)),
+                context_limit=config.channels.whatsapp.ambient_window_limit,
+            )
+        except RouteUnavailableError as exc:
+            logger.warning("semantic continuation unavailable: {}", exc)
+
     return IngestGate(
         config=config.processing,
         store=store,
         snapshots=AdapterSnapshotProvider(policy_adapter),
         evaluate=lambda request: policy_adapter.evaluate(request.event),
-        threads=threads if threads is not None else build_thread_registry(config, store),
+        threads=registry,
         participation=_participation_owns,
         source_registrar=source_registrar,
+        continuation=continuation,
     )
 
 

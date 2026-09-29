@@ -73,7 +73,7 @@ class Orchestrator:
         knowledge: object | None = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
-        ambient_window_limit: int = 8,
+        ambient_window_limit: int = 30,
         dedupe_ttl_seconds: int = 20 * 60,
         typing_notifier: "Callable[[str, str, bool], Awaitable[None]] | None" = None,
         reply_admission: "Callable[[InboundEvent], bool] | None" = None,

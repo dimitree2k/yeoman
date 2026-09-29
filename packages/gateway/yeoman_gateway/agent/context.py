@@ -908,7 +908,8 @@ When a user asks you to send, create, or reply with a voice message / Sprachnach
         raw_ambient = metadata.get("ambient_context_window")
         ambient_lines: list[str] = []
         if isinstance(raw_ambient, list):
-            for item in raw_ambient[-15:]:
+            # ReplyContextMiddleware already applies the configured window size.
+            for item in raw_ambient:
                 if not isinstance(item, str):
                     continue
                 compact = " ".join(item.split())

@@ -3261,6 +3261,37 @@ class ProcessingStore:
             ).fetchall()
         return tuple(str(row["effect_id"]) for row in rows)
 
+    def recent_reply_effects(
+        self, *, channel: str, chat_id: str, since_ms: int, limit: int = 30
+    ) -> tuple[StoredEffect, ...]:
+        """Confirmed same-chat text, across reactive and Participation producers."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT e.* FROM effects e JOIN transport_receipts r "
+                "ON r.effect_id=e.effect_id WHERE r.channel=? AND r.chat_id=? "
+                "AND r.confirmed_ms>=? AND r.provider_message_id IS NOT NULL "
+                "AND e.state='sent' AND e.payload_kind='text' "
+                "AND e.payload_json IS NOT NULL ORDER BY e.created_ms DESC LIMIT ?",
+                (channel, chat_id, since_ms, limit),
+            ).fetchall()
+        return tuple(_effect_from_row(row) for row in rows)
+
+    def recent_context_events(
+        self, *, channel: str, chat_id: str, since_ms: int, before_ms: int, limit: int = 30
+    ) -> tuple[CanonicalEvent, ...]:
+        """Chronological, readable observations in one exact scope and time window."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT e.* FROM events e WHERE channel=? AND chat_id=? "
+                "AND kind='message' AND payload_json IS NOT NULL "
+                "AND COALESCE(occurred_ms,created_ms) BETWEEN ? AND ? "
+                "AND NOT EXISTS (SELECT 1 FROM event_source_authority a "
+                "WHERE a.event_id=e.event_id AND a.revoked_at_ms IS NOT NULL) "
+                "ORDER BY COALESCE(occurred_ms,created_ms) DESC,created_ms DESC LIMIT ?",
+                (channel, chat_id, since_ms, before_ms, limit),
+            ).fetchall()
+        return tuple(self._event_from_row(row) for row in reversed(rows))
+
     # -- reconciliation probes (Plan 04) ------------------------------------------------
 
     def schedule_probe(

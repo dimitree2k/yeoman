@@ -123,12 +123,31 @@ async def test_reply_budget_middleware_derives_turn_budget_and_preserves_reply_c
     assert budget["answer_shape"] == "short_take"
     assert budget["target_chars"] == 180
     assert budget["hard_cap_enabled"] is True
-    assert ctx.event.raw_metadata["ambient_context_window"] == ["c", "d"]
+    assert ctx.event.raw_metadata["ambient_context_window"] == ["a", "b", "c", "d"]
     assert ctx.event.reply_to_message_id == "quoted-1"
     assert ctx.event.reply_to_participant == "u2@s.whatsapp.net"
     assert ctx.event.reply_to_text == "quoted source"
     assert ctx.event.raw_metadata["reply_context_window"] == ["quoted source", "previous"]
     assert ctx.reply == "next reached"
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_all_configured_ambient_messages_reach_the_prompt(tmp_path: Path, compact: bool) -> None:
+    from yeoman_shared.config.schema import Config
+
+    assert Config().channels.whatsapp.ambient_window_limit == 30
+    lines = [f"[person] fact-{index:02d}" for index in range(30)]
+    if compact:
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts/RUNTIME.md").write_text("Runtime rules")
+        (tmp_path / "prompts/AGENTS.md").write_text("Evidence rules")
+    persona = "<!-- prompt-chain: compact -->\nPersona" if compact else None
+    messages = ContextBuilder(tmp_path).build_messages(
+        history=[], current_message="Calculate the result", persona_text=persona,
+        current_metadata={"ambient_context_window": lines},
+        channel="whatsapp", chat_id="group@g.us",
+    )
+    assert all(line in str(messages[-1]["content"]) for line in lines)
 
 
 @pytest.mark.parametrize("compact", [False, True])

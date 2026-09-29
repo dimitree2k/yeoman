@@ -676,6 +676,8 @@ class WhatsAppChannel(BaseChannel):
                     max_attempts=self._send_attempts(msg.metadata),
                 )
                 media_receipt = _receipt_from_bridge(media_result)
+                if caption:
+                    self._archive_sent_text(msg, caption, media_receipt)
                 sent_any_media = True
 
                 # Best-effort cleanup for generated TTS voice notes.
@@ -711,7 +713,28 @@ class WhatsAppChannel(BaseChannel):
             timeout_seconds=20.0,
             max_attempts=self._send_attempts(msg.metadata),
         )
-        return _receipt_from_bridge(text_result)
+        receipt = _receipt_from_bridge(text_result)
+        self._archive_sent_text(msg, text, receipt)
+        return receipt
+
+    def _archive_sent_text(
+        self, msg: OutboundMessage, text: str, receipt: dict[str, Any] | None
+    ) -> None:
+        """Project confirmed bot text into the same context window as incoming text."""
+        archive = getattr(self, "inbound_archive", None)
+        message_id = str((receipt or {}).get("provider_message_id") or "")
+        if archive is None or not message_id:
+            return
+        try:
+            archive.record_inbound(
+                channel=self.name, chat_id=msg.chat_id, message_id=message_id,
+                participant=None, sender_id="assistant", sender_name="Arvid",
+                text=text, timestamp=int(datetime.now(UTC).timestamp()), reply_to_message_id=msg.reply_to,
+            )
+        except Exception as exc:
+            # Sending already succeeded. A projection failure must not trigger a resend.
+            logger.warning("sent_context_projection_failed message_id={} error_type={}",
+                           message_id, type(exc).__name__)
 
     async def start_typing(self, chat_id: str) -> None:
         """Public typing API used by policy-aware orchestration."""
@@ -1689,8 +1712,14 @@ class WhatsAppChannel(BaseChannel):
 
         ambient_candidate = False
         if self._processing_gate is not None:
-            verdict = self._processing_gate.admit(self._processing_request(event))
+            request = self._processing_request(event)
+            admit_async = getattr(self._processing_gate, "admit_async", None)
+            verdict = (await admit_async(request) if callable(admit_async)
+                       else self._processing_gate.admit(request))
             if verdict is not None and not verdict.denied:
+                if getattr(verdict, "continuation_anchor_id", None):
+                    # Internal inferred address; keep the original wire quote untouched.
+                    event = replace(event, mentioned_bot=True, processing_answer_granted=True)
                 assignment = getattr(verdict, "assignment", None)
                 if assignment is not None and assignment.thread_id:
                     event = replace(

@@ -304,6 +304,7 @@ async def _dispatch(
     content: str = "answer",
     message_id: str = "m1",
     principal: str | None = None,
+    reply_to: str | None = None,
 ):
     """Dispatch one managed reply. ``principal`` comes from the runtime, never metadata."""
     dispatcher = ManagedOutboundDispatcher(
@@ -313,9 +314,209 @@ async def _dispatch(
     )
     await dispatcher(
         OutboundMessage(
-            channel="whatsapp", chat_id=chat, content=content, metadata={"message_id": message_id}
+            channel="whatsapp", chat_id=chat, content=content, reply_to=reply_to,
+            metadata={"message_id": message_id}
         )
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mentioned", [False, True])
+async def test_semantic_answer_continues_confirmed_thread_without_named_options(runtime, mentioned):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    runtime.reload_policy(_policy(when_to_reply="mention_only"))
+    first = _admit(runtime, message_id="price-question", content="Rechne den Verkauf durch")
+    await _dispatch(runtime, message_id="price-question", reply_to="price-question",
+                    content="Kaufpreis nennen, dann rechne ich es genau.")
+    runtime.store.close_turn(first.assignment.turn_id, now_ms=runtime.gate._clock())
+    judge = AsyncMock()
+    judge.choose.return_value = "PROVIDER-1"
+    runtime.gate._continuation = ContinuationResolver(
+        store=runtime.store, threads=runtime.registry, judge=judge,
+    )
+    event = _event(message_id="price-answer", content="295k. 330k kredit", mentioned=mentioned)
+    result = await runtime.gate.admit_async(IngestRequest(
+        event_key="price-answer", event_id="price-answer", trace_id="price-answer", event=event,
+    ))
+    assert result.outcome.value == "react"
+    assert result.continuation_anchor_id == "PROVIDER-1"
+    assert result.assignment.thread_id == first.assignment.thread_id
+    assert result.assignment.turn_id != first.assignment.turn_id
+    assert judge.choose.await_count == 1
+    # The canonical observation retains the actual unquoted message.
+    assert not runtime.store.get_event("price-answer").payload.get("reply_to_message_id")
+
+
+@pytest.mark.asyncio
+async def test_semantic_continuation_rechecks_policy_after_await(runtime):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    _admit(runtime, message_id="m1", content="Rechne den Verkauf durch")
+    await _dispatch(runtime, reply_to="m1", content="Kaufpreis nennen.")
+
+    async def choose(**kwargs):
+        runtime.reload_policy(_policy(when_to_reply="off"))
+        return "PROVIDER-1"
+
+    runtime.gate._continuation = ContinuationResolver(
+        store=runtime.store, threads=runtime.registry, judge=AsyncMock(choose=choose),
+    )
+    result = await runtime.gate.admit_async(IngestRequest(
+        event_key="m2", event_id="m2", trace_id="m2",
+        event=_event(message_id="m2", content="295k", mentioned=False),
+    ))
+    assert result.outcome.value == "observe"
+    assert not result.continuation_anchor_id
+    assert result.assignment.turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_context_excludes_denied_observations(runtime):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    stamp = runtime.gate._clock()
+    runtime.reload_policy(_policy(mode="owner_only", when_to_reply="mention_only"))
+    _admit(runtime, message_id="owner-question", sender="owner@s.whatsapp.net")
+    await _dispatch(runtime, message_id="owner-question", reply_to="owner-question",
+                    principal="owner@s.whatsapp.net", content="Which price?")
+    for sender, message_id in [("guest@s.whatsapp.net", "denied"),
+                               ("owner@s.whatsapp.net", "allowed")]:
+        result = runtime.gate.admit(IngestRequest(
+            event_key=message_id, event_id=message_id, trace_id=message_id,
+            event=replace(_event(message_id=message_id, sender=sender,
+                                 content=message_id, mentioned=False),
+                          timestamp=datetime.fromtimestamp(stamp / 1000, UTC)),
+        ))
+        if message_id == "denied":
+            assert result.outcome.value == "deny"
+        assert runtime.store.get_event(message_id) is not None
+    judge = AsyncMock()
+    judge.choose.return_value = "PROVIDER-1"
+    runtime.gate._continuation = ContinuationResolver(
+        store=runtime.store, threads=runtime.registry, judge=judge,
+    )
+    result = await runtime.gate.admit_async(IngestRequest(
+        event_key="followup", event_id="followup", trace_id="followup",
+        event=replace(_event(message_id="followup", sender="owner@s.whatsapp.net",
+                             content="295k", mentioned=False),
+                      timestamp=datetime.fromtimestamp(stamp / 1000, UTC)),
+    ))
+    assert result.continuation_anchor_id == "PROVIDER-1"
+    context = judge.choose.call_args.kwargs["context"]
+    assert any(item["text"] == "allowed" for item in context)
+    assert not any(item["text"] == "denied" for item in context)
+
+
+def _participation_anchor(runtime, *, confirmed=True, mentioned=False):
+    from yeoman_gateway.processing.models import EffectEnvelope, EffectTarget, TextPayload
+    from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
+
+    runtime.reload_policy(_policy(when_to_reply="mention_only"))
+    _admit(runtime, message_id="rent", content="300k, rent 1200", mentioned=mentioned)
+    now = runtime.gate._clock() - 1000
+    envelope = EffectEnvelope(
+        effect_id="participation-text", operation_key="participation-text",
+        payload=TextPayload(text="On 300k that is 4.8% gross yield.", reply_to="rent"),
+        target=EffectTarget(channel="whatsapp", chat_id=CHAT),
+        origin="participation", admission_id="adm-test", created_ms=now,
+    )
+    runtime.store.enqueue_participation_effect(envelope, ParticipationAdmission(
+        opportunity_id="test", channel="whatsapp", chat_id=CHAT, activation_epoch=1,
+        lane="production", observed_revision=1, action="comment", intent="initiate",
+        admission_id="adm-test", payload_hash=envelope.payload_hash,
+    ))
+    if confirmed:
+        runtime.store.transition("participation-text", expected="queued", target="executing", now_ms=now, worker_id="test")
+        runtime.store.transition("participation-text", expected="executing", target="sent", now_ms=now, worker_id="test")
+        runtime.store.record_transport_receipt(
+            "participation-text", channel="whatsapp", chat_id=CHAT,
+            provider_message_id="participation-bot", now_ms=now,
+        )
+
+
+async def test_participation_mention_and_free_answer_share_one_thread(runtime):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    _participation_anchor(runtime)
+    judge = AsyncMock()
+    judge.choose.side_effect = ["participation-bot", "PROVIDER-1"]
+    runtime.gate._continuation = ContinuationResolver(
+        store=runtime.store, threads=runtime.registry, judge=judge,
+    )
+    async def admit(message_id, text, mentioned):
+        return await runtime.gate.admit_async(IngestRequest(
+            event_key=message_id, event_id=message_id, trace_id=message_id,
+            event=_event(message_id=message_id, content=text, mentioned=mentioned),
+        ))
+    first = await admit("sale", "Calculate the net sale proceeds after 15 years", True)
+    assert first.outcome.value == "react"
+    assert first.assignment.thread_id == runtime.store.resolve_reference("participation-bot")[0]
+    assert first.assignment.thread_id == runtime.store.event_assignment("rent")[0]
+    await _dispatch(runtime, message_id="sale", reply_to="sale", content="Tell me the loan amount.")
+    runtime.store.close_turn(first.assignment.turn_id, now_ms=runtime.gate._clock())
+    second = await admit("loan", "295k. 330k credit", False)
+    assert second.outcome.value == "react"
+    assert second.assignment.thread_id == first.assignment.thread_id
+    assert second.assignment.turn_id != first.assignment.turn_id
+
+
+@pytest.mark.parametrize("case", ["other_sender", "other_chat", "expired", "unconfirmed", "denied", "unrelated", "invalid", "failure", "closed"])
+async def test_semantic_continuation_never_guesses_authority(runtime, case):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    _participation_anchor(runtime, confirmed=case != "unconfirmed")
+    judge = AsyncMock()
+    judge.choose.return_value = {"unrelated": None, "invalid": "invented"}.get(case, "participation-bot")
+    if case == "failure":
+        judge.choose.side_effect = TimeoutError()
+    if case == "expired":
+        runtime.gate._clock = _Clock(runtime.gate._clock() + 601_000)
+    if case == "denied":
+        runtime.reload_policy(_policy(when_to_reply="off"))
+    resolver = ContinuationResolver(store=runtime.store, threads=runtime.registry, judge=judge)
+    runtime.gate._continuation = resolver
+    if case == "closed":
+        request = IngestRequest(event_key="bind", event_id="bind", trace_id="bind",
+                               event=_event(message_id="bind"))
+        candidate = resolver.candidates(runtime.gate._canonical_event(request), aliases=(), now_ms=runtime.gate._clock())[0]
+        resolver.bind(candidate, principal="orderer@s.whatsapp.net", now_ms=runtime.gate._clock())
+        runtime.store.close_chat_threads(channel="whatsapp", chat_id=CHAT, now_ms=runtime.gate._clock())
+    result = await runtime.gate.admit_async(IngestRequest(
+        event_key="follow", event_id="follow", trace_id="follow",
+        event=_event(message_id="follow", content="295k", mentioned=False,
+                     sender="stranger" if case == "other_sender" else "orderer@s.whatsapp.net",
+                     chat=OTHER if case == "other_chat" else CHAT),
+    ))
+    assert result is None or result.outcome.value != "react"
+    assert result is None or not result.continuation_anchor_id
+    if case not in {"unrelated", "invalid", "failure"}:
+        judge.choose.assert_not_awaited()
+
+
+async def test_participation_reply_keeps_its_sources_existing_thread(runtime):
+    from unittest.mock import AsyncMock
+
+    from yeoman_gateway.processing.continuation import ContinuationResolver
+
+    _participation_anchor(runtime, mentioned=True)
+    original_thread = runtime.store.event_assignment("rent")[0]
+    resolver = ContinuationResolver(store=runtime.store, threads=runtime.registry, judge=AsyncMock())
+    request = IngestRequest(event_key="next", event_id="next", trace_id="next", event=_event(message_id="next"))
+    candidate = resolver.candidates(runtime.gate._canonical_event(request), aliases=(), now_ms=runtime.gate._clock())[0]
+    assert candidate.thread_id == original_thread
+    resolver.bind(candidate, principal="orderer@s.whatsapp.net", now_ms=runtime.gate._clock())
+    assert runtime.store.resolve_reference("participation-bot")[0] == original_thread
 
 
 @pytest.mark.asyncio

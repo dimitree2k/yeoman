@@ -38,7 +38,7 @@ class ReplyContextMiddleware:
         knowledge: object | None = None,
         reply_context_window_limit: int = 6,
         reply_context_line_max_chars: int = 500,
-        ambient_window_limit: int = 8,
+        ambient_window_limit: int = 30,
     ) -> None:
         self._archive = archive
         self._contacts = contacts

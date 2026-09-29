@@ -56,7 +56,6 @@ class ReplyBudgetDecision:
     long_form_allowed: bool
     hard_cap_enabled: bool
     session_history_limit: int | None = None
-    ambient_window_limit: int | None = None
     instruction: str = ""
 
     def as_metadata(self) -> dict[str, object]:
@@ -69,7 +68,6 @@ class ReplyBudgetDecision:
             "long_form_allowed": self.long_form_allowed,
             "hard_cap_enabled": self.hard_cap_enabled,
             "session_history_limit": self.session_history_limit,
-            "ambient_window_limit": self.ambient_window_limit,
             "instruction": self.instruction,
         }
 
@@ -123,7 +121,6 @@ def coerce_reply_budget_policy(raw: object) -> dict[str, object]:
         ),
         "long_form_bypass": long_form_bypass,
         "session_history_limit": optional_positive_int("session_history_limit"),
-        "ambient_window_limit": optional_positive_int("ambient_window_limit"),
     }
 
 
@@ -170,9 +167,7 @@ def derive_reply_budget(
         instruction += f" Long-form detail is allowed up to about {long_form_max_chars} characters."
 
     session_history_limit = cfg["session_history_limit"]
-    ambient_window_limit = cfg["ambient_window_limit"]
     assert session_history_limit is None or isinstance(session_history_limit, int)
-    assert ambient_window_limit is None or isinstance(ambient_window_limit, int)
     return ReplyBudgetDecision(
         enabled=True,
         answer_shape=shape,
@@ -182,7 +177,6 @@ def derive_reply_budget(
         long_form_allowed=long_form_allowed,
         hard_cap_enabled=hard_cap_enabled,
         session_history_limit=session_history_limit,
-        ambient_window_limit=ambient_window_limit,
         instruction=instruction,
     )
 

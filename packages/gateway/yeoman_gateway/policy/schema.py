@@ -193,6 +193,7 @@ class ReplyBudgetPolicy(PolicyModel):
     long_form_max_chars: int = Field(default=2200, alias="longFormMaxChars", ge=1)
     long_form_bypass: LongFormBypassMode = Field(default="owner_only", alias="longFormBypass")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
+    # Load old policies without failing; ambient count is owned by channel config only.
     ambient_window_limit: int | None = Field(default=None, alias="ambientWindowLimit", ge=1, le=50)
 
 
@@ -205,6 +206,7 @@ class ReplyBudgetPolicyOverride(PolicyModel):
     long_form_max_chars: int | None = Field(default=None, alias="longFormMaxChars", ge=1)
     long_form_bypass: LongFormBypassMode | None = Field(default=None, alias="longFormBypass")
     session_history_limit: int | None = Field(default=None, alias="sessionHistoryLimit", ge=1, le=100)
+    # Backward-compatible no-op; answer length must not discard input context.
     ambient_window_limit: int | None = Field(default=None, alias="ambientWindowLimit", ge=1, le=50)
 
 
