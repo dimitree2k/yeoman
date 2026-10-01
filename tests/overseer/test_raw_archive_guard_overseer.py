@@ -59,3 +59,21 @@ async def test_rotate_logs_refuses_raw_archive_files(home: Path) -> None:
     assert audit.exists()
     assert result.success is False
     assert "refusing" in result.detail
+
+
+async def test_rotate_logs_refuses_archive_ancestors_and_keeps_ordinary_rotation(
+    home: Path,
+) -> None:
+    raw_file = _old_file(home / "data" / "raw" / "whatsapp" / "2026-01.jsonl")
+    spool_file = _old_file(home / "data" / "raw-spool" / "0001-a.json")
+    result = await _executor().execute("rotate_logs", target=str(home / "data"))
+    assert result.success is False
+    assert "refusing" in result.detail
+    assert raw_file.exists()
+    assert spool_file.exists()
+
+    log = _old_file(home / "var" / "logs" / "yeoman.log")
+    result = await _executor().execute("rotate_logs", target=str(log))
+    assert result.success is True
+    assert not log.exists()
+    assert len(list(log.parent.glob("yeoman-*.log"))) == 1

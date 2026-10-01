@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from yeoman_shared.raw_archive.paths import ProtectedPathError, assert_deletable
+from yeoman_shared.raw_archive.paths import (
+    ProtectedPathError,
+    assert_deletable,
+    assert_deletable_tree,
+)
 
 from yeoman_overseer.alerts.formatting import format_overseer_alert
 from yeoman_overseer.comms.cascading import CascadingComms
@@ -83,7 +87,7 @@ class DeterministicExecutor:
         if not path.exists():
             return ActionResult(success=True, detail=f"No log file at {target}")
         try:
-            assert_deletable(path)
+            assert_deletable_tree(path)
         except ProtectedPathError as exc:
             logger.error("rotate_logs refused: %s", exc)
             return ActionResult(success=False, detail=str(exc))
