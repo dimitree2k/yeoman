@@ -1,0 +1,170 @@
+"""V1 spec §4.0: append-only JSONL, UTC month files, spool on failure (S26)."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+from yeoman_shared.raw_archive.records import append_line, file_digest, iter_records
+from yeoman_shared.raw_archive.writer import RawArchive, RawEvent, month_of, read_start_ms
+
+NOW = 1_790_000_000_000  # 2026-09-21 UTC
+
+
+def _archive(tmp_path: Path, clock: int = NOW) -> RawArchive:
+    return RawArchive(
+        tmp_path / "raw",
+        spool=tmp_path / "raw-spool",
+        status_path=tmp_path / "run" / "raw-archive.json",
+        clock=lambda: clock,
+    )
+
+
+def _event(text: str = "hi", **overrides: object) -> RawEvent:
+    values: dict[str, object] = {
+        "channel": "whatsapp",
+        "kind": "message",
+        "direction": "in",
+        "native": {"type": "message", "payload": {"text": text}},
+        "native_id": "evt-1",
+        "chat_id": "chat@g.us",
+        "account": "acc",
+    }
+    values.update(overrides)
+    return RawEvent(**values)  # type: ignore[arg-type]
+
+
+def _lines(path: Path) -> list[dict]:
+    return [record for _, record, _ in iter_records(path) if record is not None]
+
+
+def test_append_writes_one_record_with_all_fields(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    assert archive.append(_event()) is True
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    [record] = _lines(month_file)
+    assert record["archive_version"] == 1
+    assert record["received_ms"] == NOW
+    assert record["channel"] == "whatsapp"
+    assert record["kind"] == "message"
+    assert record["direction"] == "in"
+    assert record["native_id"] == "evt-1"
+    assert record["chat_id"] == "chat@g.us"
+    assert record["provenance"] == "native"
+    assert record["native"]["payload"]["text"] == "hi"
+    assert month_file.read_text(encoding="utf-8").count("\n") == 1
+
+
+def test_month_bucket_uses_utc_boundaries(tmp_path: Path) -> None:
+    last_ms = int(datetime(2026, 10, 31, 23, 59, 59, 999000, tzinfo=UTC).timestamp() * 1000)
+    archive = _archive(tmp_path)
+    archive.append(_event(received_ms=last_ms))
+    archive.append(_event(received_ms=last_ms + 1))
+    assert (tmp_path / "raw" / "whatsapp" / "2026-10.jsonl").is_file()
+    assert (tmp_path / "raw" / "whatsapp" / "2026-11.jsonl").is_file()
+
+
+def test_files_and_directories_are_private(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    archive.append(_event())
+    root = tmp_path / "raw"
+    month_file = root / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / "whatsapp").stat().st_mode) == 0o700
+    assert stat.S_IMODE(month_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE((root / "START").stat().st_mode) == 0o444
+
+
+def test_start_marker_is_written_once(tmp_path: Path) -> None:
+    _archive(tmp_path, clock=NOW)
+    _archive(tmp_path, clock=NOW + 5_000)
+    assert read_start_ms(tmp_path / "raw") == NOW
+
+
+def test_non_json_values_are_serialized(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    native = {"date": datetime(2026, 10, 1, tzinfo=UTC), "blob": b"\x00\x01", "tags": {"a"}}
+    assert archive.append(_event(native=native)) is True
+    [record] = _lines(tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl")
+    assert record["native"]["date"] == "2026-10-01T00:00:00+00:00"
+    assert record["native"]["blob"] == {"__b64__": "AAE="}
+    assert record["native"]["tags"] == ["a"]
+
+
+def test_concurrent_appends_produce_parseable_lines(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: archive.append(_event(text=f"m{i}", native_id=f"e{i}")), range(400)))
+    records = _lines(tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl")
+    assert len(records) == 400
+    assert {r["native_id"] for r in records} == {f"e{i}" for i in range(400)}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_write_failure_spools_then_drains_in_order(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    root = tmp_path / "raw"
+    os.chmod(root, 0o500)  # channel directory can no longer be created
+    try:
+        assert archive.append(_event(text="first", native_id="e1")) is False
+        status = json.loads((tmp_path / "run" / "raw-archive.json").read_text())
+        assert status["state"] == "degraded"
+        assert status["spooled"] == 1
+    finally:
+        os.chmod(root, 0o700)
+    assert archive.append(_event(text="second", native_id="e2")) is True
+    records = _lines(root / "whatsapp" / f"{month_of(NOW)}.jsonl")
+    assert [r["native_id"] for r in records] == ["e1", "e2"]
+    assert list((tmp_path / "raw-spool").glob("*.json")) == []
+    assert archive.status().state == "ok"
+    status = json.loads((tmp_path / "run" / "raw-archive.json").read_text())
+    assert status["state"] == "ok"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_spool_failure_falls_back_to_memory(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    (tmp_path / "raw-spool").write_text("not a directory")
+    root = tmp_path / "raw"
+    os.chmod(root, 0o500)
+    try:
+        assert archive.append(_event(native_id="e1")) is False
+        assert archive.status().pending_in_memory == 1
+    finally:
+        os.chmod(root, 0o700)
+    assert archive.append(_event(native_id="e2")) is True
+    records = _lines(root / "whatsapp" / f"{month_of(NOW)}.jsonl")
+    assert [r["native_id"] for r in records] == ["e1", "e2"]
+    assert archive.status().pending_in_memory == 0
+
+
+def test_corrupt_spool_file_is_set_aside_not_deleted(tmp_path: Path) -> None:
+    spool = tmp_path / "raw-spool"
+    spool.mkdir()
+    (spool / "0001-bad.json").write_text("{not json")
+    archive = _archive(tmp_path)
+    assert archive.append(_event()) is True
+    assert (spool / "0001-bad.json.corrupt").is_file()
+    assert list(spool.glob("*.json")) == []
+
+
+def test_append_line_follows_a_replaced_file(tmp_path: Path) -> None:
+    path = tmp_path / "f.jsonl"
+    append_line(path, '{"a":1}')
+    replacement = tmp_path / "f.tmp"
+    replacement.write_text('{"b":2}\n')
+    os.replace(replacement, path)
+    append_line(path, '{"c":3}')
+    assert path.read_text().splitlines() == ['{"b":2}', '{"c":3}']
+    digest, lines, size = file_digest(path)
+    assert lines == 2 and size == len('{"b":2}\n{"c":3}\n') and len(digest) == 64
+
+
+def test_newlines_inside_a_line_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        append_line(tmp_path / "f.jsonl", "a\nb")
