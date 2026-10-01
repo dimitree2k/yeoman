@@ -15,8 +15,11 @@ from yeoman_gateway.media.router import ResolvedProfile
 from yeoman_gateway.providers.factory import ProviderFactory
 
 PROMPT = (
-    "Describe this image in 1-2 concise sentences. "
-    "Be factual, include key objects/action, and mention visible text only if readable."
+    "Describe the image in 3-6 factual sentences, using fewer sentences for simple images "
+    "and more when the image supports useful detail. Start with the overall scene, then "
+    "describe important objects and their actions or relationships. Include notable "
+    "background details when they add context. Quote short visible text exactly when it "
+    "is clearly readable. Mark uncertainty and do not infer identities or unseen context."
 )
 
 VIDEO_PROMPT = (

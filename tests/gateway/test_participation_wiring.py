@@ -1055,6 +1055,10 @@ async def test_bootstrap_reaction_reaches_transport_with_reserved_effect_id(
         def __init__(self, **_: object) -> None:
             pass
 
+        async def chat_with_usage(self, *args, **kwargs):
+            from yeoman_gateway.processing.model_route import RouteReply
+            return RouteReply(content=await self.chat(*args, **kwargs))
+
         async def chat(
             self,
             messages: object,
@@ -1421,6 +1425,10 @@ async def test_participation_approval_rechecks_pause_and_submits_once(
 
         def __init__(self, **_: object) -> None:
             pass
+
+        async def chat_with_usage(self, *args, **kwargs):
+            from yeoman_gateway.processing.model_route import RouteReply
+            return RouteReply(content=await self.chat(*args, **kwargs))
 
         async def chat(
             self,

@@ -57,6 +57,10 @@ class _ScriptedClient:
         self._answer = answer
         self.calls = 0
 
+    async def chat_with_usage(self, *args, **kwargs):
+        from yeoman_gateway.processing.model_route import RouteReply
+        return RouteReply(content=await self.chat(*args, **kwargs))
+
     async def chat(
         self,
         messages,

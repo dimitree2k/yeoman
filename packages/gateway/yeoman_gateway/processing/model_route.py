@@ -22,6 +22,7 @@ class RouteReply:
     model: str = ""
     latency_ms: int = 0
     finish_reason: str = ""
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
 class RouteUnavailableError(RuntimeError):
@@ -93,6 +94,7 @@ class RouteClient:
             model=self.model,
             latency_ms=int((time.monotonic() - started) * 1000),
             finish_reason=str(getattr(response, "finish_reason", "") or ""),
+            diagnostics=getattr(response, "diagnostics", None) or {},
         )
 
     async def chat(

@@ -125,6 +125,36 @@ JUDGE_SYSTEM_PROMPT = (
     "another person's task."
 )
 
+
+JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "participation_judge_decision",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["silence", "react", "comment"]},
+                "intent": {"type": "string", "enum": ["direct", "continue", "initiate"]},
+                "reason": {"type": "string"},
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                "anchor_message_id": {"type": ["string", "null"]},
+                "target_message_id": {"type": ["string", "null"]},
+                "contribution_type": {"type": ["string", "null"]},
+                "purpose": {"type": "string"},
+                "emoji": {"type": ["string", "null"]},
+                "closes_exchange": {"type": "boolean"},
+            },
+            "required": [
+                "action", "intent", "reason", "evidence_ids", "anchor_message_id",
+                "target_message_id", "contribution_type", "purpose", "emoji",
+                "closes_exchange",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
+
 JUDGE_USER_TEMPLATE = (
     "Trusted participation guidance (owner-authored):\n{guidance}\n\n"
     "Allowed actions for this opportunity: {allowed_actions}\n"
@@ -243,11 +273,11 @@ class ParticipationJudge:
                 detail="context_budget_exceeded",
             )
         try:
-            raw = await asyncio.wait_for(
-                self._client.chat(
+            reply = await asyncio.wait_for(
+                self._client.chat_with_usage(
                     messages,
                     max_tokens=self._max_output_tokens,
-                    response_format={"type": "json_object"},
+                    response_format=JUDGE_RESPONSE_FORMAT,
                 ),
                 timeout=self._timeout_seconds,
             )
@@ -262,7 +292,23 @@ class ParticipationJudge:
                 type(exc).__name__,
             )
             raise ParticipationDecisionError("provider_error") from exc
-        text = str(raw or "").strip()
+        native_finish_reason = str(
+            reply.diagnostics.get("native_finish_reason") or reply.finish_reason or ""
+        )
+        logger.info(
+            "participation_judge_completion opportunity={} route={} model={} "
+            "finish_reason={} native_finish_reason={} usage={} diagnostics={}",
+            opportunity.opportunity_id, self.route_key, reply.model,
+            reply.finish_reason, native_finish_reason, dict(reply.usage),
+            dict(reply.diagnostics),
+        )
+        if native_finish_reason == "length":
+            raise ParticipationDecisionError("invalid_response", detail="output_truncated")
+        if native_finish_reason == "content_filter" or reply.diagnostics.get("refusal"):
+            raise ParticipationDecisionError("provider_error", detail="refusal")
+        if reply.finish_reason == "error":
+            raise ParticipationDecisionError("provider_error", detail="provider_error")
+        text = str(reply.content or "").strip()
         if not text:
             raise ParticipationDecisionError("empty_response")
         return self._parse(text, opportunity, view)

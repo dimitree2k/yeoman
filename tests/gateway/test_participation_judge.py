@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 from yeoman_gateway.processing.participation import (
@@ -66,15 +67,19 @@ class _Client:
         self._answer = answer
         self.calls: list[list[dict[str, str]]] = []
         self.max_tokens: list[int] = []
-        self.response_formats: list[dict[str, str] | None] = []
+        self.response_formats: list[dict[str, Any] | None] = []
         self.route_key = "test.route"
+
+    async def chat_with_usage(self, *args, **kwargs):
+        from yeoman_gateway.processing.model_route import RouteReply
+        return RouteReply(content=await self.chat(*args, **kwargs))
 
     async def chat(
         self,
         messages,
         *,
         max_tokens: int = 0,
-        response_format: dict[str, str] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         self.calls.append(list(messages))
         self.max_tokens.append(int(max_tokens))
@@ -186,6 +191,10 @@ async def test_short_primary_emoji_reaches_judgment_without_a_time_rule() -> Non
 
 
 class _EmptyClient:
+    async def chat_with_usage(self, *args, **kwargs):
+        from yeoman_gateway.processing.model_route import RouteReply
+        return RouteReply(content=await self.chat(*args, **kwargs))
+
     async def chat(self, messages, **kwargs):
         del messages, kwargs
         return ""
@@ -237,12 +246,16 @@ async def test_cancellation_propagates_and_is_not_silence() -> None:
     class _Blocking:
         route_key = "test.route"
 
+        async def chat_with_usage(self, *args, **kwargs):
+            from yeoman_gateway.processing.model_route import RouteReply
+            return RouteReply(content=await self.chat(*args, **kwargs))
+
         async def chat(
             self,
             messages,
             *,
             max_tokens: int = 0,
-            response_format: dict[str, str] | None = None,
+            response_format: dict[str, Any] | None = None,
         ) -> str:
             del messages, max_tokens, response_format
             await asyncio.sleep(30)
@@ -257,13 +270,21 @@ async def test_cancellation_propagates_and_is_not_silence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_judge_requests_json_object_response_format() -> None:
+async def test_judge_requests_strict_json_schema_response_format() -> None:
     client = _Client(_payload())
     judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
 
     await judge.decide(_opportunity(), _context())
 
-    assert client.response_formats == [{"type": "json_object"}]
+    response_format = client.response_formats[0]
+    assert response_format is not None
+    assert response_format["type"] == "json_schema"
+    contract = response_format["json_schema"]
+    assert contract["strict"] is True
+    schema = contract["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 @pytest.mark.asyncio
@@ -875,3 +896,27 @@ async def test_comment_labelled_continue_still_requires_a_delivered_anchor() -> 
         "continuation_without_anchor",
         "continuation_without_delivered_anchor",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("finish", "content", "diagnostics", "reason", "detail"), [
+    ("length", '{"action":', {"native_finish_reason": "length"}, "invalid_response", "output_truncated"),
+    ("error", "", {"native_finish_reason": "length"}, "invalid_response", "output_truncated"),
+    ("error", "", {}, "provider_error", "provider_error"),
+    ("error", "", {"native_finish_reason": "content_filter"}, "provider_error", "refusal"),
+    ("error", "", {"native_finish_reason": "stop", "refusal": True}, "provider_error", "refusal"),
+])
+async def test_judge_classifies_provider_completion_before_parsing(
+    finish, content, diagnostics, reason, detail,
+):
+    from types import SimpleNamespace
+
+    class Client(_Client):
+        async def chat_with_usage(self, *args, **kwargs):
+            return SimpleNamespace(content=content, finish_reason=finish,
+                                   usage={}, model="test", diagnostics=diagnostics)
+
+    judge = ParticipationJudge(client=Client(content))
+    with pytest.raises(ParticipationDecisionError) as error:
+        await judge.decide(_opportunity(), _context())
+    assert (error.value.reason, error.value.detail) == (reason, detail)

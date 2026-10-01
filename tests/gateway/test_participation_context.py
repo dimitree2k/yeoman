@@ -177,6 +177,10 @@ async def test_newest_required_source_is_default_reaction_target(tmp_path: Path)
     class _Client:
         route_key = "test.participation"
 
+        async def chat_with_usage(self, *args, **kwargs):
+            from yeoman_gateway.processing.model_route import RouteReply
+            return RouteReply(content=await self.chat(*args, **kwargs))
+
         async def chat(
             self,
             messages,

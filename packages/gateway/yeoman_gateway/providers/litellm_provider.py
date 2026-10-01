@@ -176,6 +176,16 @@ class LiteLLMProvider(LLMProvider):
             from yeoman_gateway.model_catalog import direct_card, reasoning_kwargs
 
             kwargs.update(reasoning_kwargs(self.provider_name, reasoning))
+            if (
+                self.is_openrouter
+                and response_format is not None
+                and response_format.get("type") == "json_schema"
+            ):
+                # OpenRouter filters every request parameter, including optional ones.
+                kwargs.pop("temperature", None)
+                kwargs.setdefault("extra_body", {}).setdefault("provider", {})[
+                    "require_parameters"
+                ] = True
             card = direct_card(self.provider_name, model.removeprefix("openai/"))
             enabled = (reasoning or {}).get("enabled", card.default_enabled)
             if enabled and card.temperature_with_reasoning is False:
@@ -185,7 +195,18 @@ class LiteLLMProvider(LLMProvider):
             else:
                 async with asyncio.timeout(timeout_seconds):
                     response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            parsed = self._parse_response(response)
+            if response_format is not None:
+                parsed.diagnostics.update({
+                    "response_format": response_format.get("type"),
+                    "strict_schema": response_format.get("json_schema", {}).get("strict") is True,
+                    "require_parameters": kwargs.get("extra_body", {}).get(
+                        "provider", {}
+                    ).get("require_parameters") is True,
+                    "temperature_sent": "temperature" in kwargs,
+                    "max_tokens": max_tokens,
+                })
+            return parsed
         except Exception as e:
             logger.error(
                 "LLM provider request failed provider={} model={} error_type={} error={}",
@@ -226,11 +247,9 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
 
-        finish_reason = choice.finish_reason or "stop"
-        if (
-            not str(message.content or "").strip()
-            and not tool_calls
-        ):
+        native_finish_reason = choice.finish_reason or "stop"
+        finish_reason = native_finish_reason
+        if not str(message.content or "").strip() and not tool_calls:
             finish_reason = "error"
 
         return LLMResponse(
@@ -239,6 +258,16 @@ class LiteLLMProvider(LLMProvider):
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            diagnostics={
+                "native_finish_reason": native_finish_reason,
+                "request_id": getattr(response, "id", None),
+                "selected_provider": getattr(response, "provider", None),
+                "refusal": bool(getattr(message, "refusal", None)),
+                "reasoning_tokens": getattr(
+                    getattr(getattr(response, "usage", None), "completion_tokens_details", None),
+                    "reasoning_tokens", None,
+                ),
+            },
         )
 
     def get_default_model(self) -> str:
