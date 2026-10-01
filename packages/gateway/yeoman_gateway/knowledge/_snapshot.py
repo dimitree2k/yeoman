@@ -202,6 +202,14 @@ def _backup(source: Path, target: Path) -> None:
         origin.close()
 
 
+def _unlink_unprotected(path: Path) -> None:
+    """Remove a rehearsal copy; never a raw archive file (V1 spec §4.0)."""
+    from yeoman_shared.raw_archive.paths import assert_deletable
+
+    assert_deletable(path)
+    path.unlink()
+
+
 def _require_readable(path: Path, role: str) -> None:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
@@ -348,7 +356,7 @@ def verify_snapshot(*, manifest: Path, restore_dir: Path | None = None) -> Snaps
             )
         target = workspace / f"{role}.db"
         if target.exists():
-            target.unlink()
+            _unlink_unprotected(target)
         _backup(source, target)
         copies[role] = target
         if _fingerprint(target) != str(entry["fingerprint"]):

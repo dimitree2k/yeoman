@@ -1944,6 +1944,10 @@ def _combined(*values: str) -> str:
 
 
 def _discard(path: Path) -> None:
+    from yeoman_shared.raw_archive.paths import is_protected
+
+    if is_protected(path):
+        return
     try:
         if path.exists():
             path.unlink()

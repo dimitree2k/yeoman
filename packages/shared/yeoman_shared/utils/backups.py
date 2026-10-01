@@ -25,6 +25,8 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from yeoman_shared.raw_archive.paths import is_protected
+
 BACKUP_DIR_NAME = "backups"
 DEFAULT_RETENTION_DAYS = 30
 RETENTION_ENV_VAR = "YEOMAN_BACKUP_RETENTION_DAYS"
@@ -143,7 +145,7 @@ def prune_backups(
     cutoff = ((now or datetime.now().astimezone()) - timedelta(days=days)).timestamp()
     removed: list[Path] = []
     for candidate in directory.iterdir():
-        if not candidate.is_file():
+        if not candidate.is_file() or is_protected(candidate):
             continue
         try:
             if candidate.stat().st_mtime < cutoff:

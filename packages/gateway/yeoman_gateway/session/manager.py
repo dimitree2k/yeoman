@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from yeoman_shared.raw_archive.paths import is_protected
 from yeoman_shared.utils.helpers import get_sessions_path, safe_filename
 
 _LLM_HISTORY_METADATA_KEYS = frozenset(
@@ -256,6 +257,9 @@ class SessionManager:
 
         # Remove file
         path = self._get_session_path(key)
+        if is_protected(path):
+            logger.error("session delete refused: {} is inside the raw archive", path)
+            return False
         if path.exists():
             path.unlink()
             return True

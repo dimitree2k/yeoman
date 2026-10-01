@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from loguru import logger
+from yeoman_shared.raw_archive.paths import ProtectedPathError, assert_deletable_tree, is_protected
 from yeoman_shared.utils.helpers import ensure_dir
 
 
@@ -46,19 +48,21 @@ class MediaStorage:
         channel_dir = self._channel_dir(channel)
         if not channel_dir.exists():
             return 0
+        try:
+            assert_deletable_tree(channel_dir)
+        except ProtectedPathError:
+            logger.error("media cleanup refused: {} reaches the raw archive", channel_dir)
+            return 0
 
         deleted = 0
         for path in sorted(channel_dir.rglob("*"), reverse=True):
             if path.is_file():
+                if is_protected(path):
+                    continue
                 try:
                     if path.stat().st_mtime < threshold:
                         path.unlink()
                         deleted += 1
-                except OSError:
-                    continue
-            elif path.is_dir():
-                try:
-                    path.rmdir()
                 except OSError:
                     continue
         return deleted

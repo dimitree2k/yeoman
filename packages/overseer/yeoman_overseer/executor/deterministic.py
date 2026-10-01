@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from yeoman_shared.raw_archive.paths import ProtectedPathError, assert_deletable
 
 from yeoman_overseer.alerts.formatting import format_overseer_alert
 from yeoman_overseer.comms.cascading import CascadingComms
@@ -78,9 +79,14 @@ class DeterministicExecutor:
             return ActionResult(success=False, detail=f"Alert failed: {exc}")
 
     async def _rotate_logs(self, *, target: str, **_: str) -> ActionResult:
-        path = Path(target)
+        path = Path(target).expanduser()
         if not path.exists():
             return ActionResult(success=True, detail=f"No log file at {target}")
+        try:
+            assert_deletable(path)
+        except ProtectedPathError as exc:
+            logger.error("rotate_logs refused: %s", exc)
+            return ActionResult(success=False, detail=str(exc))
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         rotated = path.with_name(f"{path.stem}-{ts}{path.suffix}")
         shutil.move(str(path), str(rotated))
@@ -88,15 +94,30 @@ class DeterministicExecutor:
 
     async def _prune_files(self, *, target: str, max_age_days: str = "7", **_: str) -> ActionResult:
         import time
-        directory = Path(target)
+        directory = Path(target).expanduser()
         if not directory.is_dir():
             return ActionResult(success=True, detail=f"No directory at {target}")
         cutoff = time.time() - float(max_age_days) * 86400
         removed = 0
+        refused = 0
         for f in directory.iterdir():
             if f.is_file() and f.stat().st_mtime < cutoff:
+                try:
+                    assert_deletable(f)
+                except ProtectedPathError:
+                    refused += 1
+                    logger.error("prune_files refused protected raw archive file %s", f)
+                    continue
                 f.unlink()
                 removed += 1
+        if refused:
+            return ActionResult(
+                success=False,
+                detail=(
+                    f"Pruned {removed} files from {target}; "
+                    f"refused {refused} protected raw archive file(s)"
+                ),
+            )
         return ActionResult(success=True, detail=f"Pruned {removed} files from {target}")
 
     async def _noop(self, **_: str) -> ActionResult:
