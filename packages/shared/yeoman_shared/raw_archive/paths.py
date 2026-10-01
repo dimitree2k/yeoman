@@ -9,6 +9,7 @@ running with a different ``YEOMAN_HOME`` cannot sweep the live archive by accide
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from yeoman_shared.utils.helpers import get_operational_data_path
@@ -33,28 +34,46 @@ def spool_root() -> Path:
     return get_operational_data_path() / SPOOL_DIR
 
 
+def _normalize(path: str | Path) -> Path:
+    return Path(os.path.abspath(Path(path).expanduser()))
+
+
 def _resolve(path: str | Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
+def _lexical_protected_roots() -> tuple[Path, ...]:
+    """Normalized protected root paths before following any symlinks."""
+    bases = {get_operational_data_path(), DEFAULT_RUNTIME_DATA.expanduser()}
+    return tuple(sorted({_normalize(base / name) for base in bases for name in PROTECTED_DIR_NAMES}))
+
+
 def protected_roots() -> tuple[Path, ...]:
     """Resolved protected roots for the current home and the default runtime home."""
-    bases = {get_operational_data_path(), DEFAULT_RUNTIME_DATA.expanduser()}
-    return tuple(sorted({_resolve(base / name) for base in bases for name in PROTECTED_DIR_NAMES}))
+    return tuple(sorted({_resolve(root) for root in _lexical_protected_roots()}))
 
 
 def is_protected(path: str | Path) -> bool:
     """True when *path* is a protected root or lies inside one."""
-    target = _resolve(path)
-    return any(target == root or root in target.parents for root in protected_roots())
+    targets = (_normalize(path), _resolve(path))
+    lexical_roots = _lexical_protected_roots()
+    roots = set(lexical_roots) | {_resolve(root) for root in lexical_roots}
+    return any(
+        target == root or root in target.parents
+        for target in targets
+        for root in roots
+    )
 
 
 def contains_protected(path: str | Path) -> bool:
     """True when a recursive operation on *path* would reach a protected root."""
-    target = _resolve(path)
+    targets = (_normalize(path), _resolve(path))
+    lexical_roots = _lexical_protected_roots()
+    roots = set(lexical_roots) | {_resolve(root) for root in lexical_roots}
     return any(
         target == root or root in target.parents or target in root.parents
-        for root in protected_roots()
+        for target in targets
+        for root in roots
     )
 
 

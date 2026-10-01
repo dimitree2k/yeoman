@@ -71,3 +71,38 @@ def test_assert_helpers_raise_only_for_protected_paths(home: Path) -> None:
     assert_deletable(home / "var" / "media" / "incoming" / "a.jpg")
     assert_deletable_tree(home / "var" / "media")
     assert issubclass(ProtectedPathError, PermissionError)
+
+
+def test_inside_to_outside_symlink_is_protected(home: Path) -> None:
+    raw_dir = raw_root()
+    raw_dir.mkdir(parents=True)
+    outside = home / "outside.txt"
+    outside.write_text("x\n")
+    link = raw_dir / "link.txt"
+    link.symlink_to(outside)
+
+    assert is_protected(link)
+    assert contains_protected(link)
+    with pytest.raises(ProtectedPathError):
+        assert_deletable(link)
+    with pytest.raises(ProtectedPathError):
+        assert_deletable_tree(link)
+
+
+def test_symlinked_raw_root_with_outside_entry_is_protected(home: Path) -> None:
+    raw_dir = raw_root()
+    raw_dir.parent.mkdir(parents=True, exist_ok=True)
+    raw_target = home / "raw-target"
+    raw_target.mkdir()
+    raw_dir.symlink_to(raw_target, target_is_directory=True)
+    outside = home / "outside.txt"
+    outside.write_text("x\n")
+    link = raw_dir / "link.txt"
+    link.symlink_to(outside)
+
+    assert is_protected(link)
+    assert contains_protected(link)
+    with pytest.raises(ProtectedPathError):
+        assert_deletable(link)
+    with pytest.raises(ProtectedPathError):
+        assert_deletable_tree(link)
