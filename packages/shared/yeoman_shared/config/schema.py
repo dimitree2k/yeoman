@@ -986,6 +986,24 @@ class ProcessingConfig(BaseModel):
         return bool(shadowed) and f"{channel}:{chat_id}" in shadowed
 
 
+class RawArchiveMediaConfig(BaseModel):
+    """Raw media originals kept beside the raw archive (owner decision D10)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    max_video_bytes: int = Field(default=50 * 1024 * 1024, ge=0)
+
+
+class RawArchiveConfig(BaseModel):
+    """Append-only raw message archive (V1 spec §4.0, R7). Disabling it is an owner decision."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    media: RawArchiveMediaConfig = Field(default_factory=RawArchiveMediaConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for yeoman."""
 
@@ -1012,6 +1030,7 @@ class Config(BaseSettings):
         alias="personaEvolution",
     )
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
+    raw: RawArchiveConfig = Field(default_factory=RawArchiveConfig)
 
     @property
     def workspace_path(self) -> Path:
