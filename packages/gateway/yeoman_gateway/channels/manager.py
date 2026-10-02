@@ -14,12 +14,28 @@ from yeoman_gateway.channels.base import BaseChannel
 from yeoman_gateway.providers.openai_compatible import resolve_openai_compatible_credentials
 
 if TYPE_CHECKING:
+    from yeoman_shared.raw_archive.writer import RawArchive
+
     from yeoman_gateway.media.document_cache import DocumentCache
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.storage import MediaStorage
     from yeoman_gateway.providers.factory import ProviderFactory
     from yeoman_gateway.session.manager import SessionManager
     from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+
+def build_raw_archive(config: Config) -> RawArchive | None:
+    """The append-only raw archive for all channels, or None if owner-disabled."""
+    raw_cfg = config.raw
+    if not raw_cfg.enabled:
+        logger.warning("raw message archive disabled by config (owner decision required)")
+        return None
+    from yeoman_shared.raw_archive.writer import RawArchive as RawArchiveWriter
+
+    return RawArchiveWriter(
+        media_enabled=raw_cfg.media.enabled,
+        max_video_bytes=raw_cfg.media.max_video_bytes,
+    )
 
 
 class ChannelManager:
@@ -67,6 +83,7 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
+        self.raw_archive = build_raw_archive(self.config)
 
         # Telegram channel
         if self.config.channels.telegram.enabled:
@@ -79,6 +96,7 @@ class ChannelManager:
                     groq_api_key=self.config.providers.groq.api_key,
                     session_manager=self.session_manager,
                 )
+                self.channels["telegram"].set_raw_archive(self.raw_archive)
                 logger.info("Telegram channel enabled")
             except ImportError as e:
                 logger.warning(f"Telegram channel not available: {e}")
@@ -102,6 +120,7 @@ class ChannelManager:
                     openai_api_base=openai_compat.api_base if openai_compat else None,
                     openai_extra_headers=openai_compat.extra_headers if openai_compat else None,
                 )
+                self.channels["whatsapp"].set_raw_archive(self.raw_archive)
                 if self.processing_gate is not None:
                     setter = getattr(self.channels["whatsapp"], "set_processing_gate", None)
                     if setter is not None:

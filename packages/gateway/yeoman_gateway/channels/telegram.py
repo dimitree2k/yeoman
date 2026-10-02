@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from telegram import BotCommand, Update
@@ -12,6 +12,13 @@ from telegram.constants import MessageEntityType
 from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yeoman_shared.config.schema import TelegramConfig
+from yeoman_shared.raw_archive.writer import (
+    RawArchive,
+    RawArchiveCapacityError,
+    RawEvent,
+    append_async,
+    store_media_async,
+)
 
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
@@ -84,6 +91,19 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+def raw_event_for_update(update: Any) -> RawEvent:
+    """The native Telegram update as one raw archive line (V1 spec §4.0)."""
+    message = getattr(update, "message", None)
+    return RawEvent(
+        channel="telegram",
+        kind="update",
+        direction="in",
+        native=update.to_dict(),
+        native_id=str(getattr(update, "update_id", "") or ""),
+        chat_id=str(getattr(message, "chat_id", "") or ""),
+    )
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
@@ -117,6 +137,23 @@ class TelegramChannel(BaseChannel):
         self._bot_id: int | None = None
         self._bot_username: str = ""
         self._stopping_due_to_conflict = False
+        self._raw_archive: RawArchive | None = None
+        self._stopping_due_to_raw_archive_capacity = False
+
+    def set_raw_archive(self, archive: RawArchive | None) -> None:
+        """Attach the append-only raw archive (V1 spec §4.0)."""
+        self._raw_archive = archive
+
+    def _stop_for_raw_archive_capacity(self) -> None:
+        if self._stopping_due_to_raw_archive_capacity:
+            return
+        self._stopping_due_to_raw_archive_capacity = True
+        self._running = False
+        logger.error(
+            "Telegram raw archive capacity reached; stopping until storage is repaired "
+            "and Telegram is explicitly restarted"
+        )
+        asyncio.create_task(self.stop())
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -193,39 +230,74 @@ class TelegramChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
+        if self._stopping_due_to_raw_archive_capacity:
+            raise RawArchiveCapacityError("Telegram raw archive capacity reached")
         if not self._app:
             logger.warning("Telegram bot not running")
             return
 
         # Stop typing indicator for this chat
         self._stop_typing(msg.chat_id)
+        request_native = {"chat_id": msg.chat_id, "content": msg.content, "media": list(msg.media)}
+        try:
+            await append_async(
+                self._raw_archive,
+                RawEvent(
+                    channel="telegram",
+                    kind="outbound_request",
+                    direction="out",
+                    native=request_native,
+                    chat_id=str(msg.chat_id),
+                ),
+            )
+        except RawArchiveCapacityError:
+            self._stop_for_raw_archive_capacity()
+            raise
 
         try:
             # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML"
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id, text=html_content, parse_mode="HTML"
             )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
+            return
         except Exception as e:
             # Fallback to plain text if HTML parsing fails
             logger.warning(f"HTML parse failed, falling back to plain text: {e}")
             try:
-                await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text=msg.content
+                sent = await self._app.bot.send_message(
+                    chat_id=int(msg.chat_id), text=msg.content
                 )
             except Exception as e2:
                 logger.error(f"Error sending Telegram message: {e2}")
+                return
+
+        try:
+            await append_async(
+                self._raw_archive,
+                RawEvent(
+                    channel="telegram",
+                    kind="outbound_result",
+                    direction="out",
+                    native={"message_id": getattr(sent, "message_id", None)},
+                    native_id=str(getattr(sent, "message_id", "") or ""),
+                    chat_id=str(msg.chat_id),
+                ),
+            )
+        except RawArchiveCapacityError:
+            logger.error(
+                "Telegram send succeeded but its raw archive result could not be retained; "
+                "preserving the send result"
+            )
+            self._stop_for_raw_archive_capacity()
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
-        if not update.message or not update.effective_user:
+        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
             return
 
         user = update.effective_user
@@ -237,7 +309,7 @@ class TelegramChannel(BaseChannel):
 
     async def _on_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /reset command — clear conversation history."""
-        if not update.message or not update.effective_user:
+        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
             return
 
         chat_id = str(update.message.chat_id)
@@ -258,7 +330,7 @@ class TelegramChannel(BaseChannel):
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command — show available commands."""
-        if not update.message:
+        if self._stopping_due_to_raw_archive_capacity or not update.message:
             return
 
         help_text = (
@@ -272,7 +344,13 @@ class TelegramChannel(BaseChannel):
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
-        if not update.message or not update.effective_user:
+        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
+            return
+
+        try:
+            await append_async(self._raw_archive, raw_event_for_update(update))
+        except RawArchiveCapacityError:
+            self._stop_for_raw_archive_capacity()
             return
 
         message = update.message
@@ -329,6 +407,33 @@ class TelegramChannel(BaseChannel):
                 await file.download_to_drive(str(file_path))
 
                 media_paths.append(str(file_path))
+                try:
+                    media_meta = await store_media_async(
+                        self._raw_archive,
+                        "telegram",
+                        file_path,
+                        kind={"image": "image", "voice": "audio", "audio": "audio"}.get(
+                            str(media_type), "document"
+                        ),
+                    )
+                    await append_async(
+                        self._raw_archive,
+                        RawEvent(
+                            channel="telegram",
+                            kind="media",
+                            direction="in",
+                            native={
+                                "update_id": getattr(update, "update_id", ""),
+                                "file_id": media_file.file_id,
+                            },
+                            native_id=str(getattr(update, "update_id", "") or ""),
+                            chat_id=str(chat_id),
+                            media=media_meta,
+                        ),
+                    )
+                except RawArchiveCapacityError:
+                    self._stop_for_raw_archive_capacity()
+                    return
 
                 # Handle voice transcription
                 if media_type == "voice" or media_type == "audio":
@@ -354,6 +459,10 @@ class TelegramChannel(BaseChannel):
 
         str_chat_id = str(chat_id)
         mention_meta = self._mention_metadata(message)
+
+        # Stop processing if another handler reached the raw archive capacity limit.
+        if self._stopping_due_to_raw_archive_capacity:
+            return
 
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
