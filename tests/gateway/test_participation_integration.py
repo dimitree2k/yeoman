@@ -875,6 +875,246 @@ async def test_comment_is_one_judge_one_generation_one_effect(tmp_path: Path) ->
     log.close()
 
 
+@pytest.mark.parametrize(
+    ("revoke_source", "oversized_optional"),
+    [(False, False), (True, False), (False, True)],
+    ids=["effect", "revocation", "optional-budget-trim"],
+)
+@pytest.mark.asyncio
+async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effect(
+    tmp_path: Path, revoke_source: bool, oversized_optional: bool
+) -> None:
+    """A real protected statement reaches both prompts; revocation blocks its draft."""
+    from time import time
+
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.knowledge._capture_worker import StatementDraft
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+    from yeoman_gateway.media.router import ModelRouter
+    from yeoman_gateway.processing.model_route import RouteReply
+    from yeoman_gateway.processing.participation import ParticipationJudge
+    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+    from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelector
+    from yeoman_gateway.providers.base import LLMResponse
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+    from yeoman_shared.config.schema import Config
+
+    from tests.gateway.capture_harness import CaptureHarness, Registry
+
+    older_fact = "The group meetup is every Friday."
+    knowledge_now_ms = int(time() * 1000)
+    members = frozenset({"anna@s.whatsapp.net", "ben@s.whatsapp.net"})
+    harness = CaptureHarness(
+        tmp_path / "protected",
+        registry=Registry({("whatsapp", CHAT): ["anna", "ben"]}),
+        idle_ms=0,
+    )
+    harness.now = knowledge_now_ms
+    harness.activate()
+    old_source = harness.observe(
+        "The group meetup is every Friday.",
+        message_id="old-meetup",
+        chat_id=CHAT,
+        occurred_ms=knowledge_now_ms - 7 * 86_400_000,
+    )
+    harness.advance(1)
+    harness.drafts = [StatementDraft(content=older_fact, source_index=0)]
+    assert harness.run_capture().published == 1
+    assert harness.source_row(old_source)["audience_status"] == "known"
+
+    archive = InboundArchive(tmp_path / "inbound.db")
+    archive.record_inbound(
+        channel=CHANNEL,
+        chat_id=CHAT,
+        message_id="m1",
+        participant="anna@s.whatsapp.net",
+        sender_id="anna@s.whatsapp.net",
+        sender_name="Anna",
+        text="When is the group meetup?",
+        timestamp=knowledge_now_ms // 1000,
+    )
+    oversized_text = "unrelated optional history " * 5_000
+    if oversized_optional:
+        archive.record_inbound(
+            channel=CHANNEL,
+            chat_id=CHAT,
+            message_id="optional-large-history",
+            participant="ben@s.whatsapp.net",
+            sender_id="ben@s.whatsapp.net",
+            sender_name="Ben",
+            text=oversized_text,
+            timestamp=knowledge_now_ms // 1000 - 60,
+        )
+    selector = ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
+
+    def trusted_contexts(opportunity, context):
+        del opportunity, context
+        return (
+            TrustedReadContext(
+                principal_id="anna@s.whatsapp.net",
+                channel=CHANNEL,
+                chat_id=CHAT,
+                recipient_principals=members,
+                membership_revision="members-v1",
+                policy_revision=1,
+                purpose="proactive",
+                now_ms=knowledge_now_ms,
+                is_direct=False,
+            ),
+            FactReadContext(
+                principal_id="anna@s.whatsapp.net",
+                chat_scope_key=f"channel:{CHANNEL}:chat:{CHAT}",
+                current_members=members,
+                epoch=harness.memory.store.acl_epoch(),
+                now_ms=knowledge_now_ms,
+            ),
+        )
+
+    builder = ParticipationContextBuilder(
+        archive=archive,
+        policy=PolicyEngine(_policy(), workspace=tmp_path),
+        source_authorizer=lambda row: True,
+        knowledge_selector=selector,
+        knowledge_context_supplier=trusted_contexts,
+    )
+
+    class JudgeClient:
+        route_key = "fake-participation-judge"
+
+        def __init__(self):
+            self.requests = []
+
+        async def chat_with_usage(self, messages, **kwargs):
+            del kwargs
+            self.requests.append(messages)
+            action = "silence" if len(self.requests) > 1 else "comment"
+            payload = (
+                '{"action":"comment","intent":"initiate","reason":"useful",'
+                '"purpose":"answer the meetup question",'
+                '"contribution_type":"observation","target_message_id":"m1"}'
+                if action == "comment"
+                else '{"action":"silence","intent":"initiate","reason":"no longer grounded"}'
+            )
+            return RouteReply(content=payload, model="fake-judge", finish_reason="stop")
+
+    writer_requests = []
+    effects = []
+
+    class WriterProvider:
+        async def chat(self, messages, **kwargs):
+            del kwargs
+            writer_requests.append(messages)
+            # Simulate a real source deletion while the draft is being generated.
+            if revoke_source:
+                harness.delete("old-meetup", chat_id=CHAT)
+            return LLMResponse(content="Friday works for the meetup.")
+
+    class MainProvider:
+        def get_default_model(self):
+            return "unused"
+
+        async def chat(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("draft-only generation must use the writer route")
+
+    config = Config.model_validate({
+        "models": {
+            "profiles": {
+                "participation_writer": {
+                    "kind": "chat", "model": "fake-writer", "provider": "fake"
+                }
+            },
+            "routes": {"participation.writer": "participation_writer"},
+        }
+    })
+    responder = LLMResponder(
+        provider=MainProvider(),  # type: ignore[arg-type]
+        workspace=tmp_path,
+        bus=MessageBus(),
+        model_router=ModelRouter(config.models),
+        routed_provider_factory=lambda model, provider: WriterProvider(),  # type: ignore[arg-type]
+    )
+
+    async def record_effect(*, admission, effect_id, content):
+        del admission
+        effects.append((effect_id, content))
+        return {"status": "submitted", "effect_id": effect_id}
+
+    responder.submit_participation_comment = record_effect
+    submission = _ParticipationSubmission(
+        responder=responder, writer_profile="participation_writer"
+    )
+    runtime, _judge, _context, log = _runtime(
+        tmp_path, decision=COMMENT, submission=submission
+    )
+    runtime._context_builder = builder
+    judge_client = JudgeClient()
+    finalized_contexts = []
+
+    class InspectingJudge(ParticipationJudge):
+        def _fit_context_for_judge(self, context, opportunity):
+            super()._fit_context_for_judge(context, opportunity)
+            finalized_contexts.append(dict(context))
+
+    runtime._judge = InspectingJudge(client=judge_client)
+
+    def revalidate(opportunity, context, selection):
+        read_context, fact_context = trusted_contexts(opportunity, context)
+        return selector.revalidate(
+            selection, read_context=read_context, fact_context=fact_context
+        )
+
+    runtime._revalidate_knowledge = revalidate
+    try:
+        result = await runtime.evaluate_participation(_opportunity("m1"))
+        assert writer_requests
+        assert len(writer_requests) == 1
+        judge_prompt = "\n".join(item["content"] for item in judge_client.requests[0])
+        writer_prompt = "\n".join(
+            str(item.get("content", "")) for request in writer_requests for item in request
+        )
+        assert older_fact in judge_prompt and older_fact in writer_prompt
+        assert 'id="m1"' in judge_prompt
+        assert "When is the group meetup?" in writer_prompt
+        assert finalized_contexts[0]["knowledge_rendered_to_judge"] is True
+        if oversized_optional:
+            assert finalized_contexts[0]["judge_dropped_entry_count"] >= 1
+            assert "optional-large-history" in finalized_contexts[0]["judge_dropped_entry_ids"]
+            assert finalized_contexts[0]["selected_knowledge_text"] == older_fact
+            assert oversized_text not in judge_prompt
+            assert oversized_text not in writer_prompt
+        if revoke_source:
+            harness.advance(1_000)
+            assert harness.statements()[0]["status"] == "revoked"
+            assert len(judge_client.requests) == 2, result
+            assert result["status"] == "silence", result
+            assert effects == []
+            assert await log.pending_delivery_reservations(origin="participation") == []
+            assert harness.knowledge.recall(
+                __import__("yeoman_gateway.knowledge.models", fromlist=["RecallQuery"]).RecallQuery(
+                    text="group meetup", limit=3
+                ),
+                context=trusted_contexts(_opportunity("m1"), {})[0],
+                group_wide=True,
+            ).text == ""
+        else:
+            assert len(judge_client.requests) == 1, result
+            assert result["status"] == "submitted", result
+            assert len(effects) == 1
+            assert selector.revalidate(
+                finalized_contexts[0]["_knowledge_selection"],
+                read_context=trusted_contexts(_opportunity("m1"), {})[0],
+                fact_context=trusted_contexts(_opportunity("m1"), {})[1],
+            ).text == older_fact
+    finally:
+        archive.close()
+        harness.close()
+        log.close()
+
+
 @pytest.mark.asyncio
 async def test_writer_unavailable_removes_only_comment(tmp_path: Path) -> None:
     """A missing writer must not disable an otherwise permitted reaction."""
