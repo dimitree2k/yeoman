@@ -113,57 +113,105 @@ def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
     )
 
 
-def _rewrite_without(path: Path, selector: PurgeSelector) -> None:
+def _lock_file(path: Path) -> int:
     while True:
         lock_fd = os.open(path, os.O_RDONLY)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            if os.fstat(lock_fd).st_ino != os.stat(path).st_ino:
-                continue
-            mode = path.stat().st_mode & 0o777
-            temporary = path.with_name(f".{path.name}.purge-tmp")
-            with temporary.open("w", encoding="utf-8") as handle:
-                for _, record, line in iter_records(path):
-                    if record is not None and selector.matches(record):
-                        continue
-                    handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, mode or OPEN_FILE_MODE)
-            os.replace(temporary, path)
-            return
-        finally:
+            if os.fstat(lock_fd).st_ino == os.stat(path).st_ino:
+                return lock_fd
+        except BaseException:
             os.close(lock_fd)
+            raise
+        os.close(lock_fd)
+
+
+def _lock_files(root: Path, files: tuple[str, ...]) -> list[tuple[str, Path, int]]:
+    locked: list[tuple[str, Path, int]] = []
+    try:
+        for relative in sorted(files):
+            path = root / relative
+            locked.append((relative, path, _lock_file(path)))
+    except BaseException:
+        for _, _, lock_fd in reversed(locked):
+            os.close(lock_fd)
+        raise
+    return locked
+
+
+def _snapshot_locked(
+    locked: list[tuple[str, Path, int]],
+    selector: PurgeSelector,
+    media_removed: tuple[str, ...],
+) -> PurgeResult:
+    files: list[str] = []
+    removed: list[str] = []
+    for relative, path, _ in locked:
+        hit = False
+        for _, record, line in iter_records(path):
+            if record is not None and selector.matches(record):
+                hit = True
+                removed.append(line_sha256(line))
+        if hit:
+            files.append(relative)
+    return PurgeResult(tuple(files), len(removed), tuple(removed), media_removed)
+
+
+def _rewrite_without(path: Path, selector: PurgeSelector, lock_fd: int) -> None:
+    mode = os.fstat(lock_fd).st_mode & 0o777
+    temporary = path.with_name(f".{path.name}.purge-tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for _, record, line in iter_records(path):
+            if record is not None and selector.matches(record):
+                continue
+            handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, mode or OPEN_FILE_MODE)
+    os.replace(temporary, path)
 
 
 def purge(
     root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None
 ) -> PurgeResult:
     """Physically remove matching lines (and now-unreferenced media). Owner CLI only."""
-    plan = plan_purge(root, selector)
-    if plan.removed_lines == 0:
-        return plan
-    now = int(now_ms if now_ms is not None else time.time() * 1000)
-    append_protected(
-        root / AUDIT,
-        dumps(
-            {
-                "ts_ms": now,
-                "operator": operator,
-                "selector": asdict(selector),
-                "files": list(plan.files),
-                "removed_lines": plan.removed_lines,
-                "removed_sha256": list(plan.removed_sha256),
-                "media_removed": list(plan.media_removed),
-            }
-        ),
+    preview = plan_purge(root, selector)
+    files = tuple(
+        path.relative_to(root).as_posix()
+        for path in archive_files(root, safe_channel(selector.channel))
     )
-    sealed = latest_manifest(root)
-    for relative in plan.files:
-        path = root / relative
-        _rewrite_without(path, selector)
-        if relative in sealed:
-            record_closed(root, path, now_ms=now, note="purged")
+    if not files:
+        return preview
+    locked = _lock_files(root, files)
+    try:
+        plan = _snapshot_locked(locked, selector, preview.media_removed)
+        if plan.removed_lines == 0:
+            return PurgeResult((), 0, (), ())
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        append_protected(
+            root / AUDIT,
+            dumps(
+                {
+                    "ts_ms": now,
+                    "operator": operator,
+                    "selector": asdict(selector),
+                    "files": list(plan.files),
+                    "removed_lines": plan.removed_lines,
+                    "removed_sha256": list(plan.removed_sha256),
+                    "media_removed": list(plan.media_removed),
+                }
+            ),
+        )
+        sealed = latest_manifest(root)
+        for relative, path, lock_fd in locked:
+            if relative not in plan.files:
+                continue
+            _rewrite_without(path, selector, lock_fd)
+            if relative in sealed:
+                record_closed(root, path, now_ms=now, note="purged")
+    finally:
+        for _, _, lock_fd in reversed(locked):
+            os.close(lock_fd)
     for relative in plan.media_removed:
         (root / relative).unlink(missing_ok=True)
     return plan

@@ -153,3 +153,83 @@ def test_purge_does_not_follow_media_paths_outside_archive(tmp_path: Path) -> No
     assert result.removed_lines == 1
     assert result.media_removed == ()
     assert outside.read_bytes() == b"keep"
+
+
+def test_purge_audits_only_the_locked_snapshot_and_preserves_late_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import yeoman_shared.raw_archive.purge as purge_module
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "before", "c1", OCT)
+    append_started = threading.Event()
+    append_finished = threading.Event()
+    real_append_line = writer_module.append_line
+    real_append_protected = purge_module.append_protected
+    late_writer: threading.Thread | None = None
+
+    def tracked_append_line(path: Path, line: str, **kwargs: object) -> None:
+        if threading.current_thread().name == "late-archive-writer":
+            append_started.set()
+        real_append_line(path, line, **kwargs)
+
+    def append_late_message() -> None:
+        try:
+            _message(archive, "late", "c1", OCT)
+        finally:
+            append_finished.set()
+
+    def audited_append(path: Path, line: str) -> None:
+        nonlocal late_writer
+        real_append_protected(path, line)
+        if path == root / AUDIT:
+            late_writer = threading.Thread(
+                name="late-archive-writer", target=append_late_message, daemon=True
+            )
+            late_writer.start()
+            assert append_started.wait(timeout=2)
+            late_writer.join(timeout=1)
+
+    monkeypatch.setattr(writer_module, "append_line", tracked_append_line)
+    monkeypatch.setattr(purge_module, "append_protected", audited_append)
+    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm")
+
+    assert late_writer is not None
+    late_writer.join(timeout=5)
+    assert append_finished.is_set()
+    assert result.removed_lines == 1
+    [audit] = [r for _, r, _ in iter_records(root / AUDIT) if r]
+    assert audit["removed_lines"] == result.removed_lines
+    assert audit["removed_sha256"] == list(result.removed_sha256)
+    assert _ids(root) == ["late"]
+
+
+def test_purge_includes_matches_arriving_before_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.purge as purge_module
+
+    root, archive = _setup(tmp_path)
+    _message(archive, "other-chat", "c2", OCT)
+    real_lock_file = purge_module._lock_file
+    appended = False
+
+    def append_before_lock(path: Path) -> int:
+        nonlocal appended
+        if not appended:
+            appended = True
+            _message(archive, "arrived-before-lock", "c1", OCT)
+        return real_lock_file(path)
+
+    monkeypatch.setattr(purge_module, "_lock_file", append_before_lock)
+    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm")
+
+    assert appended
+    assert result.removed_lines == 1
+    [audit] = [r for _, r, _ in iter_records(root / AUDIT) if r]
+    assert audit["removed_lines"] == 1
+    assert audit["removed_sha256"] == list(result.removed_sha256)
+    assert _ids(root) == ["other-chat"]
