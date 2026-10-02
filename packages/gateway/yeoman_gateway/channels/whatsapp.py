@@ -17,6 +17,14 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.raw_archive.writer import (
+    RawArchive,
+    RawArchiveCapacityError,
+    RawEvent,
+    append_async,
+    media_kind_from_mime,
+    store_media_async,
+)
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION, REPLAYABLE_EVENT_TYPES
 
 from yeoman_gateway.bus.events import OutboundMessage, ReactionMessage
@@ -49,6 +57,10 @@ _VOLATILE_PROVIDER_FIELDS = frozenset(
         "commit_ms",
         "confirmed_ms",
     }
+)
+
+RAW_ARCHIVED_COMMANDS = frozenset(
+    {"send_text", "send_media", "react", "delete_message", "forward_message"}
 )
 
 
@@ -270,6 +282,7 @@ class WhatsAppChannel(BaseChannel):
             outgoing_dir=self.config.media.outgoing_path,
         )
         self._document_cache = document_cache
+        self._raw_archive: RawArchive | None = None
         self._vision_describer = (
             VisionDescriber(provider_factory) if provider_factory is not None else None
         )
@@ -1044,6 +1057,97 @@ class WhatsAppChannel(BaseChannel):
         """Attach the journal sink for provider signals (edit/delete/reaction/receipt)."""
         self._processing_signals = sink
 
+    def set_raw_archive(self, archive: RawArchive | None) -> None:
+        """Attach the append-only raw archive (V1 spec §4.0)."""
+        self._raw_archive = archive
+
+    async def _raw_archive_bridge_frame(
+        self, frame: dict[str, Any], kind: str, payload: dict[str, Any]
+    ) -> None:
+        archive = self._raw_archive
+        if archive is None:
+            return
+        media_meta: dict[str, Any] | None = None
+        media = payload.get("media")
+        if isinstance(media, dict) and isinstance(media.get("path"), str):
+            validated = self._media_storage.validate_incoming_path(media["path"])
+            if validated is None:
+                media_meta = {"stored": False, "path": None, "reason": "path_rejected"}
+            else:
+                kind_hint = str(media.get("kind") or media_kind_from_mime(media.get("mimeType")))
+                media_meta = await store_media_async(archive, "whatsapp", validated, kind=kind_hint)
+        await append_async(
+            archive,
+            RawEvent(
+                channel="whatsapp",
+                kind=kind,
+                direction="in",
+                native={key: value for key, value in frame.items() if key != "token"},
+                native_id=str(frame.get("eventId") or ""),
+                chat_id=str(payload.get("chatJid") or ""),
+                account=str(frame.get("accountId") or ""),
+                media=media_meta,
+            ),
+        )
+
+    async def _raw_archive_outbound(
+        self,
+        kind: str,
+        command_type: str,
+        request_id: str,
+        payload: dict[str, Any],
+        *,
+        result: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        archive = self._raw_archive
+        if archive is None or command_type not in RAW_ARCHIVED_COMMANDS:
+            return
+        native: dict[str, Any] = {"type": command_type, "requestId": request_id}
+        media_meta: dict[str, Any] | None = None
+        native_id = ""
+        if kind == "outbound_request":
+            native["payload"] = payload
+            media_path = payload.get("mediaPath")
+            if isinstance(media_path, str):
+                validated = self._media_storage.validate_outgoing_path(media_path)
+                if validated is None:
+                    media_meta = {"stored": False, "path": None, "reason": "path_rejected"}
+                else:
+                    media_meta = await store_media_async(
+                        archive,
+                        "whatsapp",
+                        validated,
+                        kind=media_kind_from_mime(str(payload.get("mimeType") or "")),
+                    )
+        elif error is not None:
+            native["error"] = f"{type(error).__name__}: {error}"[:300]
+        else:
+            native["result"] = result or {}
+            native_id = str((result or {}).get("providerMessageId") or "")
+        await append_async(
+            archive,
+            RawEvent(
+                channel="whatsapp",
+                kind=kind,
+                direction="out",
+                native=native,
+                native_id=native_id,
+                chat_id=str(payload.get("to") or payload.get("chatJid") or ""),
+                account="default",
+                correlation_id=request_id,
+                media=media_meta,
+            ),
+        )
+
+    async def _stop_for_raw_archive_capacity(self) -> None:
+        logger.error(
+            "WhatsApp raw archive capacity reached; stopping until storage is repaired "
+            "and intake is explicitly restarted"
+        )
+        self._running = False
+        await self._close_bridge_intake("raw_archive_capacity")
+
     def _reject_replayable_frame(self, kind: object, reason: str) -> None:
         """Reject malformed canonical input without echoing its untrusted payload."""
         logger.warning("Malformed replayable bridge frame type={} reason={}", kind, reason)
@@ -1219,6 +1323,13 @@ class WhatsAppChannel(BaseChannel):
             if current_task is not reader_task:
                 return bool(await wait_for_completion)
             return True
+
+        try:
+            await self._raw_archive_bridge_frame(frame, kind, payload)
+        except RawArchiveCapacityError:
+            await self._forget_bridge_work(work)
+            await self._stop_for_raw_archive_capacity()
+            return False
 
         capture = getattr(self._processing_signals, "capture", None)
         if not callable(capture):
@@ -2656,6 +2767,12 @@ class WhatsAppChannel(BaseChannel):
             raise ValueError(
                 f"Bridge command payload too large: {envelope_bytes} > {max_payload_bytes} bytes"
             )
+        try:
+            await self._raw_archive_outbound("outbound_request", command_type, request_id, payload)
+        except RawArchiveCapacityError:
+            await self._stop_for_raw_archive_capacity()
+            raise
+
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
 
@@ -2670,6 +2787,16 @@ class WhatsAppChannel(BaseChannel):
             async with self._send_lock:
                 await self._ws.send(encoded)
             result = await asyncio.wait_for(future, timeout=timeout_seconds)
+            try:
+                await self._raw_archive_outbound(
+                    "outbound_result", command_type, request_id, payload, result=result
+                )
+            except RawArchiveCapacityError:
+                logger.error(
+                    "WhatsApp bridge command succeeded but its raw archive result "
+                    "could not be retained; preserving the bridge result"
+                )
+                await self._stop_for_raw_archive_capacity()
             logger.debug(
                 "WhatsApp bridge command ok type={} request_id={}",
                 command_type,
@@ -2677,6 +2804,12 @@ class WhatsAppChannel(BaseChannel):
             )
             return result
         except Exception as e:
+            try:
+                await self._raw_archive_outbound(
+                    "outbound_result", command_type, request_id, payload, error=e
+                )
+            except RawArchiveCapacityError:
+                await self._stop_for_raw_archive_capacity()
             logger.warning(
                 "WhatsApp bridge command failed type={} request_id={} error={} {}",
                 command_type,
