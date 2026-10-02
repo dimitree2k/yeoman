@@ -10,7 +10,14 @@ from loguru import logger
 from telegram import BotCommand, Update
 from telegram.constants import MessageEntityType
 from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 from yeoman_shared.config.schema import TelegramConfig
 from yeoman_shared.raw_archive.writer import (
     RawArchive,
@@ -139,10 +146,29 @@ class TelegramChannel(BaseChannel):
         self._stopping_due_to_conflict = False
         self._raw_archive: RawArchive | None = None
         self._stopping_due_to_raw_archive_capacity = False
+        self._capacity_stop_task: asyncio.Task[None] | None = None
 
     def set_raw_archive(self, archive: RawArchive | None) -> None:
         """Attach the append-only raw archive (V1 spec §4.0)."""
         self._raw_archive = archive
+
+    async def _archive_native_update(self, update: Update, context: Any) -> bool:
+        if self._stopping_due_to_raw_archive_capacity:
+            return False
+        if context is not None and getattr(context, "_yeoman_raw_archived_update", None) is update:
+            return True
+        try:
+            await append_async(self._raw_archive, raw_event_for_update(update))
+        except RawArchiveCapacityError:
+            self._stop_for_raw_archive_capacity()
+            return False
+        if context is not None:
+            context._yeoman_raw_archived_update = update
+        return True
+
+    async def _on_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Archive every polled update before filters or command handlers run."""
+        await self._archive_native_update(update, context)
 
     def _stop_for_raw_archive_capacity(self) -> None:
         if self._stopping_due_to_raw_archive_capacity:
@@ -153,13 +179,18 @@ class TelegramChannel(BaseChannel):
             "Telegram raw archive capacity reached; stopping until storage is repaired "
             "and Telegram is explicitly restarted"
         )
-        asyncio.create_task(self.stop())
+        self._capacity_stop_task = asyncio.create_task(self.stop())
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
             logger.error("Telegram bot token not configured")
             return
+
+        if self._capacity_stop_task is not None:
+            await self._capacity_stop_task
+            self._capacity_stop_task = None
+            self._stopping_due_to_raw_archive_capacity = False
 
         self._running = True
 
@@ -168,6 +199,9 @@ class TelegramChannel(BaseChannel):
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
+
+        # Capture every update before command/filter dispatch; handlers share this context.
+        self._app.add_handler(TypeHandler(Update, self._on_update), group=-1)
 
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
@@ -297,11 +331,14 @@ class TelegramChannel(BaseChannel):
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
-        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
+        if not update.message or not update.effective_user:
+            return
+        if not await self._archive_native_update(update, context):
             return
 
         user = update.effective_user
-        await update.message.reply_text(
+        await self._reply_text(
+            update,
             f"👋 Hi {user.first_name}! I'm yeoman.\n\n"
             "Send me a message and I'll respond!\n"
             "Type /help to see available commands."
@@ -309,7 +346,9 @@ class TelegramChannel(BaseChannel):
 
     async def _on_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /reset command — clear conversation history."""
-        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
+        if not update.message or not update.effective_user:
+            return
+        if not await self._archive_native_update(update, context):
             return
 
         chat_id = str(update.message.chat_id)
@@ -317,7 +356,7 @@ class TelegramChannel(BaseChannel):
 
         if self.session_manager is None:
             logger.warning("/reset called but session_manager is not available")
-            await update.message.reply_text("⚠️ Session management is not available.")
+            await self._reply_text(update, "⚠️ Session management is not available.")
             return
 
         session = self.session_manager.get_or_create(session_key)
@@ -326,11 +365,13 @@ class TelegramChannel(BaseChannel):
         self.session_manager.save(session)
 
         logger.info(f"Session reset for {session_key} (cleared {msg_count} messages)")
-        await update.message.reply_text("🔄 Conversation history cleared. Let's start fresh!")
+        await self._reply_text(update, "🔄 Conversation history cleared. Let's start fresh!")
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command — show available commands."""
-        if self._stopping_due_to_raw_archive_capacity or not update.message:
+        if not update.message:
+            return
+        if not await self._archive_native_update(update, context):
             return
 
         help_text = (
@@ -340,17 +381,65 @@ class TelegramChannel(BaseChannel):
             "/help — Show this help message\n\n"
             "Just send me a text message to chat!"
         )
-        await update.message.reply_text(help_text, parse_mode="HTML")
+        await self._reply_text(update, help_text, parse_mode="HTML")
+
+    async def _reply_text(
+        self, update: Update, text: str, *, parse_mode: str | None = None
+    ) -> None:
+        message = update.message
+        if self._stopping_due_to_raw_archive_capacity or message is None:
+            return
+        request_native = {
+            "method": "reply_text",
+            "chat_id": message.chat_id,
+            "reply_to_message_id": message.message_id,
+            "text": text,
+        }
+        if parse_mode is not None:
+            request_native["parse_mode"] = parse_mode
+        try:
+            await append_async(
+                self._raw_archive,
+                RawEvent(
+                    channel="telegram",
+                    kind="outbound_request",
+                    direction="out",
+                    native=request_native,
+                    chat_id=str(message.chat_id),
+                ),
+            )
+        except RawArchiveCapacityError:
+            self._stop_for_raw_archive_capacity()
+            return
+
+        if parse_mode is None:
+            sent = await message.reply_text(text)
+        else:
+            sent = await message.reply_text(text, parse_mode=parse_mode)
+        try:
+            await append_async(
+                self._raw_archive,
+                RawEvent(
+                    channel="telegram",
+                    kind="outbound_result",
+                    direction="out",
+                    native={"message_id": getattr(sent, "message_id", None)},
+                    native_id=str(getattr(sent, "message_id", "") or ""),
+                    chat_id=str(message.chat_id),
+                ),
+            )
+        except RawArchiveCapacityError:
+            logger.error(
+                "Telegram command reply succeeded but its raw archive result could not be retained; "
+                "preserving the reply result"
+            )
+            self._stop_for_raw_archive_capacity()
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
-        if self._stopping_due_to_raw_archive_capacity or not update.message or not update.effective_user:
+        if not update.message or not update.effective_user:
             return
-
-        try:
-            await append_async(self._raw_archive, raw_event_for_update(update))
-        except RawArchiveCapacityError:
-            self._stop_for_raw_archive_capacity()
+        if not await self._archive_native_update(update, context):
             return
 
         message = update.message

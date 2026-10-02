@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from telegram.ext import TypeHandler
 from yeoman_gateway.bus.events import OutboundMessage
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels import telegram
@@ -13,6 +14,7 @@ from yeoman_gateway.channels.manager import build_raw_archive
 from yeoman_gateway.channels.telegram import TelegramChannel, raw_event_for_update
 from yeoman_shared.config.loader import convert_keys
 from yeoman_shared.config.schema import Config, TelegramConfig
+from yeoman_shared.raw_archive import writer as raw_writer
 from yeoman_shared.raw_archive.records import archive_files, iter_records
 from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError
 
@@ -226,7 +228,9 @@ async def test_inbound_media_is_copied_and_linked_to_its_update(
         return None
 
     channel._handle_message = handle_message  # type: ignore[method-assign]
-    await channel._on_message(update, None)
+    context = SimpleNamespace()
+    await channel._on_update(update, context)
+    await channel._on_message(update, context)
 
     records = _records(tmp_path / "raw")
     assert [record["kind"] for record in records] == ["update", "media"]
@@ -234,3 +238,305 @@ async def test_inbound_media_is_copied_and_linked_to_its_update(
     media_path = tmp_path / "raw" / records[1]["media"]["path"]
     assert records[1]["media"]["stored"] is True
     assert media_path.read_bytes() == b"telegram photo"
+
+
+@pytest.mark.asyncio
+async def test_start_registers_raw_update_capture_before_command_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = TelegramChannel(TelegramConfig(token="fake"), MessageBus())
+    registered: list[tuple[int, object]] = []
+
+    class App:
+        bot = SimpleNamespace(
+            get_me=lambda: _async_result(SimpleNamespace(id=1, username="bot")),
+            set_my_commands=lambda commands: _async_result(None),
+        )
+
+        def __init__(self) -> None:
+            self.updater = SimpleNamespace(start_polling=self.start_polling)
+
+        def add_handler(self, handler, group=0) -> None:
+            registered.append((group, handler))
+
+        async def initialize(self) -> None:
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        async def start_polling(self, **kwargs) -> None:
+            channel._running = False
+
+    class Builder:
+        def token(self, token: str):
+            return self
+
+        def build(self) -> App:
+            return App()
+
+    monkeypatch.setattr(telegram.Application, "builder", lambda: Builder())
+    await channel.start()
+
+    assert registered[0][0] == -1
+    assert isinstance(registered[0][1], TypeHandler)
+    assert registered[0][1].callback == channel._on_update
+    assert all(group == 0 for group, _ in registered[1:])
+
+
+async def _async_result(value):
+    return value
+
+
+@pytest.mark.asyncio
+async def test_command_update_and_reply_are_archived(monkeypatch: pytest.MonkeyPatch) -> None:
+    channel = TelegramChannel(TelegramConfig(), MessageBus())
+    events = []
+    replies = []
+
+    async def append(archive, event) -> None:
+        events.append(event)
+
+    async def reply_text(text: str, **kwargs):
+        replies.append((text, kwargs))
+        return SimpleNamespace(message_id=99)
+
+    monkeypatch.setattr(telegram, "append_async", append)
+    message = SimpleNamespace(chat_id=1001, message_id=42, reply_text=reply_text)
+    update = SimpleNamespace(
+        update_id=77,
+        message=message,
+        to_dict=lambda: {"update_id": 77, "message": {"text": "/help"}},
+    )
+
+    context = SimpleNamespace()
+    await channel._on_update(update, context)
+    await channel._on_help(update, context)
+
+    assert [event.kind for event in events] == ["update", "outbound_request", "outbound_result"]
+    assert events[0].native["message"]["text"] == "/help"
+    assert events[1].native["text"] == replies[0][0]
+    assert events[1].native["reply_to_message_id"] == 42
+    assert events[2].native_id == "99"
+    assert replies[0][1] == {"parse_mode": "HTML"}
+
+
+@pytest.mark.asyncio
+async def test_inbound_capacity_blocks_reset_side_effects_and_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    side_effects: list[str] = []
+    replies: list[str] = []
+
+    class Session:
+        messages = ["existing"]
+
+        def clear(self) -> None:
+            side_effects.append("clear")
+
+    class Sessions:
+        def get_or_create(self, key: str) -> Session:
+            side_effects.append("get")
+            return Session()
+
+        def save(self, session: Session) -> None:
+            side_effects.append("save")
+
+    channel = TelegramChannel(TelegramConfig(), MessageBus(), session_manager=Sessions())
+    app, stopped = _stoppable_app(SimpleNamespace())
+    channel._app = app  # type: ignore[assignment]
+    channel._running = True
+
+    async def full_archive(archive, event) -> None:
+        raise RawArchiveCapacityError("full")
+
+    monkeypatch.setattr(telegram, "append_async", full_archive)
+    message = SimpleNamespace(
+        chat_id=1001,
+        reply_text=lambda text: replies.append(text),
+    )
+    update = SimpleNamespace(
+        update_id=78,
+        message=message,
+        effective_user=SimpleNamespace(id=22),
+        to_dict=lambda: {"update_id": 78, "message": {"text": "/reset"}},
+    )
+
+    context = SimpleNamespace()
+    await channel._on_update(update, context)
+    await channel._on_reset(update, context)
+    await channel._capacity_stop_task
+
+    assert side_effects == []
+    assert replies == []
+    assert stopped == ["updater", "application", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_command_reply_capacity_blocks_send_and_preserves_sent_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = TelegramChannel(TelegramConfig(), MessageBus())
+    app, stopped = _stoppable_app(SimpleNamespace())
+    channel._app = app  # type: ignore[assignment]
+    channel._running = True
+    events = []
+    replies = []
+
+    async def archive_request(archive, event) -> None:
+        events.append(event.kind)
+        if event.kind == "outbound_request":
+            raise RawArchiveCapacityError("full")
+
+    async def blocked_reply_text(text: str, **kwargs):
+        replies.append(text)
+        return SimpleNamespace(message_id=1)
+
+    monkeypatch.setattr(telegram, "append_async", archive_request)
+    message = SimpleNamespace(chat_id=1001, message_id=42, reply_text=blocked_reply_text)
+    update = SimpleNamespace(
+        update_id=79,
+        message=message,
+        to_dict=lambda: {"update_id": 79, "message": {"text": "/help"}},
+    )
+    context = SimpleNamespace()
+    await channel._on_update(update, context)
+    await channel._on_help(update, context)
+    await channel._capacity_stop_task
+
+    assert events == ["update", "outbound_request"]
+    assert replies == []
+    assert stopped == ["updater", "application", "shutdown"]
+
+    channel = TelegramChannel(TelegramConfig(), MessageBus())
+    app, stopped = _stoppable_app(SimpleNamespace())
+    channel._app = app  # type: ignore[assignment]
+    channel._running = True
+    events = []
+    replies = []
+
+    async def archive_result(archive, event) -> None:
+        events.append(event.kind)
+        if event.kind == "outbound_result":
+            raise RawArchiveCapacityError("full")
+
+    async def successful_reply_text(text: str, **kwargs):
+        replies.append(text)
+        return SimpleNamespace(message_id=2)
+
+    monkeypatch.setattr(telegram, "append_async", archive_result)
+    message = SimpleNamespace(chat_id=1001, message_id=42, reply_text=successful_reply_text)
+    update = SimpleNamespace(
+        update_id=80,
+        message=message,
+        to_dict=lambda: {"update_id": 80, "message": {"text": "/help"}},
+    )
+    context = SimpleNamespace()
+    await channel._on_update(update, context)
+    await channel._on_help(update, context)
+    await channel._capacity_stop_task
+
+    assert events == ["update", "outbound_request", "outbound_result"]
+    assert len(replies) == 1
+    assert stopped == ["updater", "application", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_restart_drains_retained_event_and_resumes_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = RawArchive(
+        tmp_path / "raw", spool=tmp_path / "spool", status_path=tmp_path / "s.json", clock=lambda: NOW
+    )
+    channel = TelegramChannel(TelegramConfig(token="fake"), MessageBus())
+    channel.set_raw_archive(archive)
+    old_app, stopped = _stoppable_app(SimpleNamespace())
+    channel._app = old_app  # type: ignore[assignment]
+    channel._running = True
+
+    def unavailable(*args, **kwargs):
+        raise OSError("storage unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(raw_writer, "MAX_MEMORY_PENDING", 1)
+        patch.setattr(raw_writer, "append_line", unavailable)
+        patch.setattr(archive, "_spool_line_locked", lambda *args: False)
+        await telegram.append_async(
+            archive,
+            raw_writer.RawEvent(channel="telegram", kind="retained", direction="in", native={"n": 1}),
+        )
+        assert archive.status().pending_in_memory == 1
+
+        update = SimpleNamespace(
+            update_id=81,
+            message=SimpleNamespace(chat_id=1001),
+            to_dict=lambda: {"update_id": 81, "message": {"text": "/help"}},
+        )
+        await channel._on_update(update, None)
+        assert channel._stopping_due_to_raw_archive_capacity
+        assert archive.status().state == "blocked"
+
+    await channel._capacity_stop_task
+    assert channel._app is None
+    assert stopped == ["updater", "application", "shutdown"]
+
+    replied = []
+
+    class App:
+        def __init__(self) -> None:
+            self.handlers = []
+            self.bot = SimpleNamespace(
+                get_me=lambda: _async_result(SimpleNamespace(id=1, username="bot")),
+                set_my_commands=lambda commands: _async_result(None),
+            )
+            self.updater = SimpleNamespace(start_polling=self.start_polling)
+
+        def add_handler(self, handler, group=0) -> None:
+            self.handlers.append((group, handler))
+
+        async def initialize(self) -> None:
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        async def start_polling(self, **kwargs) -> None:
+            channel._running = False
+
+    new_app = App()
+
+    class Builder:
+        def token(self, token: str):
+            return self
+
+        def build(self) -> App:
+            return new_app
+
+    monkeypatch.setattr(telegram.Application, "builder", lambda: Builder())
+    await channel.start()
+
+    assert not channel._stopping_due_to_raw_archive_capacity
+    assert new_app.handlers[0][0] == -1
+    await channel._on_update(update, None)
+    reply_update = SimpleNamespace(
+        update_id=82,
+        message=SimpleNamespace(
+            chat_id=1001,
+            message_id=81,
+            reply_text=lambda text, **kwargs: _async_reply(replied, text),
+        ),
+        to_dict=lambda: {"update_id": 82, "message": {"text": "/help"}},
+    )
+    reply_context = SimpleNamespace()
+    await channel._on_update(reply_update, reply_context)
+    await channel._on_help(reply_update, reply_context)
+
+    records = _records(tmp_path / "raw")
+    assert [record["kind"] for record in records] == ["retained", "update", "update", "outbound_request", "outbound_result"]
+    assert archive.status().pending_in_memory == 0
+    assert replied
+
+
+async def _async_reply(replies: list[str], text: str):
+    replies.append(text)
+    return SimpleNamespace(message_id=10)
