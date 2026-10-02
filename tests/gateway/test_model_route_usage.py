@@ -28,6 +28,7 @@ def _client(response: object) -> RouteClient:
     client.route_key = "test.route"  # type: ignore[attr-defined]
     client.model = "openai/test-model"  # type: ignore[attr-defined]
     client.timeout_ms = 0  # type: ignore[attr-defined]
+    client.reasoning = None  # type: ignore[attr-defined]
     client._provider = _Provider(response)  # type: ignore[attr-defined]
     return client
 

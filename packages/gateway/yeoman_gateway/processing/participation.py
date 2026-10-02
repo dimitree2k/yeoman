@@ -156,6 +156,15 @@ JUDGE_RESPONSE_FORMAT: dict[str, Any] = {
     },
 }
 
+def response_format_for(mode: str) -> dict[str, Any] | None:
+    """Choose provider-side JSON formatting; trusted validation remains unchanged."""
+    if mode == "json_object":
+        return {"type": "json_object"}
+    if mode == "prompt_only":
+        return None
+    return JUDGE_RESPONSE_FORMAT
+
+
 JUDGE_USER_TEMPLATE = (
     "Trusted participation guidance (owner-authored):\n{guidance}\n\n"
     "Allowed actions for this opportunity: {allowed_actions}\n"
@@ -278,7 +287,9 @@ class ParticipationJudge:
                 self._client.chat_with_usage(
                     messages,
                     max_tokens=self._max_output_tokens,
-                    response_format=JUDGE_RESPONSE_FORMAT,
+                    response_format=response_format_for(
+                        str(getattr(self._client, "structured_output", "json_schema_strict"))
+                    ),
                 ),
                 timeout=self._timeout_seconds,
             )
@@ -701,6 +712,7 @@ __all__ = [
     "ParticipationDecisionError",
     "ParticipationJudge",
     "ParticipationOpportunity",
+    "response_format_for",
 ]
 
 

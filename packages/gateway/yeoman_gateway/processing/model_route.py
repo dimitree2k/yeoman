@@ -56,6 +56,11 @@ class RouteClient:
             )
         self.model = model
         self.timeout_ms = int(getattr(profile, "timeout_ms", 0) or 0)
+        self.structured_output = str(
+            getattr(profile, "structured_output", "json_schema_strict") or "json_schema_strict"
+        )
+        reasoning = getattr(profile, "reasoning", None)
+        self.reasoning: dict[str, Any] | None = dict(reasoning) if reasoning else None
         self._provider = LiteLLMProvider(
             api_key=provider_cfg.api_key if provider_cfg.api_key else None,
             api_base=provider_cfg.api_base,
@@ -79,6 +84,7 @@ class RouteClient:
             model=self.model,
             max_tokens=max_tokens,
             temperature=0.0,
+            reasoning=self.reasoning,
             response_format=response_format,
             max_retries=max_retries,
         )

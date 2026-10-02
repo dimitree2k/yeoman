@@ -48,6 +48,9 @@ class ModelProfile(BaseModel):
     cooldown_seconds: int = 60
     # OpenRouter reasoning tokens config: {enabled, effort, max_tokens, exclude}
     reasoning: dict[str, Any] | None = None
+    structured_output: Literal["json_schema_strict", "json_object", "prompt_only"] = (
+        "json_schema_strict"
+    )
 
 
 class ModelRoutingConfig(BaseModel):
