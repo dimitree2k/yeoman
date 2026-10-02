@@ -232,9 +232,20 @@ class RawArchive:
 
     def _defer_locked(self, channel: str, received_ms: int, line: str) -> None:
         if self._pending:
-            # Memory already holds older lines; spooling now would reorder them.
+            # Persist older memory entries before letting a newer line past them.
+            while self._pending:
+                pending = self._pending[0]
+                if not self._spool_line_locked(*pending):
+                    break
+                self._pending.pop(0)
+            if self._capacity_blocked and len(self._pending) < MAX_MEMORY_PENDING:
+                self._capacity_blocked = False
             self._remember_locked(channel, received_ms, line)
             return
+        if not self._spool_line_locked(channel, received_ms, line):
+            self._remember_locked(channel, received_ms, line)
+
+    def _spool_line_locked(self, channel: str, received_ms: int, line: str) -> bool:
         try:
             ensure_private_dir(self.spool)
             name = f"{received_ms:013d}-{uuid.uuid4().hex}.json"
@@ -255,9 +266,10 @@ class RawArchive:
                 os.close(fd)
             os.replace(temporary, self.spool / name)
             _fsync_directory(self.spool)
+            return True
         except OSError as exc:
             self._note_error(exc)
-            self._remember_locked(channel, received_ms, line)
+            return False
 
     def _remember_locked(self, channel: str, received_ms: int, line: str) -> None:
         if len(self._pending) >= MAX_MEMORY_PENDING:

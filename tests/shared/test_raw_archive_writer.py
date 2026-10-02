@@ -381,3 +381,44 @@ async def test_capacity_stops_intake_and_recovers_after_storage_repair(
     assert [record["native_id"] for record in _lines(month_file)] == ["e1", "e4"]
     assert archive.status().state == "ok"
     assert archive.status().pending_in_memory == 0
+
+
+def test_recovered_spool_persists_pending_before_accepting_new_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(writer_module, "MAX_MEMORY_PENDING", 1)
+    archive = _archive(tmp_path)
+    archive.spool.write_text("not a directory", encoding="utf-8")
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        real_append_line(path, line, **kwargs)
+
+    def spooled_ids() -> list[str]:
+        return [
+            json.loads(json.loads(path.read_text(encoding="utf-8"))["line"])["native_id"]
+            for path in sorted(archive.spool.glob("*.json"))
+        ]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(writer_module, "append_line", fail_month)
+        assert archive.append(_event(native_id="e1", received_ms=NOW - 2)) is False
+
+        archive.spool.unlink()
+        archive.spool.mkdir(mode=0o700)
+        assert archive.append(_event(native_id="e2", received_ms=NOW - 1)) is False
+        assert archive.status().state == "degraded"
+        assert archive.status().pending_in_memory == 1
+        assert spooled_ids() == ["e1"]
+
+        assert archive.append(_event(native_id="e3", received_ms=NOW)) is False
+        assert archive.status().state == "degraded"
+        assert archive.status().pending_in_memory == 1
+        assert spooled_ids() == ["e1", "e2"]
+
+    assert archive.append(_event(native_id="e4", received_ms=NOW + 1)) is True
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert [record["native_id"] for record in _lines(month_file)] == ["e1", "e2", "e3", "e4"]
+    assert archive.status().state == "ok"
