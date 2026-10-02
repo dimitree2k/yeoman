@@ -146,7 +146,19 @@ def verify_archive(
         return VerifyReport(False, ("archive_missing",), (), 0, 0)
 
     problems: list[str] = []
-    closed = close_months(root, now_ms=now)
+    status = _load_json(run / STATUS_FILE)
+    spool = root.parent / "raw-spool"
+    try:
+        spool_has_backlog = next(spool.glob("*.json"), None) is not None
+    except OSError:
+        spool_has_backlog = True
+    writer_has_backlog = (
+        spool_has_backlog
+        or status.get("state") in {"degraded", "blocked"}
+        or int(status.get("spooled", 0)) > 0
+        or int(status.get("pending_in_memory", 0)) > 0
+    )
+    closed = [] if writer_has_backlog else close_months(root, now_ms=now)
     manifest = latest_manifest(root)
     previous = _load_json(run / COUNTS_FILE)
     since = int(previous.get("checked_ms", 0))
@@ -189,7 +201,6 @@ def verify_archive(
     if media_files < int(previous.get("media_files", 0)) and not media_audited:
         problems.append(f"media_count_dropped:{previous.get('media_files')}->{media_files}")
 
-    status = _load_json(run / STATUS_FILE)
     if status.get("state") == "degraded":
         problems.append(f"writer_degraded:spooled={status.get('spooled', '?')}")
     elif status.get("state") == "blocked":

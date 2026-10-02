@@ -7,6 +7,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+from yeoman_shared.raw_archive import writer
 from yeoman_shared.raw_archive.records import append_protected, dumps
 from yeoman_shared.raw_archive.verify import (
     AUDIT,
@@ -25,7 +27,7 @@ OCT = 1_791_500_000_000  # 2026-10-08
 def _archive(tmp_path: Path, clock: int) -> RawArchive:
     return RawArchive(
         tmp_path / "raw",
-        spool=tmp_path / "spool",
+        spool=tmp_path / "raw-spool",
         status_path=tmp_path / "run" / "raw-archive.json",
         clock=lambda: clock,
     )
@@ -56,6 +58,89 @@ def test_close_months_seals_only_finished_months(tmp_path: Path) -> None:
     entry = latest_manifest(root)["whatsapp/2026-09.jsonl"]
     assert entry["lines"] == 1 and len(entry["sha256"]) == 64
     assert close_months(root, now_ms=OCT) == []
+
+
+@pytest.mark.parametrize("backlog_kind", ("spool", "memory"))
+def test_verify_defers_month_seal_until_backlog_drains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backlog_kind: str
+) -> None:
+    archive = _archive(tmp_path, OCT)
+    _append(archive, "before-failure", SEPT)
+    root = tmp_path / "raw"
+    month_file = root / "whatsapp" / "2026-09.jsonl"
+    original_append_line = writer.append_line
+    original_spool_line = archive._spool_line_locked
+
+    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+        if path == month_file:
+            raise OSError("temporary storage failure")
+        original_append_line(path, line, mode=mode)
+
+    def fail_spool_append(channel: str, received_ms: int, line: str) -> bool:
+        return False
+
+    monkeypatch.setattr(writer, "append_line", fail_month_append)
+    if backlog_kind == "memory":
+        monkeypatch.setattr(archive, "_spool_line_locked", fail_spool_append)
+    _append(archive, "retained-september", SEPT)
+    status = archive.status()
+    if backlog_kind == "spool":
+        assert status.spooled == 1 and status.pending_in_memory == 0
+    else:
+        assert status.spooled == 0 and status.pending_in_memory == 1
+
+    report = verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT)
+    assert report.closed == ()
+    assert stat.S_IMODE(month_file.stat().st_mode) == 0o600
+
+    monkeypatch.setattr(writer, "append_line", original_append_line)
+    monkeypatch.setattr(archive, "_spool_line_locked", original_spool_line)
+    assert archive.drain_spool() == 1
+    _append(archive, "october-after-repair", OCT)
+
+    report = verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT + 1)
+    assert report.ok, report.problems
+    assert report.closed == ("whatsapp/2026-09.jsonl",)
+    assert stat.S_IMODE(month_file.stat().st_mode) == 0o444
+    assert len(month_file.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_verify_defers_seal_when_status_is_missing_but_spool_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path, OCT)
+    _append(archive, "before-failure", SEPT)
+    root = tmp_path / "raw"
+    month_file = root / "whatsapp" / "2026-09.jsonl"
+    original_append_line = writer.append_line
+
+    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+        if path == month_file:
+            raise OSError("temporary storage failure")
+        original_append_line(path, line, mode=mode)
+
+    monkeypatch.setattr(writer, "append_line", fail_month_append)
+    _append(archive, "retained-september", SEPT)
+    (tmp_path / "run" / writer.STATUS_FILE).unlink()
+    assert list((root.parent / "raw-spool").glob("*.json"))
+
+    report = verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT)
+
+    assert report.closed == ()
+    assert stat.S_IMODE(month_file.stat().st_mode) == 0o600
+
+
+def test_verify_seals_month_when_writer_status_is_absent(tmp_path: Path) -> None:
+    archive = _archive(tmp_path, OCT)
+    _append(archive, "september", SEPT)
+    root = tmp_path / "raw"
+    run_dir = tmp_path / "verify-run"
+
+    report = verify_archive(root, run_dir=run_dir, now_ms=OCT)
+
+    assert not (run_dir / writer.STATUS_FILE).exists()
+    assert report.closed == ("whatsapp/2026-09.jsonl",)
+    assert stat.S_IMODE((root / "whatsapp" / "2026-09.jsonl").stat().st_mode) == 0o444
 
 
 def test_verify_is_clean_for_an_untouched_archive(tmp_path: Path) -> None:
