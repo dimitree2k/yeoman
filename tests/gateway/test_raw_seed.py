@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
+import time
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 
 import pytest
+import yeoman_gateway.session.manager as sessions
 from yeoman_gateway.storage.raw_seed import SeedPaths, seed_raw_archive
 from yeoman_shared.raw_archive.records import iter_records
 from yeoman_shared.raw_archive.verify import latest_manifest
@@ -258,3 +262,80 @@ def test_default_memory2_sources_include_legacy_store_and_deduplicate(
     assert report.per_source["memory2"]["read"] == 3
     assert report.per_source["memory2"]["written"] == 2
     assert report.per_source["memory2"]["skipped_duplicate"] == 1
+
+
+def test_naive_session_timestamp_uses_local_time_for_utc_anchor_and_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    time.tzset()
+    try:
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                utc_time = datetime(2026, 9, 30, 22, 30, tzinfo=UTC)
+                return cls.fromtimestamp(utc_time.timestamp(), tz)
+
+        monkeypatch.setattr(sessions, "datetime", FixedDateTime)
+        session = sessions.Session(key="whatsapp:g1")
+        session.add_message("user", "unique earlier session message")
+        session_record = session.messages[0]
+        assert session_record["timestamp"] == "2026-10-01T00:30:00"
+
+        home = tmp_path / "yeoman"
+        monkeypatch.setenv("YEOMAN_HOME", str(home))
+        inbound = tmp_path / "inbound"
+        inbound.mkdir()
+        (inbound / "whatsapp_g1.jsonl").write_text(
+            json.dumps(session_record) + "\n", encoding="utf-8"
+        )
+        knowledge = tmp_path / "knowledge.db"
+        with sqlite3.connect(knowledge) as con:
+            con.execute(
+                "CREATE TABLE memory2_nodes (id TEXT, channel TEXT, chat_id TEXT, sender_id TEXT,"
+                " content TEXT, source_message_id TEXT, created_at TEXT, kind TEXT, is_deleted INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO memory2_nodes VALUES "
+                "('n1', 'whatsapp', 'g1', 's', 'later ID history', 'M1', "
+                "'2026-09-30T23:00:00+00:00', 'utterance', 0)"
+            )
+
+        start_ms = int(datetime(2026, 10, 2, tzinfo=UTC).timestamp() * 1000)
+        root = tmp_path / "raw"
+        RawArchive(
+            root,
+            spool=tmp_path / "spool",
+            status_path=tmp_path / "status.json",
+            clock=lambda: start_ms,
+        )
+        paths = SeedPaths(
+            processing_db=tmp_path / "missing-processing.db",
+            reply_context_db=tmp_path / "missing-reply.db",
+            inbound_dir=inbound,
+            knowledge_db=knowledge,
+        )
+
+        report = seed_raw_archive(root, paths, now_ms=start_ms + 1)
+
+        session_line = _seed_lines(root, "session_jsonl")[0]
+        memory_line = _seed_lines(root, "memory2")[0]
+        assert session_line["received_ms"] == int(
+            datetime(2026, 9, 30, 22, 30, tzinfo=UTC).timestamp() * 1000
+        )
+        assert memory_line["received_ms"] == int(
+            datetime(2026, 9, 30, 23, 0, tzinfo=UTC).timestamp() * 1000
+        )
+        assert session_line["provenance"] == "session_jsonl"
+        assert memory_line["provenance"] == "memory2"
+        assert report.per_source["session_jsonl"]["written"] == 1
+        assert report.per_source["session_jsonl"]["skipped_duplicate"] == 0
+        assert report.per_month == {"2026-09": 2}
+    finally:
+        if previous_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", previous_tz)
+        time.tzset()

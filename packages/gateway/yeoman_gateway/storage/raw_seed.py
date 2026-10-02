@@ -69,12 +69,12 @@ class _Item:
     has_id: bool = True
 
 
-def _iso_ms(value: str) -> int | None:
+def _iso_ms(value: str, *, naive_is_local: bool = False) -> int | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
+    if parsed.tzinfo is None and not naive_is_local:
         parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp() * 1000)
 
@@ -150,7 +150,7 @@ def _session_jsonl(directory: Path, counts: dict[str, int]) -> Iterator[_Item]:
                 if not isinstance(record, dict) or record.get("_type") == "metadata":
                     continue
                 counts["read"] += 1
-                received = _iso_ms(str(record.get("timestamp") or ""))
+                received = _iso_ms(str(record.get("timestamp") or ""), naive_is_local=True)
                 if received is None:
                     counts["skipped_no_time"] += 1
                     continue
