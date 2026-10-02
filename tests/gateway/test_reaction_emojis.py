@@ -245,6 +245,7 @@ def _judge(answer: str, *, min_confidence: float = 0.75, allowed: tuple[str, ...
     client.route_key = "test.route"  # type: ignore[attr-defined]
     client.model = "test-model"  # type: ignore[attr-defined]
     client.timeout_ms = 0  # type: ignore[attr-defined]
+    client.reasoning = None
     client._provider = _FakeProvider(answer)  # type: ignore[attr-defined]
     return AmbientJudge(
         client=client,
