@@ -1,10 +1,11 @@
 """Append-only writer for the raw message archive (V1 spec §4.0, R7).
 
-The writer never raises into message handling. A line that cannot reach its month file goes
-to the spool (``data/raw-spool/``). When even the spool fails, it stays in a bounded
-in-memory queue. Both drain, oldest first, on the next append. A crash between "appended"
-and "spool file removed" can duplicate a line; that is harmless because readers deduplicate.
-The writer owns the spool, so removing a drained spool file is not a guard violation.
+A line that cannot reach its month file goes to the spool (``data/raw-spool/``). When even
+the spool fails, it stays in a bounded in-memory queue. Both drain, oldest first, on the next
+append. If that queue is full, ``RawArchiveCapacityError`` stops intake rather than losing
+the event. A crash between "appended" and "spool file removed" can duplicate a line; that
+is harmless because readers deduplicate. The writer owns the spool, so removing a drained
+spool file is not a guard violation.
 """
 
 from __future__ import annotations
@@ -71,6 +72,10 @@ class RawArchiveStatus:
     updated_ms: int
 
 
+class RawArchiveCapacityError(RuntimeError):
+    """Raised when both persistent stores fail and the bounded queue is full."""
+
+
 def month_of(ms: int) -> str:
     """UTC month bucket of a millisecond timestamp, e.g. ``2026-10``."""
     return datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y-%m")
@@ -134,6 +139,7 @@ class RawArchive:
         self._lock = threading.Lock()
         self._pending: list[tuple[str, int, str]] = []
         self._last_error = ""
+        self._capacity_blocked = False
         self._published = ""
         self._write_start_marker()
 
@@ -255,8 +261,11 @@ class RawArchive:
 
     def _remember_locked(self, channel: str, received_ms: int, line: str) -> None:
         if len(self._pending) >= MAX_MEMORY_PENDING:
-            logger.error("raw archive in-memory queue full; a line could not be kept")
-            return
+            self._capacity_blocked = True
+            self._last_error = "raw archive capacity reached; persistent storage unavailable"
+            logger.error("raw archive capacity reached; intake must stop")
+            self._publish_status_locked()
+            raise RawArchiveCapacityError(self._last_error)
         self._pending.append((channel, received_ms, line))
 
     def _quarantine_locked(self, item: Path, error: BaseException) -> bool:
@@ -325,13 +334,21 @@ class RawArchive:
                 break
             self._pending.pop(0)
             moved += 1
+        if self._capacity_blocked and len(self._pending) < MAX_MEMORY_PENDING:
+            self._capacity_blocked = False
         return moved
 
     def _status_locked(self) -> RawArchiveStatus:
         spooled = len(self._spooled_files())
         degraded = spooled > 0 or bool(self._pending)
+        if self._capacity_blocked:
+            state = "blocked"
+        elif degraded:
+            state = "degraded"
+        else:
+            state = "ok"
         return RawArchiveStatus(
-            state="degraded" if degraded else "ok",
+            state=state,
             spooled=spooled,
             pending_in_memory=len(self._pending),
             last_error=self._last_error if degraded else "",
@@ -354,10 +371,12 @@ class RawArchive:
 
 
 async def append_async(archive: RawArchive | None, event: RawEvent) -> None:
-    """Archive from async code without blocking the loop. Never raises."""
+    """Archive from async code without blocking the loop; propagate capacity stops."""
     if archive is None:
         return
     try:
         await asyncio.to_thread(archive.append, event)
+    except RawArchiveCapacityError:
+        raise
     except Exception as exc:  # noqa: BLE001 - the archive must never break message handling
         logger.error("raw archive append crashed kind=%s error=%s", event.kind, type(exc).__name__)

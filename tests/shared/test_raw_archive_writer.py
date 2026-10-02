@@ -337,3 +337,47 @@ def test_spool_file_and_new_month_name_are_fsynced(
         if kind == "dir" and path == month_file.parent
     )
     assert file_sync < dir_sync
+
+
+@pytest.mark.asyncio
+async def test_capacity_stops_intake_and_recovers_after_storage_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(writer_module, "MAX_MEMORY_PENDING", 1)
+    archive = _archive(tmp_path)
+    archive.spool.write_text("not a directory", encoding="utf-8")
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        real_append_line(path, line, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(writer_module, "append_line", fail_month)
+        assert archive.append(_event(text="retained", native_id="e1")) is False
+        with pytest.raises(writer_module.RawArchiveCapacityError):
+            archive.append(_event(text="rejected direct", native_id="e2"))
+        with pytest.raises(writer_module.RawArchiveCapacityError):
+            await writer_module.append_async(
+                archive, _event(text="rejected async", native_id="e3")
+            )
+
+        status = archive.status()
+        assert status.state == "blocked"
+        assert status.spooled == 0
+        assert status.pending_in_memory == 1
+        assert "rejected direct" not in status.last_error
+        assert "rejected async" not in status.last_error
+        status_text = archive.status_path.read_text(encoding="utf-8")
+        assert '"state": "blocked"' in status_text
+        assert "retained" not in status_text
+        assert "rejected direct" not in status_text
+        assert "rejected async" not in status_text
+
+    archive.spool.unlink()
+    assert archive.append(_event(text="accepted after repair", native_id="e4")) is True
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert [record["native_id"] for record in _lines(month_file)] == ["e1", "e4"]
+    assert archive.status().state == "ok"
+    assert archive.status().pending_in_memory == 0
