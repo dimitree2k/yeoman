@@ -82,6 +82,7 @@ async def test_whatsapp_debug_log_redacts_target_but_keeps_command_summary() -> 
     sent_frames: list[dict[str, object]] = []
     channel = object.__new__(WhatsAppChannel)
     channel.config = WhatsAppConfig(bridge_token="test-token")
+    channel._raw_archive = None
     channel._pending = {}
     channel._send_lock = asyncio.Lock()
 
