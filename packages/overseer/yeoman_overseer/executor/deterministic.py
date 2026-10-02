@@ -155,6 +155,24 @@ class DeterministicExecutor:
         )
 
 
+    async def _verify_raw_archive(self, *, target: str, **_: str) -> ActionResult:
+        from yeoman_shared.raw_archive.verify import verify_archive
+
+        root = None if target in {"", "default"} else Path(target).expanduser()
+        report = await asyncio.to_thread(verify_archive, root)
+        if report.ok:
+            return ActionResult(
+                success=True,
+                detail=(
+                    f"raw archive ok: {report.files_checked} files, "
+                    f"{report.lines_total} lines, closed {len(report.closed)}"
+                ),
+            )
+        message = "Raw archive integrity problem: " + "; ".join(report.problems[:5])
+        await self._alert(target="raw-archive", message=message)
+        return ActionResult(success=False, detail=message)
+
+
 def parse_deterministic_actions(body: str) -> list[DeterministicAction]:
     actions_text = _extract_actions_block(body)
     if not actions_text:
@@ -207,5 +225,6 @@ _ACTION_REGISTRY = {
     "rotate_logs": DeterministicExecutor._rotate_logs,
     "prune_files": DeterministicExecutor._prune_files,
     "cleanup_stale_agent_sessions": DeterministicExecutor._cleanup_stale_agent_sessions,
+    "verify_raw_archive": DeterministicExecutor._verify_raw_archive,
     "noop": DeterministicExecutor._noop,
 }
