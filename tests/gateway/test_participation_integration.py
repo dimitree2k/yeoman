@@ -2605,3 +2605,75 @@ def _auth_check(**overrides: object):
     from yeoman_gateway.processing.participation_runtime import ParticipationEffectAuthorizer
 
     return ParticipationEffectAuthorizer().check(_authorization(**overrides))
+
+
+@pytest.mark.asyncio
+async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge(tmp_path: Path) -> None:
+    from yeoman_gateway.adapters.responder_llm import LLMResponder
+    from yeoman_gateway.bus.queue import MessageBus
+    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
+    from yeoman_gateway.providers.base import LLMResponse
+
+    class _PromptProvider:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get_default_model(self) -> str:
+            return "test/model"
+
+        async def chat(self, **kwargs: object) -> LLMResponse:
+            self.calls.append(dict(kwargs))
+            return LLMResponse(content="draft")
+
+    class _PromptSpy(LLMResponder):
+        def __init__(self, provider: _PromptProvider, workspace: Path) -> None:
+            super().__init__(provider=provider, workspace=workspace, bus=MessageBus())  # type: ignore[arg-type]
+            self._test_provider = provider
+
+        def _profile_for_name(self, profile_name: str | None) -> object:
+            del profile_name
+            return SimpleNamespace(model="test/model", max_tokens=64, timeout_ms=1000)
+
+        def _provider_for_profile(self, profile: object | None):
+            del profile
+            return self._test_provider
+
+    provider = _PromptProvider()
+    responder = _PromptSpy(provider, tmp_path)
+    target = "THIS REQUIRED TARGET MUST SURVIVE"
+    selection = object()
+    context = {
+        "target_message_id": "current",
+        "messages": [
+            {"event_id": "current", "sender": "Ben", "text": target},
+            {"event_id": "optional", "sender": "Anna", "text": "optional context " * 600},
+        ],
+        "selected_knowledge_text": "The venue is Riverside.",
+        "advisory_taste": [{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
+        "_knowledge_selection": selection,
+    }
+    await responder.generate_participation_draft(
+        InboundEvent(channel=CHANNEL, chat_id=CHAT, sender_id="", content="", is_group=True),
+        PolicyDecision(accept_message=False, should_respond=False, allowed_tools=frozenset(), reason="participation_draft_only"),
+        purpose="brief response",
+        context=context,
+        model_profile="participation_writer",
+    )
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] == []
+    prompt = "\n".join(
+        str(message.get("content") or "")
+        for message in provider.calls[0]["messages"]
+        if isinstance(message, dict)
+    )
+    assert target in prompt
+    assert "The venue is Riverside." in prompt
+    assert "Prefer concise replies." in prompt
+    assert "optional context" not in prompt
+    assert context["writer_dropped_entry_ids"] == ["optional"]
+    assert "provenance=participation:v1" in prompt
+    assert "object at 0x" not in prompt
+    from yeoman_gateway.adapters.responder_llm import _render_participation_transcript
+
+    assert len(_render_participation_transcript(context)) <= 4000
+    assert "optional context " * 600 not in prompt

@@ -782,6 +782,8 @@ class ProcessingParticipationConfig(BaseModel):
     shadow: bool = True
     #: Explicit existing model-route key. There is no hidden model fallback.
     judge_route: str = Field(default="", alias="judgeRoute")
+    #: Optional protected same-chat knowledge for the Judge and Writer.
+    knowledge_enabled: bool = Field(default=False, alias="knowledgeEnabled")
     judge_timeout_seconds: float = Field(default=12.0, alias="judgeTimeoutSeconds", gt=0, le=60)
     judge_max_input_tokens: int = Field(
         default=4000, alias="judgeMaxInputTokens", ge=512, le=16_000

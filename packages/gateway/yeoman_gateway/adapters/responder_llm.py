@@ -571,10 +571,15 @@ _PARTICIPATION_DRAFT_NOTE = (
 
 
 def _render_participation_transcript(context: dict[str, object], *, limit: int = 4000) -> str:
-    """Render the trusted context as plain data lines for the draft prompt."""
+    """Allocate the Writer's data budget by complete evidence entry."""
+    from yeoman_gateway.processing.participation_context import (
+        render_knowledge_block,
+        render_taste_block,
+    )
+
     target_id = str(context.get("target_message_id") or "").strip()
     target_line = ""
-    context_lines: list[str] = []
+    context_lines: list[tuple[str, str]] = []
     messages = context.get("messages")
     if isinstance(messages, list):
         for item in messages:
@@ -588,7 +593,7 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
             if not target_line and message_id == target_id:
                 target_line = f"[CURRENT] {sender}: {body}"
             else:
-                context_lines.append(f"[CONTEXT] {sender}: {body}")
+                context_lines.append((message_id, f"[CONTEXT] {sender}: {body}"))
     anchors = context.get("anchors")
     if isinstance(anchors, list):
         for anchor in anchors:
@@ -596,9 +601,33 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
                 continue
             text = str(anchor.get("message") or "").strip()
             if text:
-                context_lines.append(f"Arvid (already delivered): {text}")
-    rendered = "\n".join(([target_line] if target_line else []) + context_lines)
-    return rendered[:limit]
+                anchor_id = str(anchor.get("provider_message_id") or anchor.get("effect_id") or "")
+                line = f"Arvid (already delivered): {text}"
+                if not target_line and target_id and target_id == anchor_id:
+                    target_line = f"[CURRENT] {line}"
+                else:
+                    context_lines.append((anchor_id, line))
+    if not target_line:
+        raise ValueError("required participation target unavailable")
+
+    knowledge = str(context.get("selected_knowledge_text") or "").strip()
+    knowledge_block = render_knowledge_block(knowledge)
+    taste_block = render_taste_block(context.get("advisory_taste"))
+    fixed = [target_line, *([knowledge_block] if knowledge_block else []),
+             *([taste_block] if taste_block else [])]
+    if sum(map(len, fixed)) + len(fixed) - 1 > limit:
+        raise ValueError("required participation context exceeds writer budget")
+    rendered = "\n".join(fixed)
+    dropped: list[str] = []
+    for entry_id, line in context_lines:
+        candidate = f"{rendered}\n{line}"
+        if len(candidate) <= limit:
+            rendered = candidate
+        else:
+            dropped.append(entry_id)
+    context["writer_dropped_entry_ids"] = [item for item in dropped if item]
+    context["writer_dropped_entry_count"] = len(dropped)
+    return rendered
 
 
 class LLMResponder(ResponderPort):

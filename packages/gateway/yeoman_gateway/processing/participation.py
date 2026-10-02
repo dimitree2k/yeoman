@@ -276,7 +276,9 @@ class ParticipationJudge:
         :class:`asyncio.CancelledError` propagates untouched. Every attempt is
         traced when Langfuse is configured.
         """
-        view = _JudgeContext.from_mapping(context)
+        mutable_context = context if isinstance(context, dict) else dict(context)
+        self._fit_context_for_judge(mutable_context, opportunity)
+        view = _JudgeContext.from_mapping(mutable_context)
         messages = self._build_messages(opportunity, view)
         trace = tracing.start_trace(
             name="participation.judge",
@@ -303,6 +305,110 @@ class ParticipationJudge:
             metadata={"outcome": "decision"},
         )
         return decision
+
+    def _fit_context_for_judge(
+        self, context: dict[str, Any], opportunity: ParticipationOpportunity
+    ) -> None:
+        """Fit whole optional entries before the provider sees the prompt."""
+        from yeoman_gateway.processing.participation_context import (
+            render_advisory_taste,
+            render_knowledge_block,
+            render_taste_block,
+        )
+
+        messages = context.get("messages")
+        anchors = context.get("anchors")
+        if not isinstance(messages, list):
+            messages = []
+        if not isinstance(anchors, list):
+            anchors = []
+
+        # Any allowed target must still fit in the Writer's data budget together with
+        # the exact shared selection. Drop optional blocks whole before judgment.
+        source_ids = context.get("current_source_ids", context.get("source_event_ids"))
+        current_ids = {str(item) for item in opportunity.source_event_ids}
+        if isinstance(source_ids, (list, tuple, set, frozenset)):
+            current_ids.update(str(item) for item in source_ids)
+        else:
+            current_ids.update(
+                str(row.get("event_id") or row.get("message_id") or "")
+                for row in messages if isinstance(row, Mapping)
+            )
+        target_sizes = [
+            len(f"[CURRENT] {row.get('sender') or '?'}: {str(row.get('text') or row.get('media_summary') or '').strip()}")
+            for row in messages
+            if isinstance(row, Mapping)
+            and str(row.get("event_id") or row.get("message_id") or "") in current_ids
+        ]
+        target_sizes.extend(
+            len(f"[CURRENT] Arvid (already delivered): {str(anchor.get('message') or '').strip()}")
+            for anchor in anchors if isinstance(anchor, Mapping)
+        )
+        max_target = max(target_sizes, default=0)
+        knowledge = str(context.get("selected_knowledge_text") or "").strip()
+        taste = render_advisory_taste(context.get("advisory_taste"))
+        knowledge_block = render_knowledge_block(knowledge)
+        taste_block = render_taste_block(context.get("advisory_taste"))
+        fixed_length = max_target + sum(len(item) for item in (knowledge_block, taste_block))
+        if fixed_length + 2 > 4000 and taste:
+            context.pop("advisory_taste", None)
+            taste = ""
+            taste_block = ""
+            fixed_length = max_target + len(knowledge_block)
+        if fixed_length + 2 > 4000 and knowledge:
+            context.pop("selected_knowledge_text", None)
+            selection = context.get("_knowledge_selection")
+            if selection is not None:
+                context["_knowledge_selection"] = type(selection)(reason="writer_budget")
+            context["knowledge_selection_status"] = "budget_dropped"
+            context["knowledge_selected_count"] = 0
+            context["knowledge_rendered_chars"] = 0
+            knowledge = ""
+            knowledge_block = ""
+            fixed_length = max_target + len(taste_block)
+        if max_target > 4000 or fixed_length + 2 > 4000:
+            raise ParticipationDecisionError("context_too_large", detail="context_budget_exceeded")
+
+        dropped: list[str] = []
+        while True:
+            view = _JudgeContext.from_mapping(context)
+            prompt = self._build_messages(opportunity, view)
+            if self._estimate_tokens(prompt) <= self._max_input_tokens:
+                break
+            optional = next(
+                (
+                    row for row in messages
+                    if isinstance(row, Mapping)
+                    and str(row.get("event_id") or row.get("message_id") or "") not in current_ids
+                ),
+                None,
+            )
+            if optional is not None:
+                messages.remove(optional)
+                dropped.append(str(optional.get("event_id") or optional.get("message_id") or ""))
+                continue
+            if anchors:
+                anchors.pop(0)
+                continue
+            if taste:
+                context.pop("advisory_taste", None)
+                taste = ""
+                continue
+            if knowledge:
+                context.pop("selected_knowledge_text", None)
+                selection = context.get("_knowledge_selection")
+                if selection is not None:
+                    context["_knowledge_selection"] = type(selection)(reason="judge_budget")
+                context["knowledge_selection_status"] = "budget_dropped"
+                context["knowledge_selected_count"] = 0
+                context["knowledge_rendered_chars"] = 0
+                knowledge = ""
+                continue
+            raise ParticipationDecisionError("context_too_large", detail="required_judge_evidence_overflow")
+        context["messages"] = messages
+        context["anchors"] = anchors
+        context["judge_dropped_entry_ids"] = dropped[:32]
+        context["judge_dropped_entry_count"] = len(dropped)
 
     async def _decide(
         self,
@@ -595,6 +701,8 @@ class _JudgeContext:
     guidance: str
     direct_addressed: bool
     allows_continuation: bool
+    selected_knowledge_text: str
+    advisory_taste: str
     rendered: str
 
     @classmethod
@@ -683,6 +791,8 @@ class _JudgeContext:
             for item in (context.get("allowed_contribution_types") or ())
             if str(item).strip()
         )
+        from yeoman_gateway.processing.participation_context import render_advisory_taste
+
         return cls(
             evidence_ids=frozenset(evidence),
             message_ids=frozenset(message_ids),
@@ -699,11 +809,23 @@ class _JudgeContext:
             guidance=str(context.get("guidance") or ""),
             direct_addressed=bool(context.get("direct_addressed")),
             allows_continuation=bool(context.get("allows_continuation", False)),
+            selected_knowledge_text=str(context.get("selected_knowledge_text") or ""),
+            advisory_taste=render_advisory_taste(context.get("advisory_taste")),
             rendered="\n".join(lines) if lines else "(no retained context)",
         )
 
     def render(self) -> str:
-        return self.rendered
+        from yeoman_gateway.processing.participation_context import (
+            render_knowledge_block,
+            render_taste_block,
+        )
+
+        blocks = [self.rendered]
+        if self.selected_knowledge_text:
+            blocks.append(render_knowledge_block(self.selected_knowledge_text))
+        if self.advisory_taste:
+            blocks.append(render_taste_block(self.advisory_taste))
+        return "\n\n".join(blocks)
 
 
 def _message_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:

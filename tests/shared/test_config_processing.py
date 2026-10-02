@@ -13,6 +13,7 @@ def test_processing_is_disabled_by_default() -> None:
     assert cfg.processing.enabled is False
     assert cfg.processing.chats == []
     assert cfg.processing.db_path == "data/processing/processing.db"
+    assert cfg.processing.participation.knowledge_enabled is False
 
 
 def test_processing_carries_the_v1_start_values() -> None:

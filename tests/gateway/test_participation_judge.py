@@ -920,3 +920,85 @@ async def test_judge_classifies_provider_completion_before_parsing(
     with pytest.raises(ParticipationDecisionError) as error:
         await judge.decide(_opportunity(), _context())
     assert (error.value.reason, error.value.detail) == (reason, detail)
+
+
+@pytest.mark.asyncio
+async def test_knowledge_and_taste_reach_actual_judge_request_without_widening_evidence() -> None:
+    private_selection = object()
+    client = _Client(
+        _payload(
+            action="comment",
+            intent="initiate",
+            purpose="answer the current question",
+            evidence_ids=["m1"],
+            target_message_id="m1",
+        )
+    )
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+
+    decision = await judge.decide(
+        _opportunity(),
+        _context(
+            selected_knowledge_text="[untrusted prior knowledge] The venue is Riverside.",
+            advisory_taste=[{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
+            _knowledge_selection=private_selection,
+        ),
+    )
+
+    request = "\n".join(message["content"] for message in client.calls[0])
+    assert "The venue is Riverside." in request
+    assert "Prefer concise replies." in request
+    assert "advisory" in request.lower()
+    assert "untrusted" in request.lower()
+    assert "private_selection" not in request
+    assert "id=" not in request.split("Relevant prior knowledge", 1)[-1]
+    assert decision.evidence_ids == ("m1",)
+    assert decision.target_message_id == "m1"
+
+
+@pytest.mark.asyncio
+async def test_writer_required_target_and_knowledge_budget_is_finalized_before_judge() -> None:
+    from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelection
+
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,))
+    context = _context(
+        messages=[{"event_id": "m1", "sender": "Anna", "text": "x" * 3900}],
+        current_source_ids=["m1"],
+        selected_knowledge_text="A relevant fact " * 45,
+        _knowledge_selection=ParticipationKnowledgeSelection(text="A relevant fact " * 45),
+        knowledge_selection_status="selected",
+        knowledge_selected_count=1,
+        knowledge_rendered_chars=720,
+    )
+
+    decision = await judge.decide(_opportunity(), context)
+
+    request = "\n".join(message["content"] for message in client.calls[0])
+    assert "A relevant fact" not in request
+    assert "x" * 3900 in request
+    assert "selected_knowledge_text" not in context
+    assert context["knowledge_selection_status"] == "budget_dropped"
+    assert context["knowledge_selected_count"] == 0
+    assert decision.action == "silence"
+
+
+@pytest.mark.asyncio
+async def test_judge_removes_whole_optional_entries_until_actual_request_fits() -> None:
+    client = _Client(_payload())
+    judge = ParticipationJudge(client=client, allowed_emojis=(EMOJI,), max_input_tokens=1024)
+    context = _context(
+        messages=[
+            {"event_id": "m1", "sender": "Anna", "text": "required"},
+            {"event_id": "optional", "sender": "Ben", "text": "optional " * 5000},
+        ],
+        current_source_ids=["m1"],
+    )
+
+    await judge.decide(_opportunity(), context)
+
+    request = "\n".join(message["content"] for message in client.calls[0])
+    assert "required" in request
+    assert "optional" not in request
+    assert judge._estimate_tokens(client.calls[0]) <= 1024
+    assert context["judge_dropped_entry_ids"] == ["optional"]

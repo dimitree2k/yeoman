@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.consciousness.delivery import DeliveryAnchorReader
@@ -306,7 +307,7 @@ async def test_context_truncation_keeps_newest_optional_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_required_sources_over_bound_keep_newest_deterministically(
+async def test_required_sources_over_bound_fail_closed(
     tmp_path: Path,
 ) -> None:
     builder = await _builder(tmp_path)
@@ -319,15 +320,12 @@ async def test_required_sources_over_bound_keep_newest_deterministically(
             minutes_ago=6 - index,
         )
 
-    context = await _build_context(
-        builder,
-        _opportunity(*(f"required-{index}" for index in range(6))),
-        bounds=ParticipationContextBounds(max_messages=3, window_minutes=120),
-    )
-    ids = [row["event_id"] for row in context["messages"]]  # type: ignore[index]
-    assert ids == ["required-3", "required-4", "required-5"]
-    assert context["dropped_source_ids"] == ["required-0", "required-1", "required-2"]
-    assert context["dropped_source_count"] == 3
+    with pytest.raises(ParticipationDecisionError, match="required_sources_exceed_message_limit"):
+        await _build_context(
+            builder,
+            _opportunity(*(f"required-{index}" for index in range(6))),
+            bounds=ParticipationContextBounds(max_messages=3, window_minutes=120),
+        )
 
 
 @pytest.mark.asyncio
@@ -666,6 +664,44 @@ async def test_advisory_taste_requires_provenance(tmp_path: Path) -> None:
     patterns = context["advisory_taste"]
     assert isinstance(patterns, list) and len(patterns) == 1
     assert patterns[0]["provenance"] == "participation:v1"
+
+
+@pytest.mark.asyncio
+async def test_context_attaches_only_rendered_selection_with_bounded_source_query(
+    tmp_path: Path,
+) -> None:
+    archive = _archive(tmp_path)
+    _record(archive, message_id="trigger", text="Riverside venue plans", minutes_ago=1)
+    captured: dict[str, object] = {}
+
+    class _Selector:
+        def select(self, *, query, read_context, fact_context):
+            captured.update(query=query, read_context=read_context, fact_context=fact_context)
+            return SimpleNamespace(
+                text="The venue is Riverside.",
+                reason="selected",
+                statements=SimpleNamespace(statement_ids=("private-statement-id",)),
+                facts=SimpleNamespace(used_source_refs={"private-fact-id": ()}),
+            )
+
+    builder = ParticipationContextBuilder(
+        archive=archive,
+        policy=PolicyEngine(_policy(), workspace=tmp_path),
+        source_authorizer=lambda row: True,
+        knowledge_selector=_Selector(),
+        knowledge_context_supplier=lambda opportunity, context: ("trusted-read", "trusted-facts"),
+    )
+    context = await _build_context(builder, _opportunity("trigger"))
+
+    assert captured["query"] == "Riverside venue plans"
+    assert captured["read_context"] == "trusted-read"
+    assert captured["fact_context"] == "trusted-facts"
+    assert context["selected_knowledge_text"] == "The venue is Riverside."
+    assert context["_knowledge_selection"].text == "The venue is Riverside."
+    assert context["knowledge_selection_status"] == "selected"
+    assert context["knowledge_selected_count"] == 2
+    assert "private-statement-id" not in str(context["selected_knowledge_text"])
+    assert context["current_source_ids"] == ["trigger"]
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import random
 import time
@@ -989,6 +990,73 @@ def _offer_participation_trigger(
     return None
 
 
+def _participation_knowledge_contexts(
+    opportunity: object,
+    context: Mapping[str, object],
+    *,
+    chat_registry: object,
+    knowledge: object,
+):
+    """Build protected reader contexts only from verified trigger authors and members."""
+    from yeoman_gateway.knowledge._memory.read_gate import registry_members
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+
+    source_ids = tuple(getattr(opportunity, "source_event_ids", ()) or ())
+    messages = context.get("messages")
+    rows = {
+        str(row.get("event_id") or row.get("message_id") or ""): row
+        for row in messages if isinstance(row, Mapping)
+    } if isinstance(messages, list) else {}
+    authors = {
+        str(rows.get(str(source_id), {}).get("sender_id") or "").strip()
+        for source_id in source_ids
+    }
+    # One principal is supported by the current protected-reader contract. A coalesced
+    # multi-author trigger stays recent-only instead of borrowing one author's rights.
+    if not source_ids or "" in authors:
+        return "source_unavailable"
+    if len(authors) != 1:
+        return "multi_author"
+    channel = str(getattr(opportunity, "channel", ""))
+    chat_id = str(getattr(opportunity, "chat_id", ""))
+    try:
+        members = frozenset(registry_members(chat_registry, channel=channel, chat_id=chat_id))
+    except Exception:
+        return "unknown_membership"
+    principal = next(iter(authors))
+    if not members:
+        return "unknown_membership"
+    if principal not in members:
+        return "denied"
+    policy_revision = getattr(knowledge, "policy_revision", 0)
+    if isinstance(policy_revision, bool) or not isinstance(policy_revision, int) or policy_revision < 0:
+        return "error"
+    member_revision = hashlib.sha256("\0".join(sorted(members)).encode()).hexdigest()
+    now = int(time.time() * 1000)
+    read_context = TrustedReadContext(
+        principal_id=principal,
+        channel=channel,
+        chat_id=chat_id,
+        recipient_principals=members,
+        membership_revision=member_revision,
+        policy_revision=policy_revision,
+        purpose="proactive",
+        now_ms=now,
+        is_direct=not chat_id.endswith("@g.us"),
+        owner=False,
+    )
+    fact_context = FactReadContext(
+        principal_id=principal,
+        chat_scope_key=read_context.scope_key(),
+        current_members=members,
+        now_ms=now,
+        owner=False,
+        group_wide=not read_context.is_direct,
+    )
+    return read_context, fact_context
+
+
 def _build_participation_runtime(
     *,
     config: Config,
@@ -996,6 +1064,7 @@ def _build_participation_runtime(
     log: object,
     policy_engine: object | None,
     inbound_archive: object | None,
+    chat_registry: object | None = None,
     processing_store: object | None,
     responder: object | None,
     policy_adapter: object | None,
@@ -1082,12 +1151,37 @@ def _build_participation_runtime(
             sender=str(row.get("sender_id") or row.get("participant") or ""),
         )
 
+    knowledge_selector = None
+    knowledge_context_supplier = None
+    knowledge = getattr(responder, "knowledge", None)
+    memory = getattr(responder, "memory", None)
+    if (
+        bool(getattr(participation, "knowledge_enabled", False))
+        and knowledge is not None
+        and memory is not None
+        and chat_registry is not None
+    ):
+        from yeoman_gateway.processing.participation_knowledge import (
+            ParticipationKnowledgeSelector,
+        )
+
+        knowledge_selector = ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
+
+        def _knowledge_contexts(opportunity: object, context: Mapping[str, object]):
+            return _participation_knowledge_contexts(
+                opportunity, context, chat_registry=chat_registry, knowledge=knowledge
+            )
+
+        knowledge_context_supplier = _knowledge_contexts
+
     context_builder = ParticipationContextBuilder(
         archive=inbound_archive,
         policy=policy_engine,
         anchors=anchors,
         taste=_taste_hits,
         source_authorizer=_source_authorized,
+        knowledge_selector=knowledge_selector,
+        knowledge_context_supplier=knowledge_context_supplier,
     )
 
     def _continuation_candidate(opportunity: object | None) -> bool:
@@ -3595,6 +3689,7 @@ def build_gateway_runtime(
                     log=speakup_log,
                     policy_engine=policy_engine,
                     inbound_archive=inbound_archive,
+                    chat_registry=chat_registry,
                     processing_store=processing_store,
                     responder=responder,
                     policy_adapter=policy_adapter,

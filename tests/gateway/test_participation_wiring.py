@@ -16,6 +16,7 @@ from yeoman_gateway.app.bootstrap import (
     _build_participation_runtime,
     _has_pending_participation_recovery,
     _offer_participation_trigger,
+    _participation_knowledge_contexts,
     build_effect_router,
     build_gateway_runtime,
     build_reconciliation_service,
@@ -27,6 +28,37 @@ from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import Config, WhatsAppConfig
+
+
+def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
+    opportunity = SimpleNamespace(
+        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2")
+    )
+    context = {
+        "messages": [
+            {"event_id": "m1", "sender_id": "anna"},
+            {"event_id": "m2", "sender_id": "anna"},
+        ]
+    }
+    registry = SimpleNamespace(
+        get_chat=lambda channel, chat: {
+            "metadata": {"participants": ["anna", "ben"]}
+        }
+    )
+    read, facts = _participation_knowledge_contexts(
+        opportunity, context, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
+    )
+    assert read.principal_id == facts.principal_id == "anna"
+    assert read.purpose == "proactive" and read.owner is False and facts.owner is False
+    assert read.recipient_principals == facts.current_members == frozenset({"anna", "ben"})
+
+    mixed = {"messages": [
+        {"event_id": "m1", "sender_id": "anna"},
+        {"event_id": "m2", "sender_id": "ben"},
+    ]}
+    assert _participation_knowledge_contexts(
+        opportunity, mixed, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
+    ) == "multi_author"
 
 
 @pytest.mark.asyncio
@@ -1354,13 +1386,14 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
         reason="useful",
         purpose="answer briefly",
         contribution_type="observation",
+        target_message_id="m1",
     )
 
     try:
         draft = await submission.generate_draft(
             opportunity=opportunity,
             decision=decision,
-            context={"messages": []},
+            context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
         )
         assert draft == "explicit writer draft"
         assert calls == [("writer/model", "openrouter")]
@@ -1370,14 +1403,14 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
             await submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
-                context={"messages": []},
+                context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
             )
 
         writer_mode = "empty"
         assert await submission.generate_draft(
             opportunity=opportunity,
             decision=decision,
-            context={"messages": []},
+            context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
         ) is None
 
         writer_mode = "unbound"
@@ -1385,7 +1418,7 @@ async def test_participation_writer_uses_explicit_route_provider_and_model(
             await submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
-                context={"messages": []},
+                context={"messages": [{"event_id": "m1", "sender": "Anna", "text": "question"}]},
             )
     finally:
         await responder.aclose()
