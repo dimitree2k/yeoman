@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, open as openFile, readFile, readdir, rena
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MAX_BRIDGE_FRAME_BYTES } from './protocol.js';
+import { deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES } from './protocol.js';
 
 async function loadOutbox(): Promise<any> {
   const modulePath = './outbox.js';
@@ -58,6 +58,40 @@ function oversizedEvent(eventId: string, eventKey: string): Record<string, unkno
 function eventFileName(eventValue: Record<string, unknown>): string {
   return `00000000000000000001-${encodeURIComponent(String(eventValue.eventId))}-${encodeURIComponent(String(eventValue.eventKey))}.json`;
 }
+
+test('legacy edit identities append for ordinary group and provider id lengths', async () => {
+  const { root, outbox } = await temporaryOutbox();
+  try {
+    const appended = [];
+    for (const messageId of ['A'.repeat(20), 'B'.repeat(22)]) {
+      const payload = {
+        chatJid: '123456789012345678@g.us',
+        messageId,
+        timestamp: 1_700_000_000,
+        text: 'synthetic replacement',
+      };
+      const identity = deriveProviderEventIdentity('edit', 'default', payload);
+      assert.ok(identity);
+      const persisted = await outbox.append(
+        event({ type: 'edit', accountId: 'default', payload, ...identity }),
+      );
+      appended.push(persisted);
+
+      const finalName = eventFileName({
+        eventId: persisted.eventId,
+        eventKey: persisted.eventKey,
+      });
+      const temporaryName = `.${finalName}.${'0'.repeat(36)}.tmp`;
+      assert.ok(Buffer.byteLength(temporaryName) <= 255);
+    }
+
+    assert.equal(new Set(appended.map(({ eventId }) => eventId)).size, 2);
+    assert.deepEqual(await outbox.pending(), appended);
+    assert.equal((await readdir(root)).filter((name) => name.endsWith('.json')).length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('event is durable before a subscriber callback can see it', async () => {
   const { root, outbox } = await temporaryOutbox();

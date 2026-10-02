@@ -231,7 +231,7 @@ function deriveEditRevisionIdentity(payload: Record<string, unknown>): string {
     }
   }
   const snapshot = JSON.stringify([timestamp, text, mediaMetadata]);
-  const digest = createHash('sha256').update(snapshot ?? 'null', 'utf8').digest('hex');
+  const digest = createHash('sha256').update(snapshot ?? 'null', 'utf8').digest('hex').slice(0, 32);
   return `legacy:${digest}`;
 }
 
