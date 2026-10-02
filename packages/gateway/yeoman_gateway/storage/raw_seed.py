@@ -66,7 +66,9 @@ class _Item:
     direction: str
     account: str
     native: dict[str, Any]
+    dedupe_id: str = ""
     has_id: bool = True
+    correlation_id: str = ""
 
 
 def _iso_ms(value: str, *, naive_is_local: bool = False) -> int | None:
@@ -104,12 +106,14 @@ def _journal(path: Path, counts: dict[str, int]) -> Iterator[_Item]:
             yield _Item(
                 channel=str(row["channel"]),
                 chat_id=str(row["chat_id"] or ""),
-                native_id=str(row["source_message_id"] or row["event_id"]),
+                native_id=str(row["event_id"]),
                 received_ms=int(row["created_ms"]),
                 kind=str(row["kind"]),
                 direction=str(row["direction"] or "in"),
                 account=str(row["account"] or ""),
                 native=json.loads(row["payload_json"]),
+                dedupe_id=(str(row["source_message_id"] or "") if row["kind"] == "message" else ""),
+                correlation_id=str(row["source_message_id"] or ""),
             )
 
 
@@ -131,6 +135,7 @@ def _reply_context(path: Path, counts: dict[str, int]) -> Iterator[_Item]:
                 direction="in",
                 account="",
                 native={key: row[key] for key in row.keys()},
+                dedupe_id=str(row["message_id"]),
             )
 
 
@@ -196,6 +201,7 @@ def _memory2(paths: SeedPaths, counts: dict[str, int]) -> Iterator[_Item]:
                     direction="in",
                     account="",
                     native={key: row[key] for key in row.keys()},
+                    dedupe_id=source_id,
                     has_id=bool(source_id),
                 )
 
@@ -220,7 +226,8 @@ def seed_raw_archive(
         "memory2": lambda c: _memory2(paths, c),
     }
     report = SeedReport(dry_run=dry_run)
-    seen: set[tuple[str, str, str]] = set()
+    seen_journal_events: set[tuple[str, str, str]] = set()
+    seen_message_copies: set[tuple[str, str, str]] = set()
     earliest_with_id: dict[tuple[str, str], int] = {}
     pending: dict[tuple[str, str], list[_Item]] = defaultdict(list)
     session_candidates: list[tuple[str, _Item]] = []
@@ -242,12 +249,24 @@ def seed_raw_archive(
                 continue
             channel = safe_channel(item.channel)
             chat_key = (channel, item.chat_id)
-            if item.has_id:
-                key = (channel, item.chat_id, item.native_id)
-                if key in seen:
+            if source == "journal":
+                event_key = (channel, item.chat_id, item.native_id)
+                if event_key in seen_journal_events:
                     counts["skipped_duplicate"] += 1
                     continue
-                seen.add(key)
+                seen_journal_events.add(event_key)
+                if item.dedupe_id:
+                    seen_message_copies.add((channel, item.chat_id, item.dedupe_id))
+                    earliest_with_id[chat_key] = min(
+                        earliest_with_id.get(chat_key, item.received_ms), item.received_ms
+                    )
+            elif item.has_id:
+                copy_id = item.dedupe_id or item.native_id
+                copy_key = (channel, item.chat_id, copy_id)
+                if copy_key in seen_message_copies:
+                    counts["skipped_duplicate"] += 1
+                    continue
+                seen_message_copies.add(copy_key)
                 earliest_with_id[chat_key] = min(
                     earliest_with_id.get(chat_key, item.received_ms), item.received_ms
                 )
@@ -295,7 +314,7 @@ def seed_raw_archive(
                         "native_id": item.native_id,
                         "chat_id": item.chat_id,
                         "account": item.account,
-                        "correlation_id": "",
+                        "correlation_id": item.correlation_id,
                         "provenance": source,
                         "media": None,
                         "native": item.native,

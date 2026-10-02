@@ -15,8 +15,9 @@ from yeoman_gateway.channels.telegram import TelegramChannel, raw_event_for_upda
 from yeoman_shared.config.loader import convert_keys
 from yeoman_shared.config.schema import Config, TelegramConfig
 from yeoman_shared.raw_archive import writer as raw_writer
+from yeoman_shared.raw_archive.purge import PurgeSelector, purge
 from yeoman_shared.raw_archive.records import archive_files, iter_records
-from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError
+from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError, RawEvent
 
 NOW = 1_790_000_000_000
 
@@ -60,7 +61,10 @@ def test_raw_event_for_update_keeps_the_whole_update() -> None:
 
 def test_send_is_archived_as_request_and_result(tmp_path: Path) -> None:
     archive = RawArchive(
-        tmp_path / "raw", spool=tmp_path / "spool", status_path=tmp_path / "s.json", clock=lambda: NOW
+        tmp_path / "raw",
+        spool=tmp_path / "spool",
+        status_path=tmp_path / "s.json",
+        clock=lambda: NOW,
     )
     channel = TelegramChannel(TelegramConfig(), MessageBus())
 
@@ -74,6 +78,8 @@ def test_send_is_archived_as_request_and_result(tmp_path: Path) -> None:
     assert [record["kind"] for record in records] == ["outbound_request", "outbound_result"]
     assert records[0]["native"]["content"] == "yo"
     assert records[1]["native_id"] == "7"
+    assert records[0]["correlation_id"] == records[1]["correlation_id"]
+    assert records[0]["correlation_id"]
 
 
 @pytest.fixture
@@ -152,7 +158,9 @@ async def test_outbound_capacity_blocks_send(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_result_capacity_preserves_success_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_result_capacity_preserves_success_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     channel = TelegramChannel(TelegramConfig(), MessageBus())
     send_calls = 0
 
@@ -187,7 +195,10 @@ async def test_inbound_media_is_copied_and_linked_to_its_update(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     archive = RawArchive(
-        tmp_path / "raw", spool=tmp_path / "spool", status_path=tmp_path / "s.json", clock=lambda: NOW
+        tmp_path / "raw",
+        spool=tmp_path / "spool",
+        status_path=tmp_path / "s.json",
+        clock=lambda: NOW,
     )
     channel = TelegramChannel(TelegramConfig(), MessageBus())
 
@@ -318,6 +329,8 @@ async def test_command_update_and_reply_are_archived(monkeypatch: pytest.MonkeyP
     assert events[1].native["text"] == replies[0][0]
     assert events[1].native["reply_to_message_id"] == 42
     assert events[2].native_id == "99"
+    assert events[1].correlation_id == events[2].correlation_id
+    assert events[1].correlation_id
     assert replies[0][1] == {"parse_mode": "HTML"}
 
 
@@ -446,7 +459,10 @@ async def test_explicit_restart_drains_retained_event_and_resumes_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     archive = RawArchive(
-        tmp_path / "raw", spool=tmp_path / "spool", status_path=tmp_path / "s.json", clock=lambda: NOW
+        tmp_path / "raw",
+        spool=tmp_path / "spool",
+        status_path=tmp_path / "s.json",
+        clock=lambda: NOW,
     )
     channel = TelegramChannel(TelegramConfig(token="fake"), MessageBus())
     channel.set_raw_archive(archive)
@@ -463,7 +479,9 @@ async def test_explicit_restart_drains_retained_event_and_resumes_commands(
         patch.setattr(archive, "_spool_line_locked", lambda *args: False)
         await telegram.append_async(
             archive,
-            raw_writer.RawEvent(channel="telegram", kind="retained", direction="in", native={"n": 1}),
+            raw_writer.RawEvent(
+                channel="telegram", kind="retained", direction="in", native={"n": 1}
+            ),
         )
         assert archive.status().pending_in_memory == 1
 
@@ -532,7 +550,13 @@ async def test_explicit_restart_drains_retained_event_and_resumes_commands(
     await channel._on_help(reply_update, reply_context)
 
     records = _records(tmp_path / "raw")
-    assert [record["kind"] for record in records] == ["retained", "update", "update", "outbound_request", "outbound_result"]
+    assert [record["kind"] for record in records] == [
+        "retained",
+        "update",
+        "update",
+        "outbound_request",
+        "outbound_result",
+    ]
     assert archive.status().pending_in_memory == 0
     assert replied
 
@@ -540,3 +564,91 @@ async def test_explicit_restart_drains_retained_event_and_resumes_commands(
 async def _async_reply(replies: list[str], text: str):
     replies.append(text)
     return SimpleNamespace(message_id=10)
+
+
+def test_telegram_purge_uses_effective_message_scope_and_removes_associated_media(
+    tmp_path: Path,
+) -> None:
+    archive = RawArchive(
+        tmp_path / "raw",
+        spool=tmp_path / "spool",
+        status_path=tmp_path / "status.json",
+        clock=lambda: NOW,
+    )
+
+    def update(
+        update_id: int, field: str, message_id: int, chat_id: int, *, reply_id: int | None = None
+    ):
+        native_message = {"message_id": message_id, "chat": {"id": chat_id}, "text": "synthetic"}
+        if reply_id is not None:
+            native_message["reply_to_message"] = {"message_id": reply_id}
+        message = SimpleNamespace(
+            message_id=message_id,
+            chat_id=chat_id,
+            chat=SimpleNamespace(id=chat_id),
+        )
+        return SimpleNamespace(
+            update_id=update_id,
+            **{field: message},
+            to_dict=lambda: {"update_id": update_id, field: native_message},
+        )
+
+    normal = update(1001, "message", 7, 101)
+    edited = update(1002, "edited_message", 7, 101)
+    same_number_elsewhere = update(1003, "message", 7, 202)
+    reply_to_target = update(1004, "message", 8, 101, reply_id=7)
+    for item in (normal, edited, same_number_elsewhere, reply_to_target):
+        archive.append(raw_event_for_update(item))
+    archive.append(
+        RawEvent(
+            channel="telegram",
+            kind="media",
+            direction="in",
+            native={"update_id": 1001, "file_id": "photo"},
+            native_id="1001",
+            chat_id="101",
+            correlation_id="7",
+            received_ms=NOW,
+        )
+    )
+
+    result = purge(
+        archive.root,
+        PurgeSelector(channel="telegram", chat_id="101", native_id="7"),
+        operator="dm",
+        now_ms=NOW + 1,
+    )
+    assert result.removed_lines == 3
+    remaining = [
+        record
+        for path in archive_files(archive.root)
+        for _, record, _ in iter_records(path)
+        if record
+    ]
+    assert [(record["native_id"], record["chat_id"], record["kind"]) for record in remaining] == [
+        ("1003", "202", "update"),
+        ("1004", "101", "update"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reply_text_archives_correlated_request_and_result(tmp_path: Path) -> None:
+    archive = RawArchive(
+        tmp_path / "raw",
+        spool=tmp_path / "spool",
+        status_path=tmp_path / "s.json",
+        clock=lambda: NOW,
+    )
+    channel = TelegramChannel(TelegramConfig(), MessageBus())
+
+    async def reply_text(text: str, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(message_id=88)
+
+    message = SimpleNamespace(chat_id=1001, message_id=13, reply_text=reply_text)
+    channel.set_raw_archive(archive)
+    await channel._reply_text(SimpleNamespace(message=message), "synthetic reply")
+
+    records = _records(archive.root)
+    assert [record["kind"] for record in records] == ["outbound_request", "outbound_result"]
+    assert records[0]["correlation_id"]
+    assert records[0]["correlation_id"] == records[1]["correlation_id"]

@@ -6,6 +6,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 from yeoman_shared.raw_archive import writer
@@ -71,10 +72,16 @@ def test_verify_defers_month_seal_until_backlog_drains(
     original_append_line = writer.append_line
     original_spool_line = archive._spool_line_locked
 
-    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+    def fail_month_append(
+        path: Path,
+        line: str,
+        *,
+        mode: int = writer.OPEN_FILE_MODE,
+        **append_options: Any,
+    ) -> bool:
         if path == month_file:
             raise OSError("temporary storage failure")
-        original_append_line(path, line, mode=mode)
+        return original_append_line(path, line, mode=mode, **append_options)
 
     def fail_spool_append(channel: str, received_ms: int, line: str) -> bool:
         return False
@@ -114,10 +121,16 @@ def test_verify_defers_seal_when_status_is_missing_but_spool_exists(
     month_file = root / "whatsapp" / "2026-09.jsonl"
     original_append_line = writer.append_line
 
-    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+    def fail_month_append(
+        path: Path,
+        line: str,
+        *,
+        mode: int = writer.OPEN_FILE_MODE,
+        **append_options: Any,
+    ) -> bool:
         if path == month_file:
             raise OSError("temporary storage failure")
-        original_append_line(path, line, mode=mode)
+        return original_append_line(path, line, mode=mode, **append_options)
 
     monkeypatch.setattr(writer, "append_line", fail_month_append)
     _append(archive, "retained-september", SEPT)
@@ -139,10 +152,16 @@ def test_verify_defers_seal_when_spool_scan_fails(
     month_file = root / "whatsapp" / "2026-09.jsonl"
     original_append_line = writer.append_line
 
-    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+    def fail_month_append(
+        path: Path,
+        line: str,
+        *,
+        mode: int = writer.OPEN_FILE_MODE,
+        **append_options: Any,
+    ) -> bool:
         if path == month_file:
             raise OSError("temporary storage failure")
-        original_append_line(path, line, mode=mode)
+        return original_append_line(path, line, mode=mode, **append_options)
 
     monkeypatch.setattr(writer, "append_line", fail_month_append)
     _append(archive, "retained-september", SEPT)

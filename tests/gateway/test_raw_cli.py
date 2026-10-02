@@ -82,6 +82,22 @@ def test_purge_with_yes_removes_and_audits(home: Path) -> None:
     assert ids == ["evt-m2"]
 
 
+def test_zero_match_purge_still_confirms_and_records_disposition(home: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["raw", "purge", "--channel", "whatsapp", "--chat", "never-seen", "--message", "missing"],
+        input="y\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Permanently apply this purge disposition?" in result.output
+    assert "0 archived lines removed" in result.output
+    audit_path = home / "data" / "raw" / "AUDIT"
+    [audit] = [record for _, record, _ in iter_records(audit_path) if record]
+    assert audit["removed_lines"] == 0
+    assert audit["disposition"]["chat_id"] == "never-seen"
+    assert audit["disposition"]["before_ms"] > 0
+
+
 def test_purge_without_chat_or_message_is_refused(home: Path) -> None:
     result = runner.invoke(app, ["raw", "purge", "--channel", "whatsapp", "--yes"])
     assert result.exit_code == 2
@@ -120,7 +136,7 @@ def test_seed_dry_run_and_import_use_only_home_stores(home: Path) -> None:
     assert seeded.exit_code == 0, seeded.output
     seed_file = home / "data" / "raw" / "whatsapp" / "seed-journal.jsonl"
     assert seed_file.is_file()
-    assert json.loads(seed_file.read_text().splitlines()[0])["native_id"] == "history-message"
+    assert json.loads(seed_file.read_text().splitlines()[0])["native_id"] == "history-event"
 
 
 def test_rebuild_drill_compares_with_synthetic_live_journal(

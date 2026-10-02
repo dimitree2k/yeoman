@@ -30,7 +30,7 @@ def raw_status(json_output: bool = typer.Option(False, "--json", help="Output JS
     lines = sum(file_digest(path)[1] for path in files)
     try:
         writer = json.loads((get_run_path() / STATUS_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except OSError, ValueError:
         writer = {"state": "unknown"}
     data = {
         "root": str(root),
@@ -53,7 +53,9 @@ def raw_verify() -> None:
     report = verify_archive()
     for problem in report.problems:
         typer.echo(f"PROBLEM {problem}")
-    typer.echo(f"files={report.files_checked} lines={report.lines_total} closed={len(report.closed)}")
+    typer.echo(
+        f"files={report.files_checked} lines={report.lines_total} closed={len(report.closed)}"
+    )
     raise typer.Exit(0 if report.ok else 1)
 
 
@@ -72,8 +74,12 @@ def raw_seed(dry_run: bool = typer.Option(False, "--dry-run", help="Count only")
 def raw_rebuild_drill(
     channel: str = typer.Option(..., "--channel"),
     chat: str = typer.Option(..., "--chat"),
-    target: Path | None = typer.Option(None, "--target", help="Empty directory; default: a temp dir"),
-    compare_live: bool = typer.Option(False, "--compare-live", help="Compare with the live journal"),
+    target: Path | None = typer.Option(
+        None, "--target", help="Empty directory; default: a temp dir"
+    ),
+    compare_live: bool = typer.Option(
+        False, "--compare-live", help="Compare with the live journal"
+    ),
 ) -> None:
     """Replay one chat from the raw archive into an empty journal."""
     from yeoman_shared.raw_archive.paths import raw_root
@@ -118,9 +124,10 @@ def raw_purge(
         f"Would remove {plan.removed_lines} line(s) from {len(plan.files)} file(s) "
         f"and {len(plan.media_removed)} media file(s)."
     )
-    if plan.removed_lines == 0:
-        return
-    if not yes and not typer.confirm("Permanently delete these lines?", default=False):
+    if not yes and not typer.confirm("Permanently apply this purge disposition?", default=False):
         raise typer.Exit(1)
     result = purge(raw_root(), selector, operator=getpass.getuser())
-    typer.echo(f"Removed {result.removed_lines} line(s); AUDIT updated.")
+    if result.removed_lines:
+        typer.echo(f"Removed {result.removed_lines} line(s); AUDIT updated.")
+    else:
+        typer.echo("Recorded purge disposition; 0 archived lines removed.")

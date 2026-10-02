@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 import yeoman_gateway.session.manager as sessions
+from yeoman_gateway.processing.signals import SignalJournalSink
+from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.storage.raw_seed import SeedPaths, seed_raw_archive
 from yeoman_shared.raw_archive.records import iter_records
 from yeoman_shared.raw_archive.verify import latest_manifest
@@ -162,7 +164,7 @@ def test_seed_writes_each_message_once_in_priority_order(tmp_path: Path) -> None
     root = _archive_root(tmp_path)
     report = seed_raw_archive(root, _paths(tmp_path), now_ms=START + 10)
     journal = _seed_lines(root, "journal")
-    assert [r["native_id"] for r in journal] == ["M1"]
+    assert [r["native_id"] for r in journal] == ["e1"]
     assert journal[0]["provenance"] == "journal" and journal[0]["native"] == {"text": "a"}
     assert [r["native_id"] for r in _seed_lines(root, "reply_context")] == ["M0"]
     assert [r["native"]["content"] for r in _seed_lines(root, "session_jsonl")] == [
@@ -339,3 +341,74 @@ def test_naive_session_timestamp_uses_local_time_for_utc_anchor_and_month(
         else:
             monkeypatch.setenv("TZ", previous_tz)
         time.tzset()
+
+
+def test_seed_preserves_journal_events_and_only_deduplicates_original_messages(
+    tmp_path: Path,
+) -> None:
+    source_paths = _paths(tmp_path)
+    payload = {"chatJid": "g1", "messageId": "M1", "text": "canonical text"}
+
+    canonical_db = tmp_path / "canonical.db"
+    sink = SignalJournalSink(ProcessingStore(canonical_db), clock=lambda: BEFORE)
+    for kind, event_id in (("message", "e-message"), ("edit", "e-edit"), ("delete", "e-delete")):
+        sink.capture(
+            kind,
+            payload,
+            event_id=event_id,
+            event_key=f"g1:{kind}:{event_id}",
+            account="acc",
+            observed_at_ms=BEFORE,
+            strict=True,
+        )
+
+    paths = SeedPaths(
+        processing_db=canonical_db,
+        reply_context_db=source_paths.reply_context_db,
+        inbound_dir=source_paths.inbound_dir,
+        knowledge_db=source_paths.knowledge_db,
+    )
+    root = _archive_root(tmp_path)
+    seed_raw_archive(root, paths, now_ms=START + 10)
+    journal = _seed_lines(root, "journal")
+    assert [(row["kind"], row["native_id"]) for row in journal] == [
+        ("message", "e-message"),
+        ("edit", "e-edit"),
+        ("delete", "e-delete"),
+    ]
+    assert {row["correlation_id"] for row in journal} == {"M1"}
+    assert [row["native_id"] for row in _seed_lines(root, "reply_context")] == ["M0"]
+
+    delete_db = tmp_path / "delete-only.db"
+    delete_sink = SignalJournalSink(ProcessingStore(delete_db), clock=lambda: BEFORE)
+    delete_sink.capture(
+        "delete",
+        payload,
+        event_id="e-delete-only",
+        event_key="g1:delete:e-delete-only",
+        account="acc",
+        observed_at_ms=BEFORE,
+        strict=True,
+    )
+    delete_root = tmp_path / "raw-delete-only"
+    RawArchive(
+        delete_root,
+        spool=tmp_path / "spool-delete-only",
+        status_path=tmp_path / "status-delete-only.json",
+        clock=lambda: START,
+    )
+    seed_raw_archive(
+        delete_root,
+        SeedPaths(
+            processing_db=delete_db,
+            reply_context_db=source_paths.reply_context_db,
+            inbound_dir=source_paths.inbound_dir,
+            knowledge_db=source_paths.knowledge_db,
+        ),
+        now_ms=START + 10,
+    )
+    assert [row["native_id"] for row in _seed_lines(delete_root, "journal")] == ["e-delete-only"]
+    assert sorted(row["native_id"] for row in _seed_lines(delete_root, "reply_context")) == [
+        "M0",
+        "M1",
+    ]

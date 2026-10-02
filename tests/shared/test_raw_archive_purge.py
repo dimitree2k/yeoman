@@ -59,6 +59,25 @@ def _ids(root: Path) -> list[str]:
     ]
 
 
+def _records(root: Path) -> list[dict]:
+    return [record for path in archive_files(root) for _, record, _ in iter_records(path) if record]
+
+
+def _pending_message(
+    message_id: str, *, received_ms: int = SEPT, correlation_id: str = ""
+) -> RawEvent:
+    return RawEvent(
+        channel="whatsapp",
+        kind="message",
+        direction="in",
+        native={"payload": {"messageId": message_id, "text": f"body-{message_id}"}},
+        native_id=f"event-{message_id}",
+        chat_id="c1",
+        correlation_id=correlation_id,
+        received_ms=received_ms,
+    )
+
+
 def test_selector_requires_a_chat_or_a_message() -> None:
     with pytest.raises(ValueError):
         PurgeSelector(channel="whatsapp").validate()
@@ -123,6 +142,238 @@ def test_purge_by_chat_and_before_keeps_newer_lines(tmp_path: Path) -> None:
     assert sorted(_ids(root)) == ["new", "other"]
 
 
+def test_purged_append_before_spool_unlink_is_drained_without_resurrection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    event = _pending_message("m1")
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> bool:
+        if path.parent == root / "whatsapp" and path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        return real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_month)
+    assert archive.append(event) is False
+    [spool_line] = archive.spool.glob("*.json")
+    monkeypatch.setattr(writer_module, "append_line", real_append_line)
+
+    real_unlink = Path.unlink
+    failed = False
+
+    def fail_spool_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path == spool_line and not failed:
+            failed = True
+            raise OSError("injected post-append spool unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_spool_unlink)
+    assert archive.drain_spool() == 0
+    assert len(_ids(root)) == 1
+    result = purge(
+        root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="m1"), operator="dm"
+    )
+    assert result.removed_lines == 1
+
+    monkeypatch.undo()
+    assert archive.drain_spool() == 1
+    assert _ids(root) == []
+    assert list(archive.spool.glob("*.json")) == []
+
+
+@pytest.mark.parametrize("pending_kind", ["default-spool", "custom-spool", "memory"])
+def test_zero_match_disposition_drains_changed_pending_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pending_kind: str
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root = tmp_path / "raw"
+    spool = tmp_path / ("custom" if pending_kind == "custom-spool" else "raw-spool")
+    archive = RawArchive(
+        root,
+        spool=spool,
+        status_path=tmp_path / f"{pending_kind}.json",
+        clock=lambda: OCT,
+    )
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> bool:
+        if path.parent == root / "whatsapp" and path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        return real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_month)
+    if pending_kind == "memory":
+        monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    assert archive.append(_pending_message("m1")) is False
+
+    if pending_kind == "memory":
+        channel, received_ms, line, lease = archive._pending[0]
+        record = json.loads(line)
+        record["native"]["payload"]["attempt"] = "changed-frame"
+        archive._pending[0] = (channel, received_ms, json.dumps(record), lease)
+    else:
+        [spool_line] = archive.spool.glob("*.json")
+        envelope = json.loads(spool_line.read_text(encoding="utf-8"))
+        record = json.loads(envelope["line"])
+        record["native"]["payload"]["attempt"] = "changed-frame"
+        envelope["line"] = json.dumps(record)
+        spool_line.write_text(json.dumps(envelope), encoding="utf-8")
+
+    result = purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="c1", native_id="m1"),
+        operator="dm",
+        now_ms=OCT,
+    )
+    assert result.removed_lines == 0
+    assert result.disposition_recorded is True
+    [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
+    assert audit["disposition"]["message_identities"] == ["m1"]
+
+    monkeypatch.undo()
+    assert archive.drain_spool() == 1
+    assert _records(root) == []
+    assert not list(archive.spool.glob("*.json"))
+    assert archive.status().pending_in_memory == 0
+
+
+def test_message_purge_disposition_covers_correlated_pending_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    archive.append(
+        RawEvent(
+            channel="whatsapp",
+            kind="outbound_result",
+            direction="out",
+            native={"message_id": "sent-1"},
+            native_id="sent-1",
+            chat_id="c1",
+            correlation_id="request-1",
+            received_ms=OCT,
+        )
+    )
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> bool:
+        if path.parent == root / "whatsapp" and path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        return real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_month)
+    assert (
+        archive.append(
+            RawEvent(
+                channel="whatsapp",
+                kind="outbound_request",
+                direction="out",
+                native={"text": "secret"},
+                chat_id="c1",
+                correlation_id="request-1",
+                received_ms=OCT,
+            )
+        )
+        is False
+    )
+    purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="c1", native_id="sent-1"),
+        operator="dm",
+        now_ms=OCT + 1,
+    )
+    monkeypatch.undo()
+    assert archive.drain_spool() == 1
+    assert _records(root) == []
+    assert not list(archive.spool.glob("*.json"))
+
+
+@pytest.mark.parametrize("channel", ["whatsapp", "telegram"])
+def test_purge_message_expands_scoped_outbound_correlation_closure(
+    tmp_path: Path, channel: str
+) -> None:
+    root, archive = _setup(tmp_path)
+
+    def request(chat: str, correlation_id: str, content: str) -> None:
+        archive.append(
+            RawEvent(
+                channel=channel,
+                kind="outbound_request",
+                direction="out",
+                native={"content": content},
+                chat_id=chat,
+                correlation_id=correlation_id,
+                received_ms=OCT,
+            )
+        )
+
+    def result(chat: str, correlation_id: str, message_id: str) -> None:
+        archive.append(
+            RawEvent(
+                channel=channel,
+                kind="outbound_result",
+                direction="out",
+                native={"message_id": message_id},
+                native_id=message_id,
+                chat_id=chat,
+                correlation_id=correlation_id,
+                received_ms=OCT,
+            )
+        )
+
+    request("c1", "req-selected", "selected secret")
+    result("c1", "req-selected", "7")
+    request("c1", "req-neighbor", "keep this")
+    result("c1", "req-neighbor", "8")
+    request("c2", "req-other-chat", "other chat")
+    result("c2", "req-other-chat", "7")
+
+    selector = PurgeSelector(channel=channel, chat_id="c1", native_id="7")
+    assert plan_purge(root, selector).removed_lines == 2
+    result = purge(root, selector, operator="dm", now_ms=OCT + 1)
+
+    assert result.removed_lines == 2
+    remaining = _records(root)
+    assert {(row["chat_id"], row["kind"], row["native_id"]) for row in remaining} == {
+        ("c1", "outbound_request", ""),
+        ("c1", "outbound_result", "8"),
+        ("c2", "outbound_request", ""),
+        ("c2", "outbound_result", "7"),
+    }
+    [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
+    assert audit["removed_lines"] == 2
+    assert len(audit["removed_sha256"]) == 2
+
+
+def test_chat_disposition_expires_at_snapshot_and_keeps_later_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> bool:
+        if path.parent == root / "whatsapp" and path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        return real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_month)
+    assert archive.append(_pending_message("old")) is False
+    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm", now_ms=OCT)
+    assert result.removed_lines == 0 and result.disposition_recorded is True
+    monkeypatch.undo()
+
+    assert archive.append(_pending_message("new", received_ms=OCT + 1)) is True
+    assert _ids(root) == ["new"]
+
+
 def test_media_is_removed_only_when_no_kept_line_references_it(tmp_path: Path) -> None:
     root, archive = _setup(tmp_path)
     src = tmp_path / "a.jpg"
@@ -166,9 +417,12 @@ def test_purge_audits_only_the_locked_snapshot_and_preserves_late_append(
 
     root, archive = _setup(tmp_path)
     _message(archive, "before", "c1", OCT)
+    month_file = root / "whatsapp" / "2026-10.jsonl"
+    old_inode = month_file.stat().st_ino
     append_started = threading.Event()
     append_finished = threading.Event()
     real_append_line = writer_module.append_line
+    real_append_is_disposed = writer_module.append_is_disposed
     real_append_protected = purge_module.append_protected
     late_writer: threading.Thread | None = None
 
@@ -177,9 +431,15 @@ def test_purge_audits_only_the_locked_snapshot_and_preserves_late_append(
             append_started.set()
         real_append_line(path, line, **kwargs)
 
+    def checked_disposition(audit_path: Path, record: dict, line: str) -> bool:
+        if threading.current_thread().name == "late-archive-writer":
+            assert audit_path.is_file()
+            assert month_file.stat().st_ino != old_inode
+        return real_append_is_disposed(audit_path, record, line)
+
     def append_late_message() -> None:
         try:
-            _message(archive, "late", "c1", OCT)
+            _message(archive, "late", "c1", OCT + 1)
         finally:
             append_finished.set()
 
@@ -195,8 +455,11 @@ def test_purge_audits_only_the_locked_snapshot_and_preserves_late_append(
             late_writer.join(timeout=1)
 
     monkeypatch.setattr(writer_module, "append_line", tracked_append_line)
+    monkeypatch.setattr(writer_module, "append_is_disposed", checked_disposition)
     monkeypatch.setattr(purge_module, "append_protected", audited_append)
-    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm")
+    result = purge(
+        root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm", now_ms=OCT + 1
+    )
 
     assert late_writer is not None
     late_writer.join(timeout=5)
@@ -215,18 +478,20 @@ def test_purge_includes_matches_arriving_before_file_lock(
 
     root, archive = _setup(tmp_path)
     _message(archive, "other-chat", "c2", OCT)
-    real_lock_file = purge_module._lock_file
+    real_lock_file = purge_module.lock_file
     appended = False
 
-    def append_before_lock(path: Path) -> int:
+    def append_before_lock(path: Path, *, create: bool = False) -> int:
         nonlocal appended
-        if not appended:
+        if path == root / ".purge-disposition.lock" and not appended:
             appended = True
             _message(archive, "arrived-before-lock", "c1", OCT)
-        return real_lock_file(path)
+        return real_lock_file(path, create=create)
 
-    monkeypatch.setattr(purge_module, "_lock_file", append_before_lock)
-    result = purge(root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm")
+    monkeypatch.setattr(purge_module, "lock_file", append_before_lock)
+    result = purge(
+        root, PurgeSelector(channel="whatsapp", chat_id="c1"), operator="dm", now_ms=OCT + 1
+    )
 
     assert appended
     assert result.removed_lines == 1

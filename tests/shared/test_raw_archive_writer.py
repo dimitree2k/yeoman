@@ -100,7 +100,9 @@ def test_non_json_values_are_serialized(tmp_path: Path) -> None:
 def test_concurrent_appends_produce_parseable_lines(tmp_path: Path) -> None:
     archive = _archive(tmp_path)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(lambda i: archive.append(_event(text=f"m{i}", native_id=f"e{i}")), range(400)))
+        list(
+            pool.map(lambda i: archive.append(_event(text=f"m{i}", native_id=f"e{i}")), range(400))
+        )
     records = _lines(tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl")
     assert len(records) == 400
     assert {r["native_id"] for r in records} == {f"e{i}" for i in range(400)}
@@ -145,9 +147,7 @@ def test_spool_failure_falls_back_to_memory(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("contents", [b"{not json", b"\xff"])
-def test_corrupt_spool_file_is_set_aside_not_deleted(
-    tmp_path: Path, contents: bytes
-) -> None:
+def test_corrupt_spool_file_is_set_aside_not_deleted(tmp_path: Path, contents: bytes) -> None:
     spool = tmp_path / "raw-spool"
     spool.mkdir()
     (spool / "0001-bad.json").write_bytes(contents)
@@ -256,7 +256,9 @@ def test_malformed_spool_line_quarantine_failure_preserves_new_event(
     real_replace = os.replace
     quarantines: list[Path] = []
 
-    def fail_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+    def fail_quarantine(
+        source: str | os.PathLike[str], destination: str | os.PathLike[str]
+    ) -> None:
         destination_path = Path(destination)
         if destination_path.name.endswith(".corrupt"):
             quarantines.append(destination_path)
@@ -330,7 +332,9 @@ def test_spool_file_and_new_month_name_are_fsynced(
     monkeypatch.setattr(os, "fsync", track_month_fsync)
     assert fresh_archive.append(_event(native_id="month")) is True
     month_file = tmp_path / "month-check" / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
-    file_sync = next(i for i, (kind, path) in enumerate(month_syncs) if kind == "file" and path == month_file)
+    file_sync = next(
+        i for i, (kind, path) in enumerate(month_syncs) if kind == "file" and path == month_file
+    )
     dir_sync = next(
         i
         for i, (kind, path) in enumerate(month_syncs)
@@ -359,9 +363,7 @@ async def test_capacity_stops_intake_and_recovers_after_storage_repair(
         with pytest.raises(writer_module.RawArchiveCapacityError):
             archive.append(_event(text="rejected direct", native_id="e2"))
         with pytest.raises(writer_module.RawArchiveCapacityError):
-            await writer_module.append_async(
-                archive, _event(text="rejected async", native_id="e3")
-            )
+            await writer_module.append_async(archive, _event(text="rejected async", native_id="e3"))
 
         status = archive.status()
         assert status.state == "blocked"
@@ -422,3 +424,17 @@ def test_recovered_spool_persists_pending_before_accepting_new_events(
     month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
     assert [record["native_id"] for record in _lines(month_file)] == ["e1", "e2", "e3", "e4"]
     assert archive.status().state == "ok"
+
+
+def test_invalid_audit_blocks_archive_append_and_preserves_spool(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    audit = archive.root / "AUDIT"
+    audit.write_text("not-json\n", encoding="utf-8")
+
+    assert archive.append(_event("must stay deferred")) is False
+    month_file = archive.root / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert _lines(month_file) == []
+    [spooled] = archive.spool.glob("*.json")
+    assert archive.drain_spool() == 0
+    assert spooled.is_file()
+    assert _lines(month_file) == []

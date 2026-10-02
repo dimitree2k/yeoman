@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ from typing import Any
 DIR_MODE = 0o700
 OPEN_FILE_MODE = 0o600
 CLOSED_FILE_MODE = 0o444
+PURGE_DISPOSITION_LOCK = ".purge-disposition.lock"
 _MONTH_STEM = re.compile(r"^\d{4}-\d{2}$")
 
 
@@ -47,39 +48,170 @@ def ensure_private_dir(path: Path) -> None:
         _fsync_directory(parent)
 
 
-def append_line(path: Path, line: str, *, mode: int = OPEN_FILE_MODE) -> None:
-    """Append one line and fsync. Raises ``OSError``; callers decide how to degrade."""
+def lock_file(path: Path, *, create: bool = False) -> int:
+    """Take an exclusive lock, retrying if an owner purge replaced the path."""
+    if create:
+        ensure_private_dir(path.parent)
+    while True:
+        try:
+            flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
+            fd = os.open(path, flags, OPEN_FILE_MODE)
+        except FileNotFoundError:
+            if create:
+                continue
+            raise
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_ino == os.stat(path).st_ino:
+                return fd
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
+def append_line(
+    path: Path,
+    line: str,
+    *,
+    mode: int = OPEN_FILE_MODE,
+    coordination_lock: Path | None = None,
+    should_append: Callable[[], bool] | None = None,
+) -> bool:
+    """Append one line and fsync; return false when the locked owner check disposes it."""
     if "\n" in line or "\r" in line:
         raise ValueError("raw archive lines must not contain newlines")
     ensure_private_dir(path.parent)
     data = (line + "\n").encode("utf-8")
-    while True:
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, mode)
-        except FileExistsError:
+    coordinator_fd = (
+        lock_file(coordination_lock, create=True) if coordination_lock is not None else None
+    )
+    try:
+        while True:
             try:
-                fd = os.open(path, os.O_RDWR | os.O_APPEND)
-            except FileNotFoundError:
+                fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, mode)
+            except FileExistsError:
+                try:
+                    fd = os.open(path, os.O_RDWR | os.O_APPEND)
+                except FileNotFoundError:
+                    continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                if os.fstat(fd).st_ino != os.stat(path).st_ino:
+                    continue  # replaced while we waited; reopen the current file
+                if should_append is not None and not should_append():
+                    return False
+                size = os.fstat(fd).st_size
+                if size and os.pread(fd, 1, size - 1) != b"\n":
+                    if os.write(fd, b"\n") != 1:
+                        raise OSError("could not separate an incomplete raw archive line")
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("raw archive append made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+                _fsync_directory(path.parent)
+                return True
+            finally:
+                os.close(fd)
+    finally:
+        if coordinator_fd is not None:
+            os.close(coordinator_fd)
+
+
+def record_identities(record: dict[str, Any]) -> set[str]:
+    ids = {str(record.get("native_id") or "")}
+    native = record.get("native")
+    if isinstance(native, dict):
+        payload = native.get("payload")
+        if isinstance(payload, dict):
+            ids.add(str(payload.get("messageId") or ""))
+        for key in ("message_id", "source_message_id"):
+            ids.add(str(native.get(key) or ""))
+        for key in (
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "business_message",
+            "edited_business_message",
+        ):
+            message = native.get(key)
+            if isinstance(message, dict):
+                ids.add(str(message.get("message_id") or ""))
+    ids.discard("")
+    return ids
+
+
+def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> bool:
+    """Match a locked month append against durable owner purge dispositions."""
+    channel = str(record.get("channel") or "")
+    chat_id = str(record.get("chat_id") or "")
+    received_ms = int(record.get("received_ms") or 0)
+    identities = record_identities(record)
+    correlation_id = str(record.get("correlation_id") or "")
+    digest = line_sha256(line)
+    try:
+        for _, audit, _ in iter_records(audit_path):
+            if audit is None:
+                raise OSError("raw archive AUDIT contains an invalid line")
+            if "disposition" not in audit:
+                continue  # Historical AUDIT records predate durable dispositions.
+            disposition = audit["disposition"]
+            if not isinstance(disposition, dict):
+                raise OSError("raw archive AUDIT disposition is invalid")
+            scope = disposition.get("scope")
+            disposition_channel = disposition.get("channel")
+            scoped_chat = disposition.get("chat_id")
+            before_ms = disposition.get("before_ms")
+            message_ids = disposition.get("message_identities")
+            correlation_ids = disposition.get("correlation_ids")
+            removed_hashes = audit.get("removed_sha256")
+            if (
+                scope not in {"chat", "message"}
+                or not isinstance(disposition_channel, str)
+                or (scoped_chat is not None and not isinstance(scoped_chat, str))
+                or (
+                    before_ms is not None
+                    and (not isinstance(before_ms, int) or isinstance(before_ms, bool))
+                )
+                or (scope == "chat" and before_ms is None)
+                or not isinstance(message_ids, list)
+                or any(not isinstance(value, str) for value in message_ids)
+                or not isinstance(correlation_ids, list)
+                or any(not isinstance(value, str) for value in correlation_ids)
+                or not isinstance(removed_hashes, list)
+                or any(not isinstance(value, str) for value in removed_hashes)
+            ):
+                raise OSError("raw archive AUDIT disposition is malformed")
+            if disposition_channel != channel:
                 continue
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            if os.fstat(fd).st_ino != os.stat(path).st_ino:
-                continue  # replaced while we waited; reopen the current file
-            size = os.fstat(fd).st_size
-            if size and os.pread(fd, 1, size - 1) != b"\n":
-                if os.write(fd, b"\n") != 1:
-                    raise OSError("could not separate an incomplete raw archive line")
-            view = memoryview(data)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("raw archive append made no progress")
-                view = view[written:]
-            os.fsync(fd)
-            _fsync_directory(path.parent)
-            return
-        finally:
-            os.close(fd)
+            if scoped_chat is not None and scoped_chat != chat_id:
+                continue
+            if scope == "message" and scoped_chat is None and chat_id:
+                continue  # Do not let an unscoped numeric ID collide across chats.
+            if before_ms is not None and received_ms >= before_ms:
+                continue
+            if scope == "chat":
+                if before_ms is None:
+                    raise OSError("raw archive chat disposition has no cutoff")
+                return received_ms < before_ms
+            if digest in removed_hashes:
+                return True
+            if identities.intersection(message_ids):
+                return True
+            if correlation_id and correlation_id in correlation_ids:
+                return True
+    except FileNotFoundError:
+        if audit_path.is_symlink():
+            raise OSError("raw archive AUDIT symlink is broken")
+        return False
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise OSError("could not read raw archive purge dispositions") from exc
+    return False
+
 
 def append_protected(path: Path, line: str) -> None:
     """Append to a ``0444`` bookkeeping file (MANIFEST, AUDIT, SUPPRESSIONS)."""

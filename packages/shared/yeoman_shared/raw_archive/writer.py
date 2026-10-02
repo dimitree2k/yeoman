@@ -31,7 +31,9 @@ from yeoman_shared.raw_archive.paths import raw_root, spool_root
 from yeoman_shared.raw_archive.records import (
     CLOSED_FILE_MODE,
     OPEN_FILE_MODE,
+    PURGE_DISPOSITION_LOCK,
     _fsync_directory,
+    append_is_disposed,
     append_line,
     append_protected,
     dumps,
@@ -413,6 +415,17 @@ class RawArchive:
     def _month_file(self, channel: str, received_ms: int) -> Path:
         return self.root / channel / f"{month_of(received_ms)}.jsonl"
 
+    def _append_archive_line(
+        self, channel: str, received_ms: int, line: str, record: dict[str, Any]
+    ) -> bool:
+        # ponytail: AUDIT is scanned per append; compact only if archive size makes latency measurable.
+        return append_line(
+            self._month_file(channel, received_ms),
+            line,
+            coordination_lock=self.root / PURGE_DISPOSITION_LOCK,
+            should_append=lambda: not append_is_disposed(self.root / "AUDIT", record, line),
+        )
+
     def _append_locked(
         self, event: RawEvent, *, media_lease: _MediaGuardLease | None = None
     ) -> bool:
@@ -446,21 +459,22 @@ class RawArchive:
                 )
             received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
             channel = safe_channel(event.channel)
-            line = dumps(self._record(event, channel=channel, received_ms=received_ms))
+            record = self._record(event, channel=channel, received_ms=received_ms)
+            line = dumps(record)
             self._drain_locked()
             if self._has_backlog_locked():
                 self._defer_locked(channel, received_ms, line, lease)
                 self._publish_status_locked()
                 return False
             try:
-                append_line(self._month_file(channel, received_ms), line)
+                self._append_archive_line(channel, received_ms, line, record)
             except OSError as exc:
                 self._note_error(exc)
                 self._defer_locked(channel, received_ms, line, lease)
                 self._publish_status_locked()
                 return False
             self._publish_status_locked()
-            return True
+            return True  # A false append means the owner disposition drained this event.
         finally:
             if lease is not None:
                 lease.release()
@@ -641,7 +655,6 @@ class RawArchive:
                 record = json.loads(line)
                 if "\n" in line or "\r" in line or not isinstance(record, dict):
                     raise ValueError("spool line must be one JSON object")
-                target = self._month_file(channel, received_ms)
             except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
                 if not self._quarantine_locked(item, exc):
                     return moved
@@ -655,7 +668,7 @@ class RawArchive:
                     return moved
             try:
                 try:
-                    append_line(target, line)
+                    self._append_archive_line(channel, received_ms, line, record)
                 except OSError as exc:
                     self._note_error(exc)
                     return moved
@@ -675,7 +688,8 @@ class RawArchive:
         while self._pending:
             channel, received_ms, line, media_lease = self._pending[0]
             try:
-                append_line(self._month_file(channel, received_ms), line)
+                record = json.loads(line)
+                self._append_archive_line(channel, received_ms, line, record)
             except OSError as exc:
                 self._note_error(exc)
                 break

@@ -9,7 +9,6 @@ are rewritten through a temporary file and an atomic rename while holding the sa
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
@@ -19,11 +18,14 @@ from typing import Any
 
 from yeoman_shared.raw_archive.records import (
     OPEN_FILE_MODE,
+    PURGE_DISPOSITION_LOCK,
     append_protected,
     archive_files,
     dumps,
     iter_records,
     line_sha256,
+    lock_file,
+    record_identities,
 )
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, record_closed
 from yeoman_shared.raw_archive.writer import (
@@ -32,19 +34,6 @@ from yeoman_shared.raw_archive.writer import (
     stored_media_relative,
     try_lock_media_purge,
 )
-
-
-def _identities(record: dict[str, Any]) -> set[str]:
-    ids = {str(record.get("native_id") or "")}
-    native = record.get("native")
-    if isinstance(native, dict):
-        payload = native.get("payload")
-        if isinstance(payload, dict):
-            ids.add(str(payload.get("messageId") or ""))
-        for key in ("message_id", "source_message_id"):
-            ids.add(str(native.get(key) or ""))
-    ids.discard("")
-    return ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +54,7 @@ class PurgeSelector:
             return False
         if self.chat_id and record.get("chat_id") != self.chat_id:
             return False
-        if self.native_id and self.native_id not in _identities(record):
+        if self.native_id and self.native_id not in record_identities(record):
             return False
         if self.before_ms is not None and int(record.get("received_ms") or 0) >= self.before_ms:
             return False
@@ -78,15 +67,63 @@ class PurgeResult:
     removed_lines: int
     removed_sha256: tuple[str, ...]
     media_removed: tuple[str, ...]
+    disposition_recorded: bool = False
 
 
 def _media_path(record: dict[str, Any]) -> str | None:
     return stored_media_relative(record.get("media"))
 
 
+@dataclass(frozen=True, slots=True)
+class _PurgePredicate:
+    selector: PurgeSelector
+    chat_id: str | None
+    identities: frozenset[str]
+    correlations: frozenset[str]
+
+    def matches(self, record: dict[str, Any]) -> bool:
+        if record.get("channel") != safe_channel(self.selector.channel):
+            return False
+        if self.chat_id is not None and str(record.get("chat_id") or "") != self.chat_id:
+            return False
+        if (
+            self.selector.before_ms is not None
+            and int(record.get("received_ms") or 0) >= self.selector.before_ms
+        ):
+            return False
+        if self.selector.native_id is None:
+            return self.selector.chat_id is not None
+        ids = record_identities(record)
+        if ids.intersection(self.identities):
+            return True
+        correlation = str(record.get("correlation_id") or "")
+        return bool(correlation and correlation in self.correlations)
+
+
+def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
+    matched: list[dict[str, Any]] = []
+    for path in archive_files(root, safe_channel(selector.channel)):
+        for _, record, _ in iter_records(path):
+            if record is not None and selector.matches(record):
+                matched.append(record)
+    chats = {str(record.get("chat_id") or "") for record in matched}
+    if selector.native_id is not None and selector.chat_id is None and len(chats) > 1:
+        raise ValueError("message purge spans multiple chats; specify --chat")
+    chat_id = selector.chat_id or (next(iter(chats)) if chats else None)
+    identities = {selector.native_id} if selector.native_id else set()
+    correlations: set[str] = set()
+    for record in matched:
+        identities.update(record_identities(record))
+        correlation = str(record.get("correlation_id") or "")
+        if correlation:
+            correlations.add(correlation)
+    return _PurgePredicate(selector, chat_id, frozenset(identities), frozenset(correlations))
+
+
 def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
     """Dry run: what a purge with this selector would remove."""
     selector.validate()
+    predicate = _build_predicate(root, selector)
     files: list[str] = []
     removed: list[str] = []
     removed_media: set[str] = set()
@@ -95,7 +132,7 @@ def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
         hit = False
         for _, record, line in iter_records(path):
             media = _media_path(record) if record else None
-            if record is not None and selector.matches(record):
+            if record is not None and predicate.matches(record):
                 hit = True
                 removed.append(line_sha256(line))
                 if media:
@@ -110,16 +147,7 @@ def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
 
 
 def _lock_file(path: Path) -> int:
-    while True:
-        lock_fd = os.open(path, os.O_RDONLY)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            if os.fstat(lock_fd).st_ino == os.stat(path).st_ino:
-                return lock_fd
-        except BaseException:
-            os.close(lock_fd)
-            raise
-        os.close(lock_fd)
+    return lock_file(path)
 
 
 def _lock_files(root: Path, files: tuple[str, ...]) -> list[tuple[str, Path, int]]:
@@ -137,7 +165,7 @@ def _lock_files(root: Path, files: tuple[str, ...]) -> list[tuple[str, Path, int
 
 def _snapshot_locked(
     locked: list[tuple[str, Path, int]],
-    selector: PurgeSelector,
+    predicate: _PurgePredicate,
     media_removed: tuple[str, ...],
 ) -> PurgeResult:
     files: list[str] = []
@@ -145,7 +173,7 @@ def _snapshot_locked(
     for relative, path, _ in locked:
         hit = False
         for _, record, line in iter_records(path):
-            if record is not None and selector.matches(record):
+            if record is not None and predicate.matches(record):
                 hit = True
                 removed.append(line_sha256(line))
         if hit:
@@ -231,14 +259,14 @@ def _spool_media_references(root: Path) -> set[str] | None:
 def _unreferenced_media_locked(
     root: Path,
     locked: list[tuple[str, Path, int]],
-    selector: PurgeSelector,
+    predicate: _PurgePredicate,
 ) -> tuple[str, ...]:
     candidates: set[str] = set()
     selected_paths = {path for _, path, _ in locked}
     for _, path, _ in locked:
         try:
             for _, record, _ in iter_records(path):
-                if record is not None and selector.matches(record):
+                if record is not None and predicate.matches(record):
                     media = _media_path(record)
                     if media:
                         candidates.add(media)
@@ -257,7 +285,7 @@ def _unreferenced_media_locked(
                     return ()
                 media = _media_path(record)
                 if media in candidates and not (
-                    path in selected_paths and selector.matches(record)
+                    path in selected_paths and predicate.matches(record)
                 ):
                     candidates.discard(media)
         spool_references = _spool_media_references(root)
@@ -268,12 +296,12 @@ def _unreferenced_media_locked(
     return tuple(sorted(candidates - spool_references))
 
 
-def _rewrite_without(path: Path, selector: PurgeSelector, lock_fd: int) -> None:
+def _rewrite_without(path: Path, predicate: _PurgePredicate, lock_fd: int) -> None:
     mode = os.fstat(lock_fd).st_mode & 0o777
     temporary = path.with_name(f".{path.name}.purge-tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         for _, record, line in iter_records(path):
-            if record is not None and selector.matches(record):
+            if record is not None and predicate.matches(record):
                 continue
             handle.write(line + "\n")
         handle.flush()
@@ -285,53 +313,76 @@ def _rewrite_without(path: Path, selector: PurgeSelector, lock_fd: int) -> None:
 def purge(
     root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None
 ) -> PurgeResult:
-    """Remove selected lines and only media proven unreferenced under the writer guard."""
+    """Remove selected lines and record a durable owner disposition, including zero matches."""
     selector.validate()
-    files = tuple(
-        path.relative_to(root).as_posix()
-        for path in archive_files(root, safe_channel(selector.channel))
-    )
-    if not files:
-        return PurgeResult((), 0, (), ())
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    effective = selector
+    if selector.chat_id is not None and selector.before_ms is None:
+        from dataclasses import replace
 
-    # ponytail: root-wide media lock serializes channels; shard if needed, while busy scans retain media.
-    # Writers hold it from publication through the archive/spool write.
-    media_guard_fd = try_lock_media_purge(root)
+        effective = replace(selector, before_ms=now)
+
+    # ponytail: this root-wide lock serializes only raw appends against owner dispositions.
+    disposition_fd = lock_file(root / PURGE_DISPOSITION_LOCK, create=True)
+    media_guard_fd: int | None = None
     locked: list[tuple[str, Path, int]] = []
     try:
+        media_guard_fd = try_lock_media_purge(root)
+        files = tuple(
+            path.relative_to(root).as_posix()
+            for path in archive_files(root, safe_channel(effective.channel))
+        )
         locked = _lock_files(root, files)
-        snapshot = _snapshot_locked(locked, selector, ())
-        if snapshot.removed_lines == 0:
-            return snapshot
+        predicate = _build_predicate(root, effective)
+        snapshot = _snapshot_locked(locked, predicate, ())
         media_removed = (
-            _unreferenced_media_locked(root, locked, selector) if media_guard_fd is not None else ()
+            _unreferenced_media_locked(root, locked, predicate)
+            if media_guard_fd is not None
+            else ()
         )
         plan = PurgeResult(
             snapshot.files,
             snapshot.removed_lines,
             snapshot.removed_sha256,
             media_removed,
+            True,
         )
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
-        append_protected(
-            root / AUDIT,
-            dumps(
-                {
-                    "ts_ms": now,
-                    "operator": operator,
-                    "selector": asdict(selector),
-                    "files": list(plan.files),
-                    "removed_lines": plan.removed_lines,
-                    "removed_sha256": list(plan.removed_sha256),
-                    "media_removed": list(plan.media_removed),
-                }
-            ),
-        )
+
+        selected_records: list[dict[str, Any]] = []
+        for _, path, _ in locked:
+            for _, record, _ in iter_records(path):
+                if record is not None and predicate.matches(record):
+                    selected_records.append(record)
+        identities = set(predicate.identities)
+        correlations = set(predicate.correlations)
+        for record in selected_records:
+            identities.update(record_identities(record))
+            correlation = str(record.get("correlation_id") or "")
+            if correlation:
+                correlations.add(correlation)
+        audit_record = {
+            "ts_ms": now,
+            "operator": operator,
+            "selector": asdict(effective),
+            "files": list(plan.files),
+            "removed_lines": plan.removed_lines,
+            "removed_sha256": list(plan.removed_sha256),
+            "media_removed": list(plan.media_removed),
+            "disposition": {
+                "scope": "message" if effective.native_id is not None else "chat",
+                "channel": safe_channel(effective.channel),
+                "chat_id": predicate.chat_id,
+                "before_ms": effective.before_ms,
+                "message_identities": sorted(identities),
+                "correlation_ids": sorted(correlations),
+            },
+        }
+        append_protected(root / AUDIT, dumps(audit_record))
         sealed = latest_manifest(root)
         for relative, path, lock_fd in locked:
             if relative not in plan.files:
                 continue
-            _rewrite_without(path, selector, lock_fd)
+            _rewrite_without(path, predicate, lock_fd)
             if relative in sealed:
                 record_closed(root, path, now_ms=now, note="purged")
         for relative in plan.media_removed:
@@ -342,3 +393,4 @@ def purge(
             os.close(lock_fd)
         if media_guard_fd is not None:
             os.close(media_guard_fd)
+        os.close(disposition_fd)
