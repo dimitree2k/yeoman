@@ -61,6 +61,24 @@ def test_participation_knowledge_context_uses_verified_single_source_author() ->
     ) == "multi_author"
 
 
+def test_participation_knowledge_context_fails_closed_for_unverified_chat_types() -> None:
+    registry = SimpleNamespace(
+        get_chat=lambda channel, chat: {
+            "metadata": {"participants": ["anna", "ben"]}
+        }
+    )
+    context = {"messages": [{"event_id": "m1", "sender_id": "anna"}]}
+    knowledge = SimpleNamespace(policy_revision=7)
+
+    for channel, chat_id in (("telegram", "-100123"), ("whatsapp", "anna@s.whatsapp.net")):
+        opportunity = SimpleNamespace(
+            channel=channel, chat_id=chat_id, source_event_ids=("m1",)
+        )
+        assert _participation_knowledge_contexts(
+            opportunity, context, chat_registry=registry, knowledge=knowledge
+        ) == "unsupported_chat_type"
+
+
 @pytest.mark.asyncio
 async def test_reconciliation_wiring_projects_participation_before_empty_return(
     tmp_path: Path,

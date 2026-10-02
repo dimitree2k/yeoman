@@ -1002,6 +1002,13 @@ def _participation_knowledge_contexts(
     from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_gateway.knowledge.models import TrustedReadContext
 
+    channel = str(getattr(opportunity, "channel", ""))
+    chat_id = str(getattr(opportunity, "chat_id", ""))
+    # This supplier has a proven group marker only for WhatsApp. Other channel
+    # identifiers and WhatsApp direct-chat forms stay recent-only until their
+    # group/direct type has an equally trusted source.
+    if channel != "whatsapp" or not chat_id.endswith("@g.us"):
+        return "unsupported_chat_type"
     source_ids = tuple(getattr(opportunity, "source_event_ids", ()) or ())
     messages = context.get("messages")
     rows = {
@@ -1018,8 +1025,6 @@ def _participation_knowledge_contexts(
         return "source_unavailable"
     if len(authors) != 1:
         return "multi_author"
-    channel = str(getattr(opportunity, "channel", ""))
-    chat_id = str(getattr(opportunity, "chat_id", ""))
     try:
         members = frozenset(registry_members(chat_registry, channel=channel, chat_id=chat_id))
     except Exception:
@@ -1043,7 +1048,7 @@ def _participation_knowledge_contexts(
         policy_revision=policy_revision,
         purpose="proactive",
         now_ms=now,
-        is_direct=not chat_id.endswith("@g.us"),
+        is_direct=False,
         owner=False,
     )
     fact_context = FactReadContext(
@@ -1052,7 +1057,7 @@ def _participation_knowledge_contexts(
         current_members=members,
         now_ms=now,
         owner=False,
-        group_wide=not read_context.is_direct,
+        group_wide=True,
     )
     return read_context, fact_context
 
