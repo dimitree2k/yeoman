@@ -24,9 +24,27 @@ CLOSED_FILE_MODE = 0o444
 _MONTH_STEM = re.compile(r"^\d{4}-\d{2}$")
 
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def ensure_private_dir(path: Path) -> None:
-    if not path.is_dir():
-        path.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+    if path.is_dir():
+        return
+    parent = path.parent
+    if parent != path:
+        ensure_private_dir(parent)
+    try:
+        path.mkdir(mode=DIR_MODE)
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+    else:
+        _fsync_directory(parent)
 
 
 def append_line(path: Path, line: str, *, mode: int = OPEN_FILE_MODE) -> None:
@@ -36,20 +54,32 @@ def append_line(path: Path, line: str, *, mode: int = OPEN_FILE_MODE) -> None:
     ensure_private_dir(path.parent)
     data = (line + "\n").encode("utf-8")
     while True:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode)
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_APPEND)
+            except FileNotFoundError:
+                continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             if os.fstat(fd).st_ino != os.stat(path).st_ino:
                 continue  # replaced while we waited; reopen the current file
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                if os.write(fd, b"\n") != 1:
+                    raise OSError("could not separate an incomplete raw archive line")
             view = memoryview(data)
             while view:
                 written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("raw archive append made no progress")
                 view = view[written:]
             os.fsync(fd)
+            _fsync_directory(path.parent)
             return
         finally:
             os.close(fd)
-
 
 def append_protected(path: Path, line: str) -> None:
     """Append to a ``0444`` bookkeeping file (MANIFEST, AUDIT, SUPPRESSIONS)."""

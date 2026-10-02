@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from yeoman_shared.raw_archive import writer as writer_module
 from yeoman_shared.raw_archive.records import append_line, file_digest, iter_records
 from yeoman_shared.raw_archive.writer import RawArchive, RawEvent, month_of, read_start_ms
 
@@ -168,3 +169,166 @@ def test_append_line_follows_a_replaced_file(tmp_path: Path) -> None:
 def test_newlines_inside_a_line_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         append_line(tmp_path / "f.jsonl", "a\nb")
+
+
+def test_partial_write_is_separated_before_spooled_record_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path)
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    real_write = os.write
+    partial = b""
+    calls = 0
+
+    def fail_after_partial(fd: int, data: bytes | memoryview) -> int:
+        nonlocal calls, partial
+        if Path(os.readlink(f"/proc/self/fd/{fd}")) == month_file:
+            calls += 1
+            if calls == 1:
+                partial = bytes(data[:17])
+                return real_write(fd, partial)
+            if calls == 2:
+                raise OSError("injected short-write failure")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", fail_after_partial)
+    assert archive.append(_event(native_id="e1")) is False
+    assert archive.append(_event(native_id="e2")) is True
+
+    rows = list(iter_records(month_file))
+    assert rows[0][1] is None
+    assert [record["native_id"] for _, record, _ in rows if record is not None] == ["e1", "e2"]
+    assert month_file.read_bytes().startswith(partial + b"\n")
+
+
+def test_spool_unlink_failure_keeps_entry_and_defers_current_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path)
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected month failure")
+        real_append_line(path, line, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("yeoman_shared.raw_archive.writer.append_line", fail_month)
+        assert archive.append(_event(native_id="e1")) is False
+
+    [old_entry] = list(archive.spool.glob("*.json"))
+    real_unlink = Path.unlink
+    failed = False
+
+    def fail_old_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path == old_entry and not failed:
+            failed = True
+            raise PermissionError("injected spool unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_old_unlink)
+    assert archive.append(_event(native_id="e2")) is False
+
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert [record["native_id"] for record in _lines(month_file)] == ["e1"]
+    spool_records = [json.loads(path.read_text()) for path in archive.spool.glob("*.json")]
+    assert {json.loads(record["line"])["native_id"] for record in spool_records} == {"e1", "e2"}
+    assert archive.status().spooled == 2
+
+
+def test_malformed_spool_line_quarantine_failure_preserves_new_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spool = tmp_path / "raw-spool"
+    spool.mkdir()
+    malformed = spool / "0001-malformed.json"
+    malformed.write_text(
+        json.dumps({"channel": "whatsapp", "received_ms": NOW, "line": '{"bad":1}\n{"bad":2}'}),
+        encoding="utf-8",
+    )
+    archive = _archive(tmp_path)
+    real_replace = os.replace
+    quarantines: list[Path] = []
+
+    def fail_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        destination_path = Path(destination)
+        if destination_path.name.endswith(".corrupt"):
+            quarantines.append(destination_path)
+            raise PermissionError("injected quarantine failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_quarantine)
+    assert archive.append(_event(native_id="e2")) is False
+
+    assert malformed.is_file()
+    assert quarantines == [malformed.with_name(malformed.name + ".corrupt")]
+    spool_records = [json.loads(path.read_text()) for path in spool.glob("*.json")]
+    assert any(json.loads(record["line"])["native_id"] == "e2" for record in spool_records)
+
+
+def test_spool_file_and_new_month_name_are_fsynced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path)
+    real_append_line = writer_module.append_line
+
+    def fail_month(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected month failure")
+        real_append_line(path, line, **kwargs)
+
+    events: list[tuple[str, Path]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def track_fsync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        kind = "dir-fsync" if stat.S_ISDIR(mode) else "file-fsync"
+        events.append((kind, Path(os.readlink(f"/proc/self/fd/{fd}"))))
+        real_fsync(fd)
+
+    def track_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        destination_path = Path(destination)
+        if destination_path.parent == archive.spool:
+            events.append(("spool-rename", destination_path))
+        real_replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("yeoman_shared.raw_archive.writer.append_line", fail_month)
+        patch.setattr(os, "fsync", track_fsync)
+        patch.setattr(os, "replace", track_replace)
+        assert archive.append(_event(native_id="e1")) is False
+
+    spool_rename = next(i for i, (kind, _) in enumerate(events) if kind == "spool-rename")
+    temp_fsync = max(
+        i
+        for i, (kind, path) in enumerate(events[:spool_rename])
+        if kind == "file-fsync" and path.parent == archive.spool
+    )
+    dir_fsync = next(
+        i
+        for i, (kind, path) in enumerate(events[spool_rename + 1 :], spool_rename + 1)
+        if kind == "dir-fsync" and path == archive.spool
+    )
+    assert temp_fsync < spool_rename < dir_fsync
+
+    fresh_archive = _archive(tmp_path / "month-check")
+    month_syncs: list[tuple[str, Path]] = []
+
+    def track_month_fsync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        kind = "dir" if stat.S_ISDIR(mode) else "file"
+        month_syncs.append((kind, Path(os.readlink(f"/proc/self/fd/{fd}"))))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_month_fsync)
+    assert fresh_archive.append(_event(native_id="month")) is True
+    month_file = tmp_path / "month-check" / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    file_sync = next(i for i, (kind, path) in enumerate(month_syncs) if kind == "file" and path == month_file)
+    dir_sync = next(
+        i
+        for i, (kind, path) in enumerate(month_syncs)
+        if kind == "dir" and path == month_file.parent
+    )
+    assert file_sync < dir_sync

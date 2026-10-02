@@ -28,6 +28,7 @@ from yeoman_shared.raw_archive.paths import raw_root, spool_root
 from yeoman_shared.raw_archive.records import (
     CLOSED_FILE_MODE,
     OPEN_FILE_MODE,
+    _fsync_directory,
     append_line,
     dumps,
     ensure_private_dir,
@@ -232,12 +233,22 @@ class RawArchive:
             ensure_private_dir(self.spool)
             name = f"{received_ms:013d}-{uuid.uuid4().hex}.json"
             temporary = self.spool / f".{name}.tmp"
-            temporary.write_text(
-                json.dumps({"channel": channel, "received_ms": received_ms, "line": line}),
-                encoding="utf-8",
-            )
-            os.chmod(temporary, OPEN_FILE_MODE)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, OPEN_FILE_MODE)
+            try:
+                data = json.dumps(
+                    {"channel": channel, "received_ms": received_ms, "line": line}
+                ).encode("utf-8")
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("raw archive spool write made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
             os.replace(temporary, self.spool / name)
+            _fsync_directory(self.spool)
         except OSError as exc:
             self._note_error(exc)
             self._remember_locked(channel, received_ms, line)
@@ -248,25 +259,58 @@ class RawArchive:
             return
         self._pending.append((channel, received_ms, line))
 
+    def _quarantine_locked(self, item: Path, error: BaseException) -> bool:
+        self._note_error(error)
+        try:
+            os.replace(item, item.with_name(item.name + ".corrupt"))
+        except OSError as exc:
+            self._note_error(exc)
+            return False
+        return True
+
     def _drain_locked(self) -> int:
         moved = 0
-        for item in self._spooled_files():
+        try:
+            items = self._spooled_files()
+        except OSError as exc:
+            self._note_error(exc)
+            return moved
+        for item in items:
             try:
-                record = json.loads(item.read_text(encoding="utf-8"))
-                target = self._month_file(str(record["channel"]), int(record["received_ms"]))
-                line = str(record["line"])
-            except (ValueError, KeyError, TypeError):
-                os.replace(item, item.with_name(item.name + ".corrupt"))
-                continue
+                envelope = json.loads(item.read_text(encoding="utf-8"))
             except OSError as exc:
                 self._note_error(exc)
                 return moved
+            try:
+                if not isinstance(envelope, dict):
+                    raise ValueError("spool entry must be an object")
+                channel = envelope["channel"]
+                received_ms = int(envelope["received_ms"])
+                line = envelope["line"]
+                if not isinstance(channel, str) or not isinstance(line, str):
+                    raise ValueError("spool channel and line must be strings")
+                channel = safe_channel(channel)
+                if "\n" in line or "\r" in line or not isinstance(json.loads(line), dict):
+                    raise ValueError("spool line must be one JSON object")
+                target = self._month_file(channel, received_ms)
+            except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+                if not self._quarantine_locked(item, exc):
+                    return moved
+                continue
             try:
                 append_line(target, line)
             except OSError as exc:
                 self._note_error(exc)
                 return moved
-            item.unlink()
+            except (UnicodeError, ValueError) as exc:
+                if not self._quarantine_locked(item, exc):
+                    return moved
+                continue
+            try:
+                item.unlink()
+            except OSError as exc:
+                self._note_error(exc)
+                return moved
             moved += 1
         while self._pending:
             channel, received_ms, line = self._pending[0]
