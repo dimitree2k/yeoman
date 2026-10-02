@@ -418,3 +418,83 @@ def test_fact_revalidation_rerenders_only_selected_ids_with_current_sources(
     assert current.used_source_refs == {}
     assert unselected_id not in current.used_source_refs
     service.close()
+
+
+def test_group_wide_revalidation_drops_fact_that_became_author_only(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    shared = _fact(
+        fact_id="selected",
+        audience={"member-old", "member-new"},
+        content="Same unchanged dinner detail.",
+    )
+    _publish(service, shared)
+    context = replace(
+        _ctx(principal="member-old", members={"member-old", "member-new"}),
+        group_wide=True,
+    )
+    selected = service.retrieve_for_context(
+        query="dinner detail", read_context=context, lexical_only=True
+    )
+    assert "Same unchanged dinner detail." in selected.text
+
+    _publish(
+        service,
+        replace(
+            shared,
+            visibility_scope="author_only",
+            group_rule="author_only",
+            audience=frozenset(),
+        ),
+    )
+    current = service.revalidate_for_context(selected, read_context=context, max_chars=1200)
+
+    assert current.text == ""
+    assert current.used_source_refs == {}
+    service.close()
+
+
+def test_group_wide_revalidation_drops_nonreadable_status_without_markers(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    _publish(
+        service,
+        _fact(fact_id="selected", audience={"member-old", "member-new"}),
+    )
+    context = replace(
+        _ctx(principal="member-old", members={"member-old", "member-new"}),
+        group_wide=True,
+    )
+    selected = service.retrieve_for_context(
+        query="Stammtisch", read_context=context, lexical_only=True
+    )
+    service.store.set_fact_status("selected", status="expired", now_ms=T0 + 1)
+
+    current = service.revalidate_for_context(selected, read_context=context, max_chars=1200)
+
+    assert current.text == ""
+    assert current.used_source_refs == {}
+    service.close()
+
+
+def test_group_wide_revalidation_drops_fact_from_another_chat_scope(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    fact = _fact(fact_id="selected", audience={"member-old", "member-new"})
+    _publish(service, fact)
+    context = replace(
+        _ctx(principal="member-old", members={"member-old", "member-new"}),
+        group_wide=True,
+    )
+    selected = service.retrieve_for_context(
+        query="Stammtisch", read_context=context, lexical_only=True
+    )
+    with service.store._lock:
+        service.store._conn.execute(
+            "UPDATE memory2_facts SET chat_scope_key = ? WHERE fact_id = ?",
+            ("another-chat", "selected"),
+        )
+    service.store.bump_acl_epoch()
+
+    current = service.revalidate_for_context(selected, read_context=context, max_chars=1200)
+
+    assert current.text == ""
+    assert current.used_source_refs == {}
+    service.close()

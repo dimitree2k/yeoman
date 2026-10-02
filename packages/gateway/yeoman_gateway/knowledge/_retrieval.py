@@ -358,6 +358,7 @@ class RetrievalEngine:
         context: TrustedReadContext,
         view: str = "current",
         group_wide: bool = False,
+        require_match: bool = False,
     ) -> tuple[CandidateRows, ReadDecision]:
         decision = self.decide(context)
         if not decision.allowed:
@@ -379,7 +380,7 @@ class RetrievalEngine:
         if not statement_ids:
             return CandidateRows((), denied), decision
 
-        ranked = self._rank(query.text, statement_ids)
+        ranked = self._rank(query.text, statement_ids, require_match=require_match)
         return CandidateRows(tuple(ranked[: query.limit]), denied), decision
 
     def _denied_count(
@@ -424,12 +425,14 @@ class RetrievalEngine:
         total = int(self._store.scalar(sql, tuple(bound)) or 0)
         return max(0, total - permitted)
 
-    def _rank(self, text: str, statement_ids: list[str]) -> list[str]:
+    def _rank(
+        self, text: str, statement_ids: list[str], *, require_match: bool = False
+    ) -> list[str]:
         """Rank permitted candidates only.  Never touch a row that failed the gate."""
         if not statement_ids:
             return []
         if not text.strip():
-            return list(statement_ids)
+            return [] if require_match else list(statement_ids)
         placeholders = ",".join("?" for _ in statement_ids)
         tokens = re.findall(r"[0-9A-Za-z_]{2,}", text.lower())[:16]
         scores: dict[str, float] = {item: 0.0 for item in statement_ids}
@@ -457,6 +460,8 @@ class RetrievalEngine:
                     overlap = sum(1 for token in tokens if token in content)
                     scores[str(row["id"])] = overlap / max(1, len(tokens))
         ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if require_match:
+            ordered = [item for item in ordered if item[1] > 0]
         return [item for item, _score in ordered]
 
     # ── public read operations ───────────────────────────────────────────────
@@ -469,9 +474,14 @@ class RetrievalEngine:
         view: str = "current",
         max_chars: int | None = None,
         group_wide: bool = False,
+        require_match: bool = False,
     ) -> KnowledgeContext:
         rows, decision = self.candidates(
-            query, context=context, view=view, group_wide=group_wide
+            query,
+            context=context,
+            view=view,
+            group_wide=group_wide,
+            require_match=require_match,
         )
         if not decision.allowed:
             return KnowledgeContext(
@@ -488,7 +498,7 @@ class RetrievalEngine:
         allowed_ids = self._recheck_ids(
             rows.statement_ids, context, decision, view=view, group_wide=group_wide
         )
-        text, rendered_ids, source_refs = self._render(
+        text, rendered_ids, source_refs, entry_texts = self._render(
             allowed_ids, context, decision, view=view, max_chars=max_chars
         )
         revision = self.context_revision(
@@ -503,6 +513,7 @@ class RetrievalEngine:
             context_revision=revision,
             reason="ok" if allowed_ids else "empty",
             denied_count=rows.denied,
+            entry_texts=entry_texts,
         )
 
     def recall_hybrid(
@@ -543,7 +554,7 @@ class RetrievalEngine:
             if statement_id not in merged:
                 merged.append(statement_id)
         allowed_ids = self._recheck_ids(tuple(merged), context, decision)
-        text, rendered_ids, source_refs = self._render(allowed_ids, context, decision)
+        text, rendered_ids, source_refs, entry_texts = self._render(allowed_ids, context, decision)
         return KnowledgeContext(
             text=text,
             statement_ids=rendered_ids,
@@ -553,6 +564,7 @@ class RetrievalEngine:
             context_revision=self.context_revision(context, decision, rendered_ids),
             reason="ok" if allowed_ids else "empty",
             denied_count=rows.denied,
+            entry_texts=entry_texts,
         )
 
     def _vector_candidates(
@@ -872,7 +884,7 @@ class RetrievalEngine:
                 ),
                 reason="stale_context",
             )
-        text, rendered_ids, source_refs = self._render(
+        text, rendered_ids, source_refs, entry_texts = self._render(
             allowed_ids, context, decision, max_chars=max_chars
         )
         if result.context_revision and result.context_revision != self.context_revision(
@@ -889,6 +901,7 @@ class RetrievalEngine:
                     context, decision, rendered_ids, group_wide=group_wide
                 ),
                 reason="revalidated",
+                entry_texts=entry_texts,
             )
         return KnowledgeContext(
             text=text,
@@ -900,6 +913,7 @@ class RetrievalEngine:
                 context, decision, rendered_ids, group_wide=group_wide
             ),
             reason="ok",
+            entry_texts=entry_texts,
         )
 
     def _recheck_ids(
@@ -938,14 +952,14 @@ class RetrievalEngine:
         *,
         view: str = "current",
         max_chars: int | None = None,
-    ) -> tuple[str, tuple[str, ...], tuple[SourceRef, ...]]:
+    ) -> tuple[str, tuple[str, ...], tuple[SourceRef, ...], tuple[str, ...]]:
         """Render permitted statements with eligible names.  Evidence ids stay structured.
 
         Text is only ever read for ids that survived the gate *and* a fresh recheck, and
         only active person roles supply labels: a withheld role never names anybody.
         """
         if not statement_ids:
-            return "", (), ()
+            return "", (), (), ()
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
             "SELECT s.statement_id, s.status, s.superseded_by, s.supersession_reason,"
@@ -966,6 +980,7 @@ class RetrievalEngine:
         lines: list[str] = []
         used: list[SourceRef] = []
         rendered_ids: list[str] = []
+        entry_texts: list[str] = []
         total = 0
         char_limit = MAX_CONTEXT_CHARS if max_chars is None else max(0, int(max_chars))
         for statement_id in statement_ids:
@@ -988,11 +1003,12 @@ class RetrievalEngine:
                 break
             total += line_size
             lines.append(line)
+            entry_texts.append(line)
             rendered_ids.append(statement_id)
             for source, status in self._statements.sources_of(statement_id):
                 if status == "active" and source not in used:
                     used.append(source)
-        return "\n".join(lines), tuple(rendered_ids), tuple(used)
+        return "\n".join(lines), tuple(rendered_ids), tuple(used), tuple(entry_texts)
 
     def context_revision(
         self,

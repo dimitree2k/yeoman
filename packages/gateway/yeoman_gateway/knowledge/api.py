@@ -504,6 +504,7 @@ class KnowledgeService:
         view: str = "current",
         max_chars: int | None = None,
         group_wide: bool = False,
+        require_match: bool = False,
     ) -> KnowledgeContext:
         """Recall under the one shared read contract.
 
@@ -519,6 +520,7 @@ class KnowledgeService:
             view=view,
             max_chars=max_chars,
             group_wide=group_wide,
+            require_match=require_match,
         )
 
     def recall_hybrid(

@@ -318,6 +318,164 @@ def test_whole_entry_budget_keeps_metadata_aligned() -> None:
     assert selected.facts.used_source_refs == {}
 
 
+def test_selector_requests_topical_statement_match() -> None:
+    selector, knowledge, _memory = _selector()
+    read_context, fact_context = _contexts()
+
+    selector.select(query="topic", read_context=read_context, fact_context=fact_context)
+
+    assert knowledge.calls[0]["require_match"] is True
+
+
+def test_multiline_statement_entry_remains_whole_with_identity_and_source() -> None:
+    multiline = "Zusammenkunft am Donnerstag.\nBeginn ist um 19 Uhr."
+    selector = ParticipationKnowledgeSelector(
+        knowledge=_Knowledge(
+            KnowledgeContext(
+                text=multiline,
+                statement_ids=("stmt-multiline",),
+                source_refs=(SourceRef("ev-multi", 1, "whatsapp", CHAT, "alice", NOW),),
+                entry_texts=(multiline,),
+            ),
+            [],
+        ),
+        memory=_Memory(FactRetrievalResult(), []),
+    )
+    read_context, fact_context = _contexts()
+
+    selected = selector.select(
+        query="Wann beginnt die Zusammenkunft?",
+        read_context=read_context,
+        fact_context=fact_context,
+    )
+
+    assert selected.text == multiline
+    assert selected.statements.statement_ids == ("stmt-multiline",)
+    assert tuple(ref.event_id for ref in selected.statements.source_refs) == ("ev-multi",)
+
+
+def _capture_test_statement(harness: CaptureHarness, text: str, key: str):
+    event_id = harness.observe(text, message_id=key)
+    source = harness.authority.verify_source_ref(event_id, 1)
+    assert source is not None
+    return harness.knowledge.capture(
+        StatementCandidate(
+            content=text,
+            sources=(source,),
+            extractor_version="participation-review-v1",
+            confidence=0.9,
+        ),
+        context=TrustedCaptureContext(
+            request_id=f"participation-{key}",
+            policy_revision=1,
+            capture_basis="historic_row",
+            authorized_sources=(source,),
+        ),
+    )
+
+
+def test_owned_selector_returns_empty_for_unrelated_and_multilingual_zero_hit(
+    tmp_path,
+) -> None:
+    harness = CaptureHarness(tmp_path)
+    try:
+        _capture_test_statement(harness, "Stammtisch Donnerstag um acht.", "3EB0C01")
+        members = frozenset({f"{AUTHOR}@s.whatsapp.net", "491511@s.whatsapp.net"})
+        read_context = TrustedReadContext(
+            principal_id=f"{AUTHOR}@s.whatsapp.net",
+            channel="whatsapp",
+            chat_id=GROUP,
+            recipient_principals=members,
+            membership_revision="captured-members-v1",
+            policy_revision=1,
+            purpose="proactive",
+            now_ms=harness.now,
+            is_direct=False,
+        )
+        fact_context = FactReadContext(
+            principal_id=read_context.principal_id,
+            chat_scope_key=f"channel:whatsapp:chat:{GROUP}",
+            current_members=members,
+            epoch=1,
+            now_ms=harness.now,
+        )
+        selector = ParticipationKnowledgeSelector(
+            knowledge=harness.knowledge,
+            memory=_Memory(FactRetrievalResult(), []),
+        )
+
+        unrelated = selector.select(
+            query="quasar nebula xyzzy",
+            read_context=read_context,
+            fact_context=fact_context,
+        )
+        multilingual = selector.select(
+            query="東京の集合時間",
+            read_context=read_context,
+            fact_context=fact_context,
+        )
+
+        assert unrelated.text == ""
+        assert multilingual.text == ""
+    finally:
+        harness.close()
+
+
+def test_owned_multiline_statement_keeps_complete_text_and_metadata_through_revalidation(
+    tmp_path,
+) -> None:
+    harness = CaptureHarness(tmp_path)
+    multiline = "Zusammenkunft am Donnerstag.\nBeginn ist um 19 Uhr."
+    singleline = "Beginn der zweiten Zusammenkunft ist um 20 Uhr."
+    try:
+        _capture_test_statement(harness, multiline, "3EB0C02")
+        _capture_test_statement(harness, singleline, "3EB0C03")
+        members = frozenset({f"{AUTHOR}@s.whatsapp.net", "491511@s.whatsapp.net"})
+        read_context = TrustedReadContext(
+            principal_id=f"{AUTHOR}@s.whatsapp.net",
+            channel="whatsapp",
+            chat_id=GROUP,
+            recipient_principals=members,
+            membership_revision="captured-members-v1",
+            policy_revision=1,
+            purpose="proactive",
+            now_ms=harness.now,
+            is_direct=False,
+        )
+        fact_context = FactReadContext(
+            principal_id=read_context.principal_id,
+            chat_scope_key=f"channel:whatsapp:chat:{GROUP}",
+            current_members=members,
+            epoch=1,
+            now_ms=harness.now,
+        )
+        selector = ParticipationKnowledgeSelector(
+            knowledge=harness.knowledge,
+            memory=_Memory(FactRetrievalResult(), []),
+        )
+
+        selected = selector.select(
+            query="Zusammenkunft Donnerstag Beginn",
+            read_context=read_context,
+            fact_context=fact_context,
+        )
+        current = selector.revalidate(
+            selected,
+            read_context=read_context,
+            fact_context=fact_context,
+        )
+
+        assert multiline in selected.text and singleline in selected.text
+        assert set(selected.statements.entry_texts) == {multiline, singleline}
+        assert len(selected.statements.statement_ids) == 2
+        assert len(selected.statements.source_refs) == 2
+        assert multiline in current.text and singleline in current.text
+        assert current.statements.statement_ids == selected.statements.statement_ids
+        assert current.statements.source_refs == selected.statements.source_refs
+    finally:
+        harness.close()
+
+
 def test_shared_fact_partial_revocation_changes_selection() -> None:
     selector, _knowledge, memory = _selector(fact_text="Gegessen wird um sieben.")
     read_context, fact_context = _contexts()

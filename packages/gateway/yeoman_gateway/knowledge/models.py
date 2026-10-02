@@ -913,6 +913,7 @@ class KnowledgeContext:
     context_revision: str = ""
     reason: str = "ok"
     denied_count: int = 0
+    entry_texts: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:

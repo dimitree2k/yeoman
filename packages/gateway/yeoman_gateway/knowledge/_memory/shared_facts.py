@@ -134,6 +134,12 @@ def effective_audience(
 
 def can_read_shared(*, fact: SharedFact, read_context: FactReadContext) -> bool:
     """Pure read rule. Order matters and is part of the contract (Plan 05, Aufgabe 2)."""
+    if read_context.group_wide and (
+        fact.visibility_scope == "author_only"
+        or fact.chat_scope_key != read_context.chat_scope_key
+        or fact.assertion_status not in ("assertion", "confirmed")
+    ):
+        return False
     if fact.visibility_scope == "author_only":
         return fact.author_principal == read_context.principal_id
     if not read_context.membership_known:

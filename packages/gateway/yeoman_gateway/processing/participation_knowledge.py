@@ -98,6 +98,7 @@ class ParticipationKnowledgeSelector:
                 context=read_context,
                 max_chars=MAX_TEXT_CHARS,
                 group_wide=group_wide,
+                require_match=True,
             )
             statement_lines = _statement_lines(statements)
             remaining_entries = max(0, MAX_ENTRIES - len(statement_lines))
@@ -237,6 +238,8 @@ def _normalize_query(query: str) -> str:
 def _statement_lines(result: KnowledgeContext) -> list[str]:
     if not result.text:
         return []
+    if result.entry_texts and len(result.entry_texts) == len(result.statement_ids):
+        return list(result.entry_texts)
     lines = [line for line in result.text.splitlines() if line.strip()]
     return lines if len(lines) == len(result.statement_ids) else []
 
