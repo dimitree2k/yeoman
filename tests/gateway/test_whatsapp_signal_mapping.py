@@ -542,3 +542,116 @@ def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -
     channel._parse_inbound_event = lambda _: pytest.fail("opaque edit reached normal parsing")  # type: ignore[method-assign]
     asyncio.run(channel._project_bridge_event(type("Work", (), {"kind": "message", "payload": payload})()))
     store.close()
+
+
+def test_partial_encrypted_edit_fields_are_canonical_but_not_projected() -> None:
+    class Memory:
+        def __init__(self) -> None:
+            self.indexed: list[object] = []
+
+        def index_canonical_event(self, event: object, **kwargs: object) -> None:
+            self.indexed.append(event)
+
+    class Sources:
+        def __init__(self) -> None:
+            self.registered: list[str] = []
+
+        def __call__(self, event_id: str) -> bool:
+            self.registered.append(event_id)
+            return True
+
+    store = ProcessingStore(":memory:")
+    memory = Memory()
+    sources = Sources()
+    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    id_only = {
+        "chatJid": CHAT,
+        "messageId": "edit-envelope-id-only",
+        "targetMessageId": "target-id-only",
+        "senderId": "49123@s.whatsapp.net",
+        "text": "",
+        "observationOnly": True,
+        "observationType": "encrypted_message_edit_undecoded",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "AQID",
+            "encIv": "AAECAwQFBgcICQoL",
+            "secretEncType": 2,
+            "targetMessageKey": {"id": "target-id-only", "fromMe": True},
+        },
+    }
+    incomplete = {
+        **id_only,
+        "messageId": "edit-envelope-incomplete",
+        "targetMessageId": "target-incomplete",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "%%%malformed-but-bounded",
+            "secretEncType": 2,
+            "targetMessageKey": {"id": "target-incomplete"},
+        },
+    }
+    for index, payload in enumerate((id_only, incomplete)):
+        event_id = f"opaque-partial-{index}"
+        sink.capture(
+            "message",
+            payload,
+            event_id=event_id,
+            event_key=f"opaque-partial-key-{index}",
+            account="account-a",
+            observed_at_ms=T0,
+            strict=True,
+        )
+        event = store.get_event(event_id)
+        assert event is not None
+        assert event.payload["observation_only"] is True
+        assert event.payload["target_message_id"] == payload["targetMessageId"]
+        safe_edit = event.payload["encrypted_edit"]
+        assert safe_edit["targetMessageKey"]["id"] == payload["targetMessageId"]
+        assert "remoteJid" not in safe_edit["targetMessageKey"]
+        assert "messageSecret" not in safe_edit
+    first_edit = store.get_event("opaque-partial-0").payload["encrypted_edit"]
+    second_edit = store.get_event("opaque-partial-1").payload["encrypted_edit"]
+    assert first_edit["targetMessageKey"]["fromMe"] is True
+    assert first_edit["encIv"] == "AAECAwQFBgcICQoL"
+    assert second_edit["encPayload"] == "%%%malformed-but-bounded"
+    assert "encIv" not in second_edit
+    assert "fromMe" not in second_edit["targetMessageKey"]
+    assert memory.indexed == []
+    assert sources.registered == []
+
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    projected: list[dict[str, str]] = []
+    channel._parse_inbound_event = lambda payload: payload  # type: ignore[method-assign]
+
+    async def ingest(event: dict[str, str]) -> None:
+        projected.append(event)
+
+    channel._ingest_inbound_event = ingest  # type: ignore[method-assign]
+    for payload in (id_only, incomplete):
+        asyncio.run(
+            channel._project_bridge_event(
+                type("Work", (), {"kind": "message", "payload": payload})()
+            )
+        )
+    ordinary = {"messageId": "ordinary-after-opaque", "text": "ordinary"}
+    sink.capture(
+        "message",
+        {"chatJid": CHAT, "messageId": ordinary["messageId"], "senderId": "49123", "text": ordinary["text"]},
+        event_id="ordinary-after-opaque",
+        event_key="ordinary-after-opaque-key",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+    asyncio.run(
+        channel._project_bridge_event(
+            type("Work", (), {"kind": "message", "payload": ordinary})()
+        )
+    )
+    assert projected == [ordinary]
+    ordinary_event = store.get_event("ordinary-after-opaque")
+    assert ordinary_event is not None
+    assert len(memory.indexed) == 1
+    assert sources.registered == ["ordinary-after-opaque"]
+    store.close()

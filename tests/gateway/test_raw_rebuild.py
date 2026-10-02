@@ -309,6 +309,95 @@ def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edit(
     rebuilt.close()
 
 
+def test_partial_encrypted_edits_are_acked_and_do_not_block_ordinary_intake(
+    tmp_path: Path,
+) -> None:
+    channel, store = _live(tmp_path)
+    acknowledged: list[str] = []
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        if command_type == "ack_event":
+            acknowledged.append(str(payload["eventId"]))
+        return {"acknowledged": True}
+
+    channel._send_command = ack  # type: ignore[method-assign]
+    projected: list[str] = []
+
+    async def ingest(event) -> None:
+        projected.append(event.text)
+
+    channel._ingest_inbound_event = ingest  # type: ignore[method-assign]
+    id_only = {
+        "chatJid": CHAT,
+        "messageId": "edit-envelope-id-only",
+        "targetMessageId": "target-id-only",
+        "senderId": "4915@s.whatsapp.net",
+        "text": "",
+        "observationOnly": True,
+        "observationType": "encrypted_message_edit_undecoded",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "AQID",
+            "encIv": "AAECAwQFBgcICQoL",
+            "secretEncType": 2,
+            "targetMessageKey": {"id": "target-id-only", "fromMe": True},
+        },
+    }
+    incomplete = {
+        **id_only,
+        "messageId": "edit-envelope-incomplete",
+        "targetMessageId": "target-incomplete",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "%%%malformed-but-bounded",
+            "secretEncType": 2,
+            "targetMessageKey": {"id": "target-incomplete"},
+        },
+    }
+    ordinary = _msg("ordinary-after-opaque", "ordinary still flows")
+    _feed(
+        channel,
+        [
+            _frame("message", id_only, "opaque-id-only-event"),
+            _frame("message", incomplete, "opaque-incomplete-event"),
+            _frame("message", ordinary, "ordinary-after-opaque-event"),
+        ],
+    )
+
+    assert acknowledged == [
+        "opaque-id-only-event",
+        "opaque-incomplete-event",
+        "ordinary-after-opaque-event",
+    ]
+    assert projected == ["ordinary still flows"]
+    for event_id in ("opaque-id-only-event", "opaque-incomplete-event"):
+        event = store.get_event(event_id)
+        assert event is not None and event.payload["observation_only"] is True
+    assert store.get_event("ordinary-after-opaque-event") is not None
+
+    report = rebuild_chat(
+        tmp_path / "raw",
+        channel="whatsapp",
+        chat_id=CHAT,
+        target_home=tmp_path / "rebuilt",
+    )
+    assert report.replayed == 3
+    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "processing" / "processing.db")
+    assert rebuilt.get_event("opaque-id-only-event").payload["encrypted_edit"]["targetMessageKey"] == {
+        "id": "target-id-only",
+        "fromMe": True,
+    }
+    assert rebuilt.get_event("opaque-incomplete-event").payload["encrypted_edit"] == {
+        "kind": "secretEncryptedMessage",
+        "secretEncType": 2,
+        "encPayload": "%%%malformed-but-bounded",
+        "targetMessageKey": {"id": "target-incomplete"},
+    }
+    assert rebuilt.get_event("ordinary-after-opaque-event").payload["text"] == "ordinary still flows"
+    rebuilt.close()
+    store.close()
+
+
 def test_message_purge_matches_the_target_of_only_opaque_encrypted_edits() -> None:
     encrypted = {
         "channel": "whatsapp",

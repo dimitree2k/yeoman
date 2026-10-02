@@ -15,8 +15,6 @@ Determinism rules:
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -182,43 +180,32 @@ def _encrypted_edit_observation(
     safe: dict[str, Any] = {"kind": "secretEncryptedMessage", "secretEncType": 2}
     for field_name in ("encPayload", "encIv"):
         encoded = encrypted.get(field_name)
-        if not isinstance(encoded, str) or len(encoded) > MAX_BRIDGE_FRAME_BYTES:
-            if strict:
-                raise ValueError(f"invalid encrypted edit {field_name}")
-            return None
-        try:
-            decoded = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            if strict:
-                raise ValueError(f"invalid encrypted edit {field_name}") from exc
-            return None
-        if field_name == "encIv" and len(decoded) != 12:
-            if strict:
-                raise ValueError("invalid encrypted edit IV")
-            return None
-        if field_name == "encPayload" and not decoded:
-            if strict:
-                raise ValueError("empty encrypted edit payload")
-            return None
-        safe[field_name] = encoded
+        if isinstance(encoded, str) and len(encoded) <= MAX_BRIDGE_FRAME_BYTES:
+            safe[field_name] = encoded
 
     target_key = encrypted.get("targetMessageKey")
-    if not isinstance(target_key, Mapping):
-        if strict:
-            raise ValueError("encrypted edit target key is missing")
-        return None
-    target_id = str(payload.get("targetMessageId") or "").strip()
-    key_id = str(target_key.get("id") or "").strip()
-    remote_jid = str(target_key.get("remoteJid") or "").strip()
-    if not target_id or key_id != target_id or not remote_jid or not isinstance(target_key.get("fromMe"), bool):
-        if strict:
-            raise ValueError("invalid encrypted edit target key")
-        return None
-    safe_target = {"remoteJid": remote_jid, "id": key_id, "fromMe": target_key["fromMe"]}
-    participant = target_key.get("participant")
-    if isinstance(participant, str) and participant.strip():
-        safe_target["participant"] = participant.strip()
-    safe["targetMessageKey"] = safe_target
+    target_id_value = payload.get("targetMessageId")
+    target_id = (
+        target_id_value.strip()
+        if isinstance(target_id_value, str)
+        and target_id_value.strip()
+        and len(target_id_value) <= MAX_BRIDGE_FRAME_BYTES
+        else None
+    )
+    if isinstance(target_key, Mapping):
+        safe_target: dict[str, Any] = {}
+        for field_name in ("remoteJid", "id", "participant"):
+            value = target_key.get(field_name)
+            if isinstance(value, str) and value.strip() and len(value) <= MAX_BRIDGE_FRAME_BYTES:
+                safe_target[field_name] = value.strip()
+        from_me = target_key.get("fromMe")
+        if isinstance(from_me, bool):
+            safe_target["fromMe"] = from_me
+        if safe_target:
+            safe["targetMessageKey"] = safe_target
+        key_id = safe_target.get("id")
+        if target_id is not None and key_id is not None and key_id != target_id:
+            target_id = None
     return target_id, safe
 
 
