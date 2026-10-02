@@ -95,7 +95,18 @@ def test_zero_match_purge_still_confirms_and_records_disposition(home: Path) -> 
     [audit] = [record for _, record, _ in iter_records(audit_path) if record]
     assert audit["removed_lines"] == 0
     assert audit["disposition"]["chat_id"] == "never-seen"
-    assert audit["disposition"]["before_ms"] > 0
+    assert audit["disposition"]["before_ms"] is None
+
+
+def test_zero_match_unscoped_message_purge_is_refused_without_audit(home: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["raw", "purge", "--channel", "whatsapp", "--message", "never-seen", "--yes"],
+    )
+
+    assert result.exit_code == 2
+    assert "Refused:" in result.output
+    assert not (home / "data" / "raw" / "AUDIT").exists()
 
 
 def test_purge_without_chat_or_message_is_refused(home: Path) -> None:

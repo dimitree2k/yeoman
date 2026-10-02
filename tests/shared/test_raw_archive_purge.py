@@ -108,6 +108,129 @@ def test_purge_by_message_id_removes_only_that_line_and_audits(tmp_path: Path) -
     assert stat.S_IMODE((root / AUDIT).stat().st_mode) == 0o444
 
 
+def test_message_purge_does_not_apply_an_implicit_chat_cutoff(tmp_path: Path) -> None:
+    root, archive = _setup(tmp_path)
+    _message(archive, "future-stamped", "c1", OCT + 1)
+
+    result = purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="c1", native_id="future-stamped"),
+        operator="dm",
+        now_ms=OCT,
+    )
+
+    assert result.removed_lines == 1
+    [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
+    assert audit["selector"]["before_ms"] is None
+
+
+def test_telegram_update_id_is_not_a_provider_message_identity(tmp_path: Path) -> None:
+    from telegram import Update
+    from yeoman_gateway.channels.telegram import raw_event_for_update
+
+    root, archive = _setup(tmp_path)
+
+    def event(update_id: int, message_id: int) -> RawEvent:
+        update = Update.de_json(
+            {
+                "update_id": update_id,
+                "message": {
+                    "message_id": message_id,
+                    "date": OCT // 1000,
+                    "chat": {"id": 101, "type": "supergroup"},
+                    "text": "synthetic",
+                },
+            },
+            bot=None,
+        )
+        return raw_event_for_update(update)
+
+    archive.append(event(1001, 7))
+    archive.append(event(1002, 1001))
+
+    selector = PurgeSelector(channel="telegram", chat_id="101", native_id="7")
+    assert plan_purge(root, selector).removed_lines == 1
+    result = purge(root, selector, operator="dm", now_ms=OCT + 1)
+    assert result.removed_lines == 1
+
+    remaining = _records(root)
+    assert [
+        (record["native_id"], record["native"]["message"]["message_id"]) for record in remaining
+    ] == [("1002", 1001)]
+    assert archive.append(event(1003, 1001)) is True
+
+
+def test_zero_match_disposition_closes_telegram_media_provider_identity(
+    tmp_path: Path,
+) -> None:
+    from telegram import Update
+    from yeoman_gateway.channels.telegram import raw_event_for_update
+
+    root, archive = _setup(tmp_path)
+    result = purge(
+        root,
+        PurgeSelector(channel="telegram", chat_id="101", native_id="7"),
+        operator="dm",
+        now_ms=OCT + 1,
+    )
+    assert result.removed_lines == 0
+    [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
+    assert audit["disposition"]["message_identities"] == ["7"]
+    assert audit["disposition"]["correlation_ids"] == []
+
+    def event(update_id: int, message_id: int, chat_id: int = 101) -> RawEvent:
+        update = Update.de_json(
+            {
+                "update_id": update_id,
+                "message": {
+                    "message_id": message_id,
+                    "date": OCT // 1000,
+                    "chat": {"id": chat_id, "type": "supergroup"},
+                    "text": "synthetic",
+                },
+            },
+            bot=None,
+        )
+        return raw_event_for_update(update)
+
+    selected = event(1001, 7)
+    archive.append(selected)
+    archive.append(
+        RawEvent(
+            channel="telegram",
+            kind="media",
+            direction="in",
+            native={"update_id": 1001, "file_id": "selected-media"},
+            native_id="1001",
+            chat_id="101",
+            correlation_id="7",
+            received_ms=OCT,
+        )
+    )
+    archive.append(event(2002, 1001))
+    archive.append(event(2003, 7, chat_id=202))
+    archive.append(
+        RawEvent(
+            channel="whatsapp",
+            kind="message",
+            direction="in",
+            native={"payload": {"messageId": "7"}},
+            native_id="whatsapp-event-7",
+            chat_id="101",
+            received_ms=OCT,
+        )
+    )
+
+    assert [
+        (record["channel"], record["kind"], record["chat_id"], record["native_id"])
+        for record in _records(root)
+    ] == [
+        ("telegram", "update", "101", "2002"),
+        ("telegram", "update", "202", "2003"),
+        ("whatsapp", "message", "101", "whatsapp-event-7"),
+    ]
+
+
 def test_purge_of_a_sealed_month_updates_the_manifest_and_verify_stays_green(
     tmp_path: Path,
 ) -> None:
@@ -591,7 +714,7 @@ def test_purge_keeps_media_while_referencing_event_is_pending_in_memory(
                 channel="telegram",
                 kind="media",
                 direction="in",
-                native={"file_id": "pending"},
+                native={"file_id": "pending", "source_message_id": "pending"},
                 native_id="pending",
                 chat_id="elsewhere",
                 received_ms=SEPT,

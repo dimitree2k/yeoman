@@ -107,8 +107,11 @@ def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
             if record is not None and selector.matches(record):
                 matched.append(record)
     chats = {str(record.get("chat_id") or "") for record in matched}
-    if selector.native_id is not None and selector.chat_id is None and len(chats) > 1:
-        raise ValueError("message purge spans multiple chats; specify --chat")
+    if selector.native_id is not None and selector.chat_id is None:
+        if len(chats) > 1:
+            raise ValueError("message purge spans multiple chats; specify --chat")
+        if len(chats) != 1 or not next(iter(chats)):
+            raise ValueError("message purge has no resolvable chat; specify --chat")
     chat_id = selector.chat_id or (next(iter(chats)) if chats else None)
     identities = {selector.native_id} if selector.native_id else set()
     correlations: set[str] = set()
@@ -317,7 +320,7 @@ def purge(
     selector.validate()
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     effective = selector
-    if selector.chat_id is not None and selector.before_ms is None:
+    if selector.chat_id is not None and selector.native_id is None and selector.before_ms is None:
         from dataclasses import replace
 
         effective = replace(selector, before_ms=now)

@@ -412,3 +412,55 @@ def test_seed_preserves_journal_events_and_only_deduplicates_original_messages(
         "M0",
         "M1",
     ]
+
+
+def test_seed_skips_durable_purge_dispositions_with_accurate_dry_run_counts(
+    tmp_path: Path,
+) -> None:
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+
+    root = _archive_root(tmp_path)
+    purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="g1", native_id="M1"),
+        operator="dm",
+        now_ms=START,
+    )
+
+    processing_db = tmp_path / "seed-source.db"
+    with sqlite3.connect(processing_db) as connection:
+        connection.execute(
+            "CREATE TABLE events (event_id TEXT, kind TEXT, channel TEXT, chat_id TEXT, "
+            "direction TEXT, source_message_id TEXT, created_ms INTEGER, account TEXT, "
+            "payload_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("journal-event-M1", "message", "whatsapp", "g1", "in", "M1", BEFORE, "", "{}"),
+                ("journal-event-M2", "message", "whatsapp", "g1", "in", "M2", BEFORE + 1, "", "{}"),
+            ],
+        )
+    [audit] = [record for _, record, _ in iter_records(root / "AUDIT") if record]
+    assert audit["removed_lines"] == 0
+    assert audit["disposition"]["correlation_ids"] == []
+    source_before = processing_db.read_bytes()
+    paths = SeedPaths(
+        processing_db=processing_db,
+        reply_context_db=tmp_path / "missing-reply.db",
+        inbound_dir=tmp_path / "missing-inbound",
+        knowledge_db=tmp_path / "missing-knowledge.db",
+    )
+
+    dry = seed_raw_archive(root, paths, dry_run=True, now_ms=START + 1)
+    assert dry.per_source["journal"]["written"] == 1
+    assert dry.per_source["journal"]["skipped_purged"] == 1
+    assert dry.per_month == {"2026-09": 1}
+    assert processing_db.read_bytes() == source_before
+
+    seeded = seed_raw_archive(root, paths, now_ms=START + 2)
+    assert seeded.per_source["journal"]["written"] == 1
+    assert seeded.per_source["journal"]["skipped_purged"] == 1
+    assert seeded.per_month == {"2026-09": 1}
+    assert [record["native_id"] for record in _seed_lines(root, "journal")] == ["journal-event-M2"]
+    assert processing_db.read_bytes() == source_before

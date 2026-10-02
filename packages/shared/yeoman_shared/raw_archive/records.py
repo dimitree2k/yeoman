@@ -122,9 +122,16 @@ def append_line(
 
 
 def record_identities(record: dict[str, Any]) -> set[str]:
-    ids = {str(record.get("native_id") or "")}
+    channel = str(record.get("channel") or "")
+    kind = str(record.get("kind") or "")
     native = record.get("native")
     if isinstance(native, dict):
+        event_metadata = (
+            (channel == "telegram" and kind in {"update", "media"})
+            or "eventId" in native
+            or record.get("provenance") == "journal"
+        )
+        ids = set() if event_metadata else {str(record.get("native_id") or "")}
         payload = native.get("payload")
         if isinstance(payload, dict):
             ids.add(str(payload.get("messageId") or ""))
@@ -141,6 +148,10 @@ def record_identities(record: dict[str, Any]) -> set[str]:
             message = native.get(key)
             if isinstance(message, dict):
                 ids.add(str(message.get("message_id") or ""))
+    else:
+        ids = {str(record.get("native_id") or "")}
+    if (channel == "telegram" and kind == "media") or record.get("provenance") == "journal":
+        ids.add(str(record.get("correlation_id") or ""))
     ids.discard("")
     return ids
 

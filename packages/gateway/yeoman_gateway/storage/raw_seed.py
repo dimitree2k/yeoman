@@ -11,6 +11,7 @@ than every id-bearing item of the same chat. Each source becomes one sealed
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -20,7 +21,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from yeoman_shared.raw_archive.records import CLOSED_FILE_MODE, OPEN_FILE_MODE, append_line, dumps
+from yeoman_shared.raw_archive.records import (
+    CLOSED_FILE_MODE,
+    OPEN_FILE_MODE,
+    PURGE_DISPOSITION_LOCK,
+    append_is_disposed,
+    append_line,
+    dumps,
+    lock_file,
+)
 from yeoman_shared.raw_archive.verify import record_closed
 from yeoman_shared.raw_archive.writer import ARCHIVE_VERSION, month_of, read_start_ms, safe_channel
 from yeoman_shared.utils.helpers import get_operational_data_path
@@ -241,6 +250,7 @@ def seed_raw_archive(
             "skipped_not_before_start",
             "skipped_no_payload",
             "skipped_no_time",
+            "skipped_purged",
         ):
             counts[name] = 0
         for item in readers[source](counts):
@@ -294,34 +304,69 @@ def seed_raw_archive(
         month = month_of(item.received_ms)
         report.per_month[month] = report.per_month.get(month, 0) + 1
 
+    def disposition_matches(record: dict[str, Any], line: str) -> bool:
+        coordinator = root / PURGE_DISPOSITION_LOCK
+        try:
+            coordinator_fd = lock_file(coordinator)
+        except FileNotFoundError:
+            if coordinator.is_symlink():
+                raise OSError("raw archive purge disposition lock is a broken symlink")
+            return append_is_disposed(root / "AUDIT", record, line)
+        try:
+            return append_is_disposed(root / "AUDIT", record, line)
+        finally:
+            os.close(coordinator_fd)
+
+    def mark_disposed(source: str, item: _Item) -> None:
+        counts = report.per_source[source]
+        counts["written"] -= 1
+        counts["skipped_purged"] += 1
+        month = month_of(item.received_ms)
+        report.per_month[month] -= 1
+        if report.per_month[month] == 0:
+            del report.per_month[month]
+
     for (source, channel), items in pending.items():
         if not items:
+            continue
+        ready: list[tuple[_Item, dict[str, Any], str]] = []
+        for item in sorted(items, key=lambda i: i.received_ms):
+            record = {
+                "archive_version": ARCHIVE_VERSION,
+                "received_ms": item.received_ms,
+                "channel": channel,
+                "kind": item.kind,
+                "direction": item.direction,
+                "native_id": item.native_id,
+                "chat_id": item.chat_id,
+                "account": item.account,
+                "correlation_id": item.correlation_id,
+                "provenance": source,
+                "media": None,
+                "native": item.native,
+            }
+            line = dumps(record)
+            if disposition_matches(record, line):
+                mark_disposed(source, item)
+                continue
+            ready.append((item, record, line))
+
+        if not ready:
             continue
         target = root / channel / f"seed-{source}.jsonl"
         report.files.append(target.relative_to(root).as_posix())
         if dry_run:
             continue
-        for item in sorted(items, key=lambda i: i.received_ms):
-            append_line(
+        for item, record, line in ready:
+            archived = append_line(
                 target,
-                dumps(
-                    {
-                        "archive_version": ARCHIVE_VERSION,
-                        "received_ms": item.received_ms,
-                        "channel": channel,
-                        "kind": item.kind,
-                        "direction": item.direction,
-                        "native_id": item.native_id,
-                        "chat_id": item.chat_id,
-                        "account": item.account,
-                        "correlation_id": item.correlation_id,
-                        "provenance": source,
-                        "media": None,
-                        "native": item.native,
-                    }
-                ),
+                line,
                 mode=OPEN_FILE_MODE,
+                coordination_lock=root / PURGE_DISPOSITION_LOCK,
+                should_append=lambda: not append_is_disposed(root / "AUDIT", record, line),
             )
+            if not archived:
+                mark_disposed(source, item)
         target.chmod(CLOSED_FILE_MODE)
         record_closed(root, target, now_ms=now, note="seed")
     return report
