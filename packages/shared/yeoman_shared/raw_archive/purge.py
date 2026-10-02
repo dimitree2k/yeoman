@@ -27,6 +27,7 @@ from yeoman_shared.raw_archive.records import (
 )
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, record_closed
 from yeoman_shared.raw_archive.writer import (
+    SPOOL_REGISTRY_FILE,
     safe_channel,
     stored_media_relative,
     try_lock_media_purge,
@@ -177,34 +178,52 @@ def _archive_files_strict(root: Path) -> list[Path] | None:
 
 
 def _spool_media_references(root: Path) -> set[str] | None:
-    spool = root.parent / "raw-spool"
+    registry = root / SPOOL_REGISTRY_FILE
     try:
-        with os.scandir(spool) as entries:
-            items = sorted(entries, key=lambda entry: entry.name)
-    except FileNotFoundError:
-        return set()
-    except OSError:
+        lines = registry.read_text(encoding="utf-8").splitlines()
+    except OSError, UnicodeError:
         return None
+    spools: set[Path] = set()
+    try:
+        for line in lines:
+            entry = json.loads(line)
+            spool = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(spool, str) or "\x00" in spool or not Path(spool).is_absolute():
+                return None
+            spools.add(Path(spool))
+    except json.JSONDecodeError, TypeError, ValueError:
+        return None
+    if not spools:
+        return None
+
     references: set[str] = set()
-    for entry in items:
-        if entry.name.endswith(".corrupt"):
-            return None
-        if not entry.name.endswith(".json"):
-            continue
-        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-            return None
+    for spool in spools:
         try:
-            envelope = json.loads(Path(entry.path).read_text(encoding="utf-8"))
-            if not isinstance(envelope, dict) or not isinstance(envelope.get("line"), str):
-                return None
-            record = json.loads(envelope["line"])
-            if not isinstance(record, dict):
-                return None
-        except OSError, UnicodeError, json.JSONDecodeError, TypeError:
+            with os.scandir(spool) as entries:
+                items = sorted(entries, key=lambda entry: entry.name)
+        except FileNotFoundError:
+            continue
+        except OSError, ValueError:
             return None
-        media = _media_path(record)
-        if media:
-            references.add(media)
+        for entry in items:
+            if entry.name.endswith(".corrupt"):
+                return None
+            if not entry.name.endswith(".json"):
+                continue
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                return None
+            try:
+                envelope = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                if not isinstance(envelope, dict) or not isinstance(envelope.get("line"), str):
+                    return None
+                record = json.loads(envelope["line"])
+                if not isinstance(record, dict):
+                    return None
+            except OSError, UnicodeError, json.JSONDecodeError, TypeError:
+                return None
+            media = _media_path(record)
+            if media:
+                references.add(media)
     return references
 
 
@@ -277,8 +296,9 @@ def purge(
     # ponytail: root-wide media lock serializes channels; shard if needed, while busy scans retain media.
     # Writers hold it from publication through the archive/spool write.
     media_guard_fd = try_lock_media_purge(root)
-    locked = _lock_files(root, files)
+    locked: list[tuple[str, Path, int]] = []
     try:
+        locked = _lock_files(root, files)
         snapshot = _snapshot_locked(locked, selector, ())
         if snapshot.removed_lines == 0:
             return snapshot

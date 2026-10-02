@@ -33,6 +33,7 @@ from yeoman_shared.raw_archive.records import (
     OPEN_FILE_MODE,
     _fsync_directory,
     append_line,
+    append_protected,
     dumps,
     ensure_private_dir,
 )
@@ -47,6 +48,7 @@ MAX_MEMORY_PENDING = 10_000
 DEFAULT_MAX_VIDEO_BYTES = 50 * 1024 * 1024
 _HASH_CHUNK = 1024 * 1024
 MEDIA_PURGE_LOCK = ".media-purge.lock"
+SPOOL_REGISTRY_FILE = ".raw-spools.jsonl"
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,11 +255,13 @@ class RawArchive:
         self._max_video_bytes = max(0, int(max_video_bytes))
         self._lock = threading.Lock()
         self._media_guard = _media_guard_for(self.root)
+        self._registered_spool_path: str | None = None
         self._pending: list[tuple[str, int, str, _MediaGuardLease | None]] = []
         self._last_error = ""
         self._capacity_blocked = False
         self._published = ""
         self._write_start_marker()
+        self._register_spool()
 
     # -- public API -------------------------------------------------------------------
 
@@ -465,6 +469,37 @@ class RawArchive:
         self._last_error = f"{type(exc).__name__}: {exc}"[:300]
         logger.error("raw archive write failed: %s", type(exc).__name__)
 
+    def _register_spool(self) -> bool:
+        spool_path = os.path.abspath(self.spool)
+        if self._registered_spool_path == spool_path:
+            return True
+        try:
+            lease = self._media_guard.acquire()
+        except OSError as exc:
+            self._note_error(exc)
+            return False
+        try:
+            registry = self.root / SPOOL_REGISTRY_FILE
+            registered: set[str] = set()
+            try:
+                for line in registry.read_text(encoding="utf-8").splitlines():
+                    record = json.loads(line)
+                    path = record.get("path") if isinstance(record, dict) else None
+                    if not isinstance(path, str) or not Path(path).is_absolute():
+                        raise ValueError("raw archive spool registry entry is invalid")
+                    registered.add(path)
+            except FileNotFoundError:
+                pass
+            if spool_path not in registered:
+                append_protected(registry, dumps({"path": spool_path}))
+            self._registered_spool_path = spool_path
+            return True
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            self._note_error(exc)
+            return False
+        finally:
+            lease.release()
+
     def _write_start_marker(self) -> None:
         marker = self.root / START_FILE
         if marker.exists():
@@ -516,7 +551,15 @@ class RawArchive:
             self._remember_locked(channel, received_ms, line, media_lease)
 
     def _spool_line_locked(self, channel: str, received_ms: int, line: str) -> bool:
+        media_lease: _MediaGuardLease | None = None
         try:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("raw archive spool line must be an object")
+            if stored_media_relative(record.get("media")):
+                media_lease = self._media_guard.acquire()
+                if not self._register_spool():
+                    return False
             ensure_private_dir(self.spool)
             name = f"{received_ms:013d}-{uuid.uuid4().hex}.json"
             temporary = self.spool / f".{name}.tmp"
@@ -537,9 +580,12 @@ class RawArchive:
             os.replace(temporary, self.spool / name)
             _fsync_directory(self.spool)
             return True
-        except OSError as exc:
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
             self._note_error(exc)
             return False
+        finally:
+            if media_lease is not None:
+                media_lease.release()
 
     def _remember_locked(
         self,
