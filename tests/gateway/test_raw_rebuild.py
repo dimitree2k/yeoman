@@ -185,6 +185,42 @@ def test_rebuild_refuses_the_live_home_and_an_existing_journal(
         )
 
 
+def test_rebuild_refuses_journal_symlink_into_live_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_home = tmp_path / "home"
+    live_home.mkdir()
+    monkeypatch.setenv("YEOMAN_HOME", str(live_home))
+    target_home = tmp_path / "target"
+    target_home.mkdir()
+    live_redirect = live_home / "rebuild-data"
+    live_redirect.mkdir()
+    (target_home / "data").symlink_to(live_redirect, target_is_directory=True)
+    live_journal = live_redirect / "processing" / "processing.db"
+
+    with pytest.raises(RuntimeError, match="live"):
+        rebuild_chat(tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=target_home)
+
+    assert not live_journal.exists()
+
+
+def test_rebuild_refuses_journal_symlink_outside_target_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "home"))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target_home = tmp_path / "target"
+    target_home.mkdir()
+    (target_home / "data").symlink_to(outside, target_is_directory=True)
+    redirected_journal = outside / "processing" / "processing.db"
+
+    with pytest.raises(RuntimeError, match="target_home"):
+        rebuild_chat(tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=target_home)
+
+    assert not redirected_journal.exists()
+
+
 def test_live_comparison_detects_missing_events_when_archive_has_no_records(tmp_path: Path) -> None:
     channel, _ = _live(tmp_path)
     channel.set_raw_archive(None)

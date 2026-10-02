@@ -64,7 +64,11 @@ def rebuild_chat(
     target = target_home.expanduser().resolve()
     if target == live_home or live_home in target.parents:
         raise RuntimeError("refusing to rebuild into the live YEOMAN_HOME")
-    journal_path = target / "data" / "processing" / "processing.db"
+    journal_path = (target / "data" / "processing" / "processing.db").resolve()
+    if journal_path == live_home or live_home in journal_path.parents:
+        raise RuntimeError("refusing to rebuild into the live YEOMAN_HOME")
+    if target not in journal_path.parents:
+        raise RuntimeError("refusing to rebuild outside target_home")
     if journal_path.exists():
         raise RuntimeError(f"rebuild target must be empty: {journal_path} exists")
     journal_path.parent.mkdir(parents=True, exist_ok=True)
