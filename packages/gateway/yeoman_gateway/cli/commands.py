@@ -12,6 +12,7 @@ from . import cron_commands as _cron_commands  # noqa: F401
 from . import deploy_commands as _deploy_commands  # noqa: F401
 from . import doctor_commands as _doctor_commands  # noqa: F401
 from . import env_commands as _env_commands  # noqa: F401
+from . import eval_commands as _eval_commands  # noqa: F401
 from . import knowledge_commands as _knowledge_commands  # noqa: F401
 from . import memory_commands as _memory_commands  # noqa: F401
 from . import model_commands as _model_commands  # noqa: F401
