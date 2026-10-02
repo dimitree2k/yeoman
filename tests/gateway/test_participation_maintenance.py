@@ -62,7 +62,7 @@ async def _delivered(
         channel=CHANNEL,
         chat_id=CHAT,
         now_ms=delivered_at_ms - 1000,
-        limits=(("comment", 10, 3_600_000),),
+        limits=(("comment", 1000, 3_600_000),),
         origin="participation",
         lane="production",
     )
@@ -334,16 +334,23 @@ def _distiller(pattern: str = "keep replies short in this group") -> object:
 
 
 async def _delivered_sample(
-    log: SpeakupLog, *, effect_id: str, outcome: str = "replied", kind: str = "explicit"
+    log: SpeakupLog,
+    *,
+    effect_id: str,
+    outcome: str = "replied",
+    kind: str = "explicit",
+    delivered_at_ms: int = 0,
 ) -> None:
     payload = f"p-{effect_id}"
-    await _delivered(log, proposal_id=payload, effect_id=effect_id, delivered_at_ms=0)
+    await _delivered(
+        log, proposal_id=payload, effect_id=effect_id, delivered_at_ms=delivered_at_ms
+    )
     await log.mark_delivery_outcome(
         effect_id=effect_id,
         outcome=outcome,
         evidence_kind=kind,
         evidence_ids=(f"ev-{effect_id}",),
-        now_ms=WINDOW_MS,
+        now_ms=delivered_at_ms + WINDOW_MS,
     )
 
 
@@ -476,4 +483,126 @@ async def test_advisory_taste_cannot_change_policy_caps_or_tool_rights(tmp_path:
     }
     assert record["kind"] == "preference"
     assert "policy" not in str(record).lower().replace("taste pattern", "")
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_distills_one_opted_in_chat_per_fair_pass(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for chat in ("a@g.us", "b@g.us"):
+        for index in range(10):
+            proposal = f"{chat}-{index}"
+            effect = f"e-{chat}-{index}"
+            await log.record_proposed(
+                proposal_id=proposal, channel=CHANNEL, chat_id=chat, action_type="comment",
+                profile="balanced", message="sample", trigger="burst", context_snapshot={}, now=1.0
+            )
+            await log.reserve_delivery(
+                proposal_id=proposal, effect_id=effect, channel=CHANNEL, chat_id=chat,
+                now_ms=1, limits=(("comment", 10, 1000),), origin="participation", lane="production"
+            )
+            await log.project_recipient_delivery(
+                proposal, effect_id=effect, provider_message_id=f"p-{effect}",
+                evidence_kind="recipient_delivery", evidence_ref="r", now_ms=2
+            )
+            await log.mark_delivery_outcome(
+                effect_id=effect, outcome="replied", evidence_kind="explicit", evidence_ids=(), now_ms=3
+            )
+    memory = _Memory()
+    taste = ParticipationTasteDistiller(log=log, memory=memory, distiller=_distiller())
+    def opted(channel: str, chat_id: str) -> bool:
+        del channel, chat_id
+        return True
+    maintenance = ParticipationMaintenance(
+        ledger=log, taste_distiller=taste, taste_opted_in=opted,
+    )
+    await maintenance.run_once(now_ms=WINDOW_MS + 10)
+    await maintenance.run_once(now_ms=WINDOW_MS + 11)
+    assert [record["chat_id"] for record in memory.records] == ["a@g.us", "b@g.us"]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_taste_distillation_daily_cap_and_persistence_failure_release_claim(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for index in range(10):
+        await _delivered_sample(log, effect_id=f"e{index}")
+    class BrokenMemory(_Memory):
+        def record_manual(self, **kwargs: object) -> None:
+            raise OSError("disk full")
+    taste = ParticipationTasteDistiller(log=log, memory=BrokenMemory(), distiller=_distiller())
+    with pytest.raises(OSError):
+        await taste.run_once(channel=CHANNEL, chat_id=CHAT)
+    assert await log.last_taste_distillation_at(channel=CHANNEL, chat_id=CHAT) is None
+    working_memory = _Memory()
+    working = ParticipationTasteDistiller(log=log, memory=working_memory, distiller=_distiller())
+    assert (await working.run_once(channel=CHANNEL, chat_id=CHAT))["distilled"] is True
+    assert await log.last_taste_distillation_at(channel=CHANNEL, chat_id=CHAT) is not None
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_taste_requires_elapsed_recipient_observation_window(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for index in range(10):
+        await _delivered_sample(log, effect_id=f"e{index}")
+    calls: list[str] = []
+    taste = ParticipationTasteDistiller(
+        log=log,
+        memory=_Memory(),
+        distiller=lambda prompt: calls.append(prompt) or _distiller()(prompt),
+    )
+    result = await taste.run_once(channel=CHANNEL, chat_id=CHAT, now_ms=1, observation_window_ms=100)
+    assert result["reason"] == "not_enough_samples"
+    assert calls == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_recent_samples_do_not_hide_older_elapsed_taste_samples(tmp_path: Path) -> None:
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for index in range(10):
+        await _delivered_sample(log, effect_id=f"old{index}")
+    for index in range(50):
+        await _delivered_sample(
+            log, effect_id=f"new{index}", delivered_at_ms=WINDOW_MS - 100
+        )
+    memory = _Memory()
+    taste = ParticipationTasteDistiller(log=log, memory=memory, distiller=_distiller())
+    result = await taste.run_once(
+        channel=CHANNEL, chat_id=CHAT, now_ms=WINDOW_MS + 10,
+        observation_window_ms=WINDOW_MS,
+    )
+    assert result["distilled"] is True
+    assert result["samples"] == 10
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_taste_releases_its_fingerprint_claim(tmp_path: Path) -> None:
+    import asyncio
+
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for index in range(10):
+        await _delivered_sample(log, effect_id=f"e{index}")
+
+    async def cancelled(prompt: str) -> str:
+        del prompt
+        raise asyncio.CancelledError
+
+    taste = ParticipationTasteDistiller(log=log, memory=_Memory(), distiller=cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await taste.run_once(channel=CHANNEL, chat_id=CHAT)
+    retry = ParticipationTasteDistiller(log=log, memory=_Memory(), distiller=_distiller())
+    assert (await retry.run_once(channel=CHANNEL, chat_id=CHAT))["distilled"] is True
     log.close()

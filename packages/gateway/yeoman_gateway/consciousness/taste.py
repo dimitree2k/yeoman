@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import math
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -48,10 +50,27 @@ class ParticipationTasteDistiller:
         self._distiller = distiller
         self._min_samples = max(1, int(min_samples))
 
-    async def run_once(self, *, channel: str, chat_id: str) -> dict[str, object]:
+    async def run_once(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        now_ms: int | None = None,
+        observation_window_ms: int = 120 * 60_000,
+    ) -> dict[str, object]:
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
         samples = await self._log.participation_outcome_samples(
-            channel=channel, chat_id=chat_id, limit=max(self._min_samples, 50)
+            channel=channel,
+            chat_id=chat_id,
+            limit=max(self._min_samples, 50),
+            before_ms=now - int(observation_window_ms),
         )
+        samples = [
+            sample
+            for sample in samples
+            if sample.get("delivered_at_ms") is not None
+            and now - int(sample["delivered_at_ms"]) >= int(observation_window_ms)
+        ]
         if len(samples) < self._min_samples:
             return {
                 "distilled": False,
@@ -63,6 +82,7 @@ class ParticipationTasteDistiller:
             channel=channel,
             chat_id=chat_id,
             sample_fingerprint=fingerprint,
+            now=now / 1000,
         )
         if not claimed:
             return {
@@ -83,6 +103,13 @@ class ParticipationTasteDistiller:
             confidence = float(parsed.get("confidence", 0.8))
             if not math.isfinite(confidence):
                 raise ValueError("non-finite confidence")
+        except asyncio.CancelledError:
+            await self._log.delete_taste_distillation(
+                channel=channel,
+                chat_id=chat_id,
+                sample_fingerprint=fingerprint,
+            )
+            raise
         except Exception:
             await self._log.delete_taste_distillation(
                 channel=channel,
@@ -117,7 +144,7 @@ class ParticipationTasteDistiller:
                     "sample_fingerprint": fingerprint,
                 },
             )
-        except Exception:
+        except BaseException:
             await self._log.delete_taste_distillation(
                 channel=channel,
                 chat_id=chat_id,

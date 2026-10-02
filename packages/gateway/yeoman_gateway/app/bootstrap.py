@@ -3622,6 +3622,16 @@ def build_gateway_runtime(
 
     lull_observer = None
     participation_maintenance = None
+    def _participation_active(channel: str, chat_id: str) -> bool:
+        current = getattr(policy_adapter, "current_activation", None)
+        snapshot = current(channel, chat_id) if callable(current) else None
+        pause_reason = getattr(policy_adapter, "participation_pause_reason", None)
+        return bool(
+            snapshot is not None
+            and (getattr(snapshot, "live", False) or getattr(snapshot, "observing", False))
+            and not (callable(pause_reason) and pause_reason(channel, chat_id))
+        )
+
     if social_runtime_enabled and speakup_log is not None:
         assert policy_engine is not None
         from yeoman_gateway.consciousness.burst import BurstObserver
@@ -3760,7 +3770,41 @@ def build_gateway_runtime(
             from yeoman_gateway.consciousness.participation_maintenance import (
                 ParticipationMaintenance,
             )
+            from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
 
+            taste_distiller = None
+            if memory_service is not None:
+                from yeoman_gateway.processing.model_route import RouteClient, RouteUnavailableError
+
+                taste_route = str(
+                    getattr(getattr(config.memory, "capture", None), "extract_route", "")
+                    or "memory.capture.extract"
+                )
+                try:
+                    taste_client = RouteClient(config=config, route_key=taste_route)
+
+                    async def _distill_taste(prompt: str) -> str:
+                        import asyncio
+
+                        timeout_ms = int(getattr(taste_client, "timeout_ms", 0) or 30_000)
+                        return await asyncio.wait_for(
+                            taste_client.chat(
+                                [{"role": "user", "content": prompt}],
+                                max_tokens=160,
+                                response_format={"type": "json_object"},
+                            ),
+                            timeout=min(30_000, max(1, timeout_ms)) / 1000,
+                        )
+
+                    taste_distiller = ParticipationTasteDistiller(
+                        log=speakup_log, memory=memory_service, distiller=_distill_taste
+                    )
+                except RouteUnavailableError as exc:
+                    logger.info(
+                        "participation taste unavailable route={} error_type={}",
+                        taste_route,
+                        type(exc).__name__,
+                    )
             participation_maintenance = ParticipationMaintenance(
                 ledger=speakup_log,
                 # Receipt projection is owned by ReconciliationService. Maintenance
@@ -3773,26 +3817,14 @@ def build_gateway_runtime(
                 ),
                 batch_size=int(getattr(maintenance_config, "batch_size", 20)),
                 interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
+                taste_distiller=taste_distiller,
+                taste_opted_in=_participation_active,
             )
 
         if participation_runtime is not None:
             from yeoman_gateway.consciousness.participation_runtime import (
                 ParticipationIngress,
             )
-
-            def _participation_active(channel: str, chat_id: str) -> bool:
-                current = getattr(policy_adapter, "current_activation", None)
-                snapshot = current(channel, chat_id) if callable(current) else None
-                pause_reason = getattr(
-                    policy_adapter, "participation_pause_reason", None
-                )
-                return bool(
-                    snapshot is not None
-                    and (getattr(snapshot, "live", False) or getattr(snapshot, "observing", False))
-                    and not (
-                        callable(pause_reason) and pause_reason(channel, chat_id)
-                    )
-                )
 
             def _canonical_direct_source(event: object) -> bool:
                 if processing_store is None:

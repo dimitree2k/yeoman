@@ -2446,7 +2446,7 @@ class SpeakupLog:
             )
 
     async def participation_outcome_samples(
-        self, *, channel: str, chat_id: str, limit: int = 50
+        self, *, channel: str, chat_id: str, limit: int = 50, before_ms: int | None = None
     ) -> list[dict[str, Any]]:
         """Delivered, provenance-tagged participation samples for one chat.
 
@@ -2460,10 +2460,17 @@ class SpeakupLog:
                 WHERE origin = 'participation' AND lane = 'production'
                   AND channel = ? AND chat_id = ? AND delivery_state = 'delivered'
                   AND outcome IS NOT NULL AND outcome_kind IS NOT NULL
+                  AND (? IS NULL OR delivered_at_ms <= ?)
                 ORDER BY outcome_at_ms DESC, delivered_at_ms DESC
                 LIMIT ?
                 """,
-                (str(channel), str(chat_id), max(1, int(limit))),
+                (
+                    str(channel),
+                    str(chat_id),
+                    int(before_ms) if before_ms is not None else None,
+                    int(before_ms) if before_ms is not None else None,
+                    max(1, int(limit)),
+                ),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2483,6 +2490,20 @@ class SpeakupLog:
                 (max(1, int(limit)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    async def last_taste_distillation_at(
+        self, *, channel: str, chat_id: str
+    ) -> float | None:
+        """Latest successful/in-flight claim time for the exact chat."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT MAX(created_at) AS latest_at FROM taste_distillations
+                WHERE channel = ? AND chat_id = ?
+                """,
+                (str(channel), str(chat_id)),
+            ).fetchone()
+        return float(row["latest_at"]) if row and row["latest_at"] is not None else None
 
     async def delivered_reservation_rows(
         self,

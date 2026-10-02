@@ -74,6 +74,8 @@ class ParticipationMaintenance:
         batch_size: int = 20,
         interval_seconds: int = 900,
         clock_ms: Any | None = None,
+        taste_distiller: Any | None = None,
+        taste_opted_in: Any | None = None,
     ) -> None:
         self._ledger = ledger
         self._reconciler = reconciler
@@ -83,6 +85,9 @@ class ParticipationMaintenance:
         self._batch_size = max(1, int(batch_size))
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._interval_seconds = max(1, int(interval_seconds))
+        self._taste_distiller = taste_distiller
+        self._taste_opted_in = taste_opted_in
+        self._taste_cursor: tuple[str, str] | None = None
         self._running = False
         self._task: Any | None = None
 
@@ -169,6 +174,7 @@ class ParticipationMaintenance:
                 now_ms=moment,
             )
             classified += 1
+        await self._distill_one_chat(moment)
         return MaintenanceReport(
             reconciled=reconciled,
             deliveries_seen=len(rows),
@@ -176,6 +182,56 @@ class ParticipationMaintenance:
             classified_without_a_call=without_call,
             failures=failures,
         )
+
+    async def _distill_one_chat(self, now_ms: int) -> None:
+        """Attempt one opted-in, non-daily-capped chat after outcome maintenance."""
+        if self._taste_distiller is None or not callable(self._taste_opted_in):
+            return
+        import asyncio
+
+        try:
+            chats = await self._ledger.participation_outcome_chats(limit=2**31 - 1)
+            keys = sorted((str(row["channel"]), str(row["chat_id"])) for row in chats)
+            if not keys:
+                return
+            if self._taste_cursor in keys:
+                offset = (keys.index(self._taste_cursor) + 1) % len(keys)
+                keys = keys[offset:] + keys[:offset]
+            for channel, chat_id in keys:
+                opted = self._taste_opted_in(channel, chat_id)
+                if hasattr(opted, "__await__"):
+                    opted = await opted
+                if not opted:
+                    continue
+                last = await self._ledger.last_taste_distillation_at(
+                    channel=channel, chat_id=chat_id
+                )
+                if last is not None and now_ms - int(last * 1000) < 24 * 60 * 60_000:
+                    continue
+                self._taste_cursor = (channel, chat_id)
+                try:
+                    result = await self._taste_distiller.run_once(
+                        channel=channel,
+                        chat_id=chat_id,
+                        now_ms=now_ms,
+                        observation_window_ms=self._window_ms,
+                    )
+                    logger.info(
+                        "participation_taste_distillation reason={} samples={}",
+                        "distilled" if result.get("distilled") else result.get("reason", "unknown"),
+                        int(result.get("samples", 0)),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - taste is optional maintenance
+                    logger.warning(
+                        "participation_taste_failed error_type={}", type(exc).__name__
+                    )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - taste is optional maintenance
+            logger.warning("participation_taste_failed error_type={}", type(exc).__name__)
 
     async def _classify(
         self, row: dict[str, Any], *, now_ms: int
