@@ -497,7 +497,13 @@ class KnowledgeService:
             return self._statements.capture(candidate, context=context)
 
     def recall(
-        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        view: str = "current",
+        max_chars: int | None = None,
+        group_wide: bool = False,
     ) -> KnowledgeContext:
         """Recall under the one shared read contract.
 
@@ -507,7 +513,13 @@ class KnowledgeService:
         inspection, still never ``revoked`` content).
         """
         checked = self._read_context(context)
-        return self._retrieval.recall(query, context=checked, view=view)
+        return self._retrieval.recall(
+            query,
+            context=checked,
+            view=view,
+            max_chars=max_chars,
+            group_wide=group_wide,
+        )
 
     def recall_hybrid(
         self,
@@ -557,10 +569,17 @@ class KnowledgeService:
         )
 
     def revalidate(
-        self, result: KnowledgeContext, *, context: TrustedReadContext
+        self,
+        result: KnowledgeContext,
+        *,
+        context: TrustedReadContext,
+        max_chars: int | None = None,
+        group_wide: bool = False,
     ) -> KnowledgeContext:
         checked = self._read_context(context)
-        return self._retrieval.revalidate(result, context=checked)
+        return self._retrieval.revalidate(
+            result, context=checked, max_chars=max_chars, group_wide=group_wide
+        )
 
     # ── identity changes ─────────────────────────────────────────────────────
 

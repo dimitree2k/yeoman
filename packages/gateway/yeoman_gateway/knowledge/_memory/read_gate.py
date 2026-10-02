@@ -98,7 +98,26 @@ class FactReadGate:
             # fact's stored audience says.
             return FactAclPredicate(sql="0", params=())
 
-        # The reader - not merely some member of the chat - must be named in the fact.
+        if read_context.group_wide:
+            member_ids = tuple(sorted(members))
+            placeholders = ",".join("?" for _ in member_ids)
+            disclosure = (
+                "f.visibility_scope <> 'author_only' AND "
+                "(SELECT COUNT(DISTINCT p.principal_id)"
+                " FROM memory2_fact_principals p"
+                " WHERE p.fact_id = f.fact_id AND p.role = 'audience'"
+                f" AND p.principal_id IN ({placeholders})) = ?"
+            )
+            disclosure_params: tuple[Any, ...] = (*member_ids, len(member_ids))
+        else:
+            disclosure = (
+                "((f.visibility_scope = 'author_only' AND f.author_principal = ?)"
+                " OR (f.visibility_scope <> 'author_only'"
+                " AND EXISTS (SELECT 1 FROM memory2_fact_principals p"
+                " WHERE p.fact_id = f.fact_id AND p.role = 'audience'"
+                " AND p.principal_id = ?)))"
+            )
+            disclosure_params = (read_context.principal_id, read_context.principal_id)
         sql = (
             "EXISTS (SELECT 1 FROM memory2_facts f"
             " WHERE f.fact_id = n.id"
@@ -107,18 +126,12 @@ class FactReadGate:
             "   AND f.revoked_at_ms IS NULL"
             "   AND f.superseded_by IS NULL"
             "   AND (f.valid_until_ms IS NULL OR f.valid_until_ms > ?)"
-            "   AND ((f.visibility_scope = 'author_only' AND f.author_principal = ?)"
-            "        OR (f.visibility_scope <> 'author_only'"
-            "            AND EXISTS (SELECT 1 FROM memory2_fact_principals p"
-            "                         WHERE p.fact_id = f.fact_id"
-            "                           AND p.role = 'audience'"
-            "                           AND p.principal_id = ?))))"
+            f"   AND ({disclosure}))"
         )
         params: tuple[Any, ...] = (
             read_context.chat_scope_key,
             int(read_context.now_ms),
-            read_context.principal_id,
-            read_context.principal_id,
+            *disclosure_params,
         )
         return FactAclPredicate(sql=sql, params=params)
 

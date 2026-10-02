@@ -240,6 +240,7 @@ class RetrievalEngine:
         decision: ReadDecision,
         *,
         view: str = "current",
+        group_wide: bool = False,
     ) -> tuple[str, list[Any]]:
         """SQL candidate filter: status, validity, revocation, source chat, audience.
 
@@ -265,13 +266,15 @@ class RetrievalEngine:
             at_ms,
             at_ms,
         ]
-        # author_only means "only the author reads this" - never "nobody".  Status,
-        # expiry and revocation were already checked above for every scope.
-        clauses.append(
-            "((s.visibility_scope = 'author_only' AND s.author_principal = ?)"
-            " OR (s.visibility_scope <> 'author_only'))"
-        )
-        params.append(context.principal_id)
+        # Group-wide reads cannot inherit the triggering author's author-only right.
+        if group_wide:
+            clauses.append("s.visibility_scope <> 'author_only'")
+        else:
+            clauses.append(
+                "((s.visibility_scope = 'author_only' AND s.author_principal = ?)"
+                " OR (s.visibility_scope <> 'author_only'))"
+            )
+            params.append(context.principal_id)
         # Every verified recipient must be named in the audience.  actor_only resolves
         # through its author principal, which the gate above read from the current row.
         placeholders = ",".join("?" for _ in recipients)
@@ -281,7 +284,11 @@ class RetrievalEngine:
             f" WHERE p.statement_id = s.statement_id AND p.role = 'audience'"
             f" AND p.principal_id IN ({placeholders})) = ?"
         )
-        if recipients:
+        if recipients and group_wide:
+            clauses.append("s.visibility_scope <> 'author_only' AND " + audience_match)
+            params.extend(recipients)
+            params.append(len(recipients))
+        elif recipients:
             clauses.append(
                 "((s.visibility_scope <> 'author_only' AND " + audience_match + ")"
                 " OR (s.visibility_scope = 'author_only' AND s.author_principal = ?))"
@@ -345,12 +352,19 @@ class RetrievalEngine:
         return clause, params
 
     def candidates(
-        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        view: str = "current",
+        group_wide: bool = False,
     ) -> tuple[CandidateRows, ReadDecision]:
         decision = self.decide(context)
         if not decision.allowed:
             return CandidateRows((), 0), decision
-        clauses, params = self._gate_clause(context, decision, view=view)
+        clauses, params = self._gate_clause(
+            context, decision, view=view, group_wide=group_wide
+        )
         person_clause, person_params = self._person_filter_clause(query.person_ids, query.roles)
         if person_clause:
             clauses = f"{clauses} AND {person_clause}"
@@ -448,9 +462,17 @@ class RetrievalEngine:
     # ── public read operations ───────────────────────────────────────────────
 
     def recall(
-        self, query: RecallQuery, *, context: TrustedReadContext, view: str = "current"
+        self,
+        query: RecallQuery,
+        *,
+        context: TrustedReadContext,
+        view: str = "current",
+        max_chars: int | None = None,
+        group_wide: bool = False,
     ) -> KnowledgeContext:
-        rows, decision = self.candidates(query, context=context, view=view)
+        rows, decision = self.candidates(
+            query, context=context, view=view, group_wide=group_wide
+        )
         if not decision.allowed:
             return KnowledgeContext(
                 text="",
@@ -458,15 +480,23 @@ class RetrievalEngine:
                 source_refs=(),
                 identity_revision=self._store.identity_revision,
                 acl_epoch=self._store.acl_epoch,
-                context_revision=self.context_revision(context, decision, ()),
+                context_revision=self.context_revision(
+                    context, decision, (), group_wide=group_wide
+                ),
                 reason=decision.reason,
             )
-        allowed_ids = self._recheck_ids(rows.statement_ids, context, decision, view=view)
-        text, source_refs = self._render(allowed_ids, context, decision, view=view)
-        revision = self.context_revision(context, decision, allowed_ids)
+        allowed_ids = self._recheck_ids(
+            rows.statement_ids, context, decision, view=view, group_wide=group_wide
+        )
+        text, rendered_ids, source_refs = self._render(
+            allowed_ids, context, decision, view=view, max_chars=max_chars
+        )
+        revision = self.context_revision(
+            context, decision, rendered_ids, group_wide=group_wide
+        )
         return KnowledgeContext(
             text=text,
-            statement_ids=allowed_ids,
+            statement_ids=rendered_ids,
             source_refs=source_refs,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
@@ -513,14 +543,14 @@ class RetrievalEngine:
             if statement_id not in merged:
                 merged.append(statement_id)
         allowed_ids = self._recheck_ids(tuple(merged), context, decision)
-        text, source_refs = self._render(allowed_ids, context, decision)
+        text, rendered_ids, source_refs = self._render(allowed_ids, context, decision)
         return KnowledgeContext(
             text=text,
-            statement_ids=allowed_ids,
+            statement_ids=rendered_ids,
             source_refs=source_refs,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
-            context_revision=self.context_revision(context, decision, allowed_ids),
+            context_revision=self.context_revision(context, decision, rendered_ids),
             reason="ok" if allowed_ids else "empty",
             denied_count=rows.denied,
         )
@@ -799,7 +829,12 @@ class RetrievalEngine:
         return tuple(key for key, values in attributes if len(values) > 1)
 
     def revalidate(
-        self, result: KnowledgeContext, *, context: TrustedReadContext
+        self,
+        result: KnowledgeContext,
+        *,
+        context: TrustedReadContext,
+        max_chars: int | None = None,
+        group_wide: bool = False,
     ) -> KnowledgeContext:
         """Re-check a prepared context against current rights, membership and sources.
 
@@ -815,12 +850,16 @@ class RetrievalEngine:
                 source_refs=(),
                 identity_revision=self._store.identity_revision,
                 acl_epoch=self._store.acl_epoch,
-                context_revision=self.context_revision(context, decision, ()),
+                context_revision=self.context_revision(
+                    context, decision, (), group_wide=group_wide
+                ),
                 reason=decision.reason,
             )
         if result.acl_epoch != self._store.acl_epoch:
             pass  # epoch changed: the id recheck below is the authoritative decision
-        allowed_ids = self._recheck_ids(result.statement_ids, context, decision)
+        allowed_ids = self._recheck_ids(
+            result.statement_ids, context, decision, group_wide=group_wide
+        )
         if not allowed_ids:
             return KnowledgeContext(
                 text="",
@@ -828,30 +867,38 @@ class RetrievalEngine:
                 source_refs=(),
                 identity_revision=self._store.identity_revision,
                 acl_epoch=self._store.acl_epoch,
-                context_revision=self.context_revision(context, decision, ()),
+                context_revision=self.context_revision(
+                    context, decision, (), group_wide=group_wide
+                ),
                 reason="stale_context",
             )
-        text, source_refs = self._render(allowed_ids, context, decision)
+        text, rendered_ids, source_refs = self._render(
+            allowed_ids, context, decision, max_chars=max_chars
+        )
         if result.context_revision and result.context_revision != self.context_revision(
-            context, decision, allowed_ids
+            context, decision, rendered_ids, group_wide=group_wide
         ):
             # The context was prepared against different source revisions.
             return KnowledgeContext(
                 text=text,
-                statement_ids=allowed_ids,
+                statement_ids=rendered_ids,
                 source_refs=source_refs,
                 identity_revision=self._store.identity_revision,
                 acl_epoch=self._store.acl_epoch,
-                context_revision=self.context_revision(context, decision, allowed_ids),
+                context_revision=self.context_revision(
+                    context, decision, rendered_ids, group_wide=group_wide
+                ),
                 reason="revalidated",
             )
         return KnowledgeContext(
             text=text,
-            statement_ids=allowed_ids,
+            statement_ids=rendered_ids,
             source_refs=source_refs,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
-            context_revision=self.context_revision(context, decision, allowed_ids),
+            context_revision=self.context_revision(
+                context, decision, rendered_ids, group_wide=group_wide
+            ),
             reason="ok",
         )
 
@@ -862,6 +909,7 @@ class RetrievalEngine:
         decision: ReadDecision,
         *,
         view: str = "current",
+        group_wide: bool = False,
     ) -> tuple[str, ...]:
         """Final id recheck with *current* rows, immediately before rendering.
 
@@ -870,7 +918,9 @@ class RetrievalEngine:
         """
         if not decision.allowed or not statement_ids:
             return ()
-        clauses, params = self._gate_clause(context, decision, view=view)
+        clauses, params = self._gate_clause(
+            context, decision, view=view, group_wide=group_wide
+        )
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
             f"SELECT s.statement_id FROM knowledge_statements s"
@@ -887,14 +937,15 @@ class RetrievalEngine:
         decision: ReadDecision,
         *,
         view: str = "current",
-    ) -> tuple[str, tuple[SourceRef, ...]]:
+        max_chars: int | None = None,
+    ) -> tuple[str, tuple[str, ...], tuple[SourceRef, ...]]:
         """Render permitted statements with eligible names.  Evidence ids stay structured.
 
         Text is only ever read for ids that survived the gate *and* a fresh recheck, and
         only active person roles supply labels: a withheld role never names anybody.
         """
         if not statement_ids:
-            return "", ()
+            return "", (), ()
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
             "SELECT s.statement_id, s.status, s.superseded_by, s.supersession_reason,"
@@ -914,7 +965,9 @@ class RetrievalEngine:
         names: dict[str, str | None] = {}
         lines: list[str] = []
         used: list[SourceRef] = []
+        rendered_ids: list[str] = []
         total = 0
+        char_limit = MAX_CONTEXT_CHARS if max_chars is None else max(0, int(max_chars))
         for statement_id in statement_ids:
             content = contents.get(statement_id, "")
             if not content:
@@ -930,17 +983,24 @@ class RetrievalEngine:
                 if name not in labels:
                     labels.append(name)
             line = content if not labels else f"{content} ({', '.join(labels)})"
-            if total + len(line) > MAX_CONTEXT_CHARS:
+            line_size = len(line) + (1 if lines else 0)
+            if total + line_size > char_limit:
                 break
-            total += len(line) + 1
+            total += line_size
             lines.append(line)
+            rendered_ids.append(statement_id)
             for source, status in self._statements.sources_of(statement_id):
                 if status == "active" and source not in used:
                     used.append(source)
-        return "\n".join(lines), tuple(used)
+        return "\n".join(lines), tuple(rendered_ids), tuple(used)
 
     def context_revision(
-        self, context: TrustedReadContext, decision: ReadDecision, statement_ids: tuple[str, ...]
+        self,
+        context: TrustedReadContext,
+        decision: ReadDecision,
+        statement_ids: tuple[str, ...],
+        *,
+        group_wide: bool = False,
     ) -> str:
         """A stable fingerprint of everything this context depends on."""
         source_rows: list[tuple[str, int]] = []
@@ -964,6 +1024,7 @@ class RetrievalEngine:
                 "acl_epoch": self._store.acl_epoch,
                 "statements": sorted(statement_ids),
                 "sources": source_rows,
+                "group_wide": bool(group_wide),
             },
             separators=(",", ":"),
             sort_keys=True,

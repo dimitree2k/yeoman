@@ -311,3 +311,110 @@ def test_unknown_membership_yields_no_retrieval_and_no_provider_call(tmp_path: P
     assert result.text == ""
     assert provider.seen == []
     service.close()
+
+
+def test_group_wide_participation_retrieval_excludes_author_only_and_is_lexical(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+
+    class NoEmbed:
+        def embed(self, text: str) -> list[float]:
+            raise AssertionError(f"Participation must not embed {text!r}")
+
+    service.embedding = NoEmbed()  # type: ignore[assignment]
+    _publish(
+        service,
+        _fact(
+            fact_id="author-only",
+            visibility="author_only",
+            audience=set(),
+            content=f"Der Stammtisch donnerstags. {SECRET}",
+        ),
+    )
+    _publish(
+        service,
+        _fact(
+            fact_id="shared",
+            audience={"member-old", "member-new"},
+            content="Der Stammtisch beginnt am Donnerstag.",
+        ),
+    )
+    _publish(
+        service,
+        _fact(
+            fact_id="partial-audience",
+            audience={"member-old"},
+            content="Der Stammtisch ist für Alice donnerstags.",
+        ),
+    )
+    context = replace(
+        _ctx(
+            principal="member-old",
+            members={"member-old", "member-new"},
+            now_ms=T0 + 8 * 86_400_000,
+        ),
+        group_wide=True,
+    )
+
+    result = service.retrieve_for_context(
+        query="Stammtisch Donnerstag",
+        read_context=context,
+        lexical_only=True,
+        max_chars=1200,
+        limit=3,
+    )
+
+    assert SECRET not in result.text
+    assert result.text == "- Der Stammtisch beginnt am Donnerstag."
+    assert tuple(result.used_source_refs) == ("shared",)
+    service.close()
+
+
+def test_fact_revalidation_rerenders_only_selected_ids_with_current_sources(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    _publish(
+        service,
+        _fact(
+            fact_id="selected",
+            audience={"member-old", "member-new"},
+            content="Teamessen um sieben.",
+        ),
+    )
+    _publish(
+        service,
+        _fact(
+            fact_id="other",
+            audience={"member-old", "member-new"},
+            content="Teamessen um sieben und im Park.",
+        ),
+    )
+    context = replace(
+        _ctx(principal="member-old", members={"member-old", "member-new"}),
+        group_wide=True,
+    )
+    result = service.retrieve_for_context(
+        query="Teamessen sieben",
+        read_context=context,
+        lexical_only=True,
+        max_chars=1200,
+        limit=1,
+    )
+    assert len(result.used_source_refs) == 1
+    selected_id = next(iter(result.used_source_refs))
+    unselected_id = ({"selected", "other"} - {selected_id}).pop()
+    service.store.search_lexical = lambda **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("revalidation must not run a new query")
+    )
+
+    service.store.set_fact_status(selected_id, status="revoked", now_ms=T0 + 1)
+    current = service.revalidate_for_context(
+        result, read_context=context, max_chars=1200
+    )
+
+    assert current.text == ""
+    assert current.used_source_refs == {}
+    assert unselected_id not in current.used_source_refs
+    service.close()

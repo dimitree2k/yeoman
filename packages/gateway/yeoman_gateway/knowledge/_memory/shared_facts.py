@@ -86,6 +86,7 @@ class FactReadContext:
     epoch: int = 0
     now_ms: int = 0
     owner: bool = False
+    group_wide: bool = False
 
     @property
     def membership_known(self) -> bool:
@@ -144,7 +145,10 @@ def can_read_shared(*, fact: SharedFact, read_context: FactReadContext) -> bool:
     if read_context.principal_id not in fact.audience:
         return False
     assert read_context.current_members is not None  # guaranteed by membership_known
-    return read_context.principal_id in read_context.current_members
+    return read_context.principal_id in read_context.current_members and (
+        not read_context.group_wide
+        or read_context.current_members.issubset(fact.audience)
+    )
 
 
 def fact_content_hash(fact_id: str, content: str) -> str:

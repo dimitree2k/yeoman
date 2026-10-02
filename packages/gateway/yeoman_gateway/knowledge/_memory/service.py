@@ -18,7 +18,9 @@ from loguru import logger
 
 from yeoman_gateway.knowledge._memory.disclosure import (
     classify_disclosure_for_content,
+    disclosure_decision,
     metadata_to_json_dict,
+    normalize_metadata,
     render_disclosed_hits,
 )
 from yeoman_gateway.knowledge._memory.embeddings import MemoryEmbeddingService
@@ -512,6 +514,8 @@ class MemoryService:
         read_context: "FactReadContext",
         reply_to_text: str | None = None,
         limit: int | None = None,
+        lexical_only: bool = False,
+        max_chars: int | None = None,
     ) -> "FactRetrievalResult":
         """Retrieve shared facts the reader may see - filtered before retrieval.
 
@@ -552,7 +556,7 @@ class MemoryService:
                 limit=effective_limit,
                 acl=predicate,
             )
-            if self.store.has_fact_embeddings()
+            if not lexical_only and self.store.has_fact_embeddings()
             else []
         )
         candidates = self._merge_candidates(candidates, vector_hits)
@@ -567,24 +571,89 @@ class MemoryService:
         query_text = self._normalize_content(
             query + (f"\n{reply_to_text}" if reply_to_text else "")
         )
-        rendered = self._render_hits(
-            ranked,
-            query=query_text,
-            owner_context=bool(read_context.owner),
-            max_chars=int(self.config.recall.max_prompt_chars),
-        )
+        if max_chars is None:
+            rendered = self._render_hits(
+                ranked,
+                query=query_text,
+                owner_context=bool(read_context.owner),
+                max_chars=int(self.config.recall.max_prompt_chars),
+            )
+            rendered_hits = ranked if rendered else []
+        else:
+            rendered, rendered_hits = self._render_fact_hits(
+                ranked, query=query_text, max_chars=max(0, int(max_chars))
+            )
         used: dict[str, tuple[tuple[str, int], ...]] = {}
-        for hit in ranked:
+        for hit in rendered_hits:
             used[hit.entry.id] = tuple(
                 (source.source_event_id, source.source_revision)
                 for source in self.store.list_fact_sources(hit.entry.id)
             )
         return FactRetrievalResult(
             text=rendered,
-            hits=tuple(ranked),
+            hits=tuple(rendered_hits),
             used_source_refs=used,
             denied_count=denied_count,
         )
+
+    def revalidate_for_context(
+        self,
+        result: "FactRetrievalResult",
+        *,
+        read_context: "FactReadContext",
+        max_chars: int,
+    ) -> "FactRetrievalResult":
+        """Re-render selected facts only, with the current audience and sources."""
+        selected_ids = tuple(str(item) for item in result.used_source_refs)
+        gate = self.shared_fact_gate()
+        allowed = gate.recheck(selected_ids, read_context)
+        hits: list[MemoryHit] = []
+        for fact_id in selected_ids:
+            if fact_id not in allowed:
+                continue
+            entry = self.store.get_node(fact_id, workspace_id=self.workspace_id)
+            if entry is not None:
+                hits.append(MemoryHit(entry=entry))
+        text, rendered_hits = self._render_fact_hits(
+            hits, query="", max_chars=max(0, int(max_chars))
+        )
+        used = {
+            hit.entry.id: tuple(
+                (source.source_event_id, source.source_revision)
+                for source in self.store.list_fact_sources(hit.entry.id)
+            )
+            for hit in rendered_hits
+        }
+        return FactRetrievalResult(
+            text=text,
+            hits=tuple(rendered_hits),
+            used_source_refs=used,
+            denied_count=result.denied_count + len(set(selected_ids) - allowed),
+        )
+
+    @staticmethod
+    def _render_fact_hits(
+        hits: list[MemoryHit], *, query: str, max_chars: int
+    ) -> tuple[str, list[MemoryHit]]:
+        lines: list[str] = []
+        rendered: list[MemoryHit] = []
+        total = 0
+        for hit in hits:
+            decision = disclosure_decision(
+                normalize_metadata(hit.entry.meta_json),
+                query=query,
+                owner_context=False,
+            )
+            if decision != "render_raw":
+                continue
+            line = f"- {hit.entry.content.strip()}"
+            size = len(line) + (1 if lines else 0)
+            if total + size > max_chars:
+                break
+            lines.append(line)
+            rendered.append(hit)
+            total += size
+        return "\n".join(lines), rendered
 
     def _vector_candidates(
         self,
