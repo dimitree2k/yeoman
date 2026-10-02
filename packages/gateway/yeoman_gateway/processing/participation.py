@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -667,21 +668,27 @@ def _bounded_text(value: Any, limit: int) -> str:
     return " ".join(value.split())[:limit]
 
 
+_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", flags=re.DOTALL | re.IGNORECASE)
+
+
 def _parse_payload(raw: str) -> dict[str, Any] | None:
-    """Read the JSON object out of a small model answer."""
+    """Extract one JSON object; trusted Judge validation still checks its fields."""
     text = str(raw or "").strip()
     if not text:
         return None
-    if text.startswith("```"):
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else text
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    try:
-        payload = json.loads(text.strip())
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+    candidates = [text]
+    candidates.extend(chunk.strip() for chunk in _FENCED_BLOCK.findall(text))
+    first, last = text.find("{"), text.rfind("}")
+    if 0 <= first < last:
+        candidates.append(text[first : last + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 __all__ = [

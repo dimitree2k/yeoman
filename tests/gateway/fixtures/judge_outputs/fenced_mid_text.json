@@ -1,0 +1,1 @@
+{"content": "Decision follows.\n```json\n{\"action\": \"silence\", \"intent\": \"initiate\", \"reason\": \"quiet\"}\n```\nDone.", "finish_reason": "stop", "native_finish_reason": "stop", "expect": {"outcome": "decision", "action": "silence"}}

@@ -1,0 +1,1 @@
+{"content": "{\"action\": \"react\", \"intent\": \"initiate\", \"reason\": \"funny\", \"target_message_id\": \"b2\", \"emoji\": \"👍\"}", "finish_reason": "stop", "native_finish_reason": "stop", "expect": {"outcome": "decision", "action": "react"}}

@@ -1,0 +1,1 @@
+{"content": "{\"action\": \"comm", "finish_reason": "stop", "native_finish_reason": "stop", "expect": {"outcome": "error", "reason": "invalid_response", "detail": "not_json_object"}}

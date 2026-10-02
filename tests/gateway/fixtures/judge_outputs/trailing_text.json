@@ -1,0 +1,1 @@
+{"content": "{\"action\": \"silence\", \"intent\": \"initiate\", \"reason\": \"quiet\"}\nThis keeps the chat calm.", "finish_reason": "stop", "native_finish_reason": "stop", "expect": {"outcome": "decision", "action": "silence"}}

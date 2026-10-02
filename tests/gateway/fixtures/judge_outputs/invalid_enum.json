@@ -1,0 +1,1 @@
+{"content": "{\"action\": \"laugh\", \"intent\": \"initiate\", \"reason\": \"lol\"}", "finish_reason": "stop", "native_finish_reason": "stop", "expect": {"outcome": "error", "reason": "invalid_response", "detail": "unknown_action"}}
