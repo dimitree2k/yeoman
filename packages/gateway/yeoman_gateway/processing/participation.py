@@ -409,6 +409,8 @@ class ParticipationJudge:
         context["anchors"] = anchors
         context["judge_dropped_entry_ids"] = dropped[:32]
         context["judge_dropped_entry_count"] = len(dropped)
+        context["knowledge_rendered_to_judge"] = bool(context.get("selected_knowledge_text"))
+        context["taste_rendered_to_judge"] = bool(context.get("advisory_taste"))
 
     async def _decide(
         self,

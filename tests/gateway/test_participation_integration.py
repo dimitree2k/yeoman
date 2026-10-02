@@ -369,6 +369,241 @@ async def test_hard_refusal_runs_no_judge_and_no_effect(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_partial_knowledge_revocation_during_writer_discards_entire_draft(tmp_path: Path) -> None:
+    class Selection:
+        def __init__(self, text="private fact", revision="r1"):
+            self.text, self.revision = text, revision
+
+    revoked = False
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            selection = Selection("updated fact", "r2") if revoked else Selection()
+            context["selected_knowledge_text"] = selection.text
+            context["_knowledge_selection"] = selection
+            return context
+
+    class BlockingSubmission(_Submission):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+            self.drafts = []
+            self.submitted = []
+
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.drafts.append(context["selected_knowledge_text"])
+            if len(self.drafts) > 1:
+                return "replacement draft"
+            self.started.set()
+            await self.resume.wait()
+            return "draft based on private fact"
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            del admission, payload_hash
+            self.submitted.append(content)
+            return _Receipt(effect_id=effect_id)
+
+    def revalidate(opportunity, context, selection):
+        del opportunity, context
+        return Selection("updated fact", "r2") if revoked else selection
+
+    submission = BlockingSubmission()
+    runtime, judge, _, log = _runtime(tmp_path, decision=COMMENT, submission=submission)
+    runtime._context_builder = KnowledgeContext()
+    runtime._revalidate_knowledge = revalidate
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    await submission.started.wait()
+    revoked = True
+    submission.resume.set()
+    result = await task
+    assert result["status"] == "submitted"
+    assert judge.calls == 2
+    assert submission.drafts == ["private fact", "updated fact"]
+    assert submission.submitted == ["replacement draft"]
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_change_before_writer_forces_fresh_decision(tmp_path: Path) -> None:
+    class Selection:
+        def __init__(self, text="member fact", revision="r1"):
+            self.text, self.revision = text, revision
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            selected = Selection()
+            context["selected_knowledge_text"] = selected.text
+            context["_knowledge_selection"] = selected
+            return context
+
+    sequence = iter((COMMENT, COMMENT))
+
+    class SequenceJudge(_Judge):
+        async def decide(self, opportunity, context):
+            self.calls += 1
+            self.contexts.append(context)
+            return next(sequence)
+
+        def __init__(self, decision):
+            super().__init__(decision)
+            self.contexts = []
+
+    class TrackingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.calls += 1
+            return f"draft {self.calls}"
+
+    validations = 0
+
+    def revalidate(opportunity, context, selection):
+        nonlocal validations
+        validations += 1
+        return Selection("updated member fact", "r2") if validations == 2 else selection
+
+    judge, submission = SequenceJudge(COMMENT), TrackingSubmission()
+    runtime, _, _, log = _runtime(tmp_path, decision=COMMENT, submission=submission)
+    context = KnowledgeContext()
+    runtime._context_builder = context
+    runtime._judge = judge
+    runtime._revalidate_knowledge = revalidate
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "submitted"
+    assert judge.calls == 2
+    assert submission.calls == 1
+    assert judge.contexts[1]["selected_knowledge_text"] == "updated member fact"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_revalidation_failure_releases_reservation(tmp_path: Path) -> None:
+    class Selection:
+        text = "selected"
+        revision = "r1"
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            context["selected_knowledge_text"] = "selected"
+            context["_knowledge_selection"] = Selection()
+            return context
+
+    submission = _Submission()
+    runtime, _, _, log = _runtime(tmp_path, decision=COMMENT, submission=submission)
+    runtime._context_builder = KnowledgeContext()
+    validations = 0
+
+    def fail_after_judge(*args):
+        nonlocal validations
+        validations += 1
+        if validations > 1:
+            raise RuntimeError("authority unavailable")
+        return args[2]
+
+    runtime._revalidate_knowledge = fail_after_judge
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "comment_skipped"
+    assert result["reason"] == "knowledge_revalidation_failed"
+    assert submission.calls == 0
+    assert await log.pending_delivery_reservations(origin="participation") == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_work_and_deadline_win_over_late_knowledge(tmp_path: Path) -> None:
+    class Selection:
+        text = "selected"
+        revision = "r1"
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            context["selected_knowledge_text"] = "selected"
+            context["_knowledge_selection"] = Selection()
+            return context
+
+    class TrackingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.calls += 1
+            return "draft"
+
+    submission = TrackingSubmission()
+    runtime, _, _, log = _runtime(tmp_path, decision=COMMENT, submission=submission)
+    runtime._context_builder = KnowledgeContext()
+    runtime._direct_work_active = lambda *_: True
+    runtime._revalidate_knowledge = lambda *args: args[2]
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result["status"] == "skipped"
+    assert result["reason"] == "direct_request"
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_work_and_deadline_win_over_late_knowledge_selection(tmp_path: Path) -> None:
+    class DelayedContext(_Context):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def build(self, opportunity, *, inputs):
+            self.started.set()
+            await self.resume.wait()
+            return await super().build(opportunity, inputs=inputs)
+
+    runtime, judge, _, log = _runtime(tmp_path, decision=COMMENT)
+    context = DelayedContext()
+    runtime._context_builder = context
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    await context.started.wait()
+    runtime._direct_work_active = lambda *_: True
+    context.resume.set()
+    result = await task
+    assert result["status"] == "skipped"
+    assert result["reason"] == "direct_request"
+    assert judge.calls == 0
+    assert await log.pending_delivery_reservations(origin="participation") == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_wins_over_late_knowledge_selection(tmp_path: Path) -> None:
+    class DelayedContext(_Context):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def build(self, opportunity, *, inputs):
+            self.started.set()
+            await self.resume.wait()
+            return await super().build(opportunity, inputs=inputs)
+
+    runtime, judge, _, log = _runtime(tmp_path, decision=COMMENT)
+    context = DelayedContext()
+    runtime._context_builder = context
+    current_time = NOW_MS
+    runtime._clock_ms = lambda: current_time
+    original_snapshot = runtime._snapshot_provider
+    runtime._snapshot_provider = lambda *args, **kwargs: {
+        **original_snapshot(*args, **kwargs),
+        "opportunity_ttl_seconds": 1,
+    }
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    await context.started.wait()
+    current_time = NOW_MS + 2_000
+    context.resume.set()
+    result = await task
+    assert result["status"] == "skipped"
+    assert result["reason"] == "deadline_expired"
+    assert judge.calls == 0
+    assert await log.pending_delivery_reservations(origin="participation") == []
+    log.close()
+
+
+@pytest.mark.asyncio
 async def test_silence_costs_one_judge_and_nothing_else(tmp_path: Path) -> None:
     submission = _Submission()
     reactor = _Reactor()
@@ -1669,6 +1904,37 @@ async def test_approval_required_initiation_never_bypasses_approval_path(tmp_pat
     assert {row["category"] for row in rows} == {"initiation", "comment"}
     assert {row["effect_id"] for row in rows} == {result["effect_id"]}
     assert {row["attempt_state"] for row in rows} == {"unsubmitted"}
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_backed_draft_cannot_enter_delayed_approval_queue(tmp_path: Path) -> None:
+    class Selection:
+        text = "selected"
+        revision = "r1"
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            context["selected_knowledge_text"] = "selected"
+            context["_knowledge_selection"] = Selection()
+            return context
+
+    submission = _ApprovalSubmission()
+    runtime, _, _, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        approval_required=True,
+    )
+    runtime._context_builder = KnowledgeContext()
+    runtime._revalidate_knowledge = lambda *args: args[2]
+    result = await runtime.evaluate_participation(_opportunity())
+    assert result == {
+        "status": "comment_skipped",
+        "reason": "approval_knowledge_revalidation_unavailable",
+    }
+    assert submission.approval_calls == []
     log.close()
 
 

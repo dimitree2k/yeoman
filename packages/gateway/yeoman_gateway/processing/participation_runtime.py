@@ -132,6 +132,7 @@ class _FreshCommentState:
     snapshot: Mapping[str, Any]
     inputs: ParticipationDecisionInputs
     context: Mapping[str, Any]
+    knowledge_changed: bool
 
 
 class ParticipationRuntime:
@@ -153,6 +154,8 @@ class ParticipationRuntime:
         writer_available: bool = True,
         clock_ms: Callable[[], int] | None = None,
         direct_work_active: Callable[[str, str], bool] | None = None,
+        revalidate_knowledge: Callable[[ParticipationOpportunity, Mapping[str, Any], Any], Any]
+        | None = None,
     ) -> None:
         self._judge = judge
         self._context_builder = context_builder
@@ -173,6 +176,7 @@ class ParticipationRuntime:
         self._writer_available = bool(writer_available)
         self._clock_ms = clock_ms or _now_ms
         self._direct_work_active = direct_work_active
+        self._revalidate_knowledge = revalidate_knowledge
         self._counters: dict[str, int] = {}
 
     # -- observability -----------------------------------------------------------------
@@ -182,6 +186,20 @@ class ParticipationRuntime:
 
     def _count(self, name: str) -> None:
         self._counters[name] = self._counters.get(name, 0) + 1
+
+    @staticmethod
+    def _record_knowledge_stage(context: Mapping[str, Any], stage: str) -> None:
+        logger.info(
+            "participation_knowledge stage={} outcome={} count={} chars={} elapsed_ms={} knowledge_rendered={} taste_rendered={} revalidated={}",
+            stage,
+            str(context.get("knowledge_selection_status") or "disabled"),
+            int(context.get("knowledge_selected_count") or 0),
+            int(context.get("knowledge_rendered_chars") or 0),
+            int(context.get("knowledge_selection_elapsed_ms") or 0),
+            bool(context.get(f"knowledge_rendered_to_{stage}", False)),
+            bool(context.get(f"taste_rendered_to_{stage}", False)),
+            bool(context.get("knowledge_revalidated", False)),
+        )
 
     async def _record_judge_failure(
         self,
@@ -276,6 +294,11 @@ class ParticipationRuntime:
             return {"status": "skipped", "reason": "no_feasible_action"}
         if self._direct_active(opportunity):
             return self._direct_superseded()
+        if not _within_opportunity_deadline(
+            opportunity, snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "skipped", "reason": "deadline_expired"}
         attempt_id = f"{opportunity.opportunity_id}:0"
         try:
             charged = await self._ledger.reserve_judge_attempt(
@@ -321,6 +344,30 @@ class ParticipationRuntime:
         if self._direct_active(opportunity):
             await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
             return self._direct_superseded()
+        if not _within_opportunity_deadline(
+            opportunity, snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._ledger.record_judge_outcome(attempt_id, outcome="deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "skipped", "reason": "deadline_expired"}
+
+        try:
+            await self._revalidate_selected_knowledge(opportunity, context)
+        except ParticipationBlockedError as blocked:
+            await self._ledger.record_judge_outcome(attempt_id, outcome=blocked.reason)
+            await self._record(opportunity, "stale_discarded", blocked.reason)
+            return {"status": "skipped", "reason": blocked.reason}
+
+        if not _within_opportunity_deadline(
+            opportunity, snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._ledger.record_judge_outcome(attempt_id, outcome="deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "skipped", "reason": "deadline_expired"}
+
+        if self._direct_active(opportunity):
+            await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
+            return self._direct_superseded()
 
         try:
             decision = await self._judge.decide(opportunity, context)
@@ -339,6 +386,8 @@ class ParticipationRuntime:
             await self._ledger.record_judge_outcome(attempt_id, outcome="provider_error")
             await self._record(opportunity, "judge_failed", "provider_error")
             return {"status": "judge_failed", "reason": "provider_error"}
+
+        self._record_knowledge_stage(context, "judge")
 
         if self._direct_active(opportunity):
             await self._ledger.record_judge_outcome(attempt_id, outcome="direct_superseded")
@@ -376,7 +425,7 @@ class ParticipationRuntime:
 
         if decision.action == "react":
             self._count("reaction_selected")
-            return await self._run_reaction(opportunity, decision, inputs)
+            return await self._run_reaction(opportunity, decision, inputs, context)
 
         self._count("comment_selected")
         return await self._run_comment(opportunity, snapshot, decision, context, inputs)
@@ -898,6 +947,7 @@ class ParticipationRuntime:
         opportunity: ParticipationOpportunity,
         decision: ParticipationDecision,
         inputs: ParticipationDecisionInputs,
+        context: Mapping[str, Any],
     ) -> dict[str, object]:
         if self._reactor is None or not decision.target_message_id or not decision.emoji:
             await self._record(opportunity, "reaction_skipped", "no_reaction_path")
@@ -945,6 +995,25 @@ class ParticipationRuntime:
                 reason="direct_superseded",
                 now_ms=int(self._clock_ms()),
             )
+            return self._direct_superseded()
+        try:
+            changed = await self._revalidate_selected_knowledge(opportunity, context)
+        except ParticipationBlockedError as blocked:
+            await self._release_comment(opportunity, effect_id, blocked.reason)
+            await self._record(opportunity, "stale_discarded", blocked.reason)
+            return {"status": "reaction_skipped", "reason": blocked.reason}
+        if changed:
+            await self._release_comment(opportunity, effect_id, "knowledge_changed")
+            await self._record(opportunity, "stale_discarded", "knowledge_changed")
+            return {"status": "reaction_skipped", "reason": "knowledge_changed"}
+        if not _within_opportunity_deadline(
+            opportunity, inputs.snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._release_comment(opportunity, effect_id, "deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "reaction_skipped", "reason": "deadline_expired"}
+        if self._direct_active(opportunity):
+            await self._release_comment(opportunity, effect_id, "direct_superseded")
             return self._direct_superseded()
         try:
             receipt = await self._reactor(
@@ -1049,6 +1118,37 @@ class ParticipationRuntime:
             await self._record(opportunity, "stale_discarded", "deadline_expired")
             return {"status": "comment_skipped", "reason": "deadline_expired"}
         try:
+            fresh_before_writer = await self._fresh_comment_state(
+                opportunity,
+                snapshot=snapshot,
+                inputs=inputs,
+                context=context,
+            )
+        except ParticipationBlockedError as blocked:
+            await self._release_comment(opportunity, effect_id, blocked.reason)
+            await self._record(opportunity, "stale_discarded", blocked.reason)
+            return {"status": "comment_skipped", "reason": blocked.reason}
+        if fresh_before_writer is not None:
+            return await self._reconsider_comment(
+                initial_opportunity=opportunity,
+                initial_snapshot=snapshot,
+                initial_inputs=inputs,
+                initial_context=context,
+                initial_decision=decision,
+                effect_id=effect_id,
+                text=None,
+                fresh=fresh_before_writer,
+            )
+        if self._direct_active(opportunity):
+            await self._release_comment(opportunity, effect_id, "direct_superseded")
+            return self._direct_superseded()
+        if not _within_opportunity_deadline(
+            opportunity, snapshot, now_ms=int(self._clock_ms())
+        ):
+            await self._release_comment(opportunity, effect_id, "deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "comment_skipped", "reason": "deadline_expired"}
+        try:
             draft = await self._submission.generate_draft(
                 opportunity=opportunity,
                 decision=decision,
@@ -1073,6 +1173,7 @@ class ParticipationRuntime:
             )
             await self._record(opportunity, "generation_failed", "generation_failed")
             return {"status": "generation_failed", "reason": "generation_failed"}
+        self._record_knowledge_stage(context, "writer")
         text = str(draft or "").strip()
         if not text:
             await self._ledger.release_delivery(
@@ -1107,7 +1208,7 @@ class ParticipationRuntime:
                 initial_context=context,
                 initial_decision=decision,
                 effect_id=effect_id,
-                text=text,
+                text=None if fresh.knowledge_changed else text,
                 fresh=fresh,
             )
         return await self._submit_comment(
@@ -1116,6 +1217,7 @@ class ParticipationRuntime:
             inputs=inputs,
             decision=decision,
             text=text,
+            context=context,
             effect_id=effect_id,
             evaluation_index=0,
         )
@@ -1137,11 +1239,30 @@ class ParticipationRuntime:
         inputs: ParticipationDecisionInputs,
         decision: ParticipationDecision,
         text: str,
+        context: Mapping[str, Any],
         effect_id: str,
         evaluation_index: int,
         deadline_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
         deadline_source = snapshot if deadline_snapshot is None else deadline_snapshot
+        if not _within_opportunity_deadline(
+            opportunity, deadline_source, now_ms=int(self._clock_ms())
+        ):
+            await self._release_comment(opportunity, effect_id, "deadline_expired")
+            await self._record(opportunity, "stale_discarded", "deadline_expired")
+            return {"status": "comment_skipped", "reason": "deadline_expired"}
+        try:
+            knowledge_changed = await self._revalidate_selected_knowledge(
+                opportunity, context
+            )
+        except ParticipationBlockedError as blocked:
+            await self._release_comment(opportunity, effect_id, blocked.reason)
+            await self._record(opportunity, "stale_discarded", blocked.reason)
+            return {"status": "comment_skipped", "reason": blocked.reason}
+        if knowledge_changed:
+            await self._release_comment(opportunity, effect_id, "knowledge_changed")
+            await self._record(opportunity, "stale_discarded", "knowledge_changed")
+            return {"status": "comment_skipped", "reason": "knowledge_changed"}
         if not _within_opportunity_deadline(
             opportunity, deadline_source, now_ms=int(self._clock_ms())
         ):
@@ -1184,6 +1305,19 @@ class ParticipationRuntime:
             await self._record(opportunity, "stale_discarded", veto)
             return {"status": "comment_skipped", "reason": veto}
         if approval_required:
+            if _selected_knowledge(context):
+                await self._release_comment(
+                    opportunity, effect_id, "approval_knowledge_revalidation_unavailable"
+                )
+                await self._record(
+                    opportunity,
+                    "comment_skipped",
+                    "approval_knowledge_revalidation_unavailable",
+                )
+                return {
+                    "status": "comment_skipped",
+                    "reason": "approval_knowledge_revalidation_unavailable",
+                }
             queue_approval = getattr(self._submission, "queue_approval", None)
             if not callable(queue_approval):
                 await self._release_comment(
@@ -1274,7 +1408,7 @@ class ParticipationRuntime:
         initial_context: Mapping[str, Any],
         initial_decision: ParticipationDecision,
         effect_id: str,
-        text: str,
+        text: str | None,
         fresh: _FreshCommentState,
     ) -> dict[str, object]:
         """Bound stale-draft rejudgement while retaining one delivery reservation."""
@@ -1404,6 +1538,48 @@ class ParticipationRuntime:
                     initial_opportunity, effect_id, "direct_superseded"
                 )
                 return self._direct_superseded()
+            if not _within_opportunity_deadline(
+                initial_opportunity,
+                initial_snapshot,
+                now_ms=int(self._clock_ms()),
+            ):
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="deadline_expired"
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, "deadline_expired"
+                )
+                return {"status": "comment_skipped", "reason": "deadline_expired"}
+            try:
+                await self._revalidate_selected_knowledge(
+                    current.opportunity, current.context
+                )
+            except ParticipationBlockedError as blocked:
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome=blocked.reason
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, blocked.reason
+                )
+                return {"status": "comment_skipped", "reason": blocked.reason}
+            if self._direct_active(current.opportunity):
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="direct_superseded"
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, "direct_superseded"
+                )
+                return self._direct_superseded()
+            if not _within_opportunity_deadline(
+                initial_opportunity, initial_snapshot, now_ms=int(self._clock_ms())
+            ):
+                await self._ledger.record_judge_outcome(
+                    attempt_id, outcome="deadline_expired"
+                )
+                await self._release_comment(
+                    initial_opportunity, effect_id, "deadline_expired"
+                )
+                return {"status": "comment_skipped", "reason": "deadline_expired"}
 
             try:
                 reevaluated = await self._judge.decide(
@@ -1432,6 +1608,8 @@ class ParticipationRuntime:
                 )
                 await self._record(current.opportunity, "judge_failed", "provider_error")
                 return {"status": "judge_failed", "reason": "provider_error"}
+
+            self._record_knowledge_stage(current.context, "judge")
 
             if self._direct_active(current.opportunity):
                 await self._ledger.record_judge_outcome(
@@ -1486,6 +1664,16 @@ class ParticipationRuntime:
                     current.opportunity, "stale_discarded", "reservation_intent_changed"
                 )
                 return {"status": "comment_skipped", "reason": "context_changed"}
+
+            try:
+                if await self._revalidate_selected_knowledge(
+                    current.opportunity, current.context
+                ):
+                    raise ParticipationBlockedError("knowledge_changed")
+            except ParticipationBlockedError as blocked:
+                await self._release_comment(initial_opportunity, effect_id, blocked.reason)
+                await self._record(current.opportunity, "stale_discarded", blocked.reason)
+                return {"status": "comment_skipped", "reason": blocked.reason}
 
             signature = _decision_signature(reevaluated)
             if signature != initial_signature:
@@ -1547,11 +1735,41 @@ class ParticipationRuntime:
                     await self._record(current.opportunity, "generation_failed", "empty_draft")
                     return {"status": "generation_failed", "reason": "empty_draft"}
                 self._count("generated")
+                self._record_knowledge_stage(current.context, "writer")
                 if self._direct_active(current.opportunity):
                     await self._release_comment(
                         initial_opportunity, effect_id, "direct_superseded"
                     )
                     return self._direct_superseded()
+                replacement_generated = True
+            elif current_text is None:
+                if replacement_generated:
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "replacement_already_generated"
+                    )
+                    return {"status": "comment_skipped", "reason": "context_changed"}
+                try:
+                    replacement = await self._submission.generate_draft(
+                        opportunity=current.opportunity,
+                        decision=reevaluated,
+                        context=current.context,
+                    )
+                except Exception as exc:  # noqa: BLE001 - release definite failure
+                    logger.warning(
+                        "participation_replacement_failed chat={} error_type={}",
+                        current.opportunity.chat_id,
+                        type(exc).__name__,
+                    )
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "generation_failed"
+                    )
+                    return {"status": "generation_failed", "reason": "generation_failed"}
+                current_text = str(replacement or "").strip()
+                if not current_text:
+                    await self._release_comment(initial_opportunity, effect_id, "empty_draft")
+                    return {"status": "generation_failed", "reason": "empty_draft"}
+                self._count("generated")
+                self._record_knowledge_stage(current.context, "writer")
                 replacement_generated = True
             current_decision = reevaluated
 
@@ -1587,10 +1805,58 @@ class ParticipationRuntime:
                 inputs=current.inputs,
                 decision=current_decision,
                 text=current_text,
+                context=current.context,
                 effect_id=effect_id,
                 evaluation_index=evaluation_index,
                 deadline_snapshot=initial_snapshot,
             )
+
+    async def _revalidate_selected_knowledge(
+        self,
+        opportunity: ParticipationOpportunity,
+        context: Mapping[str, Any],
+    ) -> bool:
+        """Refresh selected evidence before a decision, draft, or effect boundary."""
+        selection = _selected_knowledge(context)
+        if selection is None:
+            if str(context.get("selected_knowledge_text") or "").strip():
+                raise ParticipationBlockedError("knowledge_revalidation_failed")
+            return False
+        text = str(getattr(selection, "text", "") or "")
+        if not text:
+            return False
+        if self._revalidate_knowledge is None:
+            raise ParticipationBlockedError("knowledge_revalidation_failed")
+        try:
+            updated = self._revalidate_knowledge(opportunity, context, selection)
+        except Exception as exc:  # noqa: BLE001 - lost authority invalidates influenced work
+            raise ParticipationBlockedError("knowledge_revalidation_failed") from exc
+        if updated is None or not hasattr(updated, "text"):
+            raise ParticipationBlockedError("knowledge_revalidation_failed")
+        if isinstance(context, dict):
+            context["knowledge_revalidated"] = True
+            context["knowledge_revalidation_revision"] = str(
+                getattr(updated, "revision", "") or ""
+            )
+        changed = (
+            str(getattr(updated, "text", "") or "") != text
+            or str(getattr(updated, "revision", "") or "")
+            != str(getattr(selection, "revision", "") or "")
+        )
+        if changed:
+            if not isinstance(context, dict):
+                raise ParticipationBlockedError("knowledge_revalidation_failed")
+            context["_knowledge_selection"] = updated
+            if updated.text:
+                context["selected_knowledge_text"] = str(updated.text)
+                context["knowledge_selection_status"] = "selected"
+                context["knowledge_rendered_chars"] = len(str(updated.text))
+            else:
+                context.pop("selected_knowledge_text", None)
+                context["knowledge_selection_status"] = "empty"
+                context["knowledge_selected_count"] = 0
+                context["knowledge_rendered_chars"] = 0
+        return changed
 
     async def _fresh_comment_state(
         self,
@@ -1617,13 +1883,40 @@ class ParticipationRuntime:
         if str(fresh_snapshot.get("lane") or fresh_opportunity.lane) == "shadow":
             raise ParticipationBlockedError("shadow_lane")
         baseline = _revision_token(snapshot, opportunity, context)
-        observed = _revision_token(fresh_snapshot, fresh_opportunity, None)
-        if not _revision_token_changed(baseline, observed):
+        knowledge_changed = await self._revalidate_selected_knowledge(
+            opportunity, context
+        )
+        observed = _revision_token(fresh_snapshot, fresh_opportunity, context)
+        changed = _revision_token_changed(baseline, observed)
+        if not knowledge_changed and not changed and not context.get("advisory_taste"):
             return None
         fresh_inputs = await self._decision_inputs(fresh_opportunity, fresh_snapshot)
-        fresh_context = await self._context_builder.build(
-            fresh_opportunity, inputs=fresh_inputs
-        )
+        fresh_context: Mapping[str, Any] = dict(context)
+        rebuild = baseline[:2] != observed[:2] or baseline[4:] != observed[4:]
+        if rebuild or context.get("advisory_taste"):
+            fresh_context = await self._context_builder.build(
+                fresh_opportunity, inputs=fresh_inputs
+            )
+            if str(context.get("knowledge_selection_status") or "") == "budget_dropped":
+                fresh_context.pop("selected_knowledge_text", None)
+                old_selection = context.get("_knowledge_selection")
+                if old_selection is not None:
+                    fresh_context["_knowledge_selection"] = type(old_selection)(
+                        reason="budget_dropped"
+                    )
+                fresh_context["knowledge_selection_status"] = "budget_dropped"
+                fresh_context["knowledge_selected_count"] = 0
+                fresh_context["knowledge_rendered_chars"] = 0
+            # Re-evaluation uses a fresh bundle, never a stale handle or entries
+            # that the previous Judge dropped for its budget.
+            if await self._revalidate_selected_knowledge(
+                fresh_opportunity, fresh_context
+            ):
+                raise ParticipationBlockedError("knowledge_changed")
+            observed = _revision_token(fresh_snapshot, fresh_opportunity, fresh_context)
+            changed = _revision_token_changed(baseline, observed)
+            if not knowledge_changed and not changed:
+                return None
         fresh_context = await self._hydrate_social_anchor_closures(fresh_context)
         fresh_inputs, fresh_context = self._apply_continuation_candidate(
             fresh_opportunity, fresh_inputs, fresh_context
@@ -1635,6 +1928,7 @@ class ParticipationRuntime:
             snapshot=fresh_inputs.snapshot,
             inputs=fresh_inputs,
             context=fresh_context,
+            knowledge_changed=knowledge_changed or baseline[2] != observed[2],
         )
 
     def _source_principal_values(
@@ -1865,9 +2159,12 @@ def _revision_token(
     snapshot: Mapping[str, Any] | None,
     opportunity: ParticipationOpportunity,
     context: Mapping[str, Any] | None,
-) -> tuple[int, tuple[str, ...]]:
+) -> tuple[int, tuple[str, ...], str, str, str]:
     revision = int(opportunity.observed_revision)
     source_ids = tuple(opportunity.source_event_ids)
+    knowledge_revision = ""
+    taste_revision = ""
+    policy_inputs: list[tuple[tuple[str, Any], ...]] = []
     for value in (snapshot, context):
         if value is None:
             continue
@@ -1877,13 +2174,41 @@ def _revision_token(
         )
         if supplied:
             source_ids = supplied
-    return revision, source_ids
+        selection = _selected_knowledge(value)
+        if selection is not None and str(getattr(selection, "text", "") or ""):
+            knowledge_revision = str(getattr(selection, "revision", "") or "") or canonical_hash(
+                str(getattr(selection, "text", ""))
+            )
+        if "advisory_taste" in value:
+            taste_revision = canonical_hash(value.get("advisory_taste"))
+        policy_inputs.append(
+            tuple(
+                (name, value.get(name))
+                for name in (
+                    "policy_hash",
+                    "policy_version",
+                    "policy_revision",
+                    "arbitration_revision",
+                    "approval_revision",
+                    "activation_epoch",
+                    "lane",
+                )
+            )
+        )
+    policy_revision = canonical_hash(tuple(policy_inputs))
+    return revision, source_ids, knowledge_revision, taste_revision, policy_revision
 
 
 def _revision_token_changed(
-    baseline: tuple[int, tuple[str, ...]], observed: tuple[int, tuple[str, ...]]
+    baseline: tuple[int, tuple[str, ...], str, str, str],
+    observed: tuple[int, tuple[str, ...], str, str, str],
 ) -> bool:
-    return observed[0] > baseline[0] or observed[1] != baseline[1]
+    return observed[0] > baseline[0] or observed[1:] != baseline[1:]
+
+
+def _selected_knowledge(context: Mapping[str, Any]) -> Any | None:
+    selection = context.get("_knowledge_selection")
+    return selection if str(getattr(selection, "text", "") or "").strip() else None
 
 
 def _max_reevaluations(snapshot: Mapping[str, Any]) -> int:

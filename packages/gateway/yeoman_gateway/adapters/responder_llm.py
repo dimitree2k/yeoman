@@ -627,6 +627,8 @@ def _render_participation_transcript(context: dict[str, object], *, limit: int =
             dropped.append(entry_id)
     context["writer_dropped_entry_ids"] = [item for item in dropped if item]
     context["writer_dropped_entry_count"] = len(dropped)
+    context["knowledge_rendered_to_writer"] = bool(knowledge_block)
+    context["taste_rendered_to_writer"] = bool(taste_block)
     return rendered
 
 

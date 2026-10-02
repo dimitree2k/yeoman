@@ -1158,6 +1158,7 @@ def _build_participation_runtime(
 
     knowledge_selector = None
     knowledge_context_supplier = None
+    revalidate_knowledge = None
     knowledge = getattr(responder, "knowledge", None)
     memory = getattr(responder, "memory", None)
     if (
@@ -1170,7 +1171,8 @@ def _build_participation_runtime(
             ParticipationKnowledgeSelector,
         )
 
-        knowledge_selector = ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
+        selector = ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
+        knowledge_selector = selector
 
         def _knowledge_contexts(opportunity: object, context: Mapping[str, object]):
             return _participation_knowledge_contexts(
@@ -1178,6 +1180,16 @@ def _build_participation_runtime(
             )
 
         knowledge_context_supplier = _knowledge_contexts
+
+        def _revalidate_knowledge(opportunity: object, context: Mapping[str, object], selection: object):
+            trusted = _knowledge_contexts(opportunity, context)
+            if not isinstance(trusted, tuple) or len(trusted) != 2:
+                raise RuntimeError("current knowledge authority unavailable")
+            return selector.revalidate(
+                selection, read_context=trusted[0], fact_context=trusted[1]
+            )
+
+        revalidate_knowledge = _revalidate_knowledge
 
     context_builder = ParticipationContextBuilder(
         archive=inbound_archive,
@@ -1444,6 +1456,7 @@ def _build_participation_runtime(
             and hasattr(processing_store, "direct_work_active")
             else None
         ),
+        revalidate_knowledge=revalidate_knowledge,
     )
 
     async def _handle(opportunity: object) -> None:

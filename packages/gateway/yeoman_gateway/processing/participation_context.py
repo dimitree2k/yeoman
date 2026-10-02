@@ -18,6 +18,7 @@ that already carries reliable provenance, and the retrieval itself stays optiona
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -270,6 +271,7 @@ class ParticipationContextBuilder:
         context["knowledge_selection_status"] = "disabled"
         context["knowledge_selected_count"] = 0
         context["knowledge_rendered_chars"] = 0
+        selection_started = time.monotonic()
         if taste:
             context["advisory_taste"] = _bounded_taste(taste)
         if self._knowledge_selector is not None and self._knowledge_context_supplier is not None:
@@ -306,6 +308,9 @@ class ParticipationContextBuilder:
             except Exception:
                 # Retrieval outages preserve the existing recent-chat-only path.
                 context["knowledge_selection_status"] = "error"
+        context["knowledge_selection_elapsed_ms"] = int(
+            (time.monotonic() - selection_started) * 1000
+        )
         return context
 
     # -- source trust ------------------------------------------------------------------
