@@ -144,14 +144,19 @@ def test_spool_failure_falls_back_to_memory(tmp_path: Path) -> None:
     assert archive.status().pending_in_memory == 0
 
 
-def test_corrupt_spool_file_is_set_aside_not_deleted(tmp_path: Path) -> None:
+@pytest.mark.parametrize("contents", [b"{not json", b"\xff"])
+def test_corrupt_spool_file_is_set_aside_not_deleted(
+    tmp_path: Path, contents: bytes
+) -> None:
     spool = tmp_path / "raw-spool"
     spool.mkdir()
-    (spool / "0001-bad.json").write_text("{not json")
+    (spool / "0001-bad.json").write_bytes(contents)
     archive = _archive(tmp_path)
-    assert archive.append(_event()) is True
+    assert archive.append(_event(native_id="e2")) is True
     assert (spool / "0001-bad.json.corrupt").is_file()
     assert list(spool.glob("*.json")) == []
+    month_file = tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl"
+    assert [record["native_id"] for record in _lines(month_file)] == ["e2"]
 
 
 def test_append_line_follows_a_replaced_file(tmp_path: Path) -> None:

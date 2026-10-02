@@ -281,6 +281,10 @@ class RawArchive:
             except OSError as exc:
                 self._note_error(exc)
                 return moved
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if not self._quarantine_locked(item, exc):
+                    return moved
+                continue
             try:
                 if not isinstance(envelope, dict):
                     raise ValueError("spool entry must be an object")
