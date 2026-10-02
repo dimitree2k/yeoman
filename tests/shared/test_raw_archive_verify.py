@@ -130,6 +130,40 @@ def test_verify_defers_seal_when_status_is_missing_but_spool_exists(
     assert stat.S_IMODE(month_file.stat().st_mode) == 0o600
 
 
+def test_verify_defers_seal_when_spool_scan_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path, OCT)
+    _append(archive, "before-failure", SEPT)
+    root = tmp_path / "raw"
+    month_file = root / "whatsapp" / "2026-09.jsonl"
+    original_append_line = writer.append_line
+
+    def fail_month_append(path: Path, line: str, *, mode: int = writer.OPEN_FILE_MODE) -> None:
+        if path == month_file:
+            raise OSError("temporary storage failure")
+        original_append_line(path, line, mode=mode)
+
+    monkeypatch.setattr(writer, "append_line", fail_month_append)
+    _append(archive, "retained-september", SEPT)
+    spool = root.parent / "raw-spool"
+    assert list(spool.glob("*.json"))
+    (tmp_path / "run" / writer.STATUS_FILE).unlink()
+
+    original_scandir = os.scandir
+
+    def fail_spool_scan(path: str | os.PathLike[str] | int):
+        if isinstance(path, int) or Path(path) != spool:
+            return original_scandir(path)
+        raise PermissionError("spool is unreadable")
+
+    monkeypatch.setattr(os, "scandir", fail_spool_scan)
+    report = verify_archive(root, run_dir=tmp_path / "run", now_ms=OCT)
+
+    assert report.closed == ()
+    assert stat.S_IMODE(month_file.stat().st_mode) == 0o600
+
+
 def test_verify_seals_month_when_writer_status_is_absent(tmp_path: Path) -> None:
     archive = _archive(tmp_path, OCT)
     _append(archive, "september", SEPT)

@@ -149,7 +149,10 @@ def verify_archive(
     status = _load_json(run / STATUS_FILE)
     spool = root.parent / "raw-spool"
     try:
-        spool_has_backlog = next(spool.glob("*.json"), None) is not None
+        with os.scandir(spool) as entries:
+            spool_has_backlog = any(entry.name.endswith(".json") for entry in entries)
+    except FileNotFoundError:
+        spool_has_backlog = False
     except OSError:
         spool_has_backlog = True
     writer_has_backlog = (
