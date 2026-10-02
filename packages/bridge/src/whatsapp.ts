@@ -66,6 +66,10 @@ export interface InboundMessageV2 {
   replyToText?: string;
   replyToMedia?: InboundMedia;
   media?: InboundMedia;
+  observationOnly?: boolean;
+  observationType?: string;
+  targetMessageId?: string;
+  encryptedEdit?: Record<string, unknown>;
 }
 
 export interface WhatsAppHealth {
@@ -1282,6 +1286,124 @@ export class WhatsAppClient {
     }
   }
 
+  private sameKnownParticipant(leftRaw: string, rightRaw: string): boolean {
+    const left = normalizeJid(leftRaw);
+    const right = normalizeJid(rightRaw);
+    if (!left || !right) return false;
+    if (left === right) return true;
+    const phoneJid = (jid: string) =>
+      jid.endsWith('@s.whatsapp.net') ? jid : this.resolvePhoneJid(jid);
+    const leftPhone = phoneJid(left);
+    const rightPhone = phoneJid(right);
+    return Boolean(leftPhone && rightPhone && leftPhone === rightPhone);
+  }
+
+  /** Shared by encrypted-edit lookup and Baileys retry/resend requests; scope every return. */
+  private async getMessage(key: any): Promise<any | undefined> {
+    const chatJid = normalizeJid(String(key?.remoteJid || ''));
+    const messageId = String(key?.id || '').trim();
+    if (!chatJid || !messageId || typeof key?.fromMe !== 'boolean') return undefined;
+
+    this.cleanupQuoteCache();
+    const cacheKey = this.quoteKey(chatJid, messageId);
+    const cacheEntry = this.quoteCache.get(cacheKey);
+    let message: any;
+    if (cacheEntry && cacheEntry.expiresAt > nowMs()) {
+      message = cacheEntry.msg;
+    } else if (cacheEntry) {
+      this.quoteCache.delete(cacheKey);
+    }
+    if (!message) {
+      try {
+        message = await this.referenceStore.get(chatJid, messageId);
+      } catch (error) {
+        this.reportReferenceFailure(error);
+        return undefined;
+      }
+    }
+    const storedKey = message?.key;
+    if (
+      !storedKey ||
+      normalizeJid(String(storedKey.remoteJid || '')) !== chatJid ||
+      String(storedKey.id || '').trim() !== messageId ||
+      typeof storedKey.fromMe !== 'boolean' ||
+      storedKey.fromMe !== key.fromMe
+    ) {
+      return undefined;
+    }
+
+    if (chatJid.endsWith('@g.us')) {
+      const requestedParticipant = normalizeJid(String(key?.participant || ''));
+      const storedParticipant = normalizeJid(String(storedKey.participant || ''));
+      if (!this.sameKnownParticipant(requestedParticipant, storedParticipant)) return undefined;
+    }
+
+    return message.message && typeof message.message === 'object' ? message.message : undefined;
+  }
+
+  private encryptedEditObservation(msg: any): {
+    targetMessageId?: string;
+    encryptedEdit: Record<string, unknown>;
+  } | undefined {
+    const encrypted = msg?.message?.secretEncryptedMessage;
+    // SecretEncType.MESSAGE_EDIT's wire value is 2; no Baileys-private enum is imported.
+    if (!encrypted || typeof encrypted !== 'object' || encrypted.secretEncType !== 2) return undefined;
+
+    const encryptedEdit: Record<string, unknown> = { kind: 'secretEncryptedMessage' };
+    for (const field of ['encPayload', 'encIv']) {
+      const value = encrypted[field];
+      if (value instanceof Uint8Array) encryptedEdit[field] = Buffer.from(value).toString('base64');
+    }
+    if (typeof encrypted.secretEncType === 'number' && Number.isFinite(encrypted.secretEncType)) {
+      encryptedEdit.secretEncType = encrypted.secretEncType;
+    }
+
+    const target = encrypted.targetMessageKey;
+    if (!target || typeof target !== 'object') return { encryptedEdit };
+    const targetMessageId = String(target.id || '').trim();
+    const targetKey: Record<string, unknown> = {};
+    const remoteJid = normalizeJid(String(target.remoteJid || ''));
+    const participant = normalizeJid(String(target.participant || ''));
+    if (remoteJid) targetKey.remoteJid = remoteJid;
+    if (targetMessageId) targetKey.id = targetMessageId;
+    if (typeof target.fromMe === 'boolean') targetKey.fromMe = target.fromMe;
+    if (participant) targetKey.participant = participant;
+    if (Object.keys(targetKey).length) encryptedEdit.targetMessageKey = targetKey;
+    return { targetMessageId: targetMessageId || undefined, encryptedEdit };
+  }
+
+  private async processEncryptedMessageObservation(
+    msg: any,
+    chatJid: string,
+    messageId: string,
+    observation: { targetMessageId?: string; encryptedEdit: Record<string, unknown> },
+  ): Promise<void> {
+    const isGroup = chatJid.endsWith('@g.us');
+    const participantJid = resolveParticipantJid(msg, String(msg?.key?.remoteJid || ''), isGroup);
+    const timestampRaw = msg?.messageTimestamp;
+    const timestamp = typeof timestampRaw === 'number' ? timestampRaw : Number(timestampRaw || 0);
+    this.lastMessageAt = nowMs();
+    await this.options.onMessage({
+      messageId,
+      chatJid,
+      participantJid,
+      senderId: jidUserToken(participantJid || chatJid),
+      senderPhoneJid: this.phoneJidForParticipant(participantJid),
+      lidConflict: this.isLidConflict(participantJid),
+      senderName: (msg?.pushName || '').trim() || undefined,
+      isGroup,
+      text: '',
+      timestamp: Number.isFinite(timestamp) ? timestamp : Math.floor(nowMs() / 1000),
+      mentionedJids: [],
+      mentionedBot: false,
+      replyToBot: false,
+      observationOnly: true,
+      observationType: 'encrypted_message_edit_undecoded',
+      targetMessageId: observation.targetMessageId,
+      encryptedEdit: observation.encryptedEdit,
+    });
+  }
+
   private extractContextInfo(msg: any): any {
     const message = this.unwrapNestedMessage(msg?.message) || {};
     return (
@@ -1667,9 +1789,11 @@ export class WhatsAppClient {
     await this.persistMessageReference(chatJid, messageId, msg);
 
     const extracted = this.extractMessageTextAndMedia(msg);
+    const encryptedObservation = this.encryptedEditObservation(msg);
     const providerContent = JSON.stringify({
       text: extracted.text,
       media: extracted.media,
+      encryptedObservation,
       timestamp: msg?.messageTimestamp ?? null,
       participant: msg?.key?.participant ?? msg?.participant ?? null,
       fromMe: Boolean(msg?.key?.fromMe),
@@ -1679,7 +1803,9 @@ export class WhatsAppClient {
       .digest('hex');
     const task = this.admitDedupeEvent(
       dedupeKey,
-      () => this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
+      () => encryptedObservation
+        ? this.processEncryptedMessageObservation(msg, chatJid, messageId, encryptedObservation)
+        : this.processInboundMessage(msg, remoteJidRaw, chatJid, messageId),
       () => {
         this.droppedInboundDuplicates += 1;
       },
@@ -1801,6 +1927,7 @@ export class WhatsAppClient {
       browser: WHATSAPP_BROWSER,
       syncFullHistory: false,
       markOnlineOnConnect: true,
+      getMessage: (key: any) => this.getMessage(key),
     });
 
     let closedResolve: ((reason: unknown) => void) | null = null;

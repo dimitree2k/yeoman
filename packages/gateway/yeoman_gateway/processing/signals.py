@@ -15,13 +15,15 @@ Determinism rules:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from loguru import logger
-from yeoman_shared.whatsapp_protocol import MEDIA_METADATA_FIELDS
+from yeoman_shared.whatsapp_protocol import MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS
 
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
@@ -154,6 +156,72 @@ def _to_ms(value: Any) -> int | None:
     return int(number * 1000) if number < 1e11 else int(number)
 
 
+def _encrypted_edit_observation(
+    payload: Mapping[str, Any], *, strict: bool
+) -> tuple[str | None, dict[str, Any]] | None:
+    observation_type = payload.get("observationType")
+    observation_only = payload.get("observationOnly") is True
+    expected_type = "encrypted_message_edit_undecoded"
+    if not observation_only and observation_type is None:
+        return None
+    if not observation_only or observation_type != expected_type:
+        if strict:
+            raise ValueError("invalid encrypted edit observation marker")
+        return None
+
+    encrypted = payload.get("encryptedEdit")
+    if not isinstance(encrypted, Mapping) or encrypted.get("kind") != "secretEncryptedMessage":
+        if strict:
+            raise ValueError("invalid encrypted edit envelope")
+        return None
+    if encrypted.get("secretEncType") != 2:
+        if strict:
+            raise ValueError("unsupported encrypted edit type")
+        return None
+
+    safe: dict[str, Any] = {"kind": "secretEncryptedMessage", "secretEncType": 2}
+    for field_name in ("encPayload", "encIv"):
+        encoded = encrypted.get(field_name)
+        if not isinstance(encoded, str) or len(encoded) > MAX_BRIDGE_FRAME_BYTES:
+            if strict:
+                raise ValueError(f"invalid encrypted edit {field_name}")
+            return None
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            if strict:
+                raise ValueError(f"invalid encrypted edit {field_name}") from exc
+            return None
+        if field_name == "encIv" and len(decoded) != 12:
+            if strict:
+                raise ValueError("invalid encrypted edit IV")
+            return None
+        if field_name == "encPayload" and not decoded:
+            if strict:
+                raise ValueError("empty encrypted edit payload")
+            return None
+        safe[field_name] = encoded
+
+    target_key = encrypted.get("targetMessageKey")
+    if not isinstance(target_key, Mapping):
+        if strict:
+            raise ValueError("encrypted edit target key is missing")
+        return None
+    target_id = str(payload.get("targetMessageId") or "").strip()
+    key_id = str(target_key.get("id") or "").strip()
+    remote_jid = str(target_key.get("remoteJid") or "").strip()
+    if not target_id or key_id != target_id or not remote_jid or not isinstance(target_key.get("fromMe"), bool):
+        if strict:
+            raise ValueError("invalid encrypted edit target key")
+        return None
+    safe_target = {"remoteJid": remote_jid, "id": key_id, "fromMe": target_key["fromMe"]}
+    participant = target_key.get("participant")
+    if isinstance(participant, str) and participant.strip():
+        safe_target["participant"] = participant.strip()
+    safe["targetMessageKey"] = safe_target
+    return target_id, safe
+
+
 def _media_metadata(value: Any) -> dict[str, Any] | None:
     """Keep only bounded media metadata; never copy provider bytes into the journal."""
     if not isinstance(value, Mapping):
@@ -252,12 +320,31 @@ class WhatsAppSignalMapper:
             return None
         principal = _token(_first(payload, "senderId", "participantJid", "sender", "from"))
         event_key = f"{self._channel}:{chat_id}:message:{message_id}"
+        opaque_edit = _encrypted_edit_observation(payload, strict=strict)
         body = {
             "text": _raw_text(payload, "text", "content") or "",
             "is_group": bool(payload.get("isGroup")) or chat_id.endswith("@g.us"),
             "mentioned_bot": bool(payload.get("mentionedBot")),
             "reply_to_message_id": _first(payload, "replyToMessageId", "reply_to_message_id"),
         }
+        if opaque_edit is not None:
+            target_id, encrypted = opaque_edit
+            body.update(
+                {
+                    "observation_only": True,
+                    "observation_type": "encrypted_message_edit_undecoded",
+                    "target_message_id": target_id,
+                    "encrypted_edit": encrypted,
+                }
+            )
+            for source, target in (
+                ("participantJid", "participant_jid"),
+                ("senderPhoneJid", "sender_phone_jid"),
+                ("senderName", "sender_name"),
+            ):
+                value = payload.get(source)
+                if isinstance(value, str) and value.strip():
+                    body[target] = value.strip()
         reply_text = _raw_text(payload, "replyToText", "reply_to_text")
         if reply_text is not None:
             body["reply_to_text"] = reply_text
@@ -280,7 +367,9 @@ class WhatsAppSignalMapper:
             payload=payload,
             body=body,
             source_message_id=message_id,
-            target_message_id=body["reply_to_message_id"],
+            target_message_id=(
+                opaque_edit[0] if opaque_edit is not None else body["reply_to_message_id"]
+            ),
         )
 
     def _edit(
@@ -548,7 +637,12 @@ class SignalJournalSink:
         )
         if strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
-        if signal.kind == "message" and self._memory is not None:
+        opaque_edit = (
+            signal.kind == "message"
+            and signal.payload.get("observation_only") is True
+            and signal.payload.get("observation_type") == "encrypted_message_edit_undecoded"
+        )
+        if signal.kind == "message" and self._memory is not None and not opaque_edit:
             get_event = getattr(self._store, "get_event", None)
             get_authority = getattr(self._store, "get_event_source_authority", None)
             index_event = getattr(self._memory, "index_canonical_event", None)
@@ -567,7 +661,7 @@ class SignalJournalSink:
                         "canonical message FTS projection failed error_type={}",
                         type(exc).__name__,
                     )
-        if signal.kind == "message":
+        if signal.kind == "message" and not opaque_edit:
             self.register_observed_source(stored_event_id)
         if str(kind) in ("edit", "delete"):
             revoked_sources = self.project_source_revocation(signal, now_ms=now, strict=strict)

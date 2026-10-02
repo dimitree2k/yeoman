@@ -1493,6 +1493,11 @@ class WhatsAppChannel(BaseChannel):
             # Task 4 owns that durable projection.
             return
         elif work.kind == "message":
+            if (
+                work.payload.get("observationOnly") is True
+                and work.payload.get("observationType") == "encrypted_message_edit_undecoded"
+            ):
+                return
             event = self._parse_inbound_event(work.payload)
             if event:
                 await self._ingest_inbound_event(event)

@@ -1126,3 +1126,157 @@ test('sendMedia sends WAV and MP3 inputs through the voice PTT branch', async ()
     ],
   );
 });
+
+
+test('getMessage reuses cached and persisted originals only within the requested key scope', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-edit-get-message-'));
+  try {
+    const referenceDir = join(root, 'references');
+    const client = new WhatsAppClient({
+      authDir: root,
+      messageReferenceDir: referenceDir,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    const secret = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+    const original = {
+      key: {
+        remoteJid: '123-456@g.us',
+        id: 'original-1',
+        fromMe: false,
+        participant: '123@lid',
+      },
+      message: {
+        conversation: 'original body',
+        messageContextInfo: { messageSecret: secret },
+      },
+    };
+    const store = (client as any).referenceStore;
+    (client as any).storeInboundForQuote('123-456@g.us', 'original-1', original);
+    const persistedGet = store.get.bind(store);
+    store.get = async () => { throw new Error('disk lookup should not be needed'); };
+    const request = {
+      remoteJid: '123-456@g.us',
+      id: 'original-1',
+      fromMe: false,
+      participant: '49123@s.whatsapp.net',
+    };
+    (client as any).lidToPhone.set('123', '49123@s.whatsapp.net');
+    const cached = await (client as any).getMessage(request);
+    assert.equal(cached.conversation, 'original body');
+    assert.deepEqual(Buffer.from(cached.messageContextInfo.messageSecret), Buffer.from(secret));
+    store.get = persistedGet;
+    assert.equal(await store.put('123-456@g.us', 'original-1', original), true);
+    const cacheEntry = (client as any).quoteCache.get('123-456@g.us:original-1');
+    cacheEntry.msg = { ...original, message: { conversation: 'stale cache entry' } };
+    cacheEntry.expiresAt = 0;
+    assert.equal((await (client as any).getMessage(request)).conversation, 'original body');
+
+    const restarted = new WhatsAppClient({
+      authDir: root,
+      messageReferenceDir: referenceDir,
+      onMessage: () => {},
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (restarted as any).lidToPhone.set('123', '49123@s.whatsapp.net');
+    const restored = await (restarted as any).getMessage(request);
+    assert.equal(restored.conversation, 'original body');
+    assert.deepEqual(Buffer.from(restored.messageContextInfo.messageSecret), Buffer.from(secret));
+    assert.equal(await (restarted as any).getMessage({ ...request, remoteJid: 'other@g.us' }), undefined);
+    assert.equal(await (restarted as any).getMessage({ ...request, fromMe: true }), undefined);
+    assert.equal(await (restarted as any).getMessage({ ...request, participant: '999@lid' }), undefined);
+    (restarted as any).lidConflicts.add('123');
+    assert.equal(await (restarted as any).getMessage(request), undefined);
+    assert.equal(await (restarted as any).getMessage({ ...request, fromMe: undefined }), undefined);
+    assert.equal(await (restarted as any).getMessage({ remoteJid: '123-456@g.us', id: 'missing' }), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('repeated encrypted edits are observation-only and leave the original secret available', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-encrypted-edit-observation-'));
+  try {
+    const observations: any[] = [];
+    let readReceipts = 0;
+    const client = new WhatsAppClient({
+      authDir: root,
+      messageReferenceDir: join(root, 'references'),
+      readReceipts: true,
+      onMessage: (message) => { observations.push(message); },
+      onQR: () => {},
+      onStatus: () => {},
+      onError: () => {},
+    });
+    (client as any).acceptingProviderEvents = true;
+    (client as any).sock = { readMessages: async () => { readReceipts += 1; } };
+    const secret = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
+    const original = {
+      key: {
+        remoteJid: '123-456@g.us',
+        id: 'target-1',
+        fromMe: false,
+        participant: '123@lid',
+      },
+      message: {
+        conversation: 'original text',
+        messageContextInfo: { messageSecret: secret },
+      },
+      messageTimestamp: 1_700_000_000,
+    };
+    await (client as any).handleInboundMessage(original);
+    readReceipts = 0;
+
+    const encryptedEnvelope = (id: string) => ({
+      key: {
+        remoteJid: '123-456@g.us',
+        id,
+        fromMe: false,
+        participant: '123@lid',
+      },
+      message: {
+        secretEncryptedMessage: {
+          encPayload: Uint8Array.from([1, 2, 3]),
+          encIv: Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+          secretEncType: 2,
+          targetMessageKey: {
+            remoteJid: '123-456@g.us',
+            id: 'target-1',
+            fromMe: true,
+            participant: '49123@s.whatsapp.net',
+          },
+        },
+      },
+      messageTimestamp: 1_700_000_001,
+    });
+    await (client as any).handleInboundMessage(encryptedEnvelope('edit-envelope-1'));
+    await (client as any).handleInboundMessage(encryptedEnvelope('edit-envelope-2'));
+
+    assert.equal(observations.length, 3);
+    const [first, second] = observations.slice(1);
+    for (const item of [first, second]) {
+      assert.equal(item.text, '');
+      assert.equal(item.observationOnly, true);
+      assert.equal(item.observationType, 'encrypted_message_edit_undecoded');
+      assert.equal(item.messageId.startsWith('edit-envelope-'), true);
+      assert.equal(item.targetMessageId, 'target-1');
+      assert.equal(item.encryptedEdit.encPayload, 'AQID');
+      assert.equal(item.encryptedEdit.encIv, 'AAECAwQFBgcICQoL');
+      assert.equal('messageSecret' in item.encryptedEdit, false);
+    }
+    assert.equal(readReceipts, 0);
+    const stored = await (client as any).referenceStore.get('123-456@g.us', 'target-1');
+    assert.equal(stored.message.conversation, 'original text');
+    assert.deepEqual(Buffer.from(stored.message.messageContextInfo.messageSecret), Buffer.from(secret));
+    assert.equal((await (client as any).getMessage({
+      remoteJid: '123-456@g.us', id: 'target-1', fromMe: false, participant: '123@lid',
+    })).conversation, 'original text');
+    assert.equal(JSON.stringify([first, second]).includes('messageSecret'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -479,3 +479,66 @@ def test_the_inbound_metadata_carries_the_identity_inputs(tmp_path: Path) -> Non
         '"sender_name": event.sender_name',
     ):
         assert key in source, key
+
+
+
+def test_opaque_encrypted_edit_is_canonical_but_never_projected_as_a_message() -> None:
+    class Memory:
+        indexed: list[object] = []
+
+        def index_canonical_event(self, event: object, **kwargs: object) -> None:
+            self.indexed.append(event)
+
+    class Sources:
+        registered: list[str] = []
+
+        def __call__(self, event_id: str) -> bool:
+            self.registered.append(event_id)
+            return True
+
+    store = ProcessingStore(":memory:")
+    memory = Memory()
+    sources = Sources()
+    sink = SignalJournalSink(store, clock=lambda: T0, memory=memory, sources=sources)
+    payload = {
+        "chatJid": CHAT,
+        "messageId": "edit-envelope-1",
+        "targetMessageId": "target-1",
+        "participantJid": "123@lid",
+        "senderId": "123",
+        "senderPhoneJid": "49123@s.whatsapp.net",
+        "senderName": "Synthetic sender",
+        "isGroup": True,
+        "text": "",
+        "observationOnly": True,
+        "observationType": "encrypted_message_edit_undecoded",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "AQID",
+            "encIv": "AAECAwQFBgcICQoL",
+            "secretEncType": 2,
+            "targetMessageKey": {
+                "remoteJid": CHAT,
+                "id": "target-1",
+                "fromMe": True,
+                "participant": "49123@s.whatsapp.net",
+            },
+        },
+    }
+    sink.capture(
+        "message", payload, event_id="opaque-event-1", event_key="opaque-key-1",
+        account="account-a", observed_at_ms=T0, strict=True,
+    )
+    event = store.get_event("opaque-event-1")
+    assert event is not None
+    assert event.payload["observation_only"] is True
+    assert event.payload["target_message_id"] == "target-1"
+    assert event.payload["encrypted_edit"]["encPayload"] == "AQID"
+    assert event.payload["sender_name"] == "Synthetic sender"
+    assert memory.indexed == []
+    assert sources.registered == []
+
+    channel = WhatsAppChannel(WhatsAppConfig(), MessageBus())
+    channel._parse_inbound_event = lambda _: pytest.fail("opaque edit reached normal parsing")  # type: ignore[method-assign]
+    asyncio.run(channel._project_bridge_event(type("Work", (), {"kind": "message", "payload": payload})()))
+    store.close()

@@ -135,6 +135,14 @@ def record_identities(record: dict[str, Any]) -> set[str]:
         payload = native.get("payload")
         if isinstance(payload, dict):
             ids.add(str(payload.get("messageId") or ""))
+            encrypted_edit = payload.get("encryptedEdit")
+            if (
+                payload.get("observationOnly") is True
+                and payload.get("observationType") == "encrypted_message_edit_undecoded"
+                and isinstance(encrypted_edit, dict)
+                and encrypted_edit.get("kind") == "secretEncryptedMessage"
+            ):
+                ids.add(str(payload.get("targetMessageId") or ""))
         for key in ("message_id", "source_message_id"):
             ids.add(str(native.get(key) or ""))
         for key in (

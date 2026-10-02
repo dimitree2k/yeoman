@@ -611,6 +611,14 @@ export class BridgeServer {
       replyToText: msg.replyToText,
       replyToMedia: mediaMetadata(msg.replyToMedia),
       media: mediaMetadata(msg.media),
+      ...(msg.observationOnly === true && msg.observationType === 'encrypted_message_edit_undecoded'
+        ? {
+          observationOnly: true,
+          observationType: msg.observationType,
+          targetMessageId: msg.targetMessageId,
+          encryptedEdit: msg.encryptedEdit,
+        }
+        : {}),
     };
     const identity = deriveProviderEventIdentity('message', this.accountId, payload);
     await this.broadcastReplayable(

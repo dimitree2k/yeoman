@@ -620,3 +620,50 @@ test('stop drains an in-flight persistence operation before returning', async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+
+test('encrypted edit observations survive the replayable message outbox without secrets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-encrypted-edit-outbox-'));
+  try {
+    const server = makeServer(root);
+    await (server as any).outbox.open();
+    await (server as any).broadcastMessage({
+      messageId: 'edit-envelope-1',
+      chatJid: '123-456@g.us',
+      participantJid: '123@lid',
+      senderId: '123',
+      senderPhoneJid: '49123@s.whatsapp.net',
+      senderName: 'Synthetic sender',
+      isGroup: true,
+      text: '',
+      timestamp: 1_700_000_000,
+      mentionedJids: [],
+      mentionedBot: false,
+      replyToBot: false,
+      observationOnly: true,
+      observationType: 'encrypted_message_edit_undecoded',
+      targetMessageId: 'target-1',
+      encryptedEdit: {
+        kind: 'secretEncryptedMessage',
+        encPayload: 'AQID',
+        encIv: 'AAECAwQFBgcICQoL',
+        secretEncType: 2,
+        targetMessageKey: {
+          remoteJid: '123-456@g.us', id: 'target-1', fromMe: true,
+          participant: '49123@s.whatsapp.net',
+        },
+      },
+    });
+
+    const [event] = await (server as any).outbox.pending();
+    assert.equal(event.type, 'message');
+    assert.equal(event.payload.messageId, 'edit-envelope-1');
+    assert.equal(event.payload.targetMessageId, 'target-1');
+    assert.equal(event.payload.observationOnly, true);
+    assert.equal(event.payload.senderName, 'Synthetic sender');
+    assert.equal(event.payload.encryptedEdit.encPayload, 'AQID');
+    assert.equal(JSON.stringify(event).includes('messageSecret'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

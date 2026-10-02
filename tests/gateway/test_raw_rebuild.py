@@ -13,6 +13,7 @@ from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.storage.raw_rebuild import rebuild_chat
 from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.raw_archive.purge import PurgeSelector
 from yeoman_shared.raw_archive.verify import append_suppression
 from yeoman_shared.raw_archive.writer import RawArchive
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
@@ -236,3 +237,105 @@ def test_live_comparison_detects_missing_events_when_archive_has_no_records(tmp_
 
     assert report.lines_read == 0
     assert report.missing_vs_live == ("e1",)
+
+
+
+def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edit(
+    tmp_path: Path,
+) -> None:
+    channel, _ = _live(tmp_path)
+    original = _msg("target-1", "before edit")
+    opaque = {
+        "chatJid": CHAT,
+        "messageId": "edit-envelope-1",
+        "targetMessageId": "target-1",
+        "participantJid": "4915@s.whatsapp.net",
+        "senderId": "4915@s.whatsapp.net",
+        "senderName": "Synthetic sender",
+        "isGroup": True,
+        "text": "",
+        "observationOnly": True,
+        "observationType": "encrypted_message_edit_undecoded",
+        "encryptedEdit": {
+            "kind": "secretEncryptedMessage",
+            "encPayload": "AQID",
+            "encIv": "AAECAwQFBgcICQoL",
+            "secretEncType": 2,
+            "targetMessageKey": {
+                "remoteJid": CHAT,
+                "id": "target-1",
+                "fromMe": True,
+                "participant": "4915@s.whatsapp.net",
+            },
+        },
+    }
+    _feed(
+        channel,
+        [
+            _frame("message", original, "original-event"),
+            _frame("message", opaque, "opaque-event"),
+            _frame(
+                "edit",
+                {"chatJid": CHAT, "messageId": "target-1", "senderId": "4915@s.whatsapp.net", "text": "after edit"},
+                "decoded-edit-event",
+            ),
+        ],
+    )
+
+    raw_lines = [
+        json.loads(line)
+        for path in (tmp_path / "raw" / "whatsapp").glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    opaque_line = next(row for row in raw_lines if row.get("native_id") == "opaque-event")
+    assert opaque_line["native"]["payload"]["messageId"] == "edit-envelope-1"
+    assert opaque_line["native"]["payload"]["targetMessageId"] == "target-1"
+    assert opaque_line["native"]["payload"]["encryptedEdit"]["encPayload"] == "AQID"
+    assert "messageSecret" not in json.dumps(opaque_line)
+
+    report = rebuild_chat(
+        tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=tmp_path / "rebuilt"
+    )
+    assert report.replayed == 3
+    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "processing" / "processing.db")
+    original_event = rebuilt.get_event("original-event")
+    opaque_event = rebuilt.get_event("opaque-event")
+    decoded_edit = rebuilt.get_event("decoded-edit-event")
+    assert original_event is not None and original_event.payload["text"] == "before edit"
+    assert opaque_event is not None and opaque_event.payload["observation_only"] is True
+    assert opaque_event.payload["target_message_id"] == "target-1"
+    assert opaque_event.payload["encrypted_edit"]["encPayload"] == "AQID"
+    assert decoded_edit is not None and decoded_edit.payload["text"] == "after edit"
+    rebuilt.close()
+
+
+def test_message_purge_matches_the_target_of_only_opaque_encrypted_edits() -> None:
+    encrypted = {
+        "channel": "whatsapp",
+        "chat_id": "chat@g.us",
+        "kind": "message",
+        "native_id": "opaque-event-1",
+        "native": {
+            "type": "message",
+            "payload": {
+                "messageId": "edit-envelope-1",
+                "targetMessageId": "target-1",
+                "observationOnly": True,
+                "observationType": "encrypted_message_edit_undecoded",
+                "encryptedEdit": {"kind": "secretEncryptedMessage"},
+            },
+        },
+    }
+    ordinary = {
+        **encrypted,
+        "native": {
+            "type": "message",
+            "payload": {
+                "messageId": "ordinary-envelope-1",
+                "targetMessageId": "target-1",
+            },
+        },
+    }
+    purge_original = PurgeSelector(channel="whatsapp", chat_id="chat@g.us", native_id="target-1")
+    assert purge_original.matches(encrypted)
+    assert not purge_original.matches(ordinary)
