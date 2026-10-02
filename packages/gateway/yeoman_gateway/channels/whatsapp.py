@@ -22,8 +22,8 @@ from yeoman_shared.raw_archive.writer import (
     RawArchiveCapacityError,
     RawEvent,
     append_async,
+    append_with_media_async,
     media_kind_from_mime,
-    store_media_async,
 )
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION, REPLAYABLE_EVENT_TYPES
 
@@ -1068,27 +1068,30 @@ class WhatsAppChannel(BaseChannel):
         if archive is None:
             return
         media_meta: dict[str, Any] | None = None
+        media_source: Any | None = None
+        media_kind = ""
         media = payload.get("media")
         if isinstance(media, dict) and isinstance(media.get("path"), str):
             validated = self._media_storage.validate_incoming_path(media["path"])
             if validated is None:
                 media_meta = {"stored": False, "path": None, "reason": "path_rejected"}
             else:
-                kind_hint = str(media.get("kind") or media_kind_from_mime(media.get("mimeType")))
-                media_meta = await store_media_async(archive, "whatsapp", validated, kind=kind_hint)
-        await append_async(
-            archive,
-            RawEvent(
-                channel="whatsapp",
-                kind=kind,
-                direction="in",
-                native={key: value for key, value in frame.items() if key != "token"},
-                native_id=str(frame.get("eventId") or ""),
-                chat_id=str(payload.get("chatJid") or ""),
-                account=str(frame.get("accountId") or ""),
-                media=media_meta,
-            ),
+                media_source = validated
+                media_kind = str(media.get("kind") or media_kind_from_mime(media.get("mimeType")))
+        event = RawEvent(
+            channel="whatsapp",
+            kind=kind,
+            direction="in",
+            native={key: value for key, value in frame.items() if key != "token"},
+            native_id=str(frame.get("eventId") or ""),
+            chat_id=str(payload.get("chatJid") or ""),
+            account=str(frame.get("accountId") or ""),
+            media=media_meta,
         )
+        if media_source is not None:
+            await append_with_media_async(archive, event, media_source, kind=media_kind)
+        else:
+            await append_async(archive, event)
 
     async def _raw_archive_outbound(
         self,
@@ -1105,6 +1108,8 @@ class WhatsAppChannel(BaseChannel):
             return
         native: dict[str, Any] = {"type": command_type, "requestId": request_id}
         media_meta: dict[str, Any] | None = None
+        media_source: Any | None = None
+        media_kind = ""
         native_id = ""
         if kind == "outbound_request":
             native["payload"] = payload
@@ -1114,12 +1119,8 @@ class WhatsAppChannel(BaseChannel):
                 if validated is None:
                     media_meta = {"stored": False, "path": None, "reason": "path_rejected"}
                 else:
-                    media_meta = await store_media_async(
-                        archive,
-                        "whatsapp",
-                        validated,
-                        kind=media_kind_from_mime(str(payload.get("mimeType") or "")),
-                    )
+                    media_source = validated
+                    media_kind = media_kind_from_mime(str(payload.get("mimeType") or ""))
         elif error is not None:
             native["error"] = f"{type(error).__name__}: {error}"[:300]
         else:
@@ -1132,20 +1133,21 @@ class WhatsAppChannel(BaseChannel):
                         native_id = str(nested.get("providerMessageId") or "")
                         if native_id:
                             break
-        await append_async(
-            archive,
-            RawEvent(
-                channel="whatsapp",
-                kind=kind,
-                direction="out",
-                native=native,
-                native_id=native_id,
-                chat_id=str(payload.get("to") or payload.get("chatJid") or ""),
-                account="default",
-                correlation_id=request_id,
-                media=media_meta,
-            ),
+        event = RawEvent(
+            channel="whatsapp",
+            kind=kind,
+            direction="out",
+            native=native,
+            native_id=native_id,
+            chat_id=str(payload.get("to") or payload.get("chatJid") or ""),
+            account="default",
+            correlation_id=request_id,
+            media=media_meta,
         )
+        if media_source is not None:
+            await append_with_media_async(archive, event, media_source, kind=media_kind)
+        else:
+            await append_async(archive, event)
 
     async def _stop_for_raw_archive_capacity(self) -> None:
         logger.error(

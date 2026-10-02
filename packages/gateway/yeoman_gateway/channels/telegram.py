@@ -24,7 +24,7 @@ from yeoman_shared.raw_archive.writer import (
     RawArchiveCapacityError,
     RawEvent,
     append_async,
-    store_media_async,
+    append_with_media_async,
 )
 
 from yeoman_gateway.bus.events import OutboundMessage
@@ -497,15 +497,7 @@ class TelegramChannel(BaseChannel):
 
                 media_paths.append(str(file_path))
                 try:
-                    media_meta = await store_media_async(
-                        self._raw_archive,
-                        "telegram",
-                        file_path,
-                        kind={"image": "image", "voice": "audio", "audio": "audio"}.get(
-                            str(media_type), "document"
-                        ),
-                    )
-                    await append_async(
+                    await append_with_media_async(
                         self._raw_archive,
                         RawEvent(
                             channel="telegram",
@@ -517,7 +509,10 @@ class TelegramChannel(BaseChannel):
                             },
                             native_id=str(getattr(update, "update_id", "") or ""),
                             chat_id=str(chat_id),
-                            media=media_meta,
+                        ),
+                        file_path,
+                        kind={"image": "image", "voice": "audio", "audio": "audio"}.get(
+                            str(media_type), "document"
                         ),
                     )
                 except RawArchiveCapacityError:

@@ -11,6 +11,7 @@ spool file is not a guard violation.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -21,9 +22,9 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from yeoman_shared.raw_archive.paths import raw_root, spool_root
@@ -45,6 +46,7 @@ START_FILE = "START"
 MAX_MEMORY_PENDING = 10_000
 DEFAULT_MAX_VIDEO_BYTES = 50 * 1024 * 1024
 _HASH_CHUNK = 1024 * 1024
+MEDIA_PURGE_LOCK = ".media-purge.lock"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +79,118 @@ class RawArchiveCapacityError(RuntimeError):
     """Raised when both persistent stores fail and the bounded queue is full."""
 
 
+class _MediaGuardLease:
+    def __init__(self, guard: _MediaPurgeGuard) -> None:
+        self._guard = guard
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._guard.release()
+
+    def clone(self) -> _MediaGuardLease:
+        return self._guard.acquire()
+
+
+def _open_media_purge_guard(root: Path, *, blocking: bool) -> int | None:
+    ensure_private_dir(root)
+    path = root / MEDIA_PURGE_LOCK
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, OPEN_FILE_MODE)
+        try:
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+            try:
+                fcntl.flock(fd, flags)
+            except BlockingIOError:
+                os.close(fd)
+                return None
+            if os.fstat(fd).st_ino == os.stat(path).st_ino:
+                return fd
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
+class _MediaPurgeGuard:
+    """One process-local reference-counted descriptor for the cross-process guard."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._mutex = threading.Lock()
+        self._fd: int | None = None
+        self._references = 0
+
+    def acquire(self) -> _MediaGuardLease:
+        with self._mutex:
+            if self._fd is None:
+                fd = _open_media_purge_guard(self.root, blocking=True)
+                if fd is None:  # Blocking acquisition never returns None.
+                    raise OSError("raw archive media guard was not acquired")
+                self._fd = fd
+            self._references += 1
+            return _MediaGuardLease(self)
+
+    def release(self) -> None:
+        with self._mutex:
+            if self._references <= 0:
+                return
+            self._references -= 1
+            if self._references == 0 and self._fd is not None:
+                fd = self._fd
+                self._fd = None
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+_MEDIA_GUARDS: dict[Path, _MediaPurgeGuard] = {}
+_MEDIA_GUARDS_LOCK = threading.Lock()
+
+
+def _media_guard_for(root: Path) -> _MediaPurgeGuard:
+    normalized = Path(os.path.abspath(root))
+    with _MEDIA_GUARDS_LOCK:
+        guard = _MEDIA_GUARDS.get(normalized)
+        if guard is None:
+            guard = _MEDIA_GUARDS[normalized] = _MediaPurgeGuard(normalized)
+        return guard
+
+
+def try_lock_media_purge(root: Path) -> int | None:
+    """Take an independent nonblocking guard descriptor for owner purge."""
+    try:
+        return _open_media_purge_guard(root, blocking=False)
+    except OSError:
+        return None
+
+
+def stored_media_relative(media: Mapping[str, Any] | None) -> str | None:
+    if (
+        not isinstance(media, Mapping)
+        or not media.get("stored")
+        or not isinstance(media.get("path"), str)
+    ):
+        return None
+    path = PurePosixPath(str(media["path"]))
+    if path.is_absolute() or path.parts[:1] != ("media",) or ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
+def _unstored_media(kind: str, reason: str) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "stored": False,
+        "path": None,
+        "sha256": None,
+        "bytes": None,
+        "reason": reason,
+    }
+
+
 def month_of(ms: int) -> str:
     """UTC month bucket of a millisecond timestamp, e.g. ``2026-10``."""
     return datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y-%m")
@@ -99,7 +213,7 @@ def read_start_ms(root: Path) -> int | None:
     try:
         data = json.loads((root / START_FILE).read_text(encoding="utf-8"))
         return int(data["started_ms"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except OSError, ValueError, KeyError, TypeError:
         return None
 
 
@@ -138,7 +252,8 @@ class RawArchive:
         self._media_enabled = bool(media_enabled)
         self._max_video_bytes = max(0, int(max_video_bytes))
         self._lock = threading.Lock()
-        self._pending: list[tuple[str, int, str]] = []
+        self._media_guard = _media_guard_for(self.root)
+        self._pending: list[tuple[str, int, str, _MediaGuardLease | None]] = []
         self._last_error = ""
         self._capacity_blocked = False
         self._published = ""
@@ -148,25 +263,25 @@ class RawArchive:
 
     def append(self, event: RawEvent) -> bool:
         """Archive one event. ``True`` when it reached its month file, ``False`` when deferred."""
-        received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
-        channel = safe_channel(event.channel)
-        line = dumps(self._record(event, channel=channel, received_ms=received_ms))
         with self._lock:
-            self._drain_locked()
-            if self._has_backlog_locked():
-                # Keep order: never write past older, still-undelivered lines.
-                self._defer_locked(channel, received_ms, line)
-                self._publish_status_locked()
-                return False
+            return self._append_locked(event)
+
+    def append_with_media(self, event: RawEvent, source: str | Path, *, kind: str) -> bool:
+        """Store media and its event under one purge guard, without an unlinkable gap."""
+        with self._lock:
+            received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
+            event = replace(event, received_ms=received_ms)
             try:
-                append_line(self._month_file(channel, received_ms), line)
+                lease = self._media_guard.acquire()
             except OSError as exc:
                 self._note_error(exc)
-                self._defer_locked(channel, received_ms, line)
-                self._publish_status_locked()
-                return False
-            self._publish_status_locked()
-            return True
+                media = _unstored_media(kind, "coordination_unavailable")
+                return self._append_locked(replace(event, media=media))
+            try:
+                media = self._store_media(event.channel, source, kind=kind, received_ms=received_ms)
+                return self._append_locked(replace(event, media=media), media_lease=lease)
+            finally:
+                lease.release()
 
     def drain_spool(self) -> int:
         with self._lock:
@@ -191,6 +306,25 @@ class RawArchive:
         A copy, not a hard link: a hard link would share the inode with ``var/media``, so an
         in-place write there would silently change the archived original.
         """
+        try:
+            with self._lock:
+                lease = self._media_guard.acquire()
+                try:
+                    return self._store_media(channel, source, kind=kind, received_ms=received_ms)
+                finally:
+                    lease.release()
+        except OSError as exc:
+            self._note_error(exc)
+            return _unstored_media(kind, f"error:{type(exc).__name__}")
+
+    def _store_media(
+        self,
+        channel: str,
+        source: str | Path,
+        *,
+        kind: str,
+        received_ms: int | None = None,
+    ) -> dict[str, Any]:
         meta: dict[str, Any] = {
             "kind": kind,
             "stored": False,
@@ -275,6 +409,58 @@ class RawArchive:
     def _month_file(self, channel: str, received_ms: int) -> Path:
         return self.root / channel / f"{month_of(received_ms)}.jsonl"
 
+    def _append_locked(
+        self, event: RawEvent, *, media_lease: _MediaGuardLease | None = None
+    ) -> bool:
+        lease = media_lease
+        try:
+            relative = stored_media_relative(event.media)
+            if relative and lease is None:
+                try:
+                    lease = self._media_guard.acquire()
+                except OSError as exc:
+                    self._note_error(exc)
+                    event = replace(
+                        event,
+                        media={
+                            **dict(event.media or {}),
+                            "stored": False,
+                            "path": None,
+                            "reason": "coordination_unavailable",
+                        },
+                    )
+                    relative = None
+            if relative and not (self.root / relative).is_file():
+                event = replace(
+                    event,
+                    media={
+                        **dict(event.media or {}),
+                        "stored": False,
+                        "path": None,
+                        "reason": "purged_before_append",
+                    },
+                )
+            received_ms = int(event.received_ms if event.received_ms is not None else self._clock())
+            channel = safe_channel(event.channel)
+            line = dumps(self._record(event, channel=channel, received_ms=received_ms))
+            self._drain_locked()
+            if self._has_backlog_locked():
+                self._defer_locked(channel, received_ms, line, lease)
+                self._publish_status_locked()
+                return False
+            try:
+                append_line(self._month_file(channel, received_ms), line)
+            except OSError as exc:
+                self._note_error(exc)
+                self._defer_locked(channel, received_ms, line, lease)
+                self._publish_status_locked()
+                return False
+            self._publish_status_locked()
+            return True
+        finally:
+            if lease is not None:
+                lease.release()
+
     def _note_error(self, exc: BaseException) -> None:
         self._last_error = f"{type(exc).__name__}: {exc}"[:300]
         logger.error("raw archive write failed: %s", type(exc).__name__)
@@ -306,20 +492,28 @@ class RawArchive:
     def _has_backlog_locked(self) -> bool:
         return bool(self._pending) or bool(self._spooled_files())
 
-    def _defer_locked(self, channel: str, received_ms: int, line: str) -> None:
+    def _defer_locked(
+        self,
+        channel: str,
+        received_ms: int,
+        line: str,
+        media_lease: _MediaGuardLease | None,
+    ) -> None:
         if self._pending:
             # Persist older memory entries before letting a newer line past them.
             while self._pending:
                 pending = self._pending[0]
-                if not self._spool_line_locked(*pending):
+                if not self._spool_line_locked(*pending[:3]):
                     break
                 self._pending.pop(0)
+                if pending[3] is not None:
+                    pending[3].release()
             if self._capacity_blocked and len(self._pending) < MAX_MEMORY_PENDING:
                 self._capacity_blocked = False
-            self._remember_locked(channel, received_ms, line)
+            self._remember_locked(channel, received_ms, line, media_lease)
             return
         if not self._spool_line_locked(channel, received_ms, line):
-            self._remember_locked(channel, received_ms, line)
+            self._remember_locked(channel, received_ms, line, media_lease)
 
     def _spool_line_locked(self, channel: str, received_ms: int, line: str) -> bool:
         try:
@@ -347,14 +541,21 @@ class RawArchive:
             self._note_error(exc)
             return False
 
-    def _remember_locked(self, channel: str, received_ms: int, line: str) -> None:
+    def _remember_locked(
+        self,
+        channel: str,
+        received_ms: int,
+        line: str,
+        media_lease: _MediaGuardLease | None,
+    ) -> None:
         if len(self._pending) >= MAX_MEMORY_PENDING:
             self._capacity_blocked = True
             self._last_error = "raw archive capacity reached; persistent storage unavailable"
             logger.error("raw archive capacity reached; intake must stop")
             self._publish_status_locked()
             raise RawArchiveCapacityError(self._last_error)
-        self._pending.append((channel, received_ms, line))
+        pending_lease = media_lease.clone() if media_lease is not None else None
+        self._pending.append((channel, received_ms, line, pending_lease))
 
     def _quarantine_locked(self, item: Path, error: BaseException) -> bool:
         self._note_error(error)
@@ -391,36 +592,50 @@ class RawArchive:
                 if not isinstance(channel, str) or not isinstance(line, str):
                     raise ValueError("spool channel and line must be strings")
                 channel = safe_channel(channel)
-                if "\n" in line or "\r" in line or not isinstance(json.loads(line), dict):
+                record = json.loads(line)
+                if "\n" in line or "\r" in line or not isinstance(record, dict):
                     raise ValueError("spool line must be one JSON object")
                 target = self._month_file(channel, received_ms)
             except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
                 if not self._quarantine_locked(item, exc):
                     return moved
                 continue
-            try:
-                append_line(target, line)
-            except OSError as exc:
-                self._note_error(exc)
-                return moved
-            except (UnicodeError, ValueError) as exc:
-                if not self._quarantine_locked(item, exc):
+            media_lease: _MediaGuardLease | None = None
+            if stored_media_relative(record.get("media")):
+                try:
+                    media_lease = self._media_guard.acquire()
+                except OSError as exc:
+                    self._note_error(exc)
                     return moved
-                continue
             try:
-                item.unlink()
-            except OSError as exc:
-                self._note_error(exc)
-                return moved
-            moved += 1
+                try:
+                    append_line(target, line)
+                except OSError as exc:
+                    self._note_error(exc)
+                    return moved
+                except (UnicodeError, ValueError) as exc:
+                    if not self._quarantine_locked(item, exc):
+                        return moved
+                    continue
+                try:
+                    item.unlink()
+                except OSError as exc:
+                    self._note_error(exc)
+                    return moved
+                moved += 1
+            finally:
+                if media_lease is not None:
+                    media_lease.release()
         while self._pending:
-            channel, received_ms, line = self._pending[0]
+            channel, received_ms, line, media_lease = self._pending[0]
             try:
                 append_line(self._month_file(channel, received_ms), line)
             except OSError as exc:
                 self._note_error(exc)
                 break
             self._pending.pop(0)
+            if media_lease is not None:
+                media_lease.release()
             moved += 1
         if self._capacity_blocked and len(self._pending) < MAX_MEMORY_PENDING:
             self._capacity_blocked = False
@@ -468,6 +683,20 @@ async def append_async(archive: RawArchive | None, event: RawEvent) -> None:
         raise
     except Exception as exc:  # noqa: BLE001 - the archive must never break message handling
         logger.error("raw archive append crashed kind=%s error=%s", event.kind, type(exc).__name__)
+
+
+async def append_with_media_async(
+    archive: RawArchive | None, event: RawEvent, source: str | Path, *, kind: str
+) -> None:
+    """Store media and append its event atomically with respect to owner purge."""
+    if archive is None:
+        return
+    try:
+        await asyncio.to_thread(archive.append_with_media, event, source, kind=kind)
+    except RawArchiveCapacityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the archive must never break message handling
+        logger.error("raw archive media append crashed error=%s", type(exc).__name__)
 
 
 async def store_media_async(

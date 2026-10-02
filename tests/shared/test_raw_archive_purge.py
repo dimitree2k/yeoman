@@ -18,7 +18,7 @@ OCT = 1_791_500_000_000
 def _setup(tmp_path: Path) -> tuple[Path, RawArchive]:
     archive = RawArchive(
         tmp_path / "raw",
-        spool=tmp_path / "spool",
+        spool=tmp_path / "raw-spool",
         status_path=tmp_path / "run" / "raw-archive.json",
         clock=lambda: OCT,
     )
@@ -233,3 +233,321 @@ def test_purge_includes_matches_arriving_before_file_lock(
     assert audit["removed_lines"] == 1
     assert audit["removed_sha256"] == list(result.removed_sha256)
     assert _ids(root) == ["other-chat"]
+
+
+def test_purge_keeps_media_referenced_from_another_channel_and_month(
+    tmp_path: Path,
+) -> None:
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+    archive.append(
+        RawEvent(
+            channel="telegram",
+            kind="media",
+            direction="in",
+            native={"file_id": "kept"},
+            native_id="kept",
+            chat_id="elsewhere",
+            received_ms=SEPT,
+            media=meta,
+        )
+    )
+
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.media_removed == ()
+    assert (root / meta["path"]).exists()
+
+
+def test_purge_keeps_media_referenced_by_raw_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+    real_append_line = writer_module.append_line
+
+    def fail_archive_append(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_archive_append)
+    assert (
+        archive.append(
+            RawEvent(
+                channel="telegram",
+                kind="media",
+                direction="in",
+                native={"file_id": "spooled"},
+                native_id="spooled",
+                chat_id="elsewhere",
+                received_ms=SEPT,
+                media=meta,
+            )
+        )
+        is False
+    )
+    assert list(archive.spool.glob("*.json"))
+
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.media_removed == ()
+    assert (root / meta["path"]).exists()
+
+
+def test_purge_keeps_media_while_referencing_event_is_pending_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+
+    def unavailable(path: Path, line: str, **kwargs: object) -> None:
+        raise OSError("injected storage failure")
+
+    monkeypatch.setattr(writer_module, "append_line", unavailable)
+    monkeypatch.setattr(archive, "_spool_line_locked", lambda *args: False)
+    assert (
+        archive.append(
+            RawEvent(
+                channel="telegram",
+                kind="media",
+                direction="in",
+                native={"file_id": "pending"},
+                native_id="pending",
+                chat_id="elsewhere",
+                received_ms=SEPT,
+                media=meta,
+            )
+        )
+        is False
+    )
+    assert archive.status().pending_in_memory == 1
+
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.removed_lines == 1
+    assert result.media_removed == ()
+    assert _ids(root) == []
+    assert (root / meta["path"]).exists()
+
+    monkeypatch.undo()
+    assert archive.drain_spool() == 1
+    result = purge(root, PurgeSelector(channel="telegram", native_id="pending"), operator="dm")
+    assert result.media_removed == (meta["path"],)
+    assert not (root / meta["path"]).exists()
+
+
+def test_atomic_media_append_keeps_media_referenced_by_spool_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    selected_media = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=selected_media)
+
+    real_append_line = writer_module.append_line
+
+    def fail_archive_append(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_archive_append)
+    assert (
+        archive.append_with_media(
+            RawEvent(
+                channel="whatsapp",
+                kind="media",
+                direction="in",
+                native={"file_id": "spooled"},
+                native_id="spooled",
+                chat_id="elsewhere",
+                received_ms=OCT,
+            ),
+            src,
+            kind="image",
+        )
+        is False
+    )
+    [spool_path] = archive.spool.glob("*.json")
+
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.removed_lines == 1
+    assert result.media_removed == ()
+    assert (root / selected_media["path"]).exists()
+    assert selected_media["path"] in spool_path.read_text(encoding="utf-8")
+
+    monkeypatch.undo()
+    assert archive.drain_spool() == 1
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="spooled"), operator="dm")
+    assert result.media_removed == (selected_media["path"],)
+    assert not (root / selected_media["path"]).exists()
+
+
+def _append_atomic_media_in_child(
+    root: str,
+    spool: str,
+    status_path: str,
+    source: str,
+) -> None:
+    child = RawArchive(
+        Path(root), spool=Path(spool), status_path=Path(status_path), clock=lambda: OCT
+    )
+    child.append_with_media(
+        RawEvent(
+            channel="whatsapp",
+            kind="media",
+            direction="in",
+            native={"file_id": "late"},
+            native_id="late",
+            chat_id="c2",
+            received_ms=OCT,
+        ),
+        Path(source),
+        kind="image",
+    )
+
+
+def test_purge_retains_media_during_cross_process_store_to_append_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import multiprocessing
+
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+    context = multiprocessing.get_context("fork")
+    append_reached = context.Event()
+    allow_append = context.Event()
+    real_append_line = writer_module.append_line
+
+    def pause_before_archive_append(path: Path, line: str, **kwargs: object) -> None:
+        if multiprocessing.current_process().name == "raw-media-writer" and path.suffix == ".jsonl":
+            append_reached.set()
+            if not allow_append.wait(timeout=10):
+                raise TimeoutError("test did not release the media writer")
+        real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", pause_before_archive_append)
+    child = context.Process(
+        name="raw-media-writer",
+        target=_append_atomic_media_in_child,
+        args=(
+            str(root),
+            str(archive.spool),
+            str(archive.status_path),
+            str(src),
+        ),
+    )
+    child.start()
+    try:
+        assert append_reached.wait(timeout=5), "child did not reach the store/append boundary"
+        result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+        assert result.media_removed == ()
+        assert (root / meta["path"]).exists()
+    finally:
+        allow_append.set()
+        child.join(timeout=10)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
+    assert child.exitcode == 0
+    records = [
+        record
+        for archive_path in archive_files(root)
+        for _, record, _ in iter_records(archive_path)
+        if record is not None
+    ]
+    assert [record["native_id"] for record in records] == ["late"]
+    assert (root / meta["path"]).exists()
+
+
+def test_append_of_stale_media_metadata_is_marked_unstored(tmp_path: Path) -> None:
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+    purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    archive.append(
+        RawEvent(
+            channel="telegram",
+            kind="media",
+            direction="in",
+            native={"file_id": "stale"},
+            native_id="stale",
+            chat_id="elsewhere",
+            received_ms=SEPT,
+            media=meta,
+        )
+    )
+
+    [record] = [
+        record
+        for path in archive_files(root)
+        for _, record, _ in iter_records(path)
+        if record and record["native_id"] == "stale"
+    ]
+    assert record["native"] == {"file_id": "stale"}
+    assert record["media"]["stored"] is False
+    assert record["media"]["path"] is None
+    assert record["media"]["reason"] == "purged_before_append"
+
+
+def test_purge_retains_media_when_reference_directory_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.purge as purge_module
+
+    root, archive = _setup(tmp_path)
+    src = tmp_path / "a.jpg"
+    src.write_bytes(b"img")
+    meta = archive.store_media("whatsapp", src, kind="image")
+    _message(archive, "selected", "c1", OCT, media=meta)
+    archive.append(
+        RawEvent(
+            channel="telegram",
+            kind="media",
+            direction="in",
+            native={"file_id": "kept"},
+            native_id="kept",
+            chat_id="elsewhere",
+            received_ms=SEPT,
+            media=meta,
+        )
+    )
+    real_scandir = purge_module.os.scandir
+
+    def deny_reference_directory(path):
+        if Path(path) == root / "telegram":
+            raise PermissionError("injected unreadable reference directory")
+        return real_scandir(path)
+
+    monkeypatch.setattr(purge_module.os, "scandir", deny_reference_directory)
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.removed_lines == 1
+    assert result.media_removed == ()
+    assert (root / meta["path"]).exists()

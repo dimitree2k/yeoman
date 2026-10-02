@@ -10,10 +10,11 @@ are rewritten through a temporary file and an atomic rename while holding the sa
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from yeoman_shared.raw_archive.records import (
@@ -25,7 +26,11 @@ from yeoman_shared.raw_archive.records import (
     line_sha256,
 )
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, record_closed
-from yeoman_shared.raw_archive.writer import safe_channel
+from yeoman_shared.raw_archive.writer import (
+    safe_channel,
+    stored_media_relative,
+    try_lock_media_purge,
+)
 
 
 def _identities(record: dict[str, Any]) -> set[str]:
@@ -75,17 +80,7 @@ class PurgeResult:
 
 
 def _media_path(record: dict[str, Any]) -> str | None:
-    media = record.get("media")
-    if (
-        not isinstance(media, dict)
-        or not media.get("stored")
-        or not isinstance(media.get("path"), str)
-    ):
-        return None
-    path = PurePosixPath(media["path"])
-    if path.is_absolute() or path.parts[:1] != ("media",) or ".." in path.parts:
-        return None
-    return path.as_posix()
+    return stored_media_relative(record.get("media"))
 
 
 def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
@@ -157,6 +152,102 @@ def _snapshot_locked(
     return PurgeResult(tuple(files), len(removed), tuple(removed), media_removed)
 
 
+def _archive_files_strict(root: Path) -> list[Path] | None:
+    """Enumerate every line file without pathlib glob's suppressed scan errors."""
+    paths: list[Path] = []
+    try:
+        with os.scandir(root) as directories:
+            for directory in directories:
+                if directory.name == "media":
+                    continue
+                if directory.is_symlink():
+                    return None
+                if not directory.is_dir(follow_symlinks=False):
+                    continue
+                with os.scandir(directory.path) as entries:
+                    for entry in entries:
+                        if not entry.name.endswith(".jsonl"):
+                            continue
+                        if not entry.is_file(follow_symlinks=True):
+                            return None
+                        paths.append(Path(entry.path))
+    except OSError:
+        return None
+    return sorted(paths)
+
+
+def _spool_media_references(root: Path) -> set[str] | None:
+    spool = root.parent / "raw-spool"
+    try:
+        with os.scandir(spool) as entries:
+            items = sorted(entries, key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    references: set[str] = set()
+    for entry in items:
+        if entry.name.endswith(".corrupt"):
+            return None
+        if not entry.name.endswith(".json"):
+            continue
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            return None
+        try:
+            envelope = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+            if not isinstance(envelope, dict) or not isinstance(envelope.get("line"), str):
+                return None
+            record = json.loads(envelope["line"])
+            if not isinstance(record, dict):
+                return None
+        except OSError, UnicodeError, json.JSONDecodeError, TypeError:
+            return None
+        media = _media_path(record)
+        if media:
+            references.add(media)
+    return references
+
+
+def _unreferenced_media_locked(
+    root: Path,
+    locked: list[tuple[str, Path, int]],
+    selector: PurgeSelector,
+) -> tuple[str, ...]:
+    candidates: set[str] = set()
+    selected_paths = {path for _, path, _ in locked}
+    for _, path, _ in locked:
+        try:
+            for _, record, _ in iter_records(path):
+                if record is not None and selector.matches(record):
+                    media = _media_path(record)
+                    if media:
+                        candidates.add(media)
+        except OSError:
+            return ()
+    if not candidates:
+        return ()
+
+    paths = _archive_files_strict(root)
+    if paths is None:
+        return ()
+    try:
+        for path in paths:
+            for _, record, _ in iter_records(path):
+                if record is None:
+                    return ()
+                media = _media_path(record)
+                if media in candidates and not (
+                    path in selected_paths and selector.matches(record)
+                ):
+                    candidates.discard(media)
+        spool_references = _spool_media_references(root)
+    except OSError:
+        return ()
+    if spool_references is None:
+        return ()
+    return tuple(sorted(candidates - spool_references))
+
+
 def _rewrite_without(path: Path, selector: PurgeSelector, lock_fd: int) -> None:
     mode = os.fstat(lock_fd).st_mode & 0o777
     temporary = path.with_name(f".{path.name}.purge-tmp")
@@ -174,19 +265,32 @@ def _rewrite_without(path: Path, selector: PurgeSelector, lock_fd: int) -> None:
 def purge(
     root: Path, selector: PurgeSelector, *, operator: str, now_ms: int | None = None
 ) -> PurgeResult:
-    """Physically remove matching lines (and now-unreferenced media). Owner CLI only."""
-    preview = plan_purge(root, selector)
+    """Remove selected lines and only media proven unreferenced under the writer guard."""
+    selector.validate()
     files = tuple(
         path.relative_to(root).as_posix()
         for path in archive_files(root, safe_channel(selector.channel))
     )
     if not files:
-        return preview
+        return PurgeResult((), 0, (), ())
+
+    # ponytail: root-wide media lock serializes channels; shard if needed, while busy scans retain media.
+    # Writers hold it from publication through the archive/spool write.
+    media_guard_fd = try_lock_media_purge(root)
     locked = _lock_files(root, files)
     try:
-        plan = _snapshot_locked(locked, selector, preview.media_removed)
-        if plan.removed_lines == 0:
-            return PurgeResult((), 0, (), ())
+        snapshot = _snapshot_locked(locked, selector, ())
+        if snapshot.removed_lines == 0:
+            return snapshot
+        media_removed = (
+            _unreferenced_media_locked(root, locked, selector) if media_guard_fd is not None else ()
+        )
+        plan = PurgeResult(
+            snapshot.files,
+            snapshot.removed_lines,
+            snapshot.removed_sha256,
+            media_removed,
+        )
         now = int(now_ms if now_ms is not None else time.time() * 1000)
         append_protected(
             root / AUDIT,
@@ -209,9 +313,11 @@ def purge(
             _rewrite_without(path, selector, lock_fd)
             if relative in sealed:
                 record_closed(root, path, now_ms=now, note="purged")
+        for relative in plan.media_removed:
+            (root / relative).unlink(missing_ok=True)
+        return plan
     finally:
         for _, _, lock_fd in reversed(locked):
             os.close(lock_fd)
-    for relative in plan.media_removed:
-        (root / relative).unlink(missing_ok=True)
-    return plan
+        if media_guard_fd is not None:
+            os.close(media_guard_fd)
