@@ -1442,6 +1442,9 @@ class ParticipationRuntime:
         current_text = text
         current_decision = initial_decision
         initial_signature = _decision_signature(initial_decision)
+        draft_knowledge_token = (
+            _selected_knowledge_token(current.context) if current_text is not None else None
+        )
         replacement_generated = False
         evaluation_index = 1
 
@@ -1562,6 +1565,12 @@ class ParticipationRuntime:
                     initial_opportunity, effect_id, blocked.reason
                 )
                 return {"status": "comment_skipped", "reason": blocked.reason}
+            if (
+                current_text is not None
+                and draft_knowledge_token is not None
+                and _selected_knowledge_token(current.context) != draft_knowledge_token
+            ):
+                current_text = None
             if self._direct_active(current.opportunity):
                 await self._ledger.record_judge_outcome(
                     attempt_id, outcome="direct_superseded"
@@ -1674,6 +1683,12 @@ class ParticipationRuntime:
                 await self._release_comment(initial_opportunity, effect_id, blocked.reason)
                 await self._record(current.opportunity, "stale_discarded", blocked.reason)
                 return {"status": "comment_skipped", "reason": blocked.reason}
+            if (
+                current_text is not None
+                and draft_knowledge_token is not None
+                and _selected_knowledge_token(current.context) != draft_knowledge_token
+            ):
+                current_text = None
 
             signature = _decision_signature(reevaluated)
             if signature != initial_signature:
@@ -1700,6 +1715,18 @@ class ParticipationRuntime:
                         initial_opportunity, effect_id, "direct_superseded"
                     )
                     return self._direct_superseded()
+                if not _within_opportunity_deadline(
+                    initial_opportunity,
+                    initial_snapshot,
+                    now_ms=int(self._clock_ms()),
+                ):
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "deadline_expired"
+                    )
+                    await self._record(
+                        current.opportunity, "stale_discarded", "deadline_expired"
+                    )
+                    return {"status": "comment_skipped", "reason": "deadline_expired"}
                 try:
                     replacement = await self._submission.generate_draft(
                         opportunity=current.opportunity,
@@ -1736,6 +1763,7 @@ class ParticipationRuntime:
                     return {"status": "generation_failed", "reason": "empty_draft"}
                 self._count("generated")
                 self._record_knowledge_stage(current.context, "writer")
+                draft_knowledge_token = _selected_knowledge_token(current.context)
                 if self._direct_active(current.opportunity):
                     await self._release_comment(
                         initial_opportunity, effect_id, "direct_superseded"
@@ -1748,6 +1776,23 @@ class ParticipationRuntime:
                         initial_opportunity, effect_id, "replacement_already_generated"
                     )
                     return {"status": "comment_skipped", "reason": "context_changed"}
+                if self._direct_active(current.opportunity):
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "direct_superseded"
+                    )
+                    return self._direct_superseded()
+                if not _within_opportunity_deadline(
+                    initial_opportunity,
+                    initial_snapshot,
+                    now_ms=int(self._clock_ms()),
+                ):
+                    await self._release_comment(
+                        initial_opportunity, effect_id, "deadline_expired"
+                    )
+                    await self._record(
+                        current.opportunity, "stale_discarded", "deadline_expired"
+                    )
+                    return {"status": "comment_skipped", "reason": "deadline_expired"}
                 try:
                     replacement = await self._submission.generate_draft(
                         opportunity=current.opportunity,
@@ -1770,6 +1815,7 @@ class ParticipationRuntime:
                     return {"status": "generation_failed", "reason": "empty_draft"}
                 self._count("generated")
                 self._record_knowledge_stage(current.context, "writer")
+                draft_knowledge_token = _selected_knowledge_token(current.context)
                 replacement_generated = True
             current_decision = reevaluated
 
@@ -1891,11 +1937,13 @@ class ParticipationRuntime:
         if not knowledge_changed and not changed and not context.get("advisory_taste"):
             return None
         fresh_inputs = await self._decision_inputs(fresh_opportunity, fresh_snapshot)
-        fresh_context: Mapping[str, Any] = dict(context)
+        fresh_context: dict[str, Any] = dict(context)
         rebuild = baseline[:2] != observed[:2] or baseline[4:] != observed[4:]
         if rebuild or context.get("advisory_taste"):
-            fresh_context = await self._context_builder.build(
-                fresh_opportunity, inputs=fresh_inputs
+            fresh_context = dict(
+                await self._context_builder.build(
+                    fresh_opportunity, inputs=fresh_inputs
+                )
             )
             if str(context.get("knowledge_selection_status") or "") == "budget_dropped":
                 fresh_context.pop("selected_knowledge_text", None)
@@ -1917,9 +1965,9 @@ class ParticipationRuntime:
             changed = _revision_token_changed(baseline, observed)
             if not knowledge_changed and not changed:
                 return None
-        fresh_context = await self._hydrate_social_anchor_closures(fresh_context)
-        fresh_inputs, fresh_context = self._apply_continuation_candidate(
-            fresh_opportunity, fresh_inputs, fresh_context
+        final_context = await self._hydrate_social_anchor_closures(fresh_context)
+        fresh_inputs, final_context = self._apply_continuation_candidate(
+            fresh_opportunity, fresh_inputs, final_context
         )
         if not any(action != "silence" for action in fresh_inputs.allowed_actions):
             raise ParticipationBlockedError("no_feasible_action")
@@ -1927,7 +1975,7 @@ class ParticipationRuntime:
             opportunity=fresh_opportunity,
             snapshot=fresh_inputs.snapshot,
             inputs=fresh_inputs,
-            context=fresh_context,
+            context=final_context,
             knowledge_changed=knowledge_changed or baseline[2] != observed[2],
         )
 
@@ -2209,6 +2257,16 @@ def _revision_token_changed(
 def _selected_knowledge(context: Mapping[str, Any]) -> Any | None:
     selection = context.get("_knowledge_selection")
     return selection if str(getattr(selection, "text", "") or "").strip() else None
+
+
+def _selected_knowledge_token(context: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Freeze identity/content of knowledge used by a retained Writer draft."""
+    selection = _selected_knowledge(context)
+    if selection is None:
+        return None
+    text = str(getattr(selection, "text", "") or "")
+    revision = str(getattr(selection, "revision", "") or "")
+    return revision, canonical_hash(text)
 
 
 def _max_reevaluations(snapshot: Mapping[str, Any]) -> int:

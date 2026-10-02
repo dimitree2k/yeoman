@@ -1174,14 +1174,18 @@ def _build_participation_runtime(
         selector = ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory)
         knowledge_selector = selector
 
-        def _knowledge_contexts(opportunity: object, context: Mapping[str, object]):
+        def _knowledge_contexts(
+            opportunity: object, context: Mapping[str, object]
+        ) -> Any:
             return _participation_knowledge_contexts(
                 opportunity, context, chat_registry=chat_registry, knowledge=knowledge
             )
 
         knowledge_context_supplier = _knowledge_contexts
 
-        def _revalidate_knowledge(opportunity: object, context: Mapping[str, object], selection: object):
+        def _revalidate_knowledge(
+            opportunity: object, context: Mapping[str, object], selection: object
+        ) -> Any:
             trusted = _knowledge_contexts(opportunity, context)
             if not isinstance(trusted, tuple) or len(trusted) != 2:
                 raise RuntimeError("current knowledge authority unavailable")

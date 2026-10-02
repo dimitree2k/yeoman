@@ -604,6 +604,186 @@ async def test_deadline_wins_over_late_knowledge_selection(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("second_judge_drops_knowledge", [False, True])
+async def test_source_only_reconsideration_never_submits_draft_from_old_knowledge(
+    tmp_path: Path, second_judge_drops_knowledge: bool
+) -> None:
+    class Selection:
+        def __init__(self, text="old fact", revision="r1", reason="selected"):
+            self.text, self.revision, self.reason = text, revision, reason
+
+    source_changed = False
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            selection = Selection()
+            context["selected_knowledge_text"] = selection.text
+            context["_knowledge_selection"] = selection
+            return context
+
+    class SequenceJudge(_Judge):
+        def __init__(self):
+            super().__init__(COMMENT)
+
+        async def decide(self, opportunity, context):
+            self.calls += 1
+            if self.calls == 2 and second_judge_drops_knowledge:
+                context.pop("selected_knowledge_text", None)
+                context["_knowledge_selection"] = Selection("", "", "judge_budget")
+                context["knowledge_selection_status"] = "budget_dropped"
+            return COMMENT
+
+    class TrackingSubmission(_Submission):
+        def __init__(self):
+            super().__init__()
+            self.drafts = []
+            self.submitted = []
+
+        async def generate_draft(self, *, opportunity, decision, context):
+            del opportunity, decision
+            self.calls += 1
+            used = str(context.get("selected_knowledge_text") or "")
+            self.drafts.append(used)
+            if self.calls == 1:
+                nonlocal source_changed
+                source_changed = True
+                return "draft based on old fact"
+            return "replacement without old fact"
+
+        async def submit(self, *, admission, effect_id, content, payload_hash):
+            del admission, payload_hash
+            self.submitted.append(content)
+            return _Receipt(effect_id=effect_id)
+
+    validations = 0
+
+    def revalidate(opportunity, context, selection):
+        nonlocal validations
+        del opportunity, context
+        validations += 1
+        if not second_judge_drops_knowledge and validations >= 5:
+            return Selection("corrected fact", "r2")
+        return selection
+
+    runtime, _, _, log = _runtime(tmp_path, decision=COMMENT)
+    judge, submission = SequenceJudge(), TrackingSubmission()
+    runtime._judge = judge
+    runtime._submission = submission
+    runtime._context_builder = KnowledgeContext()
+    runtime._revalidate_knowledge = revalidate
+    original_snapshot = runtime._snapshot_provider
+    runtime._snapshot_provider = lambda *args, **kwargs: {
+        **original_snapshot(*args, **kwargs),
+        "context_revision": 4 if source_changed else 3,
+    }
+
+    result = await runtime.evaluate_participation(_opportunity())
+
+    assert result["status"] == "submitted"
+    assert judge.calls == 2
+    assert submission.drafts[0] == "old fact"
+    assert submission.submitted == ["replacement without old fact"]
+    assert "draft based on old fact" not in submission.submitted
+    log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_fence", ["deadline", "direct"])
+async def test_replacement_writer_rechecks_original_deadline_and_direct_work(
+    tmp_path: Path, late_fence: str
+) -> None:
+    class Selection:
+        def __init__(self, text="fact", revision="r1"):
+            self.text, self.revision = text, revision
+
+    class KnowledgeContext(_Context):
+        async def build(self, opportunity, *, inputs):
+            context = await super().build(opportunity, inputs=inputs)
+            context["selected_knowledge_text"] = "fact"
+            context["_knowledge_selection"] = Selection()
+            return context
+
+    class TrackingSubmission(_Submission):
+        def __init__(self):
+            super().__init__()
+
+        async def generate_draft(self, *, opportunity, decision, context):
+            self.calls += 1
+            if self.calls == 1:
+                return "initial draft"
+            return "replacement draft"
+
+    class SameDecisionJudge(_Judge):
+        async def decide(self, opportunity, context):
+            self.calls += 1
+            return COMMENT
+
+    runtime, _, _, log = _runtime(tmp_path, decision=COMMENT)
+    judge, submission = SameDecisionJudge(COMMENT), TrackingSubmission()
+    runtime._judge = judge
+    runtime._submission = submission
+    runtime._context_builder = KnowledgeContext()
+    validations = 0
+
+    def update_during_writer(opportunity, context, selection):
+        nonlocal validations
+        del opportunity, context
+        validations += 1
+        return Selection("corrected fact", "r2") if validations == 3 else selection
+
+    runtime._revalidate_knowledge = update_during_writer
+    original_snapshot = runtime._snapshot_provider
+    runtime._snapshot_provider = lambda *args, **kwargs: {
+        **original_snapshot(*args, **kwargs),
+        "opportunity_ttl_seconds": 1,
+    }
+    current_time = NOW_MS
+    runtime._clock_ms = lambda: current_time
+    outcome_started = asyncio.Event()
+    resume_outcome = asyncio.Event()
+    original_record = log.record_judge_outcome
+
+    async def delayed_record(attempt_id, *, outcome, detail_code=None):
+        if attempt_id.endswith(":1") and outcome == "comment":
+            outcome_started.set()
+            await resume_outcome.wait()
+        return await original_record(
+            attempt_id, outcome=outcome, detail_code=detail_code
+        )
+
+    log.record_judge_outcome = delayed_record
+    direct = False
+    runtime._direct_work_active = lambda *_: direct
+    task = asyncio.create_task(runtime.evaluate_participation(_opportunity()))
+    signal = asyncio.create_task(outcome_started.wait())
+    done, _ = await asyncio.wait(
+        {task, signal}, timeout=10, return_when=asyncio.FIRST_COMPLETED
+    )
+    if task in done:
+        signal.cancel()
+        result = await task
+        pytest.fail(f"evaluation ended before second-judge fence: {result}")
+    if signal not in done:
+        signal.cancel()
+        task.cancel()
+        await asyncio.gather(task, signal, return_exceptions=True)
+        pytest.fail("second-judge outcome was never reached")
+    if late_fence == "deadline":
+        current_time += 2_000
+    else:
+        direct = True
+    resume_outcome.set()
+    result = await task
+
+    assert judge.calls == 2
+    assert submission.calls == 1
+    assert result["reason"] == ("deadline_expired" if late_fence == "deadline" else "direct_request")
+    assert await log.pending_delivery_reservations(origin="participation") == []
+    log.close()
+
+
+@pytest.mark.asyncio
 async def test_silence_costs_one_judge_and_nothing_else(tmp_path: Path) -> None:
     submission = _Submission()
     reactor = _Reactor()
