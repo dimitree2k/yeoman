@@ -402,7 +402,7 @@ class WhatsAppChannel(BaseChannel):
                         await self._subscribe_bridge_events(token, timeout_seconds=startup_timeout_s)
                     except Exception as e:
                         if self._is_repairable_startup_error(e):
-                            if self.config.bridge_auto_repair and not self._repair_attempted:
+                            if self.config.bridge_auto_repair and not self._repair_attempted and self._running:
                                 self._repair_attempted = True
                                 logger.warning(
                                     f"WhatsApp bridge startup failed ({e}); attempting auto-repair once..."
@@ -1125,6 +1125,13 @@ class WhatsAppChannel(BaseChannel):
         else:
             native["result"] = result or {}
             native_id = str((result or {}).get("providerMessageId") or "")
+            if not native_id and isinstance(result, dict):
+                for envelope in _BRIDGE_ENVELOPE_KEYS:
+                    nested = result.get(envelope)
+                    if isinstance(nested, dict):
+                        native_id = str(nested.get("providerMessageId") or "")
+                        if native_id:
+                            break
         await append_async(
             archive,
             RawEvent(
