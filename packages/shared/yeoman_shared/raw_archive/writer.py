@@ -15,7 +15,7 @@ import hashlib
 import json
 import logging
 import os
-import shutil  # noqa: F401 - used by Task 5 media storage
+import shutil
 import threading
 import time
 import uuid
@@ -176,6 +176,67 @@ class RawArchive:
     def status(self) -> RawArchiveStatus:
         with self._lock:
             return self._status_locked()
+
+    def store_media(
+        self,
+        channel: str,
+        source: str | Path,
+        *,
+        kind: str,
+        received_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Copy media to ``media/<channel>/<YYYY-MM>/<sha256><ext>``. Never raises.
+
+        A copy, not a hard link: a hard link would share the inode with ``var/media``, so an
+        in-place write there would silently change the archived original.
+        """
+        meta: dict[str, Any] = {
+            "kind": kind,
+            "stored": False,
+            "path": None,
+            "sha256": None,
+            "bytes": None,
+            "reason": "",
+        }
+        if not self._media_enabled:
+            meta["reason"] = "disabled"
+            return meta
+        src = Path(source)
+        try:
+            size = src.stat().st_size
+            digest = _sha256_file(src)
+        except OSError:
+            meta["reason"] = "missing"
+            return meta
+        meta["bytes"] = size
+        meta["sha256"] = digest
+        if kind == "video" and size > self._max_video_bytes:
+            meta["reason"] = "too_large"
+            return meta
+        ms = int(received_ms if received_ms is not None else self._clock())
+        relative = (
+            Path("media")
+            / safe_channel(channel)
+            / month_of(ms)
+            / f"{digest}{_safe_suffix(src.suffix)}"
+        )
+        destination = self.root / relative
+        try:
+            if not destination.exists():
+                ensure_private_dir(destination.parent)
+                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+                shutil.copyfile(src, temporary)
+                with temporary.open("rb+") as handle:
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, CLOSED_FILE_MODE)
+                os.replace(temporary, destination)
+        except OSError as exc:
+            self._note_error(exc)
+            meta["reason"] = f"error:{type(exc).__name__}"
+            return meta
+        meta["stored"] = True
+        meta["path"] = relative.as_posix()
+        return meta
 
     # -- internals --------------------------------------------------------------------
 
@@ -392,3 +453,16 @@ async def append_async(archive: RawArchive | None, event: RawEvent) -> None:
         raise
     except Exception as exc:  # noqa: BLE001 - the archive must never break message handling
         logger.error("raw archive append crashed kind=%s error=%s", event.kind, type(exc).__name__)
+
+
+async def store_media_async(
+    archive: RawArchive | None, channel: str, source: str | Path, *, kind: str
+) -> dict[str, Any] | None:
+    """Copy media from async code. Never raises; ``None`` when no archive is configured."""
+    if archive is None:
+        return None
+    try:
+        return await asyncio.to_thread(archive.store_media, channel, source, kind=kind)
+    except Exception as exc:  # noqa: BLE001 - the archive must never break message handling
+        logger.error("raw media copy crashed error=%s", type(exc).__name__)
+        return {"stored": False, "path": None, "reason": f"error:{type(exc).__name__}"}
