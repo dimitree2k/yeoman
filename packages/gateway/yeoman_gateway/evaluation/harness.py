@@ -26,7 +26,7 @@ class ScenarioArchive:
     """InboundArchive stand-in over synthetic messages."""
 
     def __init__(self, scenario: Scenario) -> None:
-        self._rows = [
+        self._rows: list[dict[str, Any]] = [
             {
                 "message_id": message.id, "channel": "whatsapp",
                 "chat_id": scenario.chats[message.chat].chat_id,
@@ -69,7 +69,7 @@ async def build_today_judge_context(
         activation_epoch=1, created_at_ms=scenario.now_ms, lane="shadow",
     )
     inputs = ParticipationDecisionInputs(
-        snapshot={  # type: ignore[arg-type]  # The builder reads this snapshot as a mapping.
+        snapshot={
             "allowed_contribution_types": CONTRIBUTION_TYPES,
             "direct_addressed": scenario.trigger.direct,
             "guidance": DEFAULT_PARTICIPATION_GUIDANCE,
@@ -98,7 +98,14 @@ class StaticClient:
     def __init__(self, content: str) -> None:
         self.content = content
 
-    async def chat_with_usage(self, messages, *, max_tokens, response_format=None, max_retries=None):
+    async def chat_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        response_format: dict[str, Any] | None = None,
+        max_retries: int | None = None,
+    ) -> RouteReply:
         return RouteReply(content=self.content, model="stub", latency_ms=0, finish_reason="stop")
 
 
@@ -112,7 +119,14 @@ class RecordingClient:
         self.model = getattr(inner, "model", "")
         self.last: RouteReply | None = None
 
-    async def chat_with_usage(self, messages, *, max_tokens, response_format=None, max_retries=None):
+    async def chat_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        response_format: dict[str, Any] | None = None,
+        max_retries: int | None = None,
+    ) -> RouteReply:
         self.last = None
         self.last = await self._inner.chat_with_usage(
             messages, max_tokens=max_tokens, response_format=response_format, max_retries=max_retries,

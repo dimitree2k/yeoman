@@ -221,10 +221,10 @@ class RetrievalSummary:
 
 def _metrics(rows: list[dict[str, object]]) -> dict[str, float]:
     with_needed = [row for row in rows if row["needed"]]
-    recalls = [float(row["recall"]) for row in with_needed]  # type: ignore[arg-type]
+    recalls = [float(row["recall"]) for row in with_needed]
     abstain_rows = [row for row in rows if row["expect_abstain"]]
     measurable = [row for row in abstain_rows if row["abstained"] is not None]
-    builds = sorted(float(row["build_ms"]) for row in rows)  # type: ignore[arg-type]
+    builds = sorted(float(row["build_ms"]) for row in rows)
     return {
         "scenarios": float(len(rows)),
         "needed_recall": round(statistics.fmean(recalls), 4) if recalls else -1.0,
