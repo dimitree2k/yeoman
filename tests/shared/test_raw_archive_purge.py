@@ -754,3 +754,70 @@ def test_spool_registry_failure_keeps_nonmedia_spooling_and_media_in_memory(
     assert all(
         json.loads(record["line"]).get("native_id") != "memory-only" for record in spool_records
     )
+
+
+def test_purge_scans_legacy_default_spool_when_registry_has_only_custom_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, legacy = _setup(tmp_path)
+    src = tmp_path / "legacy.jpg"
+    src.write_bytes(b"img")
+    meta = legacy.store_media("whatsapp", src, kind="image")
+    _message(legacy, "selected", "c1", OCT, media=meta)
+
+    real_append_line = writer_module.append_line
+
+    def fail_archive_append(path: Path, line: str, **kwargs: object) -> None:
+        if path.suffix == ".jsonl":
+            raise OSError("injected archive failure")
+        real_append_line(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_archive_append)
+    assert (
+        legacy.append(
+            RawEvent(
+                channel="whatsapp",
+                kind="media",
+                direction="in",
+                native={"file_id": "legacy-pending"},
+                native_id="legacy-pending",
+                chat_id="c2",
+                received_ms=OCT,
+                media=meta,
+            )
+        )
+        is False
+    )
+    [spool_file] = legacy.spool.glob("*.json")
+    assert meta["path"] in spool_file.read_text(encoding="utf-8")
+
+    # Model the persisted pre-registry state before a new writer uses a custom spool.
+    registry = root / ".raw-spools.jsonl"
+    registry.unlink()
+    custom_spool = tmp_path / "configured-spool"
+    custom = RawArchive(
+        root,
+        spool=custom_spool,
+        status_path=tmp_path / "run" / "custom-status.json",
+        clock=lambda: OCT,
+    )
+    [registration] = registry.read_text(encoding="utf-8").splitlines()
+    assert json.loads(registration)["path"] == str(custom.spool)
+
+    monkeypatch.undo()
+    result = purge(root, PurgeSelector(channel="whatsapp", native_id="selected"), operator="dm")
+
+    assert result.removed_lines == 1
+    assert result.media_removed == ()
+    assert (root / meta["path"]).exists()
+    assert legacy.drain_spool() == 1
+    [kept] = [
+        record
+        for path in archive_files(root)
+        for _, record, _ in iter_records(path)
+        if record and record["native_id"] == "legacy-pending"
+    ]
+    assert kept["media"]["stored"] is True
+    assert (root / kept["media"]["path"]).is_file()

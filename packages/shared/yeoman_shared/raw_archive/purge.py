@@ -195,6 +195,7 @@ def _spool_media_references(root: Path) -> set[str] | None:
         return None
     if not spools:
         return None
+    spools.add(root.parent / "raw-spool")
 
     references: set[str] = set()
     for spool in spools:
