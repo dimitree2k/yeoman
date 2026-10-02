@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import stat
 from pathlib import Path
 
@@ -53,6 +54,49 @@ def test_changing_the_source_later_does_not_change_the_archive(tmp_path: Path) -
     meta = _archive(tmp_path).store_media("whatsapp", src, kind="image")
     src.write_bytes(b"tampered")
     assert (tmp_path / "raw" / meta["path"]).read_bytes() == b"original"
+
+
+def test_source_change_at_copy_boundary_matches_archived_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    src = _source(tmp_path, "a.jpg", b"original")
+    changed = b"changed-source-is-longer"
+    copyfile = writer_module.shutil.copyfile
+
+    def change_source_then_copy(source, destination):
+        if Path(source) == src:
+            src.write_bytes(changed)
+        return copyfile(source, destination)
+
+    monkeypatch.setattr(writer_module.shutil, "copyfile", change_source_then_copy)
+    meta = _archive(tmp_path).store_media("whatsapp", src, kind="image")
+    archived = (tmp_path / "raw" / meta["path"]).read_bytes()
+
+    assert meta["stored"] is True
+    assert archived == changed
+    assert meta["bytes"] == len(archived)
+    assert meta["sha256"] == hashlib.sha256(archived).hexdigest()
+
+
+def test_video_growth_at_copy_boundary_still_obeys_size_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    src = _source(tmp_path, "v.mp4", b"123456789")
+    grown = b"12345678901"
+    copyfile = writer_module.shutil.copyfile
+
+    def grow_source_then_copy(source, destination):
+        if Path(source) == src:
+            src.write_bytes(grown)
+        return copyfile(source, destination)
+
+    monkeypatch.setattr(writer_module.shutil, "copyfile", grow_source_then_copy)
+    meta = _archive(tmp_path, max_video_bytes=10).store_media("whatsapp", src, kind="video")
+
+    assert meta["stored"] is False and meta["reason"] == "too_large"
+    assert meta["bytes"] == len(grown)
+    assert meta["sha256"] == hashlib.sha256(grown).hexdigest()
+    assert not (tmp_path / "raw" / "media").exists()
 
 
 def test_large_video_keeps_metadata_only(tmp_path: Path) -> None:

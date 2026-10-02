@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -203,33 +204,47 @@ class RawArchive:
             return meta
         src = Path(source)
         try:
-            size = src.stat().st_size
-            digest = _sha256_file(src)
-        except OSError:
-            meta["reason"] = "missing"
-            return meta
-        meta["bytes"] = size
-        meta["sha256"] = digest
-        if kind == "video" and size > self._max_video_bytes:
-            meta["reason"] = "too_large"
-            return meta
-        ms = int(received_ms if received_ms is not None else self._clock())
-        relative = (
-            Path("media")
-            / safe_channel(channel)
-            / month_of(ms)
-            / f"{digest}{_safe_suffix(src.suffix)}"
-        )
-        destination = self.root / relative
-        try:
-            if not destination.exists():
-                ensure_private_dir(destination.parent)
-                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-                shutil.copyfile(src, temporary)
-                with temporary.open("rb+") as handle:
-                    os.fsync(handle.fileno())
-                os.chmod(temporary, CLOSED_FILE_MODE)
-                os.replace(temporary, destination)
+            with tempfile.TemporaryDirectory(
+                prefix="yeoman-raw-media-", ignore_cleanup_errors=True
+            ) as staging_dir:
+                snapshot = Path(staging_dir) / "media"
+                try:
+                    shutil.copyfile(src, snapshot)
+                except FileNotFoundError:
+                    meta["reason"] = "missing"
+                    return meta
+                except OSError as exc:
+                    self._note_error(exc)
+                    meta["reason"] = f"error:{type(exc).__name__}"
+                    return meta
+                try:
+                    size = snapshot.stat().st_size
+                    digest = _sha256_file(snapshot)
+                except OSError as exc:
+                    self._note_error(exc)
+                    meta["reason"] = f"error:{type(exc).__name__}"
+                    return meta
+                meta["bytes"] = size
+                meta["sha256"] = digest
+                if kind == "video" and size > self._max_video_bytes:
+                    meta["reason"] = "too_large"
+                    return meta
+                ms = int(received_ms if received_ms is not None else self._clock())
+                relative = (
+                    Path("media")
+                    / safe_channel(channel)
+                    / month_of(ms)
+                    / f"{digest}{_safe_suffix(src.suffix)}"
+                )
+                destination = self.root / relative
+                if not destination.exists():
+                    ensure_private_dir(destination.parent)
+                    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+                    shutil.copyfile(snapshot, temporary)
+                    with temporary.open("rb+") as handle:
+                        os.fsync(handle.fileno())
+                    os.chmod(temporary, CLOSED_FILE_MODE)
+                    os.replace(temporary, destination)
         except OSError as exc:
             self._note_error(exc)
             meta["reason"] = f"error:{type(exc).__name__}"
