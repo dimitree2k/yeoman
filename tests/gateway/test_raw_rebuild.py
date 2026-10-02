@@ -240,7 +240,7 @@ def test_live_comparison_detects_missing_events_when_archive_has_no_records(tmp_
 
 
 
-def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edit(
+def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edits(
     tmp_path: Path,
 ) -> None:
     channel, _ = _live(tmp_path)
@@ -276,8 +276,18 @@ def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edit(
             _frame("message", opaque, "opaque-event"),
             _frame(
                 "edit",
-                {"chatJid": CHAT, "messageId": "target-1", "senderId": "4915@s.whatsapp.net", "text": "after edit"},
-                "decoded-edit-event",
+                {"chatJid": CHAT, "messageId": "target-1", "senderId": "4915@s.whatsapp.net", "text": "grün"},
+                "decoded-edit-green-event",
+            ),
+            _frame(
+                "edit",
+                {"chatJid": CHAT, "messageId": "target-1", "senderId": "4915@s.whatsapp.net", "text": "rot"},
+                "decoded-edit-red-event",
+            ),
+            _frame(
+                "edit",
+                {"chatJid": CHAT, "messageId": "target-1", "senderId": "4915@s.whatsapp.net", "text": "grün"},
+                "decoded-edit-green-event",
             ),
         ],
     )
@@ -296,16 +306,20 @@ def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edit(
     report = rebuild_chat(
         tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=tmp_path / "rebuilt"
     )
-    assert report.replayed == 3
+    assert report.replayed == 4
+    assert report.duplicates == 1
     rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "processing" / "processing.db")
     original_event = rebuilt.get_event("original-event")
     opaque_event = rebuilt.get_event("opaque-event")
-    decoded_edit = rebuilt.get_event("decoded-edit-event")
+    green_edit = rebuilt.get_event("decoded-edit-green-event")
+    red_edit = rebuilt.get_event("decoded-edit-red-event")
     assert original_event is not None and original_event.payload["text"] == "before edit"
     assert opaque_event is not None and opaque_event.payload["observation_only"] is True
     assert opaque_event.payload["target_message_id"] == "target-1"
     assert opaque_event.payload["encrypted_edit"]["encPayload"] == "AQID"
-    assert decoded_edit is not None and decoded_edit.payload["text"] == "after edit"
+    assert green_edit is not None and green_edit.payload["text"] == "grün"
+    assert red_edit is not None and red_edit.payload["text"] == "rot"
+    assert green_edit.payload["target_message_id"] == red_edit.payload["target_message_id"] == "target-1"
     rebuilt.close()
 
 

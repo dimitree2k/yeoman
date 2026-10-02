@@ -213,7 +213,39 @@ function identityPart(value: unknown): string {
   return typeof value === 'string' ? value.trim() : String(value ?? '').trim();
 }
 
-/** Derive replay identity from provider ids only; payload text is never part of the key. */
+/** Stable identity for one edit revision, using the replacement snapshot when no revision exists. */
+function deriveEditRevisionIdentity(payload: Record<string, unknown>): string {
+  const revision = identityPart(payload.revision ?? payload.editRevision ?? '');
+  if (revision) return revision;
+
+  const timestamp = identityPart(payload.timestamp ?? payload.editTimestamp ?? '');
+  const text = typeof payload.text === 'string' ? payload.text : '';
+  const mediaMetadata: Array<[string, string | number]> = [];
+  if (payload.media && typeof payload.media === 'object' && !Array.isArray(payload.media)) {
+    const media = payload.media as Record<string, unknown>;
+    for (const field of MEDIA_METADATA_FIELDS) {
+      const value = media[field];
+      if (typeof value === 'string' || typeof value === 'number') {
+        mediaMetadata.push([field, value]);
+      }
+    }
+  }
+  const snapshot = JSON.stringify([timestamp, text, mediaMetadata]);
+  const digest = createHash('sha256').update(snapshot ?? 'null', 'utf8').digest('hex');
+  return `legacy:${digest}`;
+}
+
+/** Local dedupe identity for edits, scoped to the chat and target message. */
+export function deriveEditSignalIdentity(payload: Record<string, unknown>): string | undefined {
+  const chat = identityPart(payload.chatJid ?? payload.chat_jid ?? payload.chat);
+  const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
+  if (!chat || !messageId) return undefined;
+  return [chat, messageId, deriveEditRevisionIdentity(payload)]
+    .map((value) => encodeURIComponent(value))
+    .join(':');
+}
+
+/** Derive replay identity from provider ids/revisions, with a stable edit snapshot fallback. */
 export function deriveProviderEventIdentity(
   type: Extract<BridgeEventType, 'message' | 'edit' | 'delete' | 'reaction' | 'receipt'>,
   accountId: string,
@@ -231,8 +263,7 @@ export function deriveProviderEventIdentity(
   } else if (type === 'edit') {
     const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
     if (!messageId) return undefined;
-    const revision = identityPart(payload.revision ?? payload.editRevision ?? '');
-    providerIdentity = revision ? [messageId, revision] : [messageId];
+    providerIdentity = [messageId, deriveEditRevisionIdentity(payload)];
   } else if (type === 'delete') {
     const messageId = identityPart(
       payload.messageId ?? payload.message_id ?? payload.targetMessageId ?? payload.id,

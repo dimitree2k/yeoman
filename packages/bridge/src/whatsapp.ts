@@ -14,6 +14,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
+import { deriveEditSignalIdentity } from './protocol.js';
 import {
   defaultMessageReferenceDir,
   MessageReferenceStore,
@@ -2014,8 +2015,8 @@ export class WhatsAppClient {
           if (edited) {
             const payload = this.extractEditPayload(update);
             if (payload) {
-              const identity = `${messageId}:${String(payload.revision ?? payload.timestamp ?? 0)}`;
-              this.emitSignal('edit', identity, payload);
+              const identity = deriveEditSignalIdentity(payload);
+              if (identity) this.emitSignal('edit', identity, payload);
             }
           }
         } catch (err) {

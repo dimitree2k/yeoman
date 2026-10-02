@@ -14,7 +14,7 @@ import {
 } from './whatsapp.js';
 import { BridgeServer } from './server.js';
 import { BridgeOutbox } from './outbox.js';
-import { createEventEnvelope } from './protocol.js';
+import { createEventEnvelope, deriveEditSignalIdentity } from './protocol.js';
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
 function inboundMessage(messageId: string): Record<string, unknown> {
@@ -317,6 +317,28 @@ test('edit signals preserve replacement text and provider revision when present'
     text: 'replacement text',
     revision: 3,
   });
+});
+
+test('local edit signal identity is chat-scoped and shares deterministic revision fallback', () => {
+  const green = {
+    chatJid: 'chat@g.us',
+    messageId: 'target-4',
+    timestamp: 1_700_000_123,
+    text: 'grün',
+  };
+  const red = { ...green, text: 'rot' };
+  assert.notEqual(deriveEditSignalIdentity(green), deriveEditSignalIdentity(red));
+  assert.equal(deriveEditSignalIdentity(green), deriveEditSignalIdentity({ ...green }));
+  assert.notEqual(
+    deriveEditSignalIdentity(green),
+    deriveEditSignalIdentity({ ...green, chatJid: 'other-chat@g.us' }),
+  );
+
+  const withoutTimestamp = { chatJid: 'chat@g.us', messageId: 'target-5', text: 'grün' };
+  assert.notEqual(
+    deriveEditSignalIdentity(withoutTimestamp),
+    deriveEditSignalIdentity({ ...withoutTimestamp, text: 'rot' }),
+  );
 });
 
 test('send results retain provider and client message ids separately', async () => {

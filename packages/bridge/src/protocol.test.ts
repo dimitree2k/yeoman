@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   createErrorResponse,
   createOkResponse,
+  deriveProviderEventIdentity,
   parseBridgeCommand,
   PROTOCOL_VERSION,
 } from './protocol.js';
@@ -11,6 +12,61 @@ import {
 test('protocol version gates deterministic message ids', () => {
   // v5 adds the authenticated event subscription and durable event ACKs.
   assert.equal(PROTOCOL_VERSION, 5);
+});
+
+test('edit event identities distinguish same-second revisions and deduplicate exact replay', () => {
+  const identity = (payload: Record<string, unknown>) =>
+    deriveProviderEventIdentity('edit', 'account-1', payload)?.eventId;
+  const green = {
+    chatJid: 'chat@g.us',
+    messageId: 'target-1',
+    timestamp: 1_700_000_123,
+    text: 'grün',
+  };
+  const red = { ...green, text: 'rot' };
+
+  assert.notEqual(identity(green), identity(red));
+  assert.equal(identity(green), identity({ ...green }));
+});
+
+test('edit event identities distinguish legacy revisions without timestamps', () => {
+  const identity = (payload: Record<string, unknown>) =>
+    deriveProviderEventIdentity('edit', 'account-1', payload)?.eventId;
+  const green = { chatJid: 'chat@g.us', messageId: 'target-2', text: 'grün' };
+
+  assert.notEqual(identity(green), identity({ ...green, text: 'rot' }));
+  assert.equal(identity(green), identity({ ...green }));
+});
+
+test('provider edit revision remains the preferred identity', () => {
+  const identity = (payload: Record<string, unknown>) =>
+    deriveProviderEventIdentity('edit', 'account-1', payload)?.eventId;
+
+  assert.equal(
+    identity({ chatJid: 'chat@g.us', messageId: 'target-3', revision: 2, text: 'grün' }),
+    identity({ chatJid: 'chat@g.us', messageId: 'target-3', revision: 2, text: 'rot' }),
+  );
+});
+
+test('legacy edit identity is stable when media metadata property order differs', () => {
+  const identity = (media: Record<string, unknown>) =>
+    deriveProviderEventIdentity('edit', 'account-1', {
+      chatJid: 'chat@g.us',
+      messageId: 'target-media',
+      text: '[Document]',
+      media,
+    })?.eventId;
+  const media = {
+    kind: 'document',
+    mimeType: 'application/pdf',
+    fileName: 'report.pdf',
+    bytes: 42,
+    sha256: 'ab'.repeat(32),
+  };
+
+  const reordered = Object.fromEntries(Object.entries(media).reverse());
+  assert.equal(identity(media), identity(reordered));
+  assert.notEqual(identity(media), identity({ ...media, sha256: 'cd'.repeat(32) }));
 });
 
 test('parseBridgeCommand accepts event subscription and exact ACK commands', () => {
