@@ -914,7 +914,7 @@ async def test_judge_classifies_provider_completion_before_parsing(
     class Client(_Client):
         async def chat_with_usage(self, *args, **kwargs):
             return SimpleNamespace(content=content, finish_reason=finish,
-                                   usage={}, model="test", diagnostics=diagnostics)
+                                   latency_ms=0, usage={}, model="test", diagnostics=diagnostics)
 
     judge = ParticipationJudge(client=Client(content))
     with pytest.raises(ParticipationDecisionError) as error:

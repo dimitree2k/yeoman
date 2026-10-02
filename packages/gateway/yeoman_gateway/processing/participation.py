@@ -31,6 +31,7 @@ from typing import Any, Literal
 
 from loguru import logger
 from yeoman_shared.reactions import allowed_reaction
+from yeoman_shared.telemetry import tracing
 
 from yeoman_gateway.processing.model_route import RouteClient
 
@@ -272,10 +273,44 @@ class ParticipationJudge:
         Raises :class:`ParticipationDecisionError` for timeout, provider failure,
         empty or invalid output, evidence outside the supplied context, an
         untrusted ``direct`` claim, an unknown emoji or an oversized input.
-        :class:`asyncio.CancelledError` propagates untouched.
+        :class:`asyncio.CancelledError` propagates untouched. Every attempt is
+        traced when Langfuse is configured.
         """
         view = _JudgeContext.from_mapping(context)
         messages = self._build_messages(opportunity, view)
+        trace = tracing.start_trace(
+            name="participation.judge",
+            metadata={
+                "opportunity_id": opportunity.opportunity_id,
+                "route": self.route_key,
+                "trigger": opportunity.trigger,
+                "lane": opportunity.lane,
+            },
+            tags=["participation", "judge"],
+        )
+        try:
+            decision = await self._decide(opportunity, view, messages, trace)
+        except ParticipationDecisionError as exc:
+            tracing.end_span(
+                trace,
+                output={"error": exc.reason, "detail": exc.detail},
+                metadata={"outcome": "error"},
+            )
+            raise
+        tracing.end_span(
+            trace,
+            output={"action": decision.action, "intent": decision.intent},
+            metadata={"outcome": "decision"},
+        )
+        return decision
+
+    async def _decide(
+        self,
+        opportunity: ParticipationOpportunity,
+        view: "_JudgeContext",
+        messages: list[dict[str, str]],
+        trace: Any,
+    ) -> ParticipationDecision:
         budget = self._estimate_tokens(messages)
         if budget > self._max_input_tokens:
             raise ParticipationDecisionError(
@@ -313,6 +348,23 @@ class ParticipationJudge:
             opportunity.opportunity_id, self.route_key, reply.model,
             reply.finish_reason, native_finish_reason, dict(reply.usage),
             dict(reply.diagnostics),
+        )
+        tracing.log_generation(
+            parent=trace,
+            name="participation.judge.generation",
+            model=reply.model,
+            input=messages,
+            output=reply.content,
+            usage=dict(reply.usage),
+            metadata={
+                "finish_reason": reply.finish_reason,
+                "native_finish_reason": native_finish_reason,
+                "latency_ms": reply.latency_ms,
+            },
+            model_parameters={
+                "max_tokens": self._max_output_tokens,
+                "structured_output": str(getattr(self._client, "structured_output", "")),
+            },
         )
         if native_finish_reason == "length":
             raise ParticipationDecisionError("invalid_response", detail="output_truncated")
