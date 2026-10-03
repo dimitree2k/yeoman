@@ -1,4 +1,4 @@
-"""Explicit offline CLI for historical audience coverage and owner attestations."""
+"""Explicit offline CLI for rebuilt history and historical audience proofs."""
 
 from __future__ import annotations
 
@@ -10,8 +10,16 @@ import typer
 
 from yeoman_gateway.knowledge._history import HistoricalJournal
 from yeoman_gateway.knowledge._history_audience import HistoryAudience
+from yeoman_gateway.knowledge._history_reader import (
+    HistoryReader,
+    HistorySearchUnsupportedError,
+)
 from yeoman_gateway.knowledge._history_rebuild import rebuild_history, verify_history
-from yeoman_gateway.knowledge.models import KnowledgeError, TrustedAdminContext
+from yeoman_gateway.knowledge.models import (
+    KnowledgeError,
+    TrustedAdminContext,
+    TrustedReadContext,
+)
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
 
 from .knowledge_commands import knowledge_app
@@ -122,6 +130,137 @@ def history_roster_revoke(
     typer.echo(json.dumps({"status": "revoked", "proof_id": proof_id}, sort_keys=True))
 
 
+@history_app.command("search")
+def history_search(
+    target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
+    query: str = typer.Option(..., "--query", help="Search terms"),
+    channel: str = typer.Option(..., "--channel"),
+    account: str = typer.Option(..., "--account"),
+    chat_id: str = typer.Option(..., "--chat-id"),
+    authorization: Path = typer.Option(..., "--authorization", help="Trusted read context JSON"),
+    policy: Path = typer.Option(..., "--policy", help="Explicit current policy and membership snapshot"),
+    since_ms: int | None = typer.Option(None, "--since-ms"),
+    until_ms: int | None = typer.Option(None, "--until-ms"),
+    native_id: str | None = typer.Option(None, "--native-id"),
+    limit: int = typer.Option(30, "--limit", min=1, max=100),
+) -> None:
+    """Search only the owned FTS projection after current rights are checked."""
+    context, authority = _read_authorization_context(
+        authorization, policy, channel=channel, account=account, chat_id=chat_id
+    )
+    with HistoricalJournal(target_home, create=False) as journal:
+        reader = HistoryReader(journal, policy=authority)
+        try:
+            results = reader.search(
+                query,
+                context=context,
+                channel=channel,
+                account=account,
+                chat_id=chat_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                native_id=native_id,
+                limit=limit,
+            )
+        except HistorySearchUnsupportedError:
+            _emit_history_receipts(
+                {"status": "unsupported", "capability": "sqlite_fts5"}, ()
+            )
+            return
+    _emit_history_receipts(
+        {
+            "status": "ok",
+            "command": "search",
+            "query": query,
+            "scope": {"channel": channel, "account": account, "chat_id": chat_id},
+            "count": len(results),
+        },
+        results,
+    )
+
+
+@history_app.command("recent")
+def history_recent(
+    target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
+    channel: str = typer.Option(..., "--channel"),
+    account: str = typer.Option(..., "--account"),
+    chat_id: str = typer.Option(..., "--chat-id"),
+    before_ms: int = typer.Option(..., "--before-ms"),
+    authorization: Path = typer.Option(..., "--authorization", help="Trusted read context JSON"),
+    policy: Path = typer.Option(..., "--policy", help="Explicit current policy and membership snapshot"),
+    limit: int = typer.Option(8, "--limit", min=1, max=100),
+) -> None:
+    """Show the latest authorized canonical events for one explicit account scope."""
+    context, authority = _read_authorization_context(
+        authorization, policy, channel=channel, account=account, chat_id=chat_id
+    )
+    with HistoricalJournal(target_home, create=False) as journal:
+        results = HistoryReader(journal, policy=authority).recent(
+            context=context,
+            channel=channel,
+            account=account,
+            chat_id=chat_id,
+            before_ms=before_ms,
+            limit=limit,
+        )
+    _emit_history_receipts(
+        {
+            "status": "ok",
+            "command": "recent",
+            "scope": {"channel": channel, "account": account, "chat_id": chat_id},
+            "count": len(results),
+        },
+        results,
+    )
+
+
+@history_app.command("excerpt")
+def history_excerpt(
+    event_id: str = typer.Option(..., "--event-id"),
+    revision: int = typer.Option(..., "--revision", min=1),
+    target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
+    channel: str = typer.Option(..., "--channel"),
+    account: str = typer.Option(..., "--account"),
+    chat_id: str = typer.Option(..., "--chat-id"),
+    authorization: Path = typer.Option(..., "--authorization", help="Trusted read context JSON"),
+    policy: Path = typer.Option(..., "--policy", help="Explicit current policy and membership snapshot"),
+) -> None:
+    """Resolve one exact canonical/source alias and return its safe locator excerpt."""
+    context, authority = _read_authorization_context(
+        authorization, policy, channel=channel, account=account, chat_id=chat_id
+    )
+    with HistoricalJournal(target_home, create=False) as journal:
+        result = HistoryReader(journal, policy=authority).excerpt(
+            event_id, revision, context=context
+        )
+    if result is not None and result.get("account") != account:
+        result = None
+    _emit_history_receipts(
+        {
+            "status": "ok",
+            "command": "excerpt",
+            "event_id": event_id,
+            "revision": revision,
+            "scope": {"channel": channel, "account": account, "chat_id": chat_id},
+            "count": int(result is not None),
+        },
+        () if result is None else (result,),
+    )
+
+
+@history_app.command("reindex")
+def history_reindex(
+    target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
+) -> None:
+    """Rebuild the private FTS projection from canonical journal rows."""
+    with HistoricalJournal(target_home, create=False) as journal:
+        report = HistoryReader(
+            journal,
+            policy=RuntimeKnowledgePolicy(engine=None),
+        ).reindex()
+    typer.echo(json.dumps({"metadata_receipt": report, "text_receipt": []}, sort_keys=True))
+
+
 def _load_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -190,3 +329,115 @@ def _authorization_context(
     )
     authority.require_admin(context)
     return context, authority
+
+
+class _SnapshotRegistry:
+    def __init__(self, *, channel: str, account: str, chat_id: str, members: list[str], revision: str) -> None:
+        self.channel = channel
+        self.account = account
+        self.chat_id = chat_id
+        self.members = members
+        self.revision = revision
+
+    def get_chat(self, channel: str, chat_id: str) -> dict[str, Any] | None:
+        if (channel, chat_id) != (self.channel, self.chat_id):
+            return None
+        return {
+            "metadata": {"participants": self.members},
+            "last_sync_at": self.revision,
+        }
+
+
+def _read_authorization_context(
+    authorization_path: Path,
+    policy_path: Path,
+    *,
+    channel: str,
+    account: str,
+    chat_id: str,
+) -> tuple[TrustedReadContext, RuntimeKnowledgePolicy]:
+    """Build a read context only from matching explicit authorization snapshots."""
+    authorization = _load_object(authorization_path, "authorization")
+    snapshot = _load_object(policy_path, "policy snapshot")
+    revision = snapshot.get("policy_revision", snapshot.get("revision"))
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        raise KnowledgeError("unauthorized", "policy snapshot revision is invalid")
+    if authorization.get("policy_revision") != revision:
+        raise KnowledgeError("stale_revision", "authorization does not match policy snapshot")
+    authorization_ref = authorization.get("authorization_ref")
+    principal = authorization.get("principal_id")
+    recipients = authorization.get("recipient_principals")
+    if (
+        not isinstance(authorization_ref, str)
+        or not authorization_ref.strip()
+        or not isinstance(principal, str)
+        or not isinstance(recipients, list)
+        or not recipients
+        or any(not isinstance(item, str) or not item.strip() for item in recipients)
+    ):
+        raise KnowledgeError("unauthorized", "trusted read authorization is incomplete")
+    records = snapshot.get("memberships")
+    if not isinstance(records, list):
+        raise KnowledgeError("unauthorized", "policy snapshot memberships are missing")
+    matches = [
+        item for item in records
+        if isinstance(item, dict)
+        and (item.get("channel"), item.get("account"), item.get("chat_id"))
+        == (channel, account, chat_id)
+    ]
+    if len(matches) != 1:
+        raise KnowledgeError("unauthorized", "policy snapshot must contain one exact chat membership")
+    row = matches[0]
+    members, membership_revision = row.get("members"), row.get("revision")
+    if (
+        not isinstance(members, list)
+        or any(not isinstance(item, str) or not item.strip() for item in members)
+        or not isinstance(membership_revision, str)
+        or not membership_revision.strip()
+        or authorization.get("membership_revision") != membership_revision
+    ):
+        raise KnowledgeError("stale_revision", "read authorization does not match current membership")
+    if authorization.get("channel") != channel or authorization.get("chat_id") != chat_id:
+        raise KnowledgeError("unauthorized", "read authorization scope does not match request")
+    direct = authorization.get("is_direct")
+    if not isinstance(direct, bool):
+        raise KnowledgeError("unauthorized", "read authorization must specify direct-chat scope")
+    try:
+        context = TrustedReadContext(
+            principal_id=principal,
+            channel=channel,
+            chat_id=chat_id,
+            recipient_principals=frozenset(recipients),
+            membership_revision=membership_revision,
+            policy_revision=revision,
+            purpose=str(authorization.get("purpose") or "reply"),
+            now_ms=authorization.get("now_ms"),
+            is_direct=direct,
+            # A caller-supplied owner field is intentionally ignored.
+            owner=False,
+        )
+    except (TypeError, ValueError, KnowledgeError) as exc:
+        raise KnowledgeError("unauthorized", "trusted read context fields are invalid") from exc
+    registry = _SnapshotRegistry(
+        channel=channel,
+        account=account,
+        chat_id=chat_id,
+        members=members,
+        revision=membership_revision,
+    )
+    return context, RuntimeKnowledgePolicy(
+        engine=None,
+        chat_registry=registry,
+        policy_revision=revision,
+    )
+
+
+def _emit_history_receipts(metadata: dict[str, Any], results: Any) -> None:
+    typer.echo(
+        json.dumps(
+            {"metadata_receipt": metadata, "text_receipt": list(results)},
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+    )

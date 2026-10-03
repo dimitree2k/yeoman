@@ -8,10 +8,13 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.knowledge._history import HistoricalJournal, HistorySourceAuthority
+from yeoman_gateway.knowledge._history_reader import HistoryReader
 from yeoman_gateway.knowledge._history_rebuild import (
     rebuild_history,
     verify_history,
 )
+from yeoman_gateway.knowledge.authority import EvidenceAudience
+from yeoman_gateway.knowledge.models import SourceRef
 
 _WHEN = 1_725_000_000_000
 
@@ -223,6 +226,127 @@ def test_conflicting_text_and_edit_revisions_are_retained(tmp_path: Path) -> Non
     assert {row["event_id"] for row in _rows(target, "SELECT event_id FROM events")} == {"evt-one", "evt-two", "evt-edit"}
     assert {row["text_value"] for row in _rows(target, "SELECT text_value FROM history_event_copies") if row["text_value"]} == {"one", "two", "edited"}
     assert "2" in {row["revision"] for row in _rows(target, "SELECT revision FROM history_event_details")}
+
+
+def test_current_retention_and_revocation_follow_only_exact_compatible_aliases(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "synthetic-collection"
+    sources = [
+        _write_source(root, name, events=[_event("shared-source-id", native_id, text)])
+        for name, native_id, text in (
+            ("a", "shared-native-id", "original"),
+            ("b", "shared-native-id", "variant one"),
+            ("c", "shared-native-id", "variant two"),
+            ("d", "other-native-id", "other identity"),
+        )
+    ]
+    target = tmp_path / "synthetic-rebuilt"
+
+    report = rebuild_history(collection=_collection(root, *sources), target_home=target)
+
+    assert report["conflict_count"] == 3
+    with HistoricalJournal(target, create=False) as journal:
+        rows = _rows(
+            target,
+            "SELECT DISTINCT a.canonical_event_id,a.canonical_revision,c.native_id "
+            "FROM history_event_aliases a JOIN history_event_copies c "
+            "ON c.event_id=a.canonical_event_id AND c.revision=a.canonical_revision "
+            "AND c.source_id=a.source_id AND c.locator_json=a.locator_json "
+            "WHERE a.source_event_id=? AND a.canonical_event_id<>?",
+            ("shared-source-id", "shared-source-id"),
+        )
+        shared = [row for row in rows if row["native_id"] == "shared-native-id"]
+        other = [row for row in rows if row["native_id"] == "other-native-id"]
+        assert len(shared) == 2
+        assert len(other) == 1
+        first, sibling = shared
+        authority = HistorySourceAuthority(journal)
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=? WHERE event_id=? AND revision=?",
+                (_WHEN + 1, other[0]["canonical_event_id"], other[0]["canonical_revision"]),
+            )
+        scope = ("whatsapp", "acct-a", "chat-a@g.us")
+        assert not authority.current_retention_denied(
+            first["canonical_event_id"], int(first["canonical_revision"]), scope=scope
+        ), "A different native identity must not taint this source"
+
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=? WHERE event_id=? AND revision=?",
+                (_WHEN + 2, sibling["canonical_event_id"], sibling["canonical_revision"]),
+            )
+        assert authority.current_retention_denied(
+            first["canonical_event_id"], int(first["canonical_revision"]), scope=scope
+        ), "Current marker did not reach the exact-compatible sibling"
+
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE events SET payload_purged_ms=NULL WHERE event_id=? AND revision=?",
+                (sibling["canonical_event_id"], sibling["canonical_revision"]),
+            )
+        first_source = SourceRef(
+            str(first["canonical_event_id"]), int(first["canonical_revision"]),
+            "whatsapp", "chat-a@g.us", "whatsapp:alice", _WHEN,
+        )
+        audience = EvidenceAudience.known(frozenset({"whatsapp:alice", "whatsapp:bob"}))
+        reader = HistoryReader.__new__(HistoryReader)
+        reader.journal = journal
+        with journal.store._lock:
+            detail = journal.store._conn.execute(
+                "SELECT normalized_json FROM history_event_details WHERE event_id=? AND revision=?",
+                (first_source.event_id, str(first_source.revision)),
+            ).fetchone()
+        assert detail is not None
+        event = json.loads(detail["normalized_json"])
+        other_source = SourceRef(
+            str(other[0]["canonical_event_id"]), int(other[0]["canonical_revision"]),
+            "whatsapp", "chat-a@g.us", "whatsapp:alice", _WHEN,
+        )
+        journal.store.upsert_event_source_authority(
+            source=other_source, audience=audience, now_ms=_WHEN + 3
+        )
+        with journal.store._write() as connection:
+            connection.execute(
+                "UPDATE event_source_authority SET revoked_at_ms=?,revoking_event_id=? "
+                "WHERE event_id=? AND revision=?",
+                (
+                    _WHEN + 4,
+                    "evt-revoke",
+                    other_source.event_id,
+                    other_source.revision,
+                ),
+            )
+        assert not reader._event_denied(
+            first_source.event_id, str(first_source.revision), event
+        ), "Current source revocation crossed an unrelated native identity"
+
+        sibling_source = SourceRef(
+            str(sibling["canonical_event_id"]), int(sibling["canonical_revision"]),
+            "whatsapp", "chat-a@g.us", "whatsapp:alice", _WHEN,
+        )
+        journal.store.upsert_event_source_authority(
+            source=sibling_source, audience=audience, now_ms=_WHEN + 5
+        )
+        with journal.store._write() as connection:
+            updated = connection.execute(
+                "UPDATE event_source_authority SET revoked_at_ms=?,revoking_event_id=? "
+                "WHERE event_id=? AND revision=?",
+                (
+                    _WHEN + 6,
+                    "evt-revoke",
+                    sibling_source.event_id,
+                    sibling_source.revision,
+                ),
+            )
+            assert updated.rowcount == 1
+        assert reader._event_denied(
+            first_source.event_id, str(first_source.revision), event
+        ), "Current source revocation on an exact-compatible sibling did not deny reader output"
+        assert authority.source_revoked(
+            first_source
+        ), "Current source revocation did not reach the exact-compatible sibling"
 
 
 def test_delete_before_message_and_unresolved_delete_are_reported(tmp_path: Path) -> None:

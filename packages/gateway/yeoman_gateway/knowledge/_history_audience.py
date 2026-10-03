@@ -283,6 +283,13 @@ class HistoryAudience:
         raw_native = list(_evidence_items(event.get("native_evidence")))
         raw_native.extend(_evidence_items(native_evidence))
         candidates = self._native_proofs(event, scope, moment, raw_native)
+        # Reconcile against the journal's current source authority as well as the
+        # immutable rebuild snapshot.  A roster attestation is a disclosure proof; it
+        # must not replace a still-valid native proof, and source revocation must win
+        # over a copied, formerly eligible proof row.
+        current_native = self._source_authority_proof(event, scope, moment)
+        if current_native is not None:
+            candidates.append(current_native)
         with self.journal.store._lock:
             rows = self.journal.store._conn.execute(
                 """
@@ -327,6 +334,97 @@ class HistoryAudience:
             valid_from_ms=selected.valid_from_ms,
             valid_until_ms=selected.valid_until_ms,
             proof_id=selected.proof_id,
+        )
+
+    def _source_authority_proof(
+        self,
+        event: Mapping[str, Any],
+        scope: tuple[str, str, str],
+        moment: int,
+    ) -> AudienceProof | None:
+        event_id = _text(event.get("event_id"))
+        revision = _integer(event.get("revision"))
+        if event_id is None or revision is None or revision < 1:
+            return None
+        authority = self.journal.store.get_event_source_authority(event_id, revision)
+        if (
+            authority is None
+            or authority.get("revoked_at_ms") is not None
+            or authority.get("source_channel") != scope[0]
+            or authority.get("source_chat_id") != scope[2]
+            or _integer(authority.get("occurred_at_ms")) != moment
+        ):
+            return None
+        author = _text(authority.get("author_principal"))
+        status = str(authority.get("audience_status") or "unknown")
+        try:
+            members = _member_set(authority.get("audience_members") or ())
+        except (TypeError, ValueError):
+            return None
+        if status == "known" and not members:
+            return None
+        if status == "author_only":
+            if event.get("chat_kind") not in _DIRECT_CHAT_KINDS or author is None:
+                return None
+            members = frozenset({author})
+        elif status != "known":
+            return None
+
+        with self.journal.store._lock:
+            rows = self.journal.store._conn.execute(
+                "SELECT p.source_id,p.locator_json,p.author_principal,p.channel,p.chat_id,"
+                "p.occurred_ms,c.channel AS copy_channel,c.account,c.chat_id AS copy_chat_id "
+                "FROM history_source_proofs p JOIN history_event_copies c "
+                "ON c.event_id=p.event_id AND c.revision=p.revision "
+                "AND c.source_id=p.source_id AND c.locator_json=p.locator_json "
+                "WHERE p.event_id=? AND p.revision=? AND p.eligible=1 "
+                "AND p.revoked_at_ms IS NULL AND c.channel=? AND c.account=? AND c.chat_id=? "
+                "AND c.disposition<>'denied'",
+                (event_id, str(revision), *scope),
+            ).fetchall()
+        if not rows:
+            return None
+        refs: list[dict[str, Any]] = []
+        for row in rows:
+            if (
+                row["author_principal"] != author
+                or row["channel"] != scope[0]
+                or row["chat_id"] != scope[2]
+                or _integer(row["occurred_ms"]) != moment
+                or row["copy_channel"] != scope[0]
+                or row["account"] != scope[1]
+                or row["copy_chat_id"] != scope[2]
+            ):
+                continue
+            try:
+                locator = json.loads(str(row["locator_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(locator, Mapping):
+                continue
+            refs.append(
+                {
+                    "source_id": str(row["source_id"]),
+                    "event_id": event_id,
+                    "revision": revision,
+                    "locator": dict(locator),
+                }
+            )
+        if not refs:
+            return None
+        proof_id = str(authority.get("audience_snapshot_id") or "") or None
+        if proof_id is None:
+            proof_id = "native-source-" + hashlib.sha256(
+                json.dumps(refs, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:24]
+        return AudienceProof(
+            status="author_only" if status == "author_only" else "known",
+            evidence_class="native_source_authority",
+            members=members,
+            source_refs=tuple(refs),
+            valid_from_ms=moment,
+            valid_until_ms=moment + 1,
+            proof_id=proof_id,
         )
 
     @staticmethod

@@ -534,7 +534,8 @@ class HistorySourceAuthority(RuntimeKnowledgeSources):
     def _usable_source(self, event_id: str, revision: int) -> SourceRef | None:
         with self.journal.store._lock:
             aliases = self.journal.store._conn.execute(
-                "SELECT DISTINCT a.canonical_event_id,a.canonical_revision,"
+                "SELECT DISTINCT a.canonical_event_id,a.canonical_revision,a.source_id,"
+                "a.locator_json,"
                 "c.channel,c.account,c.chat_id,c.native_id "
                 "FROM history_event_aliases a LEFT JOIN history_event_copies c "
                 "ON c.event_id=a.canonical_event_id AND c.revision=a.canonical_revision "
@@ -553,8 +554,40 @@ class HistorySourceAuthority(RuntimeKnowledgeSources):
             }
             if len(targets) != 1 or len(scopes) != 1:
                 return None
+            target_id, target_revision = next(iter(targets))
+            channel, account, chat_id, native_id = next(iter(scopes))
+            alias_refs = {
+                (str(row["source_id"]), str(row["locator_json"])) for row in aliases
+            }
+        else:
+            target_id, target_revision = str(event_id), str(revision)
+            alias_refs = set()
+            with self.journal.store._lock:
+                direct_scopes = self.journal.store._conn.execute(
+                    "SELECT DISTINCT channel,account,chat_id,native_id "
+                    "FROM history_event_copies "
+                    "WHERE event_id=? AND revision=?",
+                    (target_id, target_revision),
+                ).fetchall()
+            scopes = {
+                (row["channel"], row["account"], row["chat_id"], row["native_id"])
+                for row in direct_scopes
+            }
+            if len(scopes) != 1:
+                return None
+            channel, account, chat_id, native_id = next(iter(scopes))
+        if not all(
+            isinstance(item, str) and item
+            for item in (channel, account, chat_id, native_id)
+        ):
+            return None
         rows = self._proofs(event_id, revision)
         if not rows or any(not int(row["eligible"]) or row["revoked_at_ms"] is not None for row in rows):
+            return None
+        proven_refs = {
+            (str(row["source_id"]), str(row["locator_json"])) for row in rows
+        }
+        if alias_refs and not alias_refs.intersection(proven_refs):
             return None
         identities = {
             (row["author_principal"], row["channel"], row["chat_id"], row["occurred_ms"])
@@ -564,6 +597,23 @@ class HistorySourceAuthority(RuntimeKnowledgeSources):
             return None
         author, channel, chat_id, occurred = next(iter(identities))
         if not author or not channel or not chat_id or occurred in (None, 0):
+            return None
+        current = self.journal.store.get_event_source_authority(
+            target_id, int(target_revision)
+        )
+        if (
+            current is None
+            or current.get("revoked_at_ms") is not None
+            or current.get("author_principal") != author
+            or current.get("source_channel") != channel
+            or current.get("source_chat_id") != chat_id
+            or current.get("occurred_at_ms") != occurred
+        ):
+            return None
+        scope = (str(channel), str(account), str(chat_id))
+        if self.current_retention_denied(
+            target_id, int(target_revision), scope=scope, native_id=native_id
+        ):
             return None
         try:
             return SourceRef(event_id, int(revision), str(channel), str(chat_id), str(author), int(occurred))
@@ -576,36 +626,280 @@ class HistorySourceAuthority(RuntimeKnowledgeSources):
     def verify_source(self, source: SourceRef) -> bool:
         return self._usable_source(source.event_id, source.revision) == source
 
-    def source_revoked(self, source: SourceRef) -> bool:
-        rows = self._proofs(source.event_id, source.revision)
+    def _source_scope(
+        self, event_id: str, revision: int
+    ) -> tuple[str, str, str] | None:
         with self.journal.store._lock:
-            denial = self.journal.store._conn.execute(
-                "SELECT 1 FROM history_denials WHERE event_id=? AND revision=? LIMIT 1",
-                (source.event_id, str(source.revision)),
+            rows = self.journal.store._conn.execute(
+                "SELECT DISTINCT c.channel,c.account,c.chat_id "
+                "FROM history_event_aliases a JOIN history_event_copies c "
+                "ON c.event_id=a.canonical_event_id AND c.revision=a.canonical_revision "
+                "AND c.source_id=a.source_id AND c.locator_json=a.locator_json "
+                "WHERE a.source_event_id=? AND a.source_revision=? "
+                "AND c.disposition<>'denied'",
+                (str(event_id), str(revision)),
+            ).fetchall()
+            if not rows:
+                rows = self.journal.store._conn.execute(
+                    "SELECT DISTINCT channel,account,chat_id FROM history_event_copies "
+                    "WHERE event_id=? AND revision=? AND disposition<>'denied'",
+                    (str(event_id), str(revision)),
+                ).fetchall()
+        scopes = {
+            (row["channel"], row["account"], row["chat_id"]) for row in rows
+        }
+        if len(scopes) != 1:
+            return None
+        scope = next(iter(scopes))
+        return scope if all(isinstance(item, str) and item for item in scope) else None
+
+    def _compatible_source_keys(
+        self,
+        event_id: str,
+        revision: int,
+        *,
+        scope: tuple[str, str, str],
+        native_id: str | None = None,
+    ) -> tuple[set[tuple[str, int]], str | None] | None:
+        """Expand only aliases sharing the exact transport-native identity."""
+        seed = (str(event_id), revision)
+        with self.journal.store._lock:
+            connection = self.journal.store._conn
+            identities = connection.execute(
+                "SELECT DISTINCT c.native_id FROM history_event_copies c "
+                "WHERE c.event_id=? AND c.revision=? AND c.channel=? AND c.account=? "
+                "AND c.chat_id=? AND c.disposition<>'denied' "
+                "UNION SELECT DISTINCT c.native_id FROM history_event_aliases a "
+                "JOIN history_event_copies c ON c.event_id=a.canonical_event_id "
+                "AND c.revision=a.canonical_revision AND c.source_id=a.source_id "
+                "AND c.locator_json=a.locator_json "
+                "WHERE a.source_event_id=? AND a.source_revision=? AND c.channel=? "
+                "AND c.account=? AND c.chat_id=? AND c.disposition<>'denied'",
+                (seed[0], str(revision), *scope, seed[0], str(revision), *scope),
+            ).fetchall()
+            native_ids = {
+                str(row["native_id"])
+                for row in identities
+                if isinstance(row["native_id"], str) and row["native_id"]
+            }
+            if native_id is not None and (
+                not isinstance(native_id, str)
+                or not native_id
+                or (native_ids and native_id not in native_ids)
+            ):
+                return None
+            if native_id is None and len(native_ids) > 1:
+                return None
+            native_id = native_id or next(iter(native_ids), None)
+            keys = {seed}
+            if native_id is None:
+                return keys, None
+            pending = [seed]
+            while pending:
+                current_id, current_revision = pending.pop()
+                rows = connection.execute(
+                    "SELECT DISTINCT a.source_event_id,a.source_revision,"
+                    "a.canonical_event_id,a.canonical_revision "
+                    "FROM history_event_aliases a JOIN history_event_copies c "
+                    "ON c.event_id=a.canonical_event_id AND c.revision=a.canonical_revision "
+                    "AND c.source_id=a.source_id AND c.locator_json=a.locator_json "
+                    "WHERE ((a.source_event_id=? AND a.source_revision=?) OR "
+                    "(a.canonical_event_id=? AND a.canonical_revision=?)) "
+                    "AND c.channel=? AND c.account=? AND c.chat_id=? AND c.native_id=? "
+                    "AND c.disposition<>'denied'",
+                    (
+                        current_id,
+                        str(current_revision),
+                        current_id,
+                        str(current_revision),
+                        *scope,
+                        native_id,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        related = {
+                            (str(row["source_event_id"]), int(row["source_revision"])),
+                            (str(row["canonical_event_id"]), int(row["canonical_revision"])),
+                        }
+                    except (TypeError, ValueError):
+                        return None
+                    for key in related - keys:
+                        keys.add(key)
+                        pending.append(key)
+            return keys, native_id
+
+    def _event_matches_native_identity(
+        self,
+        event_id: str,
+        revision: int,
+        *,
+        scope: tuple[str, str, str],
+        native_id: str,
+    ) -> bool:
+        with self.journal.store._lock:
+            connection = self.journal.store._conn
+            row = connection.execute(
+                "SELECT source_message_id FROM events WHERE event_id=? AND revision=? "
+                "AND channel=? AND account=? AND chat_id=?",
+                (event_id, revision, *scope),
             ).fetchone()
-        return any(row["revoked_at_ms"] is not None for row in rows) or bool(denial)
+            if row is None:
+                return False
+            current_native = row["source_message_id"]
+            if current_native == native_id:
+                return True
+            if current_native != event_id:
+                return False
+            aliases = connection.execute(
+                "SELECT DISTINCT c.native_id FROM history_event_aliases a "
+                "JOIN history_event_copies c ON c.event_id=a.canonical_event_id "
+                "AND c.revision=a.canonical_revision AND c.source_id=a.source_id "
+                "AND c.locator_json=a.locator_json "
+                "WHERE a.source_event_id=? AND a.source_revision=? "
+                "AND c.channel=? AND c.account=? AND c.chat_id=? "
+                "AND c.disposition<>'denied'",
+                (event_id, str(revision), *scope),
+            ).fetchall()
+        identities = {
+            str(alias["native_id"])
+            for alias in aliases
+            if isinstance(alias["native_id"], str) and alias["native_id"]
+        }
+        return identities == {native_id}
+
+    def current_retention_denied(
+        self,
+        event_id: str,
+        revision: int,
+        *,
+        scope: tuple[str, str, str],
+        native_id: str | None = None,
+    ) -> bool:
+        """Check current canonical and compatible alias purge markers."""
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+            or len(scope) != 3
+            or any(not isinstance(item, str) or not item for item in scope)
+        ):
+            return True
+        compatible = self._compatible_source_keys(
+            event_id, revision, scope=scope, native_id=native_id
+        )
+        if compatible is None:
+            return True
+        keys, native_id = compatible
+        with self.journal.store._lock:
+            connection = self.journal.store._conn
+            for current_id, current_revision in keys:
+                sql = (
+                    "SELECT 1 FROM events WHERE event_id=? AND revision=? "
+                    "AND channel=? AND account=? AND chat_id=? "
+                    "AND payload_purged_ms IS NOT NULL"
+                )
+                params: tuple[object, ...] = (current_id, current_revision, *scope)
+                if connection.execute(sql + " LIMIT 1", params).fetchone():
+                    if native_id is None or self._event_matches_native_identity(
+                        current_id,
+                        current_revision,
+                        scope=scope,
+                        native_id=native_id,
+                    ):
+                        return True
+        return False
+
+    def current_source_denied(
+        self,
+        event_id: str,
+        revision: int,
+        *,
+        scope: tuple[str, str, str],
+        native_id: str | None = None,
+    ) -> bool:
+        """Check current retention and revocation negatives over exact aliases."""
+        compatible = self._compatible_source_keys(
+            event_id, revision, scope=scope, native_id=native_id
+        )
+        if compatible is None:
+            return True
+        keys, native_id = compatible
+        if native_id is None or self.current_retention_denied(
+            event_id, revision, scope=scope, native_id=native_id
+        ):
+            return True
+        with self.journal.store._lock:
+            for current_id, current_revision in keys:
+                if not self._event_matches_native_identity(
+                    current_id,
+                    current_revision,
+                    scope=scope,
+                    native_id=native_id,
+                ):
+                    continue
+                current = self.journal.store._conn.execute(
+                    "SELECT revoked_at_ms FROM event_source_authority "
+                    "WHERE event_id=? AND revision=?",
+                    (current_id, current_revision),
+                ).fetchone()
+                if current is not None and current["revoked_at_ms"] is not None:
+                    return True
+                if self.journal.store._conn.execute(
+                    "SELECT 1 FROM history_denials WHERE event_id=? AND revision=? LIMIT 1",
+                    (current_id, str(current_revision)),
+                ).fetchone():
+                    return True
+        return False
+
+    def source_revoked(self, source: SourceRef) -> bool:
+        proofs = self._proofs(source.event_id, source.revision)
+        scope = self._source_scope(source.event_id, source.revision)
+        if scope is None or self.current_source_denied(
+            source.event_id, source.revision, scope=scope
+        ):
+            return True
+        return any(row["revoked_at_ms"] is not None for row in proofs)
 
     def evidence_audience(self, source: SourceRef, *, basis: str) -> EvidenceAudience | None:
         del basis
         if not self.verify_source(source):
             return None
-        rows = self._proofs(source.event_id, source.revision)
-        members: set[str] | None = None
-        statuses: set[str] = set()
-        for row in rows:
-            status = str(row["audience_status"])
-            statuses.add(status)
-            try:
-                values = json.loads(row["audience_members_json"])
-            except json.JSONDecodeError:
-                values = []
-            current = set(values) if status == "known" and isinstance(values, list) else set()
-            if members is None:
-                members = current
+        with self.journal.store._lock:
+            aliases = self.journal.store._conn.execute(
+                "SELECT DISTINCT canonical_event_id,canonical_revision "
+                "FROM history_event_aliases WHERE source_event_id=? AND source_revision=?",
+                (source.event_id, str(source.revision)),
+            ).fetchall()
+            details: sqlite3.Row | None = None
+            if aliases:
+                targets = {
+                    (str(row["canonical_event_id"]), str(row["canonical_revision"]))
+                    for row in aliases
+                }
+                if len(targets) != 1:
+                    return None
+                canonical_id, canonical_revision = next(iter(targets))
             else:
-                members &= current
-        if statuses == {"author_only"}:
-            return EvidenceAudience.author_only()
-        if statuses == {"known"} and members:
-            return EvidenceAudience.known(frozenset(members))
+                canonical_id, canonical_revision = source.event_id, str(source.revision)
+            details = self.journal.store._conn.execute(
+                "SELECT normalized_json FROM history_event_details "
+                "WHERE event_id=? AND revision=?",
+                (canonical_id, canonical_revision),
+            ).fetchone()
+        if details is None:
+            return None
+        try:
+            event = json.loads(str(details["normalized_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return EvidenceAudience.unknown()
+        if not isinstance(event, dict):
+            return EvidenceAudience.unknown()
+        from ._history_audience import HistoryAudience
+
+        proof = HistoryAudience(self.journal).resolve(event)
+        if proof.status == "author_only":
+            return EvidenceAudience.author_only(snapshot_id=proof.proof_id)
+        if proof.status == "known" and proof.members:
+            return EvidenceAudience.known(proof.members, snapshot_id=proof.proof_id)
         return EvidenceAudience.unknown()
