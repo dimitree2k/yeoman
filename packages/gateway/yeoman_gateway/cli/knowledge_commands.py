@@ -684,6 +684,115 @@ def snapshot_restore_bundle(
         _fail("manifest_mismatch", ", ".join(report["errors"]))
 
 
+@snapshot_app.command("refresh")
+def snapshot_refresh(
+    sources: Path = typer.Option(..., "--sources", help="JSON file containing explicit source descriptors"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Acquire changed explicit sources and update the local provenance catalog."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, refresh_collection
+
+    try:
+        descriptors = json.loads(sources.read_text(encoding="utf-8"))
+        report = refresh_collection(sources=descriptors, target_dir=target_dir)
+    except (OSError, ValueError, SnapshotError) as exc:
+        message = exc.message if isinstance(exc, SnapshotError) else "cannot read source descriptor JSON"
+        _fail("source_error", message, getattr(exc, "code", "sources_invalid"))
+    _line(json.dumps(report, sort_keys=True))
+
+
+@snapshot_app.command("query")
+def snapshot_query(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+    source_id: str | None = typer.Option(None, "--source-id"),
+    chat: str | None = typer.Option(None, "--chat"),
+    record_type: str | None = typer.Option(None, "--record-type"),
+    native_id: str | None = typer.Option(None, "--native-id"),
+    original_after: str | None = typer.Option(None, "--original-after"),
+    original_before: str | None = typer.Option(None, "--original-before"),
+    creation_after: str | None = typer.Option(None, "--creation-after"),
+    creation_before: str | None = typer.Option(None, "--creation-before"),
+    unknown_dates: bool = typer.Option(False, "--unknown-dates"),
+) -> None:
+    """Query owner-local provenance metadata and preserved-copy locators."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, query_catalog
+
+    filters = {
+        key: value
+        for key, value in {
+            "source_id": source_id,
+            "chat": chat,
+            "record_type": record_type,
+            "native_id": native_id,
+            "original_after": original_after,
+            "original_before": original_before,
+            "creation_after": creation_after,
+            "creation_before": creation_before,
+            "unknown_dates": True if unknown_dates else None,
+        }.items()
+        if value is not None
+    }
+    try:
+        rows = query_catalog(target_dir=target_dir, filters=filters)
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(rows, indent=2, sort_keys=True))
+
+
+@snapshot_app.command("rebuild")
+def snapshot_rebuild(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Rebuild the disposable catalog from immutable bundle manifests."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, rebuild_catalog
+
+    try:
+        report = rebuild_catalog(target_dir=target_dir)
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(report, sort_keys=True))
+
+
+@snapshot_app.command("purge")
+def snapshot_purge(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+    source_id: str = typer.Option(..., "--source-id"),
+    yes: bool = typer.Option(False, "--yes", help="Apply the exact preview without prompting"),
+) -> None:
+    """Preview and confirm a local owner purge of every bundle containing a source."""
+    import json
+    import os
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, purge_collection
+
+    operator = str(os.getuid()) if hasattr(os, "getuid") else ""
+    try:
+        preview = purge_collection(
+            target_dir=target_dir,
+            source_id=source_id,
+            operator=operator,
+            confirmed=False,
+        )
+        _line(json.dumps(preview, indent=2, sort_keys=True))
+        if not yes and not typer.confirm("Permanently purge these source bundles?", default=False):
+            raise typer.Exit(1)
+        result = purge_collection(
+            target_dir=target_dir,
+            source_id=source_id,
+            operator=operator,
+            confirmed=True,
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(result, indent=2, sort_keys=True))
+
+
 @knowledge_app.command("benchmark")
 def knowledge_benchmark(
     target: Path = typer.Option(..., "--target", help="Scratch database path to use"),

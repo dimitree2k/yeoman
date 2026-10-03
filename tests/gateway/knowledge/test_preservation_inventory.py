@@ -214,7 +214,8 @@ def test_cold_live_sqlite_descriptor_inspects_wal_only_committed_row(tmp_path: P
 
     events = next(table for table in result["tables"] if table["name"] == "events")
     assert events["row_count"] == 1
-    assert result["records"][0]["native_id"] == "wal-only-row"
+    assert result["records"][0]["native_id"] is None
+    assert "wal-only-row" not in json.dumps(result["records"][0]["locator"])
 
 
 def test_restricted_source_omits_row_values_from_searchable_metadata(tmp_path: Path) -> None:
