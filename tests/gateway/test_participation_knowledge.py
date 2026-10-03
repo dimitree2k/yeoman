@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
 from yeoman_gateway.knowledge.authority import EvidenceAudience
 from yeoman_gateway.knowledge.models import (
@@ -14,7 +15,13 @@ from yeoman_gateway.knowledge.models import (
     TrustedCaptureContext,
     TrustedReadContext,
 )
-from yeoman_gateway.processing.participation_knowledge import ParticipationKnowledgeSelector
+from yeoman_gateway.processing.participation_knowledge import (
+    ParticipationKnowledgeInvalidatedError,
+    ParticipationKnowledgeReader,
+    ParticipationKnowledgeReaders,
+    ParticipationKnowledgeSelector,
+    reader_key,
+)
 
 from tests.gateway.capture_harness import AUTHOR, GROUP, CaptureHarness
 
@@ -491,3 +498,209 @@ def test_shared_fact_partial_revocation_changes_selection() -> None:
     assert current.revision != selected.revision
     assert "Gegessen wird um sieben." not in current.text
     assert memory.calls[-1]["revalidate"] is not None
+
+
+# -- multi-author protected recall -------------------------------------------------
+
+
+def _reader(principal: str):
+    """One verified reader over the same chat and the same current membership."""
+    return (
+        TrustedReadContext(
+            principal_id=principal,
+            channel="whatsapp",
+            chat_id=CHAT,
+            recipient_principals=MEMBERS,
+            membership_revision="membership-v3",
+            policy_revision=8,
+            purpose="proactive",
+            now_ms=NOW,
+        ),
+        FactReadContext(
+            principal_id=principal,
+            chat_scope_key=f"channel:whatsapp:chat:{CHAT}",
+            current_members=MEMBERS,
+            epoch=4,
+            now_ms=NOW,
+        ),
+    )
+
+
+def _multi_selector(per_reader):
+    """A store double whose knowledge and memory answers depend on the reader."""
+    knowledge = _PerReader(per_reader, "knowledge")
+    memory = _PerReader(per_reader, "memory")
+    return (
+        ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory),
+        knowledge,
+        memory,
+    )
+
+
+class _PerReader:
+    def __init__(self, per_reader, kind: str) -> None:
+        self._per_reader = per_reader
+        self._kind = kind
+        self.principals: list[str] = []
+
+    def _target(self, context):
+        principal = str(context.principal_id)
+        self.principals.append(principal)
+        target = self._per_reader[principal]
+        return target[0] if self._kind == "knowledge" else target[1]
+
+    def recall(self, query, **kwargs):
+        return self._target(kwargs["context"])
+
+    def revalidate(self, result, **kwargs):
+        return self._target(kwargs["context"])
+
+    def retrieve_for_context(self, **kwargs):
+        return self._target(kwargs["read_context"])
+
+    def revalidate_for_context(self, result, **kwargs):
+        return self._target(kwargs["read_context"])
+
+
+def _per_reader(*, alice_statements=(), bob_statements=(), shared_fact: str = ""):
+    def knowledge(text: str, statement_id: str) -> KnowledgeContext:
+        return KnowledgeContext(
+            text=text,
+            statement_ids=(statement_id,) if text else (),
+            source_refs=(
+                SourceRef(statement_id, 1, "whatsapp", CHAT, "alice", NOW - 86_400_000),
+            )
+            if text
+            else (),
+            context_revision=f"{statement_id}-r1",
+        )
+
+    def memory(text: str) -> FactRetrievalResult:
+        return FactRetrievalResult(
+            text=f"- {text}" if text else "",
+            hits=(
+                SimpleNamespace(entry=SimpleNamespace(id="fact-shared", content=text)),
+            )
+            if text
+            else (),
+            used_source_refs={"fact-shared": (("ev-shared", 1),)} if text else {},
+        )
+
+    return {
+        "alice": (knowledge(alice_statements, "stmt-alice"), memory(shared_fact)),
+        "bob": (knowledge(bob_statements, "stmt-bob"), memory(shared_fact)),
+    }
+
+
+def test_multi_author_selection_keeps_only_the_common_records() -> None:
+    """An entry only one author may read is dropped, never unioned."""
+    per_reader = _per_reader(
+        alice_statements="Alice only hears this.",
+        bob_statements="Bob only hears this.",
+        shared_fact="Both hear this.",
+    )
+    selector, knowledge, memory = _multi_selector(per_reader)
+    readers = ParticipationKnowledgeReaders(readers=(
+        ParticipationKnowledgeReader(*_reader("alice")),
+        ParticipationKnowledgeReader(*_reader("bob")),
+    ))
+
+    selected = selector.select_for_readers(query="topic", readers=readers)
+
+    assert "Alice only hears this." not in selected.text
+    assert "Bob only hears this." not in selected.text
+    assert "Both hear this." in selected.text
+    assert sorted(knowledge.principals) == ["alice", "bob"]
+    assert selected.reader_keys == tuple(
+        sorted(reader_key(*_reader(principal)) for principal in ("alice", "bob"))
+    )
+
+
+def test_multi_author_selection_is_independent_of_author_order() -> None:
+    per_reader = _per_reader(shared_fact="Both hear this.")
+    selector, _knowledge, _memory = _multi_selector(per_reader)
+    alice = ParticipationKnowledgeReader(*_reader("alice"))
+    bob = ParticipationKnowledgeReader(*_reader("bob"))
+
+    forward = selector.select_for_readers(
+        query="topic", readers=ParticipationKnowledgeReaders(readers=(alice, bob))
+    )
+    reverse = selector.select_for_readers(
+        query="topic", readers=ParticipationKnowledgeReaders(readers=(bob, alice))
+    )
+
+    assert forward.text == reverse.text == "- Both hear this."
+    assert forward.records == reverse.records
+    assert forward.revision == reverse.revision
+
+
+def test_multi_author_selection_reads_a_repeated_author_once() -> None:
+    per_reader = _per_reader(shared_fact="Both hear this.")
+    selector, knowledge, _memory = _multi_selector(per_reader)
+    alice = ParticipationKnowledgeReader(*_reader("alice"))
+
+    selected = selector.select_for_readers(
+        query="topic", readers=ParticipationKnowledgeReaders(readers=(alice, alice))
+    )
+
+    assert selected.text == "- Both hear this."
+    assert knowledge.principals == ["alice"]
+
+
+def test_revalidation_for_readers_rejects_a_changed_record() -> None:
+    per_reader = _per_reader(shared_fact="Both hear this.")
+    selector, _knowledge, _memory = _multi_selector(per_reader)
+    readers = ParticipationKnowledgeReaders(readers=(
+        ParticipationKnowledgeReader(*_reader("alice")),
+        ParticipationKnowledgeReader(*_reader("bob")),
+    ))
+    selected = selector.select_for_readers(query="topic", readers=readers)
+
+    per_reader["bob"] = (
+        per_reader["bob"][0],
+        FactRetrievalResult(
+            text="- Both hear this, restated.",
+            hits=(
+                SimpleNamespace(
+                    entry=SimpleNamespace(id="fact-shared", content="Both hear this, restated.")
+                ),
+            ),
+            used_source_refs={"fact-shared": (("ev-shared", 1),)},
+        ),
+    )
+    changed = selector.select_for_readers(query="topic", readers=readers)
+
+    assert changed.records != selected.records
+    with pytest.raises(ParticipationKnowledgeInvalidatedError):
+        selector.revalidate_for_readers(selected, readers=readers)
+
+
+def test_revalidation_for_readers_rejects_a_departed_author() -> None:
+    per_reader = _per_reader(shared_fact="Both hear this.")
+    selector, _knowledge, _memory = _multi_selector(per_reader)
+    readers = ParticipationKnowledgeReaders(readers=(
+        ParticipationKnowledgeReader(*_reader("alice")),
+        ParticipationKnowledgeReader(*_reader("bob")),
+    ))
+    selected = selector.select_for_readers(query="topic", readers=readers)
+
+    alice_only = ParticipationKnowledgeReaders(
+        readers=(ParticipationKnowledgeReader(*_reader("alice")),)
+    )
+    with pytest.raises(ParticipationKnowledgeInvalidatedError):
+        selector.revalidate_for_readers(selected, readers=alice_only)
+
+
+def test_revalidation_for_readers_accepts_an_unchanged_selection() -> None:
+    per_reader = _per_reader(shared_fact="Both hear this.")
+    selector, _knowledge, _memory = _multi_selector(per_reader)
+    readers = ParticipationKnowledgeReaders(readers=(
+        ParticipationKnowledgeReader(*_reader("alice")),
+        ParticipationKnowledgeReader(*_reader("bob")),
+    ))
+    selected = selector.select_for_readers(query="topic", readers=readers)
+
+    current = selector.revalidate_for_readers(selected, readers=readers)
+
+    assert current.records == selected.records
+    assert current.text == selected.text

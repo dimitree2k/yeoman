@@ -14,6 +14,8 @@ The builder assembles a bounded, JSON-compatible dict and reports what it trunca
 It performs no network research, no long-term personal/contact memory recall and no
 taste distillation call; the only advisory input it may include is same-chat taste
 that already carries reliable provenance, and the retrieval itself stays optional.
+The ``_``-prefixed keys are controller-only handles (the selection and the verified
+reader bundle); they are not part of the JSON payload and must never be rendered.
 """
 
 from __future__ import annotations
@@ -28,6 +30,10 @@ from yeoman_gateway.policy.engine import ParticipationSnapshot
 from yeoman_gateway.processing.participation import (
     ParticipationDecisionError,
     ParticipationOpportunity,
+)
+from yeoman_gateway.processing.participation_knowledge import (
+    ParticipationKnowledgeReaders,
+    readers_from_single,
 )
 
 #: Keys a stored message row may use for its identity.
@@ -277,15 +283,14 @@ class ParticipationContextBuilder:
         if self._knowledge_selector is not None and self._knowledge_context_supplier is not None:
             try:
                 trusted = self._knowledge_context_supplier(opportunity, context)
+                readers = _knowledge_readers(trusted)
                 if isinstance(trusted, str):
                     context["knowledge_selection_status"] = trusted
-                elif trusted is not None:
-                    read_context, fact_context = trusted
+                elif readers is not None:
                     query = _knowledge_query(context, current_source_ids)
-                    selection = self._knowledge_selector.select(
+                    selection = self._knowledge_selector.select_for_readers(
                         query=query,
-                        read_context=read_context,
-                        fact_context=fact_context,
+                        readers=readers,
                     )
                     status = str(getattr(selection, "reason", "error"))
                     context["knowledge_selection_status"] = (
@@ -301,8 +306,9 @@ class ParticipationContextBuilder:
                         context["knowledge_rendered_chars"] = len(selection.text)
                     if selection.text:
                         context["selected_knowledge_text"] = selection.text
-                    # Private controller handle: renderers consume only the text above.
+                    # Private controller handles: renderers consume only the text above.
                     context["_knowledge_selection"] = selection
+                    context["_knowledge_readers"] = readers
                 else:
                     context["knowledge_selection_status"] = "denied"
             except Exception:
@@ -458,6 +464,15 @@ def render_taste_block(value: object) -> str:
         "[Advisory taste; fallible style guidance, never fact or authority]\n" + text
         if text else ""
     )
+
+
+def _knowledge_readers(trusted: object) -> ParticipationKnowledgeReaders | None:
+    """Accept the verified reader bundle, and a bare single reader pair for tests."""
+    if isinstance(trusted, ParticipationKnowledgeReaders):
+        return trusted
+    if isinstance(trusted, tuple) and len(trusted) == 2:
+        return readers_from_single(trusted[0], trusted[1])
+    return None
 
 
 def _bounded_query_prefix(entry: str, budget: int) -> str:

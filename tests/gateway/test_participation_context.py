@@ -685,6 +685,14 @@ async def test_context_attaches_only_rendered_selection_with_bounded_source_quer
                 facts=SimpleNamespace(used_source_refs={"private-fact-id": ()}),
             )
 
+        def select_for_readers(self, *, query, readers):
+            reader = readers.readers[0]
+            return self.select(
+                query=query,
+                read_context=reader.read_context,
+                fact_context=reader.fact_context,
+            )
+
     builder = ParticipationContextBuilder(
         archive=archive,
         policy=PolicyEngine(_policy(), workspace=tmp_path),

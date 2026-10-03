@@ -83,10 +83,11 @@ if TYPE_CHECKING:
     from yeoman_shared.config.schema import Config, ExecToolConfig
 
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
-    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
-    from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeReaders,
+    )
     from yeoman_gateway.processing.store import ProcessingStore
     from yeoman_gateway.providers.base import LLMProvider
     from yeoman_gateway.short_reply.reactor import ShortReplyReactor
@@ -992,17 +993,27 @@ def _offer_participation_trigger(
     return None
 
 
-def _participation_knowledge_contexts(
+def _participation_knowledge_readers(
     opportunity: object,
     context: Mapping[str, object],
     *,
     chat_registry: object,
     knowledge: object,
-) -> tuple[TrustedReadContext, FactReadContext] | str:
-    """Build protected reader contexts only from verified trigger authors and members."""
+) -> ParticipationKnowledgeReaders | str:
+    """Build protected reader contexts only from verified trigger authors and members.
+
+    Every distinct trigger author gets its own verified reader against the whole
+    current recipient set. A coalesced multi-author trigger is no longer downgraded
+    to recent-only: the selector intersects the authors' protected reads instead, so
+    no author's rights are borrowed and none are unioned.
+    """
     from yeoman_gateway.knowledge._memory.read_gate import registry_members
     from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_gateway.knowledge.models import TrustedReadContext
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeReader,
+        ParticipationKnowledgeReaders,
+    )
 
     channel = str(getattr(opportunity, "channel", ""))
     chat_id = str(getattr(opportunity, "chat_id", ""))
@@ -1021,47 +1032,51 @@ def _participation_knowledge_contexts(
         str(rows.get(str(source_id), {}).get("sender_id") or "").strip()
         for source_id in source_ids
     }
-    # One principal is supported by the current protected-reader contract. A coalesced
-    # multi-author trigger stays recent-only instead of borrowing one author's rights.
     if not source_ids or "" in authors:
         return "source_unavailable"
-    if len(authors) != 1:
-        return "multi_author"
     try:
         members = frozenset(registry_members(chat_registry, channel=channel, chat_id=chat_id))
     except Exception:
         return "unknown_membership"
-    principal = next(iter(authors))
     if not members:
         return "unknown_membership"
-    if principal not in members:
-        return "denied"
     policy_revision = getattr(knowledge, "policy_revision", 0)
     if isinstance(policy_revision, bool) or not isinstance(policy_revision, int) or policy_revision < 0:
         return "error"
     member_revision = hashlib.sha256("\0".join(sorted(members)).encode()).hexdigest()
     now = int(time.time() * 1000)
-    read_context = TrustedReadContext(
-        principal_id=principal,
-        channel=channel,
-        chat_id=chat_id,
-        recipient_principals=members,
-        membership_revision=member_revision,
-        policy_revision=policy_revision,
-        purpose="proactive",
-        now_ms=now,
-        is_direct=False,
-        owner=False,
-    )
-    fact_context = FactReadContext(
-        principal_id=principal,
-        chat_scope_key=read_context.scope_key(),
-        current_members=members,
-        now_ms=now,
-        owner=False,
-        group_wide=True,
-    )
-    return read_context, fact_context
+    readers: list[ParticipationKnowledgeReader] = []
+    for principal in sorted(authors):
+        # Any trigger author who is not a current member fails the whole read closed;
+        # the remaining authors must not cover for a departed one.
+        if principal not in members:
+            return "denied"
+        read_context = TrustedReadContext(
+            principal_id=principal,
+            channel=channel,
+            chat_id=chat_id,
+            recipient_principals=members,
+            membership_revision=member_revision,
+            policy_revision=policy_revision,
+            purpose="proactive",
+            now_ms=now,
+            is_direct=False,
+            owner=False,
+        )
+        readers.append(
+            ParticipationKnowledgeReader(
+                read_context,
+                FactReadContext(
+                    principal_id=principal,
+                    chat_scope_key=read_context.scope_key(),
+                    current_members=members,
+                    now_ms=now,
+                    owner=False,
+                    group_wide=True,
+                ),
+            )
+        )
+    return ParticipationKnowledgeReaders(readers=tuple(readers))
 
 
 def _participation_taste_opted_in(
@@ -1193,7 +1208,7 @@ def _build_participation_runtime(
         def _knowledge_contexts(
             opportunity: object, context: Mapping[str, object]
         ) -> Any:
-            return _participation_knowledge_contexts(
+            return _participation_knowledge_readers(
                 opportunity, context, chat_registry=chat_registry, knowledge=knowledge
             )
 
@@ -1203,11 +1218,9 @@ def _build_participation_runtime(
             opportunity: object, context: Mapping[str, object], selection: object
         ) -> Any:
             trusted = _knowledge_contexts(opportunity, context)
-            if not isinstance(trusted, tuple) or len(trusted) != 2:
+            if not isinstance(trusted, ParticipationKnowledgeReaders):
                 raise RuntimeError("current knowledge authority unavailable")
-            return selector.revalidate(
-                selection, read_context=trusted[0], fact_context=trusted[1]
-            )
+            return selector.revalidate_for_readers(selection, readers=trusted)
 
         revalidate_knowledge = _revalidate_knowledge
 

@@ -16,7 +16,7 @@ from yeoman_gateway.app.bootstrap import (
     _build_participation_runtime,
     _has_pending_participation_recovery,
     _offer_participation_trigger,
-    _participation_knowledge_contexts,
+    _participation_knowledge_readers,
     build_effect_router,
     build_gateway_runtime,
     build_reconciliation_service,
@@ -45,20 +45,50 @@ def test_participation_knowledge_context_uses_verified_single_source_author() ->
             "metadata": {"participants": ["anna", "ben"]}
         }
     )
-    read, facts = _participation_knowledge_contexts(
+    readers = _participation_knowledge_readers(
         opportunity, context, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
     )
+    assert readers.principals == ("anna",)
+    read, facts = readers.readers[0].read_context, readers.readers[0].fact_context
     assert read.principal_id == facts.principal_id == "anna"
     assert read.purpose == "proactive" and read.owner is False and facts.owner is False
     assert read.recipient_principals == facts.current_members == frozenset({"anna", "ben"})
 
-    mixed = {"messages": [
-        {"event_id": "m1", "sender_id": "anna"},
-        {"event_id": "m2", "sender_id": "ben"},
+
+def test_participation_knowledge_context_covers_every_trigger_author() -> None:
+    """A coalesced multi-author trigger gets one verified reader per distinct author."""
+    opportunity = SimpleNamespace(
+        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1", "m2", "m3")
+    )
+    registry = SimpleNamespace(
+        get_chat=lambda channel, chat: {
+            "metadata": {"participants": ["anna", "ben", "carla"]}
+        }
+    )
+    knowledge = SimpleNamespace(policy_revision=7)
+    shared = {"messages": [
+        {"event_id": "m1", "sender_id": "ben"},
+        {"event_id": "m2", "sender_id": "anna"},
+        {"event_id": "m3", "sender_id": "ben"},
     ]}
-    assert _participation_knowledge_contexts(
-        opportunity, mixed, chat_registry=registry, knowledge=SimpleNamespace(policy_revision=7)
-    ) == "multi_author"
+    readers = _participation_knowledge_readers(
+        opportunity, shared, chat_registry=registry, knowledge=knowledge
+    )
+    # Sorted, distinct: a repeated author is not read twice, and order cannot matter.
+    assert readers.principals == ("anna", "ben")
+    for reader in readers.readers:
+        assert reader.read_context.recipient_principals == frozenset({"anna", "ben", "carla"})
+        assert reader.fact_context.current_members == frozenset({"anna", "ben", "carla"})
+
+    # An author who is not a current member fails the whole read closed.
+    departed = {"messages": [
+        {"event_id": "m1", "sender_id": "anna"},
+        {"event_id": "m2", "sender_id": "mallory"},
+        {"event_id": "m3", "sender_id": "ben"},
+    ]}
+    assert _participation_knowledge_readers(
+        opportunity, departed, chat_registry=registry, knowledge=knowledge
+    ) == "denied"
 
 
 def test_participation_knowledge_context_fails_closed_for_unverified_chat_types() -> None:
@@ -74,7 +104,7 @@ def test_participation_knowledge_context_fails_closed_for_unverified_chat_types(
         opportunity = SimpleNamespace(
             channel=channel, chat_id=chat_id, source_event_ids=("m1",)
         )
-        assert _participation_knowledge_contexts(
+        assert _participation_knowledge_readers(
             opportunity, context, chat_registry=registry, knowledge=knowledge
         ) == "unsupported_chat_type"
 
