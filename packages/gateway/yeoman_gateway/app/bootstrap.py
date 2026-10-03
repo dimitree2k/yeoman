@@ -2540,10 +2540,14 @@ def build_effect_router(
         admission = store.get_participation_admission(admission_id) if admission_id else None
         if admission is None:
             return False, "participation_admission_missing"
-        if knowledge_decision_validator is not None:
-            # A knowledge-backed approval must still be true at the transport boundary.
-            # Bound to this exact admission: no selection state is cached between
-            # effects, and an unavailable validator blocks the send.
+        # A knowledge-backed approval must still be true at the transport boundary. The
+        # check is bound to this exact admission: no selection state is cached between
+        # effects. Missing evidence means the draft was never knowledge-backed; evidence
+        # with no validator configured is an unverifiable approval and fails closed.
+        evidence = getattr(admission, "knowledge_evidence", None)
+        if evidence is not None or knowledge_decision_validator is not None:
+            if knowledge_decision_validator is None:
+                return False, "knowledge_approval_revalidation_unavailable"
             allowed, reason = knowledge_decision_validator(admission)
             if not allowed:
                 return False, f"knowledge_approval_{reason}"
