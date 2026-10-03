@@ -183,7 +183,11 @@ class ContactsService:
         """Mark contacts whose identifiers appear in the policy owner lists.
 
         *owner_map* is ``{"whatsapp": ["jid1", ...], "telegram": ["tid1", ...]}``.
+
+        The flag mirrors policy: a contact that policy no longer names loses it.  An
+        empty map is treated as a missing policy, never as a decision to demote everyone.
         """
+        marked: set[str] = set()
         for channel, jids in owner_map.items():
             for jid in jids:
                 contact = self.store.lookup_by_identifier(channel, jid)
@@ -196,7 +200,14 @@ class ContactsService:
                     )
                 if contact is not None:
                     self.store.set_owner(contact.id, is_owner=True)
+                    marked.add(contact.id)
                     logger.info("marked {} as owner ({})", contact.display_name, jid)
+        if not any(owner_map.values()):
+            return
+        for contact_id in self.store.owner_ids():
+            if contact_id not in marked:
+                self.store.set_owner(contact_id, is_owner=False)
+                logger.info("cleared a stale owner flag (contact {})", contact_id[:8])
 
     # ── fields ────────────────────────────────────────────────────────────
 

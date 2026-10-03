@@ -818,7 +818,9 @@ def _person_summary(connection: Any, person_id: str) -> dict[str, Any] | None:
     }
 
 
-def _open_admin_knowledge(db: Path | None, policy_path: Path | None) -> Any:
+def _open_admin_knowledge(
+    db: Path | None, policy_path: Path | None, *, evidence_refs: tuple[str, ...] = ()
+) -> Any:
     """Open the knowledge facade with the live Policy as admin authority.
 
     Admin authority comes from the policy file's owners, never from the command line.
@@ -834,10 +836,14 @@ def _open_admin_knowledge(db: Path | None, policy_path: Path | None) -> Any:
 
     config = load_config()
     policy = load_policy(policy_path)
+    sources = RuntimeKnowledgeSources()
+    for reference in evidence_refs:
+        # The owner's own statement, given on this command line, is the evidence.
+        sources.issue_evidence_ref(reference)
     return open_knowledge_store(
         Path(db or config.knowledge.db_path).expanduser(),
         workspace_id=workspace_id_for(config.workspace_path),
-        source_authority=RuntimeKnowledgeSources(),
+        source_authority=sources,
         policy_authority=RuntimeKnowledgePolicy(
             engine=policy,
             admin_principals=frozenset(getattr(policy, "admin_principals", frozenset())),
@@ -1093,6 +1099,130 @@ def knowledge_person_alias_restore(
     finally:
         knowledge.close()
     _line(f"restored alias {_redacted(payload.get('alias_id'))} to '{restored_to}'")
+
+
+def _binding_target(kind: str, value: str, namespace: str) -> Any:
+    from yeoman_gateway.knowledge.models import Identifier
+
+    try:
+        return Identifier("whatsapp", str(kind).strip(), str(value).strip(), namespace)
+    except Exception as exc:
+        _fail("invalid_input", str(getattr(exc, "code", "") or type(exc).__name__))
+
+
+def _active_binding(connection: Any, identifier: Any) -> Any:
+    return connection.execute(
+        "SELECT binding_id, person_id, mapping_verified FROM knowledge_identifier_bindings"
+        " WHERE channel = ? AND kind = ? AND namespace = ? AND value = ? AND status = 'active'",
+        identifier.full_key,
+    ).fetchone()
+
+
+@knowledge_app.command("person-binding-move")
+def knowledge_person_binding_move(
+    kind: str = typer.Option(..., "--kind", help="Identifier kind: phone_jid or lid"),
+    value: str = typer.Option(..., "--value", help="Full identifier, e.g. 123@lid"),
+    to: str = typer.Option(..., "--to", help="Person id that really owns the identifier"),
+    evidence: str = typer.Option(..., "--evidence", help="Owner statement or proof reference"),
+    namespace: str = typer.Option("default", "--namespace", help="Platform account"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the correction; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Correct a wrong binding: hand the identifier to its real owner (dry run by default).
+
+    The wrong binding is ended and kept as history; the identifier is bound to ``--to``
+    and the legacy projection follows.  Move it back the same way to undo.
+    """
+    identifier = _binding_target(kind, value, namespace)
+    target_id = str(to).strip()
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        current = _active_binding(connection, identifier)
+        target = _person_summary(connection, target_id)
+    finally:
+        connection.close()
+    if target is None:
+        _fail("unresolved", "unknown target person")
+    if current is None:
+        _fail("unresolved", "the identifier has no active binding to correct")
+    if str(current["person_id"]) == target_id:
+        _fail("invalid_input", "the identifier is already bound to the target")
+    _line(
+        f"  {identifier.kind} {_redacted(identifier.value)}: {_redacted(current['person_id'])}"
+        f" -> {_redacted(target_id)}"
+    )
+    if not apply:
+        _line("dry run: would move this binding as a correction; re-run with --apply to write")
+        return
+    knowledge = _open_admin_knowledge(db, policy, evidence_refs=(str(evidence),))
+    try:
+        receipt = knowledge.add_or_end_binding(
+            person_id=target_id,
+            identifier=identifier,
+            evidence_ref=str(evidence),
+            context=knowledge.admin_context_for(reason="cli_person_binding_move"),
+            mapping_verified=bool(int(current["mapping_verified"] or 0)),
+            end_binding_id=str(current["binding_id"]),
+            change_kind="correction",
+        )
+    except Exception as exc:
+        _fail("move_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(f"moved (operation {receipt.operation_id})")
+
+
+@knowledge_app.command("person-binding-add")
+def knowledge_person_binding_add(
+    kind: str = typer.Option(..., "--kind", help="Identifier kind: phone_jid or lid"),
+    value: str = typer.Option(..., "--value", help="Full identifier, e.g. 49...@s.whatsapp.net"),
+    to: str = typer.Option(..., "--to", help="Person id the identifier belongs to"),
+    evidence: str = typer.Option(..., "--evidence", help="Owner statement or proof reference"),
+    namespace: str = typer.Option("default", "--namespace", help="Platform account"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the binding; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Bind an unbound identifier to a person on the owner's word (dry run by default).
+
+    The binding is recorded as not bridge-verified.  An identifier that another person
+    holds is refused; correct that with person-binding-move instead.
+    """
+    identifier = _binding_target(kind, value, namespace)
+    target_id = str(to).strip()
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        current = _active_binding(connection, identifier)
+        target = _person_summary(connection, target_id)
+    finally:
+        connection.close()
+    if target is None:
+        _fail("unresolved", "unknown target person")
+    if current is not None:
+        _fail("identity_conflict", "the identifier is already bound; use person-binding-move")
+    _line(f"  {identifier.kind} {_redacted(identifier.value)} -> {_redacted(target_id)}")
+    if not apply:
+        _line("dry run: would add this binding; re-run with --apply to write")
+        return
+    knowledge = _open_admin_knowledge(db, policy, evidence_refs=(str(evidence),))
+    try:
+        receipt = knowledge.add_or_end_binding(
+            person_id=target_id,
+            identifier=identifier,
+            evidence_ref=str(evidence),
+            context=knowledge.admin_context_for(reason="cli_person_binding_add"),
+            mapping_verified=False,
+        )
+    except Exception as exc:
+        _fail("bind_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(f"bound (operation {receipt.operation_id})")
 
 
 @capture_app.command("status")

@@ -648,10 +648,12 @@ class KnowledgeService:
         valid_from_ms: int | None = None,
         end_binding_id: str | None = None,
         end_at_ms: int | None = None,
+        change_kind: str = "binding",
     ) -> ChangeReceipt:
         """Claim, extend or hand over one temporal identifier binding."""
         with self._store.transaction():
             return self._identity.add_or_end_binding(
+                change_kind=change_kind,
                 person_id=person_id,
                 identifier=identifier,
                 evidence_ref=evidence_ref,
