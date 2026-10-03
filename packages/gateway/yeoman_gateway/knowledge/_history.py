@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from yeoman_gateway.knowledge.authority import EvidenceAudience
 from yeoman_gateway.knowledge.models import SourceRef
@@ -438,7 +438,8 @@ class HistoricalJournal:
         unresolved_refs: list[dict[str, Any]],
         name_observations: list[dict[str, Any]],
         report: dict[str, Any],
-    ) -> None:
+        finalize_report: Callable[[sqlite3.Connection, dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Write rebuild-only lineage and set completion inside one target transaction."""
         statements = {
             "history_event_details": (
@@ -487,6 +488,8 @@ class HistoricalJournal:
                         sql,
                         [tuple(row.get(column) for column in columns) for row in rows],
                     )
+            if finalize_report is not None:
+                report = finalize_report(connection, report)
             connection.execute(
                 "INSERT OR REPLACE INTO history_meta (key,value) VALUES ('build_status','complete')"
             )
@@ -494,6 +497,7 @@ class HistoricalJournal:
                 "INSERT OR REPLACE INTO history_meta (key,value) VALUES ('build_report_json',?)",
                 (json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")),),
             )
+        return report
 
     def rebuild_state(self) -> dict[str, Any]:
         with self.store._lock:

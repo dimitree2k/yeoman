@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from yeoman_gateway.knowledge._history import HistoricalJournal, HistorySourceAuthority
+from yeoman_gateway.knowledge._history_adapters import read_catalogued_events
 from yeoman_gateway.knowledge._history_reader import HistoryReader
 from yeoman_gateway.knowledge._history_rebuild import (
     rebuild_history,
@@ -703,6 +704,45 @@ def test_curated_denial_binds_unique_legacy_source_id(tmp_path: Path) -> None:
     assert report["unresolved_count"] == 0
     with HistoricalJournal(target, create=False) as journal:
         assert HistorySourceAuthority(journal).verify_source_ref("legacy-node:existing-node", 1) is None
+
+
+def test_native_bridge_reference_tree_dispatches_by_verified_manifest_metadata(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "collection"
+    entry = _write_source(
+        root,
+        "src-98799c741f2a1eb5",
+        files={
+            "native-message.json": json.dumps({
+                "encoded": "bm90LWEtYnJpZGdlLXByb3Rv",
+                "chatJid": "chat-a@g.us",
+                "messageId": "native-1",
+            }),
+            "unrelated.json": json.dumps({
+                "message_id": "should-not-become-native",
+                "timestamp": 1_725_000_000,
+                "text": "ordinary metadata",
+            }),
+        },
+    )
+    entry.update(
+        kind="tree",
+        source_class="native",
+        source_path=str(tmp_path / "bridge" / "whatsapp-message-references"),
+    )
+    collection = _collection(root, entry)
+
+    events, report = read_catalogued_events(collection=collection)
+
+    assert len(events) == 1
+    assert events[0].source_kind == "bridge_reference"
+    assert events[0].native_id == "native-1"
+    assert events[0].provenance_class == "unknown"
+    assert events[0].account is None
+    assert report["parsed_count"] == 1
+    assert report["unresolved_count"] == 1
+    assert report["omitted_counts"]["bridge_reference_encoded_missing"] == 1
 
 
 def test_derived_only_cannot_certify_authority(tmp_path: Path) -> None:

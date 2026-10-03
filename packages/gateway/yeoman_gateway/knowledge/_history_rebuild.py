@@ -7,8 +7,9 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -61,6 +62,307 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+_SEMANTIC_COLUMNS = {
+    "canonical_events": (
+        "event_id", "event_key", "trace_id", "kind", "origin", "channel", "account", "chat_id",
+        "principal", "direction", "revision", "audience_ref", "source_message_id",
+        "target_message_id", "thread_id", "turn_id", "occurred_ms", "created_ms", "payload_hash",
+        "payload_json", "payload_purged_ms",
+    ),
+    "event_source_authority": (
+        "event_id", "revision", "author_principal", "source_channel", "source_chat_id",
+        "occurred_at_ms", "audience_status", "audience_members_json", "audience_snapshot_id",
+        "policy_revision", "revoked_at_ms", "revoking_event_id",
+    ),
+    "event_details": (
+        "event_id", "revision", "normalized_json", "semantic_kind", "semantic_direction",
+        "provenance_class", "retention_status", "text_hash", "denied",
+    ),
+    "event_copies": (
+        "event_id", "revision", "source_id", "source_hash", "locator_json", "source_kind",
+        "semantic_kind", "semantic_direction", "provenance_class", "source_authority", "channel",
+        "account", "chat_id", "native_id", "text_hash", "text_value", "disposition", "copy_json",
+    ),
+    "event_aliases": (
+        "source_event_id", "source_revision", "canonical_event_id", "canonical_revision",
+        "source_id", "locator_json", "status",
+    ),
+    "source_proofs": (
+        "event_id", "revision", "source_id", "locator_json", "author_principal", "channel",
+        "chat_id", "occurred_ms", "audience_status", "audience_members_json", "snapshot_id",
+        "policy_revision", "revoked_at_ms", "revoking_event_id", "eligible", "denial_reason",
+    ),
+    "denials": (
+        "event_id", "revision", "source_id", "locator_json", "channel", "account", "chat_id",
+        "native_id", "reason",
+    ),
+    "unresolved_refs": (
+        "event_id", "revision", "source_id", "locator_json", "target_json", "reason",
+    ),
+    "name_observations": (
+        "event_id", "revision", "source_id", "locator_json", "occurred_ms", "observed_ms",
+        "time_certainty", "raw_identifier", "name", "channel", "account", "chat_id",
+        "provenance_class",
+    ),
+}
+
+
+def _source_software_receipt() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[4]
+    paths = (
+        Path(__file__).resolve(),
+        Path(adapters.__file__).resolve(),
+        Path(__file__).resolve().with_name("_history_records.py"),
+    )
+    implementation_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in paths
+        if path.is_file()
+    }
+    head: str | None = None
+    dirty: bool | None = None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            head = result.stdout.strip() or None
+            status = subprocess.run(
+                [
+                    "git", "-C", str(root), "status", "--porcelain", "--untracked-files=no",
+                    "--", *(str(path.relative_to(root)) for path in paths),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            dirty = bool(status.stdout.strip()) if status.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return {
+        "normalization_version": 1,
+        "source_head": head,
+        "normalizer_worktree_dirty": dirty,
+        "implementation_sha256": implementation_hashes,
+    }
+
+
+def _decoder_receipt(bridge_package_dir: Path | None) -> dict[str, Any]:
+    script = str(getattr(adapters, "_DECODER_SCRIPT", "")).encode("utf-8")
+    receipt: dict[str, Any] = {
+        "capability": "whatsapp_web_message_info_decode",
+        "available": False,
+        "version": None,
+        "package_sha256": None,
+        "module_sha256": None,
+        "decoder_script_sha256": hashlib.sha256(script).hexdigest(),
+    }
+    if bridge_package_dir is None:
+        receipt["status"] = "not_supplied"
+        return receipt
+    package = Path(bridge_package_dir).expanduser()
+    package_json = package / "node_modules" / "@whiskeysockets" / "baileys" / "package.json"
+    decoder_module = package / "node_modules" / "@whiskeysockets" / "baileys" / "WAProto" / "index.js"
+    if not package_json.is_file() or not decoder_module.is_file():
+        receipt["status"] = "unavailable_offline"
+        return receipt
+    try:
+        metadata = json.loads(package_json.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("version"), str):
+            raise ValueError("local decoder package version is missing")
+        receipt.update(
+            available=True,
+            status="available_offline",
+            version=metadata["version"],
+            package_sha256=hashlib.sha256(package_json.read_bytes()).hexdigest(),
+            module_sha256=hashlib.sha256(decoder_module.read_bytes()).hexdigest(),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        receipt["status"] = "unavailable_offline"
+    return receipt
+
+
+def _input_receipt(collection: Path) -> dict[str, Any]:
+    _bundle, manifest = adapters._read_manifest(collection)
+    statuses = Counter(str(entry.get("status") or "missing") for entry in manifest["sources"])
+    accepted_statuses = {"copied", "reference_only", "excluded"}
+    missing = [
+        str(entry["source_id"])
+        for entry in manifest["sources"]
+        if entry.get("status") not in accepted_statuses
+    ]
+    file_hashes: list[dict[str, str]] = []
+    for entry in manifest["sources"]:
+        source_id = str(entry["source_id"])
+        copied = entry.get("copied_files")
+        if isinstance(copied, Mapping):
+            for relative, details in copied.items():
+                if isinstance(details, Mapping) and isinstance(details.get("copied_sha256"), str):
+                    file_hashes.append({
+                        "source_id": source_id,
+                        "file": str(relative),
+                        "sha256": str(details["copied_sha256"]),
+                    })
+        reference_stats = entry.get("reference_file_stats")
+        if isinstance(reference_stats, Mapping):
+            for relative, details in reference_stats.items():
+                if isinstance(details, Mapping) and isinstance(details.get("sha256"), str):
+                    file_hashes.append({
+                        "source_id": source_id,
+                        "file": str(relative),
+                        "sha256": str(details["sha256"]),
+                    })
+    file_hashes.sort(key=_json)
+    complete = manifest.get("complete") is True and not missing
+    material = {
+        "manifest_version": manifest.get("source_bundle_manifest_version"),
+        "declared_complete": manifest.get("complete") is True,
+        "descriptor_count": len(manifest["sources"]),
+        "status_counts": dict(sorted(statuses.items())),
+        "missing_source_ids": sorted(missing),
+        "source_hashes": file_hashes,
+    }
+    return {**material, "input_complete": complete, "sha256": _digest(material)}
+
+
+def _query_semantic_table(
+    connection: sqlite3.Connection, table: str, columns: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    available = {
+        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if not available:
+        return []
+    selected = tuple(column for column in columns if column in available)
+    names = ",".join(selected)
+    rows = connection.execute(f"SELECT {names} FROM {table}").fetchall()
+    return sorted(
+        ({column: row[column] for column in selected} for row in rows),
+        key=_json,
+    )
+
+
+def _semantic_receipt(
+    records: dict[str, list[dict[str, Any]]],
+    *,
+    input_receipt: Mapping[str, Any],
+    software_receipt: Mapping[str, Any],
+    decoder_receipt: Mapping[str, Any],
+    adapter_report: Mapping[str, Any],
+    conflict_count: int,
+) -> dict[str, Any]:
+    hashes = {name: _digest(_semantic_rows(rows)) for name, rows in records.items()}
+    counts = {name: len(rows) for name, rows in records.items()}
+    diagnostics = _semantic_projection({
+        key: adapter_report.get(key)
+        for key in (
+            "collection_verdict", "parsed_count", "unresolved_count", "denial_evidence_count",
+            "omitted_counts", "unsupported_tables", "unresolved", "sources",
+        )
+    })
+    receipt_counts = {**counts, "conflicts": conflict_count}
+    input_sha256 = input_receipt.get("sha256")
+    normalization = dict(software_receipt)
+    decoder = dict(decoder_receipt)
+    material = {
+        "normalization_version": 1,
+        "counts": receipt_counts,
+        "hashes": hashes,
+        "input_sha256": input_sha256,
+        "normalization": normalization,
+        "decoder": decoder,
+        "diagnostics_sha256": _digest(diagnostics),
+        "conflict_count": conflict_count,
+    }
+    return {
+        "schema": "history-semantic-receipt-v1",
+        "counts": receipt_counts,
+        "hashes": hashes,
+        "input_sha256": input_sha256,
+        "normalization": normalization,
+        "decoder": decoder,
+        "diagnostics_sha256": material["diagnostics_sha256"],
+        "sha256": _digest(material),
+    }
+
+
+def _semantic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        normalized = dict(row)
+        for column in ("normalized_json", "copy_json"):
+            value = normalized.get(column)
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                normalized[column] = _semantic_projection(decoded)
+        result.append(_semantic_projection(normalized))
+    return sorted(result, key=_json)
+
+
+def _input_receipt_valid(receipt: Mapping[str, Any]) -> bool:
+    keys = (
+        "manifest_version", "declared_complete", "descriptor_count", "status_counts",
+        "missing_source_ids", "source_hashes",
+    )
+    material = {key: receipt.get(key) for key in keys}
+    expected_complete = receipt.get("declared_complete") is True and not receipt.get(
+        "missing_source_ids"
+    )
+    return (
+        receipt.get("input_complete") is expected_complete
+        and receipt.get("sha256") == _digest(material)
+    )
+
+
+def _semantic_projection(value: Any) -> Any:
+    """Remove acquisition and byte-container details from semantic hashes."""
+    excluded = {
+        "acquisition_started_ms",
+        "acquisition_finished_ms",
+        "collection_finished_ms",
+        "source_mtime_ns",
+        "mtime_ns",
+        "path",
+        "source_path",
+        "target_home",
+    }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _semantic_projection(item)
+            for key, item in value.items()
+            if str(key) not in excluded
+        }
+    if isinstance(value, (list, tuple)):
+        return [_semantic_projection(item) for item in value]
+    return value
+
+
+def _semantic_records_from_target(connection: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    tables = {
+        "canonical_events": "events",
+        "event_source_authority": "event_source_authority",
+        "event_details": "history_event_details",
+        "event_copies": "history_event_copies",
+        "event_aliases": "history_event_aliases",
+        "source_proofs": "history_source_proofs",
+        "denials": "history_denials",
+        "unresolved_refs": "history_unresolved_refs",
+        "name_observations": "history_name_observations",
+    }
+    return {
+        name: _query_semantic_table(connection, table, _SEMANTIC_COLUMNS[name])
+        for name, table in tables.items()
+    }
+
+
 def _source_id(event: NormalizedEvent, copy: Mapping[str, Any]) -> str:
     value = copy.get("source_id")
     return str(value) if value else event.source_id
@@ -77,6 +379,17 @@ def _copy_locator(event: NormalizedEvent, copy: Mapping[str, Any]) -> dict[str, 
 
 def _copy_identity(copy: Mapping[str, Any], event: NormalizedEvent) -> tuple[str, str]:
     return _key(copy.get("event_id") or event.event_id, copy.get("revision") or event.revision)
+
+
+def _curated_event_index(
+    events: list[NormalizedEvent],
+) -> dict[tuple[str, str], list[NormalizedEvent]]:
+    indexed: dict[tuple[str, str], list[NormalizedEvent]] = defaultdict(list)
+    for event in events:
+        identities = {_copy_identity(copy, event) for copy in _unique_copies(event)}
+        for identity in identities:
+            indexed[identity].append(event)
+    return indexed
 
 
 @contextmanager
@@ -253,6 +566,46 @@ def _copy_for_authority(
     )
 
 
+def _authority_candidate_index(
+    events: list[NormalizedEvent],
+    authority_rows: list[Mapping[str, Any]],
+) -> tuple[list[list[NormalizedEvent]], dict[int, list[Mapping[str, Any]]]]:
+    events_by_source_identity: dict[tuple[str, str, str, str], list[NormalizedEvent]] = defaultdict(list)
+    for event in events:
+        seen: set[tuple[str, str, str, str]] = set()
+        for copy in event.copies:
+            if (
+                str(copy.get("source_kind") or "") != "journal"
+                or str(copy.get("provenance_class") or "") != "native"
+            ):
+                continue
+            source = _source_id(event, copy)
+            file = _copy_locator(event, copy).get("file")
+            if not isinstance(file, str):
+                continue
+            event_id, revision = _copy_identity(copy, event)
+            key = (event_id, revision, source, file)
+            if key not in seen:
+                events_by_source_identity[key].append(event)
+                seen.add(key)
+
+    events_by_authority_row: list[list[NormalizedEvent]] = []
+    authorities_by_event: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in authority_rows:
+        file = row.get("file")
+        key = (*_key(row.get("event_id"), row.get("revision")), row.get("source_id"), file)
+        candidates = (
+            events_by_source_identity.get(key, ())
+            if isinstance(file, str) and isinstance(row.get("source_id"), str)
+            else ()
+        )
+        matches = [event for event in candidates if _copy_for_authority(event, row) is not None]
+        events_by_authority_row.append(matches)
+        for event in matches:
+            authorities_by_event[id(event)].append(row)
+    return events_by_authority_row, authorities_by_event
+
+
 def _source_revocation_copy_matches(
     event: NormalizedEvent, authority: Mapping[str, Any]
 ) -> bool:
@@ -360,16 +713,23 @@ def _combined_authority(
     return result, ",".join(sorted(set(reasons))) or None
 
 
-def _read_snapshot_refs(path: Path) -> list[tuple[str, int]]:
+def _read_snapshot_refs(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not path.is_file() or path.is_symlink():
         raise HistoryRebuildError("knowledge snapshot must be an explicit regular SQLite file")
     with tempfile.TemporaryDirectory(prefix="yeoman-history-knowledge-") as scratch:
         copied = Path(scratch) / path.name
         shutil.copyfile(path, copied)
+        copied_hashes = {path.name: hashlib.sha256(copied.read_bytes()).hexdigest()}
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(f"{path}{suffix}")
             if sidecar.is_file():
-                shutil.copyfile(sidecar, Path(f"{copied}{suffix}"))
+                if sidecar.is_symlink():
+                    raise HistoryRebuildError("knowledge snapshot sidecars cannot be symlinks")
+                copied_sidecar = Path(f"{copied}{suffix}")
+                shutil.copyfile(sidecar, copied_sidecar)
+                copied_hashes[copied_sidecar.name] = hashlib.sha256(
+                    copied_sidecar.read_bytes()
+                ).hexdigest()
         connection = sqlite3.connect(copied.as_uri() + "?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
@@ -381,17 +741,259 @@ def _read_snapshot_refs(path: Path) -> list[tuple[str, int]]:
                 )
             }
             if "knowledge_statement_sources" not in tables:
-                return []
-            return [
-                (str(row["event_id"]), int(row["revision"]))
+                return [], {
+                    "present": True,
+                    "source_row_count": 0,
+                    "distinct_reference_count": 0,
+                    "copied_sha256": dict(sorted(copied_hashes.items())),
+                }
+            columns = {
+                str(row[1])
                 for row in connection.execute(
-                    "SELECT DISTINCT event_id,revision FROM knowledge_statement_sources"
+                    "PRAGMA table_info(knowledge_statement_sources)"
                 )
+            }
+            if not {"event_id", "revision"}.issubset(columns):
+                raise HistoryRebuildError("knowledge snapshot source-reference schema is incomplete")
+            selected = ["event_id", "revision"]
+            if "statement_id" in columns:
+                selected.insert(0, "statement_id")
+            rows = connection.execute(
+                f"SELECT {','.join(selected)} FROM knowledge_statement_sources"
+            ).fetchall()
+            grouped: dict[tuple[str, int], list[str]] = defaultdict(list)
+            invalid: list[dict[str, Any]] = []
+            for row in rows:
+                event_id = row["event_id"]
+                revision = _int(row["revision"])
+                statement_id = str(row["statement_id"]) if "statement_id" in columns else ""
+                if not isinstance(event_id, str) or not event_id.strip() or revision is None or revision < 1:
+                    invalid.append({
+                        "event_id": event_id if isinstance(event_id, str) else None,
+                        "revision": revision,
+                        "statement_id": statement_id or None,
+                        "reason": "invalid_source_reference",
+                    })
+                    continue
+                grouped[(event_id, revision)].append(statement_id)
+            references = [
+                {
+                    "event_id": event_id,
+                    "revision": revision,
+                    "statement_ids": sorted(value for value in statement_ids if value),
+                    "source_row_count": len(statement_ids),
+                }
+                for (event_id, revision), statement_ids in sorted(grouped.items())
             ]
+            references.extend(invalid)
+            return references, {
+                "present": True,
+                "source_row_count": len(rows),
+                "distinct_reference_count": len(grouped) + len(invalid),
+                "copied_sha256": dict(sorted(copied_hashes.items())),
+            }
         except (sqlite3.Error, TypeError, ValueError) as exc:
+            if isinstance(exc, HistoryRebuildError):
+                raise
             raise HistoryRebuildError("knowledge source reference snapshot is unreadable") from exc
         finally:
             connection.close()
+
+
+def _original_source_status(
+    connection: sqlite3.Connection,
+    canonical: tuple[str, int],
+    source_copies: list[dict[str, Any]],
+) -> tuple[str, str | None]:
+    detail = connection.execute(
+        "SELECT normalized_json FROM history_event_details WHERE event_id=? AND revision=?",
+        (canonical[0], str(canonical[1])),
+    ).fetchone()
+    if detail is None:
+        return "invalid", "canonical_detail_missing"
+    try:
+        normalized = json.loads(str(detail["normalized_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return "invalid", "canonical_detail_invalid"
+    if not isinstance(normalized, dict):
+        return "invalid", "canonical_detail_invalid"
+    if (
+        normalized.get("provenance_class") != "native"
+        or normalized.get("kind") not in EVENT_KINDS
+        or normalized.get("direction") not in {"in", "out"}
+        or normalized.get("source_authority") in {
+            "derived_only",
+            "legacy_candidate",
+            "none_authored_outbound_context_only",
+            "none_for_authored_outbound",
+            "unverified_native_reference",
+            "reference_metadata_only",
+        }
+    ):
+        return "invalid", "source_is_derived_or_unverified"
+    for copy in source_copies:
+        locator_json = copy.get("locator_json")
+        try:
+            locator = json.loads(str(locator_json))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            copy.get("provenance_class") == "native"
+            and copy.get("source_authority") not in {
+                "derived_only",
+                "legacy_candidate",
+                "none_authored_outbound_context_only",
+                "none_for_authored_outbound",
+                "unverified_native_reference",
+                "reference_metadata_only",
+            }
+            and isinstance(copy.get("source_hash"), str)
+            and len(str(copy["source_hash"])) == 64
+            and isinstance(locator, dict)
+            and locator
+        ):
+            return "valid", None
+    return "invalid", "original_source_copy_unavailable"
+
+
+def _resolve_snapshot_refs(
+    connection: sqlite3.Connection,
+    references: list[dict[str, Any]],
+    *,
+    invalid_snapshot_refs: list[dict[str, Any]],
+    adapter_unresolved_count: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    event_rows = connection.execute("SELECT event_id,revision FROM events").fetchall()
+    canonical_events = {
+        (str(row["event_id"]), int(row["revision"])) for row in event_rows
+    }
+    alias_rows = connection.execute(
+        "SELECT source_event_id,source_revision,canonical_event_id,canonical_revision,source_id,locator_json "
+        "FROM history_event_aliases"
+    ).fetchall()
+    aliases: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in alias_rows:
+        aliases[(str(row["source_event_id"]), _positive_revision(row["source_revision"]))].append(
+            dict(row)
+        )
+    unresolved: list[dict[str, Any]] = list(invalid_snapshot_refs)
+    source_results: list[dict[str, Any]] = []
+    valid = invalid = unresolved_original = structurally_resolved = 0
+    for reference in references:
+        event_id, revision = reference.get("event_id"), reference.get("revision")
+        if not isinstance(event_id, str) or not isinstance(revision, int) or revision < 1:
+            continue
+        key = (event_id, revision)
+        candidates = aliases.get(key, [])
+        targets = {
+            (str(row["canonical_event_id"]), _positive_revision(row["canonical_revision"]))
+            for row in candidates
+        }
+        if len(targets) > 1:
+            unresolved.append({
+                "event_id": event_id,
+                "revision": revision,
+                "statement_ids": reference.get("statement_ids", []),
+                "reason": "ambiguous_source_alias",
+            })
+            source_results.append({
+                "event_id": event_id,
+                "revision": revision,
+                "statement_ids": reference.get("statement_ids", []),
+                "structural_status": "ambiguous",
+                "original_source_status": "unresolved",
+                "reason": "ambiguous_source_alias",
+            })
+            unresolved_original += 1
+            continue
+        if targets:
+            canonical = next(iter(targets))
+            source_copies = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT event_id,revision,source_id,source_hash,locator_json,provenance_class,source_authority "
+                    "FROM history_event_copies WHERE event_id=? AND revision=?",
+                    (canonical[0], str(canonical[1])),
+                )
+                if any(
+                    row["source_id"] == alias["source_id"]
+                    and row["locator_json"] == alias["locator_json"]
+                    for alias in candidates
+                )
+            ]
+        elif key in canonical_events:
+            canonical = key
+            source_copies = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT event_id,revision,source_id,source_hash,locator_json,provenance_class,source_authority "
+                    "FROM history_event_copies WHERE event_id=? AND revision=?",
+                    (canonical[0], str(canonical[1])),
+                )
+            ]
+        else:
+            unresolved.append({
+                "event_id": event_id,
+                "revision": revision,
+                "statement_ids": reference.get("statement_ids", []),
+                "reason": "source_reference_unresolved",
+            })
+            source_results.append({
+                "event_id": event_id,
+                "revision": revision,
+                "statement_ids": reference.get("statement_ids", []),
+                "structural_status": "unresolved",
+                "original_source_status": "unresolved",
+                "reason": "source_reference_unresolved",
+            })
+            unresolved_original += 1
+            continue
+        structurally_resolved += 1
+        status, reason = _original_source_status(connection, canonical, source_copies)
+        if status == "valid":
+            valid += 1
+        else:
+            invalid += 1
+        source_results.append({
+            "event_id": event_id,
+            "revision": revision,
+            "statement_ids": reference.get("statement_ids", []),
+            "structural_status": "resolved",
+            "canonical_event_id": canonical[0],
+            "canonical_revision": canonical[1],
+            "original_source_status": status,
+            "reason": reason,
+        })
+    unresolved_rows = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT event_id,revision,source_id,locator_json,target_json,reason "
+            "FROM history_unresolved_refs ORDER BY event_id,revision,source_id,locator_json,reason"
+        )
+    ]
+    unresolved.extend({
+        "event_id": row["event_id"],
+        "revision": _positive_revision(row["revision"]),
+        "reason": str(row["reason"]),
+    } for row in unresolved_rows)
+    closure = {
+        "status": "closed" if not unresolved and adapter_unresolved_count == 0 else "incomplete",
+        "reference_count": len(references) + len(invalid_snapshot_refs),
+        "structurally_resolved_count": structurally_resolved,
+        "unresolved_count": len(unresolved),
+        "adapter_unresolved_count": adapter_unresolved_count,
+        "unresolved": unresolved,
+        "references": source_results,
+    }
+    original = {
+        "status": "not_assessed" if not references and not invalid_snapshot_refs else (
+            "valid" if invalid == 0 and unresolved_original == 0 else "invalid"
+        ),
+        "valid_count": valid,
+        "invalid_count": invalid,
+        "unresolved_count": unresolved_original + len(invalid_snapshot_refs),
+    }
+    return closure, original
 
 
 def _validate_target_paths(
@@ -460,6 +1062,12 @@ def _normalize_delete_targets(
 ) -> tuple[set[int], list[dict[str, Any]]]:
     denied_events: set[int] = set()
     unresolved: list[dict[str, Any]] = []
+    by_native_id: dict[str, list[int]] = defaultdict(list)
+    by_event_id: dict[str, list[int]] = defaultdict(list)
+    for index, event in enumerate(events):
+        if event.native_id is not None:
+            by_native_id[event.native_id].append(index)
+        by_event_id[event.event_id].append(index)
     for delete in events:
         if delete.kind != "delete":
             continue
@@ -485,12 +1093,13 @@ def _normalize_delete_targets(
                 "reason": "delete_scope_unknown",
             })
             continue
+        candidate_indexes = set(by_native_id.get(target, ()))
+        candidate_indexes.update(by_event_id.get(target, ()))
         matches = [
-            event
-            for event in events
-            if event.kind in {"message", "edit"}
-            and (event.native_id == target or event.event_id == target)
-            and _scoped(event)[:3] == _scoped(delete)[:3]
+            events[index]
+            for index in sorted(candidate_indexes)
+            if events[index].kind in {"message", "edit"}
+            and _scoped(events[index])[:3] == _scoped(delete)[:3]
         ]
         if not matches:
             unresolved.append({
@@ -531,16 +1140,22 @@ def rebuild_history(
     auxiliary = _verified_auxiliary(Path(collection))
     authority_rows = auxiliary["authorities"]
     curated_denials = auxiliary["curated_denials"]
+    authority_events_by_row, authorities_by_event = _authority_candidate_index(
+        events, authority_rows
+    )
+    curated_events_by_identity = _curated_event_index(events)
 
     # A delete is scoped by channel, account and chat. Unknown scope never guesses.
     denied_by_delete, unresolved = _normalize_delete_targets(events)
     unresolved.extend(auxiliary["unresolved"])
     source_revoked_events: set[int] = set()
     source_revocation_propagation_events: set[int] = set()
-    for row in authority_rows:
+    for row, candidates in zip(authority_rows, authority_events_by_row):
         if row.get("revoked_at_ms") is None:
             continue
-        matches = [event for event in events if _source_revocation_copy_matches(event, row)]
+        matches = [
+            event for event in candidates if _source_revocation_copy_matches(event, row)
+        ]
         propagation_matches = [
             event for event in matches if _source_revocation_metadata_matches(event, row)
         ]
@@ -566,13 +1181,7 @@ def rebuild_history(
     curated_denied_events: set[int] = set()
     for row in curated_denials:
         key = _key(row.get("event_id"), row.get("revision"))
-        matches = [
-            event for event in events
-            if any(
-                _copy_identity(copy, event) == key
-                for copy in _unique_copies(event)
-            )
-        ]
+        matches = curated_events_by_identity.get(key, [])
         if len(matches) == 1:
             curated_denied_events.add(id(matches[0]))
         else:
@@ -878,14 +1487,15 @@ def rebuild_history(
 
         # Apply independent, source-bound authority only after all copies and aliases exist.
         for event, canonical_id, conflict, _revision_variant in assigned:
-            proof, reason = _combined_authority(event, authority_rows)
+            event_authorities = authorities_by_event.get(id(event), [])
+            proof, reason = _combined_authority(event, event_authorities)
             if proof is None:
                 continue
             proof_id = _key(event.event_id, event.revision)
             source_revoked_for_copy = any(
                 _key(row.get("event_id"), row.get("revision")) == proof_id
                 and _source_revocation_copy_matches(event, row)
-                for row in authority_rows
+                for row in event_authorities
             )
             revoked = source_revoked_for_copy or id(event) in denied_events
             if conflict:
@@ -974,12 +1584,20 @@ def rebuild_history(
                 "native_id": None,
                 "reason": row["reason"],
             })
+        input_receipt = _input_receipt(Path(collection))
+        software_receipt = _source_software_receipt()
+        decoder_receipt = _decoder_receipt(bridge_package_dir)
         report = {
             "schema": "history-rebuild-report-v1",
             "complete": True,
+            "build_complete": True,
             "collection_complete": bool(adapter_report.get("complete_manifest")),
             "collection_verdict": adapter_report.get("collection_verdict"),
             "adapter_report": adapter_report,
+            "input_complete": input_receipt["input_complete"],
+            "input_receipt": input_receipt,
+            "software_receipt": software_receipt,
+            "decoder_receipt": decoder_receipt,
             "event_count": accepted,
             "copy_count": len(copies),
             "conflict_count": conflict_count,
@@ -989,7 +1607,21 @@ def rebuild_history(
             "roster_input_count": roster_count,
             "roster_input_applied": False,
         }
-        journal.write_rebuild_records(
+        def finalize_report(
+            connection: sqlite3.Connection, current_report: dict[str, Any]
+        ) -> dict[str, Any]:
+            semantic_records = _semantic_records_from_target(connection)
+            semantic_receipt = _semantic_receipt(
+                semantic_records,
+                input_receipt=input_receipt,
+                software_receipt=software_receipt,
+                decoder_receipt=decoder_receipt,
+                adapter_report=adapter_report,
+                conflict_count=conflict_count,
+            )
+            return {**current_report, "semantic_receipt": semantic_receipt}
+
+        report = journal.write_rebuild_records(
             event_details=event_details,
             copies=copies,
             aliases=aliases,
@@ -998,6 +1630,7 @@ def rebuild_history(
             unresolved_refs=unresolved_refs,
             name_observations=name_observations,
             report=report,
+            finalize_report=finalize_report,
         )
         journal.close()
         with HistoricalJournal(stage, create=False) as staged:
@@ -1016,7 +1649,7 @@ def rebuild_history(
 def verify_history(
     *, target_home: Path, knowledge_snapshot: Path | None = None
 ) -> dict[str, Any]:
-    """Check target integrity and exact statement source ID/revision closure."""
+    """Verify a marked target, its semantic receipt, and supplied source references."""
     try:
         with HistoricalJournal(target_home, create=False) as journal:
             state = journal.rebuild_state()
@@ -1024,36 +1657,116 @@ def verify_history(
                 "SELECT event_id,revision FROM events"
             ).fetchall()
             resolved = {(str(row["event_id"]), int(row["revision"])) for row in rows}
-            aliases = journal.store._conn.execute(
-                "SELECT source_event_id,source_revision,canonical_event_id,canonical_revision "
-                "FROM history_event_aliases"
-            ).fetchall()
-            alias_map = {
-                (str(row["source_event_id"]), _positive_revision(row["source_revision"])):
-                (str(row["canonical_event_id"]), _positive_revision(row["canonical_revision"]))
-                for row in aliases
-            }
-            references = _read_snapshot_refs(knowledge_snapshot) if knowledge_snapshot is not None else []
-            missing = [
-                {"event_id": event_id, "revision": revision}
-                for event_id, revision in references
-                if (event_id, revision) not in resolved
-                and alias_map.get((event_id, revision)) not in resolved
+            references, snapshot_receipt = (
+                _read_snapshot_refs(knowledge_snapshot)
+                if knowledge_snapshot is not None
+                else ([], {"present": False, "source_row_count": 0, "distinct_reference_count": 0})
+            )
+            invalid_snapshot_refs = [
+                reference for reference in references if reference.get("reason")
             ]
+            valid_references = [
+                reference for reference in references if not reference.get("reason")
+            ]
+            adapter_report = state.get("adapter_report")
+            if not isinstance(adapter_report, dict):
+                adapter_report = {}
+            closure, original_validity = _resolve_snapshot_refs(
+                journal.store._conn,
+                valid_references,
+                invalid_snapshot_refs=invalid_snapshot_refs,
+                adapter_unresolved_count=int(adapter_report.get("unresolved_count") or 0),
+            )
+            input_receipt = state.get("input_receipt")
+            if not isinstance(input_receipt, dict):
+                input_receipt = {"input_complete": False, "sha256": None}
+            input_receipt_valid = _input_receipt_valid(input_receipt)
+            software_receipt = _source_software_receipt()
+            software_receipt_valid = state.get("software_receipt") == software_receipt
+            decoder_receipt = state.get("decoder_receipt")
+            if not isinstance(decoder_receipt, dict):
+                decoder_receipt = {"status": "missing_build_receipt"}
+            expected_semantic = state.get("semantic_receipt")
+            actual_semantic = _semantic_receipt(
+                _semantic_records_from_target(journal.store._conn),
+                input_receipt=input_receipt,
+                software_receipt=software_receipt,
+                decoder_receipt=decoder_receipt,
+                adapter_report=adapter_report,
+                conflict_count=int(state.get("conflict_count") or 0),
+            )
+            expected_hashes = (
+                expected_semantic.get("hashes")
+                if isinstance(expected_semantic, dict)
+                else None
+            )
+            mismatched_tables = sorted(
+                name
+                for name in set(expected_hashes or {}) | set(actual_semantic["hashes"])
+                if (expected_hashes or {}).get(name) != actual_semantic["hashes"].get(name)
+            )
+            semantic_valid = (
+                isinstance(expected_semantic, dict)
+                and expected_semantic.get("sha256") == actual_semantic["sha256"]
+                and expected_semantic.get("counts") == actual_semantic["counts"]
+                and expected_semantic.get("input_sha256") == actual_semantic["input_sha256"]
+                and expected_semantic.get("normalization") == actual_semantic["normalization"]
+                and expected_semantic.get("decoder") == actual_semantic["decoder"]
+                and expected_semantic.get("diagnostics_sha256") == actual_semantic["diagnostics_sha256"]
+                and software_receipt_valid
+                and not mismatched_tables
+            )
+            actual_semantic.update(
+                expected_sha256=(expected_semantic.get("sha256") if isinstance(expected_semantic, dict) else None),
+                matches_target=semantic_valid,
+                mismatched_tables=mismatched_tables,
+            )
             unresolved_deletes = int(journal.store._conn.execute(
                 "SELECT COUNT(*) FROM history_unresolved_refs WHERE reason LIKE 'delete_%'"
             ).fetchone()[0])
             integrity = str(journal.store._conn.execute("PRAGMA quick_check").fetchone()[0])
+            build_complete = bool(state.get("build_complete", state.get("complete")))
+            input_complete = bool(input_receipt.get("input_complete"))
+            original_status = str(original_validity.get("status"))
+            references_valid = original_status in {"valid", "not_assessed"}
+            complete = (
+                build_complete
+                and input_complete
+                and input_receipt_valid
+                and software_receipt_valid
+                and integrity == "ok"
+                and semantic_valid
+                and closure["status"] == "closed"
+                and references_valid
+            )
             report = {
-                **state,
+                "schema": "history-verification-report-v1",
+                "build_complete": build_complete,
+                "input_complete": input_complete,
+                "input_receipt_valid": input_receipt_valid,
+                "input_receipt": input_receipt,
+                "software_receipt_valid": software_receipt_valid,
+                "semantic_receipt": actual_semantic,
+                "semantic_receipt_valid": semantic_valid,
+                "structural_reference_closure": {
+                    **closure,
+                    "snapshot_supplied": knowledge_snapshot is not None,
+                    "snapshot": snapshot_receipt,
+                },
+                "original_source_validity": original_validity,
+                "disclosure_permission": {
+                    "status": "not_assessed",
+                    "reason": "Verification does not evaluate current recipient authorization.",
+                },
                 "integrity": integrity,
                 "event_count": len(resolved),
-                "statement_source_count": len(references),
-                "resolved_source_count": len(references) - len(missing),
-                "missing_source_refs": missing,
+                "statement_source_count": snapshot_receipt.get("source_row_count", 0),
+                "distinct_source_reference_count": snapshot_receipt.get("distinct_reference_count", 0),
+                "resolved_source_count": closure["structurally_resolved_count"],
+                "missing_source_refs": closure["unresolved"],
                 "unresolved_delete_count": unresolved_deletes,
+                "complete": complete,
             }
-            report["complete"] = bool(state.get("complete")) and not missing and integrity == "ok"
             return report
     except (HistoryTargetError, sqlite3.Error) as exc:
         raise HistoryRebuildError("history target failed verification") from exc

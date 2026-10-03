@@ -602,7 +602,20 @@ def _payload_account(*values: Any) -> str | None:
     return None
 
 
+def _native_bridge_reference_tree(entry: Mapping[str, Any]) -> bool:
+    source_path = entry.get("source_path")
+    return (
+        str(entry.get("source_class") or "").strip().casefold() == "native"
+        and str(entry.get("kind") or "").strip().casefold() == "tree"
+        and isinstance(source_path, str)
+        and PurePosixPath(source_path).is_absolute()
+        and PurePosixPath(source_path).name == "whatsapp-message-references"
+    )
+
+
 def _source_label(source_id: str, entry: Mapping[str, Any], relative: str) -> str:
+    if _native_bridge_reference_tree(entry):
+        return "bridge_reference"
     material = " ".join((source_id.lower(), str(entry.get("source_class") or "").lower(), relative.lower()))
     if "bridge" in material and "reference" in material:
         return "bridge_reference"
@@ -761,7 +774,19 @@ def _parse_json_line(
     locator: dict[str, Any] = {"file": relative, "line": line}
     if value.get("_type") == "metadata":
         return None, "metadata_header", False
-    if "encoded" in value and ("chatJid" in value or source_kind == "bridge_reference"):
+    if source_kind == "bridge_reference":
+        if not isinstance(value.get("encoded"), str) or not value["encoded"]:
+            return None, "bridge_reference_encoded_missing", False
+        event, error = _reference_event(
+            value,
+            source_id=source_id,
+            source_hash=source_hash,
+            locator=locator,
+            source_kind="bridge_reference",
+            bridge_package_dir=bridge_package_dir,
+        )
+        return event, error, error is not None
+    if "encoded" in value and "chatJid" in value:
         event, error = _reference_event(
             value,
             source_id=source_id,
@@ -1260,7 +1285,8 @@ def _read_reference_only(
             str(entry.get("source_path") or "").lower(),
         )
     )
-    if "raw" not in source_class and "bridge" not in source_class:
+    bridge_reference_source = _native_bridge_reference_tree(entry) or "bridge" in source_class
+    if "raw" not in source_class and not bridge_reference_source:
         _omit(report, source_report, "reference_only_metadata_not_replayable")
         return events
     for relative, path, digest, line_numbers in _reference_members(entry=entry):
@@ -1521,7 +1547,9 @@ def read_catalogued_events(
         for relative, path, digest in files:
             lower = relative.lower()
             is_bridge_json = lower.endswith(".json") and (
-                "bridge" in source_id.lower() or "whatsapp-message-references" in lower
+                "bridge" in source_id.lower()
+                or "whatsapp-message-references" in lower
+                or _native_bridge_reference_tree(entry)
             )
             if lower.endswith((".jsonl", ".ndjson")) or is_bridge_json:
                 events.extend(
