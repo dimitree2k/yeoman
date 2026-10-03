@@ -1805,6 +1805,17 @@ class KnowledgeService:
                 context=context,
             )
 
+    def retire_alias_with_policy(
+        self, alias_id: int, *, correct_mapping: bool, reason: str = "admin"
+    ) -> ChangeReceipt:
+        """Retire one alias with a Policy-issued admin context."""
+        return self.retire_alias(
+            alias_id=int(alias_id),
+            context=self.admin_context_for(reason=reason),
+            reason="wrong_mapping" if correct_mapping else "not_wanted",
+            correct_mapping=correct_mapping,
+        )
+
     def owner_read_context(
         self,
         *,

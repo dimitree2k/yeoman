@@ -867,8 +867,8 @@ def knowledge_person_merge(
     """Merge two people by exact id as a reversible redirect (dry run by default).
 
     Both person rows, their bindings and statement edges stay as they are; reads follow
-    the redirect.  An owner-flagged person is refused: owner records are repaired
-    separately, because a merge never moves the owner flag.
+    the redirect.  An owner-flagged source is refused unless the target is owner-flagged
+    too, because a merge never moves the owner flag.
     """
     target_id, source_id = str(target).strip(), str(source).strip()
     if not target_id or not source_id or target_id == source_id:
@@ -884,18 +884,25 @@ def knowledge_person_merge(
     for role, summary in people.items():
         if summary is None:
             _fail("unresolved", f"unknown {role} person")
-        if summary["owner"]:
-            _fail("owner_record", f"the {role} is owner-flagged; repair owner records separately")
         if summary["status"] != "active":
             _fail("identity_conflict", f"the {role} is not active")
         if summary["redirected"]:
             _fail("identity_conflict", f"the {role} is already merged into another person")
+    target_summary, source_summary = people["target"], people["source"]
+    assert target_summary is not None and source_summary is not None
+    if source_summary["owner"] and not target_summary["owner"]:
+        _fail(
+            "owner_record",
+            "the source is owner-flagged and the target is not; a merge never moves the"
+            " owner flag",
+        )
     for role, person_id in (("target", target_id), ("source", source_id)):
         summary = people[role]
         assert summary is not None
         _line(
             f"  {role} {_redacted(person_id)}  bindings {summary['bindings']}"
             f"  statements={summary['statements']}"
+            f"{'  owner' if summary['owner'] else ''}"
         )
     if not apply:
         _line(
@@ -957,6 +964,89 @@ def knowledge_person_merge_undo(
         f"undone: {_redacted(row['source_id'])} is separate from"
         f" {_redacted(row['target_id'])} again"
     )
+
+
+@knowledge_app.command("person-name")
+def knowledge_person_name(
+    person: str = typer.Option(..., "--person", help="Person id"),
+    name: str = typer.Option(..., "--name", help="Owner-confirmed preferred name"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the name; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Set one person's owner-confirmed preferred name (dry run by default)."""
+    person_id, clean = str(person).strip(), str(name).strip()
+    if not clean:
+        _fail("invalid_input", "the name must not be empty")
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        summary = _person_summary(connection, person_id)
+    finally:
+        connection.close()
+    if summary is None:
+        _fail("unresolved", "unknown person")
+    if not apply:
+        _line(
+            f"dry run: would set the preferred name of {_redacted(person_id)};"
+            " re-run with --apply to write"
+        )
+        return
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        knowledge.set_preferred_name_with_policy(person_id, clean, reason="cli_person_name")
+    except Exception as exc:
+        _fail("name_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(f"preferred name set for {_redacted(person_id)}")
+
+
+@knowledge_app.command("person-alias-retire")
+def knowledge_person_alias_retire(
+    person: str = typer.Option(..., "--person", help="Person id the alias belongs to"),
+    alias: str = typer.Option(..., "--alias", help="Exact alias text to retire"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the retirement; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Retire a wrong alias and retract its mapping (dry run by default).
+
+    The rows stay as history; the name stops matching searches and addresses for this
+    person.  Every observation source of that exact alias on the person is retired.
+    """
+    person_id, text = str(person).strip(), str(alias).strip()
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        rows = connection.execute(
+            "SELECT id FROM contact_aliases WHERE contact_id = ? AND alias = ?"
+            " AND status <> 'retired' ORDER BY id",
+            (person_id, text),
+        ).fetchall()
+    finally:
+        connection.close()
+    if not rows:
+        _fail("unresolved", "the person has no active alias with this exact text")
+    if not apply:
+        _line(
+            f"dry run: would retire {len(rows)} alias row(s) of {_redacted(person_id)};"
+            " re-run with --apply to write"
+        )
+        return
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        for row in rows:
+            knowledge.retire_alias_with_policy(
+                int(row["id"]), correct_mapping=True, reason="cli_person_alias_retire"
+            )
+    except Exception as exc:
+        _fail("retire_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(f"retired {len(rows)} alias row(s) of {_redacted(person_id)}")
 
 
 @capture_app.command("status")

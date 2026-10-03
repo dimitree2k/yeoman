@@ -1,8 +1,8 @@
 """Tests for ContactsService."""
 
-import pytest
 from pathlib import Path
 
+import pytest
 from yeoman_gateway.knowledge._contacts.service import ContactsService
 
 
@@ -118,6 +118,30 @@ class TestContactsService:
         contact = service.store.get_contact(cid)
         assert contact is not None
         assert contact.is_owner is True
+
+    def test_mark_owner_matches_bare_policy_digits_to_a_phone_jid(
+        self, service: ContactsService
+    ) -> None:
+        """Policy lists WhatsApp owners as bare digits; bindings store the phone JID."""
+        cid = service.ensure_contact(
+            channel="whatsapp", identifier="491520000009@s.whatsapp.net",
+            kind="phone_jid", push_name="Owner",
+        )
+        service.mark_owner_from_policy({"whatsapp": ["491520000009"]})
+        contact = service.store.get_contact(cid)
+        assert contact is not None
+        assert contact.is_owner is True
+
+    def test_mark_owner_never_turns_bare_digits_into_a_lid(
+        self, service: ContactsService
+    ) -> None:
+        cid = service.ensure_contact(
+            channel="whatsapp", identifier="491520000009@lid", kind="lid", push_name="Other",
+        )
+        service.mark_owner_from_policy({"whatsapp": ["491520000009"]})
+        contact = service.store.get_contact(cid)
+        assert contact is not None
+        assert contact.is_owner is False
 
 
 def test_upsert_field_delegates_to_store(tmp_path: Path) -> None:

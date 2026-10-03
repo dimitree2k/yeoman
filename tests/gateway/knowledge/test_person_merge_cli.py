@@ -134,19 +134,122 @@ def test_apply_redirects_the_source_so_the_account_resolves_to_one_person(store)
     assert _resolve_pair(db) == f"resolved:{people['phone']}"
 
 
-@pytest.mark.parametrize("role", ["target", "source"])
-def test_an_owner_flagged_person_is_refused(store, role: str) -> None:
+def _set_owner(db: Path, person_id: str) -> None:
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE contacts SET is_owner = 1 WHERE id = ?", (person_id,))
+
+
+def test_an_owner_flagged_source_is_refused_when_the_target_is_not(store) -> None:
+    """The flag never moves with a merge, so the canonical person would lose it."""
     db, policy, people = store
-    target, source = (
-        (people["owner"], people["lid"]) if role == "target" else (people["phone"], people["owner"])
-    )
     before = db.read_bytes()
 
-    result = _merge(db, policy, target, source, "--apply")
+    result = _merge(db, policy, people["phone"], people["owner"], "--apply")
 
     assert result.exit_code != 0
     assert "owner" in result.output
     assert db.read_bytes() == before
+
+
+def test_a_person_can_be_merged_into_an_owner_flagged_target(store) -> None:
+    db, policy, people = store
+
+    result = _merge(db, policy, people["owner"], people["lid"], "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _redirect_count(db) == 1
+
+
+def test_two_owner_flagged_people_can_be_merged(store) -> None:
+    db, policy, people = store
+    _set_owner(db, people["phone"])
+
+    result = _merge(db, policy, people["phone"], people["owner"], "--apply")
+
+    assert result.exit_code == 0, result.output
+    assert _redirect_count(db) == 1
+
+
+def _person_row(db: Path, person_id: str) -> sqlite3.Row:
+    with sqlite3.connect(db) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute("SELECT * FROM contacts WHERE id = ?", (person_id,)).fetchone()
+
+
+def _alias_rows(db: Path, person_id: str) -> list[sqlite3.Row]:
+    with sqlite3.connect(db) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT * FROM contact_aliases WHERE contact_id = ? ORDER BY id", (person_id,)
+        ).fetchall()
+
+
+def _add_alias(db: Path, person_id: str, alias: str, source: str = "push_name") -> None:
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)"
+            " VALUES (?, ?, ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            (person_id, alias, source),
+        )
+
+
+def _name(db: Path, policy: Path, person: str, name: str, *extra: str):
+    return _invoke("person-name", "--db", str(db), "--policy", str(policy),
+                   "--person", person, "--name", name, *extra)
+
+
+def _retire(db: Path, policy: Path, person: str, alias: str, *extra: str):
+    return _invoke("person-alias-retire", "--db", str(db), "--policy", str(policy),
+                   "--person", person, "--alias", alias, *extra)
+
+
+def test_person_name_is_a_dry_run_until_applied(store) -> None:
+    db, policy, people = store
+    before = db.read_bytes()
+
+    dry = _name(db, policy, people["phone"], "Synthetic Name")
+    assert dry.exit_code == 0, dry.output
+    assert "dry run" in dry.output
+    assert db.read_bytes() == before
+
+    applied = _name(db, policy, people["phone"], "Synthetic Name", "--apply")
+    assert applied.exit_code == 0, applied.output
+    row = _person_row(db, people["phone"])
+    assert row["preferred_name"] == "Synthetic Name"
+    assert row["preferred_name_source"] == "owner_confirmed"
+
+
+def test_person_name_refuses_an_unknown_person(store) -> None:
+    db, policy, _people = store
+
+    assert _name(db, policy, "no-such-person", "Synthetic Name", "--apply").exit_code != 0
+
+
+def test_alias_retire_retracts_the_mapping_only_when_applied(store) -> None:
+    db, policy, people = store
+    _add_alias(db, people["phone"], "Wrong Name")
+    _add_alias(db, people["phone"], "Kept Name")
+    before = db.read_bytes()
+
+    dry = _retire(db, policy, people["phone"], "Wrong Name")
+    assert dry.exit_code == 0, dry.output
+    assert "dry run" in dry.output
+    assert db.read_bytes() == before
+
+    applied = _retire(db, policy, people["phone"], "Wrong Name", "--apply")
+    assert applied.exit_code == 0, applied.output
+    by_alias = {row["alias"]: row for row in _alias_rows(db, people["phone"])}
+    assert by_alias["Wrong Name"]["status"] == "retired"
+    assert by_alias["Wrong Name"]["mapping_retracted"] == 1
+    assert by_alias["Kept Name"]["status"] != "retired"
+
+
+def test_alias_retire_refuses_an_alias_the_person_does_not_have(store) -> None:
+    db, policy, people = store
+
+    result = _retire(db, policy, people["phone"], "Never Seen", "--apply")
+
+    assert result.exit_code != 0
 
 
 def test_unknown_or_identical_people_are_refused(store) -> None:
