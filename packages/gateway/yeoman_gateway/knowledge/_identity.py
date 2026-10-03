@@ -7,6 +7,7 @@ naming and provenance problem; authorization stays with Policy and with
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -905,6 +906,11 @@ class IdentityEngine:
             raise KnowledgeError("unresolved", "unknown alias")
         canonical = self.canonical_id(alias.person_id)
         ts = now_ms()
+        previous = self._store.query_one(
+            "SELECT status, address_allowed, is_preferred, valid_until_ms, mapping_retracted"
+            " FROM contact_aliases WHERE id = ?",
+            (int(alias_id),),
+        )
         self._store.execute(
             "UPDATE contact_aliases SET status = 'retired', address_allowed = 0,"
             " is_preferred = 0, valid_until_ms = COALESCE(valid_until_ms, ?),"
@@ -922,11 +928,94 @@ class IdentityEngine:
                 "reason": str(reason),
                 "correct_mapping": bool(correct_mapping),
                 "expected_revision": int(expected_revision),
+                # The exact state before retirement, so an undo restores it instead of
+                # guessing.
+                "previous": {
+                    "status": str(previous["status"]),
+                    "address_allowed": int(previous["address_allowed"] or 0),
+                    "is_preferred": int(previous["is_preferred"] or 0),
+                    "valid_until_ms": previous["valid_until_ms"],
+                    "mapping_retracted": int(previous["mapping_retracted"] or 0),
+                },
             },
         )
         revision = self._store.bump_identity_revision()
         return ChangeReceipt(
             operation_id=operation_id,
+            identity_revision=revision,
+            acl_epoch=self._store.acl_epoch,
+            changed_ids=(canonical,),
+        )
+
+    def undo_alias_retire(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        context: TrustedAdminContext,
+    ) -> ChangeReceipt:
+        """Reverse one alias retirement, at most once.
+
+        The state recorded at retirement is restored exactly.  A retirement recorded
+        without it returns to the neutral ``observed`` state, which never grants
+        addressing: detection is not permission.
+        """
+        self._require_owner(context)
+        self._policy.require_admin(context)
+        if int(expected_revision) != self._store.identity_revision:
+            raise KnowledgeError("stale_revision", "identity revision changed")
+        op = self._store.query_one(
+            "SELECT kind, payload_json, undone FROM knowledge_identity_ops"
+            " WHERE operation_id = ?",
+            (str(operation_id),),
+        )
+        if op is None or str(op["kind"]) != "alias_retire":
+            raise KnowledgeError("unresolved", "unknown alias retirement")
+        if int(op["undone"] or 0):
+            raise KnowledgeError("identity_conflict", "alias retirement is already undone")
+        payload = json.loads(str(op["payload_json"] or "{}"))
+        alias_id = int(payload["alias_id"])
+        alias = self.alias_by_id(alias_id)
+        if alias is None:
+            raise KnowledgeError("unresolved", "unknown alias")
+        if alias.status != "retired":
+            raise KnowledgeError("identity_conflict", "alias is not retired")
+        previous = payload.get("previous") or {}
+        status = str(previous.get("status") or "observed")
+        if status not in ALIAS_STATUSES or status == "retired":
+            status = "observed"
+        self._store.execute(
+            "UPDATE contact_aliases SET status = ?, address_allowed = ?, is_preferred = ?,"
+            " valid_until_ms = ?, mapping_retracted = ?, revision = revision + 1"
+            " WHERE id = ?",
+            (
+                status,
+                int(previous.get("address_allowed") or 0),
+                int(previous.get("is_preferred") or 0),
+                previous.get("valid_until_ms"),
+                int(previous.get("mapping_retracted") or 0),
+                alias_id,
+            ),
+        )
+        self._store.execute(
+            "UPDATE knowledge_identity_ops SET undone = 1 WHERE operation_id = ?",
+            (str(operation_id),),
+        )
+        canonical = self.canonical_id(alias.person_id)
+        restore_id = self._record_operation(
+            kind="alias",
+            actor=context.actor_principal,
+            authorization_ref=context.authorization_ref,
+            payload={
+                "undo_of": str(operation_id),
+                "alias_id": alias_id,
+                "person_id": canonical,
+                "restored_status": status,
+            },
+        )
+        revision = self._store.bump_identity_revision()
+        return ChangeReceipt(
+            operation_id=restore_id,
             identity_revision=revision,
             acl_epoch=self._store.acl_epoch,
             changed_ids=(canonical,),

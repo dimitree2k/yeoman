@@ -285,3 +285,94 @@ def test_output_never_prints_identifier_values(store) -> None:
 
     for secret in ("491520000001", "100000000000001", OWNER_PHONE):
         assert secret not in result.output
+
+
+def _retire_operation(output: str) -> str:
+    return output.split("operation", 1)[1].split()[0].strip(":()")
+
+
+def _restore(db: Path, policy: Path, operation: str, *extra: str):
+    return _invoke("person-alias-restore", "--db", str(db), "--policy", str(policy),
+                   "--operation", operation, *extra)
+
+
+def _set_alias_state(db: Path, person_id: str, alias: str, **fields: object) -> None:
+    columns = ", ".join(f"{name} = ?" for name in fields)
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            f"UPDATE contact_aliases SET {columns} WHERE contact_id = ? AND alias = ?",
+            (*fields.values(), person_id, alias),
+        )
+
+
+def test_alias_retire_prints_an_operation_that_restores_the_exact_previous_state(
+    store,
+) -> None:
+    db, policy, people = store
+    _add_alias(db, people["phone"], "Confirmed Name")
+    _set_alias_state(
+        db, people["phone"], "Confirmed Name", status="confirmed", address_allowed=1
+    )
+    retired = _retire(db, policy, people["phone"], "Confirmed Name", "--apply")
+    assert retired.exit_code == 0, retired.output
+    operation = _retire_operation(retired.output)
+    before = db.read_bytes()
+
+    dry = _restore(db, policy, operation)
+    assert dry.exit_code == 0, dry.output
+    assert "dry run" in dry.output
+    assert db.read_bytes() == before
+
+    restored = _restore(db, policy, operation, "--apply")
+    assert restored.exit_code == 0, restored.output
+    row = {r["alias"]: r for r in _alias_rows(db, people["phone"])}["Confirmed Name"]
+    assert row["status"] == "confirmed"
+    assert row["address_allowed"] == 1
+    assert row["mapping_retracted"] == 0
+    assert row["valid_until_ms"] is None
+
+
+def test_a_retirement_without_recorded_state_restores_to_observed_without_addressing(
+    store,
+) -> None:
+    db, policy, people = store
+    _add_alias(db, people["phone"], "Legacy Name")
+    retired = _retire(db, policy, people["phone"], "Legacy Name", "--apply")
+    operation = _retire_operation(retired.output)
+    with sqlite3.connect(db) as connection:  # the shape of an older retirement record
+        connection.execute(
+            "UPDATE knowledge_identity_ops SET payload_json = json_remove(payload_json,"
+            " '$.previous') WHERE operation_id = ?",
+            (operation,),
+        )
+
+    restored = _restore(db, policy, operation, "--apply")
+
+    assert restored.exit_code == 0, restored.output
+    row = {r["alias"]: r for r in _alias_rows(db, people["phone"])}["Legacy Name"]
+    assert row["status"] == "observed"
+    assert row["address_allowed"] == 0
+    assert row["mapping_retracted"] == 0
+
+
+def test_a_restore_is_applied_at_most_once(store) -> None:
+    db, policy, people = store
+    _add_alias(db, people["phone"], "Once Name")
+    operation = _retire_operation(
+        _retire(db, policy, people["phone"], "Once Name", "--apply").output
+    )
+    assert _restore(db, policy, operation, "--apply").exit_code == 0
+
+    assert _restore(db, policy, operation, "--apply").exit_code != 0
+
+
+def test_restore_refuses_an_operation_that_is_not_an_alias_retirement(store) -> None:
+    db, policy, people = store
+    merged = _merge(db, policy, people["phone"], people["lid"], "--apply")
+    operation = merged.output.split("operation", 1)[1].split()[0].strip(":()")
+
+    result = _restore(db, policy, operation, "--apply")
+
+    assert result.exit_code != 0
+    assert _redirect_count(db) == 1
+
