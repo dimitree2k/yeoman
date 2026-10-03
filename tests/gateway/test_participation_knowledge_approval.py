@@ -1,16 +1,21 @@
-"""Durable knowledge evidence for Participation approvals (step 3 of 4).
+"""Durable knowledge evidence for Participation approvals (steps 3 and 4).
 
 A knowledge-backed approval has to survive a process restart. The admission therefore
 carries a bounded, versioned, private snapshot of exactly the knowledge a later
 revalidation must find again. These tests pin the codec, the durable admission record,
 the staging path and the unchanged draft/target/revision binding.
 
-Nothing here revalidates knowledge at approval time: that is step 4.
+They also pin the durable revalidation itself: one validator, reading only the persisted
+evidence plus the current membership and knowledge policy, guards both the owner-approval
+commit and the pre-dispatch (transport) hook, and refuses closed whenever it cannot read
+the authority it needs.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,11 +25,19 @@ from typing import Any
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog, deterministic_effect_id
 from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext, FactRetrievalResult
-from yeoman_gateway.knowledge.models import KnowledgeContext, SourceRef, TrustedReadContext
+from yeoman_gateway.knowledge.models import (
+    KnowledgeContext,
+    SourceRef,
+    StatementCandidate,
+    TrustedCaptureContext,
+    TrustedReadContext,
+)
 from yeoman_gateway.policy.engine import PolicyEngine
+from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.models import (
     EffectEnvelope,
     EffectTarget,
+    PolicySnapshot,
     TextPayload,
     payload_hash,
 )
@@ -43,8 +56,13 @@ from yeoman_gateway.processing.participation_knowledge import (
     selection_from_mapping,
     selection_to_mapping,
 )
-from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
+from yeoman_gateway.processing.participation_runtime import (
+    ParticipationAdmission,
+    ParticipationRuntime,
+)
 from yeoman_gateway.processing.store import ProcessingStore
+
+from tests.gateway.capture_harness import AUTHOR, GROUP, OTHER, CaptureHarness
 
 NOW = 1_800_000_000_000
 CHANNEL = "whatsapp"
@@ -53,6 +71,9 @@ OWNER = "4915112345678"
 MEMBERS = frozenset({"alice", "bob"})
 MARKER = "SECRET-KNOWLEDGE-MARKER"
 FIXED_NOW = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+# The policy identity the dispatch harness resolves for its synthetic target.
+DISPATCH_POLICY_VERSION = "snapshot:1"
+DISPATCH_POLICY_HASH = "a" * 32
 
 
 # -- selector harness ----------------------------------------------------------------
@@ -497,12 +518,22 @@ def test_codec_rejects_an_unreadable_selection_before_it_is_persisted() -> None:
 
 
 def _admission(
-    *, payload_hash: str, knowledge_evidence: dict[str, Any] | None = None
+    *,
+    payload_hash: str,
+    knowledge_evidence: dict[str, Any] | None = None,
+    channel: str = CHANNEL,
+    chat_id: str = CHAT,
+    source_event_ids: tuple[str, ...] = ("m1",),
+    source_principals: tuple[tuple[str, str], ...] = (("m1", "alice"),),
+    policy_version: str = DISPATCH_POLICY_VERSION,
+    policy_hash: str = DISPATCH_POLICY_HASH,
+    arbitration_revision: int = 1,
+    approval_revision: int = 1,
 ) -> ParticipationAdmission:
     return ParticipationAdmission(
         opportunity_id="opp-1",
-        channel=CHANNEL,
-        chat_id=CHAT,
+        channel=channel,
+        chat_id=chat_id,
         activation_epoch=1,
         lane="production",
         observed_revision=3,
@@ -510,14 +541,14 @@ def _admission(
         intent="initiate",
         purpose="synthetic",
         admission_id="adm-1",
-        source_event_ids=("m1",),
-        source_principals=(("m1", "alice"),),
-        policy_version="snapshot:1",
-        policy_hash="a" * 32,
-        arbitration_revision=1,
+        source_event_ids=source_event_ids,
+        source_principals=source_principals,
+        policy_version=policy_version,
+        policy_hash=policy_hash,
+        arbitration_revision=arbitration_revision,
         contribution_type="observation",
         payload_hash=payload_hash,
-        approval_revision=1,
+        approval_revision=approval_revision,
         knowledge_evidence=knowledge_evidence,
     )
 
@@ -526,12 +557,18 @@ def test_admission_evidence_defaults_to_none() -> None:
     assert _admission(payload_hash="x").knowledge_evidence is None
 
 
-def _envelope(effect_id: str = "effect-evidence-1", text: str = "prepared draft") -> EffectEnvelope:
+def _envelope(
+    effect_id: str = "effect-evidence-1",
+    text: str = "prepared draft",
+    *,
+    channel: str = CHANNEL,
+    chat_id: str = CHAT,
+) -> EffectEnvelope:
     return EffectEnvelope(
         effect_id=effect_id,
         operation_key=f"participation:{effect_id}",
         payload=TextPayload(text=text),
-        target=EffectTarget(channel=CHANNEL, chat_id=CHAT),
+        target=EffectTarget(channel=channel, chat_id=chat_id),
         principal="service:speakup",
         capability="send_text",
         origin="participation",
@@ -646,23 +683,29 @@ class _Submission:
         return SimpleNamespace(status="submitted")
 
 
-def _policy() -> object:
-    from yeoman_gateway.policy.schema import PolicyConfig
+def _approval_chat() -> dict[str, object]:
+    """One chat whose participation previews to the owner before it may send."""
+    return {
+        "whoCanTalk": {"mode": "everyone"},
+        "spontaneity": {
+            "enabled": True,
+            "profile": "balanced",
+            "preview": "owner_dm",
+        },
+    }
 
+
+def _policy() -> object:
     return PolicyConfig.model_validate(
         {
             "owners": {CHANNEL: [OWNER]},
             "channels": {
                 CHANNEL: {
                     "chats": {
-                        CHAT: {
-                            "whoCanTalk": {"mode": "everyone"},
-                            "spontaneity": {
-                                "enabled": True,
-                                "profile": "balanced",
-                                "preview": "owner_dm",
-                            },
-                        }
+                        CHAT: _approval_chat(),
+                        # The real-store harness captures in this chat, so a proposal there
+                        # can be revalidated against the same membership.
+                        GROUP: _approval_chat(),
                     }
                 }
             },
@@ -709,11 +752,11 @@ def _build_tools(tmp_path: Path):
     return tools, log, archive, effects
 
 
-def _opportunity() -> ParticipationOpportunity:
+def _opportunity(chat_id: str = CHAT) -> ParticipationOpportunity:
     return ParticipationOpportunity(
         opportunity_id="opp-1",
         channel=CHANNEL,
-        chat_id=CHAT,
+        chat_id=chat_id,
         trigger="inbound",
         source_event_ids=("m1",),
         observed_revision=3,
@@ -732,18 +775,20 @@ def _decision() -> ParticipationDecision:
     )
 
 
-def _effect_id() -> str:
+def _effect_id(chat_id: str = CHAT) -> str:
     return deterministic_effect_id(
-        channel=CHANNEL, chat_id=CHAT, operation="comment", proposal_id="opp-1"
+        channel=CHANNEL, chat_id=chat_id, operation="comment", proposal_id="opp-1"
     )
 
 
-async def _stage(tools, *, knowledge_evidence: dict[str, Any] | None = None, **kwargs):
+async def _stage(
+    tools, *, knowledge_evidence: dict[str, Any] | None = None, chat: str = CHAT, **kwargs
+):
     return await tools.stage_participation_approval(
-        opportunity=_opportunity(),
+        opportunity=_opportunity(chat),
         decision=_decision(),
-        admission=_admission(payload_hash=""),
-        effect_id=_effect_id(),
+        admission=_admission(payload_hash="", chat_id=chat),
+        effect_id=_effect_id(chat),
         content="the prepared draft",
         snapshot={},
         knowledge_evidence=knowledge_evidence,
@@ -925,3 +970,957 @@ async def test_changed_draft_target_or_revision_cannot_retain_the_approval(
     finally:
         log.close()
         archive.close()
+
+
+# -- D. durable revalidation at both boundaries (step 4) ------------------------------
+
+REAL_TEXT = "The shared Stammtisch note."
+REAL_KEY = "3EB0R01"
+REAL_AUDIENCE = frozenset({f"{AUTHOR}@s.whatsapp.net", f"{OTHER}@s.whatsapp.net"})
+
+
+def _capture_shared_statement(
+    harness: CaptureHarness, *, text: str = REAL_TEXT, key: str = REAL_KEY
+):
+    """Capture one real statement whose proven audience is the whole group."""
+    event_id = harness.observe(text, message_id=key)
+    source = harness.authority.verify_source_ref(event_id, 1)
+    assert source is not None
+    return harness.knowledge.capture(
+        StatementCandidate(
+            content=text,
+            sources=(source,),
+            extractor_version="approval-revalidation-v1",
+            confidence=0.9,
+        ),
+        context=TrustedCaptureContext(
+            request_id=f"approval-{key}",
+            policy_revision=1,
+            capture_basis="historic_row",
+            authorized_sources=(source,),
+        ),
+    )
+
+
+def _real_readers(harness: CaptureHarness) -> ParticipationKnowledgeReaders:
+    """The two verified trigger authors, over the real store's chat and membership."""
+    return ParticipationKnowledgeReaders(
+        readers=tuple(
+            ParticipationKnowledgeReader(
+                TrustedReadContext(
+                    principal_id=principal,
+                    channel=CHANNEL,
+                    chat_id=GROUP,
+                    recipient_principals=REAL_AUDIENCE,
+                    membership_revision="captured-members-v1",
+                    policy_revision=1,
+                    purpose="proactive",
+                    now_ms=harness.now,
+                    is_direct=False,
+                ),
+                FactReadContext(
+                    principal_id=principal,
+                    chat_scope_key=f"channel:{CHANNEL}:chat:{GROUP}",
+                    current_members=REAL_AUDIENCE,
+                    epoch=harness.memory.store.acl_epoch(),
+                    now_ms=harness.now,
+                ),
+            )
+            for principal in sorted(REAL_AUDIENCE)
+        )
+    )
+
+
+def _real_selector(harness: CaptureHarness) -> ParticipationKnowledgeSelector:
+    return ParticipationKnowledgeSelector(knowledge=harness.knowledge, memory=harness.memory)
+
+
+def _real_evidence(harness: CaptureHarness) -> dict[str, Any]:
+    """The durable evidence a real selection over the real store would persist."""
+    selection = _real_selector(harness).select_for_readers(
+        query="Stammtisch", readers=_real_readers(harness)
+    )
+    assert selection.text and selection.records
+    return selection_to_mapping(selection)
+
+
+def _real_validator(harness: CaptureHarness):
+    """The production validator, composed exactly as bootstrap composes it."""
+    from yeoman_gateway.app.bootstrap import _knowledge_decision_validator
+
+    return _knowledge_decision_validator(
+        chat_registry=harness.registry,
+        knowledge=harness.knowledge,
+        memory=harness.memory,
+    )
+
+
+class _RevisionKnowledge:
+    """The harness knowledge with an explicit policy revision, for drift cases."""
+
+    def __init__(self, inner: object, revision: object) -> None:
+        self._inner = inner
+        self.policy_revision = revision
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+def _custom_validator(*, selector: object, chat_registry: object, knowledge: object):
+    """A validator over an explicit knowledge double, so the policy revision can vary."""
+    from yeoman_gateway.app.bootstrap import _KnowledgeDecisionValidator
+
+    return _KnowledgeDecisionValidator(
+        selector=selector, chat_registry=chat_registry, knowledge=knowledge
+    )
+
+
+def _real_admission(evidence: Any) -> ParticipationAdmission:
+    """An admission for the harness chat, carrying exactly the evidence under test."""
+    return _admission(
+        payload_hash="x",
+        channel=CHANNEL,
+        chat_id=GROUP,
+        source_event_ids=("m1",),
+        arbitration_revision=0,
+        knowledge_evidence=evidence,
+    )
+
+
+class _UnreadableEvidence(dict):
+    """A mapping whose own reads fail: unreadable authority, not merely stale content."""
+
+    def get(self, key, default=None):
+        del default
+        raise RuntimeError(f"unreadable evidence: {key}")
+
+
+class _BrokenRegistry:
+    def get_chat(self, channel: str, chat_id: str):
+        raise RuntimeError(f"registry unavailable for {channel}:{chat_id}")
+
+
+class _BrokenKnowledge:
+    """A knowledge store that fails every re-read; an outage must never approve."""
+
+    def recall(self, query, **kwargs):
+        del query, kwargs
+        raise RuntimeError("knowledge unavailable")
+
+    def revalidate(self, result, **kwargs):
+        del result, kwargs
+        raise RuntimeError("knowledge unavailable")
+
+
+def _tampered(evidence: dict[str, Any], *, mutate) -> dict[str, Any]:
+    """A copy of the evidence with one record field rewritten, as a corrupted store would."""
+    changed = dict(evidence)
+    changed["records"] = [dict(record) for record in evidence["records"]]
+    mutate(changed)
+    return changed
+
+
+# Each case starts from evidence the validator accepts, applies one real change, and
+# pins which of the five decisions the validator actually returns for it.
+def _case_unchanged(harness, evidence, admission):
+    return _real_validator(harness), admission
+
+
+def _case_legacy_without_evidence(harness, evidence, admission):
+    del evidence
+    return _real_validator(harness), replace(admission, knowledge_evidence=None)
+
+
+def _case_statement_revoked(harness, evidence, admission):
+    assert harness.delete(REAL_KEY) == (REAL_KEY,)
+    assert any(row["status"] == "revoked" for row in harness.statements())
+    return _real_validator(harness), admission
+
+
+def _case_suppressed_text_with_live_records(harness, evidence, admission):
+    """Suppressing only the rendered text must not skip the store re-read.
+
+    A snapshot with records but empty text used to short-circuit revalidation to
+    "unchanged", which would have approved a draft whose knowledge had since been
+    revoked. The records still claim the draft used knowledge, so the read must happen
+    and the difference must invalidate the approval.
+    """
+    assert harness.delete(REAL_KEY) == (REAL_KEY,)
+    blanked = dict(evidence, text="")
+    assert blanked["records"], "the case needs records to be meaningful"
+    return _real_validator(harness), replace(admission, knowledge_evidence=blanked)
+
+
+def _case_rendered_text_changed(harness, evidence, admission):
+    changed = dict(evidence, text=evidence["text"] + " (restated elsewhere)")
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_record_text_changed(harness, evidence, admission):
+    changed = _tampered(
+        evidence,
+        mutate=lambda item: item["records"][0].__setitem__(
+            "text", "A different rendering of the same statement."
+        ),
+    )
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_source_revision_changed(harness, evidence, admission):
+    def mutate(item):
+        refs = item["records"][0]["refs"]
+        item["records"][0]["refs"] = [[refs[0][0], int(refs[0][1]) + 1], *refs[1:]]
+
+    changed = _tampered(evidence, mutate=mutate)
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_source_event_unknown(harness, evidence, admission):
+    def mutate(item):
+        refs = item["records"][0]["refs"]
+        item["records"][0]["refs"] = [["wa_unknown_source_event", refs[0][1]], *refs[1:]]
+
+    changed = _tampered(evidence, mutate=mutate)
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_reader_author_departed(harness, evidence, admission):
+    harness.registry.chats[(CHANNEL, GROUP)] = [OTHER]
+    return _real_validator(harness), admission
+
+
+def _case_proven_member_added(harness, evidence, admission):
+    harness.registry.chats[(CHANNEL, GROUP)] = [AUTHOR, OTHER, "491700000000"]
+    return _real_validator(harness), admission
+
+
+def _case_stored_policy_revision_differs(harness, evidence, admission):
+    validator = _custom_validator(
+        selector=_real_selector(harness),
+        chat_registry=harness.registry,
+        knowledge=_RevisionKnowledge(
+            harness.knowledge, int(harness.knowledge.policy_revision) + 1
+        ),
+    )
+    return validator, admission
+
+
+def _case_evidence_version_unsupported(harness, evidence, admission):
+    changed = dict(evidence, version=int(evidence["version"]) + 1)
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_evidence_readers_missing(harness, evidence, admission):
+    changed = dict(evidence, readers=[])
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_evidence_prerequisites_missing(harness, evidence, admission):
+    changed = {key: value for key, value in evidence.items() if key != "reader_prerequisites"}
+    return _real_validator(harness), replace(admission, knowledge_evidence=changed)
+
+
+def _case_evidence_not_a_mapping(harness, evidence, admission):
+    del evidence
+    return _real_validator(harness), replace(admission, knowledge_evidence="not-a-mapping")
+
+
+def _case_evidence_unreadable(harness, evidence, admission):
+    unreadable = _UnreadableEvidence(evidence)
+    return _real_validator(harness), replace(admission, knowledge_evidence=unreadable)
+
+
+def _case_registry_missing(harness, evidence, admission):
+    validator = _custom_validator(
+        selector=_real_selector(harness), chat_registry=None, knowledge=harness.knowledge
+    )
+    return validator, admission
+
+
+def _case_registry_unreadable(harness, evidence, admission):
+    validator = _custom_validator(
+        selector=_real_selector(harness),
+        chat_registry=_BrokenRegistry(),
+        knowledge=harness.knowledge,
+    )
+    return validator, admission
+
+
+def _case_knowledge_store_unavailable(harness, evidence, admission):
+    selector = ParticipationKnowledgeSelector(
+        knowledge=_BrokenKnowledge(), memory=harness.memory
+    )
+    validator = _custom_validator(
+        selector=selector, chat_registry=harness.registry, knowledge=harness.knowledge
+    )
+    return validator, admission
+
+
+def _case_revalidation_unsupported(harness, evidence, admission):
+    validator = _custom_validator(
+        selector=SimpleNamespace(), chat_registry=harness.registry, knowledge=harness.knowledge
+    )
+    return validator, admission
+
+
+def _case_policy_revision_unavailable(harness, evidence, admission):
+    validator = _custom_validator(
+        selector=_real_selector(harness),
+        chat_registry=harness.registry,
+        knowledge=_RevisionKnowledge(harness.knowledge, "1"),
+    )
+    return validator, admission
+
+
+_VALIDATOR_TABLE: list[tuple[str, Any, tuple[bool, str]]] = [
+    ("unchanged", _case_unchanged, (True, "allow")),
+    ("legacy_without_evidence", _case_legacy_without_evidence, (True, "allow")),
+    ("statement_revoked", _case_statement_revoked, (False, "knowledge_changed")),
+    (
+        "suppressed_text_with_live_records",
+        _case_suppressed_text_with_live_records,
+        (False, "knowledge_changed"),
+    ),
+    ("rendered_text_changed", _case_rendered_text_changed, (False, "knowledge_changed")),
+    ("record_text_changed", _case_record_text_changed, (False, "knowledge_changed")),
+    ("source_revision_changed", _case_source_revision_changed, (False, "knowledge_changed")),
+    ("source_event_unknown", _case_source_event_unknown, (False, "knowledge_changed")),
+    (
+        "reader_author_departed",
+        _case_reader_author_departed,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "proven_member_added",
+        _case_proven_member_added,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "stored_policy_revision_differs",
+        _case_stored_policy_revision_differs,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "evidence_version_unsupported",
+        _case_evidence_version_unsupported,
+        (False, "knowledge_evidence_invalid"),
+    ),
+    (
+        "evidence_readers_missing",
+        _case_evidence_readers_missing,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "evidence_prerequisites_missing",
+        _case_evidence_prerequisites_missing,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "evidence_not_a_mapping",
+        _case_evidence_not_a_mapping,
+        (False, "knowledge_evidence_unreadable"),
+    ),
+    (
+        "evidence_unreadable",
+        _case_evidence_unreadable,
+        (False, "knowledge_reader_authority_unavailable"),
+    ),
+    (
+        "registry_missing",
+        _case_registry_missing,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "registry_unreadable",
+        _case_registry_unreadable,
+        (False, "knowledge_reader_authority_changed"),
+    ),
+    (
+        "knowledge_store_unavailable",
+        _case_knowledge_store_unavailable,
+        (False, "knowledge_changed"),
+    ),
+    (
+        "revalidation_unsupported",
+        _case_revalidation_unsupported,
+        (False, "knowledge_revalidation_unavailable"),
+    ),
+    (
+        "policy_revision_unavailable",
+        _case_policy_revision_unavailable,
+        (False, "knowledge_reader_authority_unavailable"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "mutate,expected", [(case, expected) for _, case, expected in _VALIDATOR_TABLE],
+    ids=[name for name, _, _ in _VALIDATOR_TABLE],
+)
+def test_knowledge_validator_decision_table(tmp_path: Path, mutate, expected) -> None:
+    """Every situation resolves to the decision the validator really returns."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        baseline = _real_admission(evidence)
+        # Every case starts from evidence this same validator accepts.
+        assert _real_validator(harness)(baseline) == (True, "allow")
+
+        validator, admission = mutate(harness, evidence, baseline)
+
+        assert validator(admission) == expected
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _case_registry_missing,
+        _case_registry_unreadable,
+        _case_knowledge_store_unavailable,
+        _case_evidence_unreadable,
+        _case_revalidation_unsupported,
+        _case_policy_revision_unavailable,
+    ],
+    ids=[
+        "registry_missing",
+        "registry_unreadable",
+        "knowledge_store_unavailable",
+        "evidence_unreadable",
+        "revalidation_unsupported",
+        "policy_revision_unavailable",
+    ],
+)
+def test_knowledge_validator_fails_closed_when_it_cannot_read_authority(
+    tmp_path: Path, mutate
+) -> None:
+    """An unreadable authority never becomes an approval."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        baseline = _real_admission(evidence)
+
+        validator, admission = mutate(harness, evidence, baseline)
+        allowed, reason = validator(admission)
+
+        assert allowed is False
+        assert reason != "allow"
+    finally:
+        harness.close()
+
+
+# -- D. approval commit ---------------------------------------------------------------
+
+
+async def test_approval_commit_refuses_a_revoked_statement(tmp_path: Path) -> None:
+    """The owner approval is revalidated at the commit, before any send."""
+    harness = CaptureHarness(tmp_path)
+    tools, log, archive, effects = _build_tools(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        validator = _real_validator(harness)
+        assert validator(_real_admission(evidence)) == (True, "allow")
+        assert (await _stage(tools, knowledge_evidence=evidence, chat=GROUP))["status"] == (
+            "awaiting_approval"
+        )
+        snapshot = await _stored_snapshot(log)
+        await _claim(log, snapshot)
+        assert await log.reserve_delivery(
+            proposal_id="opp-1",
+            effect_id=_effect_id(GROUP),
+            channel=CHANNEL,
+            chat_id=GROUP,
+            now_ms=NOW,
+            limits=(("comment", 1, 3_600_000),),
+            origin="participation",
+            lane="production",
+        )
+
+        submission = _Submission()
+        tools.set_participation_submission(submission)
+        tools.set_knowledge_decision_validator(validator)
+        preview_calls = list(effects.calls)
+
+        # Knowledge changed after the owner approved and before the commit.
+        assert harness.delete(REAL_KEY) == (REAL_KEY,)
+
+        outcome = await tools.submit_proposal("opp-1")
+
+        assert outcome == {
+            "status": "rejected",
+            "reason": "knowledge_approval_knowledge_changed",
+        }
+        assert submission.calls == []
+        assert effects.calls == preview_calls
+        record = await log.delivery_record(proposal_id="opp-1", effect_id=_effect_id(GROUP))
+        assert record is not None
+        assert record["delivery_state"] == "failed"
+        assert record["attempt_state"] == "released"
+        assert record["evidence_ref"] == "knowledge_approval_knowledge_changed"
+        row = await log.proposal_row("opp-1")
+        assert row is not None
+        assert row["status"] == "rejected"
+        stored = (await _stored_snapshot(log))["participation_admission"]
+        assert stored["knowledge_evidence"] == evidence
+    finally:
+        log.close()
+        archive.close()
+        harness.close()
+
+
+async def test_a_refused_stale_approval_is_not_regenerated(tmp_path: Path) -> None:
+    """The refusal ends the approval: no new draft, no replacement payload, no second effect."""
+    harness = CaptureHarness(tmp_path)
+    tools, log, archive, effects = _build_tools(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        assert (await _stage(tools, knowledge_evidence=evidence, chat=GROUP))["status"] == (
+            "awaiting_approval"
+        )
+        snapshot = await _stored_snapshot(log)
+        await _claim(log, snapshot)
+        assert await log.reserve_delivery(
+            proposal_id="opp-1",
+            effect_id=_effect_id(GROUP),
+            channel=CHANNEL,
+            chat_id=GROUP,
+            now_ms=NOW,
+            limits=(("comment", 1, 3_600_000),),
+            origin="participation",
+            lane="production",
+        )
+
+        submission = _Submission()
+        tools.set_participation_submission(submission)
+        tools.set_knowledge_decision_validator(
+            lambda admission: (False, "knowledge_reader_authority_changed")
+        )
+        preview_calls = list(effects.calls)
+
+        outcome = await tools.submit_proposal("opp-1")
+
+        assert outcome == {
+            "status": "rejected",
+            "reason": "knowledge_approval_knowledge_reader_authority_changed",
+        }
+        # The original content never left, and nothing replaced it.
+        assert submission.calls == []
+        assert effects.calls == preview_calls
+        proposals = log._conn.execute(
+            "SELECT id, message, status FROM speakups WHERE id = 'opp-1'"
+        ).fetchall()
+        assert [dict(row) for row in proposals] == [
+            {"id": "opp-1", "message": "the prepared draft", "status": "rejected"}
+        ]
+        reservations = log._conn.execute(
+            "SELECT effect_id, delivery_state FROM delivery_reservations"
+            " WHERE proposal_id = 'opp-1'"
+        ).fetchall()
+        # Exactly the original managed effect, released - no second one was created.
+        assert [dict(row) for row in reservations] == [
+            {"effect_id": _effect_id(GROUP), "delivery_state": "failed"}
+        ]
+        stored = (await _stored_snapshot(log))["participation_admission"]
+        assert stored["knowledge_evidence"] == evidence
+        assert stored["payload_hash"] == payload_hash(TextPayload(text="the prepared draft"))
+    finally:
+        log.close()
+        archive.close()
+        harness.close()
+
+
+async def test_persisted_evidence_revalidates_after_a_full_restart(tmp_path: Path) -> None:
+    """Fresh validator and fresh tools over the same SQLite files still allow the commit."""
+    harness = CaptureHarness(tmp_path)
+    tools, log, archive, _effects = _build_tools(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        assert (await _stage(tools, knowledge_evidence=evidence, chat=GROUP))["status"] == (
+            "awaiting_approval"
+        )
+        snapshot = await _stored_snapshot(log)
+        await _claim(log, snapshot)
+    finally:
+        log.close()
+        archive.close()
+        harness.close()
+
+    restarted = CaptureHarness(tmp_path)
+    restarted_tools, restarted_log, restarted_archive, _ = _build_tools(tmp_path)
+    try:
+        validator = _real_validator(restarted)
+        stored = (await _stored_snapshot(restarted_log))["participation_admission"]
+        values = dict(stored)
+        values["source_event_ids"] = tuple(values["source_event_ids"])
+        values["source_principals"] = tuple(
+            (str(pair[0]), str(pair[1])) for pair in values["source_principals"]
+        )
+        reconstruction = ParticipationAdmission(**values)
+        assert reconstruction.knowledge_evidence == evidence
+        assert validator(reconstruction) == (True, "allow")
+
+        restarted_tools.set_knowledge_decision_validator(validator)
+        submission = _Submission()
+        restarted_tools.set_participation_submission(submission)
+
+        outcome = await restarted_tools.submit_proposal("opp-1")
+
+        assert outcome["status"] == "submitted"
+        assert len(submission.calls) == 1
+        admission = submission.calls[0]["admission"]
+        assert isinstance(admission, ParticipationAdmission)
+        assert admission.knowledge_evidence == evidence
+    finally:
+        restarted_log.close()
+        restarted_archive.close()
+        restarted.close()
+
+
+# -- D. pre-dispatch (transport) boundary ---------------------------------------------
+
+
+class _ReservationLedger:
+    """One submitted delivery reservation, without opening a second ledger."""
+
+    def __init__(self, *, proposal_id: str, effect_id: str, now_ms: int) -> None:
+        self._row = {
+            "proposal_id": proposal_id,
+            "effect_id": effect_id,
+            "created_at_ms": int(now_ms),
+            "attempt_state": "submitted",
+        }
+
+    def _delivery_row_for_effect(self, effect_id: str):
+        if str(effect_id) != self._row["effect_id"]:
+            return None
+        return dict(self._row)
+
+    def material_for_opportunity(self, channel, chat_id, sources, *, lane=None):
+        del channel, chat_id, sources, lane
+        return (False, 0)
+
+
+class _SourceArchive:
+    def __init__(self, senders: dict[str, str]) -> None:
+        self._senders = dict(senders)
+
+    def senders_for_messages(self, channel: str, chat_id: str, source_ids):
+        del channel, chat_id
+        wanted = {str(item) for item in source_ids}
+        return {key: value for key, value in self._senders.items() if key in wanted}
+
+
+class _StaticAdapter:
+    """A policy adapter that lets the transport authorization pass."""
+
+    def __init__(self, engine: object) -> None:
+        self._engine = engine
+        self._snapshot = PolicySnapshot(
+            version=DISPATCH_POLICY_VERSION,
+            policy_hash=DISPATCH_POLICY_HASH,
+            policy=None,
+            loaded_ms=0,
+            healthy=True,
+            source="in-memory",
+            error=None,
+        )
+        self.known_tools = {"message"}
+
+    def current_activation(self, channel: str, chat_id: str):
+        del channel, chat_id
+        return SimpleNamespace(
+            enabled=True,
+            valid=True,
+            opted_in=True,
+            shadow=False,
+            activation_epoch=1,
+            lane="production",
+            policy_version=DISPATCH_POLICY_VERSION,
+            participation=SimpleNamespace(
+                allow_initiation=True, allow_continuation=True, allow_reactions=True
+            ),
+        )
+
+    def policy_engine(self):
+        return self._engine
+
+    def policy_snapshot(self):
+        return self._snapshot
+
+    def participation_pause_reason(self, channel: str, chat_id: str):
+        del channel, chat_id
+        return None
+
+
+def _dispatch_config() -> object:
+    from yeoman_shared.config.schema import Config, ConsciousnessConfig, ProcessingConfig
+
+    return Config(
+        consciousness=ConsciousnessConfig.model_validate({"defaultDailyCap": 3}),
+        processing=ProcessingConfig.model_validate(
+            {
+                "enabled": True,
+                "chats": [f"{CHANNEL}:{GROUP}"],
+                "reply_actions": {f"{CHANNEL}:{GROUP}": "answer"},
+                "participation": {
+                    "enabled": True,
+                    "shadow": False,
+                    "judgeRoute": "participation.judge",
+                },
+            }
+        ),
+    )
+
+
+def _dispatch_engine(tmp_path: Path) -> PolicyEngine:
+    return PolicyEngine(
+        PolicyConfig.model_validate(
+            {
+                "defaults": {"allowedTools": {"mode": "allowlist", "tools": ["message"]}},
+                "channels": {
+                    CHANNEL: {
+                        "chats": {
+                            GROUP: {
+                                "whoCanTalk": {"mode": "everyone"},
+                                "whenToReply": {"mode": "all"},
+                                "spontaneity": {
+                                    "enabled": True,
+                                    "dailyCap": 3,
+                                    "allowedActions": ["observation"],
+                                    "preview": "owner_dm",
+                                },
+                                "participation": {"enabled": True},
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        workspace=tmp_path,
+    )
+
+
+def _dispatch_router(
+    tmp_path: Path,
+    *,
+    store: ProcessingStore,
+    validator: object,
+    evidence: dict[str, Any] | None = None,
+    effect_id: str = "effect-dispatch-1",
+):
+    """The production effect router whose pre-dispatch hook carries the validator."""
+    from yeoman_gateway.app.bootstrap import build_effect_router
+    from yeoman_gateway.bus.queue import MessageBus
+
+    envelope = _envelope(effect_id, channel=CHANNEL, chat_id=GROUP)
+    ledger = _ReservationLedger(
+        proposal_id="opp-1", effect_id=effect_id, now_ms=int(time.time() * 1000)
+    )
+    router = build_effect_router(
+        _dispatch_config(),
+        _StaticAdapter(_dispatch_engine(tmp_path)),
+        store,
+        MessageBus(),
+        participation_ledger=ledger,
+        inbound_archive=_SourceArchive({"m1": "alice"}),
+        knowledge_decision_validator=validator,
+    )
+    assert router is not None
+    transport: list[object] = []
+
+    async def record_text(message: object):
+        transport.append(message)
+        return {"provider_message_id": "provider-1"}
+
+    async def reject_reaction(message: object):
+        raise AssertionError("a comment must not reach the reaction transport")
+
+    router.set_direct_transport(record_text, reject_reaction)
+    store.enqueue_participation_effect(
+        envelope,
+        _admission(
+            payload_hash=envelope.payload_hash,
+            channel=CHANNEL,
+            chat_id=GROUP,
+            arbitration_revision=0,
+            knowledge_evidence=evidence,
+        ),
+    )
+    return router, envelope, transport
+
+
+def _effect_evidence(store: ProcessingStore, effect_id: str) -> list[str]:
+    meta = store.effect_meta(effect_id)
+    assert meta is not None
+    return [str(entry.detail) for entry in meta.evidence]
+
+
+def test_pre_dispatch_blocks_transport_when_the_validator_refuses(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    try:
+        asked: list[str] = []
+
+        def refuse(admission: object) -> tuple[bool, str]:
+            asked.append(str(getattr(admission, "admission_id", "")))
+            return False, "knowledge_changed"
+
+        router, envelope, transport = _dispatch_router(
+            tmp_path, store=store, validator=refuse
+        )
+        assert store.count_effects() == 1
+
+        receipt = asyncio.run(router._gateway.execute_ready(envelope.effect_id))
+
+        assert receipt.state == "failed"
+        assert asked == ["adm-1"]
+        assert transport == []
+        assert store.count_effects() == 1
+        assert store.effect_state(envelope.effect_id) == "failed"
+        assert any(
+            "ParticipationPreDispatchDenied: knowledge_approval_knowledge_changed" in detail
+            for detail in _effect_evidence(store, envelope.effect_id)
+        )
+    finally:
+        store.close()
+
+
+def test_invalidated_evidence_between_approval_and_dispatch_blocks_transport(
+    tmp_path: Path,
+) -> None:
+    """Evidence true at approval time, revoked before transport: the send is blocked."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        _capture_shared_statement(harness)
+        evidence = _real_evidence(harness)
+        validator = _real_validator(harness)
+        admission = _real_admission(evidence)
+        assert validator(admission) == (True, "allow")
+
+        router, envelope, transport = _dispatch_router(
+            tmp_path, store=harness.store, validator=validator, evidence=evidence
+        )
+
+        # The statement is revoked after the owner approved and before dispatch.
+        assert harness.delete(REAL_KEY) == (REAL_KEY,)
+        assert any(row["status"] == "revoked" for row in harness.statements())
+        assert validator(admission) == (False, "knowledge_changed")
+
+        receipt = asyncio.run(router._gateway.execute_ready(envelope.effect_id))
+
+        assert receipt.state == "failed"
+        assert transport == []
+        assert harness.store.effect_state(envelope.effect_id) == "failed"
+        assert any(
+            "ParticipationPreDispatchDenied: knowledge_approval_knowledge_changed" in detail
+            for detail in _effect_evidence(harness.store, envelope.effect_id)
+        )
+    finally:
+        harness.close()
+
+
+# -- D. the runtime's preserved fallback and legacy adapter ---------------------------
+
+
+class _LegacyApprovalSubmission:
+    """A submission adapter that predates durable evidence.
+
+    Its signature deliberately has no ``knowledge_evidence`` parameter: if the runtime
+    passed one when there is nothing to bind, this adapter would raise instead of queueing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def queue_approval(
+        self, *, opportunity, decision, admission, effect_id, content, snapshot
+    ):
+        self.calls.append(
+            {
+                "opportunity": opportunity,
+                "decision": decision,
+                "admission": admission,
+                "effect_id": effect_id,
+                "content": content,
+                "snapshot": snapshot,
+            }
+        )
+        return {"status": "awaiting_approval", "effect_id": effect_id}
+
+
+def _participation_runtime(tmp_path: Path, submission: object) -> ParticipationRuntime:
+    """The real runtime, wired only as far as the approval-queue branch needs."""
+    return ParticipationRuntime(
+        judge=None,
+        context_builder=object(),
+        ledger=SpeakupLog(tmp_path / "runtime-speakups.db"),
+        snapshot_provider=lambda channel, chat_id, **kwargs: {},
+        is_source_allowed=lambda channel, chat_id, sources: True,
+        source_principals=lambda channel, chat_id, sources: tuple(
+            (str(source), "anna@s.whatsapp.net") for source in sources
+        ),
+        submission=submission,
+        clock_ms=lambda: NOW,
+    )
+
+
+async def _submit_approval(runtime: ParticipationRuntime, *, context) -> dict[str, object]:
+    return await runtime._submit_comment(
+        opportunity=_opportunity(),
+        snapshot={
+            "approval_required": True,
+            "lane": "production",
+            "activation_epoch": 1,
+            "opportunity_ttl_seconds": 3600,
+        },
+        inputs=SimpleNamespace(),
+        decision=_decision(),
+        text="the prepared draft",
+        context=context,
+        effect_id=_effect_id(),
+        evaluation_index=0,
+    )
+
+
+async def test_knowledge_backed_draft_without_evidence_keeps_the_fallback(
+    tmp_path: Path,
+) -> None:
+    """A knowledge-backed draft with no durable evidence is still refused as before."""
+    submission = _LegacyApprovalSubmission()
+    runtime = _participation_runtime(tmp_path, submission)
+    try:
+        # The selection is unchanged, so only the missing evidence can refuse the queue.
+        runtime._revalidate_knowledge = lambda opportunity, context, current: current
+        selection = SimpleNamespace(text="selected knowledge", revision="r1")
+
+        result = await _submit_approval(runtime, context={"_knowledge_selection": selection})
+
+        assert result == {
+            "status": "comment_skipped",
+            "reason": "approval_knowledge_revalidation_unavailable",
+        }
+        assert submission.calls == []
+    finally:
+        runtime._ledger.close()
+
+
+async def test_legacy_recent_only_proposal_still_queues_without_the_kwarg(
+    tmp_path: Path,
+) -> None:
+    """No evidence means no ``knowledge_evidence`` kwarg, so an old adapter keeps working."""
+    submission = _LegacyApprovalSubmission()
+    runtime = _participation_runtime(tmp_path, submission)
+    try:
+        result = await _submit_approval(runtime, context={})
+
+        assert result["status"] == "awaiting_approval"
+        assert len(submission.calls) == 1
+        assert submission.calls[0]["content"] == "the prepared draft"
+        assert submission.calls[0]["admission"].knowledge_evidence is None
+    finally:
+        runtime._ledger.close()

@@ -1011,6 +1011,7 @@ def _participation_knowledge_readers(
     from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.processing.participation_knowledge import (
+        MAX_EVIDENCE_READERS,
         ParticipationKnowledgeReader,
         ParticipationKnowledgeReaders,
     )
@@ -1045,6 +1046,11 @@ def _participation_knowledge_readers(
         return "error"
     member_revision = hashlib.sha256("\0".join(sorted(members)).encode()).hexdigest()
     now = int(time.time() * 1000)
+    # The evidence codec bounds reader identities, so a bundle larger than that could
+    # never be persisted. Refuse explicitly instead of producing a selection whose
+    # evidence silently fails to encode and blocks every later approval.
+    if len(authors) > MAX_EVIDENCE_READERS:
+        return "too_many_authors"
     readers: list[ParticipationKnowledgeReader] = []
     for principal in sorted(authors):
         # Any trigger author who is not a current member fails the whole read closed;
@@ -2087,7 +2093,7 @@ def _knowledge_decision_validator(
     return _KnowledgeDecisionValidator(
         selector=ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory),
         chat_registry=chat_registry,
-        policy_revision=getattr(knowledge, "policy_revision", 0),
+        knowledge=knowledge,
     )
 
 
@@ -2105,11 +2111,20 @@ class _KnowledgeDecisionValidator:
         *,
         selector: object,
         chat_registry: object,
-        policy_revision: object,
+        knowledge: object,
     ) -> None:
         self._selector = selector
         self._chat_registry = chat_registry
-        self._policy_revision = policy_revision
+        self._knowledge = knowledge
+
+    @property
+    def _policy_revision(self) -> object:
+        """Read the knowledge policy revision live, never a build-time copy.
+
+        A revision captured at composition time would keep validating approvals
+        against a policy that has since moved.
+        """
+        return getattr(self._knowledge, "policy_revision", 0)
 
     def __call__(self, admission: object) -> tuple[bool, str]:
         evidence = getattr(admission, "knowledge_evidence", None)
@@ -2126,7 +2141,6 @@ class _KnowledgeDecisionValidator:
         if readers is None:
             return False, "knowledge_reader_authority_changed"
         return self._revalidate(evidence, readers)
-
     def _readers_from_evidence(
         self, admission: object, evidence: Mapping[str, Any]
     ) -> object | None:
@@ -2548,7 +2562,10 @@ def build_effect_router(
         if evidence is not None or knowledge_decision_validator is not None:
             if knowledge_decision_validator is None:
                 return False, "knowledge_approval_revalidation_unavailable"
-            allowed, reason = knowledge_decision_validator(admission)
+            try:
+                allowed, reason = knowledge_decision_validator(admission)
+            except Exception:  # noqa: BLE001 - an escaping check must never send
+                return False, "knowledge_approval_revalidation_unavailable"
             if not allowed:
                 return False, f"knowledge_approval_{reason}"
         try:

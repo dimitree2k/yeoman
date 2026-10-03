@@ -325,8 +325,13 @@ class ParticipationKnowledgeSelector:
         A record that merely still exists is not enough: its rendered text and its
         source revisions have to match the persisted evidence, and every original
         reader has to still produce it. Anything else is invalidation.
+
+        The early return is for a genuinely empty selection only. A selection that
+        carries records must always be re-read, even if its rendered text is empty:
+        otherwise suppressing the text would silently skip the store read and report
+        "unchanged" for a draft that claims it used knowledge.
         """
-        if not selection.text:
+        if not selection.text and not selection.records:
             return selection
         ordered = _ordered_readers(readers)
         if not ordered:
