@@ -1816,6 +1816,18 @@ class KnowledgeService:
             correct_mapping=correct_mapping,
         )
 
+    def undo_alias_retire_with_policy(
+        self, operation_id: str, *, reason: str = "admin"
+    ) -> ChangeReceipt:
+        """Reverse one alias retirement with a Policy-issued admin context."""
+        context = self.admin_context_for(reason=reason)
+        with self._store.transaction():
+            return self._identity.undo_alias_retire(
+                operation_id,
+                expected_revision=self._store.identity_revision,
+                context=context,
+            )
+
     def owner_read_context(
         self,
         *,

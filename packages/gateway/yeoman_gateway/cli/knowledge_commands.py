@@ -1037,16 +1037,62 @@ def knowledge_person_alias_retire(
         )
         return
     knowledge = _open_admin_knowledge(db, policy)
+    operations: list[str] = []
     try:
         for row in rows:
-            knowledge.retire_alias_with_policy(
+            receipt = knowledge.retire_alias_with_policy(
                 int(row["id"]), correct_mapping=True, reason="cli_person_alias_retire"
             )
+            operations.append(receipt.operation_id)
     except Exception as exc:
         _fail("retire_failed", str(getattr(exc, "code", "") or type(exc).__name__))
     finally:
         knowledge.close()
     _line(f"retired {len(rows)} alias row(s) of {_redacted(person_id)}")
+    for operation_id in operations:
+        _line(f"  undo with person-alias-restore (operation {operation_id})")
+
+
+@knowledge_app.command("person-alias-restore")
+def knowledge_person_alias_restore(
+    operation: str = typer.Option(..., "--operation", help="Alias retirement operation id"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the restore; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Undo one alias retirement by operation id (dry run by default)."""
+    import json
+
+    operation_id = str(operation).strip()
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        row = connection.execute(
+            "SELECT payload_json FROM knowledge_identity_ops"
+            " WHERE operation_id = ? AND kind = 'alias_retire' AND undone = 0",
+            (operation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        _fail("unresolved", "no open alias retirement with this operation id")
+    payload = json.loads(str(row["payload_json"] or "{}"))
+    restored_to = (payload.get("previous") or {}).get("status") or "observed"
+    if not apply:
+        _line(
+            f"dry run: would restore alias {_redacted(payload.get('alias_id'))} to"
+            f" '{restored_to}'; re-run with --apply to write"
+        )
+        return
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        knowledge.undo_alias_retire_with_policy(operation_id, reason="cli_person_alias_restore")
+    except Exception as exc:
+        _fail("restore_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(f"restored alias {_redacted(payload.get('alias_id'))} to '{restored_to}'")
 
 
 @capture_app.command("status")
