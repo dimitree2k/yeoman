@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -31,6 +34,143 @@ def _manifest_paths(target: Path) -> list[Path]:
 def _jsonl(path: Path, *rows: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _prepare_crashable_variant(tmp_path: Path, monkeypatch) -> tuple[Path, list[dict], bytes, Path, bytes]:
+    from yeoman_gateway.knowledge import _source_bundles
+
+    old_root = tmp_path / "source-a"
+    old_root.mkdir()
+    expired = old_root / "expired.json"
+    expired_bytes = json.dumps(
+        {
+            "message_id": "old-native",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "text": "old-variant-purge-sentinel",
+        }
+    ).encode() + b"\n"
+    expired.write_bytes(expired_bytes)
+    neighbor = tmp_path / "neighbor.bin"
+    neighbor.write_bytes(b"neighbor-source-bytes")
+    blocked = tmp_path / "blocked.bin"
+    blocked.write_bytes(b"blocked-source-bytes")
+    sources = [
+        {
+            "source_id": "A",
+            "path": str(old_root),
+            "kind": "tree",
+            "source_class": "synthetic",
+            "restricted": False,
+        },
+        _source("B", neighbor),
+        _source("Z", blocked),
+    ]
+    target = tmp_path / "collection"
+    original_copy = _source_bundles._copy_file
+
+    def stop_before_z(source: Path, destination: Path) -> str:
+        if source == blocked:
+            raise KeyboardInterrupt
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(_source_bundles, "_copy_file", stop_before_z)
+    with pytest.raises(KeyboardInterrupt):
+        refresh_collection(sources=sources, target_dir=target)
+
+    staged = next((target / ".staging").iterdir())
+    assert (staged / "sources/A/expired.json").read_bytes() == expired_bytes
+    assert (staged / "sources/B/neighbor.bin").read_bytes() == b"neighbor-source-bytes"
+    expired.unlink()
+    (old_root / "fresh.json").write_text(
+        json.dumps({"message_id": "new-native", "timestamp": "2026-10-03T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    return target, sources, expired_bytes, staged, b"neighbor-source-bytes"
+
+
+def _crash_variant_resume(
+    target: Path, sources: list[dict], crash_point: str
+) -> subprocess.CompletedProcess[str]:
+    repo = Path(__file__).resolve().parents[3]
+    home = target.parent / "temporary-yeoman-home"
+    home.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": os.pathsep.join(
+                str(repo / "packages" / package)
+                for package in ("gateway", "shared", "overseer")
+            ),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+            "YEOMAN_HOME": str(home),
+        }
+    )
+    script = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+from yeoman_gateway.knowledge import _source_bundles
+from yeoman_gateway.knowledge._snapshot import refresh_collection
+
+target = Path(sys.argv[1])
+sources = json.loads(sys.argv[2])
+crash_point = sys.argv[3]
+write_json = _source_bundles._write_json
+
+def is_variant_manifest(path, payload):
+    return path.name == "manifest.json" and (
+        path.parent.name.startswith(".preserve-")
+        or payload.get("preservation_state")
+        in {"variant_scratch", "variant_published"}
+    )
+
+def crash_write(path, payload):
+    if is_variant_manifest(Path(path), payload) and payload.get("complete") is True:
+        if crash_point == "before_manifest":
+            os._exit(73)
+        write_json(path, payload)
+        if crash_point == "after_manifest":
+            os._exit(74)
+        return
+    write_json(path, payload)
+
+_source_bundles._write_json = crash_write
+
+refresh_collection(sources=sources, target_dir=target)
+"""
+    return subprocess.run(
+        [sys.executable, "-c", script, str(target), json.dumps(sources), crash_point],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _purge_crashed_variant(
+    target: Path, expired_bytes: bytes, staged: Path, neighbor_bytes: bytes
+) -> list[str]:
+    preview = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=False
+    )
+    assert preview["affected_source_ids"] == ["A"]
+    assert preview["retained_source_ids"] == ["B", "Z"]
+    assert str(staged) in preview["affected_bundles"]
+    assert len(preview["affected_bundles"]) >= 2
+    purge_collection(target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True)
+    remaining = [
+        str(path.relative_to(target))
+        for path in target.rglob("*")
+        if path.is_file() and expired_bytes in path.read_bytes()
+    ]
+    assert remaining == []
+    assert (staged / "sources/B/neighbor.bin").read_bytes() == neighbor_bytes
+    return preview["affected_bundles"]
 
 
 def test_new_bundle_metadata_comes_from_preserved_copy_and_contains_only_safe_fields(
@@ -533,6 +673,125 @@ def test_resume_preserves_changed_expired_variant_and_indexes_both_locators(
     assert hashlib.sha256(old_path.read_bytes()).hexdigest() == old_entry["copied_files"][
         "expired.json"
     ]["copied_sha256"]
+
+
+def test_crash_before_variant_manifest_is_discoverable_and_source_purgeable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target, sources, expired_bytes, staged, neighbor_bytes = _prepare_crashable_variant(
+        tmp_path, monkeypatch
+    )
+    child = _crash_variant_resume(target, sources, "before_manifest")
+    assert child.returncode == 73, (child.stdout, child.stderr)
+
+    affected = _purge_crashed_variant(target, expired_bytes, staged, neighbor_bytes)
+    assert len(affected) >= 2
+
+
+def test_crash_after_variant_manifest_before_rename_remains_source_purgeable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target, sources, expired_bytes, staged, neighbor_bytes = _prepare_crashable_variant(
+        tmp_path, monkeypatch
+    )
+    child = _crash_variant_resume(target, sources, "after_manifest")
+    assert child.returncode == 74, (child.stdout, child.stderr)
+
+    affected = _purge_crashed_variant(target, expired_bytes, staged, neighbor_bytes)
+    assert len(affected) >= 2
+
+
+def test_interrupted_crash_variant_purge_retries_without_removing_neighbor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from yeoman_gateway.knowledge import _preservation_catalog
+
+    target, sources, expired_bytes, staged, neighbor_bytes = _prepare_crashable_variant(
+        tmp_path, monkeypatch
+    )
+    child = _crash_variant_resume(target, sources, "after_manifest")
+    assert child.returncode == 74, (child.stdout, child.stderr)
+    copies = [
+        path
+        for path in target.rglob("expired.json")
+        if path.is_file() and path.read_bytes() == expired_bytes
+    ]
+    variant_file = next(path for path in copies if path.parent != staged / "sources/A")
+    variant_source = variant_file.parent
+
+    remove_tree = _preservation_catalog._remove_tree
+    failed_once = False
+
+    def fail_variant_cleanup(path: Path) -> None:
+        nonlocal failed_once
+        if path == variant_source and not failed_once:
+            failed_once = True
+            raise OSError("synthetic preserved-variant cleanup interruption")
+        remove_tree(path)
+
+    monkeypatch.setattr(_preservation_catalog, "_remove_tree", fail_variant_cleanup)
+    with pytest.raises(SnapshotError, match="cleanup is incomplete"):
+        purge_collection(target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True)
+    assert failed_once
+    retry_preview = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=False
+    )
+    assert retry_preview["pending_cleanup"] is True
+
+    monkeypatch.setattr(_preservation_catalog, "_remove_tree", remove_tree)
+    retried = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True
+    )
+    assert retried["purged"] is True
+    assert all(
+        expired_bytes not in path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    )
+    assert (staged / "sources/B/neighbor.bin").read_bytes() == neighbor_bytes
+
+
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_purge_discovers_legacy_preservation_scratch(
+    tmp_path: Path, monkeypatch, with_manifest: bool
+) -> None:
+    target, _, expired_bytes, staged, neighbor_bytes = _prepare_crashable_variant(
+        tmp_path, monkeypatch
+    )
+    legacy = target / "versions" / f".preserve-{uuid.uuid4().hex}"
+    legacy_source = legacy / "sources/A"
+    legacy_source.mkdir(parents=True)
+    (legacy_source / "expired.json").write_bytes(expired_bytes)
+    if with_manifest:
+        old_entry = next(
+            entry
+            for entry in json.loads((staged / "manifest.json").read_text())["sources"]
+            if entry["source_id"] == "A"
+        )
+        (legacy / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "source_bundle_manifest_version": 2,
+                    "bundle_format": "yeoman-source-bundle",
+                    "complete": True,
+                    "sources": [old_entry],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    preview = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=False
+    )
+    assert str(legacy) in preview["affected_bundles"]
+    assert preview["retained_source_ids"] == ["B", "Z"]
+    purge_collection(target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True)
+
+    assert not legacy.exists()
+    assert not any(
+        expired_bytes in path.read_bytes() for path in target.rglob("*") if path.is_file()
+    )
+    assert (staged / "sources/B/neighbor.bin").read_bytes() == neighbor_bytes
 
 
 def test_purge_previews_requires_confirmation_and_tombstone_blocks_resurrection(

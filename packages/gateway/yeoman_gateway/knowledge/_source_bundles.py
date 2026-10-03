@@ -977,14 +977,35 @@ def _preserve_staged_variant(
     staged_source = staging / "sources" / source_id
     versions = root / "versions"
     _private_mkdir(versions)
-    temporary = versions / f".preserve-{uuid.uuid4().hex}"
-    _private_mkdir(temporary / "sources")
+    staging_root = root / ".staging"
+    _private_mkdir(staging_root)
+    temporary = staging_root / hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    _private_mkdir(temporary)
     try:
+        scratch_entry = {
+            key: entry.get(key)
+            for key in ("source_id", "source_path", "kind", "source_class", "restricted")
+        }
+        scratch_entry.update(status="preserving", acquisition_started_ms=_now_ms())
+        scratch = {
+            "source_bundle_manifest_version": SOURCE_BUNDLE_MANIFEST_VERSION,
+            "bundle_format": "yeoman-source-bundle",
+            "preservation_state": "variant_scratch",
+            "staging_key": payload.get("staging_key"),
+            "collection_started_ms": entry.get("acquisition_started_ms", _now_ms()),
+            "complete": False,
+            "sources": [scratch_entry],
+        }
+        _write_json(temporary / "manifest.json", scratch)
+        _fsync_directory(temporary)
+        _fsync_directory(staging_root)
+        _private_mkdir(temporary / "sources")
         shutil.copytree(staged_source, temporary / "sources" / source_id)
         old_entry = json.loads(json.dumps(entry))
         preserved = {
             "source_bundle_manifest_version": SOURCE_BUNDLE_MANIFEST_VERSION,
             "bundle_format": "yeoman-source-bundle",
+            "preservation_state": "variant_published",
             "staging_key": payload.get("staging_key"),
             "collection_started_ms": entry.get("acquisition_started_ms", _now_ms()),
             "collection_finished_ms": entry.get("acquisition_finished_ms", _now_ms()),
@@ -996,6 +1017,8 @@ def _preserve_staged_variant(
             f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:12]}"
         )
         os.replace(temporary, version)
+        _fsync_directory(staging_root)
+        _fsync_directory(versions)
     finally:
         if temporary.exists():
             _remove_tree(temporary)
@@ -1093,6 +1116,14 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _private_mkdir(path: Path) -> None:
