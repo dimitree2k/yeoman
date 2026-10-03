@@ -44,6 +44,10 @@ from yeoman_gateway.processing.participation_context import (
     ParticipationContextBounds,
     ParticipationDecisionInputs,
 )
+from yeoman_gateway.processing.participation_knowledge import (
+    ParticipationKnowledgeEvidenceError,
+    selection_from_mapping,
+)
 
 #: Counters that must stay distinguishable in operational traces (spec section 12).
 COUNTERS: tuple[str, ...] = (
@@ -1309,7 +1313,11 @@ class ParticipationRuntime:
             await self._record(opportunity, "stale_discarded", veto)
             return {"status": "comment_skipped", "reason": veto}
         if approval_required:
-            if _selected_knowledge(context):
+            evidence = _knowledge_evidence_for_admission(admission, context)
+            if _selected_knowledge(context) and evidence is None:
+                # A knowledge-backed draft may only be queued when the evidence that
+                # would revalidate it exists in durable form. The old blanket refusal
+                # stays as the fallback for a path that cannot produce such evidence.
                 await self._release_comment(
                     opportunity, effect_id, "approval_knowledge_revalidation_unavailable"
                 )
@@ -1334,6 +1342,11 @@ class ParticipationRuntime:
                     "status": "comment_skipped",
                     "reason": "approval_path_unavailable",
                 }
+            queue_kwargs: dict[str, Any] = {}
+            if evidence is not None:
+                # Only passed when there is something to bind, so a submission adapter
+                # that predates durable evidence keeps working unchanged.
+                queue_kwargs["knowledge_evidence"] = evidence
             outcome = await queue_approval(
                 opportunity=opportunity,
                 decision=decision,
@@ -1341,6 +1354,7 @@ class ParticipationRuntime:
                 effect_id=effect_id,
                 content=text,
                 snapshot=admission_snapshot,
+                **queue_kwargs,
             )
             status = str(getattr(outcome, "status", "") or "")
             if isinstance(outcome, Mapping):
@@ -2269,6 +2283,29 @@ def _revision_token_changed(
 def _selected_knowledge(context: Mapping[str, Any]) -> Any | None:
     selection = context.get("_knowledge_selection")
     return selection if str(getattr(selection, "text", "") or "").strip() else None
+
+
+def _knowledge_evidence_for_admission(
+    admission: "ParticipationAdmission", context: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    """The durable evidence to bind to this approval, or ``None`` if there is none.
+
+    The context builder encodes the evidence where the real selection is produced, so
+    this prefers that bounded mapping. An admission that already carries evidence keeps
+    it. ``None`` means no knowledge influenced the draft: the legacy recent-only case
+    the approval path already handled.
+    """
+    existing = getattr(admission, "knowledge_evidence", None)
+    if isinstance(existing, Mapping):
+        return existing
+    encoded = context.get("_knowledge_evidence")
+    if not isinstance(encoded, Mapping):
+        return None
+    try:
+        selection_from_mapping(encoded)
+    except ParticipationKnowledgeEvidenceError:
+        return None
+    return encoded
 
 
 def _selected_knowledge_token(context: Mapping[str, Any]) -> tuple[str, str] | None:

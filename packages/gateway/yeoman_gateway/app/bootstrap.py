@@ -1465,6 +1465,20 @@ def _build_participation_runtime(
     )
     if callable(bind_submission) and submission is not None:
         bind_submission(submission)
+    # Same durable validator the pre-dispatch hook uses, so the approval commit and the
+    # transport boundary cannot drift apart.
+    if knowledge is not None and memory is not None and chat_registry is not None:
+        bind_validator = getattr(
+            approval_tools, "set_knowledge_decision_validator", None
+        )
+        if callable(bind_validator):
+            bind_validator(
+                _knowledge_decision_validator(
+                    chat_registry=chat_registry,
+                    knowledge=knowledge,
+                    memory=memory,
+                )
+            )
     reactor = (
         _ParticipationReactor(responder=responder)
         if callable(getattr(responder, "react_to_participation", None))
@@ -2059,6 +2073,217 @@ def build_thread_responder(
     )
 
 
+def _knowledge_decision_validator(
+    *,
+    chat_registry: object,
+    knowledge: object,
+    memory: object,
+) -> "_KnowledgeDecisionValidator":
+    """Compose the durable knowledge validator from the live stores."""
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeSelector,
+    )
+
+    return _KnowledgeDecisionValidator(
+        selector=ParticipationKnowledgeSelector(knowledge=knowledge, memory=memory),
+        chat_registry=chat_registry,
+        policy_revision=getattr(knowledge, "policy_revision", 0),
+    )
+
+
+class _KnowledgeDecisionValidator:
+    """Revalidate persisted knowledge evidence against the current stores.
+
+    Everything it needs comes from the durable admission plus current membership and
+    the current knowledge policy revision. It holds no selection, keeps no mutable
+    "last selection" cache, and calls no model, so it is equally valid after a
+    restart as before one.
+    """
+
+    def __init__(
+        self,
+        *,
+        selector: object,
+        chat_registry: object,
+        policy_revision: object,
+    ) -> None:
+        self._selector = selector
+        self._chat_registry = chat_registry
+        self._policy_revision = policy_revision
+
+    def __call__(self, admission: object) -> tuple[bool, str]:
+        evidence = getattr(admission, "knowledge_evidence", None)
+        if evidence is None:
+            # A legacy recent-only approval: knowledge never influenced it, so there
+            # is no evidence to revalidate.
+            return True, "allow"
+        if not isinstance(evidence, Mapping):
+            return False, "knowledge_evidence_unreadable"
+        try:
+            readers = self._readers_from_evidence(admission, evidence)
+        except Exception:  # noqa: BLE001 - unavailable authority must fail closed
+            return False, "knowledge_reader_authority_unavailable"
+        if readers is None:
+            return False, "knowledge_reader_authority_changed"
+        return self._revalidate(evidence, readers)
+
+    def _readers_from_evidence(
+        self, admission: object, evidence: Mapping[str, Any]
+    ) -> object | None:
+        """Rebuild one reader per stored author from current membership and policy."""
+        from yeoman_gateway.knowledge._memory.read_gate import registry_members
+        from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
+        from yeoman_gateway.knowledge.models import TrustedReadContext
+        from yeoman_gateway.processing.participation_knowledge import (
+            ParticipationKnowledgeReader,
+            ParticipationKnowledgeReaders,
+        )
+
+        principals = _evidence_principals(evidence)
+        if not principals:
+            return None
+        channel = str(getattr(admission, "channel", "") or "")
+        chat_id = str(getattr(admission, "chat_id", "") or "")
+        members = frozenset(
+            registry_members(self._chat_registry, channel=channel, chat_id=chat_id)
+        )
+        if not members or any(principal not in members for principal in principals):
+            return None
+        policy_revision = self._policy_revision
+        if (
+            isinstance(policy_revision, bool)
+            or not isinstance(policy_revision, int)
+            or policy_revision < 0
+        ):
+            raise ValueError("knowledge policy revision unavailable")
+        # The stored reader identities carry the membership revision the readers were
+        # built with. Rebuild with exactly those values: `revalidate_for_readers` then
+        # compares like with like, and a changed membership shows up as a changed
+        # revision instead of a fabricated mismatch that would refuse every approval.
+        # Membership itself comes from the live registry, not from the stored snapshot.
+        principals_by_id, stored_membership = _stored_reader_identity(evidence)
+        if stored_membership is None:
+            return None
+        # The stored recipient set is the audience the evidence was read for. If the
+        # proven members are no longer exactly that set, membership changed and the
+        # approval must not survive - even when the surviving records look identical.
+        if not _stored_recipients_match(evidence, members):
+            return None
+        for principal in principals:
+            stored = principals_by_id.get(principal, ())
+            if not stored or int(stored[6]) != policy_revision:
+                return None
+        # Membership authority is re-checked by content, not only by the stored label:
+        # every author must still be a member, the proven set must still be exactly the
+        # audience the evidence was read for, and the stored revision is passed through
+        # so the selector's own comparison stays like-for-like. On the supported path
+        # that stored revision is registry-derived, so a changed member set shows up as
+        # a different identity rather than quietly re-using an old approval.
+        now = int(time.time() * 1000)
+        readers: list[Any] = []
+        for principal in sorted(principals):
+            read_context = TrustedReadContext(
+                principal_id=principal,
+                channel=channel,
+                chat_id=chat_id,
+                recipient_principals=members,
+                membership_revision=stored_membership,
+                policy_revision=policy_revision,
+                purpose="proactive",
+                now_ms=now,
+                is_direct=False,
+                owner=False,
+            )
+            readers.append(
+                ParticipationKnowledgeReader(
+                    read_context,
+                    FactReadContext(
+                        principal_id=principal,
+                        chat_scope_key=read_context.scope_key(),
+                        current_members=members,
+                        now_ms=now,
+                        owner=False,
+                        group_wide=True,
+                    ),
+                )
+            )
+        return ParticipationKnowledgeReaders(readers=tuple(readers))
+
+    def _revalidate(self, evidence: Mapping[str, Any], readers: object) -> tuple[bool, str]:
+        from yeoman_gateway.processing.participation_knowledge import (
+            ParticipationKnowledgeEvidenceError,
+            ParticipationKnowledgeInvalidatedError,
+            selection_from_mapping,
+        )
+
+        try:
+            selection = selection_from_mapping(evidence)
+        except ParticipationKnowledgeEvidenceError:
+            return False, "knowledge_evidence_invalid"
+        revalidate = getattr(self._selector, "revalidate_for_readers", None)
+        if not callable(revalidate):
+            return False, "knowledge_revalidation_unavailable"
+        try:
+            current = revalidate(selection, readers=readers)
+        except ParticipationKnowledgeInvalidatedError:
+            return False, "knowledge_changed"
+        except Exception:  # noqa: BLE001 - an outage must not approve
+            return False, "knowledge_revalidation_unavailable"
+        stored = tuple(getattr(selection, "records", ()) or ())
+        if current is None or tuple(getattr(current, "records", ()) or ()) != stored:
+            return False, "knowledge_changed"
+        if str(getattr(current, "text", "") or "") != str(selection.text):
+            return False, "knowledge_changed"
+        return True, "allow"
+
+
+def _evidence_principals(evidence: Mapping[str, Any]) -> tuple[str, ...]:
+    """The stored reader principals, in the shape the codec writes them."""
+    principals, _membership = _stored_reader_identity(evidence)
+    return tuple(principals)
+
+
+def _stored_recipients_match(evidence: Mapping[str, Any], members: frozenset[str]) -> bool:
+    """True when the proven members are exactly the audience the evidence was read for."""
+    prerequisites = evidence.get("reader_prerequisites")
+    if not isinstance(prerequisites, Mapping):
+        return False
+    stored = prerequisites.get("recipient_principals")
+    if not isinstance(stored, list) or not stored:
+        return False
+    return {str(item) for item in stored} == set(members)
+
+
+def _stored_reader_identity(
+    evidence: Mapping[str, Any],
+) -> tuple[dict[str, tuple[Any, ...]], str | None]:
+    """Stored reader keys by principal, plus the single membership revision they agree on.
+
+    A bundle whose readers disagree about membership is unusable, so it resolves to no
+    identity at all rather than to one arbitrary reader's revision.
+    """
+    readers = evidence.get("readers")
+    if not isinstance(readers, list) or not readers:
+        return {}, None
+    by_principal: dict[str, tuple[Any, ...]] = {}
+    membership: str | None = None
+    for entry in readers:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 7:
+            return {}, None
+        principal = str(entry[0] or "").strip()
+        if not principal or principal in by_principal:
+            return {}, None
+        revision = str(entry[3] or "").strip()
+        if not revision:
+            return {}, None
+        if membership is None:
+            membership = revision
+        elif membership != revision:
+            return {}, None
+        by_principal[principal] = tuple(entry)
+    return by_principal, membership
+
+
 def build_effect_router(
     config: "Config",
     policy_adapter: "EnginePolicyAdapter | None",
@@ -2068,6 +2293,7 @@ def build_effect_router(
     threads: object | None = None,
     participation_ledger: object | None = None,
     inbound_archive: object | None = None,
+    knowledge_decision_validator: object | None = None,
 ):
     """Effect gateway plus transport executor for the new mode.
 
@@ -2314,6 +2540,13 @@ def build_effect_router(
         admission = store.get_participation_admission(admission_id) if admission_id else None
         if admission is None:
             return False, "participation_admission_missing"
+        if knowledge_decision_validator is not None:
+            # A knowledge-backed approval must still be true at the transport boundary.
+            # Bound to this exact admission: no selection state is cached between
+            # effects, and an unavailable validator blocks the send.
+            allowed, reason = knowledge_decision_validator(admission)
+            if not allowed:
+                return False, f"knowledge_approval_{reason}"
         try:
             return participation_checker.check(_participation_request(envelope, admission))
         except Exception as exc:
@@ -2633,6 +2866,19 @@ def build_gateway_runtime(
         thread_registry,
         source_registrar=observed_sources,
     )
+    # The same durable validator guards both effect boundaries: the owner-approval
+    # commit and the existing pre-dispatch hook. It reads current membership and the
+    # current knowledge policy at validation time, so a reader set persisted before a
+    # restart cannot keep an approval alive after authority or content changed.
+    knowledge_decision_validator = (
+        _knowledge_decision_validator(
+            chat_registry=chat_registry,
+            knowledge=knowledge_service,
+            memory=memory_service,
+        )
+        if knowledge_service is not None
+        else None
+    )
     effect_router = build_effect_router(
         config,
         policy_adapter,
@@ -2642,6 +2888,7 @@ def build_gateway_runtime(
         threads=thread_registry,
         participation_ledger=speakup_log,
         inbound_archive=inbound_archive,
+        knowledge_decision_validator=knowledge_decision_validator,
     )
     if effect_router is not None:
         from yeoman_gateway.processing.dispatch import managed_outbound_guard

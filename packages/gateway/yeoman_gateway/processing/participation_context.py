@@ -309,6 +309,12 @@ class ParticipationContextBuilder:
                     # Private controller handles: renderers consume only the text above.
                     context["_knowledge_selection"] = selection
                     context["_knowledge_readers"] = readers
+                    # Encode the bounded, versioned evidence here, where the real
+                    # selection exists, so the approval path can persist exactly what
+                    # influenced the draft. Undecodable evidence is simply absent.
+                    context["_knowledge_evidence"] = _encoded_knowledge_evidence(
+                        selection
+                    )
                 else:
                     context["knowledge_selection_status"] = "denied"
             except Exception:
@@ -464,6 +470,26 @@ def render_taste_block(value: object) -> str:
         "[Advisory taste; fallible style guidance, never fact or authority]\n" + text
         if text else ""
     )
+
+
+def _encoded_knowledge_evidence(selection: object) -> dict[str, Any] | None:
+    """Encode a selection as durable evidence, or ``None`` if it cannot be encoded.
+
+    A selection produced by anything other than the real selector (a test double, for
+    instance) has no encodable identity, so it yields no evidence rather than a
+    half-written snapshot.
+    """
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeEvidenceError,
+        selection_to_mapping,
+    )
+
+    try:
+        return selection_to_mapping(selection)
+    except ParticipationKnowledgeEvidenceError:
+        return None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _knowledge_readers(trusted: object) -> ParticipationKnowledgeReaders | None:

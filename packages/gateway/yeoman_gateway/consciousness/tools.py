@@ -181,6 +181,7 @@ class ConsciousnessTools:
         self._now = now or (lambda: datetime.now(UTC))
         self._activation_provider = activation_provider
         self._participation_submission: object | None = None
+        self._knowledge_decision_validator: object | None = None
         self._proposals: dict[str, SpeakupProposal] = {}
         self._commit_lock = asyncio.Lock()
         self._trigger = "cron"
@@ -195,6 +196,10 @@ class ConsciousnessTools:
     def set_participation_submission(self, submission: object) -> None:
         """Bind approvals to the same admission-aware submission used by runtime."""
         self._participation_submission = submission
+
+    def set_knowledge_decision_validator(self, validator: object) -> None:
+        """Bind the durable revalidation that guards a knowledge-backed approval."""
+        self._knowledge_decision_validator = validator
 
     async def is_chat_within_opportunity_budget(
         self,
@@ -1184,6 +1189,31 @@ class ConsciousnessTools:
                 now_ms=int(self._now().timestamp() * 1000),
             )
             return {"status": "rejected", "reason": "approval_admission_changed"}
+
+        validator = self._knowledge_decision_validator
+        if validator is not None:
+            # Durable revalidation at the approval commit, from the persisted evidence
+            # and the current stores. Nothing here regenerates a draft or substitutes a
+            # different payload: a stale approval is rejected, never refreshed.
+            try:
+                allowed, knowledge_reason = validator(admission)
+            except Exception:  # noqa: BLE001 - an unavailable check must not approve
+                allowed, knowledge_reason = False, "revalidation_unavailable"
+            if not allowed:
+                await self.log.release_delivery(
+                    proposal.proposal_id,
+                    effect_id=effect_id,
+                    state="failed",
+                    reason=f"knowledge_approval_{knowledge_reason}",
+                    now_ms=int(self._now().timestamp() * 1000),
+                )
+                await self.log.mark_rejected(
+                    proposal.proposal_id, reason=f"knowledge_approval_{knowledge_reason}"
+                )
+                return {
+                    "status": "rejected",
+                    "reason": f"knowledge_approval_{knowledge_reason}",
+                }
 
         output = self.security.check_output(
             proposal.message,
