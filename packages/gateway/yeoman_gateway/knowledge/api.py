@@ -1793,6 +1793,18 @@ class KnowledgeService:
                 context=context,
             )
 
+    def undo_merge_with_policy(
+        self, operation_id: str, *, reason: str = "admin"
+    ) -> ChangeReceipt:
+        """Undo one reversible merge with a Policy-issued admin context."""
+        context = self.admin_context_for(reason=reason)
+        with self._store.transaction():
+            return self._identity.undo_merge(
+                operation_id,
+                expected_revision=self._store.identity_revision,
+                context=context,
+            )
+
     def owner_read_context(
         self,
         *,

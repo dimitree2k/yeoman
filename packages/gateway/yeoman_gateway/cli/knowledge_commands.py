@@ -783,6 +783,182 @@ def knowledge_inspect_unresolved(
     connection.close()
 
 
+# ── owner identity maintenance ───────────────────────────────────────────────
+
+
+def _person_summary(connection: Any, person_id: str) -> dict[str, Any] | None:
+    """Counts and flags for one person, read from a read-only connection."""
+    row = connection.execute(
+        "SELECT id, is_owner, status FROM contacts WHERE id = ?", (str(person_id),)
+    ).fetchone()
+    if row is None:
+        return None
+    kinds = dict(
+        connection.execute(
+            "SELECT kind, COUNT(*) FROM knowledge_identifier_bindings"
+            " WHERE person_id = ? AND status = 'active' GROUP BY kind",
+            (str(person_id),),
+        ).fetchall()
+    )
+    statements = connection.execute(
+        "SELECT COUNT(DISTINCT statement_id) FROM knowledge_statement_people"
+        " WHERE person_id = ?",
+        (str(person_id),),
+    ).fetchone()[0]
+    redirected = connection.execute(
+        "SELECT COUNT(*) FROM knowledge_identity_redirects WHERE source_id = ? AND active = 1",
+        (str(person_id),),
+    ).fetchone()[0]
+    return {
+        "owner": bool(int(row["is_owner"] or 0)),
+        "status": str(row["status"]),
+        "bindings": "  ".join(f"{kind}={count}" for kind, count in sorted(kinds.items())) or "none",
+        "statements": int(statements),
+        "redirected": bool(redirected),
+    }
+
+
+def _open_admin_knowledge(db: Path | None, policy_path: Path | None) -> Any:
+    """Open the knowledge facade with the live Policy as admin authority.
+
+    Admin authority comes from the policy file's owners, never from the command line.
+    """
+    from yeoman_shared.config.loader import load_config
+
+    from yeoman_gateway.knowledge import open_knowledge_store, workspace_id_for
+    from yeoman_gateway.knowledge.runtime import (
+        RuntimeKnowledgePolicy,
+        RuntimeKnowledgeSources,
+    )
+    from yeoman_gateway.policy.loader import load_policy
+
+    config = load_config()
+    policy = load_policy(policy_path)
+    return open_knowledge_store(
+        Path(db or config.knowledge.db_path).expanduser(),
+        workspace_id=workspace_id_for(config.workspace_path),
+        source_authority=RuntimeKnowledgeSources(),
+        policy_authority=RuntimeKnowledgePolicy(
+            engine=policy,
+            admin_principals=frozenset(getattr(policy, "admin_principals", frozenset())),
+        ),
+        create=False,
+    )
+
+
+def _default_knowledge_path(db: Path | None) -> Path:
+    if db is not None:
+        return Path(db).expanduser()
+    from yeoman_shared.config.loader import load_config
+
+    return Path(load_config().knowledge.db_path).expanduser()
+
+
+@knowledge_app.command("person-merge")
+def knowledge_person_merge(
+    target: str = typer.Option(..., "--target", help="Person id that stays canonical"),
+    source: str = typer.Option(..., "--source", help="Person id redirected to the target"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the merge; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Merge two people by exact id as a reversible redirect (dry run by default).
+
+    Both person rows, their bindings and statement edges stay as they are; reads follow
+    the redirect.  An owner-flagged person is refused: owner records are repaired
+    separately, because a merge never moves the owner flag.
+    """
+    target_id, source_id = str(target).strip(), str(source).strip()
+    if not target_id or not source_id or target_id == source_id:
+        _fail("invalid_input", "target and source must be two different person ids")
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        people = {
+            "target": _person_summary(connection, target_id),
+            "source": _person_summary(connection, source_id),
+        }
+    finally:
+        connection.close()
+    for role, summary in people.items():
+        if summary is None:
+            _fail("unresolved", f"unknown {role} person")
+        if summary["owner"]:
+            _fail("owner_record", f"the {role} is owner-flagged; repair owner records separately")
+        if summary["status"] != "active":
+            _fail("identity_conflict", f"the {role} is not active")
+        if summary["redirected"]:
+            _fail("identity_conflict", f"the {role} is already merged into another person")
+    for role, person_id in (("target", target_id), ("source", source_id)):
+        summary = people[role]
+        assert summary is not None
+        _line(
+            f"  {role} {_redacted(person_id)}  bindings {summary['bindings']}"
+            f"  statements={summary['statements']}"
+        )
+    if not apply:
+        _line(
+            f"dry run: would merge source {_redacted(source_id)}"
+            f" into target {_redacted(target_id)}; re-run with --apply to write"
+        )
+        return
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        receipt = knowledge.merge_people_with_policy(
+            target_id, source_id, reason="cli_person_merge"
+        )
+    except Exception as exc:
+        _fail("merge_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(
+        f"merged source {_redacted(source_id)} into target {_redacted(target_id)}"
+        f" (operation {receipt.operation_id})"
+    )
+
+
+@knowledge_app.command("person-merge-undo")
+def knowledge_person_merge_undo(
+    operation: str = typer.Option(..., "--operation", help="Merge operation id to undo"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write the undo; without it this is a dry run"
+    ),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Undo one person merge by operation id (dry run by default)."""
+    operation_id = str(operation).strip()
+    connection = _open_readonly_connection(_default_knowledge_path(db))
+    try:
+        row = connection.execute(
+            "SELECT source_id, target_id FROM knowledge_identity_redirects"
+            " WHERE operation_id = ? AND active = 1",
+            (operation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        _fail("unresolved", "no active merge with this operation id")
+    if not apply:
+        _line(
+            f"dry run: would undo the merge of {_redacted(row['source_id'])}"
+            f" into {_redacted(row['target_id'])}; re-run with --apply to write"
+        )
+        return
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        knowledge.undo_merge_with_policy(operation_id, reason="cli_person_merge_undo")
+    except Exception as exc:
+        _fail("undo_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _line(
+        f"undone: {_redacted(row['source_id'])} is separate from"
+        f" {_redacted(row['target_id'])} again"
+    )
+
+
 @capture_app.command("status")
 def capture_status(    target: Path = typer.Option(
         Path("~/.yeoman/data/knowledge/knowledge.db"),
