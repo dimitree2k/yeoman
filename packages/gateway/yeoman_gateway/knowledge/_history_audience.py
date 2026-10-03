@@ -18,7 +18,9 @@ from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
 
 from ._history import HistoricalJournal
 
-_TIME_CERTAINTIES = frozenset({"canonical", "certain", "exact", "source_exact", "verified"})
+_TIME_CERTAINTIES = frozenset(
+    {"canonical", "certain", "exact", "source_exact", "verified", "native", "provider_timestamp"}
+)
 _SNAPSHOT_CLASSES = frozenset({"membership_snapshot", "native_snapshot", "source_snapshot"})
 _DIRECT_CHAT_KINDS = frozenset({"direct", "dm", "private"})
 _UNKNOWN_SCOPE = "unknown"
@@ -509,7 +511,11 @@ class HistoryAudience:
         for event in events:
             if not isinstance(event, Mapping):
                 continue
-            scope = _scope(event) or (_UNKNOWN_SCOPE,) * 3
+            # Coverage is metadata-only: retain each known component even when the
+            # account is unknown. resolve() above still requires a complete strict scope.
+            scope = tuple(
+                _text(event.get(key)) or _UNKNOWN_SCOPE for key in ("channel", "account", "chat_id")
+            )
             month = _month(event)
             key = (*scope, month)
             bucket = buckets.setdefault(
