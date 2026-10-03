@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.knowledge._contacts.service import ContactsService
+    from yeoman_gateway.knowledge.models import TrustedIdentityObservation
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier
@@ -71,6 +72,7 @@ class Orchestrator:
         reply_archive: ReplyArchivePort | None = None,
         contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
+        identity_observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 30,
@@ -112,7 +114,11 @@ class Orchestrator:
         # private contacts writer.  Without knowledge the middleware is a no-op: the
         # observation is already durable in the processing journal.
         if knowledge is not None:
-            layers.append(ContactsMiddleware(knowledge=knowledge))
+            layers.append(
+                ContactsMiddleware(
+                    knowledge=knowledge, observation_issuer=identity_observation_issuer
+                )
+            )
         layers.extend([
             ReplyContextMiddleware(
                 archive=reply_archive,

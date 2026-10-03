@@ -181,13 +181,23 @@ class RuntimeKnowledgeSources:
     evidence_refs: set[str] = field(default_factory=set)
     archive: dict[tuple[str, int], ArchiveEvidence] = field(default_factory=dict)
     processing_store: Any | None = None
+    #: Issued observations are verified right after issue, so only a short window is
+    #: kept; the oldest is forgotten first and the map never grows with traffic.
+    max_observations: int = 1024
 
     # ── registration by the archive owner ────────────────────────────────────
 
     def observe(self, observation: TrustedIdentityObservation) -> str:
-        """Register a channel-verified identity observation."""
+        """Register a channel-verified identity observation.
+
+        The channel adapter issues one observation per inbound message, so the proof is
+        kept in the bounded observation window only.  It is not added to
+        ``evidence_refs``: an identity observation is not general evidence.
+        """
+        self.observations.pop(observation.evidence_ref, None)
         self.observations[observation.evidence_ref] = observation
-        self.evidence_refs.add(observation.evidence_ref)
+        while len(self.observations) > max(1, int(self.max_observations)):
+            self.observations.pop(next(iter(self.observations)))
         return observation.evidence_ref
 
     def issue_evidence_ref(self, reference: str) -> str:

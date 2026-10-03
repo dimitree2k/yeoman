@@ -2643,6 +2643,13 @@ class WhatsAppChannel(BaseChannel):
                 "participant_lid": event.participant_jid if event.sender_phone_jid else None,
                 "sender_phone_jid": event.sender_phone_jid,
                 "lid_conflict": event.lid_conflict,
+                # The bridge account namespaces the sender's identifiers; without it the
+                # identity middleware would look them up in a namespace nobody writes.
+                **(
+                    {"account_id": self._processing_account_id}
+                    if self._processing_account_id
+                    else {}
+                ),
                 "sender": effective_sender or event.sender_id,
                 "sender_name": event.sender_name,
                 "is_group": event.is_group,

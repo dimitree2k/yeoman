@@ -3210,6 +3210,9 @@ def build_gateway_runtime(
         reply_archive=archive_adapter,
         contacts=consumer_contacts,
         knowledge=knowledge_service,
+        identity_observation_issuer=(
+            knowledge_sources.observe if knowledge_sources is not None else None
+        ),
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,

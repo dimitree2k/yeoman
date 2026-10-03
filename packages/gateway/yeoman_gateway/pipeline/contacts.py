@@ -18,13 +18,17 @@ knowledge facade.  It is a bridge, not an authority:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
+
+from loguru import logger
 
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 
 if TYPE_CHECKING:
     from yeoman_gateway.knowledge.api import KnowledgeService
+    from yeoman_gateway.knowledge.models import TrustedIdentityObservation
 
 # Channels that should trigger contact resolution.
 _IDENTITY_CHANNELS = frozenset({"whatsapp", "telegram"})
@@ -57,8 +61,17 @@ def _push_name(channel: str, raw: dict[str, Any]) -> str | None:
 class ContactsMiddleware:
     """Resolve the sender identity through the public knowledge facade."""
 
-    def __init__(self, *, knowledge: "KnowledgeService | None" = None) -> None:
+    def __init__(
+        self,
+        *,
+        knowledge: "KnowledgeService | None" = None,
+        observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
+    ) -> None:
         self._knowledge = knowledge
+        # The source authority only verifies an observation that was issued to it.  The
+        # composition root hands its issuer in, because this middleware is where the
+        # channel's proven metadata becomes an observation.
+        self._observation_issuer = observation_issuer
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event = ctx.event
@@ -74,11 +87,20 @@ class ContactsMiddleware:
             return
 
         try:
+            if self._observation_issuer is not None:
+                self._observation_issuer(observation)
             resolution = self._knowledge.resolve_observation(observation)
-        except Exception:
+        except Exception as exc:
             # Knowledge is degraded.  The observation is already durable in the
             # processing journal, so nothing is lost and nothing is invented: this turn
-            # simply runs without a proven person.
+            # simply runs without a proven person.  The log names the reason code only:
+            # the error message may carry identifiers.
+            logger.warning(
+                "identity_resolution_failed channel={} reason={} error_type={}",
+                event.channel,
+                getattr(exc, "code", None) or "unexpected_error",
+                type(exc).__name__,
+            )
             await next(ctx)
             return
 
