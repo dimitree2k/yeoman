@@ -34,7 +34,9 @@ __all__ = [
     "SnapshotReport",
     "SnapshotVerification",
     "benchmark_profiles",
+    "collect_sources",
     "create_snapshot",
+    "verify_source_bundle",
     "verify_snapshot",
 ]
 
@@ -188,7 +190,7 @@ def _backup(source: Path, target: Path) -> None:
     if target.exists():
         raise SnapshotError("target_exists", f"refusing to overwrite {target}")
     try:
-        origin = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        origin = sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise SnapshotError("source_unreadable", f"cannot read {source}") from exc
     destination = sqlite3.connect(str(target))
@@ -699,6 +701,22 @@ def _percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
     return ordered[index]
+
+
+def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
+    """Collect an explicit source list into a versioned, private bundle."""
+    from ._source_bundles import collect_sources as collect
+
+    return collect(sources=sources, target_dir=target_dir)
+
+
+def verify_source_bundle(
+    *, manifest: Path, restore_dir: Path | None = None
+) -> dict[str, Any]:
+    """Verify exact bundle hashes on isolated copies."""
+    from ._source_bundles import verify_source_bundle as verify
+
+    return verify(manifest=manifest, restore_dir=restore_dir)
 
 
 # ── small helpers ────────────────────────────────────────────────────────────

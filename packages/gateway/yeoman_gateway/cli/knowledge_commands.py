@@ -623,6 +623,67 @@ def snapshot_verify(
         _fail("manifest_mismatch", report.reason)
 
 
+@snapshot_app.command("collect")
+def snapshot_collect(
+    sources: Path = typer.Option(..., "--sources", help="JSON file containing explicit source descriptors"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Collect explicitly named sources. No runtime source paths are inferred."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, collect_sources
+
+    try:
+        descriptors = json.loads(sources.read_text(encoding="utf-8"))
+        report = collect_sources(sources=descriptors, target_dir=target_dir)
+    except (OSError, ValueError, SnapshotError) as exc:
+        message = exc.message if isinstance(exc, SnapshotError) else "cannot read source descriptor JSON"
+        _fail("source_error", message, getattr(exc, "code", "sources_invalid"))
+    _line(f"bundle: {report['bundle_dir']}")
+    _line(f"manifest: {report['manifest_path']}")
+    _line(f"sources: {report['source_count']}")
+    _line(f"complete: {'yes' if report['complete'] else 'no'}")
+
+
+@snapshot_app.command("verify-bundle")
+def snapshot_verify_bundle(
+    manifest: Path = typer.Option(..., "--manifest", help="Source bundle manifest"),
+    restore_dir: Path | None = typer.Option(
+        None, "--restore-dir", help="Optional directory for verified isolated copies"
+    ),
+) -> None:
+    """Verify bundle hashes and SQLite structure without exposing row values."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_source_bundle
+
+    try:
+        report = verify_source_bundle(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"bundle verdict: {report['verdict']}", style="green" if report["verdict"] == "ok" else "red")
+    _line(f"sources: {report['source_count']}")
+    if report["verdict"] != "ok":
+        _fail("manifest_mismatch", ", ".join(report["errors"]))
+
+
+@snapshot_app.command("restore")
+def snapshot_restore_bundle(
+    manifest: Path = typer.Option(..., "--manifest", help="Source bundle manifest"),
+    restore_dir: Path = typer.Option(..., "--restore-dir", help="New empty directory for isolated copies"),
+) -> None:
+    """Restore and verify a source bundle into an isolated directory."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_source_bundle
+
+    try:
+        report = verify_source_bundle(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"bundle verdict: {report['verdict']}", style="green" if report["verdict"] == "ok" else "red")
+    _line(f"sources: {report['source_count']}")
+    _line(f"restore: {restore_dir}")
+    if report["verdict"] != "ok":
+        _fail("manifest_mismatch", ", ".join(report["errors"]))
+
+
 @knowledge_app.command("benchmark")
 def knowledge_benchmark(
     target: Path = typer.Option(..., "--target", help="Scratch database path to use"),
