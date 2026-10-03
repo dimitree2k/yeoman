@@ -460,6 +460,24 @@ def render_taste_block(value: object) -> str:
     )
 
 
+def _bounded_query_prefix(entry: str, budget: int) -> str:
+    """Return at most ``budget`` characters from the start of ``entry``.
+
+    A trigger that cannot fit whole still has to contribute something: dropping it
+    would leave an otherwise authorized long trigger with no query at all. The whole
+    ``budget`` is always spent. The only shaping is dropping a trailing partial word:
+    when the prefix ends inside a word whose completed length also fits the budget,
+    that split word is removed rather than counted as a term, because a lexically
+    meaningful boundary is worth more to the selector than a truncated token.
+    """
+    prefix = entry[:budget]
+    clipped = prefix.rstrip(" ")
+    tail_start = clipped.rfind(" ") + 1
+    if tail_start > 0 and len(clipped) - tail_start <= budget:
+        return clipped
+    return prefix
+
+
 def _knowledge_query(context: Mapping[str, Any], source_ids: tuple[str, ...]) -> str:
     rows = context.get("messages")
     if not isinstance(rows, list):
@@ -480,11 +498,18 @@ def _knowledge_query(context: Mapping[str, Any], source_ids: tuple[str, ...]) ->
         else:
             nearby.append(normalized)
     result: list[str] = []
+    used = 0
     for entry in (*required, *nearby[-3:]):
-        candidate = " ".join((*result, entry))
-        if len(candidate) > 600:
+        separator = 1 if result else 0
+        budget = 600 - used - separator
+        if budget <= 0:
             break
+        if len(entry) > budget:
+            entry = _bounded_query_prefix(entry, budget)
+            if not entry:
+                break
         result.append(entry)
+        used += separator + len(entry)
     return " ".join(result)
 
 

@@ -22,6 +22,7 @@ from yeoman_gateway.processing.participation_context import (
     ParticipationContextBounds,
     ParticipationContextBuilder,
     ParticipationDecisionInputs,
+    _knowledge_query,
 )
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_gateway.storage.inbound_archive import InboundArchive
@@ -721,3 +722,89 @@ async def test_media_and_forward_summaries_are_preserved(tmp_path: Path) -> None
     assert rows["img"]["text"] == ""
     assert "formation" in str(rows["q"]["text"])
     assert context["dropped_source_ids"] == []
+
+
+def _query_rows(*entries: tuple[str, str]) -> list[dict[str, str]]:
+    """Rows in the shape the context builder hands to the query builder."""
+    return [{"message_id": message_id, "text": text} for message_id, text in entries]
+
+
+def test_knowledge_query_retains_a_bounded_prefix_of_an_over_budget_trigger() -> None:
+    long_trigger = "topic " * 180  # 1080 characters, normalized to one entry
+    query = _knowledge_query(
+        {
+            "messages": _query_rows(
+                ("long", long_trigger),
+                ("nearby", "unrelated venue chatter"),
+            )
+        },
+        ("long",),
+    )
+    assert query, "a long authorized trigger must still produce a query"
+    assert len(query) <= 600
+    assert query.startswith("topic")
+    assert long_trigger.split()[0] in query
+    # The trigger consumed the whole budget, so it never falls back to nearby text.
+    assert "unrelated" not in query
+
+
+def test_knowledge_query_keeps_an_entry_that_fits_exactly() -> None:
+    exact = "x" * 600
+    query = _knowledge_query(
+        {"messages": _query_rows(("trigger", exact), ("nearby", "later chatter"))},
+        ("trigger",),
+    )
+    assert query == exact
+    assert len(query) == 600
+
+
+def test_knowledge_query_normalizes_whitespace_before_prefixing() -> None:
+    messy = "  alpha\t beta \n gamma " + "y" * 900
+    query = _knowledge_query({"messages": _query_rows(("trigger", messy))}, ("trigger",))
+    assert query.startswith("alpha beta gamma")
+    assert "\n" not in query and "\t" not in query and "  " not in query
+    assert len(query) == 600
+
+
+def test_knowledge_query_counts_unicode_characters_not_bytes() -> None:
+    trigger = "\u00fc" * 900
+    query = _knowledge_query({"messages": _query_rows(("trigger", trigger))}, ("trigger",))
+    assert len(query) == 600
+    assert query == "\u00fc" * 600
+
+
+def test_knowledge_query_orders_triggers_first_even_when_rows_lead_with_nearby() -> None:
+    """Trigger-first ordering must not depend on the order rows arrive in."""
+    query = _knowledge_query(
+        {
+            "messages": _query_rows(
+                ("nearby-1", "older chatter"),
+                ("trigger", "the match moved to Riverside"),
+                ("nearby-2", "newer chatter"),
+            )
+        },
+        ("trigger",),
+    )
+    assert query.startswith("the match moved to Riverside")
+    assert query == "the match moved to Riverside older chatter newer chatter"
+
+
+def test_knowledge_query_is_empty_without_usable_text() -> None:
+    assert _knowledge_query({"messages": _query_rows(("trigger", "   "))}, ("trigger",)) == ""
+    assert _knowledge_query({"messages": _query_rows(("trigger", ""))}, ("trigger",)) == ""
+
+
+def test_knowledge_query_ignores_non_mapping_rows_and_coerces_text() -> None:
+    query = _knowledge_query(
+        {"messages": ["not a row", {"message_id": "num", "text": 12345}]},
+        (),
+    )
+    assert query == "12345"
+
+
+def test_knowledge_query_does_not_mutate_message_bodies() -> None:
+    long_trigger = "topic " * 180
+    rows = _query_rows(("long", long_trigger), ("nearby", "  spaced   text  "))
+    before = [dict(row) for row in rows]
+    _knowledge_query({"messages": rows}, ("long",))
+    assert rows == before
