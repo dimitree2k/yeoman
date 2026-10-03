@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
@@ -20,6 +21,20 @@ from yeoman_gateway.knowledge.models import (
 MAX_QUERY_CHARS = 600
 MAX_ENTRIES = 3
 MAX_TEXT_CHARS = 1200
+
+#: The persisted evidence schema. A bump means an older snapshot is not readable.
+KNOWLEDGE_EVIDENCE_VERSION = 1
+MAX_EVIDENCE_READERS = 16
+MAX_EVIDENCE_MEMBERS = 1024
+MAX_EVIDENCE_REVISION_CHARS = 128
+MAX_EVIDENCE_REASON_CHARS = 128
+
+_EVIDENCE_KEYS = frozenset(
+    {"version", "text", "query", "revision", "reason", "records", "readers", "reader_prerequisites"}
+)
+_RECORD_KEYS = frozenset({"kind", "record_id", "text", "refs"})
+_PREREQUISITE_KEYS = frozenset({"recipient_principals", "current_members", "now_ms", "is_direct"})
+_RECORD_KINDS = frozenset({"statement", "fact"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +60,10 @@ class ParticipationKnowledgeSelection:
     statements: KnowledgeContext
     revision: str
     reason: str
+    recipient_principals: tuple[str, ...]
+    current_members: tuple[str, ...]
+    now_ms: int
+    is_direct: bool
     _fact_text: str
     _fact_refs: tuple[tuple[str, tuple[tuple[str, int], ...]], ...]
     _fact_denied_count: int
@@ -62,12 +81,26 @@ class ParticipationKnowledgeSelection:
         records: tuple[ParticipationKnowledgeRecord, ...] = (),
         reader_keys: tuple[tuple[str, str, str, str, str, str, int], ...] = (),
         query: str = "",
+        recipient_principals: tuple[str, ...] = (),
+        current_members: tuple[str, ...] = (),
+        now_ms: int = 0,
+        is_direct: bool = False,
     ) -> None:
         snapshot = facts or FactRetrievalResult()
         object.__setattr__(self, "text", str(text))
         object.__setattr__(self, "statements", statements)
         object.__setattr__(self, "revision", str(revision))
         object.__setattr__(self, "reason", str(reason))
+        object.__setattr__(
+            self,
+            "recipient_principals",
+            tuple(sorted(str(item) for item in recipient_principals)),
+        )
+        object.__setattr__(
+            self, "current_members", tuple(sorted(str(item) for item in current_members))
+        )
+        object.__setattr__(self, "now_ms", int(now_ms))
+        object.__setattr__(self, "is_direct", bool(is_direct))
         object.__setattr__(self, "_fact_text", str(snapshot.text))
         object.__setattr__(
             self,
@@ -242,6 +275,7 @@ class ParticipationKnowledgeSelector:
             records=_selection_records(statements, facts),
             reader_keys=(reader_key(read_context, fact_context),),
             query=text,
+            **_reader_prerequisites(read_context, fact_context),
         )
 
     def select_for_readers(
@@ -256,7 +290,9 @@ class ParticipationKnowledgeSelector:
         """
         ordered = _ordered_readers(readers)
         if not ordered:
-            return _empty("empty")
+            # An empty or inconsistent reader bundle is a refusal, not a no-hit: the
+            # caller must be able to tell "nobody may read" from "nothing matched".
+            return _empty("denied")
         if len(ordered) == 1:
             reader = ordered[0]
             return self.select(
@@ -372,29 +408,310 @@ class ParticipationKnowledgeSelector:
             records=_selection_records(statements, facts),
             reader_keys=(reader_key(read_context, fact_context),),
             query=query,
+            **_reader_prerequisites(read_context, fact_context),
         )
+
+
+# -- durable evidence ------------------------------------------------------------------
+#
+# A delayed owner approval has to survive a process restart. The admission therefore
+# carries this bounded, versioned snapshot of the exact knowledge it was influenced by,
+# so a later revalidation can look for the same records again. The mapping is JSON-native,
+# deterministic and private: it never contains a native message, a transcript or model
+# output, and it is validated on the way out as strictly as on the way in.
+
+
+class ParticipationKnowledgeEvidenceError(RuntimeError):
+    """A persisted knowledge-evidence snapshot is missing, malformed or unsupported."""
+
+
+def selection_to_mapping(selection: ParticipationKnowledgeSelection) -> dict[str, Any]:
+    """Encode one selection as bounded, versioned, JSON-native evidence."""
+    mapping: dict[str, Any] = {
+        "version": KNOWLEDGE_EVIDENCE_VERSION,
+        "text": str(selection.text),
+        "query": str(selection.query),
+        "revision": str(selection.revision),
+        "reason": str(selection.reason),
+        "records": [
+            {
+                "kind": str(record.kind),
+                "record_id": str(record.record_id),
+                "text": str(record.text),
+                "refs": [[str(event_id), int(revision)] for event_id, revision in record.refs],
+            }
+            for record in selection.records
+        ],
+        "readers": [list(key) for key in selection.reader_keys],
+        "reader_prerequisites": {
+            "recipient_principals": list(selection.recipient_principals),
+            "current_members": list(selection.current_members),
+            "now_ms": int(selection.now_ms),
+            "is_direct": bool(selection.is_direct),
+        },
+    }
+    # Fail closed: evidence this codec cannot read back is never persisted.
+    selection_from_mapping(mapping)
+    return mapping
+
+
+def selection_from_mapping(value: Mapping[str, Any]) -> ParticipationKnowledgeSelection:
+    """Decode one evidence snapshot, validating every field explicitly."""
+    if not isinstance(value, Mapping):
+        raise ParticipationKnowledgeEvidenceError("knowledge evidence must be an object")
+    version = value.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ParticipationKnowledgeEvidenceError("knowledge evidence version is not an integer")
+    if version != KNOWLEDGE_EVIDENCE_VERSION:
+        raise ParticipationKnowledgeEvidenceError(
+            f"unsupported knowledge evidence version: {version}"
+        )
+    _require_exact_keys(value, _EVIDENCE_KEYS, "knowledge evidence")
+    text = _evidence_text(value["text"], "text", max_chars=MAX_TEXT_CHARS)
+    query = _evidence_text(value["query"], "query", max_chars=MAX_QUERY_CHARS)
+    revision = _evidence_text(value["revision"], "revision", max_chars=MAX_EVIDENCE_REVISION_CHARS)
+    reason = _evidence_text(value["reason"], "reason", max_chars=MAX_EVIDENCE_REASON_CHARS)
+    records = _evidence_records(value["records"])
+    readers = _evidence_readers(value["readers"])
+    recipients, members, now_ms, is_direct = _evidence_prerequisites(value["reader_prerequisites"])
+    _validate_evidence_consistency(records, readers, recipients, members)
+
+    first = readers[0] if readers else ("", "", "")
+    statement_records = tuple(record for record in records if record.kind == "statement")
+    fact_records = tuple(record for record in records if record.kind == "fact")
+    statements = KnowledgeContext(
+        text="\n".join(record.text for record in statement_records),
+        statement_ids=tuple(record.record_id for record in statement_records),
+        source_refs=tuple(
+            SourceRef(event_id, ref_revision, first[1], first[2], first[0], now_ms)
+            for record in statement_records
+            for event_id, ref_revision in record.refs
+        ),
+        entry_texts=tuple(record.text for record in statement_records),
+    )
+    facts = FactRetrievalResult(
+        text="\n".join(record.text for record in fact_records),
+        used_source_refs={record.record_id: record.refs for record in fact_records},
+    )
+    return ParticipationKnowledgeSelection(
+        text=text,
+        statements=statements,
+        facts=facts,
+        revision=revision,
+        reason=reason,
+        records=records,
+        reader_keys=readers,
+        query=query,
+        recipient_principals=recipients,
+        current_members=members,
+        now_ms=now_ms,
+        is_direct=is_direct,
+    )
+
+
+def _require_exact_keys(value: Mapping[str, Any], keys: frozenset[str], label: str) -> None:
+    present = set(value)
+    missing = sorted(keys - present)
+    if missing:
+        raise ParticipationKnowledgeEvidenceError(f"{label} is missing keys: {', '.join(missing)}")
+    unknown = sorted(str(key) for key in present - keys)
+    if unknown:
+        raise ParticipationKnowledgeEvidenceError(f"{label} has unknown keys: {', '.join(unknown)}")
+
+
+def _evidence_text(value: Any, name: str, *, max_chars: int) -> str:
+    if not isinstance(value, str):
+        raise ParticipationKnowledgeEvidenceError(f"{name} must be a string")
+    if len(value) > max_chars:
+        raise ParticipationKnowledgeEvidenceError(f"{name} exceeds {max_chars} characters")
+    return value
+
+
+def _evidence_records(value: Any) -> tuple[ParticipationKnowledgeRecord, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ParticipationKnowledgeEvidenceError("records must be a list")
+    if len(value) > MAX_ENTRIES:
+        raise ParticipationKnowledgeEvidenceError(f"records exceed {MAX_ENTRIES} entries")
+    records: list[ParticipationKnowledgeRecord] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ParticipationKnowledgeEvidenceError("a record must be an object")
+        _require_exact_keys(item, _RECORD_KEYS, "record")
+        kind = item["kind"]
+        if kind not in _RECORD_KINDS:
+            raise ParticipationKnowledgeEvidenceError("record kind is neither statement nor fact")
+        record_id = item["record_id"]
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ParticipationKnowledgeEvidenceError("a record id is empty")
+        text = _evidence_text(item["text"], "record text", max_chars=MAX_TEXT_CHARS)
+        if not text.strip():
+            raise ParticipationKnowledgeEvidenceError("a record text is empty")
+        records.append(
+            ParticipationKnowledgeRecord(
+                kind=kind, record_id=record_id, text=text, refs=_evidence_refs(item["refs"])
+            )
+        )
+    return tuple(records)
+
+
+def _evidence_refs(value: Any) -> tuple[tuple[str, int], ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ParticipationKnowledgeEvidenceError("record refs must be a list")
+    refs: list[tuple[str, int]] = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ParticipationKnowledgeEvidenceError("a record ref must be an event/revision pair")
+        event_id, revision = item
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise ParticipationKnowledgeEvidenceError("a record ref event id is empty")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise ParticipationKnowledgeEvidenceError("a record ref revision is not a positive int")
+        refs.append((event_id, revision))
+    return tuple(refs)
+
+
+def _evidence_readers(value: Any) -> tuple[tuple[str, str, str, str, str, str, int], ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ParticipationKnowledgeEvidenceError("readers must be a list")
+    if len(value) > MAX_EVIDENCE_READERS:
+        raise ParticipationKnowledgeEvidenceError(
+            f"readers exceed {MAX_EVIDENCE_READERS} identities"
+        )
+    readers: list[tuple[str, str, str, str, str, str, int]] = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 7:
+            raise ParticipationKnowledgeEvidenceError("a reader identity must have 7 members")
+        principal, channel, chat_id, membership, scope, purpose, policy_revision = item
+        for label, member in (
+            ("principal", principal),
+            ("channel", channel),
+            ("chat id", chat_id),
+            ("chat scope key", scope),
+            ("purpose", purpose),
+        ):
+            if not isinstance(member, str) or not member.strip():
+                raise ParticipationKnowledgeEvidenceError(f"a reader {label} is missing")
+        if not isinstance(membership, str):
+            raise ParticipationKnowledgeEvidenceError(
+                "a reader membership revision is not a string"
+            )
+        if (
+            isinstance(policy_revision, bool)
+            or not isinstance(policy_revision, int)
+            or policy_revision < 0
+        ):
+            raise ParticipationKnowledgeEvidenceError("a reader policy revision is invalid")
+        readers.append((principal, channel, chat_id, membership, scope, purpose, policy_revision))
+    return tuple(readers)
+
+
+def _evidence_prerequisites(
+    value: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...], int, bool]:
+    if not isinstance(value, Mapping):
+        raise ParticipationKnowledgeEvidenceError("reader_prerequisites must be an object")
+    _require_exact_keys(value, _PREREQUISITE_KEYS, "reader_prerequisites")
+    recipients = _evidence_principals(value["recipient_principals"], "recipient_principals")
+    members = _evidence_principals(value["current_members"], "current_members")
+    now_ms = value["now_ms"]
+    if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+        raise ParticipationKnowledgeEvidenceError("reader_prerequisites now_ms is invalid")
+    is_direct = value["is_direct"]
+    if not isinstance(is_direct, bool):
+        raise ParticipationKnowledgeEvidenceError("reader_prerequisites is_direct is not a bool")
+    return recipients, members, now_ms, is_direct
+
+
+def _evidence_principals(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ParticipationKnowledgeEvidenceError(f"{name} must be a list")
+    if len(value) > MAX_EVIDENCE_MEMBERS:
+        raise ParticipationKnowledgeEvidenceError(f"{name} exceeds {MAX_EVIDENCE_MEMBERS} members")
+    principals: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ParticipationKnowledgeEvidenceError(f"{name} contains an invalid principal")
+        principals.append(item)
+    return tuple(sorted(set(principals)))
+
+
+def _validate_evidence_consistency(
+    records: tuple[ParticipationKnowledgeRecord, ...],
+    readers: tuple[tuple[str, str, str, str, str, str, int], ...],
+    recipients: tuple[str, ...],
+    members: tuple[str, ...],
+) -> None:
+    """A real selection always names its readers and one shared audience."""
+    if bool(readers) != bool(recipients):
+        raise ParticipationKnowledgeEvidenceError(
+            "reader prerequisites do not match the recorded readers"
+        )
+    if recipients != members:
+        raise ParticipationKnowledgeEvidenceError("reader recipient and member sets disagree")
+    if records and not readers:
+        raise ParticipationKnowledgeEvidenceError("evidence records have no reader identity")
+
+
+def _reader_prerequisites(
+    read_context: TrustedReadContext, fact_context: FactReadContext
+) -> dict[str, Any]:
+    """The reader inputs a revalidation needs and a reader key does not carry."""
+    return {
+        "recipient_principals": tuple(
+            sorted(str(item) for item in (read_context.recipient_principals or ()))
+        ),
+        "current_members": tuple(
+            sorted(str(item) for item in (fact_context.current_members or ()))
+        ),
+        "now_ms": int(read_context.now_ms),
+        "is_direct": bool(read_context.is_direct),
+    }
+
+
+def _records_with_refs(
+    statements: KnowledgeContext,
+) -> list[tuple[str, str, tuple[tuple[str, int], ...]]]:
+    """Pair each rendered statement with its own content and its source revisions.
+
+    ``KnowledgeContext.source_refs`` carries one entry per *active source*, not per
+    statement, so refs are attributed positionally only when the cardinalities line
+    up. Otherwise ``statement_ids`` cannot be mapped to refs at all; the record is
+    then kept without refs rather than being given another statement's evidence.
+    """
+    values = [line.strip() for line in _statement_lines(statements)]
+    ids = tuple(statements.statement_ids[: len(values)])
+    if len(ids) != len(values):
+        return []
+    refs_by_id: dict[str, list[tuple[str, int]]] = {}
+    if len(statements.source_refs) == len(ids):
+        for statement_id, ref in zip(ids, statements.source_refs, strict=True):
+            refs_by_id.setdefault(str(statement_id), []).append(
+                (str(ref.event_id), int(ref.revision))
+            )
+    else:
+        for ref in statements.source_refs:
+            refs_by_id.setdefault(str(ref.event_id), []).append(
+                (str(ref.event_id), int(ref.revision))
+            )
+    return [
+        (str(statement_id), value, _sorted_refs(refs_by_id.get(str(statement_id), [])))
+        for statement_id, value in zip(ids, values, strict=True)
+    ]
 
 
 def _selection_records(
     statements: KnowledgeContext, facts: FactRetrievalResult
 ) -> tuple[ParticipationKnowledgeRecord, ...]:
     """Freeze each selected entry as identity, rendered text and source revisions."""
-    statement_values = [line.strip() for line in _statement_lines(statements)]
-    statement_ids = tuple(statements.statement_ids[: len(statement_values)])
-    refs_by_id: dict[str, list[tuple[str, int]]] = {}
-    for ref in statements.source_refs:
-        refs_by_id.setdefault(str(ref.event_id), []).append((str(ref.event_id), int(ref.revision)))
-    records: list[ParticipationKnowledgeRecord] = []
-    if len(statement_ids) == len(statement_values):
-        for statement_id, value in zip(statement_ids, statement_values, strict=True):
-            records.append(
-                ParticipationKnowledgeRecord(
-                    kind="statement",
-                    record_id=str(statement_id),
-                    text=value,
-                    refs=_sorted_refs(refs_by_id.get(str(statement_id), ())),
-                )
-            )
+    records: list[ParticipationKnowledgeRecord] = [
+        ParticipationKnowledgeRecord(
+            kind="statement",
+            record_id=statement_id,
+            text=value,
+            refs=refs,
+        )
+        for statement_id, value, refs in _records_with_refs(statements)
+    ]
     for fact_id, line in _fact_lines(facts):
         records.append(
             ParticipationKnowledgeRecord(
@@ -457,21 +774,19 @@ def _combine_records(
     ordered = [common[key] for key in sorted(common)]
     statement_records = [record for record in ordered if record.kind == "statement"]
     fact_records = [record for record in ordered if record.kind == "fact"]
+    # Reuse the source evidence the readers actually produced. Rebuilding a SourceRef
+    # here would have to invent the author principal, which is exactly the field that
+    # proves a statement's origin, so the surviving records keep their real refs.
+    wanted_events = {
+        event_id for record in statement_records for event_id, _revision in record.refs
+    }
+    source_refs = tuple(
+        ref for ref in selections[0].statements.source_refs if str(ref.event_id) in wanted_events
+    )
     statements = KnowledgeContext(
         text="\n".join(record.text for record in statement_records),
         statement_ids=tuple(record.record_id for record in statement_records),
-        source_refs=tuple(
-            SourceRef(
-                event_id,
-                revision,
-                str(readers[0].read_context.channel),
-                str(readers[0].read_context.chat_id),
-                "",
-                int(readers[0].read_context.now_ms),
-            )
-            for record in statement_records
-            for event_id, revision in record.refs
-        ),
+        source_refs=source_refs,
         context_revision=str(selections[0].statements.context_revision),
         identity_revision=int(selections[0].statements.identity_revision),
         acl_epoch=int(selections[0].statements.acl_epoch),
@@ -496,6 +811,7 @@ def _combine_records(
         records=tuple(ordered),
         reader_keys=reader_keys,
         query=str(selections[0].query),
+        **_reader_prerequisites(readers[0].read_context, readers[0].fact_context),
     )
 
 

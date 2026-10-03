@@ -91,6 +91,47 @@ def test_participation_knowledge_context_covers_every_trigger_author() -> None:
     ) == "denied"
 
 
+def test_participation_knowledge_context_fails_closed_without_members_or_author() -> None:
+    """No proven membership and no proven author both refuse, never one author's read."""
+    knowledge = SimpleNamespace(policy_revision=7)
+    opportunity = SimpleNamespace(
+        channel="whatsapp", chat_id="group@g.us", source_event_ids=("m1",)
+    )
+    context = {"messages": [{"event_id": "m1", "sender_id": "anna"}]}
+
+    def _registry_with(participants):
+        return SimpleNamespace(
+            get_chat=lambda channel, chat: {"metadata": {"participants": participants}}
+        )
+
+    assert _participation_knowledge_readers(
+        opportunity,
+        context,
+        chat_registry=SimpleNamespace(get_chat=lambda channel, chat: None),
+        knowledge=knowledge,
+    ) == "unknown_membership"
+    assert _participation_knowledge_readers(
+        opportunity, context, chat_registry=_registry_with([]), knowledge=knowledge
+    ) == "unknown_membership"
+
+    def _unavailable(channel, chat):
+        raise RuntimeError("registry unavailable")
+
+    assert _participation_knowledge_readers(
+        opportunity,
+        context,
+        chat_registry=SimpleNamespace(get_chat=_unavailable),
+        knowledge=knowledge,
+    ) == "unknown_membership"
+    # A trigger source the archive cannot resolve has no proven author at all.
+    assert _participation_knowledge_readers(
+        opportunity,
+        {"messages": [{"event_id": "other", "sender_id": "anna"}]},
+        chat_registry=_registry_with(["anna", "ben"]),
+        knowledge=knowledge,
+    ) == "source_unavailable"
+
+
 def test_participation_knowledge_context_fails_closed_for_unverified_chat_types() -> None:
     registry = SimpleNamespace(
         get_chat=lambda channel, chat: {

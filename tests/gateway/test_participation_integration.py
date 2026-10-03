@@ -1129,6 +1129,128 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
 
 
 @pytest.mark.asyncio
+async def test_two_author_trigger_consults_the_multi_reader_knowledge_selector(
+    tmp_path: Path,
+) -> None:
+    """A coalesced two-author trigger intersects both authors' protected reads.
+
+    The superseded composition answered ``"multi_author"`` and left such a trigger on
+    the recent-only fallback; the production supplier now builds one verified reader
+    per author and the selector is asked for both principals.
+    """
+    from time import time
+
+    from yeoman_gateway.app.bootstrap import _participation_knowledge_readers
+    from yeoman_gateway.knowledge._memory.shared_facts import FactRetrievalResult
+    from yeoman_gateway.knowledge.models import KnowledgeContext, SourceRef
+    from yeoman_gateway.processing.participation_context import ParticipationContextBuilder
+    from yeoman_gateway.processing.participation_knowledge import (
+        ParticipationKnowledgeRecord,
+        ParticipationKnowledgeSelection,
+        reader_key,
+    )
+    from yeoman_gateway.storage.inbound_archive import InboundArchive
+
+    from tests.gateway.capture_harness import Registry
+
+    shared_fact = "The group meetup is every Friday."
+    now_ms = int(time() * 1000)
+    archive = InboundArchive(tmp_path / "inbound.db")
+    for message_id, sender, name, text in (
+        ("m1", "anna@s.whatsapp.net", "Anna", "When is the group meetup?"),
+        ("m2", "ben@s.whatsapp.net", "Ben", "And what time?"),
+    ):
+        archive.record_inbound(
+            channel=CHANNEL,
+            chat_id=CHAT,
+            message_id=message_id,
+            participant=sender,
+            sender_id=sender,
+            sender_name=name,
+            text=text,
+            timestamp=now_ms // 1000,
+        )
+    registry = Registry({("whatsapp", CHAT): ["anna", "ben"]})
+
+    class RecordingSelector:
+        """Records the verified principals the production supplier handed over."""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def select_for_readers(self, *, query, readers):
+            self.calls.append(readers.principals)
+            return ParticipationKnowledgeSelection(
+                text=shared_fact,
+                statements=KnowledgeContext(
+                    text=shared_fact,
+                    statement_ids=("stmt-shared",),
+                    source_refs=(
+                        SourceRef(
+                            "ev-shared", 1, CHANNEL, CHAT, "anna@s.whatsapp.net", now_ms
+                        ),
+                    ),
+                ),
+                facts=FactRetrievalResult(),
+                revision="r1",
+                reason="selected",
+                records=(
+                    ParticipationKnowledgeRecord(
+                        kind="statement",
+                        record_id="stmt-shared",
+                        text=shared_fact,
+                        refs=(("ev-shared", 1),),
+                    ),
+                ),
+                reader_keys=tuple(
+                    reader_key(reader.read_context, reader.fact_context)
+                    for reader in readers.readers
+                ),
+                query=query,
+            )
+
+    selector = RecordingSelector()
+    builder = ParticipationContextBuilder(
+        archive=archive,
+        policy=PolicyEngine(_policy(), workspace=tmp_path),
+        source_authorizer=lambda row: True,
+        knowledge_selector=selector,
+        knowledge_context_supplier=lambda opportunity, context: (
+            _participation_knowledge_readers(
+                opportunity,
+                context,
+                chat_registry=registry,
+                knowledge=SimpleNamespace(policy_revision=1),
+            )
+        ),
+    )
+    built: list[dict] = []
+    original_build = builder.build
+
+    async def build_and_capture(*args, **kwargs):
+        context = await original_build(*args, **kwargs)
+        built.append(context)
+        return context
+
+    builder.build = build_and_capture
+
+    runtime, judge, _context, log = _runtime(tmp_path, decision=COMMENT)
+    runtime._context_builder = builder
+    runtime._revalidate_knowledge = lambda opportunity, context, selection: selection
+    try:
+        result = await runtime.evaluate_participation(_opportunity("m1", "m2"))
+
+        assert selector.calls == [("anna@s.whatsapp.net", "ben@s.whatsapp.net")]
+        assert built[0]["knowledge_selection_status"] == "selected"
+        assert built[0]["selected_knowledge_text"] == shared_fact
+        assert judge.calls == 1
+        assert result["status"] == "submitted", result
+    finally:
+        archive.close()
+        log.close()
+
+
+@pytest.mark.asyncio
 async def test_writer_unavailable_removes_only_comment(tmp_path: Path) -> None:
     """A missing writer must not disable an otherwise permitted reaction."""
     runtime, _judge, context, log = _runtime(
