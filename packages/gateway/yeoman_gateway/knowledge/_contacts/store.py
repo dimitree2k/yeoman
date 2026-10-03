@@ -55,12 +55,16 @@ class ContactsStore:
         self._create_schema()
 
     def _commit_owned(self) -> None:
-        """Commit only when this store owns its connection.
+        """Commit this write unless a knowledge operation is in charge of it.
 
-        A store that joined the knowledge store's connection never commits: the outer
-        knowledge transaction is the only commit site.
+        A store that joined the knowledge store's connection never commits inside an
+        operation: the outer knowledge transaction is the only commit site there, so the
+        write commits or rolls back with it.  Outside an operation it commits at once;
+        otherwise it would hold the write lock and wait in an open transaction until the
+        next operation, and be lost if that operation failed.
         """
         if self._owner is not None:
+            self._owner.commit_if_idle()
             return
         self._conn.commit()
 
