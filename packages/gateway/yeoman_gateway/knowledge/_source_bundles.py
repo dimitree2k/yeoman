@@ -28,7 +28,12 @@ _CREDENTIAL_PARTS = {"secrets", "credentials", "auth", "authentication", "keys",
 _KEY_SUFFIXES = {".pem", ".key", ".p8", ".p12", ".pfx"}
 
 
-def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
+def collect_sources(
+    *,
+    sources: list[dict[str, Any]],
+    target_dir: Path,
+    _allow_purged_source_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Acquire one immutable version from explicit descriptors; never guess source paths."""
     if not isinstance(sources, list) or not sources:
         raise SnapshotError("sources_invalid", "sources must be a non-empty JSON descriptor list")
@@ -39,6 +44,9 @@ def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[
     descriptors.sort(key=lambda item: item["source_id"])
 
     root = _target_root(Path(target_dir).expanduser())
+    from ._preservation_catalog import _guard_collection
+
+    _guard_collection(root, ids, _allow_purged_source_ids or set())
     plans = []
     for item in descriptors:
         try:
@@ -144,6 +152,7 @@ def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[
         _write_json(manifest_path, payload)
         try:
             copied_files, sqlite_summary, source_components = _acquire(plan, temporary)
+            record_metadata = _record_metadata(temporary, plan)
             _check_unchanged(plan)
         except Exception as exc:
             _remove_tree(temporary)
@@ -172,6 +181,7 @@ def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[
             source_components=source_components,
             sqlite=sqlite_summary,
             sqlite_main_file=sqlite_main_file,
+            record_metadata=record_metadata,
             file_stats=_jsonl_stats(destination, copied_files),
             source_sidecar_note=(
                 "SQLite read-only WAL access may update shared-memory coordination bytes"
@@ -530,6 +540,59 @@ def _acquire(
                 sqlite_sources.append((relative, target))
     sqlite_summary = _inspect_sqlite_sources(sqlite_sources, temporary)
     return copied, sqlite_summary, source_components
+
+
+def _record_metadata(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Index safe locators from the verified copy, never from its original source."""
+    descriptor = plan["descriptor"]
+    if plan.get("reference_only"):
+        return {"status": "reference_only", "records": [], "tables": []}
+    from ._preservation_inventory import inspect_source
+
+    kind = descriptor["kind"]
+    if kind == "live_sqlite":
+        path = root / "data.db"
+    elif kind == "tree":
+        path = root
+    else:
+        path = root / descriptor["path"].name
+    source_class = "restricted" if descriptor["restricted"] else descriptor["source_class"]
+    inspected = inspect_source(path=path, source_class=source_class)
+    restricted = descriptor["restricted"]
+
+    def locator(record: dict[str, Any]) -> dict[str, Any]:
+        value = dict(record["locator"])
+        relative = PurePosixPath(str(value.get("file", "")))
+        if relative.is_absolute() or ".." in relative.parts or "\\" in str(value.get("file", "")):
+            return {}
+        value["file"] = PurePosixPath("sources", descriptor["source_id"], *relative.parts).as_posix()
+        return value
+
+    tables = []
+    for table in inspected.get("tables", []):
+        item = {
+            "name": str(table["name"]),
+            "columns": [str(column["name"]) for column in table.get("columns", [])],
+            "row_count": int(table.get("row_count", 0)),
+        }
+        if not restricted and table.get("cursor"):
+            item["cursor"] = table["cursor"]
+        tables.append(item)
+    records = []
+    if not restricted:
+        for record in inspected.get("records", []):
+            safe = {
+                key: record.get(key)
+                for key in ("original_time", "creation_time", "chat", "record_type", "native_id")
+            }
+            safe["locator"] = locator(record)
+            records.append(safe)
+    return {
+        "status": inspected.get("status", "unknown"),
+        "records": records,
+        "tables": tables,
+        "parse_errors": inspected.get("parse_errors", []),
+    }
 
 
 def _inspect_sqlite_sources(

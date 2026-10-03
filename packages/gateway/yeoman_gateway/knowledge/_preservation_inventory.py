@@ -51,13 +51,10 @@ _CREATION_KEYS = {
 }
 _CHAT_KEYS = {"chat", "chat_id", "chatid", "chat_jid", "chatjid", "group_id", "remotejid"}
 _ID_KEYS = {
+    "nativeid",
     "native_id",
     "message_id",
     "messageid",
-    "event_id",
-    "eventid",
-    "effect_id",
-    "record_id",
     "source_message_id",
     "sourcemessageid",
 }
@@ -67,8 +64,8 @@ _KEY_ORDER = (
     "timestampms", "messagetimestamp", "sent_at", "event_time", "creation_time", "created_at",
     "created_at_ms", "created_ms", "ingest_time", "ingest_time_ms", "ingested_at", "stored_at",
     "stored_at_ms", "storedatms",
-    "chat_id", "chatid", "chat_jid", "chatjid", "remotejid", "group_id", "chat", "native_id",
-    "message_id", "messageid", "event_id", "eventid", "effect_id", "record_id",
+    "chat_id", "chatid", "chat_jid", "chatjid", "remotejid", "group_id", "chat", "nativeid", "native_id",
+    "message_id", "messageid",
     "source_message_id", "sourcemessageid", "record_type", "event_type", "eventtype", "kind", "type",
 )
 _RECORD_LIST_KEYS = {"records", "events", "effects", "items", "messages", "entries", "rows"}
@@ -999,8 +996,8 @@ def _normalized_instant(value: Any) -> datetime | None:
         if re.fullmatch(r"\d{10,13}", text):
             return _normalized_instant(int(text))
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
         return parsed.astimezone(UTC)
     except (OverflowError, OSError, TypeError, ValueError):
         return None
