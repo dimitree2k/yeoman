@@ -368,37 +368,171 @@ def test_restricted_sqlite_record_metadata_has_only_schema_and_counts(tmp_path: 
     assert "restricted row content" not in rendered
 
 
-def test_raw_reference_refresh_never_hashes_or_reads_raw_contents(tmp_path: Path, monkeypatch) -> None:
-    from yeoman_gateway.knowledge import _source_bundles
+def test_raw_reference_metadata_is_queryable_and_nested_changes_refresh(tmp_path: Path) -> None:
+    import hashlib
 
-    raw = tmp_path / "home/data/raw/whatsapp"
-    raw.mkdir(parents=True)
-    (raw / "2026-10.jsonl").write_text('{"event_id":"raw-only"}\n', encoding="utf-8")
-    fingerprint = _source_bundles._fingerprint
-
-    def forbid_raw_hash(path: Path) -> str:
-        assert not path.is_relative_to(raw), "reference-only raw content was hashed"
-        return fingerprint(path)
-
-    monkeypatch.setattr(_source_bundles, "_fingerprint", forbid_raw_hash)
-    report = refresh_collection(
-        sources=[
-            {
-                "source_id": "raw-reference",
-                "path": str(raw),
-                "kind": "reference_only",
-                "source_class": "raw_archive",
-                "restricted": False,
-            }
-        ],
-        target_dir=tmp_path / "collection",
+    raw = tmp_path / "home/data/raw"
+    monthly = raw / "whatsapp/2026-10.jsonl"
+    _jsonl(
+        monthly,
+        {
+            "source_message_id": "raw-old",
+            "chat_jid": "chat-old",
+            "timestamp": "2026-10-02T10:00:00Z",
+            "stored_at": "2026-10-02T10:01:00Z",
+            "type": "message",
+            "text": "synthetic raw payload",
+        },
+        {
+            "source_message_id": "raw-unknown",
+            "chat_jid": "chat-unknown",
+            "timestamp": "2026-10-02T12:00:00",
+            "type": "message",
+        },
     )
+    before = {
+        path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in (raw, raw / "whatsapp", monthly)
+        if path.is_file()
+    }
+    target = tmp_path / "collection"
+    descriptor = {
+        "source_id": "raw-reference",
+        "path": str(raw),
+        "kind": "reference_only",
+        "source_class": "raw_archive",
+        "restricted": False,
+    }
+
+    report = refresh_collection(sources=[descriptor], target_dir=target)
     manifest = json.loads(Path(report["manifest_path"]).read_text())
     entry = manifest["sources"][0]
     assert entry["status"] == "reference_only"
-    assert entry["content_read"] is False
-    assert "record_metadata" not in entry
+    assert entry["content_read"] is True
+    assert entry["metadata_only"] is True
     assert not entry.get("copied_files")
+    assert not (Path(report["bundle_dir"]) / "sources/raw-reference").exists()
+    assert "synthetic raw payload" not in Path(report["manifest_path"]).read_text()
+    assert before == {
+        path: (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in before
+    }
+
+    rows = query_catalog(target_dir=target, filters={"chat": "chat-old"})
+    assert rows[0]["original_time"] == "2026-10-02T10:00:00Z"
+    assert rows[0]["creation_time"] == "2026-10-02T10:01:00Z"
+    assert rows[0]["native_id"] == "raw-old"
+    assert rows[0]["record_type"] == "message"
+    assert rows[0]["locator"] == {"file": "whatsapp/2026-10.jsonl", "line": 1}
+    assert query_catalog(
+        target_dir=target,
+        filters={"original_after": "2026-10-02T09:00:00Z", "chat": "chat-old"},
+    )
+    assert query_catalog(
+        target_dir=target,
+        filters={"creation_after": "2026-10-02T10:00:00Z", "native_id": "raw-old"},
+    )
+    assert query_catalog(target_dir=target, filters={"record_type": "message"})
+    unknown = query_catalog(target_dir=target, filters={"unknown_dates": True})
+    assert [(row["native_id"], row["original_time"]) for row in unknown] == [
+        ("raw-unknown", "2026-10-02T12:00:00")
+    ]
+
+    with monthly.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"source_message_id": "raw-new", "chat_jid": "chat-new"}) + "\n")
+    appended = refresh_collection(sources=[descriptor], target_dir=target)
+    assert appended["refreshed"] is True
+    assert query_catalog(target_dir=target, filters={"native_id": "raw-new"})
+
+    # Rewrite a nested file while the raw-root directory mtime stays fixed.
+    raw_mtime = raw.stat().st_mtime_ns
+    lines = monthly.read_text(encoding="utf-8").splitlines()
+    lines[0] = json.dumps(
+        {
+            "source_message_id": "raw-old",
+            "chat_jid": "chat-revised",
+            "timestamp": "2026-10-02T10:00:00Z",
+            "stored_at": "2026-10-02T10:01:00Z",
+            "type": "message",
+        }
+    )
+    monthly.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(raw, ns=(raw.stat().st_atime_ns, raw_mtime))
+    changed = refresh_collection(sources=[descriptor], target_dir=target)
+    assert changed["refreshed"] is True
+    assert query_catalog(target_dir=target, filters={"chat": "chat-revised"})
+    unchanged = refresh_collection(sources=[descriptor], target_dir=target)
+    assert unchanged["refreshed"] is False
+
+
+def test_resume_preserves_changed_expired_variant_and_indexes_both_locators(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hashlib
+
+    from yeoman_gateway.knowledge import _source_bundles
+
+    expired_root = tmp_path / "bridge-references"
+    expired_root.mkdir()
+    expired = expired_root / "expired.json"
+    expired.write_text(
+        json.dumps({"message_id": "expired-native", "timestamp": "2026-09-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    expired_bytes = expired.read_bytes()
+    blocked = tmp_path / "blocked.jsonl"
+    _jsonl(blocked, {"message_id": "blocked"})
+    sources = [
+        {
+            "source_id": "A",
+            "path": str(expired_root),
+            "kind": "tree",
+            "source_class": "synthetic",
+            "restricted": False,
+        },
+        {
+            "source_id": "Z",
+            "path": str(blocked),
+            "kind": "file",
+            "source_class": "synthetic",
+            "restricted": False,
+        },
+    ]
+    copy_file = _source_bundles._copy_file
+
+    def interrupt_z(source: Path, destination: Path) -> str:
+        if source == blocked:
+            raise KeyboardInterrupt
+        return copy_file(source, destination)
+
+    monkeypatch.setattr(_source_bundles, "_copy_file", interrupt_z)
+    target = tmp_path / "collection"
+    with pytest.raises(KeyboardInterrupt):
+        refresh_collection(sources=sources, target_dir=target)
+
+    expired.unlink()
+    fresh = expired_root / "fresh.json"
+    fresh.write_text(
+        json.dumps({"message_id": "fresh-native", "timestamp": "2026-10-03T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_source_bundles, "_copy_file", copy_file)
+    resumed = refresh_collection(sources=sources, target_dir=target)
+    assert resumed["complete"] is True
+    rows = query_catalog(target_dir=target, filters={"source_id": "A"})
+    assert {row["native_id"] for row in rows} >= {"expired-native", "fresh-native"}
+    assert any(row["locator"] == {"file": "sources/A/expired.json"} for row in rows)
+    assert any(row["locator"] == {"file": "sources/A/fresh.json"} for row in rows)
+    expired_row = next(row for row in rows if row["native_id"] == "expired-native")
+    old_path = target / "versions" / expired_row["version_id"] / "sources/A/expired.json"
+    assert old_path.read_bytes() == expired_bytes
+    old_manifest = json.loads(
+        (target / "versions" / expired_row["version_id"] / "manifest.json").read_text()
+    )
+    old_entry = next(entry for entry in old_manifest["sources"] if entry["source_id"] == "A")
+    assert hashlib.sha256(old_path.read_bytes()).hexdigest() == old_entry["copied_files"][
+        "expired.json"
+    ]["copied_sha256"]
 
 
 def test_purge_previews_requires_confirmation_and_tombstone_blocks_resurrection(
