@@ -257,6 +257,21 @@ def _hash_text(value: str | None) -> str | None:
     return hashlib.sha256(value.encode("utf-8")).hexdigest() if value is not None else None
 
 
+def _name_observations(name: Any, raw_identifier: Any, time: Mapping[str, Any] | None) -> tuple[dict[str, Any], ...]:
+    observed = _nonempty(name)
+    if observed is None:
+        return ()
+    timing = time or {}
+    return ({
+        "name": observed,
+        "raw_identifier": _nonempty(raw_identifier),
+        "occurred_ms": timing.get("occurred_ms"),
+        "observed_ms": timing.get("observed_ms"),
+        "time_certainty": timing.get("time_certainty") or "unknown",
+        "provenance_class": "native",
+    },)
+
+
 def _time_ms(value: Any) -> int | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -376,6 +391,7 @@ def _event(
     chat_id: Any = None,
     native_id: Any = None,
     event_id: Any = None,
+    archive_native_id: Any = None,
     revision: Any = 1,
     kind: Any = "message",
     direction: Any = "unknown",
@@ -401,6 +417,7 @@ def _event(
     participant_jid_raw: Any = None,
     payload_purged_ms: Any = None,
     source_role: Any = None,
+    name_observations: Sequence[Mapping[str, Any]] = (),
 ) -> NormalizedEvent:
     actual_text = _text(text)
     actual_event_id = _nonempty(event_id) or _generated_id(source_id, locator)
@@ -434,6 +451,8 @@ def _event(
         "payload_purged_ms": payload_purged_ms,
         "source_role": actual_source_role,
     }
+    if _nonempty(archive_native_id):
+        copy["archive_native_id"] = _nonempty(archive_native_id)
     for key, value in (("event_id", event_id), ("revision", revision)):
         if value is not None:
             copy[key] = str(value) if isinstance(value, (str, int)) else value
@@ -490,6 +509,15 @@ def _event(
         participant_jid_raw=actual_participant_jid,
         payload_purged_ms=payload_purged_ms,
         source_role=actual_source_role,
+        name_observations=tuple(
+            {
+                **dict(item),
+                "source_id": source_id,
+                "locator": dict(locator),
+                "provenance_class": provenance_class,
+            }
+            for item in name_observations
+        ),
     )
 
 
@@ -680,6 +708,11 @@ def _reference_event(
             )
             if decoded is not None
             else "unverified_native_reference",
+            name_observations=_name_observations(
+                _first(message, "pushName", "push_name", "verifiedName", "senderName"),
+                _first(key, "participant", "participantAlt"),
+                timestamp,
+            ),
         )
         return event, unresolved_reason
     native_id = _native_id(record)
@@ -705,6 +738,11 @@ def _reference_event(
         provenance_class="native",
         source_kind=source_kind,
         source_authority="reference_metadata_only",
+        name_observations=_name_observations(
+            _first(record, "sender_name", "push_name", "display_name", "name"),
+            _first(record, "sender_raw", "from", "sender_id"),
+            time,
+        ),
     )
     return event, None
 
@@ -756,6 +794,7 @@ def _parse_json_line(
             chat_id=_first(value, "chat_id") or _first(payload, "remoteJid", "chatJid", "chat_id"),
             native_id=message_id,
             event_id=event_id,
+            archive_native_id=event_id,
             revision=_first(value, "revision") or _first(payload, "revision", "editRevision") or 1,
             kind=kind,
             direction=_first(value, "direction") or "unknown",
@@ -777,6 +816,11 @@ def _parse_json_line(
             source_authority="native_envelope",
             sender_id_raw=_first(payload, "senderId"),
             participant_jid_raw=_first(payload, "participantJid"),
+            name_observations=_name_observations(
+                _first(payload, "pushName", "push_name", "verifiedName", "senderName"),
+                _first(payload, "senderId", "participantJid", "participant", "from"),
+                time,
+            ),
         )
         return event, None, False
     if _is_session_or_inbound(value, source_kind, relative):
@@ -812,6 +856,11 @@ def _parse_json_line(
             chat_kind=_chat_kind(value),
             source_kind="session_jsonl" if session else "inbound_jsonl",
             source_authority="none_for_authored_outbound" if direction == "out" else "source_copy",
+            name_observations=_name_observations(
+                _first(value, "sender_name", "display_name", "name"),
+                _first(value, "sender_id", "from", "sender"),
+                time,
+            ),
         )
         return event, None, False
     return None, "unknown_jsonl_schema", False
@@ -1012,6 +1061,11 @@ def _sqlite_row_event(
             sender_id_raw=_first(payload_map, "senderId"),
             participant_jid_raw=_first(payload_map, "participantJid"),
             payload_purged_ms=values.get("payload_purged_ms"),
+            name_observations=_name_observations(
+                _first(payload_map, "pushName", "push_name", "verifiedName", "senderName"),
+                _first(payload_map, "senderId", "participantJid", "sender", "participant", "author"),
+                time,
+            ),
         )
     if table == "inbound_messages":
         native_id = _native_id(values)
@@ -1042,6 +1096,11 @@ def _sqlite_row_event(
             source_authority="inbound_archive_copy",
             sender_id_raw=_first(values, "senderId", "sender_id"),
             participant_jid_raw=_first(values, "participantJid", "participant_jid"),
+            name_observations=_name_observations(
+                _first(values, "sender_name", "push_name", "display_name", "name"),
+                _first(values, "senderId", "sender_id", "from"),
+                time,
+            ),
         )
     if table == "memory2_nodes":
         node_id = _nonempty(values.get("id"))
@@ -1089,6 +1148,11 @@ def _sqlite_row_event(
                 )
             ),
             source_role=source_role,
+            name_observations=_name_observations(
+                _first(values, "sender_name", "display_name", "name"),
+                _first(values, "sender_id", "sender_raw"),
+                created,
+            ),
         )
     if table == "effects":
         effect_id = _nonempty(values.get("effect_id"))
@@ -1315,6 +1379,7 @@ def _merge_pair(left: NormalizedEvent, right: NormalizedEvent) -> NormalizedEven
         copies=(*primary.copies, *secondary.copies),
         known_event_ids=tuple(dict.fromkeys((*primary.known_event_ids, *secondary.known_event_ids))),
         native_evidence=_unique_json((*primary.native_evidence, *secondary.native_evidence)),
+        name_observations=_unique_json((*primary.name_observations, *secondary.name_observations)),
         provenance_class=provenance,
         source_authority=(
             "payload_purged"

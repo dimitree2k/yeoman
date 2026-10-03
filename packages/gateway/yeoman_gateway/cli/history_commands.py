@@ -10,6 +10,7 @@ import typer
 
 from yeoman_gateway.knowledge._history import HistoricalJournal
 from yeoman_gateway.knowledge._history_audience import HistoryAudience
+from yeoman_gateway.knowledge._history_rebuild import rebuild_history, verify_history
 from yeoman_gateway.knowledge.models import KnowledgeError, TrustedAdminContext
 from yeoman_gateway.knowledge.runtime import RuntimeKnowledgePolicy
 
@@ -17,6 +18,39 @@ from .knowledge_commands import knowledge_app
 
 history_app = typer.Typer(help="Offline historical audience metadata and roster proofs")
 knowledge_app.add_typer(history_app, name="history")
+
+
+@history_app.command("build")
+def history_build(
+    collection: Path = typer.Option(..., "--collection", help="Explicit verified preservation collection"),
+    target_home: Path = typer.Option(..., "--target-home", help="New empty isolated history target"),
+    bridge_package_dir: Path | None = typer.Option(
+        None, "--bridge-package-dir", help="Optional offline bridge decoder package"
+    ),
+    rosters: Path | None = typer.Option(
+        None, "--rosters", help="Optional owner-supplied roster metadata (display only)"
+    ),
+) -> None:
+    """Reconcile one explicit preservation collection into an isolated journal."""
+    report = rebuild_history(
+        collection=collection,
+        target_home=target_home,
+        bridge_package_dir=bridge_package_dir,
+        rosters=rosters,
+    )
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+@history_app.command("verify")
+def history_verify(
+    target_home: Path = typer.Option(..., "--target-home", help="Explicit rebuilt history target"),
+    knowledge_snapshot: Path | None = typer.Option(
+        None, "--knowledge-snapshot", help="Optional source-reference snapshot SQLite file"
+    ),
+) -> None:
+    """Check the isolated journal and exact cited event/revision closure."""
+    report = verify_history(target_home=target_home, knowledge_snapshot=knowledge_snapshot)
+    typer.echo(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
 
 
 @history_app.command("coverage")

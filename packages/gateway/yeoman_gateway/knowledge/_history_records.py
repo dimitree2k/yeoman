@@ -51,6 +51,7 @@ class NormalizedEvent:
     participant_jid_raw: str | None = None
     payload_purged_ms: Any = None
     source_role: str | None = None
+    name_observations: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly copy without exposing mutable internal containers."""
@@ -59,4 +60,5 @@ class NormalizedEvent:
         result["copies"] = list(self.copies)
         result["known_event_ids"] = list(self.known_event_ids)
         result["native_evidence"] = list(self.native_evidence)
+        result["name_observations"] = list(self.name_observations)
         return result
