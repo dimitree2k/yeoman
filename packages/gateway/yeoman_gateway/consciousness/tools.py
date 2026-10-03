@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -517,13 +518,23 @@ class ConsciousnessTools:
         effect_id: str,
         content: str,
         snapshot: object,
+        knowledge_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
-        """Persist and preview one exact Participation draft for owner approval."""
+        """Persist and preview one exact Participation draft for owner approval.
+
+        ``knowledge_evidence`` is the bounded, versioned snapshot of the knowledge the
+        draft was influenced by. It is persisted with the admission so a later
+        revalidation can compare against it; it is never rendered, previewed or shown.
+        """
         del decision, snapshot
         from yeoman_gateway.processing.models import (
             TextPayload,
             canonical_hash,
             payload_to_mapping,
+        )
+        from yeoman_gateway.processing.participation_knowledge import (
+            ParticipationKnowledgeEvidenceError,
+            selection_from_mapping,
         )
         from yeoman_gateway.processing.participation_runtime import (
             ParticipationAdmission,
@@ -547,6 +558,25 @@ class ConsciousnessTools:
                 "status": "approval_queue_failed",
                 "reason": "approval_path_unavailable",
             }
+        evidence = (
+            knowledge_evidence
+            if knowledge_evidence is not None
+            else getattr(admission, "knowledge_evidence", None)
+        )
+        if evidence is not None:
+            # Fail closed: only evidence this codec can read back is ever persisted.
+            if not isinstance(evidence, Mapping):
+                return {
+                    "status": "approval_queue_failed",
+                    "reason": "invalid_knowledge_evidence",
+                }
+            try:
+                selection_from_mapping(evidence)
+            except ParticipationKnowledgeEvidenceError:
+                return {
+                    "status": "approval_queue_failed",
+                    "reason": "invalid_knowledge_evidence",
+                }
 
         output = self.security.check_output(
             str(content),
@@ -576,6 +606,7 @@ class ConsciousnessTools:
             admission,
             payload_hash=payload_hash,
             approval_revision=max(1, int(admission.approval_revision or 0)),
+            knowledge_evidence=dict(evidence) if evidence is not None else None,
         )
 
         try:
@@ -1112,6 +1143,13 @@ class ConsciousnessTools:
             for pair in (values.get("source_principals") or ())
             if isinstance(pair, (tuple, list)) and len(pair) == 2
         )
+        # Evidence is a private object; anything else under that key is a corrupted
+        # admission and must not reach submission as an unusable value.
+        stored_evidence = values.get("knowledge_evidence")
+        if isinstance(stored_evidence, Mapping):
+            values["knowledge_evidence"] = dict(stored_evidence)
+        elif stored_evidence is not None:
+            return {"status": "rejected", "reason": "approval_admission_invalid"}
         try:
             admission = ParticipationAdmission(**values)
         except (TypeError, ValueError):

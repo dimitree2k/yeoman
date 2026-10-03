@@ -1967,6 +1967,17 @@ class ProcessingStore:
                 tuple(item) if isinstance(item, list) else item
                 for item in values["source_principals"]
             )
+        # Legacy admissions have no evidence key at all; a stored one must stay an
+        # object so the codec, not the constructor, is what validates its content.
+        evidence = values.get("knowledge_evidence")
+        if evidence is not None:
+            if not isinstance(evidence, Mapping):
+                raise ProcessingError(
+                    "stored participation admission evidence is not an object"
+                )
+            values["knowledge_evidence"] = {
+                str(key): _admission_json_value(item) for key, item in evidence.items()
+            }
         return ParticipationAdmission(**values)
 
     def _enqueue_effect_in_connection(
@@ -4183,6 +4194,7 @@ def _admission_mapping(admission: Any, *, admission_id: str) -> dict[str, Any]:
         "contribution_type",
         "payload_hash",
         "approval_revision",
+        "knowledge_evidence",
     )
     result: dict[str, Any] = {}
     for name in field_names:

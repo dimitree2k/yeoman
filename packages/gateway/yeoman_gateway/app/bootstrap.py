@@ -1614,6 +1614,7 @@ class _ParticipationSubmission:
         effect_id: str,
         content: str,
         snapshot: object,
+        knowledge_evidence: Mapping[str, Any] | None = None,
     ) -> object:
         queue = getattr(
             self._approval_tools, "stage_participation_approval", None
@@ -1627,6 +1628,7 @@ class _ParticipationSubmission:
             effect_id=effect_id,
             content=content,
             snapshot=snapshot,
+            knowledge_evidence=knowledge_evidence,
         )
 
 

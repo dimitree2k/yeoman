@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, TypeAlias
 
@@ -122,6 +122,10 @@ class ParticipationAdmission:
     contribution_type: str = ""
     payload_hash: str = ""
     approval_revision: int = 0
+    #: Bounded, versioned evidence of the knowledge this decision was influenced by.
+    #: Private: it is persisted with the admission, never rendered to a model and
+    #: never part of the owner preview.
+    knowledge_evidence: Mapping[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

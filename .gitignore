@@ -51,6 +51,7 @@ tests/gateway/*
 !tests/gateway/test_participation_context.py
 !tests/gateway/test_participation_integration.py
 !tests/gateway/test_participation_judge.py
+!tests/gateway/test_participation_knowledge_approval.py
 !tests/gateway/test_litellm_provider.py
 !tests/gateway/test_participation_maintenance.py
 !tests/gateway/test_participation_policy.py
