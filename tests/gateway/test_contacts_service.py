@@ -132,6 +132,19 @@ class TestContactsService:
         assert contact is not None
         assert contact.is_owner is True
 
+    def test_mark_owner_matches_an_e164_policy_number_to_a_phone_jid(
+        self, service: ContactsService
+    ) -> None:
+        """The live policy writes WhatsApp owners as ``+49...``, like the policy matcher."""
+        cid = service.ensure_contact(
+            channel="whatsapp", identifier="491520000009@s.whatsapp.net",
+            kind="phone_jid", push_name="Owner",
+        )
+        service.mark_owner_from_policy({"whatsapp": ["+491520000009"]})
+        contact = service.store.get_contact(cid)
+        assert contact is not None
+        assert contact.is_owner is True
+
     def test_mark_owner_never_turns_bare_digits_into_a_lid(
         self, service: ContactsService
     ) -> None:

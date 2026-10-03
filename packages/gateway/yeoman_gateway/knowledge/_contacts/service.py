@@ -187,10 +187,13 @@ class ContactsService:
         for channel, jids in owner_map.items():
             for jid in jids:
                 contact = self.store.lookup_by_identifier(channel, jid)
-                if contact is None and channel == "whatsapp" and "@" not in str(jid):
-                    # Policy names WhatsApp owners by bare number; a phone binding stores
-                    # the phone JID.  A bare number is never read as a LID.
-                    contact = self.store.lookup_by_identifier(channel, f"{jid}@s.whatsapp.net")
+                number = str(jid).strip().removeprefix("+")
+                if contact is None and channel == "whatsapp" and number.isdigit():
+                    # Policy names WhatsApp owners by number ("+49..." or "49..."); a phone
+                    # binding stores the phone JID.  A number is never read as a LID.
+                    contact = self.store.lookup_by_identifier(
+                        channel, f"{number}@s.whatsapp.net"
+                    )
                 if contact is not None:
                     self.store.set_owner(contact.id, is_owner=True)
                     logger.info("marked {} as owner ({})", contact.display_name, jid)
