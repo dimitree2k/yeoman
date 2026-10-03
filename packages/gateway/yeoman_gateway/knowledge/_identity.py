@@ -1596,6 +1596,14 @@ class IdentityEngine:
                 " WHERE binding_id = ? AND status = 'active'",
                 (end_ms, ts, str(end_binding_id)),
             )
+            # The legacy projection follows the hand-over: it is what the startup owner
+            # marking and the migration-window lookups read, and a stale row would keep
+            # attributing the identifier to the previous person.
+            self._store.execute(
+                "UPDATE contact_identifiers SET contact_id = ?"
+                " WHERE channel = ? AND identifier = ? AND contact_id = ?",
+                (canonical, identifier.channel, identifier.value, str(previous.person_id)),
+            )
             changed.append(self.canonical_id(previous.person_id))
 
         existing = self.binding_for(identifier)

@@ -156,6 +156,37 @@ class TestContactsService:
         assert contact is not None
         assert contact.is_owner is False
 
+    def test_mark_owner_clears_a_flag_policy_no_longer_supports(
+        self, service: ContactsService
+    ) -> None:
+        owner = service.ensure_contact(
+            channel="whatsapp", identifier="491520000009@s.whatsapp.net",
+            kind="phone_jid", push_name="Owner",
+        )
+        stale = service.ensure_contact(
+            channel="whatsapp", identifier="100000000000007@lid", kind="lid", push_name="Stub",
+        )
+        service.store.set_owner(stale, is_owner=True)
+
+        service.mark_owner_from_policy({"whatsapp": ["+491520000009"]})
+
+        assert service.store.get_contact(owner).is_owner is True
+        assert service.store.get_contact(stale).is_owner is False
+
+    def test_mark_owner_keeps_flags_when_policy_names_no_owner(
+        self, service: ContactsService
+    ) -> None:
+        """An empty owner map is a missing policy, not a decision to demote everyone."""
+        flagged = service.ensure_contact(
+            channel="whatsapp", identifier="491520000009@s.whatsapp.net",
+            kind="phone_jid", push_name="Owner",
+        )
+        service.store.set_owner(flagged, is_owner=True)
+
+        service.mark_owner_from_policy({})
+
+        assert service.store.get_contact(flagged).is_owner is True
+
 
 def test_upsert_field_delegates_to_store(tmp_path: Path) -> None:
     from yeoman_gateway.knowledge._contacts.service import ContactsService

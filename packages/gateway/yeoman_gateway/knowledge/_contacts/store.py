@@ -239,6 +239,11 @@ class ContactsStore:
             )
             self._commit_owned()
 
+    def owner_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM contacts WHERE is_owner = 1").fetchall()
+        return [str(row["id"]) for row in rows]
+
     def search_by_display_name(self, query: str) -> list[Contact]:
         with self._lock:
             rows = self._conn.execute(
