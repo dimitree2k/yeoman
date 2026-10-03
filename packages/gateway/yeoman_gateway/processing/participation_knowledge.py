@@ -259,8 +259,10 @@ class ParticipationKnowledgeSelector:
             facts,
             exclude={_normalize_entry(item) for item in statement_values},
             remaining_entries=MAX_ENTRIES - len(statement_values),
-            max_chars=max(0, MAX_TEXT_CHARS - len("\n".join(statement_values)) -
-                          (1 if statement_values else 0)),
+            max_chars=max(
+                0,
+                MAX_TEXT_CHARS - len("\n".join(statement_values)) - (1 if statement_values else 0),
+            ),
         )
         rendered = "\n".join([*statement_values, *([fact_text] if fact_text else [])])
         if statement_ids != statements.statement_ids:
@@ -340,11 +342,44 @@ class ParticipationKnowledgeSelector:
             selection.reader_keys
         ):
             raise ParticipationKnowledgeInvalidatedError("trigger author set changed")
-        current = self.select_for_readers(
-            query=selection.query, readers=ParticipationKnowledgeReaders(readers=ordered)
+        revalidated: list[ParticipationKnowledgeSelection] = []
+        try:
+            for reader in ordered:
+                group_wide = not reader.read_context.is_direct
+                statements = self._knowledge.revalidate(
+                    selection.statements,
+                    context=reader.read_context,
+                    max_chars=MAX_TEXT_CHARS,
+                    group_wide=group_wide,
+                )
+                scoped_fact_context = replace(reader.fact_context, group_wide=group_wide)
+                facts = (
+                    self._memory.revalidate_for_context(
+                        selection.facts,
+                        read_context=scoped_fact_context,
+                        max_chars=max(
+                            0,
+                            MAX_TEXT_CHARS - len(statements.text) - (1 if statements.text else 0),
+                        ),
+                    )
+                    if selection.facts.used_source_refs
+                    else FactRetrievalResult()
+                )
+                revalidated.append(
+                    self._combine(
+                        statements,
+                        facts,
+                        reader.read_context,
+                        reader.fact_context,
+                        query=selection.query,
+                    )
+                )
+        except Exception as exc:
+            raise ParticipationKnowledgeInvalidatedError("revalidation unavailable") from exc
+
+        current = (
+            revalidated[0] if len(revalidated) == 1 else _combine_records(revalidated, ordered)
         )
-        if current.reason == "error":
-            raise ParticipationKnowledgeInvalidatedError("revalidation unavailable")
         if current.records != selection.records or current.text != selection.text:
             raise ParticipationKnowledgeInvalidatedError("selected knowledge changed")
         return current
@@ -481,17 +516,11 @@ def selection_from_mapping(value: Mapping[str, Any]) -> ParticipationKnowledgeSe
     recipients, members, now_ms, is_direct = _evidence_prerequisites(value["reader_prerequisites"])
     _validate_evidence_consistency(records, readers, recipients, members)
 
-    first = readers[0] if readers else ("", "", "")
     statement_records = tuple(record for record in records if record.kind == "statement")
     fact_records = tuple(record for record in records if record.kind == "fact")
     statements = KnowledgeContext(
         text="\n".join(record.text for record in statement_records),
         statement_ids=tuple(record.record_id for record in statement_records),
-        source_refs=tuple(
-            SourceRef(event_id, ref_revision, first[1], first[2], first[0], now_ms)
-            for record in statement_records
-            for event_id, ref_revision in record.refs
-        ),
         entry_texts=tuple(record.text for record in statement_records),
     )
     facts = FactRetrievalResult(
@@ -676,30 +705,19 @@ def _reader_prerequisites(
 def _records_with_refs(
     statements: KnowledgeContext,
 ) -> list[tuple[str, str, tuple[tuple[str, int], ...]]]:
-    """Pair each rendered statement with its own content and its source revisions.
-
-    ``KnowledgeContext.source_refs`` carries one entry per *active source*, not per
-    statement, so refs are attributed positionally only when the cardinalities line
-    up. Otherwise ``statement_ids`` cannot be mapped to refs at all; the record is
-    then kept without refs rather than being given another statement's evidence.
-    """
+    """Pair each rendered statement with refs explicitly attached by protected recall."""
     values = [line.strip() for line in _statement_lines(statements)]
     ids = tuple(statements.statement_ids[: len(values)])
     if len(ids) != len(values):
         return []
-    refs_by_id: dict[str, list[tuple[str, int]]] = {}
-    if len(statements.source_refs) == len(ids):
-        for statement_id, ref in zip(ids, statements.source_refs, strict=True):
-            refs_by_id.setdefault(str(statement_id), []).append(
-                (str(ref.event_id), int(ref.revision))
-            )
-    else:
-        for ref in statements.source_refs:
-            refs_by_id.setdefault(str(ref.event_id), []).append(
-                (str(ref.event_id), int(ref.revision))
-            )
+    refs_by_id = {
+        str(statement_id): _sorted_refs([(str(ref.event_id), int(ref.revision)) for ref in refs])
+        for statement_id, refs in statements.source_refs_by_statement
+    }
+    if any(not refs_by_id.get(str(statement_id)) for statement_id in ids):
+        return []
     return [
-        (str(statement_id), value, _sorted_refs(refs_by_id.get(str(statement_id), [])))
+        (str(statement_id), value, refs_by_id[str(statement_id)])
         for statement_id, value in zip(ids, values, strict=True)
     ]
 
@@ -779,19 +797,29 @@ def _combine_records(
     ordered = [common[key] for key in sorted(common)]
     statement_records = [record for record in ordered if record.kind == "statement"]
     fact_records = [record for record in ordered if record.kind == "fact"]
-    # Reuse the source evidence the readers actually produced. Rebuilding a SourceRef
-    # here would have to invent the author principal, which is exactly the field that
-    # proves a statement's origin, so the surviving records keep their real refs.
-    wanted_events = {
-        event_id for record in statement_records for event_id, _revision in record.refs
-    }
-    source_refs = tuple(
-        ref for ref in selections[0].statements.source_refs if str(ref.event_id) in wanted_events
+    # Keep the actual protected source metadata, including each statement's association.
+    source_map = dict(selections[0].statements.source_refs_by_statement)
+    statement_source_refs = tuple(
+        (
+            record.record_id,
+            tuple(
+                ref
+                for ref in source_map.get(record.record_id, ())
+                if (str(ref.event_id), int(ref.revision)) in set(record.refs)
+            ),
+        )
+        for record in statement_records
     )
+    source_refs_list: list[SourceRef] = []
+    for _statement_id, refs in statement_source_refs:
+        for ref in refs:
+            if ref not in source_refs_list:
+                source_refs_list.append(ref)
     statements = KnowledgeContext(
         text="\n".join(record.text for record in statement_records),
         statement_ids=tuple(record.record_id for record in statement_records),
-        source_refs=source_refs,
+        source_refs=tuple(source_refs_list),
+        source_refs_by_statement=statement_source_refs,
         context_revision=str(selections[0].statements.context_revision),
         identity_revision=int(selections[0].statements.identity_revision),
         acl_epoch=int(selections[0].statements.acl_epoch),

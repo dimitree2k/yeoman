@@ -915,6 +915,7 @@ class KnowledgeContext:
     denied_count: int = 0
     entry_texts: tuple[str, ...] = ()
     truncated: bool = False
+    source_refs_by_statement: tuple[tuple[str, tuple[SourceRef, ...]], ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -955,8 +956,8 @@ class PersonProfileView:
 
 
 @dataclass(frozen=True, slots=True)
-class PersonProfile:
 
+class PersonProfile:
     """A person plus the knowledge context a reader is allowed to see."""
 
     person: PersonResolution

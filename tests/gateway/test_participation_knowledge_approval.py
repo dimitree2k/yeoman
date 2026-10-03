@@ -137,6 +137,7 @@ def _selector(*, statement_text: str = "", fact_text: str = ""):
             statement_ids=("ev-1",) if statement_text else (),
             source_refs=(ref,) if statement_text else (),
             context_revision="statement-r1",
+            source_refs_by_statement=(("ev-1", (ref,)),) if statement_text else (),
         )
     )
     memory = _Memory(
@@ -205,15 +206,13 @@ class _PerReader:
 
 def _multi_author_selection():
     def knowledge(text: str, statement_id: str) -> KnowledgeContext:
+        source = SourceRef(statement_id, 1, CHANNEL, CHAT, "alice", NOW - 86_400_000)
         return KnowledgeContext(
             text=text,
             statement_ids=(statement_id,) if text else (),
-            source_refs=(
-                SourceRef(statement_id, 1, CHANNEL, CHAT, "alice", NOW - 86_400_000),
-            )
-            if text
-            else (),
+            source_refs=(source,) if text else (),
             context_revision=f"{statement_id}-r1",
+            source_refs_by_statement=((statement_id, (source,)),) if text else (),
         )
 
     def memory(text: str) -> FactRetrievalResult:
@@ -263,10 +262,17 @@ def test_codec_round_trips_a_statements_only_selection() -> None:
     assert restored.reason == selection.reason
     assert restored.statements.statement_ids == selection.statements.statement_ids
     assert restored.statements.text == selection.statements.text
-    assert tuple(ref.key for ref in restored.statements.source_refs) == tuple(
-        ref.key for ref in selection.statements.source_refs
-    )
+    assert restored.statements.source_refs == ()
     assert selection_to_mapping(restored) == selection_to_mapping(selection)
+
+
+def test_codec_does_not_invent_source_author_from_reader_identity() -> None:
+    selection = _statement_selection()
+
+    restored = selection_from_mapping(selection_to_mapping(selection))
+
+    assert restored.records == selection.records
+    assert restored.statements.source_refs == ()
 
 
 def test_codec_round_trips_a_shared_facts_only_selection() -> None:
@@ -469,9 +475,10 @@ _MALFORMED: list[tuple[str, Any]] = [
     ("prerequisites_not_an_object", lambda m: m.__setitem__("reader_prerequisites", [])),
     ("prerequisites_missing_key", lambda m: m["reader_prerequisites"].pop("now_ms")),
     ("prerequisites_unknown_key", lambda m: m["reader_prerequisites"].__setitem__("epoch", 4)),
-    ("prerequisites_bad_principal", lambda m: m["reader_prerequisites"][
-        "recipient_principals"
-    ].__setitem__(0, 5)),
+    (
+        "prerequisites_bad_principal",
+        lambda m: m["reader_prerequisites"]["recipient_principals"].__setitem__(0, 5),
+    ),
     (
         "prerequisites_mismatched_sets",
         lambda m: m["reader_prerequisites"].__setitem__("current_members", ["alice", "carol"]),
@@ -483,9 +490,10 @@ _MALFORMED: list[tuple[str, Any]] = [
     ("prerequisites_negative_now", lambda m: m["reader_prerequisites"].__setitem__("now_ms", -1)),
     ("prerequisites_string_now", lambda m: m["reader_prerequisites"].__setitem__("now_ms", "0")),
     ("prerequisites_bool_now", lambda m: m["reader_prerequisites"].__setitem__("now_ms", True)),
-    ("prerequisites_bad_is_direct", lambda m: m["reader_prerequisites"].__setitem__(
-        "is_direct", "no"
-    )),
+    (
+        "prerequisites_bad_is_direct",
+        lambda m: m["reader_prerequisites"].__setitem__("is_direct", "no"),
+    ),
     ("records_without_readers", lambda m: m.__setitem__("readers", [])),
 ]
 

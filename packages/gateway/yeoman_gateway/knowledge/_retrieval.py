@@ -500,7 +500,7 @@ class RetrievalEngine:
         allowed_ids = self._recheck_ids(
             rows.statement_ids, context, decision, view=view, group_wide=group_wide
         )
-        text, rendered_ids, source_refs, entry_texts = self._render(
+        text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
             allowed_ids,
             context,
             decision,
@@ -515,6 +515,7 @@ class RetrievalEngine:
             text=text,
             statement_ids=rendered_ids,
             source_refs=source_refs,
+            source_refs_by_statement=source_refs_by_statement,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
             context_revision=revision,
@@ -562,11 +563,14 @@ class RetrievalEngine:
             if statement_id not in merged:
                 merged.append(statement_id)
         allowed_ids = self._recheck_ids(tuple(merged), context, decision)
-        text, rendered_ids, source_refs, entry_texts = self._render(allowed_ids, context, decision)
+        text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
+            allowed_ids, context, decision
+        )
         return KnowledgeContext(
             text=text,
             statement_ids=rendered_ids,
             source_refs=source_refs,
+            source_refs_by_statement=source_refs_by_statement,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
             context_revision=self.context_revision(context, decision, rendered_ids),
@@ -893,7 +897,7 @@ class RetrievalEngine:
                 ),
                 reason="stale_context",
             )
-        text, rendered_ids, source_refs, entry_texts = self._render(
+        text, rendered_ids, source_refs, source_refs_by_statement, entry_texts = self._render(
             allowed_ids, context, decision, max_chars=max_chars
         )
         if result.context_revision and result.context_revision != self.context_revision(
@@ -904,6 +908,7 @@ class RetrievalEngine:
                 text=text,
                 statement_ids=rendered_ids,
                 source_refs=source_refs,
+                source_refs_by_statement=source_refs_by_statement,
                 identity_revision=self._store.identity_revision,
                 acl_epoch=self._store.acl_epoch,
                 context_revision=self.context_revision(
@@ -916,6 +921,7 @@ class RetrievalEngine:
             text=text,
             statement_ids=rendered_ids,
             source_refs=source_refs,
+            source_refs_by_statement=source_refs_by_statement,
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
             context_revision=self.context_revision(
@@ -962,14 +968,20 @@ class RetrievalEngine:
         view: str = "current",
         max_chars: int | None = None,
         max_entries: int | None = None,
-    ) -> tuple[str, tuple[str, ...], tuple[SourceRef, ...], tuple[str, ...]]:
+    ) -> tuple[
+        str,
+        tuple[str, ...],
+        tuple[SourceRef, ...],
+        tuple[tuple[str, tuple[SourceRef, ...]], ...],
+        tuple[str, ...],
+    ]:
         """Render permitted statements with eligible names.  Evidence ids stay structured.
 
         Text is only ever read for ids that survived the gate *and* a fresh recheck, and
         only active person roles supply labels: a withheld role never names anybody.
         """
         if not statement_ids:
-            return "", (), (), ()
+            return "", (), (), (), ()
         placeholders = ",".join("?" for _ in statement_ids)
         rows = self._store.query(
             "SELECT s.statement_id, s.status, s.superseded_by, s.supersession_reason,"
@@ -989,6 +1001,7 @@ class RetrievalEngine:
         names: dict[str, str | None] = {}
         lines: list[str] = []
         used: list[SourceRef] = []
+        sources_by_statement: list[tuple[str, tuple[SourceRef, ...]]] = []
         rendered_ids: list[str] = []
         entry_texts: list[str] = []
         total = 0
@@ -1015,12 +1028,24 @@ class RetrievalEngine:
             lines.append(line)
             entry_texts.append(line)
             rendered_ids.append(statement_id)
-            for source, status in self._statements.sources_of(statement_id):
-                if status == "active" and source not in used:
+            active_sources = tuple(
+                source
+                for source, status in self._statements.sources_of(statement_id)
+                if status == "active"
+            )
+            sources_by_statement.append((statement_id, active_sources))
+            for source in active_sources:
+                if source not in used:
                     used.append(source)
             if max_entries is not None and len(rendered_ids) >= max(0, int(max_entries)):
                 break
-        return "\n".join(lines), tuple(rendered_ids), tuple(used), tuple(entry_texts)
+        return (
+            "\n".join(lines),
+            tuple(rendered_ids),
+            tuple(used),
+            tuple(sources_by_statement),
+            tuple(entry_texts),
+        )
 
     def context_revision(
         self,

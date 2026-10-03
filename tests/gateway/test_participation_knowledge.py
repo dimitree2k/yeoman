@@ -89,6 +89,7 @@ def _selector(statement_text: str = "Stammtisch donnerstags.", fact_text: str = 
             statement_ids=("stmt-1",) if statement_text else (),
             source_refs=(ref,) if statement_text else (),
             context_revision="statement-r1",
+            source_refs_by_statement=(("stmt-1", (ref,)),) if statement_text else (),
         ),
         [],
     )
@@ -309,6 +310,177 @@ def test_knowledge_reader_budget_keeps_whole_entries_and_source_refs(tmp_path) -
         harness.close()
 
 
+def test_statement_source_refs_stay_with_their_statement(tmp_path) -> None:
+    """Shared and multi-source statements keep their exact protected provenance."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        event_a = harness.observe("First source for the Stammtisch.", message_id="3EB0A10")
+        event_b = harness.observe(
+            "Second source for the Stammtisch.", message_id="3EB0A11", sender=OTHER
+        )
+        source_a = harness.authority.verify_source_ref(event_a, 1)
+        source_b = harness.authority.verify_source_ref(event_b, 1)
+        assert source_a is not None and source_b is not None
+
+        def capture(text: str, request_id: str, sources: tuple[SourceRef, ...]) -> str:
+            result = harness.knowledge.capture(
+                StatementCandidate(
+                    content=text,
+                    sources=sources,
+                    extractor_version="participation-provenance-v1",
+                    confidence=0.9,
+                ),
+                context=TrustedCaptureContext(
+                    request_id=request_id,
+                    policy_revision=1,
+                    capture_basis="historic_row",
+                    authorized_sources=sources,
+                ),
+            )
+            return result.statement_ids[0]
+
+        shared_statement = capture("Stammtisch first statement.", "shared-source", (source_a,))
+        multi_source_statement = capture(
+            "Stammtisch second statement.", "multi-source", (source_a, source_b)
+        )
+        shared_again_statement = capture(
+            "Stammtisch third statement.", "shared-source-again", (source_a,)
+        )
+        selector = ParticipationKnowledgeSelector(
+            knowledge=harness.knowledge, memory=_Memory(FactRetrievalResult(), [])
+        )
+
+        selected = selector.select_for_readers(query="Stammtisch", readers=_store_readers(harness))
+
+        refs_by_statement = {record.record_id: record.refs for record in selected.records}
+        assert refs_by_statement == {
+            shared_statement: ((source_a.event_id, source_a.revision),),
+            multi_source_statement: tuple(
+                sorted(
+                    {
+                        (source_a.event_id, source_a.revision),
+                        (source_b.event_id, source_b.revision),
+                    }
+                )
+            ),
+            shared_again_statement: ((source_a.event_id, source_a.revision),),
+        }
+    finally:
+        harness.close()
+
+
+def test_revalidation_preserves_selected_records_when_a_new_match_ranks_ahead(
+    tmp_path,
+) -> None:
+    """A later query ranking change cannot replace originally approved records."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        for index in range(3):
+            _capture_test_statement(
+                harness, f"Stammtisch option {index}.", f"3EB0B{20 + index:02d}"
+            )
+        selector = ParticipationKnowledgeSelector(
+            knowledge=harness.knowledge, memory=_Memory(FactRetrievalResult(), [])
+        )
+        readers = _store_readers(harness)
+        selected = selector.select_for_readers(query="Stammtisch option", readers=readers)
+        assert len(selected.records) == 3
+
+        fresh = selected
+        added_statement = ""
+        # Statement ids are stable hashes and bounded recall breaks ties by id.
+        # Add deterministic candidates until one changes the fresh ranking.
+        for index in range(64):
+            result = _capture_test_statement(
+                harness,
+                f"Stammtisch option new candidate {index}.",
+                f"3EB0C{index:02d}",
+            )
+            added_statement = result.statement_ids[0]
+            fresh = selector.select_for_readers(query="Stammtisch option", readers=readers)
+            if fresh.records != selected.records:
+                break
+        assert fresh.records != selected.records
+        assert added_statement in {record.record_id for record in fresh.records}
+
+        current = selector.revalidate_for_readers(selected, readers=readers)
+
+        assert current.records == selected.records
+        assert current.text == selected.text
+    finally:
+        harness.close()
+
+
+def test_revalidation_rejects_source_revision_change_with_unchanged_statement_text(
+    tmp_path,
+) -> None:
+    """A surviving statement id and text do not excuse changed source evidence."""
+    harness = CaptureHarness(tmp_path)
+    try:
+        event_id = harness.observe("A source for two Stammtisch statements.", message_id="3EB0D01")
+        source = harness.authority.verify_source_ref(event_id, 1)
+        assert source is not None
+
+        def capture(text: str, request_id: str) -> str:
+            result = harness.knowledge.capture(
+                StatementCandidate(
+                    content=text,
+                    sources=(source,),
+                    extractor_version="participation-revision-v1",
+                    confidence=0.9,
+                ),
+                context=TrustedCaptureContext(
+                    request_id=request_id,
+                    policy_revision=1,
+                    capture_basis="historic_row",
+                    authorized_sources=(source,),
+                ),
+            )
+            return result.statement_ids[0]
+
+        statement_ids = (
+            capture("The Stammtisch begins at seven.", "revision-first"),
+            capture("The Stammtisch ends at nine.", "revision-second"),
+        )
+        selector = ParticipationKnowledgeSelector(
+            knowledge=harness.knowledge, memory=_Memory(FactRetrievalResult(), [])
+        )
+        readers = _store_readers(harness)
+        selected = selector.select_for_readers(query="Stammtisch", readers=readers)
+        assert {record.record_id: record.refs for record in selected.records} == {
+            statement_id: ((source.event_id, source.revision),) for statement_id in statement_ids
+        }
+        replacement = SourceRef(
+            source.event_id,
+            source.revision + 1,
+            source.channel,
+            source.chat_id,
+            source.author_principal,
+            source.occurred_at_ms,
+        )
+        audience = harness.authority.evidence_audience(source, basis="")
+        assert audience is not None
+        harness.authority.register_source(replacement, audience)
+        harness.knowledge._store.execute(  # noqa: SLF001 - model a replaced active source link
+            "UPDATE knowledge_statement_sources SET revision = ?"
+            " WHERE event_id = ? AND revision = ?",
+            (replacement.revision, source.event_id, source.revision),
+        )
+
+        fresh = selector.select_for_readers(query="Stammtisch", readers=readers)
+        assert fresh.text == selected.text
+        assert fresh.statements.statement_ids == selected.statements.statement_ids
+        assert {record.record_id: record.refs for record in fresh.records} == {
+            statement_id: ((source.event_id, replacement.revision),)
+            for statement_id in statement_ids
+        }
+        assert fresh.records != selected.records
+        with pytest.raises(ParticipationKnowledgeInvalidatedError):
+            selector.revalidate_for_readers(selected, readers=readers)
+    finally:
+        harness.close()
+
+
 def test_whole_entry_budget_keeps_metadata_aligned() -> None:
     selector, _knowledge, _memory = _selector("A" * 700, "C" * 700)
     read_context, fact_context = _contexts()
@@ -337,13 +509,15 @@ def test_selector_requests_topical_statement_match() -> None:
 
 def test_multiline_statement_entry_remains_whole_with_identity_and_source() -> None:
     multiline = "Zusammenkunft am Donnerstag.\nBeginn ist um 19 Uhr."
+    source = SourceRef("ev-multi", 1, "whatsapp", CHAT, "alice", NOW)
     selector = ParticipationKnowledgeSelector(
         knowledge=_Knowledge(
             KnowledgeContext(
                 text=multiline,
                 statement_ids=("stmt-multiline",),
-                source_refs=(SourceRef("ev-multi", 1, "whatsapp", CHAT, "alice", NOW),),
+                source_refs=(source,),
                 entry_texts=(multiline,),
+                source_refs_by_statement=(("stmt-multiline", (source,)),),
             ),
             [],
         ),
@@ -867,16 +1041,14 @@ def _shared_reader_entry(
     Source refs carry the archived source event id, as the real store returns them;
     the record's own identity stays the statement id it was rendered from.
     """
+    source = SourceRef("ev-shared", 1, "whatsapp", CHAT, "alice", NOW - 86_400_000)
     return (
         KnowledgeContext(
             text=statement_text,
             statement_ids=("stmt-shared",) if statement_text else (),
-            source_refs=(
-                SourceRef("ev-shared", 1, "whatsapp", CHAT, "alice", NOW - 86_400_000),
-            )
-            if statement_text
-            else (),
+            source_refs=(source,) if statement_text else (),
             context_revision="stmt-shared-r1",
+            source_refs_by_statement=(("stmt-shared", (source,)),) if statement_text else (),
         ),
         FactRetrievalResult(
             text=f"- {fact_text}" if fact_text else "",
