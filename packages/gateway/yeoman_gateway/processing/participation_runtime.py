@@ -1412,7 +1412,7 @@ class ParticipationRuntime:
         fresh: _FreshCommentState,
     ) -> dict[str, object]:
         """Bound stale-draft rejudgement while retaining one delivery reservation."""
-        del initial_inputs, initial_context
+        del initial_inputs
         # Re-evaluation is bounded by the admission's original setting.  A live
         # policy refresh may reduce that bound, but must not retroactively buy
         # extra provider calls for work that was already admitted.
@@ -1420,6 +1420,9 @@ class ParticipationRuntime:
             _max_reevaluations(initial_snapshot),
             _max_reevaluations(fresh.snapshot),
         )
+        knowledge_used = bool(initial_context.get("knowledge_rendered_to_judge"))
+        if knowledge_used:
+            max_reevaluations = min(max_reevaluations, 1)
         original_judge_limit = _snapshot_int(
             initial_snapshot,
             "judge_calls_per_hour",
@@ -1619,6 +1622,11 @@ class ParticipationRuntime:
                 return {"status": "judge_failed", "reason": "provider_error"}
 
             self._record_knowledge_stage(current.context, "judge")
+            knowledge_used = knowledge_used or bool(
+                current.context.get("knowledge_rendered_to_judge")
+            )
+            if knowledge_used:
+                max_reevaluations = min(max_reevaluations, 1)
 
             if self._direct_active(current.opportunity):
                 await self._ledger.record_judge_outcome(

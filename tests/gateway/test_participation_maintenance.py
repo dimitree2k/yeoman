@@ -6,6 +6,7 @@ Fake-clock tests over real temporary stores. No provider, no live chat.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.consciousness.log import SpeakupLog
@@ -402,6 +403,52 @@ async def test_ten_verified_samples_distil_once_with_provenance(tmp_path: Path) 
     second = await distiller.run_once(channel=CHANNEL, chat_id=CHAT)
     assert second["distilled"] is False
     assert second["reason"] == "already_distilled"
+    assert len(memory.records) == 1
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_shadow_snapshot_does_not_distil_historical_production_samples(tmp_path: Path) -> None:
+    from yeoman_gateway.app.bootstrap import _participation_taste_opted_in
+    from yeoman_gateway.consciousness.taste import ParticipationTasteDistiller
+
+    log = SpeakupLog(tmp_path / "speakups.db")
+    for index in range(10):
+        await _delivered_sample(log, effect_id=f"e{index}")
+    memory = _Memory()
+    calls: list[str] = []
+    distiller = ParticipationTasteDistiller(
+        log=log,
+        memory=memory,
+        distiller=lambda prompt: calls.append(prompt) or '{"pattern":"keep replies short","confidence":0.8}',
+    )
+    snapshot = {"value": SimpleNamespace(live=False, observing=True)}
+    paused = {"value": False}
+    adapter = SimpleNamespace(
+        current_activation=lambda *_: snapshot["value"],
+        participation_pause_reason=lambda *_: "paused" if paused["value"] else None,
+    )
+    maintenance = ParticipationMaintenance(
+        ledger=log,
+        taste_distiller=distiller,
+        taste_opted_in=lambda channel, chat_id: _participation_taste_opted_in(
+            adapter, channel, chat_id
+        ),
+    )
+
+    await maintenance.run_once(now_ms=WINDOW_MS)
+    assert calls == []
+    assert memory.records == []
+
+    snapshot["value"] = SimpleNamespace(live=True, observing=False)
+    paused["value"] = True
+    await maintenance.run_once(now_ms=WINDOW_MS)
+    assert calls == []
+    assert memory.records == []
+
+    paused["value"] = False
+    await maintenance.run_once(now_ms=WINDOW_MS)
+    assert len(calls) == 1
     assert len(memory.records) == 1
     log.close()
 

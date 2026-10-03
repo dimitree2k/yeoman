@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, replace
 from typing import Any
@@ -473,6 +474,7 @@ class RetrievalEngine:
         context: TrustedReadContext,
         view: str = "current",
         max_chars: int | None = None,
+        max_entries: int | None = None,
         group_wide: bool = False,
         require_match: bool = False,
     ) -> KnowledgeContext:
@@ -499,7 +501,12 @@ class RetrievalEngine:
             rows.statement_ids, context, decision, view=view, group_wide=group_wide
         )
         text, rendered_ids, source_refs, entry_texts = self._render(
-            allowed_ids, context, decision, view=view, max_chars=max_chars
+            allowed_ids,
+            context,
+            decision,
+            view=view,
+            max_chars=max_chars,
+            max_entries=max_entries,
         )
         revision = self.context_revision(
             context, decision, rendered_ids, group_wide=group_wide
@@ -514,6 +521,7 @@ class RetrievalEngine:
             reason="ok" if allowed_ids else "empty",
             denied_count=rows.denied,
             entry_texts=entry_texts,
+            truncated=len(rendered_ids) < len(allowed_ids),
         )
 
     def recall_hybrid(
@@ -691,9 +699,11 @@ class RetrievalEngine:
         if history_at_ms is not None:
             effective_view = "historic"
         recall = self.recall(
-            RecallQuery(person_ids=(canonical,), limit=self.MAX_PROFILE_STATEMENTS),
+            RecallQuery(person_ids=(canonical,), limit=self.MAX_PROFILE_STATEMENTS + 1),
             context=checked,
             view=effective_view,
+            max_chars=sys.maxsize,
+            max_entries=self.MAX_PROFILE_STATEMENTS,
         )
         attributes, attribute_truncated = self._profile_attributes(
             recall.statement_ids, canonical
@@ -729,8 +739,7 @@ class RetrievalEngine:
             conflicts=self._profile_conflicts(attributes),
             identity_revision=self._store.identity_revision,
             acl_epoch=self._store.acl_epoch,
-            truncated=attribute_truncated
-            or len(recall.statement_ids) >= self.MAX_PROFILE_STATEMENTS,
+            truncated=attribute_truncated or recall.truncated,
             reason="ok" if lines else "empty",
             denied_count=recall.denied_count,
         )
@@ -952,6 +961,7 @@ class RetrievalEngine:
         *,
         view: str = "current",
         max_chars: int | None = None,
+        max_entries: int | None = None,
     ) -> tuple[str, tuple[str, ...], tuple[SourceRef, ...], tuple[str, ...]]:
         """Render permitted statements with eligible names.  Evidence ids stay structured.
 
@@ -1008,6 +1018,8 @@ class RetrievalEngine:
             for source, status in self._statements.sources_of(statement_id):
                 if status == "active" and source not in used:
                     used.append(source)
+            if max_entries is not None and len(rendered_ids) >= max(0, int(max_entries)):
+                break
         return "\n".join(lines), tuple(rendered_ids), tuple(used), tuple(entry_texts)
 
     def context_revision(

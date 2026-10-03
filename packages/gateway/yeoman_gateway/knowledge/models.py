@@ -914,6 +914,7 @@ class KnowledgeContext:
     reason: str = "ok"
     denied_count: int = 0
     entry_texts: tuple[str, ...] = ()
+    truncated: bool = False
 
     @property
     def empty(self) -> bool:

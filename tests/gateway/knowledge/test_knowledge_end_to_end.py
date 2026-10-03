@@ -637,6 +637,43 @@ def test_profile_keeps_at_most_five_values_per_attribute_group(knowledge_harness
     assert int(total) == 8
 
 
+def test_profile_keeps_long_statement_and_its_attribute_evidence_aligned(knowledge_harness):
+    from yeoman_gateway.knowledge.models import (
+        AttributeCandidate,
+        AttributeValue,
+        PersonLinkCandidate,
+        StatementCandidate,
+    )
+
+    h = knowledge_harness
+    alex = h.person("Alex")
+    source = h.source(alex)
+    content = "Approved profile detail. " * 180
+    candidate = StatementCandidate(
+        content=content,
+        sources=(source,),
+        people=(PersonLinkCandidate(
+            person_id=alex, role="subject", source=source, attribution="extracted"
+        ),),
+        attributes=(AttributeCandidate(
+            person_id=alex,
+            attribute_key="interest",
+            value=AttributeValue("long-form interest"),
+        ),),
+        extractor_version="test",
+        confidence=0.9,
+    )
+    statement_id = h.service.capture(candidate, context=h.capture_context(source)).statement_ids[0]
+
+    profile = h.service.person_profile(alex, context=h.read_context(alex))
+
+    assert profile.statement_ids == (statement_id,)
+    assert profile.source_refs
+    assert profile.attributes == (("interest", ("long-form interest",)),)
+    assert content.strip() in profile.card
+    assert profile.truncated is False
+
+
 def test_profile_marks_reported_values_as_reported(knowledge_harness):
     """A value somebody else reported reads as reported, not as a self-declaration."""
     h = knowledge_harness

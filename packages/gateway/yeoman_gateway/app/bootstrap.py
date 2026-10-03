@@ -83,6 +83,8 @@ if TYPE_CHECKING:
     from yeoman_shared.config.schema import Config, ExecToolConfig
 
     from yeoman_gateway.ipc.gateway_socket import GatewaySocket
+    from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
+    from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.policy.engine import PolicyEngine
     from yeoman_gateway.processing.dispatch import IntentEffectRouter
     from yeoman_gateway.processing.store import ProcessingStore
@@ -996,7 +998,7 @@ def _participation_knowledge_contexts(
     *,
     chat_registry: object,
     knowledge: object,
-):
+) -> tuple[TrustedReadContext, FactReadContext] | str:
     """Build protected reader contexts only from verified trigger authors and members."""
     from yeoman_gateway.knowledge._memory.read_gate import registry_members
     from yeoman_gateway.knowledge._memory.shared_facts import FactReadContext
@@ -1060,6 +1062,20 @@ def _participation_knowledge_contexts(
         group_wide=True,
     )
     return read_context, fact_context
+
+
+def _participation_taste_opted_in(
+    policy_adapter: object | None, channel: str, chat_id: str
+) -> bool:
+    """Taste writes require current production permission, including no pause."""
+    current = getattr(policy_adapter, "current_activation", None)
+    snapshot = current(channel, chat_id) if callable(current) else None
+    pause_reason = getattr(policy_adapter, "participation_pause_reason", None)
+    return bool(
+        snapshot is not None
+        and getattr(snapshot, "live", False)
+        and not (callable(pause_reason) and pause_reason(channel, chat_id))
+    )
 
 
 def _build_participation_runtime(
@@ -1537,17 +1553,28 @@ class _ParticipationSubmission:
                 str(getattr(opportunity, "chat_id", "")),
             ),
         )
+        original_context = context if isinstance(context, dict) else None
         writer_context = dict(context or {})
         writer_context["target_message_id"] = getattr(
             decision, "target_message_id", None
         )
-        return await generator(
+        draft = await generator(
             event,
             policy_decision,
             purpose=str(getattr(decision, "purpose", "") or ""),
             context=writer_context,
             model_profile=self._writer_profile,
         )
+        if original_context is not None:
+            for key in (
+                "writer_dropped_entry_ids",
+                "writer_dropped_entry_count",
+                "knowledge_rendered_to_writer",
+                "taste_rendered_to_writer",
+            ):
+                if key in writer_context:
+                    original_context[key] = writer_context[key]
+        return draft
 
     async def submit(
         self,
@@ -3818,7 +3845,9 @@ def build_gateway_runtime(
                 batch_size=int(getattr(maintenance_config, "batch_size", 20)),
                 interval_seconds=int(getattr(maintenance_config, "interval_seconds", 900)),
                 taste_distiller=taste_distiller,
-                taste_opted_in=_participation_active,
+                taste_opted_in=lambda channel, chat_id: _participation_taste_opted_in(
+                    policy_adapter, channel, chat_id
+                ),
             )
 
         if participation_runtime is not None:

@@ -980,6 +980,16 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
         knowledge_selector=selector,
         knowledge_context_supplier=trusted_contexts,
     )
+    original_context_build = builder.build
+
+    async def build_with_taste(*args, **kwargs):
+        context = await original_context_build(*args, **kwargs)
+        context["advisory_taste"] = [
+            {"content": "Use direct phrasing.", "provenance": "participation:test"}
+        ]
+        return context
+
+    builder.build = build_with_taste
 
     class JudgeClient:
         route_key = "fake-participation-judge"
@@ -1057,7 +1067,7 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
     class InspectingJudge(ParticipationJudge):
         def _fit_context_for_judge(self, context, opportunity):
             super()._fit_context_for_judge(context, opportunity)
-            finalized_contexts.append(dict(context))
+            finalized_contexts.append(context)
 
     runtime._judge = InspectingJudge(client=judge_client)
 
@@ -1080,6 +1090,9 @@ async def test_older_knowledge_reaches_real_renderers_and_revocation_blocks_effe
         assert 'id="m1"' in judge_prompt
         assert "When is the group meetup?" in writer_prompt
         assert finalized_contexts[0]["knowledge_rendered_to_judge"] is True
+        assert finalized_contexts[0].get("knowledge_rendered_to_writer") is True
+        assert finalized_contexts[0].get("taste_rendered_to_writer") is True
+        assert "Use direct phrasing." in writer_prompt
         if oversized_optional:
             assert finalized_contexts[0]["judge_dropped_entry_count"] >= 1
             assert "optional-large-history" in finalized_contexts[0]["judge_dropped_entry_ids"]
@@ -1936,6 +1949,71 @@ async def test_reevaluation_bound_stays_at_original_activation_limit(tmp_path: P
         release_draft.set()
         if not task.done():
             await task
+    assert result == {"status": "comment_skipped", "reason": "context_changed"}
+    assert judge.calls == 2
+    assert submission.calls == 1
+    assert await log.pending_delivery_reservations() == []
+    log.close()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_used_caps_configured_two_reevaluations_at_one(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    revision = {"value": 3}
+
+    class SequenceJudge:
+        calls = 0
+
+        async def decide(self, opportunity, context):
+            del opportunity
+            self.calls += 1
+            if context.get("selected_knowledge_text"):
+                context["knowledge_rendered_to_judge"] = True
+            if self.calls == 2:
+                revision["value"] = 6
+            return COMMENT
+
+    class ChangingSubmission(_Submission):
+        async def generate_draft(self, *, opportunity, decision, context):
+            revision["value"] = 4
+            return await super().generate_draft(
+                opportunity=opportunity, decision=decision, context=context
+            )
+
+    submission = ChangingSubmission()
+    runtime, _judge, context_builder, log = _runtime(
+        tmp_path,
+        decision=COMMENT,
+        submission=submission,
+        snapshot_overrides={"max_reevaluations": 2},
+    )
+    original_build = context_builder.build
+
+    async def build_changed(*args, **kwargs):
+        context = await original_build(*args, **kwargs)
+        context["_knowledge_selection"] = SimpleNamespace(text="shared fact", revision="v1")
+        context["selected_knowledge_text"] = "shared fact"
+        context["knowledge_selection_status"] = "selected"
+        return context
+
+    context_builder.build = build_changed
+    runtime._revalidate_knowledge = lambda *_: SimpleNamespace(
+        text="shared fact", revision="v1"
+    )
+    base_snapshot = runtime._snapshot_provider
+
+    def snapshot(*args, **kwargs):
+        current = dict(base_snapshot(*args, **kwargs))
+        current["context_revision"] = revision["value"]
+        current["max_reevaluations"] = 2
+        return current
+
+    judge = SequenceJudge()
+    runtime._snapshot_provider = snapshot
+    runtime._judge = judge  # type: ignore[assignment]
+    result = await runtime.evaluate_participation(_opportunity())
+
     assert result == {"status": "comment_skipped", "reason": "context_changed"}
     assert judge.calls == 2
     assert submission.calls == 1
@@ -3297,7 +3375,6 @@ def _auth_check(**overrides: object):
 async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge(tmp_path: Path) -> None:
     from yeoman_gateway.adapters.responder_llm import LLMResponder
     from yeoman_gateway.bus.queue import MessageBus
-    from yeoman_gateway.core.models import InboundEvent, PolicyDecision
     from yeoman_gateway.providers.base import LLMResponse
 
     class _PromptProvider:
@@ -3338,12 +3415,13 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
         "advisory_taste": [{"content": "Prefer concise replies.", "provenance": "participation:v1"}],
         "_knowledge_selection": selection,
     }
-    await responder.generate_participation_draft(
-        InboundEvent(channel=CHANNEL, chat_id=CHAT, sender_id="", content="", is_group=True),
-        PolicyDecision(accept_message=False, should_respond=False, allowed_tools=frozenset(), reason="participation_draft_only"),
-        purpose="brief response",
+    from yeoman_gateway.app.bootstrap import _ParticipationSubmission
+
+    submission = _ParticipationSubmission(responder=responder, writer_profile="test")
+    await submission.generate_draft(
+        opportunity=SimpleNamespace(channel=CHANNEL, chat_id=CHAT, opportunity_id="opp-writer"),
+        decision=SimpleNamespace(target_message_id="current", purpose="brief response"),
         context=context,
-        model_profile="participation_writer",
     )
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] == []
@@ -3357,6 +3435,9 @@ async def test_writer_budget_keeps_required_target_and_complete_shared_knowledge
     assert "Prefer concise replies." in prompt
     assert "optional context" not in prompt
     assert context["writer_dropped_entry_ids"] == ["optional"]
+    assert context["writer_dropped_entry_count"] == 1
+    assert context["knowledge_rendered_to_writer"] is True
+    assert context["taste_rendered_to_writer"] is True
     assert "provenance=participation:v1" in prompt
     assert "object at 0x" not in prompt
     from yeoman_gateway.adapters.responder_llm import _render_participation_transcript
