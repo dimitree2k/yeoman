@@ -268,7 +268,8 @@ def _purge_collection(
         payload = _read_json(manifest)
         entries = [entry for entry in payload.get("sources", []) if isinstance(entry, dict)]
         if any(entry.get("source_id") == source_id for entry in entries):
-            affected[manifest.parent.name] = manifest.parent
+            version = _legacy_preserve_token(manifest.parent.name) or manifest.parent.name
+            affected[version] = manifest.parent
             retained_ids.update(
                 str(entry["source_id"])
                 for entry in entries
@@ -286,6 +287,26 @@ def _purge_collection(
                 and isinstance(entry.get("source_id"), str)
                 and entry.get("source_id") != source_id
             )
+    for version_id, bundle in _legacy_preservation_bundles(root, source_id).items():
+        affected[version_id] = bundle
+        manifest = bundle / "manifest.json"
+        if manifest.is_file():
+            payload = _read_json(manifest)
+            retained_ids.update(
+                str(entry["source_id"])
+                for entry in payload["sources"]
+                if isinstance(entry, dict)
+                and isinstance(entry.get("source_id"), str)
+                and entry.get("source_id") != source_id
+            )
+        sources_root = bundle / "sources"
+        if sources_root.is_dir():
+            for child in sources_root.iterdir():
+                candidate = child.name
+                if candidate.startswith(".") and candidate.endswith(".partial"):
+                    candidate = candidate[1 : -len(".partial")]
+                if candidate != source_id and _ID.fullmatch(candidate):
+                    retained_ids.add(candidate)
     pending_for_source = {
         purge_id: item
         for purge_id, item in pending_purges.items()
@@ -861,7 +882,16 @@ def _purge_source_version(root: Path, version: str, source_id: str) -> None:
     if not _ID.fullmatch(version) or ".." in version:
         raise SnapshotError("bundle_path_invalid", "refusing an invalid purged version id")
     staging = version.startswith("staging-")
-    key = version.removeprefix("staging-") if staging else version
+    legacy_preserve = version.startswith("legacy-preserve-")
+    legacy_match = re.fullmatch(r"legacy-preserve-([a-f0-9]{32})", version)
+    if legacy_preserve and not legacy_match:
+        raise SnapshotError("bundle_path_invalid", "refusing an invalid legacy scratch id")
+    if staging:
+        key = version.removeprefix("staging-")
+    elif legacy_match:
+        key = f".preserve-{legacy_match.group(1)}"
+    else:
+        key = version
     if staging and not re.fullmatch(r"[a-f0-9]{64}", key):
         raise SnapshotError("bundle_path_invalid", "refusing an invalid staged bundle id")
     bundle_root = root / (".staging" if staging else "versions")
@@ -888,7 +918,8 @@ def _purge_source_version(root: Path, version: str, source_id: str) -> None:
     source_dir = bundle / "sources" / source_id
     _reject_symlink_components(source_dir.absolute())
     _remove_tree(source_dir)
-    if staging:
+    scratch_bundle = staging or bool(legacy_match)
+    if scratch_bundle:
         partial_dir = bundle / "sources" / f".{source_id}.partial"
         _reject_symlink_components(partial_dir.absolute())
         _remove_tree(partial_dir)
@@ -897,11 +928,14 @@ def _purge_source_version(root: Path, version: str, source_id: str) -> None:
         for entry in entries
         if not isinstance(entry, dict) or entry.get("source_id") != source_id
     ]
-    if staging:
+    if scratch_bundle:
         if len(remaining) != len(entries):
             payload["sources"] = remaining
             payload["complete"] = False
             _write_json(manifest, payload)
+        sources_root = bundle / "sources"
+        if not remaining and not (sources_root.exists() and any(sources_root.iterdir())):
+            _remove_tree(bundle)
         return
     if not remaining:
         _remove_tree(bundle)
@@ -947,9 +981,51 @@ def _staged_source_bundles(root: Path, source_id: str) -> dict[str, Path]:
     return result
 
 
+def _legacy_preserve_token(name: str) -> str | None:
+    match = re.fullmatch(r"\.preserve-([a-f0-9]{32})", name)
+    return f"legacy-preserve-{match.group(1)}" if match else None
+
+
+def _legacy_preservation_bundles(root: Path, source_id: str) -> dict[str, Path]:
+    versions = root / "versions"
+    if not versions.exists():
+        return {}
+    _reject_symlink_components(versions.absolute())
+    if versions.is_symlink() or not versions.is_dir():
+        raise SnapshotError("versions_invalid", "collection versions path is invalid")
+    result: dict[str, Path] = {}
+    for bundle in sorted(versions.iterdir()):
+        token = _legacy_preserve_token(bundle.name)
+        if token is None:
+            continue
+        _reject_symlink_components(bundle.absolute())
+        if bundle.is_symlink() or not bundle.is_dir():
+            raise SnapshotError("bundle_path_invalid", "legacy preservation scratch is invalid")
+        present = False
+        manifest = bundle / "manifest.json"
+        if manifest.exists():
+            payload = _read_json(manifest)
+            present = any(
+                isinstance(entry, dict) and entry.get("source_id") == source_id
+                for entry in payload["sources"]
+            )
+        sources = bundle / "sources"
+        if sources.exists():
+            _reject_symlink_components(sources.absolute())
+            present = present or (sources / source_id).exists() or (
+                sources / f".{source_id}.partial"
+            ).exists()
+        if present:
+            result[token] = bundle
+    return result
+
+
 def _version_path(root: Path, version: str) -> Path:
     if version.startswith("staging-"):
         return root / ".staging" / version.removeprefix("staging-")
+    legacy = re.fullmatch(r"legacy-preserve-([a-f0-9]{32})", version)
+    if legacy:
+        return root / "versions" / f".preserve-{legacy.group(1)}"
     return root / "versions" / version
 
 
