@@ -579,6 +579,7 @@ def test_snapshot_cli_exposes_catalog_operations(tmp_path: Path) -> None:
 
     runner = CliRunner()
     for command, options in (
+        ("collect", ("--sources", "--target-dir")),
         ("refresh", ("--sources", "--target-dir")),
         (
             "query",
@@ -589,6 +590,7 @@ def test_snapshot_cli_exposes_catalog_operations(tmp_path: Path) -> None:
             ),
         ),
         ("rebuild", ("--target-dir",)),
+        ("restore", ("--manifest", "--restore-dir")),
         ("purge", ("--target-dir", "--source-id", "--yes")),
     ):
         result = runner.invoke(knowledge_app, ["snapshot", command, "--help"])
@@ -626,3 +628,98 @@ def test_snapshot_cli_runs_refresh_query_rebuild_and_confirmed_purge(tmp_path: P
     )
     assert purge.exit_code == 0, purge.output
     assert _manifest_paths(target) == []
+
+
+def test_snapshot_cli_rehearses_collect_refresh_query_and_restore_in_temp_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "yeoman-home"))
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.knowledge_commands import knowledge_app
+
+    source = tmp_path / "yeoman-home" / "fixture.jsonl"
+    _jsonl(
+        source,
+        {
+            "message_id": "synthetic-native-id",
+            "chat_id": "synthetic-chat",
+            "occurred_at": "2026-10-02T12:00:00Z",
+            "type": "message",
+            "text": "synthetic private body",
+        },
+    )
+    descriptors = tmp_path / "sources.json"
+    descriptors.write_text(json.dumps([_source("synthetic", source)]), encoding="utf-8")
+    target = tmp_path / "yeoman-home" / "backups" / "preservation" / "collection"
+    restore_dir = tmp_path / "restore"
+    runner = CliRunner()
+
+    collected = runner.invoke(
+        knowledge_app,
+        ["snapshot", "collect", "--sources", str(descriptors), "--target-dir", str(target)],
+    )
+    assert collected.exit_code == 0, collected.output
+    assert "complete: yes" in collected.output
+    manifest = Path(
+        next(line.removeprefix("manifest: ") for line in collected.output.splitlines() if line.startswith("manifest: "))
+    )
+
+    refreshed = runner.invoke(
+        knowledge_app,
+        ["snapshot", "refresh", "--sources", str(descriptors), "--target-dir", str(target)],
+    )
+    assert refreshed.exit_code == 0, refreshed.output
+    assert '"refreshed": false' in refreshed.output
+    queried = runner.invoke(
+        knowledge_app,
+        ["snapshot", "query", "--target-dir", str(target), "--source-id", "synthetic"],
+    )
+    assert queried.exit_code == 0, queried.output
+    assert "synthetic-native-id" in queried.output
+    assert "synthetic private body" not in queried.output
+
+    restored = runner.invoke(
+        knowledge_app,
+        ["snapshot", "restore", "--manifest", str(manifest), "--restore-dir", str(restore_dir)],
+    )
+    assert restored.exit_code == 0, restored.output
+    assert "bundle verdict: ok" in restored.output
+    copied = restore_dir / "sources" / "synthetic" / source.name
+    assert copied.read_bytes() == source.read_bytes()
+
+
+def test_snapshot_cli_rejects_corrupt_bundle_without_partial_restore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "yeoman-home"))
+    from typer.testing import CliRunner
+    from yeoman_gateway.cli.knowledge_commands import knowledge_app
+
+    source = tmp_path / "source.jsonl"
+    _jsonl(source, {"message_id": "synthetic-native-id"})
+    descriptors = tmp_path / "sources.json"
+    descriptors.write_text(json.dumps([_source("synthetic", source)]), encoding="utf-8")
+    target = tmp_path / "collection"
+    runner = CliRunner()
+    collected = runner.invoke(
+        knowledge_app,
+        ["snapshot", "collect", "--sources", str(descriptors), "--target-dir", str(target)],
+    )
+    assert collected.exit_code == 0, collected.output
+    manifest = Path(
+        next(line.removeprefix("manifest: ") for line in collected.output.splitlines() if line.startswith("manifest: "))
+    )
+    (manifest.parent / "sources" / "synthetic" / source.name).write_text(
+        "corrupt bundle copy\n", encoding="utf-8"
+    )
+
+    restore_dir = tmp_path / "restore"
+    restored = runner.invoke(
+        knowledge_app,
+        ["snapshot", "restore", "--manifest", str(manifest), "--restore-dir", str(restore_dir)],
+    )
+    assert restored.exit_code == 2, restored.output
+    assert "bundle_hash_mismatch" in restored.output
+    assert list(restore_dir.iterdir()) == []
