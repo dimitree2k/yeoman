@@ -1,11 +1,12 @@
 """Lossless, versioned acquisition of explicitly named historical sources.
 
-Only structural metadata enters manifests. Raw archives stay reference-only, SQLite
+Only whitelisted metadata enters manifests. Raw archives stay reference-only, SQLite
 content is never projected into rows, and credential paths are excluded.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import stat
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -35,6 +37,24 @@ def collect_sources(
     _allow_purged_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Acquire one immutable version from explicit descriptors; never guess source paths."""
+    root = _target_root(Path(target_dir).expanduser())
+    _check_capacity(sources, root)
+    _private_mkdir(root)
+    with _collection_lock(root):
+        return _collect_sources(
+            sources=sources,
+            target_dir=root,
+            _allow_purged_source_ids=_allow_purged_source_ids,
+        )
+
+
+def _collect_sources(
+    *,
+    sources: list[dict[str, Any]],
+    target_dir: Path,
+    _allow_purged_source_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Collect while the caller holds the per-collection lock."""
     if not isinstance(sources, list) or not sources:
         raise SnapshotError("sources_invalid", "sources must be a non-empty JSON descriptor list")
     descriptors = [_descriptor(item) for item in sources]
@@ -119,6 +139,13 @@ def collect_sources(
         if entry and entry.get("status") == "copied" and _entry_matches(staging, entry, plan):
             entries.append(entry)
             continue
+        if (
+            plan["status"] != "excluded"
+            and entry
+            and entry.get("status") == "copied"
+            and _entry_copy_intact(staging, entry)
+        ):
+            _preserve_staged_variant(root, staging, entry, payload)
         if plan["status"] != "ready":
             entry = _not_collected_entry(plan)
             entries.append(entry)
@@ -211,6 +238,34 @@ def collect_sources(
         "manifest_path": str(final_manifest),
         "source_count": len(entries),
     }
+
+
+def _check_capacity(sources: list[dict[str, Any]], root: Path) -> None:
+    if not isinstance(sources, list) or not sources:
+        raise SnapshotError("sources_invalid", "sources must be a non-empty JSON descriptor list")
+    descriptors = [_descriptor(item) for item in sources]
+    ids = [item["source_id"] for item in descriptors]
+    if len(ids) != len(set(ids)):
+        raise SnapshotError("source_duplicate", "duplicate source ids are not allowed")
+    plans = []
+    for item in descriptors:
+        try:
+            plans.append(_plan(item, root))
+        except SnapshotError as exc:
+            if exc.code in {"source_symlink", "source_path_invalid", "source_destination_overlap"}:
+                raise
+            plans.append({"descriptor": item, "status": "incomplete", "files": []})
+        except OSError:
+            plans.append({"descriptor": item, "status": "incomplete", "files": []})
+    required = sum(
+        sum(info["size_bytes"] for info in plan["files"]) + _inspection_bytes(plan)
+        for plan in plans
+    )
+    probe = root if root.exists() else root.parent
+    while not probe.exists():
+        probe = probe.parent
+    if shutil.disk_usage(probe).free < required:
+        raise SnapshotError("capacity_insufficient", "collection target lacks required free space")
 
 
 def verify_source_bundle(*, manifest: Path, restore_dir: Path | None = None) -> dict[str, Any]:
@@ -702,6 +757,7 @@ def _not_collected_entry(plan: dict[str, Any]) -> dict[str, Any]:
 def _reference_entry(plan: dict[str, Any]) -> dict[str, Any]:
     descriptor = plan["descriptor"]
     info = descriptor["path"].stat()
+    metadata, file_stats = _reference_metadata(descriptor)
     return {
         "source_id": descriptor["source_id"],
         "source_path": str(descriptor["path"]),
@@ -711,11 +767,146 @@ def _reference_entry(plan: dict[str, Any]) -> dict[str, Any]:
         "status": "reference_only",
         "size_bytes": info.st_size if stat.S_ISREG(info.st_mode) else None,
         "source_mtime_ns": info.st_mtime_ns,
-        "content_read": False,
+        "content_read": True,
+        "metadata_only": True,
+        "record_metadata": metadata,
+        "reference_file_stats": file_stats,
         "acquisition_started_ms": _now_ms(),
         "acquisition_finished_ms": _now_ms(),
         "cursor": descriptor.get("cursor"),
     }
+
+
+def _reference_metadata(descriptor: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read only safe record fields and per-file hashes from a reference source."""
+    from ._preservation_inventory import _inspect_reference_tree, inspect_source
+
+    path: Path = descriptor["path"]
+    if _is_raw_reference(descriptor):
+        inspected = _inspect_raw_reference(path, descriptor["source_class"])
+    elif path.is_dir():
+        inspected = _inspect_reference_tree(path)
+    else:
+        inspected = inspect_source(path=path, source_class=descriptor["source_class"])
+    file_stats: dict[str, Any] = {}
+    for item in inspected.get("files", []):
+        relative = str(item.get("path", ""))
+        safe = PurePosixPath(relative)
+        if not relative or safe.is_absolute() or ".." in safe.parts or "\\" in relative:
+            continue
+        source_file = path.joinpath(*safe.parts) if path.is_dir() else path
+        try:
+            info = source_file.stat()
+        except OSError:
+            continue
+        file_stats[safe.as_posix()] = {
+            "sha256": item.get("sha256"),
+            "size_bytes": int(item.get("size_bytes", info.st_size)),
+            "mtime_ns": info.st_mtime_ns,
+        }
+
+    records: list[dict[str, Any]] = []
+    if not descriptor["restricted"]:
+        for item in inspected.get("records", []):
+            locator = item.get("locator")
+            if not isinstance(locator, dict):
+                continue
+            file_name = locator.get("file")
+            relative = PurePosixPath(str(file_name or ""))
+            if (
+                not file_name
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or "\\" in str(file_name)
+            ):
+                continue
+            safe_record: dict[str, Any] = {}
+            for field in ("original_time", "creation_time", "chat", "record_type", "native_id"):
+                value = item.get(field)
+                safe_record[field] = (
+                    value
+                    if (isinstance(value, str) and len(value) <= 512)
+                    or isinstance(value, (int, float, bool))
+                    else None
+                )
+            safe_locator: dict[str, Any] = {"file": relative.as_posix()}
+            line = locator.get("line")
+            if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                safe_locator["line"] = line
+            safe_record["locator"] = safe_locator
+            records.append(safe_record)
+    return (
+        {"status": inspected.get("status", "unknown"), "records": records, "tables": []},
+        file_stats,
+    )
+
+
+def _is_raw_reference(descriptor: dict[str, Any]) -> bool:
+    source_class = str(descriptor["source_class"]).lower()
+    return source_class in {"raw", "raw_archive", "raw-spool"} or bool(
+        {"raw", "raw-spool"}.intersection(part.lower() for part in descriptor["path"].parts)
+    )
+
+
+def _inspect_raw_reference(path: Path, source_class: str) -> dict[str, Any]:
+    """Inspect JSONL metadata only; never copy or inspect raw media/database bytes."""
+    from ._preservation_inventory import _is_excluded, inspect_source
+
+    records: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    parse_errors: list[dict[str, Any]] = []
+    status = "empty"
+
+    def inspect_file(source_file: Path, relative: str) -> None:
+        nonlocal status
+        before = source_file.stat()
+        inspected = inspect_source(path=source_file, source_class=source_class)
+        after = source_file.stat()
+        details = inspected.get("files", [])
+        if (
+            before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or not details
+            or details[0].get("size_bytes") != after.st_size
+        ):
+            raise SnapshotError("source_changed", "raw reference changed during metadata inspection")
+        files.append({**details[0], "path": relative})
+        for record in inspected.get("records", []):
+            safe = dict(record)
+            locator = dict(safe.get("locator", {}))
+            locator["file"] = relative
+            safe["locator"] = locator
+            records.append(safe)
+        parse_errors.extend(inspected.get("parse_errors", []))
+        if inspected.get("status") not in {"empty", "missing"}:
+            status = "present"
+
+    if path.is_file():
+        inspect_file(path, path.name)
+    else:
+        def inaccessible(error: OSError) -> None:
+            raise SnapshotError("source_unreadable", "raw reference tree is inaccessible") from error
+
+        for directory, dirnames, filenames in os.walk(
+            path, topdown=True, onerror=inaccessible, followlinks=False
+        ):
+            base = Path(directory)
+            for name in list(dirnames):
+                child = base / name
+                if name == "media" or _is_excluded(child):
+                    dirnames.remove(name)
+                elif child.is_symlink():
+                    raise SnapshotError("source_symlink", "raw reference symlinks are not allowed")
+            for name in sorted(filenames):
+                source_file = base / name
+                if source_file.suffix.lower() not in {".jsonl", ".ndjson"}:
+                    continue
+                if source_file.is_symlink() or not source_file.is_file():
+                    raise SnapshotError("source_symlink", "raw reference file is not regular")
+                _reject_symlink_components(source_file.absolute())
+                inspect_file(source_file, source_file.relative_to(path).as_posix())
+
+    return {"status": "partial" if parse_errors else status, "records": records, "files": files}
 
 
 def _entry_matches(staging: Path, entry: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -724,14 +915,7 @@ def _entry_matches(staging: Path, entry: dict[str, Any], plan: dict[str, Any]) -
     base = staging / "sources" / str(entry.get("source_id", ""))
     try:
         _reject_symlink_components(base)
-        bundle_ok = all(
-            not PurePosixPath(rel).is_absolute()
-            and ".." not in PurePosixPath(rel).parts
-            and "\\" not in rel
-            and _fingerprint(base.joinpath(*PurePosixPath(rel).parts)) == info.get("copied_sha256")
-            for rel, info in entry["copied_files"].items()
-        )
-        if not bundle_ok:
+        if not _entry_copy_intact(staging, entry):
             return False
         current_files = {item["relative"]: item for item in plan["files"]}
         if plan["descriptor"]["kind"] == "live_sqlite":
@@ -756,6 +940,90 @@ def _entry_matches(staging: Path, entry: dict[str, Any], plan: dict[str, Any]) -
         )
     except (OSError, SnapshotError, TypeError, KeyError, AttributeError):
         return False
+
+
+def _entry_copy_intact(staging: Path, entry: dict[str, Any]) -> bool:
+    copied_files = entry.get("copied_files")
+    if not isinstance(copied_files, dict) or not copied_files:
+        return False
+    base = staging / "sources" / str(entry.get("source_id", ""))
+    try:
+        _reject_symlink_components(base)
+        for relative, info in copied_files.items():
+            if (
+                not isinstance(relative, str)
+                or not isinstance(info, dict)
+                or PurePosixPath(relative).is_absolute()
+                or ".." in PurePosixPath(relative).parts
+                or "\\" in relative
+            ):
+                return False
+            member = base.joinpath(*PurePosixPath(relative).parts)
+            _reject_symlink_components(member)
+            if member.is_symlink() or not member.is_file():
+                return False
+            if _fingerprint(member) != info.get("copied_sha256"):
+                return False
+        return True
+    except (OSError, SnapshotError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _preserve_staged_variant(
+    root: Path, staging: Path, entry: dict[str, Any], payload: dict[str, Any]
+) -> None:
+    """Publish an intact staged source as its own immutable, queryable version."""
+    source_id = str(entry["source_id"])
+    staged_source = staging / "sources" / source_id
+    versions = root / "versions"
+    _private_mkdir(versions)
+    temporary = versions / f".preserve-{uuid.uuid4().hex}"
+    _private_mkdir(temporary / "sources")
+    try:
+        shutil.copytree(staged_source, temporary / "sources" / source_id)
+        old_entry = json.loads(json.dumps(entry))
+        preserved = {
+            "source_bundle_manifest_version": SOURCE_BUNDLE_MANIFEST_VERSION,
+            "bundle_format": "yeoman-source-bundle",
+            "staging_key": payload.get("staging_key"),
+            "collection_started_ms": entry.get("acquisition_started_ms", _now_ms()),
+            "collection_finished_ms": entry.get("acquisition_finished_ms", _now_ms()),
+            "complete": True,
+            "sources": [old_entry],
+        }
+        _write_json(temporary / "manifest.json", preserved)
+        version = versions / (
+            f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:12]}"
+        )
+        os.replace(temporary, version)
+    finally:
+        if temporary.exists():
+            _remove_tree(temporary)
+
+
+@contextmanager
+def _collection_lock(root: Path):
+    """Serialize collection, refresh, and purge across threads and CLI processes."""
+    lock_path = root / ".preservation.lock"
+    _reject_symlink_components(lock_path.absolute())
+    fd = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    locked = False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
+            raise SnapshotError("target_owner_invalid", "collection lock is not a private owner file")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _bundle_files(root: Path) -> set[str]:

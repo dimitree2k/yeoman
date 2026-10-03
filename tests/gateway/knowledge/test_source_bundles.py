@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,170 @@ def test_resume_reacquires_a_completed_source_that_changed(tmp_path: Path, monke
     copied = Path(report["bundle_dir"]) / "sources/a/first.bin"
     assert copied.read_bytes() == b"other"
     assert calls == 1
+
+
+def test_confirmed_purge_removes_staged_and_partial_source_copies_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yeoman_gateway.knowledge import _source_bundles
+    from yeoman_gateway.knowledge._preservation_catalog import purge_collection
+
+    sources = {name: tmp_path / f"{name}.bin" for name in ("A", "B", "C")}
+    for name, path in sources.items():
+        path.write_bytes(name.encode())
+    target = tmp_path / "collection"
+    copy_file = _source_bundles._copy_file
+
+    def interrupt_c(source: Path, destination: Path) -> str:
+        if source == sources["C"]:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"partial-C")
+            raise KeyboardInterrupt
+        return copy_file(source, destination)
+
+    monkeypatch.setattr(_source_bundles, "_copy_file", interrupt_c)
+    descriptors = [_source(name, path) for name, path in sources.items()]
+    with pytest.raises(KeyboardInterrupt):
+        collect_sources(sources=descriptors, target_dir=target)
+
+    staging = next((target / ".staging").iterdir())
+    staged_sources = staging / "sources"
+    assert (staged_sources / "A" / "A.bin").read_bytes() == b"A"
+    assert (staged_sources / "B" / "B.bin").read_bytes() == b"B"
+    assert (staged_sources / ".C.partial" / "C.bin").read_bytes() == b"partial-C"
+
+    preview = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=False
+    )
+    assert str(staging) in preview["affected_bundles"]
+    assert preview["affected_source_ids"] == ["A"]
+    assert preview["retained_source_ids"] == ["B", "C"]
+    purge_collection(target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True)
+    assert not (staged_sources / "A").exists()
+    assert (staged_sources / "B" / "B.bin").read_bytes() == b"B"
+    assert (staged_sources / ".C.partial" / "C.bin").read_bytes() == b"partial-C"
+
+    purge_collection(target_dir=target, source_id="C", operator=str(os.getuid()), confirmed=True)
+    assert not (staged_sources / ".C.partial").exists()
+    assert (staged_sources / "B" / "B.bin").read_bytes() == b"B"
+
+
+def test_staged_purge_cleanup_failure_is_durable_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yeoman_gateway.knowledge import _preservation_catalog, _source_bundles
+    from yeoman_gateway.knowledge._preservation_catalog import purge_collection
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    target = tmp_path / "collection"
+    copy_file = _source_bundles._copy_file
+
+    def interrupt_copy(path: Path, destination: Path) -> str:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_source_bundles, "_copy_file", interrupt_copy)
+    with pytest.raises(KeyboardInterrupt):
+        collect_sources(sources=[_source("A", source)], target_dir=target)
+    partial = next((target / ".staging").glob("*/sources/.A.partial"))
+    assert (partial / "source.bin").read_bytes() == b"partial"
+    monkeypatch.setattr(_source_bundles, "_copy_file", copy_file)
+
+    remove_tree = _preservation_catalog._remove_tree
+
+    def fail_partial(path: Path) -> None:
+        if path.name == ".A.partial":
+            raise OSError("synthetic staged cleanup interruption")
+        remove_tree(path)
+
+    monkeypatch.setattr(_preservation_catalog, "_remove_tree", fail_partial)
+    with pytest.raises(SnapshotError, match="incomplete"):
+        purge_collection(target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True)
+    assert (partial / "source.bin").read_bytes() == b"partial"
+    assert json.loads((target / "purge-audit.jsonl").read_text().splitlines()[0])["action"] == "purge_started"
+
+    monkeypatch.setattr(_preservation_catalog, "_remove_tree", remove_tree)
+    retried = purge_collection(
+        target_dir=target, source_id="A", operator=str(os.getuid()), confirmed=True
+    )
+    assert retried["purged"] is True
+    assert not partial.exists()
+
+
+def test_collection_and_purge_are_serialized_through_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import contextmanager
+
+    from yeoman_gateway.knowledge import _preservation_catalog, _source_bundles
+    from yeoman_gateway.knowledge._preservation_catalog import purge_collection
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    target = tmp_path / "collection"
+    copy_file = _source_bundles._copy_file
+    copying = threading.Event()
+    release = threading.Event()
+    purge_lock_attempted = threading.Event()
+    purge_done = threading.Event()
+    outcomes: dict[str, object] = {}
+
+    def pause_copy(path: Path, destination: Path) -> str:
+        copying.set()
+        if not release.wait(2):
+            raise TimeoutError("test did not release synthetic source copy")
+        return copy_file(path, destination)
+
+    monkeypatch.setattr(_source_bundles, "_copy_file", pause_copy)
+    collection_lock = _source_bundles._collection_lock
+
+    @contextmanager
+    def observe_purge_lock(root: Path):
+        purge_lock_attempted.set()
+        with collection_lock(root):
+            yield
+
+    monkeypatch.setattr(_preservation_catalog, "_collection_lock", observe_purge_lock)
+
+    def collect() -> None:
+        try:
+            outcomes["collect"] = collect_sources(
+                sources=[_source("A", source)], target_dir=target
+            )
+        except BaseException as exc:
+            outcomes["collect_error"] = exc
+
+    def purge() -> None:
+        try:
+            outcomes["purge"] = purge_collection(
+                target_dir=target,
+                source_id="A",
+                operator=str(os.getuid()),
+                confirmed=True,
+            )
+        except BaseException as exc:
+            outcomes["purge_error"] = exc
+        finally:
+            purge_done.set()
+
+    collector = threading.Thread(target=collect)
+    collector.start()
+    assert copying.wait(2)
+    purger = threading.Thread(target=purge, name="test-purger")
+    purger.start()
+    assert purge_lock_attempted.wait(2)
+    assert not purge_done.wait(0.05)
+    release.set()
+    collector.join(3)
+    purger.join(3)
+    assert not collector.is_alive() and not purger.is_alive()
+    assert "collect_error" not in outcomes
+    assert "purge_error" not in outcomes
+    assert outcomes["collect"]["complete"] is True
+    assert outcomes["purge"]["purged"] is True
+    assert list((target / "versions").glob("*/sources/A/source.bin")) == []
 
 
 def test_missing_and_unreadable_sources_are_recorded_incomplete(tmp_path: Path) -> None:

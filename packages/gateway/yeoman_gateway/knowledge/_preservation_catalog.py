@@ -6,7 +6,6 @@ import json
 import os
 import re
 import sqlite3
-import stat
 import time
 import uuid
 from datetime import UTC, datetime
@@ -16,16 +15,18 @@ from typing import Any
 from ._preservation_inventory import _normalized_instant
 from ._snapshot import SnapshotError
 from ._source_bundles import (
+    _collect_sources,
+    _collection_lock,
     _descriptor,
     _fingerprint,
     _plan,
     _private_mkdir,
     _read_json,
+    _reference_metadata,
     _reject_symlink_components,
     _remove_tree,
     _target_root,
     _write_json,
-    collect_sources,
 )
 
 _CATALOG_NAME = "catalog.sqlite3"
@@ -36,6 +37,14 @@ _METADATA_FIELDS = ("original_time", "creation_time", "chat", "record_type", "na
 
 def refresh_collection(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
     """Acquire only changed explicit sources and incrementally index their manifests."""
+    root = _target_root(Path(target_dir).expanduser())
+    _private_mkdir(root)
+    with _collection_lock(root):
+        return _refresh_collection(sources=sources, target_dir=root)
+
+
+def _refresh_collection(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
+    """Refresh while the caller holds the per-collection lock."""
     if not isinstance(sources, list) or not sources:
         raise SnapshotError("sources_invalid", "sources must be a non-empty JSON descriptor list")
     root = _target_root(Path(target_dir).expanduser())
@@ -78,7 +87,7 @@ def refresh_collection(*, sources: list[dict[str, Any]], target_dir: Path) -> di
             "source_count": len(source_ids),
         }
 
-    report = collect_sources(
+    report = _collect_sources(
         sources=[{key: value for key, value in source.items() if key != "owner_disposition"} for source in changed],
         target_dir=root,
         _allow_purged_source_ids=reacquire,
@@ -99,7 +108,21 @@ def refresh_collection(*, sources: list[dict[str, Any]], target_dir: Path) -> di
     previous_success = _successful_source_ids(
         root, exclude=manifest_path, tombstones=tombstones, purged_versions=purged_versions
     )
-    _index_manifest(root, manifest_path, previous_success, tombstones, purged_versions)
+    connection = _connect(root / _CATALOG_NAME)
+    try:
+        indexed = {
+            str(row[0])
+            for row in connection.execute("SELECT manifest_path FROM manifests").fetchall()
+        }
+    finally:
+        connection.close()
+    unindexed_prior = [
+        path for path in _manifest_paths(root) if path != manifest_path and str(path) not in indexed
+    ]
+    if unindexed_prior:
+        rebuild_catalog(target_dir=root)
+    else:
+        _index_manifest(root, manifest_path, previous_success, tombstones, purged_versions)
     latest = _latest_source_entries(root)
     return {
         "complete": all(_latest_complete(latest.get(source_id)) for source_id in source_ids),
@@ -214,6 +237,22 @@ def purge_collection(
     *, target_dir: Path, source_id: str, operator: str, confirmed: bool = False
 ) -> dict[str, Any]:
     """Preview or purge every immutable bundle containing one source id."""
+    root = _target_root(Path(target_dir).expanduser())
+    if not root.is_dir():
+        return _purge_collection(
+            target_dir=root, source_id=source_id, operator=operator, confirmed=confirmed
+        )
+    _check_private_root(root)
+    with _collection_lock(root):
+        return _purge_collection(
+            target_dir=root, source_id=source_id, operator=operator, confirmed=confirmed
+        )
+
+
+def _purge_collection(
+    *, target_dir: Path, source_id: str, operator: str, confirmed: bool = False
+) -> dict[str, Any]:
+    """Preview or purge while the caller holds the per-collection lock."""
     if not _ID.fullmatch(str(source_id)) or ".." in str(source_id):
         raise SnapshotError("source_id_invalid", "source id must be a safe single path component")
     if not hasattr(os, "getuid") or str(operator) != str(os.getuid()):
@@ -235,6 +274,18 @@ def purge_collection(
                 for entry in entries
                 if isinstance(entry.get("source_id"), str) and entry.get("source_id") != source_id
             )
+    for version_id, bundle in _staged_source_bundles(root, source_id).items():
+        affected[version_id] = bundle
+        manifest = bundle / "manifest.json"
+        if manifest.is_file():
+            payload = _read_json(manifest)
+            retained_ids.update(
+                str(entry["source_id"])
+                for entry in payload["sources"]
+                if isinstance(entry, dict)
+                and isinstance(entry.get("source_id"), str)
+                and entry.get("source_id") != source_id
+            )
     pending_for_source = {
         purge_id: item
         for purge_id, item in pending_purges.items()
@@ -243,7 +294,11 @@ def purge_collection(
     affected_versions = set(affected)
     for item in pending_for_source.values():
         affected_versions.update(item["versions"])
-    affected_paths = [root / "versions" / version for version in sorted(affected_versions)]
+    affected_paths = [
+        affected.get(version)
+        or _version_path(root, version)
+        for version in sorted(affected_versions)
+    ]
     preview = {
         "source_id": source_id,
         "affected_bundles": [str(path) for path in affected_paths],
@@ -415,7 +470,11 @@ def _entry_records(entry: dict[str, Any]) -> list[dict[str, Any]]:
     restricted = bool(entry.get("restricted")) or entry.get("source_class") in {
         "operational", "curated_state", "identity", "restricted", "unknown",
     }
-    if isinstance(record_metadata, dict) and entry.get("status") == "copied" and not restricted:
+    if (
+        isinstance(record_metadata, dict)
+        and entry.get("status") in {"copied", "reference_only"}
+        and not restricted
+    ):
         records = record_metadata.get("records", [])
         if isinstance(records, list):
             result.extend(
@@ -655,11 +714,8 @@ def _unchanged(descriptor: dict[str, Any], previous: dict[str, Any] | None, root
     if plan.get("reference_only"):
         if previous.get("status") != "reference_only":
             return False
-        info = descriptor["path"].stat()
-        return (
-            previous.get("source_mtime_ns") == info.st_mtime_ns
-            and previous.get("size_bytes") == (info.st_size if stat.S_ISREG(info.st_mode) else None)
-        )
+        _, file_stats = _reference_metadata(descriptor)
+        return previous.get("reference_file_stats") == file_stats
     if previous.get("status") != "copied" or "record_metadata" not in previous:
         return False
     if descriptor["kind"] == "live_sqlite":
@@ -804,8 +860,13 @@ def _append_audit(
 def _purge_source_version(root: Path, version: str, source_id: str) -> None:
     if not _ID.fullmatch(version) or ".." in version:
         raise SnapshotError("bundle_path_invalid", "refusing an invalid purged version id")
-    versions_root = (root / "versions").resolve()
-    bundle = root / "versions" / version
+    staging = version.startswith("staging-")
+    key = version.removeprefix("staging-") if staging else version
+    if staging and not re.fullmatch(r"[a-f0-9]{64}", key):
+        raise SnapshotError("bundle_path_invalid", "refusing an invalid staged bundle id")
+    bundle_root = root / (".staging" if staging else "versions")
+    versions_root = bundle_root.resolve()
+    bundle = bundle_root / key
     _reject_symlink_components(bundle.absolute())
     if bundle.is_symlink() or not bundle.resolve().is_relative_to(versions_root):
         raise SnapshotError("bundle_path_invalid", "refusing to purge a bundle outside versions")
@@ -827,11 +888,21 @@ def _purge_source_version(root: Path, version: str, source_id: str) -> None:
     source_dir = bundle / "sources" / source_id
     _reject_symlink_components(source_dir.absolute())
     _remove_tree(source_dir)
+    if staging:
+        partial_dir = bundle / "sources" / f".{source_id}.partial"
+        _reject_symlink_components(partial_dir.absolute())
+        _remove_tree(partial_dir)
     remaining = [
         entry
         for entry in entries
         if not isinstance(entry, dict) or entry.get("source_id") != source_id
     ]
+    if staging:
+        if len(remaining) != len(entries):
+            payload["sources"] = remaining
+            payload["complete"] = False
+            _write_json(manifest, payload)
+        return
     if not remaining:
         _remove_tree(bundle)
         return
@@ -843,6 +914,43 @@ def _purge_source_version(root: Path, version: str, source_id: str) -> None:
             for entry in remaining
         )
         _write_json(manifest, payload)
+
+
+def _staged_source_bundles(root: Path, source_id: str) -> dict[str, Path]:
+    staging_root = root / ".staging"
+    if not staging_root.exists():
+        return {}
+    _reject_symlink_components(staging_root.absolute())
+    if staging_root.is_symlink() or not staging_root.is_dir():
+        raise SnapshotError("bundle_path_invalid", "staging path is not a directory")
+    result: dict[str, Path] = {}
+    for bundle in sorted(staging_root.iterdir()):
+        _reject_symlink_components(bundle.absolute())
+        if bundle.is_symlink() or not bundle.is_dir():
+            raise SnapshotError("bundle_path_invalid", "staging contains a non-directory entry")
+        manifest = bundle / "manifest.json"
+        present = False
+        if manifest.exists():
+            payload = _read_json(manifest)
+            present = any(
+                isinstance(entry, dict) and entry.get("source_id") == source_id
+                for entry in payload["sources"]
+            )
+        sources = bundle / "sources"
+        if sources.exists():
+            _reject_symlink_components(sources.absolute())
+            present = present or (sources / source_id).exists() or (
+                sources / f".{source_id}.partial"
+            ).exists()
+        if present:
+            result[f"staging-{bundle.name}"] = bundle
+    return result
+
+
+def _version_path(root: Path, version: str) -> Path:
+    if version.startswith("staging-"):
+        return root / ".staging" / version.removeprefix("staging-")
+    return root / "versions" / version
 
 
 def _check_private_root(root: Path) -> None:
