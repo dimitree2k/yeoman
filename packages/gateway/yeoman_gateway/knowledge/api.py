@@ -46,6 +46,7 @@ from yeoman_gateway.knowledge.authority import (
     wall_clock_ms,
 )
 from yeoman_gateway.knowledge.models import (
+    DEFAULT_NAMESPACE,
     READ_PURPOSES,
     CaptureJobReceipt,
     CaptureJobRecord,
@@ -441,6 +442,139 @@ class KnowledgeService:
         checked = self._read_context(context)
         self._retrieval.require_read(checked)
         return self._identity.search_by_name(name, context=checked)
+
+    def resolve_mentions(
+        self,
+        identifiers: tuple[Identifier, ...],
+        *,
+        at_ms: int | None = None,
+        context: TrustedReadContext,
+    ) -> tuple[PersonResolution, ...]:
+        """Resolve typed mention identifiers only as candidates offered in this chat.
+
+        Missing time can establish only a current-binding candidate, never a historical
+        identity assertion. Current membership is rechecked by the retrieval authority;
+        this method does not establish a historical source audience.
+        """
+        if not isinstance(identifiers, tuple) or any(
+            not isinstance(item, Identifier) for item in identifiers
+        ):
+            raise ValidationError("mention identifiers must be a tuple of Identifier values")
+        if at_ms is not None and (
+            isinstance(at_ms, bool) or not isinstance(at_ms, int) or at_ms <= 0
+        ):
+            raise ValidationError("mention time must be a positive integer or None")
+
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        revision = self._store.identity_revision
+        if not decision.allowed:
+            return tuple(
+                PersonResolution(
+                    status="denied",
+                    person_id=None,
+                    display_name=None,
+                    identity_revision=revision,
+                    reason=decision.reason,
+                )
+                for _ in identifiers
+            )
+
+        offered_people = {
+            self._identity.canonical_id(person_id)
+            for principal in decision.recipients
+            if (person_id := self._identity.person_id_for_principal(principal)) is not None
+        }
+        results: list[PersonResolution] = []
+        for identifier in identifiers:
+            if identifier.channel != checked.channel:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="mention_channel_mismatch",
+                    )
+                )
+                continue
+            # Identifier remains defaultable for compatibility in older callers. Mentions
+            # require the actual channel account so an omitted namespace cannot look proven.
+            if identifier.namespace == DEFAULT_NAMESPACE:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="account_namespace_required",
+                    )
+                )
+                continue
+
+            endpoint = self._identity.resolve_identifier(identifier, at_ms=at_ms)
+            person_id = (
+                self._identity.canonical_id(endpoint.person_id)
+                if endpoint.person_id is not None
+                else None
+            )
+            if endpoint.status != "resolved" or person_id is None:
+                results.append(
+                    PersonResolution(
+                        status=endpoint.status,
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=endpoint.identity_revision,
+                        reason=endpoint.reason,
+                    )
+                )
+                continue
+            if person_id not in offered_people:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=endpoint.identity_revision,
+                        reason="mention_not_offered_member",
+                    )
+                )
+                continue
+            results.append(
+                PersonResolution(
+                    status="resolved" if at_ms is not None else "ambiguous",
+                    person_id=person_id,
+                    display_name=None,
+                    identity_revision=endpoint.identity_revision,
+                    reason=(
+                        "proven_identifier_current_member_candidate"
+                        if at_ms is not None
+                        else "mention_time_unknown"
+                    ),
+                )
+            )
+        return tuple(results)
+
+    def search_mention_name_candidates(
+        self, name_token: str, *, context: TrustedReadContext
+    ) -> tuple[PersonResolution, ...]:
+        """Match one explicitly supplied name token against offered members' scoped aliases."""
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return ()
+        offered_people = tuple(
+            dict.fromkeys(
+                self._identity.canonical_id(person_id)
+                for principal in decision.recipients
+                if (person_id := self._identity.person_id_for_principal(principal)) is not None
+            )
+        )
+        return self._identity.search_mention_name_candidates(
+            name_token,
+            person_ids=offered_people,
+            context=checked,
+        )
 
     def set_preferred_name(
         self,

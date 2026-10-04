@@ -22,31 +22,7 @@ from yeoman_gateway.knowledge.models import (
     TrustedReadContext,
     ValidationError,
 )
-
-
-def _as_principal_set(raw: Any) -> frozenset[str]:
-    """Normalize the proven participant list of a registry record."""
-    if raw is None:
-        return frozenset()
-    if isinstance(raw, Mapping):
-        raw = raw.get("participants") or raw.get("members") or []
-    members: set[str] = set()
-    for item in raw or ():
-        if isinstance(item, str):
-            members.add(item)
-            continue
-        for attribute in ("principal_id", "id", "jid", "lid", "user_id"):
-            value = getattr(item, attribute, None)
-            if value:
-                members.add(str(value))
-                break
-        else:
-            if isinstance(item, Mapping):
-                for attribute in ("principal_id", "id", "jid", "lid", "user_id"):
-                    if item.get(attribute):
-                        members.add(str(item[attribute]))
-                        break
-    return frozenset(member for member in members if member)
+from yeoman_gateway.policy.identity import registry_member_principals
 
 
 @dataclass
@@ -125,7 +101,7 @@ class RuntimeKnowledgePolicy:
             return None
         metadata = record.get("metadata")
         raw = metadata.get("participants") if isinstance(metadata, Mapping) else None
-        members = _as_principal_set(raw)
+        members = registry_member_principals(context.channel, raw)
         if not members and context.is_direct:
             return None
         if not members:

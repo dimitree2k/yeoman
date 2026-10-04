@@ -3204,6 +3204,15 @@ def build_gateway_runtime(
             return f"Eine Analyse zu {symbol} liegt bereits vor, aber kein eindeutiges Buy/Hold/Sell-Signal. Bitte frage im ursprünglichen Chat nach der Langfassung; ich starte hier keinen zweiten Auftrag."
         return None
 
+    mention_context_factory = None
+    if knowledge_service is not None:
+        from yeoman_gateway.pipeline.contacts import build_mention_read_context
+
+        def mention_context_factory(event):
+            return build_mention_read_context(
+                event, chat_registry=chat_registry, knowledge=knowledge_service
+            )
+
     orchestrator = Orchestrator(
         policy=policy_adapter,
         responder=thread_responder or responder,
@@ -3213,6 +3222,7 @@ def build_gateway_runtime(
         identity_observation_issuer=(
             knowledge_sources.observe if knowledge_sources is not None else None
         ),
+        mention_context_factory=mention_context_factory,
         reply_context_window_limit=config.channels.whatsapp.reply_context_window_limit,
         reply_context_line_max_chars=config.channels.whatsapp.reply_context_line_max_chars,
         ambient_window_limit=config.channels.whatsapp.ambient_window_limit,

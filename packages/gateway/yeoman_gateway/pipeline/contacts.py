@@ -27,8 +27,9 @@ from loguru import logger
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
 
 if TYPE_CHECKING:
+    from yeoman_gateway.core.models import InboundEvent
     from yeoman_gateway.knowledge.api import KnowledgeService
-    from yeoman_gateway.knowledge.models import TrustedIdentityObservation
+    from yeoman_gateway.knowledge.models import TrustedIdentityObservation, TrustedReadContext
 
 # Channels that should trigger contact resolution.
 _IDENTITY_CHANNELS = frozenset({"whatsapp", "telegram"})
@@ -58,6 +59,59 @@ def _push_name(channel: str, raw: dict[str, Any]) -> str | None:
     return None
 
 
+def build_mention_read_context(
+    event: "InboundEvent", *, chat_registry: Any, knowledge: "KnowledgeService"
+) -> "TrustedReadContext | None":
+    """Build a current read context from bridge identity and the live chat registry."""
+    if event.channel != "whatsapp":
+        return None
+    raw = event.raw_metadata
+    account_id = str(raw.get("account_id") or "").strip()
+    if not account_id or account_id == "default":
+        return None
+
+    from yeoman_gateway.knowledge._memory.read_gate import registry_members
+    from yeoman_gateway.knowledge.authority import wall_clock_ms
+    from yeoman_gateway.knowledge.models import TrustedReadContext
+    from yeoman_gateway.policy.identity import canonical_user_id
+
+    metadata = {str(key): value for key, value in raw.items()}
+    principal = canonical_user_id(event.channel, event.sender_id, metadata)
+    members = registry_members(
+        chat_registry, channel=event.channel, chat_id=str(event.chat_id)
+    )
+    if not principal or principal not in members:
+        return None
+    revision = getattr(knowledge, "policy_revision", None)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        return None
+    try:
+        record = chat_registry.get_chat(event.channel, str(event.chat_id))
+    except Exception:
+        return None
+    membership_revision = None
+    if isinstance(record, dict):
+        membership_revision = str(
+            record.get("last_sync_at")
+            or record.get("last_seen_at")
+            or f"{event.channel}:{event.chat_id}:{len(members)}"
+        )
+    if not membership_revision:
+        return None
+    return TrustedReadContext(
+        principal_id=principal,
+        channel=event.channel,
+        chat_id=str(event.chat_id),
+        recipient_principals=frozenset(members),
+        membership_revision=membership_revision,
+        policy_revision=revision,
+        purpose="reply",
+        now_ms=wall_clock_ms(),
+        is_direct=not event.is_group,
+        owner=False,
+    )
+
+
 class ContactsMiddleware:
     """Resolve the sender identity through the public knowledge facade."""
 
@@ -66,12 +120,14 @@ class ContactsMiddleware:
         *,
         knowledge: "KnowledgeService | None" = None,
         observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
+        mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
     ) -> None:
         self._knowledge = knowledge
         # The source authority only verifies an observation that was issued to it.  The
         # composition root hands its issuer in, because this middleware is where the
         # channel's proven metadata becomes an observation.
         self._observation_issuer = observation_issuer
+        self._mention_context_factory = mention_context_factory
 
     async def __call__(self, ctx: PipelineContext, next: NextFn) -> None:
         event = ctx.event
@@ -81,6 +137,48 @@ class ContactsMiddleware:
             return
 
         raw = event.raw_metadata
+        new_meta = dict(raw)
+        try:
+            context = (
+                self._mention_context_factory(event)
+                if self._mention_context_factory is not None
+                else None
+            )
+            identifiers = self._mentioned_identifiers(event.channel, raw)
+            if context is not None and identifiers:
+                resolutions = self._knowledge.resolve_mentions(
+                    identifiers, at_ms=None, context=context
+                )
+                candidates = self._candidate_metadata(
+                    resolutions, source="native_identifier"
+                )
+            else:
+                candidates = []
+
+            raw_name_tokens = raw.get("mentioned_name_tokens")
+            if context is not None and isinstance(raw_name_tokens, (list, tuple)):
+                for token in raw_name_tokens:
+                    if not isinstance(token, str) or not token.strip():
+                        continue
+                    candidates.extend(
+                        self._candidate_metadata(
+                            self._knowledge.search_mention_name_candidates(
+                                token, context=context
+                            ),
+                            source="explicit_name_token",
+                        )
+                    )
+            if candidates:
+                new_meta["mentioned_person_candidates"] = candidates
+        except Exception as exc:
+            logger.warning(
+                "mention_identity_resolution_failed error_type={}", type(exc).__name__
+            )
+
+        if new_meta != raw:
+            event = replace(event, raw_metadata=new_meta)
+            ctx.event = event
+
         observation = self._observation(event.channel, event.participant, event.sender_id, raw)
         if observation is None:
             await next(ctx)
@@ -108,13 +206,64 @@ class ContactsMiddleware:
             await next(ctx)
             return
 
-        new_meta = dict(raw)
         new_meta["contact_id"] = resolution.person_id
         new_meta["identity_status"] = resolution.status
         new_meta["identity_reason"] = resolution.reason
         ctx.event = replace(event, raw_metadata=new_meta)
 
         await next(ctx)
+
+    @staticmethod
+    def _mentioned_identifiers(channel: str, raw: dict[str, Any]):
+        from yeoman_gateway.knowledge.models import DEFAULT_NAMESPACE, Identifier
+
+        account_id = str(raw.get("account_id") or "").strip()
+        raw_mentions = raw.get("mentioned_jids")
+        if (
+            channel != "whatsapp"
+            or not account_id
+            or account_id == DEFAULT_NAMESPACE
+            or not isinstance(raw_mentions, (list, tuple))
+        ):
+            return ()
+        identifiers: list[Identifier] = []
+        for raw_value in raw_mentions:
+            if not isinstance(raw_value, str):
+                continue
+            value = raw_value.strip()
+            kind = (
+                "lid"
+                if value.endswith("@lid")
+                else "phone_jid"
+                if _is_phone_jid(value)
+                else ""
+            )
+            if not kind:
+                continue
+            try:
+                identifier = Identifier(
+                    channel=channel, kind=kind, value=value, namespace=account_id
+                )
+            except Exception:
+                continue
+            if identifier not in identifiers:
+                identifiers.append(identifier)
+        return tuple(identifiers)
+
+    @staticmethod
+    def _candidate_metadata(resolutions: tuple[Any, ...], *, source: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "person_id": result.person_id,
+                "status": result.status,
+                "reason": result.reason,
+                "identity_revision": result.identity_revision,
+                "source": source,
+            }
+            for result in resolutions
+            if result.person_id is not None
+            and result.status in {"resolved", "ambiguous"}
+        ]
 
     def _observation(
         self, channel: str, participant: str | None, sender_id: str, raw: dict[str, Any]

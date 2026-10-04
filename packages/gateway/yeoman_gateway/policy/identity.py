@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,3 +126,87 @@ def canonical_user_id(
         return ""
     token = raw.split("@", 1)[0].split(":", 1)[0].lstrip("+")
     return f"whatsapp:{token}" if token.isdigit() else ""
+
+
+def registry_member_principals(channel: str, raw_members: Any) -> frozenset[str]:
+    """Project a registry roster without guessing from untyped identifiers.
+
+    WhatsApp bridge participants can carry a LID in ``id`` plus a typed phone proof
+    in ``phoneNumber`` or ``phoneJid``. Only those dedicated phone fields may produce
+    a qualified phone principal. Missing or conflicting proof keeps the native member
+    identifier; an unidentifiable record makes the whole roster unknown.
+    """
+    if raw_members is None:
+        return frozenset()
+    if isinstance(raw_members, Mapping):
+        raw_members = raw_members.get("participants") or raw_members.get("members") or []
+    if isinstance(raw_members, str):
+        raw_members = (raw_members,)
+
+    members: set[str] = set()
+    for item in raw_members or ():
+        projected = _registry_member_values(channel, item)
+        if not projected:
+            # A partial roster is not proof of a complete audience.
+            return frozenset()
+        members.update(projected)
+    return frozenset(member for member in members if member)
+
+
+def _registry_member_values(channel: str, item: Any) -> tuple[str, ...]:
+    if isinstance(item, str):
+        return (item.strip(),) if item.strip() else ()
+
+    if isinstance(item, Mapping):
+        explicit_principal = str(item.get("principal_id") or "").strip()
+        if explicit_principal:
+            return (explicit_principal,)
+
+        native_id = next(
+            (
+                str(item.get(attribute) or "").strip()
+                for attribute in ("id", "jid", "lid", "user_id")
+                if str(item.get(attribute) or "").strip()
+            ),
+            "",
+        )
+        qualified_id = next(
+            (
+                str(item.get(attribute) or "").strip()
+                for attribute in ("id", "jid", "lid", "user_id")
+                if str(item.get(attribute) or "").strip().startswith(f"{channel}:")
+            ),
+            "",
+        )
+        if qualified_id:
+            return (qualified_id,)
+
+        phone_fields = (
+            str(item.get(attribute) or "").strip()
+            for attribute in ("phoneNumber", "phoneJid", "phone_jid")
+            if str(item.get(attribute) or "").strip()
+        )
+        phone_values = tuple(phone_fields)
+        if channel == "whatsapp" and phone_values:
+            principals = tuple(_native_phone_principal(value) for value in phone_values)
+            if all(principals) and len(set(principals)) == 1:
+                typed_native_id = _native_phone_principal(native_id)
+                if typed_native_id and typed_native_id != principals[0]:
+                    return (native_id,) if native_id else phone_values
+                return (principals[0],)
+            # Conflicting or malformed phone proofs cannot rewrite the native ID.
+            return (native_id,) if native_id else phone_values
+        return (native_id,) if native_id else ()
+
+    for attribute in ("principal_id", "id", "jid", "lid", "user_id"):
+        value = str(getattr(item, attribute, "") or "").strip()
+        if value:
+            return (value,)
+    return ()
+
+
+def _native_phone_principal(value: str) -> str | None:
+    token = str(value or "").strip()
+    if not token.endswith(("@s.whatsapp.net", "@c.us")):
+        return None
+    return canonical_user_id("whatsapp", metadata={"sender_phone_jid": token}) or None
