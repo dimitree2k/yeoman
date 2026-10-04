@@ -71,6 +71,47 @@ function eventWithTextThatFitsSerializedLimit(textBytes: number): Record<string,
   return event;
 }
 
+test('membership copies and snapshots are durable replayable and independently ACKable', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-membership-outbox-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const server = makeServer(root);
+  for (const sourceCopyId of ['stub:message-1', 'update:copy-1']) {
+    await (server as any).broadcastReplayable(createEventEnvelope({
+      type: 'membership_change' as any,
+      payload: { chatJid: 'members@g.us', changeId: 'logical-1', sourceCopyId,
+        action: 'add', participants: [{ lid: '123@lid' }], providerTimestampMs: null },
+    }));
+  }
+  await (server as any).broadcastReplayable(createEventEnvelope({
+    type: 'membership_snapshot' as any,
+    payload: { chatJid: 'members@g.us', snapshotAtMs: 1700000000000,
+      participants: [], complete: true, memberCount: 0 },
+  }));
+  const restarted = makeServer(root);
+  const subscriber = fakeClient();
+  const meta = clientMeta(subscriber.ws);
+  (restarted as any).clients.add(meta);
+  const command = (type: string, payload: Record<string, unknown>) =>
+    (restarted as any).handleClientMessage(meta, JSON.stringify({
+      version: PROTOCOL_VERSION, type, token: 'secret', payload,
+    }));
+  await command('subscribe_events', {});
+  const copies = subscriber.messages.filter((event: any) => event.type === 'membership_change') as any[];
+  assert.equal(copies.length, 2);
+  assert.equal(copies[0].eventKey, copies[1].eventKey);
+  assert.notEqual(copies[0].eventId, copies[1].eventId);
+  assert.equal((await (restarted as any).outbox.pending()).length, 3);
+  await command('ack_event', { eventId: copies[0].eventId });
+  const remaining = await (restarted as any).outbox.pending();
+  assert.equal(remaining.length, 2);
+  assert.equal(remaining[0].eventId, copies[1].eventId);
+  await command('ack_event', { eventId: copies[1].eventId });
+  const snapshot = subscriber.messages.find((event: any) => event.type === 'membership_snapshot') as any;
+  assert.ok(snapshot);
+  await command('ack_event', { eventId: snapshot.eventId });
+  assert.equal((await (restarted as any).outbox.pending()).length, 0);
+});
+
 test('BridgeServer dispatches delete_message to the WhatsApp client', async () => {
   const server = new BridgeServer(
     '127.0.0.1',

@@ -38,6 +38,33 @@ async function temporaryOutbox(): Promise<{ root: string; outbox: any }> {
   return { root, outbox };
 }
 
+test('membership changes and snapshots survive restart and separate copy ACKs', async (t) => {
+  const { root, outbox } = await temporaryOutbox();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const copies = [];
+  for (const sourceCopyId of ['stub:message-1', 'update:copy-1']) {
+    copies.push(await outbox.append(event({ type: 'membership_change', payload: {
+      chatJid: 'members@g.us', changeId: 'logical-1', sourceCopyId,
+      action: 'add', participants: [{ lid: '123@lid' }], providerTimestampMs: null,
+    } })));
+  }
+  const snapshot = await outbox.append(event({ type: 'membership_snapshot', payload: {
+    chatJid: 'members@g.us', snapshotAtMs: 1700000000000,
+    participants: [], complete: true, memberCount: 0,
+  } }));
+  assert.equal(copies[0].eventKey, copies[1].eventKey);
+  assert.notEqual(copies[0].eventId, copies[1].eventId);
+  const { BridgeOutbox } = await loadOutbox();
+  const restarted = new BridgeOutbox(root);
+  await restarted.open();
+  assert.equal((await restarted.pending()).length, 3);
+  await restarted.ack(copies[0].eventId);
+  assert.deepEqual(await restarted.pending(), [copies[1], snapshot]);
+  await restarted.ack(copies[1].eventId);
+  await restarted.ack(snapshot.eventId);
+  assert.deepEqual(await restarted.pending(), []);
+});
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await lstat(path);

@@ -14,7 +14,7 @@ import {
 } from './whatsapp.js';
 import { BridgeServer } from './server.js';
 import { BridgeOutbox } from './outbox.js';
-import { createEventEnvelope, deriveEditSignalIdentity } from './protocol.js';
+import { MAX_BRIDGE_FRAME_BYTES, createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity } from './protocol.js';
 import { proto } from '@whiskeysockets/baileys/WAProto/index.js';
 
 function inboundMessage(messageId: string): Record<string, unknown> {
@@ -46,6 +46,266 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
+
+function membershipStub(id: string, stubType: number, participants: unknown = ['123@lid']) {
+  return {
+    key: { remoteJid: 'members@g.us', id, participant: '456@lid' },
+    messageStubType: stubType,
+    messageStubParameters: participants,
+    messageTimestamp: 1_700_000_000,
+  };
+}
+
+async function membershipClient(t: any) {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-membership-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const signals: Array<{ kind: string; payload: any }> = [];
+  const messages: unknown[] = [];
+  const client = new WhatsAppClient({
+    authDir: root,
+    messageReferenceDir: join(root, 'references'),
+    readReceipts: false,
+    acceptFromMe: false,
+    onMessage: (message) => { messages.push(message); },
+    onSignal: (kind, payload) => { signals.push({ kind, payload }); },
+    onQR: () => {}, onStatus: () => {}, onError: () => {},
+  });
+  await (client as any).referenceStore.open();
+  (client as any).acceptingProviderEvents = true;
+  return { client: client as any, signals, messages };
+}
+
+test('test_group_membership_stub_emits_without_message_content', async (t) => {
+  const { client, signals, messages } = await membershipClient(t);
+  const stubs = [
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD, 'add'],
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_INVITE, 'add'],
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_REMOVE, 'remove'],
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_LEAVE, 'remove'],
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_PROMOTE, 'promote'],
+    [proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_DEMOTE, 'demote'],
+  ] as const;
+  for (const [stub, action] of stubs) {
+    await client.handleInboundMessage(membershipStub(`stub-${stub}`, stub, [JSON.stringify({ id: '123@lid' })]));
+    const emitted = signals.at(-1);
+    assert.equal(emitted?.kind, 'membership_change');
+    assert.equal(emitted?.payload.stubType, stub);
+    assert.equal(emitted?.payload.action, action);
+    assert.equal(emitted?.payload.messageId, `stub-${stub}`);
+    assert.equal(emitted?.payload.providerTimestampMs, 1_700_000_000_000);
+    assert.deepEqual(emitted?.payload.participants, [{ lid: '123@lid' }]);
+    assert.deepEqual(emitted?.payload.actor, { lid: '456@lid' });
+    assert.match(emitted?.payload.sourceCopyId, /^stub:/);
+    assert.equal('message' in emitted?.payload, false);
+    assert.equal('text' in emitted?.payload, false);
+  }
+  assert.equal(signals.length, 6);
+  assert.equal(messages.length, 0);
+  await client.handleInboundMessage(membershipStub('unknown', 99999));
+  assert.equal(signals.length, 6);
+});
+
+test('test_group_participants_update_emits_actor_and_participants', async (t) => {
+  const { client, signals, messages } = await membershipClient(t);
+  const handlers = new Map<string, (update: any) => unknown>();
+  client.sock = { ev: { on: (name: string, handler: (update: any) => unknown) => handlers.set(name, handler) } };
+  client.registerInboundMessageHandler();
+  const handler = handlers.get('group-participants.update');
+  assert.ok(handler);
+  await handler({
+    id: 'members@g.us', action: 'modify', author: '456@lid', authorPn: '491456@s.whatsapp.net',
+    participants: [{ id: '123@lid', phoneNumber: '491123@s.whatsapp.net', admin: 'admin', unused: 'omit' }],
+  });
+  await client.drainProviderEvents();
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].kind, 'membership_change');
+  assert.equal(signals[0].payload.action, 'modify');
+  assert.equal(signals[0].payload.providerTimestampMs, null);
+  assert.deepEqual(signals[0].payload.actor, { lid: '456@lid', phoneJid: '491456@s.whatsapp.net' });
+  assert.deepEqual(signals[0].payload.participants, [{ lid: '123@lid', phoneJid: '491123@s.whatsapp.net' }]);
+  assert.equal('admin' in signals[0].payload.participants[0], false);
+  assert.equal(messages.length, 0);
+  await handler({ id: 'members@g.us', action: 'unknown', participants: ['123@lid'] });
+  await handler({ id: 'members@g.us', action: 'add', participants: 'malformed' });
+  await client.drainProviderEvents();
+  assert.equal(signals.length, 1);
+});
+
+test('membership stubs retain unknown native identifiers and timestamps', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  await client.handleInboundMessage({
+    key: { remoteJid: 'members@g.us' },
+    messageStubType: proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD,
+    messageStubParameters: ['123@lid'],
+  });
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].payload.providerTimestampMs, null);
+  assert.equal('messageId' in signals[0].payload, false);
+  assert.equal('actor' in signals[0].payload, false);
+  assert.equal(signals[0].payload.stubType, proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD);
+  assert.ok(signals[0].payload.changeId);
+  await client.handleInboundMessage(membershipStub('bad-json',
+    proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD, ['{bad-json']));
+  assert.equal(signals.length, 1);
+});
+
+test('membership changes include known phone mappings without inventing conflicting pairs', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  client.lidToPhone.set('123', '491123@s.whatsapp.net');
+  client.lidToPhone.set('456', '491456@s.whatsapp.net');
+  await client.handleInboundMessage(membershipStub('mapped', proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD));
+  assert.deepEqual(signals[0].payload.participants, [{ lid: '123@lid', phoneJid: '491123@s.whatsapp.net' }]);
+  assert.deepEqual(signals[0].payload.actor, { lid: '456@lid', phoneJid: '491456@s.whatsapp.net' });
+  client.lidConflicts.add('123');
+  await client.handleInboundMessage(membershipStub('conflicted', proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD));
+  assert.deepEqual(signals[1].payload.participants, [{ lid: '123@lid' }]);
+});
+
+test('test_stub_and_participant_update_share_change_key_in_both_orders', async (t) => {
+  for (const stubFirst of [true, false]) {
+    const { client, signals } = await membershipClient(t);
+    const handlers = new Map<string, (update: any) => unknown>();
+    client.sock = { ev: { on: (name: string, handler: (update: any) => unknown) => handlers.set(name, handler) } };
+    client.registerInboundMessageHandler();
+    const handler = handlers.get('group-participants.update');
+    assert.ok(handler);
+    const stub = async (id: string) => client.handleInboundMessage(
+      membershipStub(id, proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD),
+    );
+    const update = async () => {
+      await handler({ id: 'members@g.us', action: 'add', author: '456@lid',
+        participants: [{ id: '123@lid', phoneNumber: '491123@s.whatsapp.net' }] });
+      await client.drainProviderEvents();
+    };
+    // Two equal signatures must pair FIFO, rather than collapsing real changes.
+    if (stubFirst) { await stub('first'); await stub('second'); await update(); await update(); }
+    else { await update(); await update(); await stub('first'); await stub('second'); }
+    assert.equal(signals.length, 4);
+    assert.equal(signals[0].payload.changeId, signals[2].payload.changeId);
+    assert.equal(signals[1].payload.changeId, signals[3].payload.changeId);
+    assert.notEqual(signals[0].payload.changeId, signals[1].payload.changeId);
+    assert.equal(new Set(signals.map(({ payload }) => payload.sourceCopyId)).size, 4);
+    await stub('first');
+    assert.equal(signals.length, 4);
+  }
+});
+
+test('test_from_me_membership_stub_is_captured_and_correlated_with_from_me_disabled', async (t) => {
+  const { client, signals, messages } = await membershipClient(t);
+  const handlers = new Map<string, (update: any) => unknown>();
+  client.sock = { ev: { on: (name: string, handler: (update: any) => unknown) => handlers.set(name, handler) } };
+  client.registerInboundMessageHandler();
+  const handler = handlers.get('group-participants.update');
+  assert.ok(handler);
+  const native = {
+    ...membershipStub('self-member-1', proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD,
+      [JSON.stringify({ id: '123@lid', phoneNumber: '491123@s.whatsapp.net' })]),
+    key: { remoteJid: 'members@g.us', id: 'self-member-1', participant: '456@lid', fromMe: true },
+    message: { conversation: 'self stub text must not invoke the ordinary callback' },
+  };
+  await client.handleInboundMessage(native);
+  await handler({ id: 'members@g.us', action: 'add', author: '456@lid',
+    participants: [{ id: '123@lid', phoneNumber: '491123@s.whatsapp.net' }] });
+  await client.drainProviderEvents();
+  assert.equal(signals.length, 2);
+  const [stub, update] = signals;
+  assert.equal(stub.kind, 'membership_change');
+  assert.equal(update.kind, 'membership_change');
+  assert.equal(stub.payload.changeId, update.payload.changeId);
+  assert.notEqual(stub.payload.sourceCopyId, update.payload.sourceCopyId);
+  const stubIdentity = deriveProviderEventIdentity('membership_change', 'default', stub.payload);
+  const updateIdentity = deriveProviderEventIdentity('membership_change', 'default', update.payload);
+  assert.ok(stubIdentity);
+  assert.ok(updateIdentity);
+  assert.equal(stubIdentity.eventKey, updateIdentity.eventKey);
+  assert.notEqual(stubIdentity.eventId, updateIdentity.eventId);
+  assert.equal(stub.payload.messageId, 'self-member-1');
+  assert.equal(stub.payload.stubType, proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD);
+  assert.equal(stub.payload.providerTimestampMs, 1_700_000_000_000);
+  assert.deepEqual(stub.payload.actor, { lid: '456@lid' });
+  assert.deepEqual(stub.payload.participants, [{ lid: '123@lid', phoneJid: '491123@s.whatsapp.net' }]);
+  const retained = await client.referenceStore.get('members@g.us', 'self-member-1') as any;
+  assert.ok(retained);
+  assert.equal(retained.key.fromMe, true);
+  assert.equal(retained.key.id, 'self-member-1');
+  assert.equal(retained.messageStubType, native.messageStubType);
+  assert.deepEqual(retained.messageStubParameters, native.messageStubParameters);
+  assert.equal(Number(retained.messageTimestamp), 1_700_000_000);
+  assert.equal(messages.length, 0);
+  await client.handleInboundMessage({
+    key: { remoteJid: 'members@g.us', id: 'self-text-1', participant: '456@lid', fromMe: true },
+    message: { conversation: 'ordinary self text remains filtered' },
+    messageTimestamp: 1_700_000_001,
+  });
+  assert.equal(signals.length, 2);
+  assert.equal(messages.length, 0);
+  assert.equal(await client.referenceStore.has('members@g.us', 'self-text-1'), false);
+});
+
+test('test_connect_emits_one_bounded_snapshot_per_group', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  client.connected = true;
+  let fetches = 0;
+  client.sock = { groupFetchAllParticipating: async () => {
+    fetches += 1;
+    return {
+      'members@g.us': { subject: 'omit', participants: [
+        { id: '123@lid', phoneNumber: '491123@s.whatsapp.net', admin: 'admin', name: 'omit' },
+      ] },
+      'empty@g.us': { participants: [] },
+      'unknown@g.us': {},
+      'huge@g.us': { participants: Array.from({ length: 6000 }, (_, index) => ({
+        id: `${index + 100000}@lid`, phoneNumber: `${index + 490000}@s.whatsapp.net`, admin: 'admin',
+      })) },
+    };
+  } };
+  await client.refreshLidCache();
+  assert.equal(fetches, 1);
+  assert.equal(signals.length, 4);
+  for (const { kind, payload } of signals) {
+    assert.equal(kind, 'membership_snapshot');
+    assert.deepEqual(Object.keys(payload).sort(), ['chatJid', 'complete', 'memberCount', 'participants', 'snapshotAtMs']);
+    assert.ok(Buffer.byteLength(JSON.stringify(createEventEnvelope({ type: kind as any, payload }))) <= MAX_BRIDGE_FRAME_BYTES);
+  }
+  assert.deepEqual(signals[0].payload.participants, [{ lid: '123@lid', phoneJid: '491123@s.whatsapp.net', admin: true }]);
+  assert.equal(signals[0].payload.complete, true);
+  assert.equal(signals[1].payload.complete, true);
+  assert.deepEqual(signals[1].payload.participants, []);
+  assert.equal(signals[2].payload.complete, false);
+  assert.equal(signals[3].payload.complete, false);
+  assert.equal(signals[3].payload.memberCount, 6000);
+  assert.deepEqual(signals[3].payload.participants, []);
+  const firstAt = signals[0].payload.snapshotAtMs;
+  await client.refreshLidCache();
+  assert.notEqual(signals[4].payload.snapshotAtMs, firstAt);
+});
+
+test('membership correlation expires after 30 seconds and retains at most 256 pending copies', async (t) => {
+  const { client, signals } = await membershipClient(t);
+  const handlers = new Map<string, (update: any) => unknown>();
+  client.sock = { ev: { on: (name: string, handler: (update: any) => unknown) => handlers.set(name, handler) } };
+  client.registerInboundMessageHandler();
+  const handler = handlers.get('group-participants.update');
+  assert.ok(handler);
+  const originalNow = Date.now;
+  let current = originalNow();
+  t.mock.method(Date, 'now', () => current);
+  await client.handleInboundMessage(membershipStub('expired', proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD));
+  current += 30_001;
+  await handler({ id: 'members@g.us', action: 'add', participants: [{ id: '123@lid' }] });
+  await client.drainProviderEvents();
+  assert.notEqual(signals[0].payload.changeId, signals[1].payload.changeId);
+  for (let index = 0; index < 257; index++) {
+    await client.handleInboundMessage(membershipStub(`bounded-${index}`,
+      proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD, [`${index + 1000}@lid`]));
+  }
+  await handler({ id: 'members@g.us', action: 'add', participants: [{ id: '1000@lid' }] });
+  await client.drainProviderEvents();
+  assert.notEqual(signals[2].payload.changeId, signals.at(-1)?.payload.changeId);
+  await handler({ id: 'members@g.us', action: 'add', participants: [{ id: '1256@lid' }] });
+  await client.drainProviderEvents();
+  assert.equal(signals[258].payload.changeId, signals.at(-1)?.payload.changeId);
+});
 
 test('resolveParticipantJid ignores quoted participant metadata in direct chat', () => {
   const msg = {

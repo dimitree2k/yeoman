@@ -17,15 +17,12 @@ import { join } from 'node:path';
 import {
   MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
+  REPLAYABLE_EVENT_TYPES,
   deriveProviderEventIdentity,
   type BridgeEventEnvelope,
-  type BridgeEventType,
 } from './protocol.js';
 
-export type ReplayableEventType = Extract<
-  BridgeEventType,
-  'message' | 'edit' | 'delete' | 'reaction' | 'receipt'
->;
+export type ReplayableEventType = (typeof REPLAYABLE_EVENT_TYPES)[number];
 
 export type ReplayableBridgeEvent = BridgeEventEnvelope & {
   type: ReplayableEventType;
@@ -82,7 +79,7 @@ export function defaultBridgeOutboxDir(): string {
 }
 
 export function isReplayableEventType(type: string): type is ReplayableEventType {
-  return type === 'message' || type === 'edit' || type === 'delete' || type === 'reaction' || type === 'receipt';
+  return (REPLAYABLE_EVENT_TYPES as readonly string[]).includes(type);
 }
 
 function diagnosticIdentity(value: string): string {

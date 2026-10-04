@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { promises as fs } from 'fs';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'path';
 
@@ -8,13 +8,14 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  WAMessageStubType,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
-import { deriveEditSignalIdentity } from './protocol.js';
+import { createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES } from './protocol.js';
 import {
   defaultMessageReferenceDir,
   MessageReferenceStore,
@@ -36,6 +37,18 @@ const MAX_RECONNECT_ATTEMPTS = 30;
 const MENTION_TOKEN_PATTERN = /@([0-9]{5,})/g;
 export const FALLBACK_WHATSAPP_WEB_VERSION: [number, number, number] = [2, 3000, 1033893291];
 const WHATSAPP_BROWSER: [string, string, string] = ['Yeoman', 'Chrome', '145.0.0'];
+const MEMBERSHIP_CORRELATION_TTL_MS = 30_000;
+const MEMBERSHIP_CORRELATION_MAX = 256;
+const MEMBERSHIP_STUB_ACTIONS = new Map<number, string>([
+  [WAMessageStubType.GROUP_PARTICIPANT_ADD, 'add'],
+  [WAMessageStubType.GROUP_PARTICIPANT_INVITE, 'add'],
+  [WAMessageStubType.GROUP_PARTICIPANT_REMOVE, 'remove'],
+  [WAMessageStubType.GROUP_PARTICIPANT_LEAVE, 'remove'],
+  [WAMessageStubType.GROUP_PARTICIPANT_PROMOTE, 'promote'],
+  [WAMessageStubType.GROUP_PARTICIPANT_DEMOTE, 'demote'],
+  [WAMessageStubType.GROUP_PARTICIPANT_CHANGE_NUMBER, 'modify'],
+]);
+type MembershipParticipant = { lid?: string; phoneJid?: string };
 
 export interface InboundMedia {
   kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
@@ -162,9 +175,9 @@ export interface WhatsAppClientOptions {
   readReceipts?: boolean;
   accountId?: string;
   onMessage: (msg: InboundMessageV2) => void | Promise<void>;
-  /** Journal evidence from the provider: edit, delete, reaction or receipt. */
+  /** Journal evidence from the provider, including membership changes and rosters. */
   onSignal?: (
-    kind: 'edit' | 'delete' | 'reaction' | 'receipt',
+    kind: 'edit' | 'delete' | 'reaction' | 'receipt' | 'membership_change' | 'membership_snapshot',
     payload: Record<string, unknown>,
   ) => void | Promise<void>;
   onQR: (qr: string) => void;
@@ -192,6 +205,32 @@ function normalizeJid(jidRaw: string): string {
   const [leftRaw, right = ''] = trimmed.split('@', 2);
   const left = (leftRaw || '').split(':', 1)[0] || '';
   return right ? `${left}@${right}` : left;
+}
+
+/** Stub parameters are JSON-encoded GroupParticipants in the pinned Baileys version. */
+function membershipParticipant(value: unknown, alternate?: unknown): MembershipParticipant {
+  let decoded: any = value;
+  if (typeof value === 'string' && value.startsWith('{')) {
+    try { decoded = JSON.parse(value); } catch { return {}; }
+  }
+  const result: MembershipParticipant = {};
+  for (const candidate of [
+    typeof decoded === 'string' ? decoded : decoded?.id,
+    decoded?.lid, decoded?.phoneNumber, alternate,
+  ]) {
+    if (typeof candidate !== 'string' || candidate.length > 128) continue;
+    const jid = normalizeJid(candidate);
+    if (/^[0-9]+@lid$/.test(jid)) result.lid = jid;
+    else if (/^[0-9]+@s\.whatsapp\.net$/.test(jid)) result.phoneJid = jid;
+  }
+  return result;
+}
+
+function membershipParticipants(values: unknown): MembershipParticipant[] | undefined {
+  if (!Array.isArray(values) || values.length === 0) return undefined;
+  const participants = values.map((value) => membershipParticipant(value));
+  // A malformed member must never turn into a partially described change.
+  return participants.every((participant) => participant.lid || participant.phoneJid) ? participants : undefined;
 }
 
 function jidUserToken(jidRaw: string): string {
@@ -584,6 +623,10 @@ export class WhatsAppClient {
   /** Maps LID user tokens to phone-number JIDs (e.g. "169303366209721" → "491757070305@s.whatsapp.net"). */
   private readonly lidToPhone = new Map<string, string>();
   private readonly lidConflicts = new Set<string>();
+  private pendingMembershipCopies: Array<{
+    signature: string; source: 'stub' | 'update'; changeId: string; expiresAt: number;
+  }> = [];
+  private lastSnapshotAtMs = 0;
 
   private qrWaiters = new Set<(value: string) => void>();
   private connectWaiters = new Set<(value: boolean) => void>();
@@ -1029,7 +1072,6 @@ export class WhatsAppClient {
     try {
       const all = await this.sock.groupFetchAllParticipating();
       let added = 0;
-      let sampleLogged = false;
       for (const meta of Object.values(all || {})) {
         const participants = (meta as any)?.participants;
         if (!Array.isArray(participants)) continue;
@@ -1052,11 +1094,92 @@ export class WhatsAppClient {
           }
         }
       }
+      const snapshotAtMs = Math.max(nowMs(), this.lastSnapshotAtMs + 1);
+      this.lastSnapshotAtMs = snapshotAtMs;
+      for (const [chatRaw, meta] of Object.entries(all || {})) {
+        const chatJid = normalizeJid(chatRaw);
+        if (!chatJid.endsWith('@g.us') || chatJid.length > 128) continue;
+        const native = (meta as any)?.participants;
+        const roster = Array.isArray(native) ? native.map((participant: any) => ({
+          ...membershipParticipant(participant),
+          admin: participant?.admin === 'admin' || participant?.admin === 'superadmin',
+        })) : [];
+        const complete = Array.isArray(native) && roster.every((participant) => participant.lid || participant.phoneJid);
+        const payload: Record<string, unknown> = {
+          chatJid, snapshotAtMs, participants: complete ? roster : [],
+          complete, memberCount: Array.isArray(native) ? native.length : 0,
+        };
+        const identity = deriveProviderEventIdentity('membership_snapshot', this.options.accountId ?? 'default', payload);
+        const envelope = createEventEnvelope({
+          type: 'membership_snapshot', accountId: this.options.accountId,
+          payload, observedAt: nowMs(), ...identity,
+        });
+        if (Buffer.byteLength(JSON.stringify(envelope), 'utf8') > MAX_BRIDGE_FRAME_BYTES) {
+          payload.complete = false;
+          payload.participants = [];
+        }
+        await this.options.onSignal?.('membership_snapshot', payload);
+      }
       this.options.onStatus('lid_cache_refreshed', { size: this.lidToPhone.size, added });
     } catch (err) {
       this.lastError = safeErrorMessage(err);
       this.options.onError(`lid_cache_refresh_failed: ${this.lastError}`);
     }
+  }
+
+  private captureMembershipChange(
+    source: 'stub' | 'update',
+    payload: Record<string, unknown>,
+    sourceCopyId: string,
+  ): Promise<void> | undefined {
+    if (!this.options.onSignal) return undefined;
+    const dedupeKey = createHash('sha1')
+      .update(`membership:${payload.chatJid}:${sourceCopyId}`).digest('hex');
+    return this.admitDedupeEvent(dedupeKey, async () => {
+      const timestamp = nowMs();
+      this.pendingMembershipCopies = this.pendingMembershipCopies.filter((copy) => copy.expiresAt > timestamp);
+      const withKnownPhone = (participant: MembershipParticipant): MembershipParticipant => {
+        const phoneJid = participant.phoneJid || (participant.lid ? this.resolvePhoneJid(participant.lid) : undefined);
+        return phoneJid ? { ...participant, phoneJid } : participant;
+      };
+      const participants = (payload.participants as MembershipParticipant[]).map(withKnownPhone);
+      // Both native copies may expose different phone metadata; prefer their shared LID.
+      const signature = JSON.stringify([
+        payload.chatJid, payload.action,
+        participants.map((participant) => participant.lid || participant.phoneJid).sort(),
+      ]);
+      const counterpart = this.pendingMembershipCopies.findIndex((copy) =>
+        copy.source !== source && copy.signature === signature,
+      );
+      const changeId = counterpart >= 0
+        ? this.pendingMembershipCopies.splice(counterpart, 1)[0].changeId
+        : source === 'stub' && payload.messageId ? `stub:${payload.messageId}` : `${source}:${randomUUID()}`;
+      if (counterpart < 0) {
+        this.pendingMembershipCopies.push({ signature, source, changeId,
+          expiresAt: timestamp + MEMBERSHIP_CORRELATION_TTL_MS });
+        if (this.pendingMembershipCopies.length > MEMBERSHIP_CORRELATION_MAX) this.pendingMembershipCopies.shift();
+      }
+      await this.options.onSignal?.('membership_change', {
+        ...payload, participants,
+        ...(payload.actor ? { actor: withKnownPhone(payload.actor as MembershipParticipant) } : {}),
+        changeId, sourceCopyId,
+      });
+    });
+  }
+
+  private handleParticipantUpdate(update: any): Promise<void> | undefined {
+    const chatJid = normalizeJid(typeof update?.id === 'string' ? update.id : '');
+    const participants = membershipParticipants(update?.participants);
+    const action = update?.action;
+    if (!chatJid.endsWith('@g.us') || chatJid.length > 128 || !participants ||
+        !['add', 'remove', 'promote', 'demote', 'modify'].includes(action)) return undefined;
+    const actor = membershipParticipant(update.author, update.authorPn);
+    return this.captureMembershipChange('update', {
+      chatJid, action, participants,
+      ...(actor.lid || actor.phoneJid ? { actor } : {}),
+      // This pinned provider event has neither a native timestamp nor a message ID.
+      providerTimestampMs: null,
+    }, `update:${randomUUID()}`);
   }
 
   private updateSelfIds(state: any): void {
@@ -1781,13 +1904,32 @@ export class WhatsAppClient {
     if (!chatJid) return;
 
     const messageId = String(msg?.key?.id || '').trim();
-    if (!messageId) return;
+    const membershipAction = MEMBERSHIP_STUB_ACTIONS.get(msg?.messageStubType);
+    const isGroupMembershipStub = Boolean(membershipAction && chatJid.endsWith('@g.us') && chatJid.length <= 128);
+    if (!messageId && !membershipAction) return;
     const fromMe = Boolean(msg?.key?.fromMe);
     const sentByBridge = fromMe && this.wasOutboundSelfMessage(chatJid, messageId);
-    if (shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) return;
+    if (!isGroupMembershipStub && shouldIgnoreFromMeInbound(fromMe, this.options.acceptFromMe, sentByBridge)) return;
 
-    this.storeInboundForQuote(chatJid, messageId, msg);
-    await this.persistMessageReference(chatJid, messageId, msg);
+    if (messageId) {
+      this.storeInboundForQuote(chatJid, messageId, msg);
+      await this.persistMessageReference(chatJid, messageId, msg);
+    }
+
+    if (isGroupMembershipStub) {
+      const participants = membershipParticipants(msg?.messageStubParameters);
+      if (participants) {
+        const actor = membershipParticipant(msg?.key?.participant ?? msg?.participant, msg?.key?.participantAlt);
+        const seconds = msg?.messageTimestamp == null ? NaN : Number(msg.messageTimestamp);
+        const providerTimestampMs = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
+        await this.captureMembershipChange('stub', {
+          chatJid, action: membershipAction, participants,
+          ...(actor.lid || actor.phoneJid ? { actor } : {}),
+          providerTimestampMs, ...(messageId ? { messageId } : {}), stubType: msg.messageStubType,
+        }, `stub:${messageId || randomUUID()}`);
+      }
+    }
+    if (!messageId || isGroupMembershipStub) return;
 
     const extracted = this.extractMessageTextAndMedia(msg);
     const encryptedObservation = this.encryptedEditObservation(msg);
@@ -1901,6 +2043,7 @@ export class WhatsAppClient {
   }
 
   private registerInboundMessageHandler(): void {
+    this.sock.ev.on('group-participants.update', (update: any) => this.handleParticipantUpdate(update));
     this.sock.ev.on('messages.upsert', ({ messages, type }: { messages: any[]; type: string }) => {
       if (type !== 'notify' && type !== 'append') return;
       for (const msg of messages ?? []) {

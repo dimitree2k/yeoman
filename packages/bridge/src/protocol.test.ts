@@ -14,6 +14,31 @@ test('protocol version gates deterministic message ids', () => {
   assert.equal(PROTOCOL_VERSION, 5);
 });
 
+test('test_membership_change_identity_uses_logical_change_id', () => {
+  const identity = (sourceCopyId: string) => deriveProviderEventIdentity(
+    'membership_change' as any, 'account-1',
+    { chatJid: 'chat@g.us', changeId: 'change-1', sourceCopyId },
+  );
+  const stub = identity('stub:message-1');
+  const update = identity('update:copy-1');
+  assert.ok(stub);
+  assert.ok(update);
+  assert.notEqual(stub.eventId, update.eventId);
+  assert.equal(stub.eventKey, update.eventKey);
+  assert.deepEqual(identity('stub:message-1'), stub);
+});
+
+test('test_membership_snapshot_identity_is_account_chat_and_time_scoped', () => {
+  const identity = (account: string, chatJid: string, snapshotAtMs: number) =>
+    deriveProviderEventIdentity('membership_snapshot' as any, account, { chatJid, snapshotAtMs });
+  const first = identity('account-1', 'chat@g.us', 1700000000000);
+  assert.ok(first);
+  assert.deepEqual(first, identity('account-1', 'chat@g.us', 1700000000000));
+  assert.notEqual(first.eventId, identity('account-2', 'chat@g.us', 1700000000000)?.eventId);
+  assert.notEqual(first.eventId, identity('account-1', 'other@g.us', 1700000000000)?.eventId);
+  assert.notEqual(first.eventId, identity('account-1', 'chat@g.us', 1700000000001)?.eventId);
+});
+
 test('edit event identities distinguish same-second revisions and deduplicate exact replay', () => {
   const identity = (payload: Record<string, unknown>) =>
     deriveProviderEventIdentity('edit', 'account-1', payload)?.eventId;

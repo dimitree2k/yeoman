@@ -9,6 +9,8 @@ export const REPLAYABLE_EVENT_TYPES = [
   'delete',
   'reaction',
   'receipt',
+  'membership_change',
+  'membership_snapshot',
 ] as const;
 
 export const MEDIA_METADATA_FIELDS = [
@@ -50,6 +52,8 @@ export type BridgeEventType =
   | 'delete'
   | 'reaction'
   | 'receipt'
+  | 'membership_change'
+  | 'membership_snapshot'
   | 'status'
   | 'qr'
   | 'error'
@@ -247,7 +251,7 @@ export function deriveEditSignalIdentity(payload: Record<string, unknown>): stri
 
 /** Derive replay identity from provider ids/revisions, with a stable edit snapshot fallback. */
 export function deriveProviderEventIdentity(
-  type: Extract<BridgeEventType, 'message' | 'edit' | 'delete' | 'reaction' | 'receipt'>,
+  type: (typeof REPLAYABLE_EVENT_TYPES)[number],
   accountId: string,
   payload: Record<string, unknown>,
 ): ProviderEventIdentity | undefined {
@@ -255,8 +259,24 @@ export function deriveProviderEventIdentity(
   const chat = identityPart(payload.chatJid ?? payload.chat_jid ?? payload.chat);
   if (!account || !chat) return undefined;
 
+  if (type === 'membership_change') {
+    const changeId = identityPart(payload.changeId);
+    const copyId = identityPart(payload.sourceCopyId);
+    if (!changeId || !copyId) return undefined;
+    const eventKey = `whatsapp:${[account, chat, type, changeId].map(encodeURIComponent).join(':')}`;
+    const copyKey = `${eventKey}:${encodeURIComponent(copyId)}`;
+    return {
+      eventKey,
+      eventId: `wa_${createHash('sha256').update(copyKey, 'utf8').digest('hex').slice(0, 32)}`,
+    };
+  }
+
   let providerIdentity: string[];
-  if (type === 'message') {
+  if (type === 'membership_snapshot') {
+    const timestamp = payload.snapshotAtMs;
+    if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0) return undefined;
+    providerIdentity = [String(timestamp)];
+  } else if (type === 'message') {
     const messageId = identityPart(payload.messageId ?? payload.message_id ?? payload.id);
     if (!messageId) return undefined;
     providerIdentity = [messageId];
