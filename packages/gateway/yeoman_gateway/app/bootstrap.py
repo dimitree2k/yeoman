@@ -3061,6 +3061,7 @@ def build_gateway_runtime(
                 memory=memory_service,
                 sources=observed_sources,
                 statements=knowledge_service,
+                identity_observation_issuer=knowledge_sources,
                 invalidator=(
                     SignalInvalidator(
                         store=processing_store,

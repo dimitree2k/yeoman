@@ -24,6 +24,7 @@ from typing import Any
 from loguru import logger
 from yeoman_shared.whatsapp_protocol import MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS
 
+from yeoman_gateway.knowledge.models import Identifier, TrustedIdentityObservation
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
     TransportReceipt,
@@ -688,6 +689,7 @@ class SignalJournalSink:
         memory: Any | None = None,
         sources: Any | None = None,
         statements: Any | None = None,
+        identity_observation_issuer: Any | None = None,
     ) -> None:
         self._store = store
         self._mapper = mapper or WhatsAppSignalMapper()
@@ -703,6 +705,8 @@ class SignalJournalSink:
         #: Applies an arrived provider revocation to derived statements.  Without it a
         #: published statement would outlive the delete that revoked its only source.
         self._statements = statements
+        #: Issues verified provider identity observations before the knowledge projection.
+        self._identity_observation_issuer = identity_observation_issuer
 
     def __call__(self, kind: str, payload: Mapping[str, Any]) -> str | None:
         return self.capture(kind, payload)
@@ -771,6 +775,8 @@ class SignalJournalSink:
                 raise ValueError("strict capture found a conflicting event identity")
         elif strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
+        if signal.kind == "membership_snapshot":
+            self._record_membership_snapshot_pairs(signal, stored_event_id)
         opaque_edit = (
             signal.kind == "message"
             and signal.payload.get("observation_only") is True
@@ -807,6 +813,52 @@ class SignalJournalSink:
         if not strict:
             self.invalidate(kind, payload)
         return stored_event_id
+
+    def _record_membership_snapshot_pairs(
+        self, signal: JournalSignal, stored_event_id: str
+    ) -> None:
+        """Project only complete snapshot pairs through the issued identity API."""
+        issuer = self._identity_observation_issuer
+        record_pair = getattr(self._statements, "record_provider_pair", None)
+        namespace = signal.account
+        participants = signal.payload.get("participants")
+        observed_at_ms = signal.payload.get("snapshot_at_ms")
+        if (
+            issuer is None
+            or not callable(getattr(issuer, "observe", None))
+            or not callable(record_pair)
+            or signal.payload.get("complete") is not True
+            or not namespace
+            or not isinstance(participants, list)
+            or not isinstance(observed_at_ms, int)
+            or isinstance(observed_at_ms, bool)
+        ):
+            return
+
+        for participant in participants:
+            if not isinstance(participant, Mapping):
+                continue
+            phone_jid = participant.get("phone_jid")
+            lid = participant.get("lid")
+            if not isinstance(phone_jid, str) or not isinstance(lid, str):
+                continue
+            pair_identity = (
+                f"whatsapp\0{namespace}\0phone_jid\0{phone_jid}\0"
+                f"whatsapp\0{namespace}\0lid\0{lid}"
+            )
+            pair_digest = hashlib.sha256(pair_identity.encode("utf-8")).hexdigest()
+            observation = TrustedIdentityObservation(
+                identifiers=(
+                    Identifier("whatsapp", "phone_jid", phone_jid, namespace=namespace),
+                    Identifier("whatsapp", "lid", lid, namespace=namespace),
+                ),
+                evidence_ref=f"whatsapp-membership:{stored_event_id}:{pair_digest}",
+                observed_at_ms=observed_at_ms,
+                mapping_verified=True,
+                account_namespace=namespace,
+            )
+            issuer.observe(observation)
+            record_pair(observation)
 
     def _invalidate_memory_projection(
         self, signal: Any, source_event_ids: Iterable[str], *, now_ms: int | None
