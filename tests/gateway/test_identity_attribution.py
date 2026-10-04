@@ -578,29 +578,273 @@ def _binding(identifier: Identifier, *, start: int = 200, status: str = "active"
     }
 
 
-def _observation_ref(at_ms: int, source_id: str = "source-1") -> dict[str, Any]:
+def _observation_ref(
+    at_ms: int, source_id: str = "source-1", copy_id: int = 1
+) -> dict[str, Any]:
     return {
         "input": "history",
         "source_id": source_id,
         "sha256": "a" * 64,
-        "locator": {"table": "history_event_copies", "copy_id": 1, "source_id": source_id},
+        "locator": {"table": "history_event_copies", "copy_id": copy_id, "source_id": source_id},
         "time_ms": at_ms,
     }
 
 
-def _planner_observation_ref(history_db: Path, at_ms: int) -> dict[str, Any]:
+def _planner_observation_ref(history_db: Path, at_ms: int, copy_id: int = 1) -> dict[str, Any]:
     with sqlite3.connect(history_db) as connection:
         row = connection.execute(
-            "SELECT source_hash,locator_json,provenance_class,source_authority FROM history_event_copies WHERE copy_id=1"
+            "SELECT source_id,source_hash,locator_json,provenance_class,source_authority "
+            "FROM history_event_copies WHERE copy_id=?", (copy_id,)
         ).fetchone()
     return {
-        **_observation_ref(at_ms),
+        **_observation_ref(at_ms, row[0], copy_id),
         "sha256": _sha256(history_db),
-        "source_hash": row[0],
-        "source_locator": json.loads(row[1]),
-        "provenance_class": row[2],
-        "source_authority": row[3],
+        "source_hash": row[1],
+        "source_locator": json.loads(row[2]),
+        "provenance_class": row[3],
+        "source_authority": row[4],
     }
+
+
+def _append_planner_event(
+    history_db: Path,
+    *,
+    event_id: str,
+    copy_id: int,
+    occurred_ms: int,
+    phone_value: str,
+    lid_value: str,
+    name: str,
+) -> None:
+    source_id = f"source-{copy_id}"
+    event = {
+        "event_id": event_id,
+        "revision": "1",
+        "channel": "whatsapp",
+        "account": "test-account",
+        "chat_id": "test-chat",
+        "sender_id_raw": phone_value,
+        "participant_jid_raw": lid_value,
+        "name_observations": [{
+            "name": name,
+            "raw_identifier": phone_value,
+            "occurred_ms": occurred_ms,
+            "observed_ms": occurred_ms,
+            "time_certainty": "native",
+            "provenance_class": "native",
+        }],
+        "occurred_ms": occurred_ms,
+        "time_certainty": "native",
+    }
+    locator = json.dumps({"line": copy_id})
+    source_hash = chr(ord("a") + copy_id) * 64
+    with sqlite3.connect(history_db) as connection:
+        connection.execute(
+            "INSERT INTO history_event_details VALUES (?,?,?,?,?,?,?,?,?)",
+            (event_id, "1", json.dumps(event), "message", "in", "native", "retained", None, 0),
+        )
+        connection.execute(
+            "INSERT INTO history_event_copies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (copy_id, event_id, "1", source_id, source_hash, locator,
+             "inbound_archive_copy", "native", "inbound_archive_copy", "whatsapp",
+             "test-account", "test-chat", "logical_copy"),
+        )
+        connection.execute(
+            "INSERT INTO history_source_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, "1", source_id, locator, None, "whatsapp", "test-chat",
+             occurred_ms, "direct", "[]", "snapshot-1", "revision-1", None, None, 1, None),
+        )
+
+
+def _planner_evidence(
+    history_db: Path,
+    knowledge_db: Path,
+    observations: list[dict[str, Any]],
+    spans: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "input_hashes": {
+            "history": _sha256(history_db),
+            "knowledge": _sha256(knowledge_db),
+        },
+        "covered_period": {"start_ms": 1, "end_ms": 200},
+        "account_inventories": [],
+        "observations": observations,
+        "continuity_spans": spans,
+    }
+
+
+def _add_lid_binding(knowledge_db: Path, lid_value: str, person_id: str) -> None:
+    with sqlite3.connect(knowledge_db) as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO contacts VALUES (?, ?, NULL)",
+            (person_id, f"Synthetic {person_id}"),
+        )
+        connection.execute(
+            "INSERT INTO knowledge_identifier_bindings VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (f"binding-lid-{person_id}", "whatsapp", "lid", "test-account", lid_value,
+             person_id, "active", 1, 0, 1, "owner-correction:test"),
+        )
+
+
+def test_unreviewed_or_out_of_period_span_cannot_hide_sender_conflict(
+    tmp_path: Path,
+) -> None:
+    phone_value, lid_value = "15550000001@s.whatsapp.net", "abc123@lid"
+    cases = ("unreviewed", "incomplete", "out_of_period", "conflicting", "compatible")
+    for case in cases:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        history_db, knowledge_db = _write_inputs(
+            case_root,
+            valid_from_ms=1,
+            participant_jid_raw=lid_value,
+            name_observations=({
+                "name": "Ada", "raw_identifier": phone_value,
+                "occurred_ms": 100, "observed_ms": 100,
+                "time_certainty": "native", "provenance_class": "native",
+            },),
+        )
+        lid_person = "person-a" if case == "compatible" else "person-b"
+        _add_lid_binding(knowledge_db, lid_value, lid_person)
+        if case == "out_of_period":
+            _append_planner_event(
+                history_db, event_id="event-0", copy_id=2, occurred_ms=60,
+                phone_value=phone_value, lid_value=lid_value, name="Ada",
+            )
+            ref = _planner_observation_ref(history_db, 60, copy_id=2)
+            start_ms, end_ms = 50, 90
+        else:
+            ref = _planner_observation_ref(history_db, 100)
+            start_ms, end_ms = 50, 150
+        phone = _typed("phone_jid", phone_value)
+        lid = _typed("lid", lid_value)
+        observation = {
+            "identifier": phone,
+            "paired_lid": lid,
+            "name": "Ada",
+            "observed_ms": ref["time_ms"],
+            "time_certainty": "native",
+            "provenance_class": "native",
+            "source_ref": ref,
+        }
+        span = {
+            "identifier": phone,
+            "lid_identifier": lid,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "reviewed": case != "unreviewed",
+            "coverage_complete": case != "incomplete",
+            "pair_name": "Ada",
+            "canonical_person_id": "person-a",
+            "binding_id": "binding-a",
+            "evidence_refs": [ref],
+        }
+        result = plan_speaker_attribution(
+            history_db,
+            knowledge_db,
+            include_details=True,
+            attribution_evidence=_planner_evidence(
+                history_db, knowledge_db, [observation], [span]
+            ),
+        )
+        detail = next(row for row in result["details"] if row["event"]["event_id"] == "event-1")
+        if case in {"unreviewed", "incomplete", "out_of_period"}:
+            assert detail["decision"]["status"] != "confirmed"
+            assert detail["attribution_basis"] is None
+        elif case == "conflicting":
+            assert detail["decision"]["status"] == "conflict"
+            assert detail["attribution_basis"] is None
+        else:
+            assert detail["decision"]["status"] == "confirmed"
+            assert detail["attribution_basis"] == "proven"
+
+
+def test_phone_span_cannot_omit_pinned_name_or_pair_break(tmp_path: Path) -> None:
+    phone_value, lid_value = "15550000001@s.whatsapp.net", "abc123@lid"
+    for break_kind in ("name", "pair", "valid"):
+        case_root = tmp_path / break_kind
+        case_root.mkdir()
+        history_db, knowledge_db = _write_inputs(
+            case_root,
+            valid_from_ms=0,
+            participant_jid_raw=lid_value,
+            name_observations=({
+                "name": "Ada", "raw_identifier": phone_value,
+                "occurred_ms": 100, "observed_ms": 100,
+                "time_certainty": "native", "provenance_class": "native",
+            },),
+        )
+        phone = _typed("phone_jid", phone_value)
+        lid = _typed("lid", lid_value)
+        if break_kind != "valid":
+            _append_planner_event(
+                history_db,
+                event_id="event-2",
+                copy_id=2,
+                occurred_ms=110,
+                phone_value=phone_value,
+                lid_value=("def456@lid" if break_kind == "pair" else lid_value),
+                name=("Bea" if break_kind == "name" else "Ada"),
+            )
+        ref = _planner_observation_ref(history_db, 100)
+        observation = {
+            "identifier": phone,
+            "paired_lid": lid,
+            "name": "Ada",
+            "observed_ms": 100,
+            "time_certainty": "native",
+            "provenance_class": "native",
+            "source_ref": ref,
+        }
+        span = {
+            "identifier": phone,
+            "lid_identifier": lid,
+            "start_ms": 50,
+            "end_ms": 150,
+            "reviewed": True,
+            "coverage_complete": True,
+            "pair_name": "Ada",
+            "canonical_person_id": "person-a",
+            "binding_id": "binding-a",
+            "evidence_refs": [ref],
+        }
+        details = plan_speaker_attribution(
+            history_db,
+            knowledge_db,
+            include_details=True,
+            attribution_evidence=_planner_evidence(
+                history_db, knowledge_db, [observation], [span]
+            ),
+        )["details"]
+        if break_kind == "valid":
+            assert details[0]["attribution_basis"] == "observed_continuity"
+        else:
+            prior_detail = next(row for row in details if row["event"]["event_id"] == "event-1")
+            break_detail = next(row for row in details if row["event"]["event_id"] == "event-2")
+            assert prior_detail["attribution_basis"] != "observed_continuity"
+            assert break_detail["attribution_basis"] != "observed_continuity"
+            assert prior_detail["resolution_proposal"] is None
+            assert break_detail["resolution_proposal"] is None
+
+
+def test_explicit_source_account_stays_proven_with_supplementary_evidence(
+    tmp_path: Path,
+) -> None:
+    history_db, knowledge_db = _write_inputs(
+        tmp_path, event_account=None, copy_account="test-account", valid_from_ms=1
+    )
+    detail = plan_speaker_attribution(
+        history_db,
+        knowledge_db,
+        include_details=True,
+        attribution_evidence=_single_account_evidence(history_db, knowledge_db),
+    )["details"][0]
+    assert detail["decision"]["status"] == "confirmed"
+    assert detail["attribution_basis"] == "proven"
+    assert detail["basis_components"] == ["proven"]
+    assert "inferred_scope" not in detail
 
 
 def test_lid_continuity_covers_prebinding_events() -> None:

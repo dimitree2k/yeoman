@@ -63,7 +63,9 @@ def plan_speaker_attribution(
                     "knowledge": _sha256(knowledge_db),
                 },
             )
-            _validate_evidence_locators(evidence, history_connection, knowledge_connection)
+            evidence = _validate_evidence_locators(
+                evidence, history_connection, knowledge_connection
+            )
         _require_columns(
             history_connection,
             "history_event_details",
@@ -233,7 +235,7 @@ def _validate_evidence_locators(
     evidence: Mapping[str, Any],
     history: sqlite3.Connection,
     knowledge: sqlite3.Connection,
-) -> None:
+) -> dict[str, Any]:
     inventories = evidence["account_inventories"]
     for inventory in inventories:
         start, end = (int(inventory["covered_period"][key]) for key in ("start_ms", "end_ms"))
@@ -273,6 +275,7 @@ def _validate_evidence_locators(
     for observation in evidence.get("observations", []):
         row, event = _history_copy_for_ref(history, observation["source_ref"])
         _validate_observation_source(observation, row, event, evidence)
+    valid_spans: list[Mapping[str, Any]] = []
     for span in evidence.get("continuity_spans", []):
         if span.get("reviewed") is not True or span.get("coverage_complete") is not True:
             continue
@@ -282,10 +285,126 @@ def _validate_evidence_locators(
             for row in evidence.get("observations", [])
             if row.get("observed_ms") is not None
             and int(span["start_ms"]) <= int(row["observed_ms"]) < int(span["end_ms"])
-            and row.get("identifier") == span.get("identifier")
+            and _evidence_identifier_matches(row.get("identifier"), span.get("identifier"))
         }
-        if expected != observed:
-            raise IdentityAuditError("phone span references do not match observations")
+        pinned = _pinned_phone_span_refs(history, evidence, span)
+        if pinned is not None and expected == observed == pinned:
+            valid_spans.append(span)
+    return {**evidence, "continuity_spans": valid_spans}
+
+
+def _pinned_phone_span_refs(
+    history: sqlite3.Connection,
+    evidence: Mapping[str, Any],
+    span: Mapping[str, Any],
+) -> set[tuple[Any, ...]] | None:
+    phone_value = span["identifier"]
+    phone = phone_value if isinstance(phone_value, Identifier) else Identifier(**phone_value)
+    start_ms, end_ms = int(span["start_ms"]), int(span["end_ms"])
+    result: set[tuple[Any, ...]] = set()
+    rows = history.execute(
+        "SELECT c.copy_id,c.source_id,c.source_hash,c.locator_json,c.provenance_class,"
+        "c.source_authority,c.channel,c.account,c.chat_id,c.disposition,"
+        "d.normalized_json,d.semantic_direction,d.semantic_kind,d.retention_status,d.denied,"
+        "p.channel AS proof_channel,p.chat_id AS proof_chat_id,p.occurred_ms AS proof_occurred_ms,"
+        "p.eligible,p.revoked_at_ms,p.denial_reason "
+        "FROM history_event_copies c JOIN history_event_details d ON d.event_id=c.event_id "
+        "AND d.revision=c.revision LEFT JOIN history_source_proofs p ON p.event_id=c.event_id "
+        "AND p.revision=c.revision AND p.source_id=c.source_id AND p.locator_json=c.locator_json "
+        "WHERE lower(c.channel)=lower(?) AND c.disposition='logical_copy' "
+        "AND d.semantic_direction='in' AND d.semantic_kind='message' "
+        "AND d.retention_status='retained' AND d.denied=0",
+        (phone.channel,),
+    )
+    for row in rows:
+        event = json.loads(row["normalized_json"])
+        at_ms = event.get("occurred_ms")
+        if not isinstance(at_ms, int) or isinstance(at_ms, bool) or not start_ms <= at_ms < end_ms:
+            continue
+        account = row["account"] or event.get("account")
+        if not account:
+            account, _, _ = account_for_event(
+                evidence, channel=str(row["channel"]), at_ms=at_ms
+            )
+        account_is_known = isinstance(account, str) and bool(account)
+        parse_account = account if account_is_known else phone.namespace
+        parsed, _ = _observation_identifiers({
+            "channel": row["channel"],
+            "account": parse_account,
+            "sender_raw": event.get("sender_raw"),
+            "sender_id_raw": event.get("sender_id_raw"),
+            "participant_jid_raw": event.get("participant_jid_raw"),
+        })
+        phones = [item for item in parsed if item.get("kind") == "phone_jid"]
+        if not any(_evidence_identifier_matches(item, phone) for item in phones):
+            continue
+        if not account_is_known:
+            return None
+        if (
+            row["eligible"] != 1
+            or row["revoked_at_ms"] is not None
+            or row["denial_reason"] not in (None, "")
+            or row["proof_occurred_ms"] not in (None, at_ms)
+            or row["provenance_class"] != "native"
+            or row["source_authority"] not in _NATIVE_SOURCE_AUTHORITIES
+            or not _has_native_locator({
+                "source_hash": row["source_hash"],
+                "locator": _json_object(row["locator_json"]),
+                "provenance_class": row["provenance_class"],
+            })
+        ):
+            continue
+        if (
+            event.get("time_certainty") not in {"native", "provider_timestamp"}
+            or row["proof_channel"] is None
+            or str(row["proof_channel"]).casefold() != str(row["channel"]).casefold()
+            or not isinstance(row["chat_id"], str)
+            or row["proof_chat_id"] != row["chat_id"]
+            or event.get("channel") is not None
+            and str(event["channel"]).casefold() != str(row["channel"]).casefold()
+            or event.get("account") is not None
+            and str(event["account"]).casefold() != str(account).casefold()
+        ):
+            return None
+        lids = [item for item in parsed if item.get("kind") == "lid"]
+        if len(lids) != 1 or not _evidence_identifier_matches(lids[0], span.get("lid_identifier")):
+            return None
+        names = event.get("name_observations")
+        name_rows = [
+            item for item in names if isinstance(item, Mapping)
+            and item.get("raw_identifier") == phone.value
+            and item.get("occurred_ms") == at_ms
+            and item.get("observed_ms") == at_ms
+        ] if isinstance(names, list) else []
+        if not name_rows or any(
+            item.get("name") != span.get("pair_name")
+            or item.get("time_certainty") != event.get("time_certainty")
+            or item.get("provenance_class") != "native"
+            for item in name_rows
+        ):
+            return None
+        locator = {
+            "table": "history_event_copies",
+            "copy_id": int(row["copy_id"]),
+            "source_id": str(row["source_id"]),
+        }
+        result.add(_reference_key({
+            "input": "history",
+            "source_id": str(row["source_id"]),
+            "sha256": evidence["input_hashes"]["history"],
+            "locator": locator,
+            "time_ms": at_ms,
+        }))
+    return result or None
+
+
+def _evidence_identifier_matches(value: Any, expected: Any) -> bool:
+    try:
+        identifier = value if isinstance(value, Identifier) else Identifier(**value)
+        other = expected if isinstance(expected, Identifier) else Identifier(**expected)
+    except (TypeError, ValueError):
+        return False
+    return identifier.full_key == other.full_key
 
 
 def _history_copy_for_ref(
@@ -691,6 +810,12 @@ def _decide(
             )
             source_unproven_diagnostics[diagnostic] += 1
         return "unresolved", "source_unproven", None
+    account_inference_required = inferred_account is not None and not any(
+        isinstance(row.get("copy_account"), str) and row["copy_account"].strip()
+        for row in valid_sources
+    )
+    if detail is not None and not account_inference_required:
+        detail.pop("inferred_scope", None)
     scopes = {
         (str(row["copy_channel"]).casefold(), str(row["_working_account"]).casefold())
         for row in valid_sources
@@ -707,23 +832,91 @@ def _decide(
             "participant_jid_raw": event.get("participant_jid_raw"),
         }
     )
+    pair_resolution: dict[str, Any] | None = None
     if evidence is not None and len(identifier_rows) == 2:
         phones = [row for row in identifier_rows if row.get("kind") == "phone_jid"]
         lids = [row for row in identifier_rows if row.get("kind") == "lid"]
-        paired = []
-        for span in evidence.get("continuity_spans", []):
-            phone = span.get("identifier")
-            lid = span.get("lid_identifier")
-            if not isinstance(phone, Identifier):
-                phone = Identifier(**phone)
-            if not isinstance(lid, Identifier):
-                lid = Identifier(**lid)
-            if (len(phones) == len(lids) == 1
-                    and tuple(phones[0].get(key) for key in ("channel", "kind", "namespace", "value")) == phone.full_key
-                    and tuple(lids[0].get(key) for key in ("channel", "kind", "namespace", "value")) == lid.full_key):
-                paired.append(phones[0])
-        if len(paired) == 1:
-            identifier_rows = paired
+        occurred_ms = event.get("occurred_ms")
+        paired_spans = []
+        if len(phones) == len(lids) == 1 and _positive_timestamp(occurred_ms):
+            for span in evidence.get("continuity_spans", []):
+                if (
+                    _evidence_identifier_matches(span.get("identifier"), phones[0])
+                    and _evidence_identifier_matches(span.get("lid_identifier"), lids[0])
+                    and int(span["start_ms"]) <= occurred_ms < int(span["end_ms"])
+                ):
+                    paired_spans.append(span)
+        if len(paired_spans) != 1:
+            return "unresolved", "sender_identifier_missing", None
+        pair_span = paired_spans[0]
+        paired_observations = [
+            row for row in evidence.get("observations", [])
+            if _evidence_identifier_matches(row.get("identifier"), phones[0])
+            and _evidence_identifier_matches(row.get("paired_lid"), lids[0])
+            and row.get("observed_ms") == occurred_ms
+            and row.get("name") == pair_span.get("pair_name")
+        ]
+        if not paired_observations:
+            return "unresolved", "sender_identifier_missing", None
+        pair_identifiers = [
+            Identifier(channel=str(row["channel"]), kind=str(row["kind"]),
+                       namespace=event_account, value=str(row["value"]))
+            for row in (phones[0], lids[0])
+        ]
+        pair_results = [
+            resolve_attribution_binding(
+                pair_identifier, int(occurred_ms), bindings=bindings,
+                canonical_ids=canonical_ids,
+                observations=evidence.get("observations", []),
+                continuity_spans=evidence.get("continuity_spans", []),
+            )
+            for pair_identifier in pair_identifiers
+        ]
+        span_person = str(pair_span.get("canonical_person_id") or "")
+        span_person = canonical_ids.get(span_person, span_person)
+        resolved_people = {
+            str(result["canonical_person_id"])
+            for result in pair_results if result.get("canonical_person_id")
+        }
+        if any(
+            result.get("reason") in {"binding_conflict", "binding_start_conflict"}
+            for result in pair_results
+        ) or any(person != span_person for person in resolved_people):
+            return "conflict", "binding_conflict", None
+        if any(
+            not result.get("canonical_person_id") and result.get("reason") != "no_binding"
+            for result in pair_results
+        ) or span_person not in resolved_people:
+            failure = next(
+                (str(result.get("reason")) for result in pair_results if result.get("reason")),
+                "sender_identifier_missing",
+            )
+            return "unresolved", failure, None
+        pair_refs: list[dict[str, Any]] = []
+        for result in pair_results:
+            for ref in result.get("evidence_refs", []):
+                if ref not in pair_refs:
+                    pair_refs.append(ref)
+        if all(
+            result.get("status") == "resolved" and result.get("basis") == "proven"
+            and result.get("canonical_person_id") == span_person
+            for result in pair_results
+        ):
+            pair_resolution = {
+                **pair_results[0],
+                "canonical_person_id": span_person,
+                "evidence_refs": pair_refs,
+            }
+        else:
+            pair_resolution = {
+                "status": "candidate",
+                "canonical_person_id": span_person,
+                "binding_id": pair_results[0].get("binding_id"),
+                "basis": "observed_continuity",
+                "evidence_refs": pair_refs,
+                "reason": None,
+            }
+        identifier_rows = phones
     if len(identifier_rows) != 1:
         return "unresolved", parse_reason or "sender_identifier_missing", None
     identifier = identifier_rows[0]
@@ -744,7 +937,7 @@ def _decide(
     if not exact_time:
         return "candidate", "event_time_not_native", None
     if evidence is not None:
-        resolution = resolve_attribution_binding(
+        resolution = pair_resolution or resolve_attribution_binding(
             Identifier(
                 channel=identifier["channel"],
                 kind=identifier["kind"],
@@ -771,7 +964,7 @@ def _decide(
                 return "candidate", "binding_not_verified", None
             if not str(binding.get("evidence_ref") or "").strip():
                 return "candidate", "binding_evidence_missing", None
-            if inferred_account is not None:
+            if account_inference_required:
                 if detail is not None:
                     detail["resolution_proposal"] = {
                         "canonical_person_id": person,
@@ -787,12 +980,12 @@ def _decide(
                 detail["basis_components"] = ["proven"]
             return "confirmed", None, "proven"
         if basis == "observed_continuity" and person:
-            final_basis = "single_account_inferred" if inferred_account is not None else "observed_continuity"
+            final_basis = "single_account_inferred" if account_inference_required else "observed_continuity"
             if detail is not None:
                 detail["attribution_basis"] = final_basis
                 detail["basis_components"] = (
                     ["single_account_inferred", "observed_continuity"]
-                    if inferred_account is not None else ["observed_continuity"]
+                    if account_inference_required else ["observed_continuity"]
                 )
             return "candidate", "observed_continuity", final_basis
         failure = str(resolution.get("reason") or "unresolved")
