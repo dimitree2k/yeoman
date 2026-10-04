@@ -670,6 +670,32 @@ def test_unknown_source_time_still_applies_exact_local_revocation(tmp_path: Path
         assert HistorySourceAuthority(journal).verify_source_ref("revoked-unknown-time", 1) is None
 
 
+def test_purged_journal_revocation_denies_restored_native_text(tmp_path: Path) -> None:
+    root = tmp_path / "collection"
+    journal_source = _write_source(
+        root,
+        "canonical",
+        events=[_event("purged-revoked", "native-revoked", None, purged_ms=_WHEN)],
+        authorities=[_authority("purged-revoked", revoked_at_ms=_WHEN + 1)],
+    )
+    original_witness = _write_source(
+        root,
+        "reply_context",
+        inbound=[_inbound("native-revoked", "synthetic revoked original")],
+    )
+    collection = _collection(root, journal_source, original_witness)
+    target = tmp_path / "rebuilt"
+
+    rebuild_history(collection=collection, target_home=target)
+    row = _rows(
+        target,
+        "SELECT denied,normalized_json FROM history_event_details WHERE event_id=?",
+        ("purged-revoked",),
+    )[0]
+    normalized = json.loads(row["normalized_json"])
+    assert row["denied"] == 1 and normalized["text"] is None
+
+
 def test_curated_denial_binds_unique_legacy_source_id(tmp_path: Path) -> None:
     root = tmp_path / "collection"
     node = {

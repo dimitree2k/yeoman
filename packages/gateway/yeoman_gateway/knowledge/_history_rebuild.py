@@ -550,6 +550,17 @@ def _verified_retention_witness(event: NormalizedEvent) -> bool:
 def _copy_for_authority(
     event: NormalizedEvent, authority: Mapping[str, Any]
 ) -> Mapping[str, Any] | None:
+    copy = _copy_for_source_identity(event, authority)
+    return (
+        copy
+        if copy is not None and str(copy.get("provenance_class") or "") == "native"
+        else None
+    )
+
+
+def _copy_for_source_identity(
+    event: NormalizedEvent, authority: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
     expected = _key(authority.get("event_id"), authority.get("revision"))
     return next(
         (
@@ -560,7 +571,6 @@ def _copy_for_authority(
             and _copy_locator(event, copy).get("file") == authority.get("file")
             and _copy_identity(copy, event) == expected
             and str(copy.get("source_kind") or "") == "journal"
-            and str(copy.get("provenance_class") or "") == "native"
         ),
         None,
     )
@@ -574,10 +584,7 @@ def _authority_candidate_index(
     for event in events:
         seen: set[tuple[str, str, str, str]] = set()
         for copy in event.copies:
-            if (
-                str(copy.get("source_kind") or "") != "journal"
-                or str(copy.get("provenance_class") or "") != "native"
-            ):
+            if str(copy.get("source_kind") or "") != "journal":
                 continue
             source = _source_id(event, copy)
             file = _copy_locator(event, copy).get("file")
@@ -599,10 +606,13 @@ def _authority_candidate_index(
             if isinstance(file, str) and isinstance(row.get("source_id"), str)
             else ()
         )
-        matches = [event for event in candidates if _copy_for_authority(event, row) is not None]
+        matches = [
+            event for event in candidates if _copy_for_source_identity(event, row) is not None
+        ]
         events_by_authority_row.append(matches)
         for event in matches:
-            authorities_by_event[id(event)].append(row)
+            if _copy_for_authority(event, row) is not None:
+                authorities_by_event[id(event)].append(row)
     return events_by_authority_row, authorities_by_event
 
 
@@ -611,14 +621,14 @@ def _source_revocation_copy_matches(
 ) -> bool:
     return (
         authority.get("revoked_at_ms") is not None
-        and _copy_for_authority(event, authority) is not None
+        and _copy_for_source_identity(event, authority) is not None
     )
 
 
 def _source_revocation_metadata_matches(
     event: NormalizedEvent, authority: Mapping[str, Any]
 ) -> bool:
-    copy = _copy_for_authority(event, authority)
+    copy = _copy_for_source_identity(event, authority)
     if copy is None or not _source_revocation_copy_matches(event, authority):
         return False
     row_author = _text(authority.get("author_principal"))
