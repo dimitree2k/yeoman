@@ -54,6 +54,168 @@ def _person(knowledge, source, number: int, *, name: str) -> str:
     return resolved.person_id
 
 
+def _empty_support_candidate(knowledge, source, context, *, first_number: int):
+    first = _person(knowledge, source, first_number, name="Shared Name")
+    second = _person(knowledge, source, first_number + 1, name=" shared name ")
+    candidate = next(
+        item
+        for item in knowledge.propose_identity_candidates(context=context)
+        if set(item.person_ids) == {first, second}
+    )
+    alias = knowledge._store.query_one(
+        "SELECT id FROM contact_aliases WHERE contact_id = ? AND normalized_alias = ?",
+        (first, "shared name"),
+    )
+    assert alias is not None
+    knowledge.retire_alias(
+        alias_id=int(alias["id"]), context=context, correct_mapping=True
+    )
+    knowledge.propose_identity_candidates(context=context)
+    refreshed = next(
+        item
+        for item in knowledge.list_identity_candidates(
+            context=context, statuses=("pending",)
+        )
+        if item.candidate_id == candidate.candidate_id
+    )
+    assert refreshed.evidence == ()
+    assert refreshed.evidence_version == candidate.evidence_version + 1
+    return first, second, refreshed
+
+
+@pytest.mark.parametrize(
+    ("decision", "status"), (("not_same", "rejected"), ("later", "later"))
+)
+def test_empty_support_candidate_can_be_dismissed(
+    tmp_path: Path, decision: str, status: str
+) -> None:
+    knowledge, source, context = _runtime(tmp_path)
+    try:
+        first, second, candidate = _empty_support_candidate(
+            knowledge, source, context, first_number=801
+        )
+        people_before = tuple(
+            tuple(row) for row in knowledge._store.query("SELECT * FROM contacts ORDER BY id")
+        )
+        bindings_before = tuple(
+            tuple(row)
+            for row in knowledge._store.query(
+                "SELECT * FROM knowledge_identifier_bindings ORDER BY binding_id"
+            )
+        )
+        evidence_before = tuple(
+            tuple(row)
+            for row in knowledge._store.query(
+                "SELECT * FROM knowledge_identity_candidate_evidence"
+                " WHERE candidate_id = ? ORDER BY evidence_version",
+                (candidate.candidate_id,),
+            )
+        )
+
+        dismissed = knowledge.decide_identity_candidate(
+            candidate.candidate_id,
+            decision=decision,
+            expected_candidate_revision=candidate.candidate_revision,
+            expected_identity_revision=candidate.identity_revision,
+            context=context,
+        )
+
+        assert dismissed.status == status
+        assert dismissed.person_ids == tuple(sorted((first, second)))
+        assert tuple(
+            tuple(row) for row in knowledge._store.query("SELECT * FROM contacts ORDER BY id")
+        ) == people_before
+        assert tuple(
+            tuple(row)
+            for row in knowledge._store.query(
+                "SELECT * FROM knowledge_identifier_bindings ORDER BY binding_id"
+            )
+        ) == bindings_before
+        assert tuple(
+            tuple(row)
+            for row in knowledge._store.query(
+                "SELECT * FROM knowledge_identity_candidate_evidence"
+                " WHERE candidate_id = ? ORDER BY evidence_version",
+                (candidate.candidate_id,),
+            )
+        ) == evidence_before
+    finally:
+        knowledge.close()
+
+
+def test_empty_support_candidate_cannot_merge(tmp_path: Path) -> None:
+    knowledge, source, context = _runtime(tmp_path)
+    try:
+        first, _, candidate = _empty_support_candidate(
+            knowledge, source, context, first_number=811
+        )
+
+        with pytest.raises(KnowledgeError) as exc_info:
+            knowledge.decide_identity_candidate(
+                candidate.candidate_id,
+                decision="merge",
+                expected_candidate_revision=candidate.candidate_revision,
+                expected_identity_revision=candidate.identity_revision,
+                context=context,
+                target_id=first,
+            )
+
+        assert exc_info.value.code == "stale_revision"
+        assert knowledge.list_identity_candidates(context=context)[0].status == "pending"
+    finally:
+        knowledge.close()
+
+
+def test_empty_support_dismissal_keeps_auth_and_revision_checks(tmp_path: Path) -> None:
+    knowledge, source, context = _runtime(tmp_path)
+    try:
+        _, _, candidate = _empty_support_candidate(
+            knowledge, source, context, first_number=821
+        )
+        forged = TrustedAdminContext("owner:1", 1, "never-issued", owner=True)
+
+        with pytest.raises(KnowledgeError):
+            knowledge.decide_identity_candidate(
+                candidate.candidate_id,
+                decision="not_same",
+                expected_candidate_revision=candidate.candidate_revision,
+                expected_identity_revision=candidate.identity_revision,
+                context=forged,
+            )
+        for expected_candidate_revision, expected_identity_revision in (
+            (candidate.candidate_revision - 1, candidate.identity_revision),
+            (candidate.candidate_revision, candidate.identity_revision - 1),
+        ):
+            with pytest.raises(KnowledgeError) as exc_info:
+                knowledge.decide_identity_candidate(
+                    candidate.candidate_id,
+                    decision="not_same",
+                    expected_candidate_revision=expected_candidate_revision,
+                    expected_identity_revision=expected_identity_revision,
+                    context=context,
+                )
+            assert exc_info.value.code == "stale_revision"
+
+        dismissed = knowledge.decide_identity_candidate(
+            candidate.candidate_id,
+            decision="later",
+            expected_candidate_revision=candidate.candidate_revision,
+            expected_identity_revision=candidate.identity_revision,
+            context=context,
+        )
+        with pytest.raises(KnowledgeError) as exc_info:
+            knowledge.decide_identity_candidate(
+                candidate.candidate_id,
+                decision="not_same",
+                expected_candidate_revision=dismissed.candidate_revision,
+                expected_identity_revision=dismissed.identity_revision,
+                context=context,
+            )
+        assert exc_info.value.code == "identity_conflict"
+    finally:
+        knowledge.close()
+
+
 def test_duplicate_nickname_is_queued_without_merging(tmp_path: Path) -> None:
     knowledge, source, context = _runtime(tmp_path)
     try:

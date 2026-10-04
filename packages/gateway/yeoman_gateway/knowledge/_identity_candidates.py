@@ -251,16 +251,20 @@ class IdentityCandidateEngine:
             raise KnowledgeError("stale_revision", "candidate evidence is stale")
         if str(row["status"]) != "pending":
             raise KnowledgeError("identity_conflict", "candidate is no longer pending")
-        evidence_row = self._store.query_one(
-            "SELECT evidence_json FROM knowledge_identity_candidate_evidence"
-            " WHERE candidate_id = ? AND evidence_version = ?",
-            (str(candidate_id), int(row["evidence_version"])),
-        )
-        if evidence_row is None or not json.loads(str(evidence_row["evidence_json"])).get("signals"):
-            raise KnowledgeError("stale_revision", "candidate has no current supporting evidence")
         people = (str(row["person_low_id"]), str(row["person_high_id"]))
         operation_id: str | None = None
         if decision == "merge":
+            evidence_row = self._store.query_one(
+                "SELECT evidence_json FROM knowledge_identity_candidate_evidence"
+                " WHERE candidate_id = ? AND evidence_version = ?",
+                (str(candidate_id), int(row["evidence_version"])),
+            )
+            if evidence_row is None or not json.loads(
+                str(evidence_row["evidence_json"])
+            ).get("signals"):
+                raise KnowledgeError(
+                    "stale_revision", "candidate has no current supporting evidence"
+                )
             if target_id not in people:
                 raise ValidationError("merge target must be one of the candidate people")
             if tuple(sorted(self._identity.canonical_ids(people))) != people:
