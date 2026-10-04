@@ -11,6 +11,7 @@ from yeoman_gateway.knowledge._identity import IdentityEngine
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
     IDENTITY_CANDIDATE_STATUSES,
+    Identifier,
     IdentityCandidate,
     IdentityCandidateWeights,
     KnowledgeError,
@@ -149,6 +150,60 @@ class IdentityCandidateEngine:
                     assert row is not None
             assert row is not None
             results.append(self._load_candidate(row))
+        if persist:
+            empty_evidence = {
+                "signals": [],
+                "common_names": [],
+                "provider_pair_sources": [],
+            }
+            empty_json = json.dumps(
+                empty_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            )
+            weights_json = (
+                None
+                if weights is None
+                else json.dumps(dict(weights.weights), sort_keys=True, separators=(",", ":"))
+            )
+            for row in self._store.query(
+                "SELECT * FROM knowledge_identity_candidates WHERE status = 'pending'"
+            ):
+                pair = (str(row["person_low_id"]), str(row["person_high_id"]))
+                if pair in evidence_by_pair:
+                    continue
+                candidate_id = str(row["candidate_id"])
+                old = self._store.query_one(
+                    "SELECT evidence_json, weights_version, weights_json, score"
+                    " FROM knowledge_identity_candidate_evidence"
+                    " WHERE candidate_id = ? AND evidence_version = ?",
+                    (candidate_id, int(row["evidence_version"])),
+                )
+                assert old is not None
+                changed = (
+                    str(old["evidence_json"]) != empty_json
+                    or old["weights_version"] != (None if weights is None else weights.version)
+                    or old["weights_json"] != weights_json
+                    or old["score"] != (None if weights is None else 0.0)
+                )
+                if not changed and int(row["identity_revision"]) == identity_revision:
+                    continue
+                next_version = int(row["evidence_version"]) + 1
+                self._insert_evidence(
+                    candidate_id,
+                    next_version,
+                    identity_revision,
+                    empty_json,
+                    None if weights is None else weights.version,
+                    weights_json,
+                    None if weights is None else 0.0,
+                    self._store.now_ms(),
+                )
+                self._store.execute(
+                    "UPDATE knowledge_identity_candidates"
+                    " SET evidence_version = ?, identity_revision = ?,"
+                    " candidate_revision = candidate_revision + 1, updated_ms = ?"
+                    " WHERE candidate_id = ?",
+                    (next_version, identity_revision, self._store.now_ms(), candidate_id),
+                )
         return tuple(results)
 
     def list_candidates(
@@ -192,8 +247,17 @@ class IdentityCandidateEngine:
             raise KnowledgeError("unresolved", "unknown identity candidate")
         if int(row["candidate_revision"]) != int(expected_candidate_revision):
             raise KnowledgeError("stale_revision", "candidate revision changed")
+        if int(row["identity_revision"]) != int(expected_identity_revision):
+            raise KnowledgeError("stale_revision", "candidate evidence is stale")
         if str(row["status"]) != "pending":
             raise KnowledgeError("identity_conflict", "candidate is no longer pending")
+        evidence_row = self._store.query_one(
+            "SELECT evidence_json FROM knowledge_identity_candidate_evidence"
+            " WHERE candidate_id = ? AND evidence_version = ?",
+            (str(candidate_id), int(row["evidence_version"])),
+        )
+        if evidence_row is None or not json.loads(str(evidence_row["evidence_json"])).get("signals"):
+            raise KnowledgeError("stale_revision", "candidate has no current supporting evidence")
         people = (str(row["person_low_id"]), str(row["person_high_id"]))
         operation_id: str | None = None
         if decision == "merge":
@@ -287,26 +351,39 @@ class IdentityCandidateEngine:
 
         provider_sources: dict[tuple[str, str], dict[tuple[str, str], set[str]]] = {}
         rows = self._store.query(
-            "SELECT src.channel, src.namespace, src.source_locator,"
-            " phone.person_id AS phone_person, lid.person_id AS lid_person"
-            " FROM knowledge_provider_pair_sources AS src"
-            " JOIN knowledge_identifier_bindings AS phone"
-            " ON phone.channel = src.channel AND phone.kind = 'phone_jid'"
-            " AND phone.namespace = src.namespace AND phone.value = src.phone_value"
-            " AND phone.status = 'active'"
-            " JOIN knowledge_identifier_bindings AS lid"
-            " ON lid.channel = src.channel AND lid.kind = 'lid'"
-            " AND lid.namespace = src.namespace AND lid.value = src.lid_value"
-            " AND lid.status = 'active'"
+            "SELECT channel, namespace, source_locator, phone_value, lid_value,"
+            " first_observed_at_ms, last_observed_at_ms"
+            " FROM knowledge_provider_pair_sources"
         )
         for row in rows:
-            left = self._identity.canonical_id(str(row["phone_person"]))
-            right = self._identity.canonical_id(str(row["lid_person"]))
+            channel = str(row["channel"])
+            namespace = str(row["namespace"])
+            phone = Identifier(channel, "phone_jid", str(row["phone_value"]), namespace)
+            lid = Identifier(channel, "lid", str(row["lid_value"]), namespace)
+            historical_pairs: set[tuple[str, str]] = set()
+            for observed_at in {
+                int(row["first_observed_at_ms"]),
+                int(row["last_observed_at_ms"]),
+            }:
+                phone_binding = self._identity.binding_at(phone, observed_at)
+                lid_binding = self._identity.binding_at(lid, observed_at)
+                if phone_binding is None or lid_binding is None:
+                    historical_pairs.clear()
+                    break
+                historical_pairs.add(
+                    (
+                        self._identity.canonical_id(phone_binding.person_id),
+                        self._identity.canonical_id(lid_binding.person_id),
+                    )
+                )
+            if len(historical_pairs) != 1:
+                continue
+            left, right = next(iter(historical_pairs))
             if left == right or left not in names or right not in names:
                 continue
             pair = tuple(sorted((left, right)))
             provider_sources.setdefault(pair, {}).setdefault(
-                (str(row["channel"]), str(row["namespace"])), set()
+                (channel, namespace), set()
             ).add(str(row["source_locator"]))
 
         for pair, by_account in provider_sources.items():

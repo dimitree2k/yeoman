@@ -43,9 +43,17 @@ def _sql(db: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def _observation(ref: str, *identifiers: Identifier, verified: bool) -> TrustedIdentityObservation:
+def _observation(
+    ref: str,
+    *identifiers: Identifier,
+    verified: bool,
+    account_namespace: str = "",
+) -> TrustedIdentityObservation:
     return TrustedIdentityObservation(
-        identifiers=identifiers, evidence_ref=ref, mapping_verified=verified
+        identifiers=identifiers,
+        evidence_ref=ref,
+        mapping_verified=verified,
+        account_namespace=account_namespace,
     )
 
 
@@ -109,7 +117,9 @@ def _resolve_pair(db: Path) -> str:
     authority = FakeSourceAuthority()
     service = _open(db, authority)
     try:
-        observation = _observation("probe", _phone(), _lid(), verified=True)
+        observation = _observation(
+            "probe", _phone(), _lid(), verified=True, account_namespace="default"
+        )
         authority.issue_observation(observation)
         result = service.resolve_observation(observation)
         return f"{result.status}:{result.person_id or ''}"
@@ -474,4 +484,3 @@ def test_adding_a_binding_never_takes_an_identifier_from_another_person(store) -
 
     assert result.exit_code != 0
     assert [row["person_id"] for row in _bindings(db, LID)] == [people["lid"]]
-

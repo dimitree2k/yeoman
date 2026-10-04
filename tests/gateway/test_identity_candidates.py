@@ -227,6 +227,7 @@ def test_provider_pair_candidates_keep_each_account_namespace_separate(tmp_path:
     try:
         expected: dict[tuple[str, str], str] = {}
         for index, namespace in enumerate(("account-a", "account-b"), start=1):
+            observed_at = knowledge._store.now_ms() + 1_000
             phone_person = _person(
                 knowledge, source, 300 + index * 2, name=f"{namespace} phone owner"
             )
@@ -242,17 +243,18 @@ def test_provider_pair_candidates_keep_each_account_namespace_separate(tmp_path:
                 (lid_person, lid, f"binding:{namespace}:lid"),
             ):
                 source.issue_evidence_ref(evidence_ref)
-                knowledge.bind_identifier(
-                    person_id,
-                    identifier,
+                knowledge.add_or_end_binding(
+                    person_id=person_id,
+                    identifier=identifier,
                     evidence_ref=evidence_ref,
                     mapping_verified=True,
                     context=context,
+                    valid_from_ms=observed_at,
                 )
             observation = TrustedIdentityObservation(
                 identifiers=(phone, lid),
                 evidence_ref=f"provider-pair:{namespace}",
-                observed_at_ms=1_700_000_000_000 + index,
+                observed_at_ms=observed_at,
                 mapping_verified=True,
                 channel_hint="whatsapp",
                 account_namespace=namespace,
@@ -413,3 +415,193 @@ def test_candidate_merge_uses_reversible_owner_redirect_and_guard(tmp_path: Path
         ).person_id == guarded_second
     finally:
         knowledge.close()
+
+
+def test_provider_pair_candidates_bind_sources_to_the_observation_time(tmp_path: Path) -> None:
+    import json
+
+    knowledge, source, context = _runtime(tmp_path)
+    namespace = "account-reassignment"
+    phone = Identifier("whatsapp", "phone_jid", "491511111199@s.whatsapp.net", namespace)
+    lid = Identifier("whatsapp", "lid", "123456789199@lid", namespace)
+    try:
+        old_observation = TrustedIdentityObservation(
+            identifiers=(phone,),
+            evidence_ref="reassignment:old-phone",
+            observed_name="Old Person",
+            observed_at_ms=1_000,
+            account_namespace=namespace,
+        )
+        source.issue_observation(old_observation)
+        old_person = knowledge.resolve_person(old_observation).person_id
+        assert old_person is not None
+
+        paired_observation = TrustedIdentityObservation(
+            identifiers=(phone, lid),
+            evidence_ref="reassignment:provider-pair",
+            observed_name="Old Person",
+            observed_at_ms=1_500,
+            mapping_verified=True,
+            account_namespace=namespace,
+        )
+        source.issue_observation(paired_observation)
+        assert knowledge.resolve_person(paired_observation).person_id == old_person
+
+        new_observation = TrustedIdentityObservation(
+            identifiers=(
+                Identifier("telegram", "telegram_id", "920199", "telegram-account"),
+            ),
+            evidence_ref="reassignment:new-owner",
+            observed_name="New Person",
+            observed_at_ms=3_000,
+            channel_hint="telegram",
+        )
+        source.issue_observation(new_observation)
+        new_person = knowledge.resolve_person(new_observation).person_id
+        assert new_person is not None
+        old_binding = knowledge._identity.binding_for(phone)
+        assert old_binding is not None
+        source.issue_evidence_ref("reassignment:owner-change")
+        knowledge.add_or_end_binding(
+            person_id=new_person,
+            identifier=phone,
+            evidence_ref="reassignment:owner-change",
+            context=context,
+            valid_from_ms=3_000,
+            end_binding_id=old_binding.binding_id,
+            end_at_ms=3_000,
+        )
+
+        # A pending row can outlive the flawed current-owner join from the prior code.
+        # Seed that persisted snapshot to verify refresh removes its obsolete support.
+        pair = tuple(sorted((old_person, new_person)))
+        candidate_id = knowledge._store.new_id()
+        now = knowledge._store.now_ms()
+        stale_evidence = json.dumps(
+            {
+                "signals": [["provider_pair_source_count", 1]],
+                "common_names": [],
+                "provider_pair_sources": [["whatsapp", namespace, 1]],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        knowledge._store.execute(
+            "INSERT INTO knowledge_identity_candidates"
+            " (candidate_id, person_low_id, person_high_id, status, candidate_revision,"
+            " evidence_version, identity_revision, created_ms, updated_ms)"
+            " VALUES (?, ?, ?, 'pending', 1, 1, ?, ?, ?)",
+            (candidate_id, *pair, knowledge._store.identity_revision, now, now),
+        )
+        knowledge._store.execute(
+            "INSERT INTO knowledge_identity_candidate_evidence"
+            " (candidate_id, evidence_version, identity_revision, evidence_json, created_ms)"
+            " VALUES (?, 1, ?, ?, ?)",
+            (candidate_id, knowledge._store.identity_revision, stale_evidence, now),
+        )
+
+        refreshed = knowledge.propose_identity_candidates(context=context)
+
+        assert not any(
+            item.person_ids == pair and item.provider_pair_sources for item in refreshed
+        )
+        persisted = next(
+            item
+            for item in knowledge.list_identity_candidates(context=context)
+            if item.candidate_id == candidate_id
+        )
+        assert persisted.provider_pair_sources == ()
+        assert persisted.evidence == ()
+        assert persisted.evidence_version == 2
+        assert knowledge._store.query_one(
+            "SELECT COUNT(*) AS count FROM knowledge_identity_candidate_evidence"
+            " WHERE candidate_id = ?",
+            (candidate_id,),
+        )["count"] == 2
+        with pytest.raises(KnowledgeError) as exc_info:
+            knowledge.decide_identity_candidate(
+                candidate_id,
+                decision="merge",
+                expected_candidate_revision=persisted.candidate_revision,
+                expected_identity_revision=persisted.identity_revision,
+                context=context,
+                target_id=old_person,
+            )
+        assert exc_info.value.code == "stale_revision"
+    finally:
+        knowledge.close()
+
+
+def test_candidate_list_ids_drive_revision_checked_cli_merge(tmp_path: Path) -> None:
+    import json
+    import re
+
+    from yeoman_gateway.cli.knowledge_commands import knowledge_app
+
+    db = tmp_path / "knowledge.db"
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"owners": {"telegram": ["999"]}}), encoding="utf-8"
+    )
+    source = FakeSourceAuthority()
+    knowledge = open_knowledge_store(
+        db,
+        workspace_id=workspace_id_for(tmp_path),
+        source_authority=source,
+        policy_authority=FakePolicyAuthority(admins={"owner:1"}),
+    )
+    admin = TrustedAdminContext("owner:1", 1, "admin-ref-1", owner=True)
+    first = _person(knowledge, source, 9101, name="Candidate One")
+    second = _person(knowledge, source, 9102, name="candidate one")
+    candidate = knowledge.propose_identity_candidates(context=admin)[0]
+    knowledge.close()
+
+    runner = CliRunner()
+    listed = runner.invoke(
+        knowledge_app,
+        [
+            "person-candidates-list",
+            "--db",
+            str(db),
+            "--policy",
+            str(policy_path),
+        ],
+    )
+    assert listed.exit_code == 0, listed.output
+    assert candidate.candidate_id in listed.output
+    assert first in listed.output
+    assert second in listed.output
+    candidate_line = re.search(
+        r"(?m)^(\S+) pending candidate_revision=(\d+) evidence_version=(\d+)"
+        r" identity_revision=(\d+)$",
+        listed.output,
+    )
+    people_line = re.search(r"(?m)^  people=([^, ]+),([^ ]+)", listed.output)
+    assert candidate_line is not None
+    assert people_line is not None
+    candidate_id, candidate_revision, _, identity_revision = candidate_line.groups()
+    target_id = people_line.group(1)
+    arguments = [
+        "person-candidate-decide",
+        "--db",
+        str(db),
+        "--policy",
+        str(policy_path),
+        "--candidate",
+        candidate_id,
+        "--candidate-revision",
+        candidate_revision,
+        "--identity-revision",
+        identity_revision,
+        "--decision",
+        "merge",
+        "--target",
+        target_id,
+    ]
+
+    preview = runner.invoke(knowledge_app, arguments)
+    assert preview.exit_code == 0, preview.output
+    assert "would apply merge" in preview.output
+    decided = runner.invoke(knowledge_app, [*arguments, "--apply"])
+    assert decided.exit_code == 0, decided.output
+    assert "merged" in decided.output

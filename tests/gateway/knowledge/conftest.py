@@ -103,12 +103,22 @@ class KnowledgeHarness:
         """Issue a verified observation and resolve it through the public API."""
         self._observation_counter += 1
         identifiers = (Identifier(channel=channel, kind=kind, value=value), *extra)
+        account_namespace = None
+        if (
+            mapping
+            and len(identifiers) == 2
+            and all(item.channel == "whatsapp" for item in identifiers)
+            and {item.kind for item in identifiers} == {"phone_jid", "lid"}
+            and len({item.namespace for item in identifiers}) == 1
+        ):
+            account_namespace = identifiers[0].namespace
         observation = TrustedIdentityObservation(
             identifiers=identifiers,
             evidence_ref=f"obs-{self._observation_counter}",
             observed_name=name,
             observed_at_ms=self.clock.now_ms(),
             mapping_verified=mapping,
+            account_namespace=account_namespace or "",
         )
         self.authority.issue_observation(observation)
         resolved = self.service.resolve_person(observation, context=context)

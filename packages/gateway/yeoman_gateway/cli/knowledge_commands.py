@@ -1089,13 +1089,13 @@ def _print_candidate(candidate: IdentityCandidate) -> None:
     )
     names = ", ".join(candidate.common_names) or "no exact normalized name"
     _line(
-        f"{_redacted(candidate.candidate_id)} {candidate.status}"
+        f"{candidate.candidate_id} {candidate.status}"
         f" candidate_revision={candidate.candidate_revision}"
         f" evidence_version={candidate.evidence_version}"
         f" identity_revision={candidate.identity_revision}"
     )
     _line(
-        f"  people={_redacted(candidate.person_ids[0])},{_redacted(candidate.person_ids[1])}"
+        f"  people={candidate.person_ids[0]},{candidate.person_ids[1]}"
         f" names={names} {evidence} {score}"
     )
 
@@ -1179,7 +1179,7 @@ def knowledge_person_candidate_decide(
             if decision == "merge" and target not in current.person_ids:
                 _fail("invalid_input", "merge target must be one of the candidate people")
             _line(
-                f"dry run: would apply {decision} to {_redacted(candidate)}"
+                f"dry run: would apply {decision} to {candidate}"
                 "; re-run with --apply to write"
             )
             return

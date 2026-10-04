@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.knowledge.models import (
@@ -152,6 +153,68 @@ def test_explicit_name_candidates_are_ambiguous_and_offered_member_only(knowledg
     assert all(item.reason == "name_candidate_requires_confirmation" for item in candidates)
 
 
+async def test_plaintext_alias_candidates_use_boundaries_and_current_members_only(
+    knowledge_harness,
+):
+    h = knowledge_harness
+    members = (
+        _observe_pair(
+            h,
+            "4910000000101@s.whatsapp.net",
+            "8420000101@lid",
+            name="Alex",
+        ),
+        _observe_pair(
+            h,
+            "4910000000102@s.whatsapp.net",
+            "8420000102@lid",
+            name="Alex",
+        ),
+    )
+    outsider = _observe_pair(
+        h,
+        "4910000000103@s.whatsapp.net",
+        "8420000103@lid",
+        name="Alex",
+    )
+    member_ids = {item.person_id for item in members}
+    assert None not in member_ids
+    context = _mention_context(h, "whatsapp:4910000000101", "whatsapp:4910000000102")
+    middleware = ContactsMiddleware(
+        knowledge=h.service,
+        mention_context_factory=lambda _: context,
+    )
+    people_before = h.service.stats(context=h.admin_context()).people_count
+
+    async def candidates_for(content: str):
+        event = InboundEvent(
+            channel="whatsapp",
+            chat_id="mention-room",
+            sender_id="untyped-sender",
+            participant=None,
+            content=content,
+            raw_metadata={"account_id": ACCOUNT},
+        )
+        pipeline_context = PipelineContext(event=event)
+
+        async def next_middleware(_ctx):
+            return None
+
+        await middleware(pipeline_context, next_middleware)
+        return pipeline_context.event.raw_metadata.get("mentioned_person_candidates", [])
+
+    mentioned = await candidates_for("Alex, what do you think?")
+    substring_only = await candidates_for("Alexandra, what do you think?")
+    people_after = h.service.stats(context=h.admin_context()).people_count
+
+    assert {item["person_id"] for item in mentioned} == member_ids
+    assert outsider.person_id not in {item["person_id"] for item in mentioned}
+    assert all(item["source"] == "plaintext_alias" for item in mentioned)
+    assert all(item["status"] == "ambiguous" for item in mentioned)
+    assert substring_only == []
+    assert people_after == people_before
+
+
 async def test_contacts_middleware_attaches_mentions_separately_and_preserves_metadata(
     knowledge_harness,
 ):
@@ -202,7 +265,8 @@ async def test_contacts_middleware_attaches_mentions_separately_and_preserves_me
     assert ctx.event.raw_metadata["mentioned_jids"] == [lid]
 
 
-def test_whatsapp_core_event_preserves_native_mention_jids():
+@pytest.mark.parametrize("account_id", [ACCOUNT, "default"])
+def test_whatsapp_core_event_preserves_native_mention_jids(account_id):
     from yeoman_gateway.channels.whatsapp import InboundEvent as WhatsAppInboundEvent
     from yeoman_gateway.channels.whatsapp import WhatsAppChannel
 
@@ -231,15 +295,18 @@ def test_whatsapp_core_event_preserves_native_mention_jids():
         voice_transcript=None,
     )
     channel = object.__new__(WhatsAppChannel)
-    channel._processing_account_id = ACCOUNT
+    channel._processing_account_id = account_id
 
     core_event = channel._to_core_event(event, "synthetic-message")
 
     assert core_event.raw_metadata["mentioned_jids"] == [lid]
-    assert core_event.raw_metadata["account_id"] == ACCOUNT
+    assert core_event.raw_metadata["account_id"] == account_id
 
 
-async def test_runtime_context_rechecks_registry_members_and_qualified_principal(tmp_path):
+@pytest.mark.parametrize("account_id", [ACCOUNT, "default"])
+async def test_runtime_context_rechecks_registry_members_and_qualified_principal(
+    tmp_path, account_id
+):
     from dataclasses import replace
     from pathlib import Path
 
@@ -291,7 +358,7 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
         phone = "4910000000051@s.whatsapp.net"
         lid = "8420000051@lid"
         member_resolution = _observe_pair_for_service(
-            service, authority, phone, lid, name="Runtime Member"
+            service, authority, phone, lid, name="Runtime Member", account=account_id
         )
         sender_phone = "4910000000050@s.whatsapp.net"
         _observe_pair_for_service(
@@ -300,6 +367,7 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
             sender_phone,
             "8420000050@lid",
             name="Runtime Sender",
+            account=account_id,
         )
         event = InboundEvent(
             channel="whatsapp",
@@ -309,7 +377,7 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
             content="hello",
             is_group=True,
             raw_metadata={
-                "account_id": ACCOUNT,
+                "account_id": account_id,
                 "sender_phone_jid": sender_phone,
                 "message_id": "synthetic-runtime-message",
                 "mentioned_jids": [lid],
@@ -393,10 +461,18 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
             ]
 
         result = service.resolve_mentions(
-            (Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),),
+            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
             at_ms=None,
             context=context,
+            account_namespace=account_id,
         )[0]
+        mismatch = service.resolve_mentions(
+            (Identifier("whatsapp", "lid", lid, namespace=account_id),),
+            context=context,
+            account_namespace=ACCOUNT if account_id == "default" else "other-account",
+        )[0]
+        assert mismatch.status == "unresolved"
+        assert mismatch.reason == "account_namespace_mismatch"
         registry.sync_from_bridge_metadata(
             "whatsapp",
             [
@@ -441,17 +517,19 @@ async def test_runtime_context_rechecks_registry_members_and_qualified_principal
         registry.close()
 
 
-def _observe_pair_for_service(service, authority, phone: str, lid: str, *, name: str):
+def _observe_pair_for_service(
+    service, authority, phone: str, lid: str, *, name: str, account: str = ACCOUNT
+):
     observation = TrustedIdentityObservation(
         identifiers=(
-            Identifier("whatsapp", "phone_jid", phone, namespace=ACCOUNT),
-            Identifier("whatsapp", "lid", lid, namespace=ACCOUNT),
+            Identifier("whatsapp", "phone_jid", phone, namespace=account),
+            Identifier("whatsapp", "lid", lid, namespace=account),
         ),
         evidence_ref=f"mention-observation:{phone}",
         observed_name=name,
         observed_at_ms=1_700_000_000_000,
         mapping_verified=True,
-        account_namespace=ACCOUNT,
+        account_namespace=account,
     )
     authority.issue_observation(observation)
     return service.resolve_person(observation)

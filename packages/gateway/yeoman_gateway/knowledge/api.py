@@ -449,6 +449,7 @@ class KnowledgeService:
         *,
         at_ms: int | None = None,
         context: TrustedReadContext,
+        account_namespace: str | None = None,
     ) -> tuple[PersonResolution, ...]:
         """Resolve typed mention identifiers only as candidates offered in this chat.
 
@@ -498,9 +499,20 @@ class KnowledgeService:
                     )
                 )
                 continue
-            # Identifier remains defaultable for compatibility in older callers. Mentions
-            # require the actual channel account so an omitted namespace cannot look proven.
-            if identifier.namespace == DEFAULT_NAMESPACE:
+            # A default namespace is valid only when the transport supplied that exact
+            # account explicitly. Identifier's compatibility default cannot prove it.
+            if account_namespace is not None and account_namespace != identifier.namespace:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="account_namespace_mismatch",
+                    )
+                )
+                continue
+            if identifier.namespace == DEFAULT_NAMESPACE and account_namespace is None:
                 results.append(
                     PersonResolution(
                         status="unresolved",
@@ -572,6 +584,29 @@ class KnowledgeService:
         )
         return self._identity.search_mention_name_candidates(
             name_token,
+            person_ids=offered_people,
+            context=checked,
+        )
+
+    def search_mention_text_candidates(
+        self, content: str, *, context: TrustedReadContext
+    ) -> tuple[PersonResolution, ...]:
+        """Find deterministic plaintext alias mentions among offered chat members."""
+        if not isinstance(content, str) or not content.strip():
+            return ()
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return ()
+        offered_people = tuple(
+            dict.fromkeys(
+                self._identity.canonical_id(person_id)
+                for principal in decision.recipients
+                if (person_id := self._identity.person_id_for_principal(principal)) is not None
+            )
+        )
+        return self._identity.search_mention_text_candidates(
+            content,
             person_ids=offered_people,
             context=checked,
         )

@@ -14,11 +14,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman_gateway.agent.tools.resolve_contact import (
     ResolveContactTool,
     resolve_contact_reference,
 )
-from yeoman_gateway.adapters.reply_archive_sqlite import SqliteReplyArchiveAdapter
 from yeoman_gateway.agent.tools.summarize_history import SummarizeHistoryTool
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import InboundEvent
@@ -86,12 +86,23 @@ def knowledge(tmp_path: Path):
     ) -> str:
         """Create the person a *verified* platform observation points at."""
         counter["n"] += 1
+        identifiers = (Identifier(channel, kind, value, "account-tests"), *extra)
+        account_namespace = ""
+        if (
+            mapping
+            and len(identifiers) == 2
+            and all(item.channel == "whatsapp" for item in identifiers)
+            and {item.kind for item in identifiers} == {"phone_jid", "lid"}
+            and len({item.namespace for item in identifiers}) == 1
+        ):
+            account_namespace = identifiers[0].namespace
         observation = TrustedIdentityObservation(
-            identifiers=(Identifier(channel, kind, value, "account-tests"), *extra),
+            identifiers=identifiers,
             evidence_ref=f"cutover-observation-{counter['n']}",
             observed_name=name,
             observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock seam
             mapping_verified=mapping,
+            account_namespace=account_namespace,
         )
         authority.issue_observation(observation)
         resolved = service.resolve_observation(observation)
@@ -111,6 +122,27 @@ def knowledge(tmp_path: Path):
 
     service.issue_person = issue  # type: ignore[attr-defined]
     service.allow_address = allow_address  # type: ignore[attr-defined]
+
+    def add_secondary_address(person_id: str, value: str) -> None:
+        """Bind a separately issued phone observation through an owner operation."""
+        counter["n"] += 1
+        identifier = Identifier("whatsapp", "phone_jid", value, "account-tests")
+        evidence_ref = f"cutover-owner-binding-{counter['n']}"
+        observation = TrustedIdentityObservation(
+            identifiers=(identifier,),
+            evidence_ref=evidence_ref,
+            observed_at_ms=service._now(),  # noqa: SLF001 - synthetic clock seam
+        )
+        authority.issue_observation(observation)
+        service.bind_identifier(
+            person_id,
+            identifier,
+            evidence_ref=evidence_ref,
+            mapping_verified=False,
+            context=service.admin_context_for(reason="cutover-secondary-address"),
+        )
+
+    service.add_secondary_address = add_secondary_address  # type: ignore[attr-defined]
     try:
         yield service
     finally:
@@ -626,14 +658,8 @@ def _retract(knowledge, person_id: str, name: str) -> None:
 
 def test_two_proven_phone_addresses_are_ambiguous_not_a_first_match(knowledge) -> None:
     """Spec 7.2: several equal targets are ambiguous."""
-    knowledge.issue_person(
-        FRANK_PHONE,
-        name="Frank Taeger",
-        extra=(
-            Identifier("whatsapp", "phone_jid", "4917632625470@s.whatsapp.net", "account-tests"),
-        ),
-        mapping=True,
-    )
+    person = knowledge.issue_person(FRANK_PHONE, name="Frank Taeger")
+    knowledge.add_secondary_address(person, "4917632625470@s.whatsapp.net")
 
     assert (
         resolve_contact_reference(
@@ -648,12 +674,8 @@ def test_two_proven_phone_addresses_are_ambiguous_not_a_first_match(knowledge) -
 
 
 def test_a_conversation_address_is_preferred_over_an_unknown_one(knowledge) -> None:
-    person = knowledge.issue_person(
-        "4917632625469@s.whatsapp.net",
-        name="Frank Taeger",
-        extra=(Identifier("whatsapp", "phone_jid", "4917632625470@s.whatsapp.net", "account-tests"),),
-        mapping=True,
-    )
+    person = knowledge.issue_person("4917632625469@s.whatsapp.net", name="Frank Taeger")
+    knowledge.add_secondary_address(person, "4917632625470@s.whatsapp.net")
     in_conversation = "4917632625470@s.whatsapp.net"
 
     resolved = knowledge.identifier_for_name(

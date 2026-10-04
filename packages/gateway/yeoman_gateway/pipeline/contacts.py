@@ -18,6 +18,7 @@ knowledge facade.  It is a bridge, not an authority:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -67,11 +68,10 @@ def build_mention_read_context(
         return None
     raw = event.raw_metadata
     account_id = str(raw.get("account_id") or "").strip()
-    if not account_id or account_id == "default":
+    if not account_id:
         return None
 
     from yeoman_gateway.knowledge._memory.read_gate import registry_members
-    from yeoman_gateway.knowledge.authority import wall_clock_ms
     from yeoman_gateway.knowledge.models import TrustedReadContext
     from yeoman_gateway.policy.identity import canonical_user_id
 
@@ -106,7 +106,7 @@ def build_mention_read_context(
         membership_revision=membership_revision,
         policy_revision=revision,
         purpose="reply",
-        now_ms=wall_clock_ms(),
+        now_ms=time.time_ns() // 1_000_000,
         is_direct=not event.is_group,
         owner=False,
     )
@@ -147,7 +147,10 @@ class ContactsMiddleware:
             identifiers = self._mentioned_identifiers(event.channel, raw)
             if context is not None and identifiers:
                 resolutions = self._knowledge.resolve_mentions(
-                    identifiers, at_ms=None, context=context
+                    identifiers,
+                    at_ms=None,
+                    context=context,
+                    account_namespace=str(raw.get("account_id") or "").strip(),
                 )
                 candidates = self._candidate_metadata(
                     resolutions, source="native_identifier"
@@ -156,6 +159,19 @@ class ContactsMiddleware:
                 candidates = []
 
             raw_name_tokens = raw.get("mentioned_name_tokens")
+            if (
+                context is not None
+                and not raw_name_tokens
+                and isinstance(event.content, str)
+            ):
+                candidates.extend(
+                    self._candidate_metadata(
+                        self._knowledge.search_mention_text_candidates(
+                            event.content, context=context
+                        ),
+                        source="plaintext_alias",
+                    )
+                )
             if context is not None and isinstance(raw_name_tokens, (list, tuple)):
                 for token in raw_name_tokens:
                     if not isinstance(token, str) or not token.strip():
@@ -215,14 +231,13 @@ class ContactsMiddleware:
 
     @staticmethod
     def _mentioned_identifiers(channel: str, raw: dict[str, Any]):
-        from yeoman_gateway.knowledge.models import DEFAULT_NAMESPACE, Identifier
+        from yeoman_gateway.knowledge.models import Identifier
 
         account_id = str(raw.get("account_id") or "").strip()
         raw_mentions = raw.get("mentioned_jids")
         if (
             channel != "whatsapp"
             or not account_id
-            or account_id == DEFAULT_NAMESPACE
             or not isinstance(raw_mentions, (list, tuple))
         ):
             return ()
