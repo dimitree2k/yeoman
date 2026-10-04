@@ -30,6 +30,7 @@ next to the other command modules.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Final, NoReturn
@@ -38,6 +39,7 @@ import typer
 from rich.table import Table
 from rich.text import Text
 
+from yeoman_gateway.knowledge._identity_audit import IdentityAuditError, audit_person_stores
 from yeoman_gateway.knowledge._migration import (
     MigrationInventory,
     MigrationReport,
@@ -70,6 +72,34 @@ migration_app = typer.Typer(help="Inspect, build and verify offline legacy snaps
 knowledge_app.add_typer(migration_app, name="migration")
 capture_app = typer.Typer(help="Statement promotion: read-only status")
 knowledge_app.add_typer(capture_app, name="capture")
+
+
+@knowledge_app.command("person-audit")
+def knowledge_person_audit(
+    knowledge_db: Path = typer.Option(..., "--knowledge-db", help="Knowledge database to read"),
+    legacy_db: Path | None = typer.Option(None, "--legacy-db", help="Optional legacy contacts database"),
+    observation_files: list[Path] = typer.Option(
+        [], "--observations", help="Optional JSON array of preserved identity observations; repeatable"
+    ),
+) -> None:
+    """Reconcile person stores and print aggregate JSON without changing either input."""
+    records: list[dict[str, Any]] = []
+    try:
+        for observation_file in observation_files:
+            payload = json.loads(Path(observation_file).expanduser().read_text(encoding="utf-8"))
+            if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+                _fail("source_error", "observation inputs must be JSON arrays of objects")
+            records.extend(payload)
+        report = audit_person_stores(
+            Path(knowledge_db).expanduser(),
+            Path(legacy_db).expanduser() if legacy_db is not None else None,
+            observations=records,
+        )
+    except IdentityAuditError as exc:
+        _fail("source_error", str(exc))
+    except (OSError, json.JSONDecodeError):
+        _fail("source_error", "cannot read an observation input")
+    _line(json.dumps(report["aggregate"], ensure_ascii=True, sort_keys=True))
 
 _FAILURE_EXIT: Final[int] = 2
 
