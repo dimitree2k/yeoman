@@ -8,14 +8,18 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
 from yeoman_gateway.knowledge._identity_attribution import plan_speaker_attribution
+from yeoman_gateway.knowledge._identity_attribution_basis import resolve_attribution_binding
+from yeoman_gateway.knowledge._identity_audit import IdentityAuditError
+from yeoman_gateway.knowledge.models import Identifier
 
 
 def _write_inputs(
     root: Path,
     *,
     time_certainty: str = "native",
-    occurred_ms: int = 100,
+    occurred_ms: int | None = 100,
     proof_occurred_ms: int | None = None,
     valid_from_ms: int = 1,
     valid_until_ms: int = 0,
@@ -24,7 +28,9 @@ def _write_inputs(
     event_channel: str | None = "whatsapp",
     sender_id_raw: str | None = "15550000001@s.whatsapp.net",
     sender_raw: str | None = None,
-    copy_account: str = "test-account",
+    participant_jid_raw: str | None = None,
+    name_observations: tuple[dict[str, Any], ...] = (),
+    copy_account: str | None = "test-account",
     unproven_extra_copy: bool = False,
     extra_bindings: tuple[tuple[str, int, int], ...] = (),
     denied: int = 0,
@@ -56,6 +62,8 @@ def _write_inputs(
         "chat_id": "test-chat",
         "sender_id_raw": sender_id_raw,
         "sender_raw": sender_raw,
+        "participant_jid_raw": participant_jid_raw,
+        "name_observations": list(name_observations),
         "occurred_ms": occurred_ms,
         "time_certainty": time_certainty,
     }
@@ -400,3 +408,480 @@ def test_denied_message_is_excluded_before_identifier_resolution(tmp_path: Path)
     assert aggregate["denominator"] == 0
     assert aggregate["excluded_counts"] == {"denied": 1}
     assert aggregate["confirmed_fraction"] == {"numerator": 0, "denominator": 0}
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _without_explicit_account(history_db: Path) -> None:
+    with sqlite3.connect(history_db) as connection:
+        raw = connection.execute(
+            "SELECT normalized_json FROM history_event_details"
+        ).fetchone()[0]
+        event = json.loads(raw)
+        event["account"] = None
+        connection.execute(
+            "UPDATE history_event_details SET normalized_json=?", (json.dumps(event),)
+        )
+        connection.execute("UPDATE history_event_copies SET account=NULL")
+
+
+def _single_account_evidence(
+    history_db: Path,
+    knowledge_db: Path,
+    *,
+    config_accounts: tuple[str, ...] = ("test-account",),
+    journal_complete: bool = True,
+) -> dict[str, Any]:
+    with sqlite3.connect(history_db) as connection:
+        if connection.execute("SELECT 1 FROM history_event_copies WHERE copy_id=2").fetchone() is None:
+            connection.execute(
+                "INSERT INTO history_event_copies VALUES (2,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("event-1", "1", "inventory-source", "b" * 64, '{"line":2}',
+                 "inbound_archive_copy", "native", "inbound_archive_copy", "whatsapp",
+                 "test-account", "test-chat", "logical_copy"),
+            )
+    history_hash = _sha256(history_db)
+    knowledge_hash = _sha256(knowledge_db)
+    period = {"start_ms": 1, "end_ms": 101}
+    config_path = history_db.parent / "account-inventory.json"
+    config_path.write_text(json.dumps({
+        "channel": "whatsapp", "accounts": list(config_accounts),
+        "covered_period": period, "reviewed": True, "coverage_complete": True,
+    }))
+    config_hash = _sha256(config_path)
+    with sqlite3.connect(history_db) as connection:
+        copies = connection.execute(
+            "SELECT copy_id, source_id FROM history_event_copies WHERE event_id='event-1' ORDER BY copy_id"
+        ).fetchall()
+    journal_refs = [
+        {"input": "history", "source_id": source_id, "sha256": history_hash,
+         "locator": {"table": "history_event_copies", "copy_id": copy_id, "source_id": source_id},
+         "time_ms": 100}
+        for copy_id, source_id in copies
+    ]
+    return {
+        "schema_version": 1,
+        "input_hashes": {
+            "history": history_hash,
+            "knowledge": knowledge_hash,
+            "config": config_hash,
+        },
+        "covered_period": period,
+        "account_inventories": [
+            {
+                "channel": "whatsapp",
+                "covered_period": period,
+                "sources": {
+                    "config": {
+                        "complete": True,
+                        "reviewed": True,
+                        "coverage_complete": True,
+                        "accounts": list(config_accounts),
+                        "source_refs": [
+                            {
+                                "input": "config",
+                                "source_id": "config-whatsapp",
+                                "sha256": config_hash,
+                                "locator": {"path": str(config_path), "key": "accounts"},
+                                "time_ms": 100,
+                            }
+                        ],
+                    },
+                    "journal": {
+                        "complete": journal_complete,
+                        "accounts": ["test-account"],
+                        "source_refs": journal_refs,
+                    },
+                    "bindings": {
+                        "complete": True,
+                        "accounts": ["test-account"],
+                        "source_refs": [
+                            {
+                                "input": "knowledge",
+                                "source_id": "binding-a",
+                                "sha256": knowledge_hash,
+                                "locator": {
+                                    "table": "knowledge_identifier_bindings",
+                                    "binding_id": "binding-a",
+                                },
+                                "time_ms": 100,
+                            }
+                        ],
+                    },
+                },
+            }
+        ],
+        "observations": [],
+        "continuity_spans": [],
+    }
+
+
+def test_single_account_inference_requires_complete_period(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(tmp_path, valid_from_ms=1)
+    _without_explicit_account(history_db)
+
+    complete = plan_speaker_attribution(
+        history_db,
+        knowledge_db,
+        include_details=True,
+        attribution_evidence=_single_account_evidence(history_db, knowledge_db),
+    )["details"][0]
+    assert complete["decision"]["status"] == "candidate"
+    assert complete["attribution_basis"] == "single_account_inferred"
+    assert complete["resolution_proposal"]["canonical_person_id"] == "person-a"
+    assert complete["supporting_sources"][0]["account"] is None
+
+    multiple_accounts = _single_account_evidence(
+        history_db, knowledge_db, config_accounts=("test-account", "other-account")
+    )
+    multiple = plan_speaker_attribution(
+        history_db,
+        knowledge_db,
+        include_details=True,
+        attribution_evidence=multiple_accounts,
+    )["details"][0]
+    assert multiple["attribution_basis"] is None
+    assert multiple["decision"]["status"] == "unresolved"
+
+    incomplete = _single_account_evidence(
+        history_db, knowledge_db, journal_complete=False
+    )
+    refused = plan_speaker_attribution(
+        history_db,
+        knowledge_db,
+        include_details=True,
+        attribution_evidence=incomplete,
+    )["details"][0]
+    assert refused["attribution_basis"] is None
+    assert refused["decision"]["status"] == "unresolved"
+
+
+def _typed(kind: str, value: str, account: str = "test-account") -> Identifier:
+    return Identifier(channel="whatsapp", kind=kind, namespace=account, value=value)
+
+
+def _binding(identifier: Identifier, *, start: int = 200, status: str = "active", person: str = "person-a") -> dict[str, Any]:
+    return {
+        "binding_id": f"binding-{person}",
+        "channel": identifier.channel,
+        "kind": identifier.kind,
+        "namespace": identifier.namespace,
+        "value": identifier.value,
+        "person_id": person,
+        "status": status,
+        "valid_from_ms": start,
+        "valid_until_ms": 0,
+        "mapping_verified": 1,
+        "evidence_ref": "owner-correction:test",
+    }
+
+
+def _observation_ref(at_ms: int, source_id: str = "source-1") -> dict[str, Any]:
+    return {
+        "input": "history",
+        "source_id": source_id,
+        "sha256": "a" * 64,
+        "locator": {"table": "history_event_copies", "copy_id": 1, "source_id": source_id},
+        "time_ms": at_ms,
+    }
+
+
+def _planner_observation_ref(history_db: Path, at_ms: int) -> dict[str, Any]:
+    with sqlite3.connect(history_db) as connection:
+        row = connection.execute(
+            "SELECT source_hash,locator_json,provenance_class,source_authority FROM history_event_copies WHERE copy_id=1"
+        ).fetchone()
+    return {
+        **_observation_ref(at_ms),
+        "sha256": _sha256(history_db),
+        "source_hash": row[0],
+        "source_locator": json.loads(row[1]),
+        "provenance_class": row[2],
+        "source_authority": row[3],
+    }
+
+
+def test_lid_continuity_covers_prebinding_events() -> None:
+    identifier = _typed("lid", "abc123@lid")
+    observations = [
+        {"identifier": identifier, "observed_ms": at_ms, "time_certainty": "native",
+         "provenance_class": "native", "source_ref": _observation_ref(at_ms)}
+        for at_ms in (50, 150)
+    ]
+    result = resolve_attribution_binding(
+        identifier, 100, bindings=[_binding(identifier, start=0)], canonical_ids={},
+        observations=observations, continuity_spans=[]
+    )
+    assert result["status"] == "candidate"
+    assert result["basis"] == "observed_continuity"
+    assert result["canonical_person_id"] == "person-a"
+
+    future = resolve_attribution_binding(
+        identifier, 100, bindings=[_binding(identifier, start=200)], canonical_ids={},
+        observations=observations, continuity_spans=[]
+    )
+    assert future["status"] == "unresolved"
+    assert future["basis"] is None
+    ended = _binding(identifier, start=1, status="ended")
+    ended["valid_until_ms"] = 90
+    after_end = resolve_attribution_binding(
+        identifier, 100, bindings=[ended], canonical_ids={}, observations=observations,
+        continuity_spans=[]
+    )
+    assert after_end["status"] == "unresolved"
+    assert after_end["basis"] is None
+
+    unknown_start_ended = _binding(identifier, start=0, status="ended")
+    unknown_start_ended["valid_until_ms"] = 90
+    after_unknown_start_end = resolve_attribution_binding(
+        identifier, 100, bindings=[unknown_start_ended], canonical_ids={}, observations=observations,
+        continuity_spans=[]
+    )
+    assert after_unknown_start_end["status"] == "unresolved"
+    assert after_unknown_start_end["basis"] is None
+    unknown_start_ended["valid_until_ms"] = 0
+    unknown_end = resolve_attribution_binding(
+        identifier, 100, bindings=[unknown_start_ended], canonical_ids={}, observations=observations,
+        continuity_spans=[]
+    )
+    assert unknown_end["status"] == "unresolved"
+    assert unknown_end["basis"] is None
+    unknown_start_ended["valid_until_ms"] = 120
+    within_unknown_start_end = resolve_attribution_binding(
+        identifier, 100, bindings=[unknown_start_ended], canonical_ids={},
+        observations=[observations[0], {
+            **observations[1], "observed_ms": 110, "source_ref": _observation_ref(110)
+        }], continuity_spans=[]
+    )
+    assert within_unknown_start_end["status"] == "candidate"
+    assert within_unknown_start_end["basis"] == "observed_continuity"
+
+    competing = resolve_attribution_binding(
+        identifier, 100, bindings=[_binding(identifier, start=0), _binding(identifier, start=0, person="person-b")],
+        canonical_ids={}, observations=observations, continuity_spans=[]
+    )
+    assert competing["canonical_person_id"] is None
+    assert competing["reason"] == "binding_start_conflict"
+
+
+def test_phone_continuity_stops_at_pair_name_or_coverage_break() -> None:
+    phone = _typed("phone_jid", "15550000001@s.whatsapp.net")
+    lid = _typed("lid", "abc123@lid")
+    ref = _observation_ref(100)
+    observation = {
+        "identifier": phone, "paired_lid": lid, "name": "Ada", "observed_ms": 100,
+        "time_certainty": "native", "provenance_class": "native", "source_ref": ref,
+    }
+    span = {
+        "identifier": phone, "lid_identifier": lid, "start_ms": 50, "end_ms": 150,
+        "reviewed": True, "coverage_complete": True, "pair_name": "Ada",
+        "canonical_person_id": "person-a", "binding_id": "binding-person-a",
+        "evidence_refs": [ref],
+    }
+    args = dict(identifier=phone, at_ms=100, bindings=[_binding(phone, start=0)], canonical_ids={},
+                observations=[observation], continuity_spans=[span])
+    assert resolve_attribution_binding(**args)["basis"] == "observed_continuity"
+    name_break = {**observation, "name": "Bea"}
+    assert resolve_attribution_binding(**{**args, "observations": [name_break]})["reason"] == "phone_continuity_pair_break"
+    coverage_break = {**span, "evidence_refs": []}
+    # Empty evidence is malformed at the schema boundary; a nonmatching locator is a known gap.
+    coverage_break["evidence_refs"] = [{**ref, "locator": {"line": 9}}]
+    assert resolve_attribution_binding(**{**args, "continuity_spans": [coverage_break]})["reason"] == "phone_continuity_coverage_break"
+    weak_provenance = {**observation, "provenance_class": "recovered_text"}
+    assert resolve_attribution_binding(**{**args, "observations": [weak_provenance]})["reason"] == "phone_continuity_pair_break"
+    no_source = {**observation, "source_ref": {}}
+    assert resolve_attribution_binding(**{**args, "observations": [no_source]})["reason"] == "phone_continuity_pair_break"
+    ended_stub = _binding(phone, start=50, status="ended")
+    assert resolve_attribution_binding(**{**args, "bindings": [ended_stub]})["reason"] == "binding_end_unknown"
+
+    unknown_start_ended = _binding(phone, start=0, status="ended")
+    unknown_start_ended["valid_until_ms"] = 90
+    after_unknown_start_end = resolve_attribution_binding(
+        **{**args, "bindings": [unknown_start_ended]}
+    )
+    assert after_unknown_start_end["basis"] is None
+    unknown_start_ended["valid_until_ms"] = 0
+    unknown_end = resolve_attribution_binding(
+        **{**args, "bindings": [unknown_start_ended]}
+    )
+    assert unknown_end["basis"] is None
+    unknown_start_ended["valid_until_ms"] = 120
+    within_unknown_start_end = resolve_attribution_binding(
+        **{**args, "bindings": [unknown_start_ended]}
+    )
+    assert within_unknown_start_end["basis"] == "observed_continuity"
+
+
+def test_name_free_observation_time_certainty_matches_pinned_event(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(
+        tmp_path, time_certainty="capture_time_approx", valid_from_ms=0
+    )
+    evidence = _single_account_evidence(history_db, knowledge_db)
+    phone = _typed("phone_jid", "15550000001@s.whatsapp.net")
+    evidence["observations"] = [{
+        "identifier": phone, "observed_ms": 100, "time_certainty": "capture_time_approx",
+        "provenance_class": "native", "source_ref": _planner_observation_ref(history_db, 100),
+    }]
+    plan_speaker_attribution(
+        history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+    )
+
+    evidence["observations"][0]["time_certainty"] = "native"
+    with pytest.raises(IdentityAuditError, match="time certainty"):
+        plan_speaker_attribution(
+            history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+        )
+
+
+def test_missing_event_time_with_evidence_stays_unresolved_and_unchanged(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(
+        tmp_path, occurred_ms=None, event_account=None, copy_account=None, valid_from_ms=0
+    )
+    evidence = {
+        "schema_version": 1,
+        "input_hashes": {"history": _sha256(history_db), "knowledge": _sha256(knowledge_db)},
+        "covered_period": {"start_ms": 1, "end_ms": 200},
+        "account_inventories": [],
+        "observations": [],
+        "continuity_spans": [],
+    }
+    history_before = _sha256(history_db)
+    knowledge_before = _sha256(knowledge_db)
+
+    result = plan_speaker_attribution(
+        history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+    )
+
+    detail = result["details"][0]
+    assert result["aggregate"]["decision_counts"]["unresolved"] == 1
+    assert result["aggregate"]["reason_counts"]["unresolved"] == {"source_unproven": 1}
+    assert result["aggregate"]["source_unproven_diagnostics"] == {"event_time_unknown": 1}
+    assert detail["decision"] == {"status": "unresolved", "reason": "source_unproven"}
+    assert detail["event"]["occurred_ms"] is None
+    assert detail["resolution_proposal"] is None
+    assert "inferred_scope" not in detail
+    assert _sha256(history_db) == history_before
+    assert _sha256(knowledge_db) == knowledge_before
+
+
+def test_owner_correction_beats_continuity() -> None:
+    phone = _typed("phone_jid", "15550000001@s.whatsapp.net")
+    lid = _typed("lid", "abc123@lid")
+    ref = _observation_ref(100)
+    contradictory_span = {
+        "identifier": phone, "lid_identifier": lid, "start_ms": 50, "end_ms": 150,
+        "reviewed": True, "coverage_complete": True, "pair_name": "Someone else",
+        "canonical_person_id": "person-a", "binding_id": "binding-person-a",
+        "evidence_refs": [ref],
+    }
+    result = resolve_attribution_binding(
+        phone, 100, bindings=[_binding(phone, start=1)], canonical_ids={},
+        observations=[], continuity_spans=[contradictory_span]
+    )
+    assert result["status"] == "resolved"
+    assert result["basis"] == "proven"
+    assert result["binding_id"] == "binding-person-a"
+
+
+def test_combined_inference_uses_weakest_required_basis(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(
+        tmp_path, valid_from_ms=0, participant_jid_raw="abc123@lid",
+        name_observations=({
+            "name": "Ada", "raw_identifier": "15550000001@s.whatsapp.net",
+            "occurred_ms": 100, "observed_ms": 100, "time_certainty": "native",
+            "provenance_class": "native",
+        },),
+    )
+    _without_explicit_account(history_db)
+    evidence = _single_account_evidence(history_db, knowledge_db)
+    phone = _typed("phone_jid", "15550000001@s.whatsapp.net")
+    lid = _typed("lid", "abc123@lid")
+    ref = _planner_observation_ref(history_db, 100)
+    evidence["observations"] = [{
+        "identifier": phone, "paired_lid": lid, "name": "Ada", "observed_ms": 100,
+        "time_certainty": "native", "provenance_class": "native", "source_ref": ref,
+    }]
+    evidence["continuity_spans"] = [{
+        "identifier": phone, "lid_identifier": lid, "start_ms": 50, "end_ms": 150,
+        "reviewed": True, "coverage_complete": True, "pair_name": "Ada",
+        "canonical_person_id": "person-a", "binding_id": "binding-a", "evidence_refs": [ref],
+    }]
+    detail = plan_speaker_attribution(
+        history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+    )["details"][0]
+    assert detail["decision"]["status"] == "candidate"
+    assert detail["attribution_basis"] == "single_account_inferred"
+    assert detail["basis_components"] == ["single_account_inferred", "observed_continuity"]
+
+
+def test_phone_observation_requires_exact_source_time_and_pair_metadata(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(tmp_path, valid_from_ms=0)
+    _without_explicit_account(history_db)
+    evidence = _single_account_evidence(history_db, knowledge_db)
+    phone = _typed("phone_jid", "15550000001@s.whatsapp.net")
+    lid = _typed("lid", "abc123@lid")
+    ref = {**_planner_observation_ref(history_db, 99)}
+    evidence["observations"] = [{
+        "identifier": phone, "paired_lid": lid, "name": "Invented name", "observed_ms": 99,
+        "time_certainty": "native", "provenance_class": "native", "source_ref": ref,
+    }]
+    evidence["continuity_spans"] = [{
+        "identifier": phone, "lid_identifier": lid, "start_ms": 50, "end_ms": 101,
+        "reviewed": True, "coverage_complete": True, "pair_name": "Invented name",
+        "canonical_person_id": "person-a", "binding_id": "binding-a", "evidence_refs": [ref],
+    }]
+    with pytest.raises(IdentityAuditError):
+        plan_speaker_attribution(
+            history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+        )
+
+
+def test_account_inventory_cannot_omit_a_pinned_second_account(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(tmp_path, valid_from_ms=1)
+    _without_explicit_account(history_db)
+    with sqlite3.connect(history_db) as connection:
+        connection.execute(
+            "INSERT INTO history_event_copies VALUES (3,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("event-1", "1", "other-account-source", "d" * 64, '{"line":3}',
+             "inbound_archive_copy", "native", "inbound_archive_copy", "whatsapp",
+             "other-account", "test-chat", "logical_copy"),
+        )
+    evidence = _single_account_evidence(history_db, knowledge_db)
+    with pytest.raises(IdentityAuditError):
+        plan_speaker_attribution(
+            history_db, knowledge_db, include_details=True, attribution_evidence=evidence
+        )
+
+
+def test_weaker_attribution_preserves_denials_and_input_bytes(tmp_path: Path) -> None:
+    denied_root = tmp_path / "denied"
+    denied_root.mkdir()
+    history_db, knowledge_db = _write_inputs(denied_root, denied=1)
+    _without_explicit_account(history_db)
+    evidence = _single_account_evidence(history_db, knowledge_db)
+    before = (_sha256(history_db), _sha256(knowledge_db))
+    result = plan_speaker_attribution(history_db, knowledge_db, include_details=True,
+                                      attribution_evidence=evidence)
+    assert result["aggregate"]["denominator"] == 0
+    assert result["aggregate"]["decision_counts"]["confirmed"] == 0
+    assert (_sha256(history_db), _sha256(knowledge_db)) == before
+    assert not Path(f"{history_db}-wal").exists()
+    assert not Path(f"{history_db}-shm").exists()
+
+    audience_root = tmp_path / "unknown-audience"
+    audience_root.mkdir()
+    live_history, live_knowledge = _write_inputs(audience_root)
+    _without_explicit_account(live_history)
+    with sqlite3.connect(live_history) as connection:
+        connection.execute("UPDATE history_source_proofs SET audience_status='unknown'")
+    evidence = _single_account_evidence(live_history, live_knowledge)
+    before = (_sha256(live_history), _sha256(live_knowledge))
+    result = plan_speaker_attribution(live_history, live_knowledge, include_details=True,
+                                      attribution_evidence=evidence)
+    assert result["aggregate"]["unknown_audience_proposal_counts"] == {"candidate": 1}
+    assert result["details"][0]["supporting_sources"][0]["audience_status"] == "unknown"
+    assert (_sha256(live_history), _sha256(live_knowledge)) == before
+    assert not Path(f"{live_history}-wal").exists()
+    assert not Path(f"{live_history}-shm").exists()
