@@ -83,6 +83,8 @@ class WhatsAppMediaConfig(BaseModel):
     incoming_dir: str = str(DEFAULT_WHATSAPP_MEDIA["incoming_dir"])
     outgoing_dir: str = str(DEFAULT_WHATSAPP_MEDIA["outgoing_dir"])
     retention_days: int = int(DEFAULT_WHATSAPP_MEDIA["retention_days"])
+    image_retention_days: int = int(DEFAULT_WHATSAPP_MEDIA["image_retention_days"])
+    video_retention_days: int = int(DEFAULT_WHATSAPP_MEDIA["video_retention_days"])
     describe_images: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_images"])
     pass_image_to_assistant: bool = bool(DEFAULT_WHATSAPP_MEDIA["pass_image_to_assistant"])
     max_image_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_image_bytes_mb"])
@@ -100,7 +102,6 @@ class WhatsAppMediaConfig(BaseModel):
     )
     describe_videos: bool = bool(DEFAULT_WHATSAPP_MEDIA["describe_videos"])
     max_video_bytes_mb: int = int(DEFAULT_WHATSAPP_MEDIA["max_video_bytes_mb"])
-    video_frame_count: int = int(DEFAULT_WHATSAPP_MEDIA["video_frame_count"])
     delete_video_after_description: bool = bool(
         DEFAULT_WHATSAPP_MEDIA["delete_video_after_description"]
     )

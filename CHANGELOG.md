@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- WhatsApp media now retains images for 90 days and videos for 30 days, and sends
+  supported video files to Gemini through OpenRouter for full-clip descriptions.
 - Added the standalone `yeoman a2a serve` relay command, contract conformance
   check, and source-owned `yeoman-a2a.service` user unit for the structured
   Hermes/Yeoman A2A v1 relay.

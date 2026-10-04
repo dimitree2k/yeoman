@@ -2181,7 +2181,11 @@ class WhatsAppChannel(BaseChannel):
                 local_path=validated_path,
                 size_bytes=size_bytes,
                 timestamp=event.timestamp,
-                retention_days=self.config.media.retention_days,
+                retention_days=(
+                    self.config.media.image_retention_days
+                    if event.media_kind == "image"
+                    else self.config.media.retention_days
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -2504,7 +2508,6 @@ class WhatsAppChannel(BaseChannel):
                 description = await self._vision_describer.describe_video(
                     validated_path,
                     profile,
-                    frame_count=self.config.media.video_frame_count,
                 )
             except Exception as e:
                 logger.warning("WhatsApp video description failed {}: {}", e.__class__.__name__, e)
@@ -2593,12 +2596,16 @@ class WhatsAppChannel(BaseChannel):
                 self._media_storage.cleanup_expired,
                 self.name,
                 self.config.media.retention_days,
+                image_retention_days=self.config.media.image_retention_days,
+                video_retention_days=self.config.media.video_retention_days,
             )
             if deleted > 0:
                 logger.info(
-                    "WhatsApp media cleanup removed {} files (retention={}d)",
+                    "WhatsApp media cleanup removed {} files (retention={}d image={}d video={}d)",
                     deleted,
                     self.config.media.retention_days,
+                    self.config.media.image_retention_days,
+                    self.config.media.video_retention_days,
                 )
         except Exception as e:
             logger.warning("WhatsApp media cleanup failed {}: {}", e.__class__.__name__, e)
