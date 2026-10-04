@@ -254,7 +254,7 @@ class RuntimeKnowledgeSources:
         known = self.observations.get(observation.evidence_ref)
         if known is None:
             raise KnowledgeError("unauthorized", "identity observation was never issued")
-        if known.identifiers != observation.identifiers:
+        if known != observation:
             raise KnowledgeError("unauthorized", "observation does not match its evidence")
         return observation.evidence_ref
 

@@ -423,9 +423,10 @@ class KnowledgeService:
         """Resolve a verified platform observation.  Creates at most one stub."""
         if not isinstance(observation, TrustedIdentityObservation):
             raise ValidationError("observation must be a TrustedIdentityObservation")
-        return self._identity.resolve_observation(
-            observation, context=context, create_stub=True
-        )
+        with self._store.transaction():
+            return self._identity.resolve_observation(
+                observation, context=context, create_stub=True
+            )
 
     def search_people(
         self, name: str, *, context: TrustedReadContext
@@ -629,6 +630,27 @@ class KnowledgeService:
             return self._identity.resolve_observation(
                 observation, context=context, create_stub=create_stub
             )
+
+    def record_provider_pair(
+        self,
+        observation: TrustedIdentityObservation,
+    ) -> PersonResolution:
+        """Persist and resolve one issuer-verified WhatsApp phone/LID pairing."""
+        if not isinstance(observation, TrustedIdentityObservation):
+            raise ValidationError("observation must be a TrustedIdentityObservation")
+        with self._store.transaction():
+            return self._identity.record_provider_pair(observation)
+
+    def provider_merge_protection_reason(
+        self,
+        person_ids: Iterable[str],
+        *,
+        additional_identifiers: Iterable[Identifier] = (),
+    ) -> str | None:
+        """Check the provider-specific phone/LID cardinality guard for person sets."""
+        return self._identity.provider_merge_protection_reason(
+            person_ids, additional_identifiers=additional_identifiers
+        )
 
     def resolve_identifier(
         self, identifier: Identifier, *, at_ms: int | None = None

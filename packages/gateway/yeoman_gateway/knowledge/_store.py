@@ -182,6 +182,47 @@ _CORE_SCHEMA: tuple[str, ...] = (
       ON knowledge_identifier_bindings (channel, kind, namespace, value, status)
     """,
     """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_pair_evidence (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        first_observed_at_ms INTEGER NOT NULL,
+        last_observed_at_ms INTEGER NOT NULL,
+        first_source_locator TEXT NOT NULL,
+        last_source_locator TEXT NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_pair_sources (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        source_locator TEXT NOT NULL,
+        first_observed_at_ms INTEGER NOT NULL,
+        last_observed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value, source_locator)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_stitch_proposals (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        phone_person_id TEXT NOT NULL REFERENCES contacts(id),
+        lid_person_id TEXT NOT NULL REFERENCES contacts(id),
+        status TEXT NOT NULL CHECK (status IN ('pending','protected')),
+        reason TEXT NOT NULL,
+        evidence_ref TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS knowledge_identity_redirects (
         operation_id TEXT PRIMARY KEY,
         seq INTEGER NOT NULL DEFAULT 0,

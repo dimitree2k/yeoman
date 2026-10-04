@@ -157,7 +157,7 @@ class FakeSourceAuthority:
             raise KnowledgeError(
                 "unauthorized", "identity observation evidence was never issued"
             )
-        if known.identifiers != observation.identifiers:
+        if known != observation:
             raise KnowledgeError("unauthorized", "observation does not match its evidence")
         return observation.evidence_ref
 
