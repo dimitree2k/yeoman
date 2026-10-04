@@ -63,6 +63,11 @@ from yeoman_gateway.knowledge._upgrade import (
     verify_upgrade,
 )
 from yeoman_gateway.knowledge.api import propose_legacy_links
+from yeoman_gateway.knowledge.models import (
+    IdentityCandidate,
+    IdentityCandidateWeights,
+    ValidationError,
+)
 
 from .core import app, console
 
@@ -1058,6 +1063,141 @@ def _default_knowledge_path(db: Path | None) -> Path:
     from yeoman_shared.config.loader import load_config
 
     return Path(load_config().knowledge.db_path).expanduser()
+
+
+def _candidate_weights(path: Path | None) -> IdentityCandidateWeights | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("weights"), dict):
+            raise ValueError
+        return IdentityCandidateWeights(
+            version=str(payload["version"]),
+            weights=tuple((str(key), float(value)) for key, value in payload["weights"].items()),
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError):
+        _fail("invalid_input", "weights must be JSON with a version and numeric weights object")
+
+
+def _print_candidate(candidate: IdentityCandidate) -> None:
+    evidence = " ".join(f"{name}={count}" for name, count in candidate.evidence) or "no signals"
+    score = (
+        "unscored"
+        if candidate.score is None
+        else f"score={candidate.score:g} weights={candidate.weights_version}"
+    )
+    names = ", ".join(candidate.common_names) or "no exact normalized name"
+    _line(
+        f"{_redacted(candidate.candidate_id)} {candidate.status}"
+        f" candidate_revision={candidate.candidate_revision}"
+        f" evidence_version={candidate.evidence_version}"
+        f" identity_revision={candidate.identity_revision}"
+    )
+    _line(
+        f"  people={_redacted(candidate.person_ids[0])},{_redacted(candidate.person_ids[1])}"
+        f" names={names} {evidence} {score}"
+    )
+
+
+@knowledge_app.command("person-candidates-propose")
+def knowledge_person_candidates_propose(
+    weights: Path | None = typer.Option(None, "--weights", help="Versioned owner-approved weights JSON"),
+    apply: bool = typer.Option(False, "--apply", help="Persist proposals; without it this is a dry run"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Build duplicate-person evidence candidates (dry run by default)."""
+    configured_weights = _candidate_weights(weights)
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        candidates = knowledge.propose_identity_candidates(
+            context=knowledge.admin_context_for(reason="cli_person_candidates_propose"),
+            weights=configured_weights,
+            persist=apply,
+        )
+    except Exception as exc:
+        _fail("candidate_proposal_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    for candidate in candidates:
+        _print_candidate(candidate)
+    _line(
+        f"{'queued' if apply else 'would queue'} {len(candidates)} candidate(s)"
+        + ("" if apply else "; re-run with --apply to persist")
+    )
+
+
+@knowledge_app.command("person-candidates-list")
+def knowledge_person_candidates_list(
+    status: str | None = typer.Option(None, "--status", help="Optional pending/rejected/later/merged filter"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """List text-free owner candidate summaries."""
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        candidates = knowledge.list_identity_candidates(
+            context=knowledge.admin_context_for(reason="cli_person_candidates_list"),
+            statuses=() if status is None else (status,),
+        )
+    except Exception as exc:
+        _fail("candidate_list_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    for candidate in candidates:
+        _print_candidate(candidate)
+    _line(f"{len(candidates)} candidate(s)")
+
+
+@knowledge_app.command("person-candidate-decide")
+def knowledge_person_candidate_decide(
+    candidate: str = typer.Option(..., "--candidate", help="Candidate id"),
+    decision: str = typer.Option(..., "--decision", help="merge, not_same, or later"),
+    candidate_revision: int = typer.Option(..., "--candidate-revision", min=1),
+    identity_revision: int = typer.Option(..., "--identity-revision", min=0),
+    target: str | None = typer.Option(None, "--target", help="Person id to keep canonical for merge"),
+    apply: bool = typer.Option(False, "--apply", help="Record the decision; without it this is a dry run"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Record one revision-checked owner decision (dry run by default)."""
+    if decision not in ("merge", "not_same", "later"):
+        _fail("invalid_input", "decision must be merge, not_same or later")
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        context = knowledge.admin_context_for(reason="cli_person_candidate_decide")
+        if not apply:
+            rows = knowledge.list_identity_candidates(context=context)
+            current = next((item for item in rows if item.candidate_id == candidate), None)
+            if current is None:
+                _fail("unresolved", "unknown identity candidate")
+            if current.candidate_revision != candidate_revision:
+                _fail("stale_revision", "candidate revision changed")
+            if current.identity_revision != identity_revision:
+                _fail("stale_revision", "identity revision changed")
+            if decision == "merge" and target not in current.person_ids:
+                _fail("invalid_input", "merge target must be one of the candidate people")
+            _line(
+                f"dry run: would apply {decision} to {_redacted(candidate)}"
+                "; re-run with --apply to write"
+            )
+            return
+        result = knowledge.decide_identity_candidate(
+            candidate,
+            decision=decision,
+            expected_candidate_revision=candidate_revision,
+            expected_identity_revision=identity_revision,
+            context=context,
+            target_id=target,
+        )
+    except Exception as exc:
+        _fail("candidate_decision_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _print_candidate(result)
+    if result.operation_id:
+        _line(f"merge operation: {result.operation_id}; use person-merge-undo to reverse")
 
 
 @knowledge_app.command("person-merge")

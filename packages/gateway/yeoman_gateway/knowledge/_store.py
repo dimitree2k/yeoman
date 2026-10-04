@@ -236,6 +236,45 @@ _CORE_SCHEMA: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS knowledge_identity_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        person_low_id TEXT NOT NULL REFERENCES contacts(id),
+        person_high_id TEXT NOT NULL REFERENCES contacts(id),
+        status TEXT NOT NULL CHECK(status IN ('pending','rejected','later','merged')),
+        candidate_revision INTEGER NOT NULL DEFAULT 1,
+        evidence_version INTEGER NOT NULL,
+        identity_revision INTEGER NOT NULL,
+        operation_id TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        UNIQUE(person_low_id, person_high_id),
+        CHECK(person_low_id < person_high_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_identity_candidate_evidence (
+        candidate_id TEXT NOT NULL REFERENCES knowledge_identity_candidates(candidate_id),
+        evidence_version INTEGER NOT NULL,
+        identity_revision INTEGER NOT NULL,
+        evidence_json TEXT NOT NULL,
+        weights_version TEXT,
+        weights_json TEXT,
+        score REAL,
+        created_ms INTEGER NOT NULL,
+        PRIMARY KEY(candidate_id, evidence_version)
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS knowledge_identity_candidate_evidence_no_update
+    BEFORE UPDATE ON knowledge_identity_candidate_evidence
+    BEGIN SELECT RAISE(ABORT, 'candidate evidence versions are immutable'); END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS knowledge_identity_candidate_evidence_no_delete
+    BEFORE DELETE ON knowledge_identity_candidate_evidence
+    BEGIN SELECT RAISE(ABORT, 'candidate evidence versions are immutable'); END
+    """,
+    """
     CREATE INDEX IF NOT EXISTS knowledge_identity_redirects_by_source
       ON knowledge_identity_redirects (source_id, active)
     """,

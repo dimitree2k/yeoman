@@ -20,6 +20,7 @@ from typing import Any, Iterable
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
 from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._identity_candidates import IdentityCandidateEngine
 from yeoman_gateway.knowledge._migration import (
     LegacyCanonicalApplyReport,
     LegacyLinkApplyReport,
@@ -59,6 +60,8 @@ from yeoman_gateway.knowledge.models import (
     EpisodeBuildReport,
     EpisodeView,
     Identifier,
+    IdentityCandidate,
+    IdentityCandidateWeights,
     KnowledgeContext,
     KnowledgeError,
     KnowledgeStats,
@@ -84,6 +87,8 @@ from yeoman_gateway.knowledge.models import (
 __all__ = [
     "KnowledgeService",
     "KnowledgeStartupError",
+    "IdentityCandidate",
+    "IdentityCandidateWeights",
     "LegacyLinkApplyReport",
     "LegacyCanonicalApplyReport",
     "LegacyLinkCandidate",
@@ -351,6 +356,7 @@ class KnowledgeService:
         self.workspace_id = str(workspace_id)
         self._clock = clock
         self._identity = IdentityEngine(store, authority=self._authority, policy=policy_authority)
+        self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
         self._statements = StatementEngine(
             store,
             identity=self._identity,
@@ -651,6 +657,56 @@ class KnowledgeService:
         return self._identity.provider_merge_protection_reason(
             person_ids, additional_identifiers=additional_identifiers
         )
+
+    def propose_identity_candidates(
+        self,
+        *,
+        context: TrustedAdminContext,
+        weights: IdentityCandidateWeights | None = None,
+        persist: bool = True,
+    ) -> tuple[IdentityCandidate, ...]:
+        """Refresh the owner-only duplicate queue using available structured evidence."""
+        self._require_admin_context(context)
+        if persist:
+            with self._store.transaction():
+                return self._identity_candidates.propose(
+                    context=context, weights=weights, persist=True
+                )
+        return self._identity_candidates.propose(
+            context=context, weights=weights, persist=False
+        )
+
+    def list_identity_candidates(
+        self,
+        *,
+        context: TrustedAdminContext,
+        statuses: tuple[str, ...] = (),
+    ) -> tuple[IdentityCandidate, ...]:
+        """List owner-only candidate summaries; ordinary read contexts are rejected."""
+        self._require_admin_context(context)
+        return self._identity_candidates.list_candidates(context=context, statuses=statuses)
+
+    def decide_identity_candidate(
+        self,
+        candidate_id: str,
+        *,
+        decision: str,
+        expected_candidate_revision: int,
+        expected_identity_revision: int,
+        context: TrustedAdminContext,
+        target_id: str | None = None,
+    ) -> IdentityCandidate:
+        """Record an owner decision, routing merges through the existing redirect API."""
+        self._require_admin_context(context)
+        with self._store.transaction():
+            return self._identity_candidates.decide(
+                candidate_id,
+                decision=decision,
+                expected_candidate_revision=expected_candidate_revision,
+                expected_identity_revision=expected_identity_revision,
+                context=context,
+                target_id=target_id,
+            )
 
     def resolve_identifier(
         self, identifier: Identifier, *, at_ms: int | None = None
