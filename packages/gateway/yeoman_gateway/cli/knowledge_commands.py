@@ -30,6 +30,7 @@ next to the other command modules.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Final, NoReturn
@@ -38,6 +39,7 @@ import typer
 from rich.table import Table
 from rich.text import Text
 
+from yeoman_gateway.knowledge._identity_audit import IdentityAuditError, audit_person_stores
 from yeoman_gateway.knowledge._migration import (
     MigrationInventory,
     MigrationReport,
@@ -61,6 +63,11 @@ from yeoman_gateway.knowledge._upgrade import (
     verify_upgrade,
 )
 from yeoman_gateway.knowledge.api import propose_legacy_links
+from yeoman_gateway.knowledge.models import (
+    IdentityCandidate,
+    IdentityCandidateWeights,
+    ValidationError,
+)
 
 from .core import app, console
 
@@ -70,6 +77,34 @@ migration_app = typer.Typer(help="Inspect, build and verify offline legacy snaps
 knowledge_app.add_typer(migration_app, name="migration")
 capture_app = typer.Typer(help="Statement promotion: read-only status")
 knowledge_app.add_typer(capture_app, name="capture")
+
+
+@knowledge_app.command("person-audit")
+def knowledge_person_audit(
+    knowledge_db: Path = typer.Option(..., "--knowledge-db", help="Knowledge database to read"),
+    legacy_db: Path | None = typer.Option(None, "--legacy-db", help="Optional legacy contacts database"),
+    observation_files: list[Path] = typer.Option(
+        [], "--observations", help="Optional JSON array of preserved identity observations; repeatable"
+    ),
+) -> None:
+    """Reconcile person stores and print aggregate JSON without changing either input."""
+    records: list[dict[str, Any]] = []
+    try:
+        for observation_file in observation_files:
+            payload = json.loads(Path(observation_file).expanduser().read_text(encoding="utf-8"))
+            if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+                _fail("source_error", "observation inputs must be JSON arrays of objects")
+            records.extend(payload)
+        report = audit_person_stores(
+            Path(knowledge_db).expanduser(),
+            Path(legacy_db).expanduser() if legacy_db is not None else None,
+            observations=records,
+        )
+    except IdentityAuditError as exc:
+        _fail("source_error", str(exc))
+    except (OSError, json.JSONDecodeError):
+        _fail("source_error", "cannot read an observation input")
+    _line(json.dumps(report["aggregate"], ensure_ascii=True, sort_keys=True))
 
 _FAILURE_EXIT: Final[int] = 2
 
@@ -623,6 +658,176 @@ def snapshot_verify(
         _fail("manifest_mismatch", report.reason)
 
 
+@snapshot_app.command("collect")
+def snapshot_collect(
+    sources: Path = typer.Option(..., "--sources", help="JSON file containing explicit source descriptors"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Collect explicitly named sources. No runtime source paths are inferred."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, collect_sources
+
+    try:
+        descriptors = json.loads(sources.read_text(encoding="utf-8"))
+        report = collect_sources(sources=descriptors, target_dir=target_dir)
+    except (OSError, ValueError, SnapshotError) as exc:
+        message = exc.message if isinstance(exc, SnapshotError) else "cannot read source descriptor JSON"
+        _fail("source_error", message, getattr(exc, "code", "sources_invalid"))
+    _line(f"bundle: {report['bundle_dir']}")
+    _line(f"manifest: {report['manifest_path']}")
+    _line(f"sources: {report['source_count']}")
+    _line(f"complete: {'yes' if report['complete'] else 'no'}")
+
+
+@snapshot_app.command("verify-bundle")
+def snapshot_verify_bundle(
+    manifest: Path = typer.Option(..., "--manifest", help="Source bundle manifest"),
+    restore_dir: Path | None = typer.Option(
+        None, "--restore-dir", help="Optional directory for verified isolated copies"
+    ),
+) -> None:
+    """Verify bundle hashes and SQLite structure without exposing row values."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_source_bundle
+
+    try:
+        report = verify_source_bundle(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"bundle verdict: {report['verdict']}", style="green" if report["verdict"] == "ok" else "red")
+    _line(f"sources: {report['source_count']}")
+    if report["verdict"] != "ok":
+        _fail("manifest_mismatch", ", ".join(report["errors"]))
+
+
+@snapshot_app.command("restore")
+def snapshot_restore_bundle(
+    manifest: Path = typer.Option(..., "--manifest", help="Source bundle manifest"),
+    restore_dir: Path = typer.Option(..., "--restore-dir", help="New empty directory for isolated copies"),
+) -> None:
+    """Restore and verify a source bundle into an isolated directory."""
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, verify_source_bundle
+
+    try:
+        report = verify_source_bundle(manifest=manifest, restore_dir=restore_dir)
+    except SnapshotError as exc:
+        _fail("manifest_mismatch", exc.message, exc.code)
+    _line(f"bundle verdict: {report['verdict']}", style="green" if report["verdict"] == "ok" else "red")
+    _line(f"sources: {report['source_count']}")
+    _line(f"restore: {restore_dir}")
+    if report["verdict"] != "ok":
+        _fail("manifest_mismatch", ", ".join(report["errors"]))
+
+
+@snapshot_app.command("refresh")
+def snapshot_refresh(
+    sources: Path = typer.Option(..., "--sources", help="JSON file containing explicit source descriptors"),
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Acquire changed explicit sources and update the local provenance catalog."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, refresh_collection
+
+    try:
+        descriptors = json.loads(sources.read_text(encoding="utf-8"))
+        report = refresh_collection(sources=descriptors, target_dir=target_dir)
+    except (OSError, ValueError, SnapshotError) as exc:
+        message = exc.message if isinstance(exc, SnapshotError) else "cannot read source descriptor JSON"
+        _fail("source_error", message, getattr(exc, "code", "sources_invalid"))
+    _line(json.dumps(report, sort_keys=True))
+
+
+@snapshot_app.command("query")
+def snapshot_query(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+    source_id: str | None = typer.Option(None, "--source-id"),
+    chat: str | None = typer.Option(None, "--chat"),
+    record_type: str | None = typer.Option(None, "--record-type"),
+    native_id: str | None = typer.Option(None, "--native-id"),
+    original_after: str | None = typer.Option(None, "--original-after"),
+    original_before: str | None = typer.Option(None, "--original-before"),
+    creation_after: str | None = typer.Option(None, "--creation-after"),
+    creation_before: str | None = typer.Option(None, "--creation-before"),
+    unknown_dates: bool = typer.Option(False, "--unknown-dates"),
+) -> None:
+    """Query owner-local provenance metadata and preserved-copy locators."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, query_catalog
+
+    filters = {
+        key: value
+        for key, value in {
+            "source_id": source_id,
+            "chat": chat,
+            "record_type": record_type,
+            "native_id": native_id,
+            "original_after": original_after,
+            "original_before": original_before,
+            "creation_after": creation_after,
+            "creation_before": creation_before,
+            "unknown_dates": True if unknown_dates else None,
+        }.items()
+        if value is not None
+    }
+    try:
+        rows = query_catalog(target_dir=target_dir, filters=filters)
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(rows, indent=2, sort_keys=True))
+
+
+@snapshot_app.command("rebuild")
+def snapshot_rebuild(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+) -> None:
+    """Rebuild the disposable catalog from immutable bundle manifests."""
+    import json
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, rebuild_catalog
+
+    try:
+        report = rebuild_catalog(target_dir=target_dir)
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(report, sort_keys=True))
+
+
+@snapshot_app.command("purge")
+def snapshot_purge(
+    target_dir: Path = typer.Option(..., "--target-dir", help="Private collection root"),
+    source_id: str = typer.Option(..., "--source-id"),
+    yes: bool = typer.Option(False, "--yes", help="Apply the exact preview without prompting"),
+) -> None:
+    """Preview and confirm a local owner purge of every bundle containing a source."""
+    import json
+    import os
+
+    from yeoman_gateway.knowledge._snapshot import SnapshotError, purge_collection
+
+    operator = str(os.getuid()) if hasattr(os, "getuid") else ""
+    try:
+        preview = purge_collection(
+            target_dir=target_dir,
+            source_id=source_id,
+            operator=operator,
+            confirmed=False,
+        )
+        _line(json.dumps(preview, indent=2, sort_keys=True))
+        if not yes and not typer.confirm("Permanently purge these source bundles?", default=False):
+            raise typer.Exit(1)
+        result = purge_collection(
+            target_dir=target_dir,
+            source_id=source_id,
+            operator=operator,
+            confirmed=True,
+        )
+    except SnapshotError as exc:
+        _fail("source_error", exc.message, exc.code)
+    _line(json.dumps(result, indent=2, sort_keys=True))
+
+
 @knowledge_app.command("benchmark")
 def knowledge_benchmark(
     target: Path = typer.Option(..., "--target", help="Scratch database path to use"),
@@ -858,6 +1063,141 @@ def _default_knowledge_path(db: Path | None) -> Path:
     from yeoman_shared.config.loader import load_config
 
     return Path(load_config().knowledge.db_path).expanduser()
+
+
+def _candidate_weights(path: Path | None) -> IdentityCandidateWeights | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("weights"), dict):
+            raise ValueError
+        return IdentityCandidateWeights(
+            version=str(payload["version"]),
+            weights=tuple((str(key), float(value)) for key, value in payload["weights"].items()),
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError):
+        _fail("invalid_input", "weights must be JSON with a version and numeric weights object")
+
+
+def _print_candidate(candidate: IdentityCandidate) -> None:
+    evidence = " ".join(f"{name}={count}" for name, count in candidate.evidence) or "no signals"
+    score = (
+        "unscored"
+        if candidate.score is None
+        else f"score={candidate.score:g} weights={candidate.weights_version}"
+    )
+    names = ", ".join(candidate.common_names) or "no exact normalized name"
+    _line(
+        f"{candidate.candidate_id} {candidate.status}"
+        f" candidate_revision={candidate.candidate_revision}"
+        f" evidence_version={candidate.evidence_version}"
+        f" identity_revision={candidate.identity_revision}"
+    )
+    _line(
+        f"  people={candidate.person_ids[0]},{candidate.person_ids[1]}"
+        f" names={names} {evidence} {score}"
+    )
+
+
+@knowledge_app.command("person-candidates-propose")
+def knowledge_person_candidates_propose(
+    weights: Path | None = typer.Option(None, "--weights", help="Versioned owner-approved weights JSON"),
+    apply: bool = typer.Option(False, "--apply", help="Persist proposals; without it this is a dry run"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Build duplicate-person evidence candidates (dry run by default)."""
+    configured_weights = _candidate_weights(weights)
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        candidates = knowledge.propose_identity_candidates(
+            context=knowledge.admin_context_for(reason="cli_person_candidates_propose"),
+            weights=configured_weights,
+            persist=apply,
+        )
+    except Exception as exc:
+        _fail("candidate_proposal_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    for candidate in candidates:
+        _print_candidate(candidate)
+    _line(
+        f"{'queued' if apply else 'would queue'} {len(candidates)} candidate(s)"
+        + ("" if apply else "; re-run with --apply to persist")
+    )
+
+
+@knowledge_app.command("person-candidates-list")
+def knowledge_person_candidates_list(
+    status: str | None = typer.Option(None, "--status", help="Optional pending/rejected/later/merged filter"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """List text-free owner candidate summaries."""
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        candidates = knowledge.list_identity_candidates(
+            context=knowledge.admin_context_for(reason="cli_person_candidates_list"),
+            statuses=() if status is None else (status,),
+        )
+    except Exception as exc:
+        _fail("candidate_list_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    for candidate in candidates:
+        _print_candidate(candidate)
+    _line(f"{len(candidates)} candidate(s)")
+
+
+@knowledge_app.command("person-candidate-decide")
+def knowledge_person_candidate_decide(
+    candidate: str = typer.Option(..., "--candidate", help="Candidate id"),
+    decision: str = typer.Option(..., "--decision", help="merge, not_same, or later"),
+    candidate_revision: int = typer.Option(..., "--candidate-revision", min=1),
+    identity_revision: int = typer.Option(..., "--identity-revision", min=0),
+    target: str | None = typer.Option(None, "--target", help="Person id to keep canonical for merge"),
+    apply: bool = typer.Option(False, "--apply", help="Record the decision; without it this is a dry run"),
+    db: Path | None = typer.Option(None, "--db", help="Knowledge database (default: config)"),
+    policy: Path | None = typer.Option(None, "--policy", help="Policy file (default: live)"),
+) -> None:
+    """Record one revision-checked owner decision (dry run by default)."""
+    if decision not in ("merge", "not_same", "later"):
+        _fail("invalid_input", "decision must be merge, not_same or later")
+    knowledge = _open_admin_knowledge(db, policy)
+    try:
+        context = knowledge.admin_context_for(reason="cli_person_candidate_decide")
+        if not apply:
+            rows = knowledge.list_identity_candidates(context=context)
+            current = next((item for item in rows if item.candidate_id == candidate), None)
+            if current is None:
+                _fail("unresolved", "unknown identity candidate")
+            if current.candidate_revision != candidate_revision:
+                _fail("stale_revision", "candidate revision changed")
+            if current.identity_revision != identity_revision:
+                _fail("stale_revision", "identity revision changed")
+            if decision == "merge" and target not in current.person_ids:
+                _fail("invalid_input", "merge target must be one of the candidate people")
+            _line(
+                f"dry run: would apply {decision} to {candidate}"
+                "; re-run with --apply to write"
+            )
+            return
+        result = knowledge.decide_identity_candidate(
+            candidate,
+            decision=decision,
+            expected_candidate_revision=candidate_revision,
+            expected_identity_revision=identity_revision,
+            context=context,
+            target_id=target,
+        )
+    except Exception as exc:
+        _fail("candidate_decision_failed", str(getattr(exc, "code", "") or type(exc).__name__))
+    finally:
+        knowledge.close()
+    _print_candidate(result)
+    if result.operation_id:
+        _line(f"merge operation: {result.operation_id}; use person-merge-undo to reverse")
 
 
 @knowledge_app.command("person-merge")

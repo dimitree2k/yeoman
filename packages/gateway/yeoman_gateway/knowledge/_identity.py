@@ -8,10 +8,11 @@ naming and provenance problem; authorization stays with Policy and with
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Iterable
 
 from yeoman_gateway.knowledge._store import KnowledgeStore
 from yeoman_gateway.knowledge.models import (
@@ -391,10 +392,30 @@ class IdentityEngine:
             (identifier.channel, identifier.value, person_id, identifier.kind),
         )
         if not claimed.rowcount:
-            # Another observer already owns this identifier: drop this stub entirely
-            # (the savepoint in resolve_observation rolls the contact row back too) and
-            # let the caller read the winner.
-            raise sqlite3.IntegrityError("identifier is already bound")
+            # The legacy projection has no account namespace. It can represent one
+            # account's claim only; a typed active binding in another namespace is a
+            # projection collision, not an identity collision.
+            cross_namespace = self._store.query_one(
+                "SELECT 1 FROM contact_identifiers AS legacy"
+                " JOIN knowledge_identifier_bindings AS binding"
+                " ON binding.person_id = legacy.contact_id"
+                " WHERE legacy.channel = ? AND legacy.identifier = ?"
+                " AND legacy.kind = ? AND binding.channel = ? AND binding.kind = ?"
+                " AND binding.value = ? AND binding.namespace <> ?"
+                " AND binding.status = 'active' LIMIT 1",
+                (
+                    identifier.channel,
+                    identifier.value,
+                    identifier.kind,
+                    identifier.channel,
+                    identifier.kind,
+                    identifier.value,
+                    str(identifier.namespace),
+                ),
+            )
+            if cross_namespace is None:
+                # Same-account races and untyped legacy claims stay fail-closed.
+                raise sqlite3.IntegrityError("identifier is already bound")
         self._bind(
             person_id=person_id,
             identifier=identifier,
@@ -624,6 +645,56 @@ class IdentityEngine:
 
     # ── observation resolution ───────────────────────────────────────────────
 
+    @staticmethod
+    def _provider_pair_identifiers(
+        observation: TrustedIdentityObservation,
+    ) -> tuple[Identifier, Identifier] | None:
+        """Return the one explicitly-accounted WhatsApp phone/LID pair, if present."""
+        if observation.account_namespace == "" or len(observation.identifiers) != 2:
+            return None
+        if any(item.channel != "whatsapp" for item in observation.identifiers):
+            return None
+        by_kind = {item.kind: item for item in observation.identifiers}
+        if set(by_kind) != {"phone_jid", "lid"}:
+            return None
+        phone, lid = by_kind["phone_jid"], by_kind["lid"]
+        if phone.namespace != lid.namespace or phone.namespace != observation.account_namespace:
+            return None
+        return phone, lid
+
+    def provider_merge_protection_reason(
+        self,
+        person_ids: Iterable[str],
+        *,
+        additional_identifiers: Iterable[Identifier] = (),
+    ) -> str | None:
+        """Reject new provider stitching that would leave multiple phone/LID values.
+
+        Existing owner-directed merges remain governed by their separate admin API. This
+        guard is shared by provider stitching and pending duplicate proposals.
+        """
+        canonical_people = {self.canonical_id(item) for item in person_ids}
+        values: dict[tuple[str, str, str], set[str]] = {}
+        if canonical_people:
+            for row in self._store.query(
+                "SELECT person_id, channel, kind, namespace, value"
+                " FROM knowledge_identifier_bindings"
+                " WHERE status = 'active' AND kind IN ('phone_jid','lid')"
+            ):
+                if self.canonical_id(str(row["person_id"])) not in canonical_people:
+                    continue
+                key = (str(row["channel"]), str(row["namespace"]), str(row["kind"]))
+                values.setdefault(key, set()).add(str(row["value"]))
+        for identifier in additional_identifiers:
+            if identifier.kind not in {"phone_jid", "lid"}:
+                continue
+            key = (identifier.channel, str(identifier.namespace), identifier.kind)
+            values.setdefault(key, set()).add(identifier.value)
+        for (_channel, _namespace, _kind), identifiers in values.items():
+            if len(identifiers) > 1:
+                return "multiple_phone_or_lid_values_in_account_namespace"
+        return None
+
     def resolve_observation(
         self,
         observation: TrustedIdentityObservation,
@@ -638,6 +709,339 @@ class IdentityEngine:
         never reaches this method.
         """
         evidence_ref = self._authority.verify_observation(observation)
+        pair = self._provider_pair_identifiers(observation)
+        if pair is not None and observation.mapping_verified:
+            if observation.evidence_ref == "observation:unattributed":
+                return PersonResolution(
+                    status="ambiguous",
+                    person_id=None,
+                    display_name=None,
+                    identity_revision=self._store.identity_revision,
+                    reason="provider_pair_missing_source_locator",
+                )
+            return self._resolve_verified_provider_pair(
+                observation,
+                pair=pair,
+                evidence_ref=evidence_ref,
+                context=context,
+                create_stub=create_stub,
+            )
+        elif self._is_unrecognized_verified_provider_shape(observation):
+            return self._reject_unrecognized_verified_provider_shape(
+                observation, evidence_ref=evidence_ref
+            )
+        return self._resolve_observation_verified(
+            observation,
+            evidence_ref=evidence_ref,
+            context=context,
+            create_stub=create_stub,
+        )
+
+    def record_provider_pair(
+        self,
+        observation: TrustedIdentityObservation,
+    ) -> PersonResolution:
+        """Record and resolve one issuer-verified WhatsApp phone/LID observation."""
+        evidence_ref = self._authority.verify_observation(observation)
+        pair = self._provider_pair_identifiers(observation)
+        if pair is None:
+            raise ValidationError("provider pair needs one WhatsApp phone JID and one LID")
+        if not observation.mapping_verified:
+            raise KnowledgeError("unauthorized", "provider account mapping is not verified")
+        if observation.evidence_ref == "observation:unattributed":
+            raise KnowledgeError("unauthorized", "provider pair has no source locator")
+        return self._resolve_verified_provider_pair(
+            observation,
+            pair=pair,
+            evidence_ref=evidence_ref,
+            context=None,
+            create_stub=True,
+        )
+
+    @staticmethod
+    def _is_unrecognized_verified_provider_shape(
+        observation: TrustedIdentityObservation,
+    ) -> bool:
+        return observation.mapping_verified and len(observation.identifiers) > 1 and any(
+            item.channel == "whatsapp" and item.kind in {"phone_jid", "lid"}
+            for item in observation.identifiers
+        )
+
+    def _reject_unrecognized_verified_provider_shape(
+        self,
+        observation: TrustedIdentityObservation,
+        *,
+        evidence_ref: str,
+    ) -> PersonResolution:
+        identifiers = observation.identifiers
+        exact_pair_missing_account = (
+            len(identifiers) == 2
+            and observation.account_namespace == ""
+            and all(item.channel == "whatsapp" for item in identifiers)
+            and {item.kind for item in identifiers} == {"phone_jid", "lid"}
+            and identifiers[0].namespace != ""
+            and identifiers[0].namespace == identifiers[1].namespace
+        )
+        reason = (
+            "provider_pair_missing_account_namespace"
+            if exact_pair_missing_account
+            else "provider_pair_invalid_shape"
+        )
+
+        lids = [item for item in identifiers if item.channel == "whatsapp" and item.kind == "lid"]
+        phones = [
+            item
+            for item in identifiers
+            if item.channel == "whatsapp" and item.kind == "phone_jid"
+        ]
+        candidate: tuple[Identifier, Identifier] | None = None
+        if len(lids) == 1:
+            lid = lids[0]
+            same_namespace = [item for item in phones if item.namespace == lid.namespace]
+            if len(same_namespace) == 1:
+                candidate = same_namespace[0], lid
+            elif len(same_namespace) > 1:
+                bound_phones = [
+                    item
+                    for item in same_namespace
+                    if (binding := self.binding_for(item)) is not None
+                    and binding.status == "active"
+                ]
+                unbound_phones = [
+                    item for item in same_namespace if item not in bound_phones
+                ]
+                if len(bound_phones) == 1 and len(unbound_phones) == 1:
+                    candidate = unbound_phones[0], lid
+
+        if candidate is not None:
+            phone, lid = candidate
+            phone_binding = self.binding_for(phone)
+            lid_binding = self.binding_for(lid)
+            known_people = {
+                self.canonical_id(binding.person_id)
+                for binding in (phone_binding, lid_binding)
+                if binding is not None and binding.status == "active"
+            }
+            if known_people:
+                # This malformed mapping is evidence for review only. It cannot
+                # authorize either a new binding or a merge, even when both values
+                # currently resolve to the same person.
+                person_ids = sorted(known_people)
+                phone_person_id = (
+                    self.canonical_id(phone_binding.person_id)
+                    if phone_binding is not None and phone_binding.status == "active"
+                    else person_ids[0]
+                )
+                lid_person_id = (
+                    self.canonical_id(lid_binding.person_id)
+                    if lid_binding is not None and lid_binding.status == "active"
+                    else person_ids[0]
+                )
+                self._record_provider_stitch_proposal(
+                    phone=phone,
+                    lid=lid,
+                    phone_person_id=phone_person_id,
+                    lid_person_id=lid_person_id,
+                    status="protected",
+                    reason=reason,
+                    evidence_ref=evidence_ref,
+                )
+
+        return PersonResolution(
+            status="conflict",
+            person_id=None,
+            display_name=None,
+            identity_revision=self._store.identity_revision,
+            reason=reason,
+        )
+
+    def _resolve_verified_provider_pair(
+        self,
+        observation: TrustedIdentityObservation,
+        *,
+        pair: tuple[Identifier, Identifier],
+        evidence_ref: str,
+        context: TrustedReadContext | None,
+        create_stub: bool,
+    ) -> PersonResolution:
+        phone, lid = pair
+        observed_at_ms = int(observation.observed_at_ms or now_ms())
+        self._store.execute(
+            """
+            INSERT INTO knowledge_provider_pair_sources
+                (channel, namespace, phone_value, lid_value, source_locator,
+                 first_observed_at_ms, last_observed_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel, namespace, phone_value, lid_value, source_locator)
+            DO UPDATE SET
+                first_observed_at_ms = MIN(
+                    knowledge_provider_pair_sources.first_observed_at_ms,
+                    excluded.first_observed_at_ms
+                ),
+                last_observed_at_ms = MAX(
+                    knowledge_provider_pair_sources.last_observed_at_ms,
+                    excluded.last_observed_at_ms
+                )
+            """,
+            (
+                "whatsapp",
+                str(phone.namespace),
+                phone.value,
+                lid.value,
+                evidence_ref,
+                observed_at_ms,
+                observed_at_ms,
+            ),
+        )
+        first_source = self._store.query_one(
+            "SELECT source_locator, first_observed_at_ms"
+            " FROM knowledge_provider_pair_sources"
+            " WHERE channel = 'whatsapp' AND namespace = ? AND phone_value = ? AND lid_value = ?"
+            " ORDER BY first_observed_at_ms, source_locator LIMIT 1",
+            (str(phone.namespace), phone.value, lid.value),
+        )
+        last_source = self._store.query_one(
+            "SELECT source_locator, last_observed_at_ms"
+            " FROM knowledge_provider_pair_sources"
+            " WHERE channel = 'whatsapp' AND namespace = ? AND phone_value = ? AND lid_value = ?"
+            " ORDER BY last_observed_at_ms DESC, source_locator DESC LIMIT 1",
+            (str(phone.namespace), phone.value, lid.value),
+        )
+        assert first_source is not None and last_source is not None
+        self._store.execute(
+            """
+            INSERT INTO knowledge_provider_pair_evidence
+                (channel, namespace, phone_value, lid_value,
+                 first_observed_at_ms, last_observed_at_ms,
+                 first_source_locator, last_source_locator)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel, namespace, phone_value, lid_value) DO UPDATE SET
+                first_observed_at_ms = excluded.first_observed_at_ms,
+                last_observed_at_ms = excluded.last_observed_at_ms,
+                first_source_locator = excluded.first_source_locator,
+                last_source_locator = excluded.last_source_locator
+            """,
+            (
+                "whatsapp",
+                str(phone.namespace),
+                phone.value,
+                lid.value,
+                int(first_source["first_observed_at_ms"]),
+                int(last_source["last_observed_at_ms"]),
+                str(first_source["source_locator"]),
+                str(last_source["source_locator"]),
+            ),
+        )
+
+        existing = {
+            identifier.full_key: binding
+            for identifier in pair
+            if (binding := self.binding_for(identifier)) is not None
+            and binding.status == "active"
+        }
+        people = {self.canonical_id(binding.person_id) for binding in existing.values()}
+        identifiers = (phone, lid)
+        if len(people) > 1:
+            protection = self.provider_merge_protection_reason(
+                people, additional_identifiers=identifiers
+            )
+            self._record_provider_stitch_proposal(
+                phone=phone,
+                lid=lid,
+                phone_person_id=self.canonical_id(existing[phone.full_key].person_id),
+                lid_person_id=self.canonical_id(existing[lid.full_key].person_id),
+                status="protected" if protection else "pending",
+                reason=protection or "identifiers_belong_to_different_people",
+                evidence_ref=evidence_ref,
+            )
+            return PersonResolution(
+                status="conflict",
+                person_id=None,
+                display_name=None,
+                identity_revision=self._store.identity_revision,
+                reason="identifiers_belong_to_different_people",
+            )
+
+        if people and len(existing) < len(identifiers):
+            protection = self.provider_merge_protection_reason(
+                people, additional_identifiers=identifiers
+            )
+            if protection:
+                person_id = next(iter(people))
+                self._record_provider_stitch_proposal(
+                    phone=phone,
+                    lid=lid,
+                    phone_person_id=person_id,
+                    lid_person_id=person_id,
+                    status="protected",
+                    reason=protection,
+                    evidence_ref=evidence_ref,
+                )
+                return PersonResolution(
+                    status="conflict",
+                    person_id=None,
+                    display_name=None,
+                    identity_revision=self._store.identity_revision,
+                    reason="provider_pair_cardinality_conflict",
+                )
+
+        return self._resolve_observation_verified(
+            observation,
+            evidence_ref=evidence_ref,
+            context=context,
+            create_stub=create_stub,
+        )
+
+    def _record_provider_stitch_proposal(
+        self,
+        *,
+        phone: Identifier,
+        lid: Identifier,
+        phone_person_id: str,
+        lid_person_id: str,
+        status: str,
+        reason: str,
+        evidence_ref: str,
+    ) -> None:
+        ts = self._store.now_ms()
+        self._store.execute(
+            """
+            INSERT INTO knowledge_provider_stitch_proposals
+                (channel, namespace, phone_value, lid_value,
+                 phone_person_id, lid_person_id, status, reason, evidence_ref,
+                 created_ms, updated_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel, namespace, phone_value, lid_value) DO UPDATE SET
+                phone_person_id = excluded.phone_person_id,
+                lid_person_id = excluded.lid_person_id,
+                status = excluded.status,
+                reason = excluded.reason,
+                evidence_ref = excluded.evidence_ref,
+                updated_ms = excluded.updated_ms
+            """,
+            (
+                "whatsapp",
+                str(phone.namespace),
+                phone.value,
+                lid.value,
+                phone_person_id,
+                lid_person_id,
+                status,
+                reason,
+                evidence_ref,
+                ts,
+                ts,
+            ),
+        )
+
+    def _resolve_observation_verified(
+        self,
+        observation: TrustedIdentityObservation,
+        *,
+        evidence_ref: str,
+        context: TrustedReadContext | None,
+        create_stub: bool,
+    ) -> PersonResolution:
         revision = self._store.identity_revision
         observed_at_ms = int(observation.observed_at_ms or now_ms())
 
@@ -662,6 +1066,14 @@ class IdentityEngine:
             if observation.mapping_verified:
                 for identifier in observation.identifiers:
                     if identifier.full_key in existing:
+                        matched = existing[identifier.full_key]
+                        self._bind(
+                            person_id=matched.person_id,
+                            identifier=identifier,
+                            evidence_ref=matched.evidence_ref,
+                            mapping_verified=True,
+                            observed_at_ms=observed_at_ms,
+                        )
                         continue
                     if identifier.kind in _REASSIGNABLE_KINDS:
                         # A recyclable handle is not durable identity evidence.
@@ -1294,6 +1706,104 @@ class IdentityEngine:
                     display_name=self.display_name(person_id, context=context),
                     identity_revision=self._store.identity_revision,
                     reason="name_match",
+                )
+            )
+        return tuple(results)
+
+    def search_mention_name_candidates(
+        self,
+        name_token: str,
+        *,
+        person_ids: tuple[str, ...],
+        context: TrustedReadContext,
+    ) -> tuple[PersonResolution, ...]:
+        """Find name candidates only among offered people and visible scoped aliases."""
+        token = normalize_alias_value(validate_name(name_token, "mention name token"))
+        if not token:
+            return ()
+        allowed_scopes = {GLOBAL_SCOPE_KEY, context.scope_key()}
+        results: list[PersonResolution] = []
+        for person_id in sorted({self.canonical_id(item) for item in person_ids}):
+            person = self.get_person(person_id)
+            if person is None or person.status != "active":
+                continue
+            names = [
+                alias
+                for member_id in self.merged_member_ids(person_id)
+                for alias in self.aliases_of(member_id)
+                if alias.status in ("observed", "confirmed")
+                and alias.findable
+                and alias.scope_key in allowed_scopes
+                and (alias.visibility == "public" or context.is_direct)
+                and (alias.valid_until_ms is None or alias.valid_until_ms > context.now_ms)
+            ]
+            matching = [
+                alias.name
+                for alias in names
+                if token in normalize_alias_value(alias.name)
+            ]
+            if not matching:
+                continue
+            matched_name = min(
+                matching,
+                key=lambda name: (
+                    normalize_alias_value(name) != token,
+                    len(normalize_alias_value(name)),
+                    normalize_alias_value(name),
+                ),
+            )
+            results.append(
+                PersonResolution(
+                    status="ambiguous",
+                    person_id=person_id,
+                    display_name=matched_name,
+                    identity_revision=self._store.identity_revision,
+                    reason="name_candidate_requires_confirmation",
+                )
+            )
+        return tuple(results)
+
+    def search_mention_text_candidates(
+        self,
+        content: str,
+        *,
+        person_ids: tuple[str, ...],
+        context: TrustedReadContext,
+    ) -> tuple[PersonResolution, ...]:
+        """Match complete visible aliases in ordinary text, without resolving identity."""
+        text = " ".join(content.casefold().split())
+        if not text:
+            return ()
+        allowed_scopes = {GLOBAL_SCOPE_KEY, context.scope_key()}
+        results: list[PersonResolution] = []
+        for person_id in sorted({self.canonical_id(item) for item in person_ids}):
+            person = self.get_person(person_id)
+            if person is None or person.status != "active":
+                continue
+            eligible_names = {
+                normalize_alias_value(alias.name)
+                for member_id in self.merged_member_ids(person_id)
+                for alias in self.aliases_of(member_id)
+                if alias.status in ("observed", "confirmed")
+                and alias.findable
+                and alias.scope_key in allowed_scopes
+                and (alias.visibility == "public" or context.is_direct)
+                and (alias.valid_until_ms is None or alias.valid_until_ms > context.now_ms)
+            }
+            matches = sorted(
+                name
+                for name in eligible_names
+                if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text)
+            )
+            if not matches:
+                continue
+            results.append(
+                PersonResolution(
+                    status="ambiguous",
+                    person_id=person_id,
+                    display_name=matches[0],
+                    identity_revision=self._store.identity_revision,
+                    reason="name_candidate_requires_confirmation",
                 )
             )
         return tuple(results)

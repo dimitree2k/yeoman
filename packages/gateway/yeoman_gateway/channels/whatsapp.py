@@ -1813,6 +1813,7 @@ class WhatsAppChannel(BaseChannel):
                 # identifier, so two accounts never share one binding by accident.
                 "account_id": self._processing_account_id,
                 "lid_conflict": event.lid_conflict,
+                "mentioned_jids": list(event.mentioned_jids),
             },
         )
 

@@ -20,6 +20,7 @@ from typing import Any, Iterable
 from yeoman_gateway.knowledge._conversations import ConversationEngine
 from yeoman_gateway.knowledge._episodes import EpisodeConsolidator
 from yeoman_gateway.knowledge._identity import IdentityEngine
+from yeoman_gateway.knowledge._identity_candidates import IdentityCandidateEngine
 from yeoman_gateway.knowledge._migration import (
     LegacyCanonicalApplyReport,
     LegacyLinkApplyReport,
@@ -45,6 +46,7 @@ from yeoman_gateway.knowledge.authority import (
     wall_clock_ms,
 )
 from yeoman_gateway.knowledge.models import (
+    DEFAULT_NAMESPACE,
     READ_PURPOSES,
     CaptureJobReceipt,
     CaptureJobRecord,
@@ -59,6 +61,8 @@ from yeoman_gateway.knowledge.models import (
     EpisodeBuildReport,
     EpisodeView,
     Identifier,
+    IdentityCandidate,
+    IdentityCandidateWeights,
     KnowledgeContext,
     KnowledgeError,
     KnowledgeStats,
@@ -84,6 +88,8 @@ from yeoman_gateway.knowledge.models import (
 __all__ = [
     "KnowledgeService",
     "KnowledgeStartupError",
+    "IdentityCandidate",
+    "IdentityCandidateWeights",
     "LegacyLinkApplyReport",
     "LegacyCanonicalApplyReport",
     "LegacyLinkCandidate",
@@ -351,6 +357,7 @@ class KnowledgeService:
         self.workspace_id = str(workspace_id)
         self._clock = clock
         self._identity = IdentityEngine(store, authority=self._authority, policy=policy_authority)
+        self._identity_candidates = IdentityCandidateEngine(store, identity=self._identity)
         self._statements = StatementEngine(
             store,
             identity=self._identity,
@@ -423,9 +430,10 @@ class KnowledgeService:
         """Resolve a verified platform observation.  Creates at most one stub."""
         if not isinstance(observation, TrustedIdentityObservation):
             raise ValidationError("observation must be a TrustedIdentityObservation")
-        return self._identity.resolve_observation(
-            observation, context=context, create_stub=True
-        )
+        with self._store.transaction():
+            return self._identity.resolve_observation(
+                observation, context=context, create_stub=True
+            )
 
     def search_people(
         self, name: str, *, context: TrustedReadContext
@@ -434,6 +442,174 @@ class KnowledgeService:
         checked = self._read_context(context)
         self._retrieval.require_read(checked)
         return self._identity.search_by_name(name, context=checked)
+
+    def resolve_mentions(
+        self,
+        identifiers: tuple[Identifier, ...],
+        *,
+        at_ms: int | None = None,
+        context: TrustedReadContext,
+        account_namespace: str | None = None,
+    ) -> tuple[PersonResolution, ...]:
+        """Resolve typed mention identifiers only as candidates offered in this chat.
+
+        Missing time can establish only a current-binding candidate, never a historical
+        identity assertion. Current membership is rechecked by the retrieval authority;
+        this method does not establish a historical source audience.
+        """
+        if not isinstance(identifiers, tuple) or any(
+            not isinstance(item, Identifier) for item in identifiers
+        ):
+            raise ValidationError("mention identifiers must be a tuple of Identifier values")
+        if at_ms is not None and (
+            isinstance(at_ms, bool) or not isinstance(at_ms, int) or at_ms <= 0
+        ):
+            raise ValidationError("mention time must be a positive integer or None")
+
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        revision = self._store.identity_revision
+        if not decision.allowed:
+            return tuple(
+                PersonResolution(
+                    status="denied",
+                    person_id=None,
+                    display_name=None,
+                    identity_revision=revision,
+                    reason=decision.reason,
+                )
+                for _ in identifiers
+            )
+
+        offered_people = {
+            self._identity.canonical_id(person_id)
+            for principal in decision.recipients
+            if (person_id := self._identity.person_id_for_principal(principal)) is not None
+        }
+        results: list[PersonResolution] = []
+        for identifier in identifiers:
+            if identifier.channel != checked.channel:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="mention_channel_mismatch",
+                    )
+                )
+                continue
+            # A default namespace is valid only when the transport supplied that exact
+            # account explicitly. Identifier's compatibility default cannot prove it.
+            if account_namespace is not None and account_namespace != identifier.namespace:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="account_namespace_mismatch",
+                    )
+                )
+                continue
+            if identifier.namespace == DEFAULT_NAMESPACE and account_namespace is None:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=revision,
+                        reason="account_namespace_required",
+                    )
+                )
+                continue
+
+            endpoint = self._identity.resolve_identifier(identifier, at_ms=at_ms)
+            person_id = (
+                self._identity.canonical_id(endpoint.person_id)
+                if endpoint.person_id is not None
+                else None
+            )
+            if endpoint.status != "resolved" or person_id is None:
+                results.append(
+                    PersonResolution(
+                        status=endpoint.status,
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=endpoint.identity_revision,
+                        reason=endpoint.reason,
+                    )
+                )
+                continue
+            if person_id not in offered_people:
+                results.append(
+                    PersonResolution(
+                        status="unresolved",
+                        person_id=None,
+                        display_name=None,
+                        identity_revision=endpoint.identity_revision,
+                        reason="mention_not_offered_member",
+                    )
+                )
+                continue
+            results.append(
+                PersonResolution(
+                    status="resolved" if at_ms is not None else "ambiguous",
+                    person_id=person_id,
+                    display_name=None,
+                    identity_revision=endpoint.identity_revision,
+                    reason=(
+                        "proven_identifier_current_member_candidate"
+                        if at_ms is not None
+                        else "mention_time_unknown"
+                    ),
+                )
+            )
+        return tuple(results)
+
+    def search_mention_name_candidates(
+        self, name_token: str, *, context: TrustedReadContext
+    ) -> tuple[PersonResolution, ...]:
+        """Match one explicitly supplied name token against offered members' scoped aliases."""
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return ()
+        offered_people = tuple(
+            dict.fromkeys(
+                self._identity.canonical_id(person_id)
+                for principal in decision.recipients
+                if (person_id := self._identity.person_id_for_principal(principal)) is not None
+            )
+        )
+        return self._identity.search_mention_name_candidates(
+            name_token,
+            person_ids=offered_people,
+            context=checked,
+        )
+
+    def search_mention_text_candidates(
+        self, content: str, *, context: TrustedReadContext
+    ) -> tuple[PersonResolution, ...]:
+        """Find deterministic plaintext alias mentions among offered chat members."""
+        if not isinstance(content, str) or not content.strip():
+            return ()
+        checked = self._read_context(context)
+        decision = self._retrieval.decide(checked)
+        if not decision.allowed:
+            return ()
+        offered_people = tuple(
+            dict.fromkeys(
+                self._identity.canonical_id(person_id)
+                for principal in decision.recipients
+                if (person_id := self._identity.person_id_for_principal(principal)) is not None
+            )
+        )
+        return self._identity.search_mention_text_candidates(
+            content,
+            person_ids=offered_people,
+            context=checked,
+        )
 
     def set_preferred_name(
         self,
@@ -628,6 +804,77 @@ class KnowledgeService:
         with self._store.transaction():
             return self._identity.resolve_observation(
                 observation, context=context, create_stub=create_stub
+            )
+
+    def record_provider_pair(
+        self,
+        observation: TrustedIdentityObservation,
+    ) -> PersonResolution:
+        """Persist and resolve one issuer-verified WhatsApp phone/LID pairing."""
+        if not isinstance(observation, TrustedIdentityObservation):
+            raise ValidationError("observation must be a TrustedIdentityObservation")
+        with self._store.transaction():
+            return self._identity.record_provider_pair(observation)
+
+    def provider_merge_protection_reason(
+        self,
+        person_ids: Iterable[str],
+        *,
+        additional_identifiers: Iterable[Identifier] = (),
+    ) -> str | None:
+        """Check the provider-specific phone/LID cardinality guard for person sets."""
+        return self._identity.provider_merge_protection_reason(
+            person_ids, additional_identifiers=additional_identifiers
+        )
+
+    def propose_identity_candidates(
+        self,
+        *,
+        context: TrustedAdminContext,
+        weights: IdentityCandidateWeights | None = None,
+        persist: bool = True,
+    ) -> tuple[IdentityCandidate, ...]:
+        """Refresh the owner-only duplicate queue using available structured evidence."""
+        self._require_admin_context(context)
+        if persist:
+            with self._store.transaction():
+                return self._identity_candidates.propose(
+                    context=context, weights=weights, persist=True
+                )
+        return self._identity_candidates.propose(
+            context=context, weights=weights, persist=False
+        )
+
+    def list_identity_candidates(
+        self,
+        *,
+        context: TrustedAdminContext,
+        statuses: tuple[str, ...] = (),
+    ) -> tuple[IdentityCandidate, ...]:
+        """List owner-only candidate summaries; ordinary read contexts are rejected."""
+        self._require_admin_context(context)
+        return self._identity_candidates.list_candidates(context=context, statuses=statuses)
+
+    def decide_identity_candidate(
+        self,
+        candidate_id: str,
+        *,
+        decision: str,
+        expected_candidate_revision: int,
+        expected_identity_revision: int,
+        context: TrustedAdminContext,
+        target_id: str | None = None,
+    ) -> IdentityCandidate:
+        """Record an owner decision, routing merges through the existing redirect API."""
+        self._require_admin_context(context)
+        with self._store.transaction():
+            return self._identity_candidates.decide(
+                candidate_id,
+                decision=decision,
+                expected_candidate_revision=expected_candidate_revision,
+                expected_identity_revision=expected_identity_revision,
+                context=context,
+                target_id=target_id,
             )
 
     def resolve_identifier(
@@ -1185,6 +1432,25 @@ class KnowledgeService:
                     )
         return MaintenanceReport(examined=examined, changed=examined, denied=0)
 
+    def backfill_alias_search_keys(
+        self, *, context: TrustedAdminContext
+    ) -> MaintenanceReport:
+        """Populate missing normalized alias keys on this owner-authorized store."""
+        self._require_admin_context(context)
+        with self._store.transaction():
+            rows = self._store.query(
+                "SELECT id, alias FROM contact_aliases WHERE normalized_alias = '' ORDER BY id"
+            )
+            changed = 0
+            for row in rows:
+                cursor = self._store.execute(
+                    "UPDATE contact_aliases SET normalized_alias = ?"
+                    " WHERE id = ? AND normalized_alias = ''",
+                    (normalize_alias_value(str(row["alias"])), int(row["id"])),
+                )
+                changed += max(0, cursor.rowcount)
+        return MaintenanceReport(examined=len(rows), changed=changed, denied=0)
+
     def prune(self, *, before_ms: int, context: TrustedAdminContext) -> MaintenanceReport:
         """Expire statements whose validity window passed.  Counts only, no content."""
         self._require_admin_context(context)
@@ -1548,27 +1814,14 @@ class KnowledgeService:
         self._store.commit_if_idle()
 
     def person_id_for_value(self, value: str) -> str | None:
-        """Person id for a proven *active* identifier value, searched across channels.
+        """One canonical person for a proven active identifier value.
 
-        The compatibility projection ``contact_identifiers`` is deliberately not a
-        fallback here: a legacy row without a proven mapping must not resolve a person.
+        Without channel or account context, local and full-value matches must agree on
+        exactly one canonical person.  An unproven compatibility projection is never a
+        fallback.
         """
-        token = str(value or "").strip()
-        if not token:
-            return None
-        candidates: list[str] = [token]
-        local = token.split("@", 1)[0]
-        if local and local != token:
-            candidates.append(local)
-        for candidate in dict.fromkeys(candidates):
-            row = self._store.query_one(
-                "SELECT person_id FROM knowledge_identifier_bindings"
-                " WHERE value = ? AND status = 'active' LIMIT 1",
-                (candidate,),
-            )
-            if row is not None:
-                return self.canonical_id(str(row["person_id"]))
-        return None
+        owners = self.owners_of_identifier_value(value)
+        return owners[0] if len(owners) == 1 else None
 
     def canonical_id(self, person_id: str) -> str:
         """Current canonical person for an original (possibly merged) person id."""

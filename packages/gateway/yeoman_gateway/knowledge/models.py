@@ -38,6 +38,8 @@ __all__ = [
     "EPISODE_STATUSES",
     "ERROR_CODES",
     "GLOBAL_SCOPE_KEY",
+    "IDENTITY_CANDIDATE_SIGNALS",
+    "IDENTITY_CANDIDATE_STATUSES",
     "MAX_ATTRIBUTE_VALUE_LENGTH",
     "MAX_NAME_LENGTH",
     "MAX_PEOPLE_PER_STATEMENT",
@@ -70,6 +72,8 @@ __all__ = [
     "EpisodeView",
     "Identifier",
     "IdentifierBinding",
+    "IdentityCandidate",
+    "IdentityCandidateWeights",
     "KnowledgeContext",
     "KnowledgeError",
     "KnowledgeStats",
@@ -200,6 +204,21 @@ TIME_BASES: Final[tuple[str, ...]] = ("explicit", "source_time", "unknown", "sto
 
 #: Precision of a stated time.  ``unknown`` must never be rendered as a certain day.
 TIME_PRECISIONS: Final[tuple[str, ...]] = ("exact", "day", "month", "year", "approximate", "unknown")
+
+IDENTITY_CANDIDATE_STATUSES: Final[tuple[str, ...]] = (
+    "pending",
+    "rejected",
+    "later",
+    "merged",
+)
+IDENTITY_CANDIDATE_SIGNALS: Final[tuple[str, ...]] = (
+    "normalized_name_match",
+    "shared_chat_count",
+    "activity_overlap_days",
+    "profile_overlap_count",
+    "reply_overlap_count",
+    "provider_pair_source_count",
+)
 
 ALIAS_KINDS: Final[tuple[str, ...]] = (
     "platform_display",
@@ -1172,6 +1191,96 @@ class ChangeReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class IdentityCandidateWeights:
+    """Explicit owner-supplied scoring weights; no implicit defaults exist."""
+
+    version: str
+    weights: tuple[tuple[str, float], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "version", _require_id(self.version, "weights version"))
+        values: list[tuple[str, float]] = []
+        for raw_name, raw_weight in self.weights:
+            name = _require_id(raw_name, "weight signal")
+            if name not in IDENTITY_CANDIDATE_SIGNALS:
+                raise ValidationError(f"unsupported identity candidate signal: {name!r}")
+            if isinstance(raw_weight, bool):
+                raise ValidationError("identity candidate weights must be finite numbers")
+            weight = float(raw_weight)
+            if not math.isfinite(weight):
+                raise ValidationError("identity candidate weights must be finite numbers")
+            values.append((name, weight))
+        if len({name for name, _ in values}) != len(values):
+            raise ValidationError("identity candidate weights contain duplicate signals")
+        object.__setattr__(self, "weights", tuple(sorted(values)))
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityCandidate:
+    """Owner-only, text-free summary of one canonical person pair."""
+
+    candidate_id: str
+    person_ids: tuple[str, str]
+    status: str
+    candidate_revision: int
+    evidence_version: int
+    identity_revision: int
+    evidence: tuple[tuple[str, int], ...]
+    common_names: tuple[str, ...] = ()
+    provider_pair_sources: tuple[tuple[str, str, int], ...] = ()
+    score: float | None = None
+    weights_version: str | None = None
+    operation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "candidate_id", _require_id(self.candidate_id, "candidate_id"))
+        people = tuple(_require_id(item, "person_id") for item in self.person_ids)
+        if len(people) != 2 or people != tuple(sorted(set(people))):
+            raise ValidationError("candidate person ids must be a canonical unordered pair")
+        object.__setattr__(self, "person_ids", people)
+        _require_choice(self.status, IDENTITY_CANDIDATE_STATUSES, "candidate status")
+        object.__setattr__(
+            self,
+            "candidate_revision",
+            _require_int(self.candidate_revision, "candidate_revision", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "evidence_version",
+            _require_int(self.evidence_version, "evidence_version", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "identity_revision",
+            _require_int(self.identity_revision, "identity_revision", minimum=0),
+        )
+        evidence: list[tuple[str, int]] = []
+        for name, count in self.evidence:
+            if name not in IDENTITY_CANDIDATE_SIGNALS:
+                raise ValidationError(f"unsupported identity candidate signal: {name!r}")
+            evidence.append((name, _require_int(count, f"evidence {name}", minimum=1)))
+        if len({name for name, _ in evidence}) != len(evidence):
+            raise ValidationError("identity candidate evidence contains duplicate signals")
+        object.__setattr__(self, "evidence", tuple(sorted(evidence)))
+        object.__setattr__(
+            self, "common_names", tuple(normalize_alias_value(item) for item in self.common_names)
+        )
+        pairs = tuple(
+            (str(channel), str(namespace), _require_int(count, "provider pair count", minimum=1))
+            for channel, namespace, count in self.provider_pair_sources
+        )
+        object.__setattr__(self, "provider_pair_sources", tuple(sorted(set(pairs))))
+        if self.score is not None and not math.isfinite(float(self.score)):
+            raise ValidationError("candidate score must be finite")
+        if self.weights_version is not None:
+            object.__setattr__(
+                self, "weights_version", _require_id(self.weights_version, "weights version")
+            )
+        if self.operation_id is not None:
+            object.__setattr__(self, "operation_id", _require_id(self.operation_id, "operation_id"))
+
+
+@dataclass(frozen=True, slots=True)
 class StatementSummary:
     """One statement row for admin inspection.  Content only for allowed admin output."""
 
@@ -1379,11 +1488,16 @@ class IdentifierBinding:
         start is knowledge time, not a proven historical start, so it covers nothing and
         authorizes nothing retroactively.
 
+        An ended binding also needs a known end; zero is only the open-ended sentinel for
+        an active binding.
+
         An ``ended`` binding still covers its own past - that is exactly what makes
         "which person did this number belong to in March?" answerable.  ``conflict`` and
         ``withheld`` never cover anything, because the mapping itself is unproven.
         """
         if self.status not in ("active", "ended") or self.valid_from_ms <= 0:
+            return False
+        if self.status == "ended" and self.valid_until_ms <= 0:
             return False
         if at_ms < self.valid_from_ms:
             return False

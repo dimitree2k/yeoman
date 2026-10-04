@@ -182,6 +182,47 @@ _CORE_SCHEMA: tuple[str, ...] = (
       ON knowledge_identifier_bindings (channel, kind, namespace, value, status)
     """,
     """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_pair_evidence (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        first_observed_at_ms INTEGER NOT NULL,
+        last_observed_at_ms INTEGER NOT NULL,
+        first_source_locator TEXT NOT NULL,
+        last_source_locator TEXT NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_pair_sources (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        source_locator TEXT NOT NULL,
+        first_observed_at_ms INTEGER NOT NULL,
+        last_observed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value, source_locator)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_provider_stitch_proposals (
+        channel TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        phone_value TEXT NOT NULL,
+        lid_value TEXT NOT NULL,
+        phone_person_id TEXT NOT NULL REFERENCES contacts(id),
+        lid_person_id TEXT NOT NULL REFERENCES contacts(id),
+        status TEXT NOT NULL CHECK (status IN ('pending','protected')),
+        reason TEXT NOT NULL,
+        evidence_ref TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel, namespace, phone_value, lid_value)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS knowledge_identity_redirects (
         operation_id TEXT PRIMARY KEY,
         seq INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +234,45 @@ _CORE_SCHEMA: tuple[str, ...] = (
         active INTEGER NOT NULL DEFAULT 1,
         undone_ms INTEGER
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_identity_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        person_low_id TEXT NOT NULL REFERENCES contacts(id),
+        person_high_id TEXT NOT NULL REFERENCES contacts(id),
+        status TEXT NOT NULL CHECK(status IN ('pending','rejected','later','merged')),
+        candidate_revision INTEGER NOT NULL DEFAULT 1,
+        evidence_version INTEGER NOT NULL,
+        identity_revision INTEGER NOT NULL,
+        operation_id TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        UNIQUE(person_low_id, person_high_id),
+        CHECK(person_low_id < person_high_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_identity_candidate_evidence (
+        candidate_id TEXT NOT NULL REFERENCES knowledge_identity_candidates(candidate_id),
+        evidence_version INTEGER NOT NULL,
+        identity_revision INTEGER NOT NULL,
+        evidence_json TEXT NOT NULL,
+        weights_version TEXT,
+        weights_json TEXT,
+        score REAL,
+        created_ms INTEGER NOT NULL,
+        PRIMARY KEY(candidate_id, evidence_version)
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS knowledge_identity_candidate_evidence_no_update
+    BEFORE UPDATE ON knowledge_identity_candidate_evidence
+    BEGIN SELECT RAISE(ABORT, 'candidate evidence versions are immutable'); END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS knowledge_identity_candidate_evidence_no_delete
+    BEFORE DELETE ON knowledge_identity_candidate_evidence
+    BEGIN SELECT RAISE(ABORT, 'candidate evidence versions are immutable'); END
     """,
     """
     CREATE INDEX IF NOT EXISTS knowledge_identity_redirects_by_source

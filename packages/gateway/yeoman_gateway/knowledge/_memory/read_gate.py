@@ -20,6 +20,7 @@ from yeoman_gateway.knowledge._memory.shared_facts import (
     SharedFact,
     can_read_shared,
 )
+from yeoman_gateway.policy.identity import registry_member_principals
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yeoman_gateway.knowledge._memory.store import MemoryStore
@@ -232,31 +233,7 @@ def registry_members(chat_registry: Any, *, channel: str, chat_id: str) -> set[s
         return set()
     metadata = record.get("metadata")
     participants = metadata.get("participants") if isinstance(metadata, Mapping) else None
-    return _as_principal_set(participants)
-
-
-def _as_principal_set(raw: Any) -> set[str]:
-    if raw is None:
-        return set()
-    if isinstance(raw, Mapping):
-        raw = raw.get("participants") or raw.get("members") or []
-    members: set[str] = set()
-    for item in raw or ():
-        if isinstance(item, str):
-            members.add(item)
-            continue
-        for attribute in ("principal_id", "id", "jid", "lid", "user_id"):
-            value = getattr(item, attribute, None)
-            if value:
-                members.add(str(value))
-                break
-        else:
-            if isinstance(item, Mapping):
-                for attribute in ("principal_id", "id", "jid", "lid", "user_id"):
-                    if item.get(attribute):
-                        members.add(str(item[attribute]))
-                        break
-    return {member for member in members if member}
+    return set(registry_member_principals(channel, participants))
 
 
 def fact_denied_by_status(fact: SharedFact | None, *, now_ms: int) -> bool:

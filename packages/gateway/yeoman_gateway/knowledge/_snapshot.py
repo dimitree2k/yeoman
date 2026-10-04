@@ -34,7 +34,13 @@ __all__ = [
     "SnapshotReport",
     "SnapshotVerification",
     "benchmark_profiles",
+    "collect_sources",
     "create_snapshot",
+    "purge_collection",
+    "query_catalog",
+    "rebuild_catalog",
+    "refresh_collection",
+    "verify_source_bundle",
     "verify_snapshot",
 ]
 
@@ -188,7 +194,7 @@ def _backup(source: Path, target: Path) -> None:
     if target.exists():
         raise SnapshotError("target_exists", f"refusing to overwrite {target}")
     try:
-        origin = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        origin = sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise SnapshotError("source_unreadable", f"cannot read {source}") from exc
     destination = sqlite3.connect(str(target))
@@ -699,6 +705,57 @@ def _percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
     return ordered[index]
+
+
+def collect_sources(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
+    """Collect an explicit source list into a versioned, private bundle."""
+    from ._source_bundles import collect_sources as collect
+
+    return collect(sources=sources, target_dir=target_dir)
+
+
+def refresh_collection(*, sources: list[dict[str, Any]], target_dir: Path) -> dict[str, Any]:
+    """Incrementally refresh an explicit source collection and its local catalog."""
+    from ._preservation_catalog import refresh_collection as refresh
+
+    return refresh(sources=sources, target_dir=target_dir)
+
+
+def rebuild_catalog(*, target_dir: Path) -> dict[str, Any]:
+    """Rebuild the disposable source catalog from finalized manifests only."""
+    from ._preservation_catalog import rebuild_catalog as rebuild
+
+    return rebuild(target_dir=target_dir)
+
+
+def query_catalog(*, target_dir: Path, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    """Query safe provenance metadata from the local preservation catalog."""
+    from ._preservation_catalog import query_catalog as query
+
+    return query(target_dir=target_dir, filters=filters)
+
+
+def purge_collection(
+    *, target_dir: Path, source_id: str, operator: str, confirmed: bool = False
+) -> dict[str, Any]:
+    """Preview or apply an owner-local purge of every bundle containing a source."""
+    from ._preservation_catalog import purge_collection as purge
+
+    return purge(
+        target_dir=target_dir,
+        source_id=source_id,
+        operator=operator,
+        confirmed=confirmed,
+    )
+
+
+def verify_source_bundle(
+    *, manifest: Path, restore_dir: Path | None = None
+) -> dict[str, Any]:
+    """Verify exact bundle hashes on isolated copies."""
+    from ._source_bundles import verify_source_bundle as verify
+
+    return verify(manifest=manifest, restore_dir=restore_dir)
 
 
 # ── small helpers ────────────────────────────────────────────────────────────

@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from yeoman_gateway.consciousness.tools import ConsciousnessTools
     from yeoman_gateway.cron.workflow_state import PendingApproval, WorkflowState
     from yeoman_gateway.knowledge._contacts.service import ContactsService
-    from yeoman_gateway.knowledge.models import TrustedIdentityObservation
+    from yeoman_gateway.knowledge.models import TrustedIdentityObservation, TrustedReadContext
     from yeoman_gateway.media.router import ModelRouter
     from yeoman_gateway.media.tts import TTSSynthesizer
     from yeoman_gateway.security.classifier import InputClassifier
@@ -73,6 +73,7 @@ class Orchestrator:
         contacts: "ContactsService | None" = None,
         knowledge: object | None = None,
         identity_observation_issuer: "Callable[[TrustedIdentityObservation], object] | None" = None,
+        mention_context_factory: "Callable[[InboundEvent], TrustedReadContext | None] | None" = None,
         reply_context_window_limit: int,
         reply_context_line_max_chars: int,
         ambient_window_limit: int = 30,
@@ -116,7 +117,9 @@ class Orchestrator:
         if knowledge is not None:
             layers.append(
                 ContactsMiddleware(
-                    knowledge=knowledge, observation_issuer=identity_observation_issuer
+                    knowledge=knowledge,
+                    observation_issuer=identity_observation_issuer,
+                    mention_context_factory=mention_context_factory,
                 )
             )
         layers.extend([
