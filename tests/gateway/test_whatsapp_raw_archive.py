@@ -102,6 +102,125 @@ def test_frame_is_archived_even_when_journal_capture_fails(tmp_path: Path) -> No
     assert len(_records(tmp_path / "raw")) == 1
 
 
+def test_membership_change_is_raw_archived_before_journaling(tmp_path: Path) -> None:
+    channel, archive, store = _setup(tmp_path)
+    order: list[str] = []
+    append_raw = archive.append
+    append_event = store.append_event
+
+    def record_raw(event):
+        order.append("raw")
+        return append_raw(event)
+
+    def record_journal(*args, **kwargs):
+        order.append("journal")
+        return append_event(*args, **kwargs)
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        order.append("ack")
+        return {"acknowledged": True}
+
+    archive.append = record_raw  # type: ignore[method-assign]
+    store.append_event = record_journal  # type: ignore[method-assign]
+    channel._send_command = ack  # type: ignore[method-assign]
+    frame = json.loads(
+        _frame(
+            {
+                "chatJid": CHAT,
+                "action": "add",
+                "changeId": "stub:message-9",
+                "sourceCopyId": "stub:message-9",
+                "messageId": "message-9",
+                "stubType": 27,
+                "providerTimestampMs": NOW,
+                "participants": [{"lid": "123@lid"}],
+            },
+            event_id="stub-event",
+            kind="membership_change",
+        )
+    )
+    frame["eventKey"] = "whatsapp:account-a:chat@g.us:membership_change:stub%3Amessage-9"
+    frame["payload"]["actor"] = {"lid": "456@lid"}
+
+    asyncio.run(channel._handle_bridge_message(json.dumps(frame)))
+
+    assert order == ["raw", "journal", "ack"]
+    [record] = _records(tmp_path / "raw")
+    assert record["kind"] == "membership_change"
+    assert record["native"]["payload"]["sourceCopyId"] == "stub:message-9"
+    assert record["native"]["payload"]["messageId"] == "message-9"
+    assert record["native"]["payload"]["stubType"] == 27
+    assert store.count_events() == 1
+
+
+def test_membership_copies_make_two_raw_lines_and_one_journal_event(tmp_path: Path) -> None:
+    channel, _, store = _setup(tmp_path)
+    shared_key = "whatsapp:account-a:chat@g.us:membership_change:stub%3Amessage-10"
+    common = {
+        "chatJid": CHAT,
+        "action": "add",
+        "changeId": "stub:message-10",
+        "participants": [{"lid": "123@lid", "phoneJid": "49123@s.whatsapp.net"}],
+        "actor": {"lid": "456@lid"},
+    }
+    frames = [
+        {
+            "version": PROTOCOL_VERSION,
+            "type": "membership_change",
+            "ts": NOW,
+            "accountId": "account-a",
+            "eventId": "stub-event-10",
+            "eventKey": shared_key,
+            "observedAt": NOW,
+            "payload": {
+                **common,
+                "sourceCopyId": "stub:message-10",
+                "messageId": "message-10",
+                "stubType": 27,
+                "providerTimestampMs": NOW,
+            },
+        },
+        {
+            "version": PROTOCOL_VERSION,
+            "type": "membership_change",
+            "ts": NOW + 1,
+            "accountId": "account-a",
+            "eventId": "update-event-10",
+            "eventKey": shared_key,
+            "observedAt": NOW + 1,
+            "payload": {
+                **common,
+                "sourceCopyId": "update:copy-10",
+                "providerTimestampMs": None,
+            },
+        },
+    ]
+
+    for frame in frames:
+        asyncio.run(channel._handle_bridge_message(json.dumps(frame)))
+
+    records = _records(tmp_path / "raw")
+    assert [record["kind"] for record in records] == [
+        "membership_change",
+        "membership_change",
+    ]
+    assert [record["native"]["eventId"] for record in records] == [
+        "stub-event-10",
+        "update-event-10",
+    ]
+    assert [record["native"]["payload"]["sourceCopyId"] for record in records] == [
+        "stub:message-10",
+        "update:copy-10",
+    ]
+    assert records[0]["native"]["payload"]["messageId"] == "message-10"
+    assert records[0]["native"]["payload"]["stubType"] == 27
+    assert store.count_events() == 1
+    event = store.get_event("stub-event-10")
+    assert event is not None
+    assert event.kind == "membership_change"
+    assert event.event_key == shared_key
+
+
 def test_inbound_capacity_stops_before_capture_and_ack(tmp_path: Path) -> None:
     channel, archive, _ = _setup(tmp_path)
     channel._running = True

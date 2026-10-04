@@ -6,7 +6,9 @@ PROTOCOL_VERSION = 5
 MAX_BRIDGE_FRAME_BYTES = 262_144
 """UTF-8 serialized event and WebSocket frame ceiling shared with the Bridge."""
 
-REPLAYABLE_EVENT_TYPES = frozenset({"message", "edit", "delete", "reaction", "receipt"})
+REPLAYABLE_EVENT_TYPES = frozenset(
+    {"message", "edit", "delete", "reaction", "receipt", "membership_change", "membership_snapshot"}
+)
 """Business event kinds retained by the Bridge outbox."""
 
 MEDIA_METADATA_FIELDS = frozenset(

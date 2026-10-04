@@ -16,6 +16,7 @@ Determinism rules:
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -34,7 +35,14 @@ from yeoman_gateway.processing.models import DELIVERED_STATUSES_TUPLE as _DELIVE
 CHANNEL = "whatsapp"
 
 #: Signal kinds the bridge can report (the canonical event kinds of spec R01).
-SIGNAL_KINDS: tuple[str, ...] = ("message", "edit", "reaction", "delete", "receipt")
+SIGNAL_KINDS: tuple[str, ...] = (
+    "message", "edit", "reaction", "delete", "receipt", "membership_change", "membership_snapshot"
+)
+_MEMBERSHIP_ACTIONS = frozenset({"add", "remove", "promote", "demote", "modify"})
+_MAX_MEMBERSHIP_PARTICIPANTS = 2048
+_MAX_MEMBERSHIP_ID_LENGTH = 256
+_MEMBERSHIP_LID = re.compile(r"^[0-9]+@lid$")
+_MEMBERSHIP_PHONE_JID = re.compile(r"^[0-9]+@s\.whatsapp\.net$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +292,8 @@ class WhatsAppSignalMapper:
             signal = self._delete(payload, chat_id)
         elif kind == "reaction":
             signal = self._reaction(payload, chat_id)
+        elif kind in {"membership_change", "membership_snapshot"}:
+            signal = self._membership(kind, payload, chat_id, strict=strict)
         else:
             signal = self._receipt(payload, chat_id)
         if signal is None:
@@ -293,7 +303,9 @@ class WhatsAppSignalMapper:
             event_id=event_id or signal.event_id,
             event_key=event_key or signal.event_key,
             account=account if account is not None else signal.account,
-            observed_at_ms=observed_at_ms,
+            observed_at_ms=(
+                None if signal.kind == "membership_change" else observed_at_ms
+            ),
         )
         return signal
 
@@ -446,6 +458,132 @@ class WhatsAppSignalMapper:
             body={"status": status, "recipient_token": _hashed_token(recipient)},
             source_message_id=message_id,
             target_message_id=message_id,
+        )
+
+    def _membership(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        chat_id: str,
+        *,
+        strict: bool,
+    ) -> JournalSignal | None:
+        def invalid(reason: str) -> None:
+            if strict:
+                raise ValueError(f"malformed WhatsApp {kind}: {reason}")
+
+        if not chat_id.endswith("@g.us") or len(chat_id) > 128:
+            invalid("chat must be a bounded group JID")
+            return None
+
+        raw_participants = payload.get("participants")
+        if (
+            not isinstance(raw_participants, list)
+            or len(raw_participants) > _MAX_MEMBERSHIP_PARTICIPANTS
+        ):
+            invalid("participants must be a bounded list")
+            return None
+
+        def participant(value: Any, *, snapshot: bool = False) -> dict[str, Any] | None:
+            if not isinstance(value, Mapping):
+                return None
+            result: dict[str, Any] = {}
+            for source, target in (("lid", "lid"), ("phoneJid", "phone_jid")):
+                identifier = value.get(source)
+                if identifier is None:
+                    continue
+                if (
+                    not isinstance(identifier, str)
+                    or not identifier.strip()
+                    or len(identifier) > _MAX_MEMBERSHIP_ID_LENGTH
+                ):
+                    return None
+                identifier = identifier.strip()
+                pattern = _MEMBERSHIP_LID if source == "lid" else _MEMBERSHIP_PHONE_JID
+                if pattern.fullmatch(identifier) is None:
+                    return None
+                result[target] = identifier
+            if not result:
+                return None
+            if snapshot:
+                admin = value.get("admin")
+                if not isinstance(admin, bool):
+                    return None
+                result["admin"] = admin
+            return result
+
+        snapshot = kind == "membership_snapshot"
+        participants = [participant(value, snapshot=snapshot) for value in raw_participants]
+        if any(value is None for value in participants):
+            invalid("participant identifiers are malformed")
+            return None
+
+        if snapshot:
+            complete = payload.get("complete")
+            member_count = payload.get("memberCount")
+            snapshot_at = payload.get("snapshotAtMs")
+            if (
+                not isinstance(complete, bool)
+                or isinstance(member_count, bool)
+                or not isinstance(member_count, int)
+                or not 0 <= member_count <= 100_000
+                or (complete and member_count != len(participants))
+                or (complete and not participants)
+                or isinstance(snapshot_at, bool)
+                or not isinstance(snapshot_at, int)
+                or not 0 <= snapshot_at <= 2**53 - 1
+            ):
+                invalid("snapshot completeness, count, or timestamp is invalid")
+                return None
+            body: dict[str, Any] = {
+                "snapshot_at_ms": snapshot_at,
+                "complete": complete,
+                "member_count": member_count,
+                "participants": participants,
+            }
+            event_key = f"{self._channel}:{chat_id}:membership_snapshot:{snapshot_at}"
+            occurred_ms: int | None = snapshot_at
+        else:
+            action = payload.get("action")
+            if not isinstance(action, str) or action not in _MEMBERSHIP_ACTIONS or not participants:
+                invalid("change action or participants are invalid")
+                return None
+            # The bridge correlator matches on participant identity, not source order
+            # or optional LID-to-phone enrichment. Keep only its shared identity fields
+            # and sort them so the two native copies have identical canonical payloads.
+            stable_participants: list[dict[str, str]] = []
+            for value in participants:
+                assert value is not None
+                stable_participants.append(
+                    {"lid": value["lid"]}
+                    if "lid" in value
+                    else {"phone_jid": value["phone_jid"]}
+                )
+            stable_participants.sort(key=lambda value: next(iter(value.values())))
+
+            raw_actor = payload.get("actor")
+            if raw_actor is not None:
+                if participant(raw_actor) is None:
+                    invalid("actor identifiers are malformed")
+                    return None
+            body = {"action": action, "participants": stable_participants}
+            change_id = payload.get("changeId")
+            if not isinstance(change_id, str) or not change_id.strip() or len(change_id) > 512:
+                invalid("change id is missing or too long")
+                return None
+            event_key = f"{self._channel}:{chat_id}:membership_change:{change_id.strip()}"
+            # Native provider timestamps are only present on the stub copy. Keep the
+            # canonical occurrence time unknown so correlated copies stay byte-identical.
+            occurred_ms = None
+
+        return self._signal(
+            kind=kind,
+            event_key=event_key,
+            chat_id=chat_id,
+            principal="",
+            payload=payload,
+            body=body,
+            occurred_ms=occurred_ms,
         )
 
     # -- receipt evidence --------------------------------------------------------------
@@ -622,7 +760,16 @@ class SignalJournalSink:
             revision=signal.revision,
             audience_ref=signal.audience_ref,
         )
-        if strict and stored_event_id != signal.event_id:
+        if strict and signal.kind in {"membership_change", "membership_snapshot"}:
+            prior = self._store.get_event(stored_event_id)
+            if (
+                prior is None
+                or prior.event_key != signal.event_key
+                or prior.payload is None
+                or dict(prior.payload) != signal.to_event_payload()
+            ):
+                raise ValueError("strict capture found a conflicting event identity")
+        elif strict and stored_event_id != signal.event_id:
             raise ValueError("strict capture found a conflicting event identity")
         opaque_edit = (
             signal.kind == "message"

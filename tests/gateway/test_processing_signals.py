@@ -132,6 +132,223 @@ def test_receipt_creates_no_message_event_and_no_decision(tmp_path: Path) -> Non
     db.close()
 
 
+def test_membership_change_maps_to_canonical_event() -> None:
+    signal = _mapper().map(
+        {
+            "chatJid": CHAT,
+            "action": "add",
+            "changeId": "stub:message-7",
+            "sourceCopyId": "stub:message-7",
+            "messageId": "message-7",
+            "stubType": 27,
+            "providerTimestampMs": T0,
+            "participants": [
+                {"lid": "123@lid", "phoneJid": "49123@s.whatsapp.net"},
+                {"lid": "456@lid", "phoneJid": "49456@s.whatsapp.net"},
+            ],
+            "actor": {"lid": "456@lid", "phoneJid": "49456@s.whatsapp.net"},
+        },
+        kind="membership_change",
+        event_key="whatsapp:account-a:chat@g.us:membership_change:stub%3Amessage-7",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+
+    assert signal is not None
+    body = signal.to_event_payload()
+    assert body["kind"] == "membership_change"
+    assert body["chat_id"] == CHAT
+    assert body["account"] == "account-a"
+    assert body["action"] == "add"
+    assert body["participants"] == [{"lid": "123@lid"}, {"lid": "456@lid"}]
+    assert "actor" not in body
+    assert not {"sourceCopyId", "messageId", "stubType", "providerTimestampMs"} & body.keys()
+    assert body["occurred_ms"] is None and "observed_at_ms" not in body
+
+
+def test_membership_snapshot_maps_to_canonical_event() -> None:
+    signal = _mapper().map(
+        {
+            "chatJid": CHAT,
+            "snapshotAtMs": T0,
+            "complete": True,
+            "memberCount": 1,
+            "participants": [
+                {"lid": "123@lid", "phoneJid": "49123@s.whatsapp.net", "admin": True}
+            ],
+        },
+        kind="membership_snapshot",
+        event_key="whatsapp:account-a:chat@g.us:membership_snapshot:1700000000000",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+
+    assert signal is not None
+    body = signal.to_event_payload()
+    assert body["kind"] == "membership_snapshot"
+    assert body["chat_id"] == CHAT
+    assert body["snapshot_at_ms"] == T0
+    assert body["complete"] is True and body["member_count"] == 1
+    assert body["participants"] == [
+        {"lid": "123@lid", "phone_jid": "49123@s.whatsapp.net", "admin": True}
+    ]
+
+
+def test_membership_change_source_copies_append_one_event(tmp_path: Path) -> None:
+    db = ProcessingStore(tmp_path / "p.db")
+    mapper = _mapper()
+    stable = {
+        "chatJid": CHAT,
+        "action": "add",
+        "changeId": "stub:message-7",
+        "participants": [
+            {"lid": "123@lid", "phoneJid": "49123@s.whatsapp.net"},
+            {"lid": "456@lid", "phoneJid": "49456@s.whatsapp.net"},
+        ],
+        "actor": {"lid": "456@lid"},
+    }
+    stub = mapper.map(
+        {
+            **stable,
+            "sourceCopyId": "stub:message-7",
+            "messageId": "message-7",
+            "stubType": 27,
+            "providerTimestampMs": T0,
+        },
+        kind="membership_change",
+        event_id="stub-event",
+        event_key="shared-membership-key",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+    update = mapper.map(
+        {
+            **stable,
+            "participants": [{"lid": "456@lid"}, {"lid": "123@lid"}],
+            "actor": None,
+            "sourceCopyId": "update:copy-8",
+            "providerTimestampMs": None,
+        },
+        kind="membership_change",
+        event_id="update-event",
+        event_key="shared-membership-key",
+        account="account-a",
+        observed_at_ms=T0 + 5,
+        strict=True,
+    )
+
+    assert stub is not None and update is not None
+    assert stub.to_event_payload() == update.to_event_payload()
+    assert _append(db, stub) == _append(db, update) == "stub-event"
+    assert db.count_events() == 1
+    db.close()
+
+
+def test_membership_snapshot_requires_boolean_admin_metadata() -> None:
+    mapper = _mapper()
+    base = {
+        "chatJid": CHAT,
+        "snapshotAtMs": T0,
+        "complete": True,
+        "memberCount": 1,
+        "participants": [{"lid": "123@lid"}],
+    }
+
+    with pytest.raises(ValueError, match="malformed WhatsApp membership_snapshot"):
+        mapper.map(base, kind="membership_snapshot", strict=True)
+    with pytest.raises(ValueError, match="malformed WhatsApp membership_snapshot"):
+        mapper.map(
+            {**base, "participants": [{"lid": "123@lid", "admin": "unknown"}]},
+            kind="membership_snapshot",
+            strict=True,
+        )
+
+
+def test_membership_change_copy_requires_available_exact_payload(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    db = ProcessingStore(tmp_path / "p.db")
+    sink = SignalJournalSink(db, clock=lambda: T0)
+    base = {
+        "chatJid": CHAT,
+        "action": "add",
+        "changeId": "stub:message-11",
+        "participants": [{"lid": "123@lid"}],
+    }
+    sink.capture(
+        "membership_change",
+        {**base, "sourceCopyId": "stub:message-11"},
+        event_id="stub-event-11",
+        event_key="shared-membership-key-11",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+    stored = db.get_event("stub-event-11")
+    assert stored is not None
+    purged = replace(stored, payload=None)
+    monkeypatch.setattr(db, "get_event", lambda event_id: purged)
+
+    with pytest.raises(ValueError, match="conflicting event identity"):
+        sink.capture(
+            "membership_change",
+            {**base, "sourceCopyId": "update:copy-11"},
+            event_id="update-event-11",
+            event_key="shared-membership-key-11",
+            account="account-a",
+            observed_at_ms=T0 + 1,
+            strict=True,
+        )
+    db.close()
+
+
+def test_membership_same_id_replay_requires_available_exact_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dataclasses import replace
+
+    db = ProcessingStore(tmp_path / "p.db")
+    sink = SignalJournalSink(db, clock=lambda: T0)
+    payload = {
+        "chatJid": CHAT,
+        "action": "add",
+        "changeId": "stub:message-12",
+        "participants": [{"lid": "123@lid"}],
+        "sourceCopyId": "stub:message-12",
+    }
+    sink.capture(
+        "membership_change",
+        payload,
+        event_id="same-event-12",
+        event_key="shared-membership-key-12",
+        account="account-a",
+        observed_at_ms=T0,
+        strict=True,
+    )
+    stored = db.get_event("same-event-12")
+    assert stored is not None
+    purged = replace(stored, payload=None)
+    monkeypatch.setattr(db, "get_event", lambda event_id: purged)
+    # A payload-purged ProcessingStore row accepts the provider identity without
+    # comparing content; model that store result while testing the strict sink guard.
+    monkeypatch.setattr(db, "append_event", lambda **kwargs: "same-event-12")
+
+    with pytest.raises(ValueError, match="conflicting event identity"):
+        sink.capture(
+            "membership_change",
+            {**payload, "action": "remove"},
+            event_id="same-event-12",
+            event_key="shared-membership-key-12",
+            account="account-a",
+            observed_at_ms=T0 + 1,
+            strict=True,
+        )
+    db.close()
+
+
 def test_receipt_recipient_is_stored_hashed() -> None:
     signal = _mapper().map(
         {"chatJid": CHAT, "messageId": "3EB0", "recipientJid": "4915111@s.whatsapp.net",
@@ -153,6 +370,15 @@ def test_malformed_payloads_are_rejected_not_guessed() -> None:
     assert mapper.map({"messageId": "3EB0"}, kind="delete") is None
     with pytest.raises(ValueError):
         mapper.map({"chatJid": CHAT, "messageId": "3EB0"}, kind="typing")
+    malformed_membership = {
+        "chatJid": CHAT,
+        "action": "add",
+        "changeId": "change-1",
+        "participants": [{"lid": "not-a-lid"}],
+    }
+    assert mapper.map(malformed_membership, kind="membership_change") is None
+    with pytest.raises(ValueError, match="malformed WhatsApp membership_change"):
+        mapper.map(malformed_membership, kind="membership_change", strict=True)
 
 
 def test_channel_hook_journals_signals_without_touching_ingest(tmp_path: Path) -> None:

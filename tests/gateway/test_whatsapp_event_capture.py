@@ -163,6 +163,23 @@ def test_conflicting_replay_is_acknowledged_without_overwriting_the_journal(tmp_
     store.close()
 
 
+def test_unknown_bridge_event_type_is_ignored(tmp_path: Path) -> None:
+    store = ProcessingStore(tmp_path / "processing.db")
+    channel = _channel(store)
+    frame = _frame(
+        "future_unknown_kind",
+        {"chatJid": CHAT, "messageId": "unknown-1", "secret": "not-captured"},
+        event_id="unknown-event",
+        event_key="unknown-key",
+    )
+
+    asyncio.run(channel._handle_bridge_message(frame))
+
+    assert store.count_events() == 0
+    assert not channel._inbound_tasks
+    store.close()
+
+
 def test_same_replay_is_acknowledged_again_without_second_route(tmp_path: Path) -> None:
     store = ProcessingStore(tmp_path / "processing.db")
     channel = _channel(store)
