@@ -1263,6 +1263,25 @@ class KnowledgeService:
                     )
         return MaintenanceReport(examined=examined, changed=examined, denied=0)
 
+    def backfill_alias_search_keys(
+        self, *, context: TrustedAdminContext
+    ) -> MaintenanceReport:
+        """Populate missing normalized alias keys on this owner-authorized store."""
+        self._require_admin_context(context)
+        with self._store.transaction():
+            rows = self._store.query(
+                "SELECT id, alias FROM contact_aliases WHERE normalized_alias = '' ORDER BY id"
+            )
+            changed = 0
+            for row in rows:
+                cursor = self._store.execute(
+                    "UPDATE contact_aliases SET normalized_alias = ?"
+                    " WHERE id = ? AND normalized_alias = ''",
+                    (normalize_alias_value(str(row["alias"])), int(row["id"])),
+                )
+                changed += max(0, cursor.rowcount)
+        return MaintenanceReport(examined=len(rows), changed=changed, denied=0)
+
     def prune(self, *, before_ms: int, context: TrustedAdminContext) -> MaintenanceReport:
         """Expire statements whose validity window passed.  Counts only, no content."""
         self._require_admin_context(context)

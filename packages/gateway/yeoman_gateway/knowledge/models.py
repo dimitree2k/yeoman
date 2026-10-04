@@ -1488,11 +1488,16 @@ class IdentifierBinding:
         start is knowledge time, not a proven historical start, so it covers nothing and
         authorizes nothing retroactively.
 
+        An ended binding also needs a known end; zero is only the open-ended sentinel for
+        an active binding.
+
         An ``ended`` binding still covers its own past - that is exactly what makes
         "which person did this number belong to in March?" answerable.  ``conflict`` and
         ``withheld`` never cover anything, because the mapping itself is unproven.
         """
         if self.status not in ("active", "ended") or self.valid_from_ms <= 0:
+            return False
+        if self.status == "ended" and self.valid_until_ms <= 0:
             return False
         if at_ms < self.valid_from_ms:
             return False

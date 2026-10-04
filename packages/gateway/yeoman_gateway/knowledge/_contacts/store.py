@@ -16,6 +16,7 @@ from yeoman_gateway.knowledge._contacts.models import (
     ContactField,
     ContactIdentifier,
 )
+from yeoman_gateway.knowledge.models import normalize_alias_value
 
 
 def _now_iso() -> str:
@@ -130,6 +131,10 @@ class ContactsStore:
                     ON contact_fields (contact_id);
                 """
             )
+            self._has_normalized_alias = "normalized_alias" in {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(contact_aliases)")
+            }
             self._commit_owned()
 
             # Migration: dedup existing rows then add unique index on contact_fields.
@@ -321,15 +326,28 @@ class ContactsStore:
     ) -> None:
         now = _now_iso()
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (contact_id, alias, source)
-                DO UPDATE SET last_seen = excluded.last_seen
-                """,
-                (contact_id, alias, source, now, now),
-            )
+            if self._has_normalized_alias:
+                self._conn.execute(
+                    """
+                    INSERT INTO contact_aliases
+                        (contact_id, alias, source, first_seen, last_seen, normalized_alias)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (contact_id, alias, source)
+                    DO UPDATE SET last_seen = excluded.last_seen,
+                                  normalized_alias = excluded.normalized_alias
+                    """,
+                    (contact_id, alias, source, now, now, normalize_alias_value(alias)),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO contact_aliases (contact_id, alias, source, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (contact_id, alias, source)
+                    DO UPDATE SET last_seen = excluded.last_seen
+                    """,
+                    (contact_id, alias, source, now, now),
+                )
             self._commit_owned()
 
     def get_aliases(self, contact_id: str) -> list[ContactAlias]:

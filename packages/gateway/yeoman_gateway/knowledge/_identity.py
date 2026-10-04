@@ -1065,6 +1065,14 @@ class IdentityEngine:
             if observation.mapping_verified:
                 for identifier in observation.identifiers:
                     if identifier.full_key in existing:
+                        matched = existing[identifier.full_key]
+                        self._bind(
+                            person_id=matched.person_id,
+                            identifier=identifier,
+                            evidence_ref=matched.evidence_ref,
+                            mapping_verified=True,
+                            observed_at_ms=observed_at_ms,
+                        )
                         continue
                     if identifier.kind in _REASSIGNABLE_KINDS:
                         # A recyclable handle is not durable identity evidence.
