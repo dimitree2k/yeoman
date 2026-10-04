@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ _ACTIONS = {
     "GROUP_PARTICIPANT_PROMOTE": "promote",
     "GROUP_PARTICIPANT_DEMOTE": "demote",
 }
+_MEMBER_IDENTIFIER = re.compile(r"^([0-9]+)(?::[0-9]+)?@(lid|s\.whatsapp\.net)$", re.ASCII)
 
 
 def _checked_root(value: Path, suffix: tuple[str, ...]) -> Path:
@@ -41,6 +43,34 @@ def _checked_root(value: Path, suffix: tuple[str, ...]) -> Path:
 
 def _identifier(value: Any) -> str | None:
     return value if isinstance(value, str) and 0 < len(value) <= 256 and "@" in value else None
+
+
+def _participant_identifiers(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    raw = value.strip()
+    if raw.startswith("{"):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, RecursionError):
+            return []
+        if not isinstance(decoded, dict):
+            return []
+        candidates = (decoded.get("id"), decoded.get("lid"), decoded.get("phoneNumber"))
+    else:
+        candidates = (raw,)
+
+    identifiers: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str) or len(candidate) > 128:
+            continue
+        match = _MEMBER_IDENTIFIER.fullmatch(candidate.strip())
+        if match is None:
+            continue
+        normalized = f"{match.group(1)}@{match.group(2)}"
+        if normalized not in identifiers:
+            identifiers.append(normalized)
+    return identifiers
 
 
 def _message_id(value: Any) -> str | None:
@@ -104,6 +134,11 @@ def extract_membership_stubs(cold_root: Path, rolling_root: Path, bridge_package
                 continue
             key = decoded.get("key") if isinstance(decoded.get("key"), dict) else {}
             participants = decoded.get("messageStubParameters")
+            participant_ids = (
+                [jid for item in participants for jid in _participant_identifiers(item)]
+                if isinstance(participants, list)
+                else []
+            )
             stubs.append({
                 "source_locator": f"{label}/{path.name}",
                 "source_sha256": source_hash,
@@ -114,7 +149,7 @@ def extract_membership_stubs(cold_root: Path, rolling_root: Path, bridge_package
                 "stub_type": stub_type,
                 "action": _ACTIONS[stub_type],
                 "actor": _identifier(key.get("participant")) or _identifier(decoded.get("participant")),
-                "participants": [jid for item in participants if (jid := _identifier(item))] if isinstance(participants, list) else [],
+                "participants": participant_ids,
                 "duplicate_locators": [],
                 "conflicting_payloads": False,
             })

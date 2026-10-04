@@ -63,6 +63,42 @@ def _setup(tmp_path: Path) -> tuple[WhatsAppChannel, RawArchive, ProcessingStore
     return channel, archive, store
 
 
+def _use_inline_bridge_ack(channel: WhatsAppChannel) -> None:
+    """Keep the real capture/ACK path while making tests own worker scheduling."""
+    def ensure_pipeline() -> None:
+        channel._bridge_pipeline_loop = asyncio.get_running_loop()
+        channel._bridge_ack_queue = asyncio.Queue(
+            maxsize=max(1, int(channel._ack_queue_maxsize))
+        )
+        channel._bridge_event_lock = asyncio.Lock()
+        channel._bridge_inflight.clear()
+        channel._bridge_intake_closed = False
+
+    channel._ensure_bridge_pipeline = ensure_pipeline  # type: ignore[method-assign]
+
+
+async def _handle_with_inline_ack(channel: WhatsAppChannel, raw: str) -> None:
+    await channel._handle_bridge_message(raw)
+    queue = channel._bridge_ack_queue
+    if queue is None:
+        return
+    while not queue.empty():
+        work = queue.get_nowait()
+        try:
+            await channel._ack_and_project_bridge_work(work)
+        finally:
+            queue.task_done()
+
+
+def _inline_raw_append(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid a default-executor thread in sync tests; keep RawArchive writes real."""
+    async def append_inline(archive, event) -> None:
+        if archive is not None:
+            archive.append(event)
+
+    monkeypatch.setattr("yeoman_gateway.channels.whatsapp.append_async", append_inline)
+
+
 def _records(root: Path) -> list[dict]:
     return [r for path in archive_files(root) for _, r, _ in iter_records(path) if r]
 
@@ -151,6 +187,195 @@ def test_membership_change_is_raw_archived_before_journaling(tmp_path: Path) -> 
     assert record["native"]["payload"]["messageId"] == "message-9"
     assert record["native"]["payload"]["stubType"] == 27
     assert store.count_events() == 1
+
+
+def test_empty_complete_membership_snapshot_is_archived_journaled_and_acked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    channel, archive, store = _setup(tmp_path)
+    order: list[str] = []
+    issued: list[object] = []
+    recorded: list[object] = []
+    append_raw = archive.append
+    append_event = store.append_event
+
+    class Issuer:
+        def observe(self, observation: object) -> None:
+            issued.append(observation)
+
+    class IdentityService:
+        def record_provider_pair(self, observation: object) -> None:
+            recorded.append(observation)
+
+    channel.set_processing_signals(
+        SignalJournalSink(
+            store,
+            clock=lambda: NOW,
+            identity_observation_issuer=Issuer(),
+            statements=IdentityService(),
+        )
+    )
+    _inline_raw_append(monkeypatch)
+
+    def record_raw(event):
+        order.append("raw")
+        return append_raw(event)
+
+    def record_journal(*args, **kwargs):
+        order.append("journal")
+        return append_event(*args, **kwargs)
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del timeout_seconds, kwargs
+        assert command_type == "ack_event"
+        assert store.get_event("empty-roster") is not None
+        order.append("ack")
+        return {"acknowledged": True}
+
+    archive.append = record_raw  # type: ignore[method-assign]
+    store.append_event = record_journal  # type: ignore[method-assign]
+    channel._send_command = ack  # type: ignore[method-assign]
+    _use_inline_bridge_ack(channel)
+    payload = {
+        "chatJid": CHAT,
+        "snapshotAtMs": NOW,
+        "complete": True,
+        "memberCount": 0,
+        "participants": [],
+    }
+    frame = json.loads(
+        _frame(payload, event_id="empty-roster", kind="membership_snapshot")
+    )
+    frame["eventKey"] = f"whatsapp:account-a:{CHAT}:membership_snapshot:{NOW}"
+
+    async def capture() -> None:
+        channel._reader_task = asyncio.current_task()
+        channel._events_subscribed = True
+        await _handle_with_inline_ack(channel, json.dumps(frame))
+
+    asyncio.run(capture())
+
+    assert order == ["raw", "journal", "ack"]
+    [record] = _records(tmp_path / "raw")
+    assert record["kind"] == "membership_snapshot"
+    event = store.get_event("empty-roster")
+    assert event is not None and event.payload is not None
+    assert event.payload["complete"] is True
+    assert event.payload["member_count"] == 0
+    assert event.payload["participants"] == []
+    assert issued == recorded == []
+    store.close()
+
+
+@pytest.mark.parametrize("kind", ["membership_change", "membership_snapshot"])
+def test_membership_conflict_is_archived_but_not_acked_or_projected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    channel, archive, store = _setup(tmp_path)
+    channel._connected = True
+    acknowledgements: list[str] = []
+    order: list[str] = []
+    issued: list[object] = []
+    recorded: list[object] = []
+    append_raw = archive.append
+    append_event = store.append_event
+
+    def record_raw(event):
+        order.append("raw")
+        return append_raw(event)
+
+    def record_journal(*args, **kwargs):
+        order.append("journal")
+        return append_event(*args, **kwargs)
+
+    archive.append = record_raw  # type: ignore[method-assign]
+    store.append_event = record_journal  # type: ignore[method-assign]
+    _use_inline_bridge_ack(channel)
+    _inline_raw_append(monkeypatch)
+
+    class Socket:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class Issuer:
+        def observe(self, observation: object) -> None:
+            issued.append(observation)
+
+    class IdentityService:
+        def record_provider_pair(self, observation: object) -> None:
+            recorded.append(observation)
+
+    socket = Socket()
+    channel._ws = socket
+    channel.set_processing_signals(
+        SignalJournalSink(
+            store,
+            clock=lambda: NOW,
+            identity_observation_issuer=Issuer(),
+            statements=IdentityService(),
+        )
+    )
+
+    async def ack(command_type: str, payload: dict, timeout_seconds: float, **kwargs):
+        del timeout_seconds, kwargs
+        assert command_type == "ack_event"
+        acknowledgements.append(payload["eventId"])
+        order.append("ack")
+        return {"acknowledged": True}
+
+    channel._send_command = ack  # type: ignore[method-assign]
+
+    def payload(member: str) -> dict:
+        if kind == "membership_change":
+            return {
+                "chatJid": CHAT,
+                "action": "add",
+                "changeId": "same-change",
+                "sourceCopyId": "stub:same-change",
+                "participants": [{"lid": member}],
+            }
+        digits = "123" if member == "123@lid" else "456"
+        return {
+            "chatJid": CHAT,
+            "snapshotAtMs": NOW,
+            "complete": True,
+            "memberCount": 1,
+            "participants": [
+                {"lid": member, "phoneJid": f"49{digits}@s.whatsapp.net", "admin": False}
+            ],
+        }
+
+    def frame(event_id: str, member: str) -> str:
+        value = json.loads(_frame(payload(member), event_id=event_id, kind=kind))
+        value["eventKey"] = f"whatsapp:account-a:{CHAT}:{kind}:same-provider-identity"
+        return json.dumps(value)
+
+    async def capture_both() -> None:
+        channel._reader_task = asyncio.current_task()
+        channel._events_subscribed = True
+        await _handle_with_inline_ack(channel, frame("membership-first", "123@lid"))
+        await _handle_with_inline_ack(channel, frame("membership-conflict", "456@lid"))
+
+    asyncio.run(capture_both())
+
+    records = _records(tmp_path / "raw")
+    assert [record["kind"] for record in records] == [kind, kind]
+    assert acknowledgements == ["membership-first"]
+    assert order == ["raw", "journal", "ack", "raw", "journal"]
+    assert channel._bridge_intake_closed is True
+    assert socket.closed is True
+    assert store.count_events() == 1
+    original = store.get_event("membership-first")
+    assert original is not None and original.payload is not None
+    assert original.payload["participants"][0].get("lid") == "123@lid"
+    if kind == "membership_snapshot":
+        assert len(issued) == len(recorded) == 1
+        assert issued[0] is recorded[0]
+    else:
+        assert issued == recorded == []
+    store.close()
 
 
 def test_membership_copies_make_two_raw_lines_and_one_journal_event(tmp_path: Path) -> None:

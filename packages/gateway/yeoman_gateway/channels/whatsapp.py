@@ -1359,6 +1359,17 @@ class WhatsAppChannel(BaseChannel):
                 observed_at_ms=int(observed_at),
             )
         except JournalConflictError as exc:
+            if kind in {"membership_change", "membership_snapshot"}:
+                logger.warning(
+                    "WhatsApp membership capture conflict detail={} event_id={} "
+                    "event_key={}; refusing ACK",
+                    str(exc)[:400],
+                    str(event_id)[:64],
+                    str(event_key)[:200],
+                )
+                await self._forget_bridge_work(work)
+                await self._close_bridge_intake("membership_capture_conflict")
+                return False
             # The provider identity is already journaled with different content: WhatsApp
             # revised the event (an edited message, a reaction moved to another emoji) or
             # the bridge re-derived its payload.  The stored row stays authoritative and

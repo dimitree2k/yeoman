@@ -529,7 +529,6 @@ class WhatsAppSignalMapper:
                 or not isinstance(member_count, int)
                 or not 0 <= member_count <= 100_000
                 or (complete and member_count != len(participants))
-                or (complete and not participants)
                 or isinstance(snapshot_at, bool)
                 or not isinstance(snapshot_at, int)
                 or not 0 <= snapshot_at <= 2**53 - 1

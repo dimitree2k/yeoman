@@ -29,11 +29,27 @@ def _decoder(encoded: str, _package: Path) -> tuple[dict | None, str | None]:
     if encoded == "nonascii":
         raise UnicodeEncodeError("ascii", encoded, 0, 1, "invalid input")
     stub_type = encoded if encoded.startswith("GROUP_PARTICIPANT_") else ("UNKNOWN" if encoded == "ordinary" else "GROUP_PARTICIPANT_ADD")
+    participants = ["49100@s.whatsapp.net"]
+    if encoded == "structured":
+        participants = [
+            json.dumps(
+                {
+                    "id": "123:4@lid",
+                    "lid": "123@lid",
+                    "phoneNumber": "49123:2@s.whatsapp.net",
+                    "notify": "PRIVATE PARTICIPANT NAME",
+                    "admin": "PRIVATE PARTICIPANT NOTE",
+                }
+            ),
+            json.dumps({"id": "789@lid", "notify": "x" * 300}),
+            '{"id":"888@lid"',
+            "49199@s.whatsapp.net",
+        ]
     return {
         "key": {"remoteJid": "group@g.us", "id": "native-1", "participant": "actor@s.whatsapp.net"},
         "messageTimestamp": "1725000000",
         "messageStubType": stub_type,
-        "messageStubParameters": ["member@s.whatsapp.net"],
+        "messageStubParameters": participants,
         "message": {"conversation": "PRIVATE MESSAGE BODY"},
     }, None
 
@@ -53,7 +69,7 @@ def test_extracts_only_membership_stubs_without_message_text(tmp_path: Path, mon
         "group@g.us", "native-1", "GROUP_PARTICIPANT_ADD", "add"
     )
     assert row["actor"] == "actor@s.whatsapp.net"
-    assert row["participants"] == ["member@s.whatsapp.net"]
+    assert row["participants"] == ["49100@s.whatsapp.net"]
     assert row["provider_timestamp"] == "1725000000"
     assert set(row) == {
         "source_locator", "source_sha256", "payload_sha256", "chat_jid", "native_message_id",
@@ -61,6 +77,29 @@ def test_extracts_only_membership_stubs_without_message_text(tmp_path: Path, mon
         "duplicate_locators", "conflicting_payloads",
     }
     assert "PRIVATE MESSAGE BODY" not in json.dumps(report)
+
+
+def test_json_participant_parameters_emit_only_normalized_identifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cold, rolling = _roots(tmp_path)
+    _write(cold, "structured.json", "structured")
+    monkeypatch.setattr(reader, "_decode_bridge", _decoder)
+
+    report = reader.extract_membership_stubs(cold, rolling, tmp_path / "bridge")
+
+    row = report["stubs"][0]
+    assert row["participants"] == [
+        "123@lid",
+        "49123@s.whatsapp.net",
+        "789@lid",
+        "49199@s.whatsapp.net",
+    ]
+    serialized = json.dumps(report)
+    assert "PRIVATE PARTICIPANT NAME" not in serialized
+    assert "PRIVATE PARTICIPANT NOTE" not in serialized
+    assert "888@lid" not in serialized
+    assert all(not value.startswith("{") for value in row["participants"])
 
 
 def test_duplicate_reference_sources_keep_both_locators(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
