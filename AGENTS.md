@@ -55,7 +55,7 @@ BREAKING CHANGE: config key renamed; update ~/.yeoman/config.json manually.
 
 - Never commit secrets, API keys, or personal data (`~/.yeoman/` runtime data is gitignored).
 - Keep PRs focused — one logical change per commit where practical.
-- Run `python -m pytest tests/` and `ruff check .` before pushing.
+- Follow the validation scope in the approved plan and `~/.codex/AGENTS.md`; do not run the full suite or repository-wide Ruff automatically before every push.
 
 ## Two-Repository Model
 
@@ -145,63 +145,28 @@ Before large feature work or architectural refactors:
 
 ## Bounded Delivery Protocol
 
-This repository uses bounded execution. Generic continuous-execution or
-five-round subagent workflows are not used automatically here.
+Follow the approved plan; generic continuous-execution or five-round workflows
+do not apply automatically.
 
-- Before recovery or refactoring, record the branch, `HEAD`, and worktree
-  status. Preserve uncommitted changes as a patch or WIP commit; never reset,
-  clean, or discard them without explicit approval.
-- One task may use at most one implementer and one reviewer.
-- At most one fix round is automatic. A second fix round requires an explicit
-  human decision.
-- Only P0/P1 findings inside the stated task scope block completion. Record
-  P2/P3 findings in the ledger and defer them.
-- Do not broaden a task because a reviewer finds unrelated edge cases.
-- Timebox work to 60 minutes per task and 4 hours per phase. On timeout,
-  usage-limit error, or a hanging test, stop, preserve state, and report.
-  Do not silently retry or spawn another agent.
-- Use three test tiers: targeted RED/GREEN checks while editing; the related
-  suite once at task completion; the full suite once at final handoff. Do not
-  rerun an unchanged suite after every agent message.
-- During iteration, run Ruff on changed files and Mypy only on affected
-  strict targets (or where the plan explicitly requires it). Run broader
-  Ruff/Mypy checks once at the applicable plan/final gate. After a failure,
-  rerun only the failed or affected check; do not repeat passing lint/type
-  checks after unrelated edits or agent messages unless later changes could
-  invalidate them.
-- Use a 360-second hard timeout for targeted and related test suites; keep
-  the full-suite timeout at 1200 seconds. A longer rerun after a timeout
-  needs explicit owner authorization; do not silently retry.
-- Keep parent handoffs to ten lines plus a path to the detailed report. Do not
-  copy full logs, source files, or agent reports into the parent context.
-- After dispatch, verify that the actual child model matches the requested
-  model. A mismatch is a stop condition.
-- Do not merge, push, deploy, or restart services as part of a bounded task
-  unless the user explicitly authorizes that side effect.
+- Plans identify prerequisites, independent lanes, file/API ownership, and
+  integration. Parallelize only ready, disjoint lanes; serialize shared files,
+  shared `~/.yeoman` tracker/plan edits, rebases, and integration.
 
-## Test And Validation Matrix
-
-Prefer targeted checks while iterating, then broader checks before handoff:
-
-```bash
-python -m pytest tests/gateway/
-python -m pytest tests/shared/
-python -m pytest tests/overseer/
-python -m pytest tests/
-ruff check .
-mypy packages/gateway/yeoman_gateway/core packages/gateway/yeoman_gateway/adapters
-```
-
-Bridge changes:
-
-```bash
-cd packages/bridge
-npm run build
-npm test
-```
-
-After Python-only gateway changes, restart affected services. After bridge,
-dependency, or packaging changes, run `yeoman deploy` from `~/Documents/yeoman/`.
+- Before recovery/refactoring, record branch, HEAD and worktree status. Preserve
+  uncommitted work; never reset, clean or discard it without approval.
+- Use at most one implementer and one reviewer per task. Allow one fix round;
+  a second needs the owner's decision. Only in-scope P0/P1 findings block
+  completion; log P2/P3 and do not broaden the task.
+- Work budgets are 60 minutes per task and 4 hours per phase, not process
+  timeouts. Follow the approved plan and `~/.codex/AGENTS.md` for check scope,
+  preflight, monitoring and retries.
+- Run Ruff on changed files and Mypy on affected strict targets during work;
+  broader checks belong only to a plan's final gate.
+- Keep handoffs to ten lines plus a report path. Do not copy full logs or agent
+  reports into the parent context.
+- Verify the dispatched child uses the requested model and effort; stop if
+  it does not.
+- Do not merge, push, deploy or restart services unless the user authorized it.
 
 ## Deployment Rules
 
@@ -216,6 +181,7 @@ changes require `yeoman deploy`.
 - ~/.yeoman/var/cache/bridge/               (managed by ensure_runtime)
 
 ### After Code Changes
-For Python-only changes: restart affected services.
-For bridge or dependency changes: run `yeoman deploy` from ~/Documents/yeoman/.
-Do not manually copy files between source and installed locations.
+Only after an authorized rollout, restart affected services for Python-only
+changes or run `yeoman deploy` from ~/Documents/yeoman/ for bridge, dependency
+or packaging changes. Never manually copy files between source and installed
+locations.
