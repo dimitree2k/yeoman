@@ -1779,27 +1779,14 @@ class KnowledgeService:
         self._store.commit_if_idle()
 
     def person_id_for_value(self, value: str) -> str | None:
-        """Person id for a proven *active* identifier value, searched across channels.
+        """One canonical person for a proven active identifier value.
 
-        The compatibility projection ``contact_identifiers`` is deliberately not a
-        fallback here: a legacy row without a proven mapping must not resolve a person.
+        Without channel or account context, local and full-value matches must agree on
+        exactly one canonical person.  An unproven compatibility projection is never a
+        fallback.
         """
-        token = str(value or "").strip()
-        if not token:
-            return None
-        candidates: list[str] = [token]
-        local = token.split("@", 1)[0]
-        if local and local != token:
-            candidates.append(local)
-        for candidate in dict.fromkeys(candidates):
-            row = self._store.query_one(
-                "SELECT person_id FROM knowledge_identifier_bindings"
-                " WHERE value = ? AND status = 'active' LIMIT 1",
-                (candidate,),
-            )
-            if row is not None:
-                return self.canonical_id(str(row["person_id"]))
-        return None
+        owners = self.owners_of_identifier_value(value)
+        return owners[0] if len(owners) == 1 else None
 
     def canonical_id(self, person_id: str) -> str:
         """Current canonical person for an original (possibly merged) person id."""
