@@ -558,6 +558,30 @@ def test_single_account_inference_requires_complete_period(tmp_path: Path) -> No
     assert refused["decision"]["status"] == "unresolved"
 
 
+def test_account_inventory_accepts_source_proof_time_difference(tmp_path: Path) -> None:
+    history_db, knowledge_db = _write_inputs(
+        tmp_path,
+        time_certainty="capture_time_approx",
+        proof_occurred_ms=101,
+        valid_from_ms=1,
+    )
+    _without_explicit_account(history_db)
+
+    detail = plan_speaker_attribution(
+        history_db,
+        knowledge_db,
+        include_details=True,
+        attribution_evidence=_single_account_evidence(history_db, knowledge_db),
+    )["details"][0]
+
+    # Inventory coverage does not turn an approximate source time into identity proof.
+    assert detail["attribution_basis"] is None
+    assert detail["decision"] == {
+        "status": "candidate",
+        "reason": "event_time_not_native",
+    }
+
+
 def _typed(kind: str, value: str, account: str = "test-account") -> Identifier:
     return Identifier(channel="whatsapp", kind=kind, namespace=account, value=value)
 

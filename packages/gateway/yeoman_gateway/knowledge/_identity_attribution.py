@@ -249,7 +249,9 @@ def _validate_evidence_locators(
                 if name == "config":
                     _validate_config_ref(ref, source, evidence)
                 elif name == "journal":
-                    _history_copy_for_ref(history, ref, expected_channel=channel)
+                    _history_copy_for_ref(
+                        history, ref, expected_channel=channel, require_proof_time=False
+                    )
                 else:
                     _binding_for_ref(knowledge, ref, expected_channel=channel)
         if config["complete"]:
@@ -412,6 +414,7 @@ def _history_copy_for_ref(
     ref: Mapping[str, Any],
     *,
     expected_channel: str | None = None,
+    require_proof_time: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     locator = ref["locator"]
     if (ref.get("input") != "history" or not isinstance(locator, Mapping)
@@ -433,7 +436,8 @@ def _history_copy_for_ref(
     event = json.loads(row["normalized_json"])
     event_time = event.get("occurred_ms")
     if (not _positive_timestamp(event_time) or ref.get("time_ms") != event_time
-            or (row["proof_occurred_ms"] is not None and row["proof_occurred_ms"] != event_time)):
+            or (require_proof_time and row["proof_occurred_ms"] is not None
+                and row["proof_occurred_ms"] != event_time)):
         raise IdentityAuditError("history evidence time mismatch")
     return dict(row), event
 
