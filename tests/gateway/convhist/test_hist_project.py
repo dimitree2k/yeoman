@@ -80,6 +80,22 @@ def test_accounting(built):
     assert session["out_of_scope_channel"] == 1 and session["skipped:tool_trace"] == 1
 
 
+def test_group_only_message_is_retained_with_unknown_sender(tmp_path):
+    live = tmp_path / "live"
+    write_jsonl(live / "whatsapp/2026-10.jsonl", [
+        _raw("message", "message", {"chatJid": G, "messageId": "AC-group", "senderId": G,
+                                     "text": "preserved", "timestamp": T0 // 1000}),
+    ])
+    report = project([live], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM messages WHERE native_message_id = 'AC-group'").fetchone()
+
+    assert report["messages"] == 1
+    assert row["text"] == "preserved" and row["sender_contact_id"] is None
+    assert row["sender_identifier"] is None and row["sender_basis"] == "unknown"
+
+
 def _dump(path):
     conn = sqlite3.connect(path)
     tables = {t: conn.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()

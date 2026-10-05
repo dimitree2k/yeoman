@@ -40,6 +40,23 @@ def test_raw_message_links_and_names():
     assert ex.outcomes[("whatsapp/2026-10.jsonl", "message")] == 1
 
 
+def test_group_identifier_is_not_a_message_sender_but_other_ids_are_observed():
+    group_only = [
+        raw(1, "message", "message", {"chatJid": G, "messageId": "AC-group-raw", "senderId": G}),
+        bf("bridge_refs", 1, "message", {"chatJid": G, "messageId": "AC-group-bridge", "senderId": G}),
+        bf("session_jsonl", 1, "message", {"chatJid": G, "messageId": "AC-group-derived", "senderId": G},
+           provenance="derived_only"),
+    ]
+    ex = extract(group_only + [raw(4, "message", "message", {
+        "chatJid": G, "messageId": "AC-person", "participantJid": G, "senderPhoneJid": PN,
+    })])
+
+    assert len(ex.messages) == 4
+    assert all(copy.sender is None and copy.sender_raw is None for copy in ex.messages[:3])
+    assert ex.messages[3].sender == classify(PN) and ex.messages[3].sender_raw == PN
+    assert classify(G) in ex.identity.groups
+
+
 def test_lid_conflict_gives_no_link():
     ex = extract([raw(1, "message", "message", {"chatJid": G, "messageId": "AC1", "participantJid": LID,
                                                 "senderPhoneJid": PN, "lidConflict": True})])

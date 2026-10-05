@@ -134,7 +134,7 @@ def extract(lines: Iterable[Layer1Line]) -> Extracted:
     return out
 
 
-def _sender(payload: dict[str, Any]) -> tuple[Ident | None, str | None, list[Ident]]:
+def _sender(payload: dict[str, Any], *, allow_group: bool = True) -> tuple[Ident | None, str | None, list[Ident]]:
     found = [(str(payload[k]), i) for k in ("participantJid", "senderPhoneJid", "senderId")
              if (i := classify(payload.get(k))) is not None]
     idents = [i for _, i in found]
@@ -142,7 +142,7 @@ def _sender(payload: dict[str, Any]) -> tuple[Ident | None, str | None, list[Ide
         if ident.strong:
             return ident, raw, idents
     for raw, ident in found:
-        if ident.kind in ("numeric", "group", "assistant"):
+        if ident.kind in ("numeric", "assistant") or (allow_group and ident.kind == "group"):
             return ident, raw, idents
     return None, None, idents
 
@@ -166,7 +166,7 @@ def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat:
              from_assistant: bool | None = None, media: Any = None, description: str | None = None,
              mentions: Any = None, extra_refs: tuple[str, ...] = ()) -> None:
     assistant = bool(p.get("fromAssistant")) if from_assistant is None else from_assistant
-    sender, sender_raw, idents = (None, None, []) if assistant else _sender(p)
+    sender, sender_raw, idents = (None, None, []) if assistant else _sender(p, allow_group=False)
     name = None if assistant else p.get("senderName")
     cleaned = clean_text(p.get("text"))
     if not (isinstance(media, dict) and media) and cleaned.placeholder:
