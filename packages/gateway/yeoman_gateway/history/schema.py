@@ -82,9 +82,10 @@ CREATE TABLE message_events (
 CREATE INDEX message_events_target ON message_events(target_message_id, kind);
 CREATE INDEX message_events_chat_time ON message_events(channel, chat_id, occurred_ms);
 CREATE TABLE projector_state (
-  file   TEXT PRIMARY KEY,
-  lines  INTEGER NOT NULL,
-  sha256 TEXT NOT NULL
+  file              TEXT PRIMARY KEY,
+  lines             INTEGER NOT NULL,
+  sha256            TEXT NOT NULL,
+  projector_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE VIEW messages_current AS
 SELECT m.*,

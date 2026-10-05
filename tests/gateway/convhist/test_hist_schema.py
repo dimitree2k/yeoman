@@ -54,3 +54,10 @@ def test_messages_current_view(db):
     row = db.execute("SELECT current_text, deleted, reactions FROM messages_current").fetchone()
     assert row[0] == "hallo!!" and row[1] == 0
     assert '"😂"' in row[2] and "👍" not in row[2]
+
+
+def test_projector_state_defaults_projector_version_to_one(db):
+    columns = {row[1] for row in db.execute("PRAGMA table_info(projector_state)")}
+    assert "projector_version" in columns
+    db.execute("INSERT INTO projector_state (file, lines, sha256) VALUES ('messages.jsonl', 1, 'abc')")
+    assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 1
