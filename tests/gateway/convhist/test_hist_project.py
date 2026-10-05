@@ -170,6 +170,44 @@ def test_ambiguous_purged_event_is_retained_for_review(tmp_path):
     assert json.loads(rows[-1][1]) == ["whatsapp/events.jsonl#3"]
 
 
+
+def test_complete_event_window_is_anchored_to_first_copy(tmp_path):
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(live / "whatsapp/events.jsonl", [
+        _raw("edit", "edit", {"chatJid": G, "messageId": "AC1", "participantJid": FRANK_LID,
+                              "text": "same", "timestamp": T0 // 1000 + offset // 1000})
+        for offset in (0, 120_000, 240_000)
+    ])
+    project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    rows = conn.execute("SELECT source_refs FROM message_events ORDER BY occurred_ms").fetchall()
+    assert [json.loads(row[0]) for row in rows] == [
+        ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"],
+        ["whatsapp/events.jsonl#3"],
+    ]
+
+
+def test_purged_event_matches_only_complete_copies_within_window(tmp_path):
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(live / "whatsapp/events.jsonl", [
+        _raw("edit", "edit", {"chatJid": G, "messageId": "AC1", "participantJid": FRANK_LID,
+                              "text": "complete", "timestamp": T0 // 1000}),
+        _raw("edit", "edit", {"chatJid": G, "messageId": "AC1", "participantJid": FRANK_LID,
+                              "timestamp": T0 // 1000 + 100}),
+        _raw("edit", "edit", {"chatJid": G, "messageId": "AC1", "participantJid": FRANK_LID,
+                              "timestamp": T0 // 1000 + 200}),
+    ])
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    rows = conn.execute("SELECT payload_json, source_refs FROM message_events ORDER BY occurred_ms").fetchall()
+    assert len(rows) == 2 and report["events"] == 2
+    assert json.loads(rows[0][1]) == ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"]
+    assert json.loads(rows[0][0])["text"] == "complete"
+    assert json.loads(rows[1][1]) == ["whatsapp/events.jsonl#3"]
+    assert json.loads(rows[1][0])["text"] is None
+    assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
+
+
 def test_explicit_reaction_removal_is_not_treated_as_purged_payload(tmp_path):
     live, dev = tmp_path / "live", tmp_path / "dev"
     write_jsonl(live / "whatsapp/events.jsonl", [

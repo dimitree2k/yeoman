@@ -272,15 +272,15 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
         items = sorted(groups[key], key=lambda x: (x[0].occurred_ms is None, x[0].occurred_ms or 0,
                                                    x[0].rank, x[0].ref))
         current: list[tuple[EventCopy, str | None, str]] = []
-        latest: int | None = None
+        first_time: int | None = None
         for item in items:
             moment = item[0].occurred_ms
-            if current and (moment is None or latest is None or moment - latest > WINDOW_MS):
+            if current and (moment is None or first_time is None or moment - first_time > WINDOW_MS):
                 clusters.append((key, current))
-                current, latest = [], None
+                current, first_time = [], None
             current.append(item)
-            if moment is not None:
-                latest = moment
+            if first_time is None and moment is not None:
+                first_time = moment
         if current:
             clusters.append((key, current))
 
@@ -289,8 +289,8 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
         moment = item[0].occurred_ms
         candidates = [members for key, members in clusters
                       if key[:5] == base and moment is not None
-                      and any(c.occurred_ms is not None and abs(c.occurred_ms - moment) <= WINDOW_MS
-                              for c, _, _ in members)]
+                      and any(_event_complete(c) and c.occurred_ms is not None
+                              and abs(c.occurred_ms - moment) <= WINDOW_MS for c, _, _ in members)]
         if len(candidates) == 1:
             candidates[0].append(item)
         else:
