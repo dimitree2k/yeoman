@@ -1,5 +1,6 @@
 from hist_fixtures import make_db
 from yeoman_gateway.history.convert.media import convert_media_descriptions, convert_media_records
+from yeoman_gateway.history.layer1 import row_sha256
 
 DDL = """
 CREATE TABLE media_items (id INTEGER PRIMARY KEY, channel TEXT, chat_id TEXT, message_id TEXT,
@@ -26,4 +27,8 @@ def test_media(tmp_path):
     (desc,) = convert_media_descriptions(tmp_path)
     assert desc["kind"] == "media_description" and desc["mode"] == "ocr"
     assert (desc["chat_id"], desc["native_message_id"], desc["text"]) == ("1-2@g.us", "AC06", "25. November")
+    extraction = {"id": 1, "media_item_id": 65, "mode": "ocr_image", "content": "25. November",
+                  "char_count": 12, "page_count": 1, "created_at": 1779997872}
     assert desc["generated_ms"] == 1779997872000 and desc["origin"]["row_key"] == "1"
+    assert desc["original"] == extraction
+    assert desc["origin"]["row_sha256"] == row_sha256(extraction)

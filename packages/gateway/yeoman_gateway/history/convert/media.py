@@ -46,14 +46,16 @@ def convert_media_descriptions(source_home: Path) -> Iterator[dict[str, Any]]:
         query = ("SELECT x.*, i.channel AS i_channel, i.chat_id AS i_chat_id, i.message_id AS i_message_id"
                  " FROM media_extractions x JOIN media_items i ON i.id = x.media_item_id ORDER BY x.id")
         for row in conn.execute(query):
-            original = row_dict(row)
+            joined = row_dict(row)
+            linkage = {key: joined.pop(f"i_{key}") for key in ("channel", "chat_id", "message_id")}
+            original = joined
             generated_ms, _ = epoch_or_iso_to_ms(original.get("created_at"))
             yield {
                 "derived_version": 1,
                 "kind": "media_description",
-                "channel": original.get("i_channel") or "whatsapp",
-                "chat_id": original.get("i_chat_id"),
-                "native_message_id": original.get("i_message_id"),
+                "channel": linkage["channel"] or "whatsapp",
+                "chat_id": linkage["chat_id"],
+                "native_message_id": linkage["message_id"],
                 "mode": "ocr" if str(original.get("mode", "")).startswith("ocr") else "description",
                 "generator": None,
                 "generated_ms": generated_ms,
