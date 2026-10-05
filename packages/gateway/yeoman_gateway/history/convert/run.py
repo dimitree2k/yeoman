@@ -73,7 +73,8 @@ def run_conversion(source_home: Path, raw_out: Path, *, decode: Decoder | None,
     todo = jobs(source_home, decode=decode, extra_bridge_dirs=extra_bridge_dirs)
     targets = [raw_out / job.subdir / f"{job.name}.jsonl" for job in todo]
     for target in targets:
-        if target.exists() or target.with_name(target.name + ".partial").exists():
+        partial = target.with_name(target.name + ".partial")
+        if target.exists() or target.is_symlink() or partial.exists() or partial.is_symlink():
             raise FileExistsError(target)
     report: dict[str, Any] = {"source_home": str(source_home), "raw_out": str(raw_out), "files": {}}
     for job, target in zip(todo, targets, strict=True):

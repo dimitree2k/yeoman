@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from hist_fixtures import INBOUND_DDL, make_db, write_jsonl
@@ -72,3 +73,19 @@ def test_partial_target_refuses_before_writing_other_targets(tmp_path):
         run_conversion(home, out, decode=None)
     assert set(out.rglob("*")) == {out / "derived", partial}
     assert partial.read_bytes() == b"unfinished\n"
+
+
+@pytest.mark.parametrize("suffix", ["", ".partial"])
+def test_dangling_late_target_refuses_before_writing_or_mutating_links(tmp_path, suffix):
+    home, out = _home(tmp_path), tmp_path / "out" / "raw"
+    target = out / "derived" / f"media-descriptions.jsonl{suffix}"
+    target.parent.mkdir(parents=True)
+    dangling_to = "missing-destination"
+    target.symlink_to(dangling_to)
+
+    with pytest.raises(FileExistsError):
+        run_conversion(home, out, decode=None)
+
+    assert set(out.rglob("*")) == {out / "derived", target}
+    assert target.is_symlink()
+    assert target.readlink() == Path(dangling_to)
