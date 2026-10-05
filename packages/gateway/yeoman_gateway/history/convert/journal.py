@@ -91,6 +91,19 @@ def _event(row: dict[str, Any]) -> dict[str, Any]:
         payload.update({"targetMessageId": target, "text": payload_in.get("text")})
     elif kind == "delete":
         payload.update({"targetMessageId": target})
+    elif kind in {"membership_snapshot", "membership_change"}:
+        membership = {k: v for k, v in payload_in.items() if k not in payload}
+        participants = membership.get("participants")
+        if isinstance(participants, list):
+            membership["participants"] = [
+                ({**item, "phoneJid": item["phone_jid"]} if isinstance(item, dict)
+                 and "phone_jid" in item and "phoneJid" not in item else item)
+                for item in participants
+            ]
+            for item in membership["participants"]:
+                if isinstance(item, dict):
+                    item.pop("phone_jid", None)
+        payload.update(membership)
     else:
         payload.update({k: v for k, v in payload_in.items() if k not in payload})
     payload = compact(payload)

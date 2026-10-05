@@ -213,11 +213,11 @@ def _membership(out: Extracted, ref: str, type_: str, p: dict[str, Any], *, chan
         kind = _MEMBER_ACTIONS.get(str(p.get("action")), "")
         if not kind:
             return f"skipped:membership_action:{p.get('action')}"
-    members: list[list[str]] = []
+    members: set[tuple[str, ...]] = set()
     for item in p.get("participants") or []:
         if isinstance(item, dict):
             lid = classify(item.get("lid"))
-            pn = classify(item.get("phoneJid") or item.get("pn") or item.get("jid"))
+            pn = classify(item.get("phoneJid") or item.get("phone_jid") or item.get("pn") or item.get("jid"))
         else:
             ident = classify(item)
             lid, pn = (ident, None) if ident is not None and ident.kind == "lid" else (None, ident)
@@ -225,15 +225,29 @@ def _membership(out: Extracted, ref: str, type_: str, p: dict[str, Any], *, chan
             out.identity.see(ident, ms, ref)
         if provenance == "native" and lid is not None and pn is not None:
             out.identity.link(lid, pn, "native_pair", ref)
-        members.append(sorted(i.value for i in (lid, pn) if i is not None))
-    members.sort()
-    payload: dict[str, Any] = {"participants": members}
+        members.add(tuple(sorted(i.value for i in (lid, pn) if i is not None)))
+    payload: dict[str, Any] = {"participants": [list(member) for member in sorted(members)]}
     if kind == "member_snapshot":
         payload["complete"] = bool(p.get("complete"))
-    actor = classify(p.get("actor"))
-    out.identity.see(actor, ms, ref)
+    raw_actor = p.get("actor")
+    if isinstance(raw_actor, dict):
+        actor_lid = classify(raw_actor.get("lid"))
+        actor_phone = classify(raw_actor.get("phoneJid") or raw_actor.get("phone_jid")
+                                or raw_actor.get("pn") or raw_actor.get("jid"))
+        actor = actor_lid or actor_phone
+        actor_raw = (raw_actor.get("lid") if actor_lid is not None else
+                     raw_actor.get("phoneJid") or raw_actor.get("phone_jid")
+                     or raw_actor.get("pn") or raw_actor.get("jid"))
+        for ident in (actor_lid, actor_phone):
+            out.identity.see(ident, ms, ref)
+        if provenance == "native" and actor_lid is not None and actor_phone is not None:
+            out.identity.link(actor_lid, actor_phone, "native_pair", ref)
+    else:
+        actor = classify(raw_actor)
+        actor_raw = str(raw_actor) if raw_actor else None
+        out.identity.see(actor, ms, ref)
     out.events.append(EventCopy(ref, rank_of(ref), kind, channel, chat, None, actor,
-                                str(p["actor"]) if p.get("actor") else None, False, ms, certainty,
+                                str(actor_raw) if actor_raw else None, False, ms, certainty,
                                 payload, provenance))
     return "event"
 

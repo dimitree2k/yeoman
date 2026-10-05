@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 import pytest
-from hist_fixtures import FRANK_LID, T0, _bf, _raw, sample_layer1, write_jsonl
+from hist_fixtures import FRANK_LID, FRANK_PN, T0, _bf, _raw, sample_layer1, write_jsonl
 from hist_fixtures import SAMPLE_GROUP as G
 from yeoman_gateway.history.project import project
 
@@ -112,6 +112,94 @@ def test_rebuild_identical_and_protected_refused(built, monkeypatch):
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "home"))
     with pytest.raises(PermissionError):
         project([live, dev], tmp_path / "home" / "data" / "raw" / "history.db")
+
+
+def test_dangling_protected_building_symlink_is_refused_without_touching_output(
+    tmp_path, monkeypatch
+):
+    live, dev = sample_layer1(tmp_path)
+    output = tmp_path / "out" / "history.db"
+    project([live, dev], output)
+    original = output.read_bytes()
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path / "home"))
+    protected_target = tmp_path / "home" / "data" / "raw" / "must-not-exist.db"
+    building = output.with_name(output.name + ".building")
+    building.symlink_to(protected_target)
+
+    with pytest.raises(PermissionError):
+        project([live, dev], output)
+
+    assert output.read_bytes() == original
+    assert building.is_symlink() and not protected_target.exists()
+
+
+def test_existing_building_file_is_refused_and_preserved(tmp_path):
+    live, dev = sample_layer1(tmp_path)
+    output = tmp_path / "out" / "history.db"
+    output.parent.mkdir()
+    building = output.with_name(output.name + ".building")
+    building.write_bytes(b"owned by another invocation")
+
+    with pytest.raises(FileExistsError):
+        project([live, dev], output)
+
+    assert building.read_bytes() == b"owned by another invocation"
+
+
+def test_failed_rebuild_preserves_previous_db_and_removes_owned_stage(tmp_path, monkeypatch):
+    live, dev = sample_layer1(tmp_path)
+    output = tmp_path / "history.db"
+    project([live, dev], output)
+    original = output.read_bytes()
+
+    def fail_create(_conn):
+        raise RuntimeError("synthetic schema failure")
+
+    monkeypatch.setattr("yeoman_gateway.history.project.create", fail_create)
+    with pytest.raises(RuntimeError, match="synthetic schema failure"):
+        project([live, dev], output)
+
+    assert output.read_bytes() == original
+    assert not output.with_name(output.name + ".building").exists()
+
+
+def test_producer_membership_snapshot_journal_copy_deduplicates_with_raw(tmp_path):
+    from yeoman_gateway.history.convert.journal import _event
+    from yeoman_gateway.processing.signals import WhatsAppSignalMapper
+
+    participants = [{"lid": FRANK_LID, "phoneJid": FRANK_PN, "admin": True}]
+    signal = WhatsAppSignalMapper().map(
+        {"chatJid": G, "snapshotAtMs": T0, "complete": True, "memberCount": 1,
+         "participants": participants},
+        kind="membership_snapshot", event_key="snapshot", observed_at_ms=T0, strict=True,
+    )
+    assert signal is not None
+    journal_line = _event({
+        "event_id": signal.event_id, "kind": signal.kind, "channel": "whatsapp", "chat_id": G,
+        "principal": "", "direction": "in", "occurred_ms": T0,
+        "created_ms": T0, "payload_json": json.dumps(signal.to_event_payload()),
+    })
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(live / "whatsapp/2026-10.jsonl", [
+        _raw("membership_snapshot", "membership_snapshot", {
+            "chatJid": G, "snapshotAtMs": T0, "complete": True,
+            "participants": participants, "timestamp": T0,
+        })
+    ])
+    write_jsonl(dev / "backfill/journal.jsonl", [journal_line])
+
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    row = conn.execute("SELECT payload_json, source_refs FROM message_events").fetchone()
+    pair = conn.execute(
+        "SELECT count(DISTINCT contact_id) FROM identifier_history WHERE value IN (?,?)",
+        (FRANK_LID, FRANK_PN),
+    ).fetchone()[0]
+
+    assert report["events"] == 1
+    assert json.loads(row[1]) == ["backfill/journal.jsonl#1", "whatsapp/2026-10.jsonl#1"]
+    assert json.loads(row[0])["participants"] == [[FRANK_LID, FRANK_PN]]
+    assert pair == 1
 
 
 def test_native_event_ids_do_not_identify_revisions(tmp_path):

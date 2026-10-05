@@ -350,54 +350,66 @@ def _mark_current_reactions(rows: list[dict[str, Any]]) -> None:
 
 def _write(db_path: Path, res: Resolution, messages: list[dict[str, Any]], events: list[dict[str, Any]],
            files: list[tuple[str, Path]]) -> dict[str, int]:
-    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     building = db_path.with_name(db_path.name + ".building")
-    if building.exists():
-        building.unlink()
+    if is_protected(building):
+        raise PermissionError(f"refusing to write history.db staging file into the raw archive: {building}")
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(building, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    owned = os.fstat(fd)
+    os.close(fd)
     counts: dict[str, int] = {}
-    conn = sqlite3.connect(building)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        create(conn)
-        contacts = sorted(res.contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
-        conn.executemany("INSERT INTO contacts (contact_id, kind, role, display_name, status, merged_into, source_refs) "
-                          "VALUES (?, ?, ?, ?, ?, ?, ?)", [
-            (c.contact_id, c.kind, c.role, c.display_name, c.status, c.merged_into,
-             json.dumps(list(c.source_refs))) for c in contacts])
-        conn.executemany(
-            "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
-            " first_seen_ms, last_seen_ms, ended_ms, source_refs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-                (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
-                 i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)))
-                for i in sorted(res.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
-        conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
-                          "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
-                          "reply_to_native_id, mentions_json, provenance, source_refs) "
-                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-            (m["message_id"], m["channel"], m["chat_id"], m["native_message_id"], m["sender_contact_id"],
-             m["sender_identifier"], m["sender_basis"], m["direction"], m["sent_ms"], m["time_certainty"],
-             m["text"], canonical_json(m["media"]) if m["media"] else None, m["reply_to_native_id"],
-             canonical_json(m["mentions"]) if m["mentions"] else None, m["provenance"],
-             json.dumps(m["source_refs"])) for m in messages])
-        conn.executemany("INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, "
-                          "target_native_id, actor_contact_id, actor_identifier, actor_basis, occurred_ms, "
-                          "time_certainty, payload_json, provenance, source_refs, native_event_id) "
-                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-            (e["event_id"], e["kind"], e["channel"], e["chat_id"], e["target_message_id"],
-             e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
-             e["occurred_ms"], e["time_certainty"], canonical_json(e["payload"]), e["provenance"],
-             json.dumps(e["source_refs"]), e["native_event_id"]) for e in events])
-        for rel, path in files:
-            data = path.read_bytes()
-            counts[rel] = sum(1 for line in data.decode("utf-8", errors="replace").splitlines() if line.strip())
-            conn.execute("INSERT INTO projector_state (file, lines, sha256) VALUES (?, ?, ?)",
-                         (rel, counts[rel], hashlib.sha256(data).hexdigest()))
-        conn.commit()
+        conn = sqlite3.connect(building)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            create(conn)
+            contacts = sorted(res.contacts, key=lambda c: (c.merged_into is not None, c.contact_id))
+            conn.executemany("INSERT INTO contacts (contact_id, kind, role, display_name, status, merged_into, source_refs) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?)", [
+                (c.contact_id, c.kind, c.role, c.display_name, c.status, c.merged_into,
+                 json.dumps(list(c.source_refs))) for c in contacts])
+            conn.executemany(
+                "INSERT INTO identifier_history (contact_id, channel, kind, value, strength, evidence,"
+                " first_seen_ms, last_seen_ms, ended_ms, source_refs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                    (i.contact_id, i.channel, i.kind, i.value, i.strength, i.evidence, i.first_seen_ms,
+                     i.last_seen_ms, i.ended_ms, json.dumps(list(i.source_refs)))
+                    for i in sorted(res.identifiers, key=lambda i: (i.contact_id, i.kind, i.value))])
+            conn.executemany("INSERT INTO messages (message_id, channel, chat_id, native_message_id, sender_contact_id, "
+                              "sender_identifier, sender_basis, direction, sent_ms, time_certainty, text, media_json, "
+                              "reply_to_native_id, mentions_json, provenance, source_refs) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                (m["message_id"], m["channel"], m["chat_id"], m["native_message_id"], m["sender_contact_id"],
+                 m["sender_identifier"], m["sender_basis"], m["direction"], m["sent_ms"], m["time_certainty"],
+                 m["text"], canonical_json(m["media"]) if m["media"] else None, m["reply_to_native_id"],
+                 canonical_json(m["mentions"]) if m["mentions"] else None, m["provenance"],
+                 json.dumps(m["source_refs"])) for m in messages])
+            conn.executemany("INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, "
+                              "target_native_id, actor_contact_id, actor_identifier, actor_basis, occurred_ms, "
+                              "time_certainty, payload_json, provenance, source_refs, native_event_id) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+                (e["event_id"], e["kind"], e["channel"], e["chat_id"], e["target_message_id"],
+                 e["target_native_id"], e["actor_contact_id"], e["actor_identifier"], e["actor_basis"],
+                 e["occurred_ms"], e["time_certainty"], canonical_json(e["payload"]), e["provenance"],
+                 json.dumps(e["source_refs"]), e["native_event_id"]) for e in events])
+            for rel, path in files:
+                data = path.read_bytes()
+                counts[rel] = sum(1 for line in data.decode("utf-8", errors="replace").splitlines() if line.strip())
+                conn.execute("INSERT INTO projector_state (file, lines, sha256) VALUES (?, ?, ?)",
+                             (rel, counts[rel], hashlib.sha256(data).hexdigest()))
+            conn.commit()
+        finally:
+            conn.close()
+        os.chmod(building, 0o600)
+        os.replace(building, db_path)
+        return counts
     finally:
-        conn.close()
-    os.chmod(building, 0o600)
-    os.replace(building, db_path)
-    return counts
+        try:
+            current = building.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+                building.unlink()
 
 
 def _report(ex: Extracted, res: Resolution, messages: list[dict[str, Any]], events: list[dict[str, Any]],

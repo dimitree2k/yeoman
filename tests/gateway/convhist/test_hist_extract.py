@@ -106,6 +106,24 @@ def test_events_membership_and_receipts():
     assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:receipt")] == 1
 
 
+def test_membership_actor_pair_and_journal_phone_key_are_normalized():
+    actor = {"lid": LID, "phoneJid": PN}
+    ex = extract([
+        raw(1, "membership_change", "membership_change", {
+            "chatJid": G, "action": "add", "participants": [actor], "actor": actor,
+        }),
+        bf("journal", 1, "membership_change", {
+            "chatJid": G, "action": "add",
+            "participants": [{"lid": LID, "phone_jid": PN}], "actor": actor,
+        }),
+    ])
+
+    assert len(ex.events) == 2
+    assert all(event.actor == classify(LID) for event in ex.events)
+    assert all(event.actor_raw == LID for event in ex.events)
+    assert sum(link[:3] == (LID, PN, "native_pair") for link in ex.identity.links) == 4
+
+
 def test_event_native_id_is_separate_from_target_and_positional_api_remains_compatible():
     ex = extract([bf("bridge_refs", 1, "edit", {"targetMessageId": "AC1", "nativeEventId": "P2",
                                                    "text": "neu"})])
