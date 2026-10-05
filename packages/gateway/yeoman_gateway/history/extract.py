@@ -272,7 +272,11 @@ def _raw(line: Layer1Line, out: Extracted,
         out.count(line.ref, _membership(out, line.ref, type_, p, channel=channel, chat=chat, ms=ms,
                                         certainty=certainty, provenance="native"))
     elif kind == "outbound_request" and type_ in _SEND_TYPES:
-        pending[str(record.get("correlation_id") or line.ref)] = (line, p, type_)
+        correlation = str(record.get("correlation_id") or line.ref)
+        previous = pending.get(correlation)
+        if previous is not None:
+            out.count(previous[0].ref, "skipped:duplicate_outbound_correlation")
+        pending[correlation] = (line, p, type_)
     elif kind == "outbound_result" and type_ in _SEND_TYPES:
         request = pending.pop(str(record.get("correlation_id") or ""), None)
         sent = (native.get("result") or {}).get("sent") or {}

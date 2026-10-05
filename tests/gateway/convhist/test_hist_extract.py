@@ -123,3 +123,31 @@ def test_backfill_kinds_and_identity():
     assert o[("owner/attestations.jsonl", "invalid_attestation")] == 1
     assert o[("backfill/memory.jsonl", "invalid_json")] == 1
     assert sum(o.values()) == 11
+
+
+def test_malformed_attestation_types_are_counted_invalid():
+    lines = [
+        Layer1Line(f"owner/attestations.jsonl#{i}", {"type": value, "at_ms": 1})
+        for i, value in enumerate(([], {}, 1, True), 1)
+    ]
+    ex = extract(lines)
+    assert ex.outcomes[("owner/attestations.jsonl", "invalid_attestation")] == len(lines)
+    assert sum(ex.outcomes.values()) == len(lines)
+
+
+def test_duplicate_outbound_correlation_counts_replaced_request():
+    lines = [
+        raw(1, "outbound_request", "send_text", {"text": "erste", "to": G}, direction="out",
+            correlation_id="same"),
+        raw(2, "outbound_request", "send_text", {"text": "zweite", "to": G}, direction="out",
+            correlation_id="same"),
+        raw(3, "outbound_result", "send_text", {}, direction="out", correlation_id="same",
+            native={"result": {"sent": {"messageId": "3EB0"}}}),
+    ]
+    ex = extract(lines)
+    (message,) = ex.messages
+    assert message.text == "zweite"
+    assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:duplicate_outbound_correlation")] == 1
+    assert ex.outcomes[("whatsapp/2026-10.jsonl", "message")] == 1
+    assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:outbound_result_paired")] == 1
+    assert sum(ex.outcomes.values()) == len(lines)

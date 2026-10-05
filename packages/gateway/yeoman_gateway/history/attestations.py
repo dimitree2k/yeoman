@@ -44,6 +44,8 @@ def _check(record: Any) -> None:
     if not isinstance(record, dict):
         raise ValueError("attestation must be a JSON object")
     type_ = record.get("type")
+    if not isinstance(type_, str):
+        raise ValueError("attestation type must be a string")
     if type_ not in REQUIRED:
         raise ValueError(f"unknown attestation type: {type_!r}")
     if not isinstance(record.get("at_ms"), int) or isinstance(record["at_ms"], bool):
