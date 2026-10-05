@@ -1,9 +1,12 @@
-from hist_fixtures import make_db
+import sqlite3
+
+from hist_fixtures import T0, _raw, make_db, write_jsonl
 from yeoman_gateway.history.convert.memory_nodes import convert_memory_nodes
+from yeoman_gateway.history.project import project
 
 FULL = """CREATE TABLE memory2_nodes (id TEXT, channel TEXT, chat_id TEXT, sender_id TEXT, kind TEXT,
   content TEXT, source_message_id TEXT, source_role TEXT, meta_json TEXT, created_at TEXT,
-  is_deleted INTEGER, contact_id TEXT);"""
+  is_deleted INTEGER, contact_id TEXT, source TEXT);"""
 OLD = """CREATE TABLE memory2_nodes (id TEXT, channel TEXT, chat_id TEXT, sender_id TEXT, kind TEXT,
   content TEXT, source_message_id TEXT, source_role TEXT, meta_json TEXT, created_at TEXT,
   is_deleted INTEGER);"""
@@ -45,3 +48,40 @@ def test_old_backup_without_contact_id(tmp_path):
     make_db(tmp_path / rel, OLD, {"memory2_nodes": [_node(id="x", sender_id="491757070305", content="hi")]})
     (line,) = convert_memory_nodes(tmp_path, rel, "memory_pre_rebackfill")
     assert line["payload"]["senderId"] == "491757070305" and "contactRef" not in line["payload"]
+
+
+def test_generated_utterance_stays_derived_even_with_native_message_id(tmp_path):
+    rel = "data/memory/memory.db"
+    make_db(tmp_path / rel, FULL, {"memory2_nodes": [
+        *[_node(id=f"generated{i}", source="auto_semantic_v2", source_message_id=f"IMAGE{i}",
+                content=f"The photo shows generated claim {i}", sender_id="491757070305")
+          for i in range(3)],
+        _node(id="caption", source="manual", source_message_id="IMAGE3",
+              content="My blue car", sender_id="491757070305"),
+    ]})
+    converted = list(convert_memory_nodes(tmp_path, rel, "memory"))
+    by_id = {line["origin"]["row_key"]: line for line in converted}
+    for i in range(3):
+        generated = by_id[f"generated{i}"]
+        assert (generated["kind"], generated["provenance"], generated["skip_reason"]) == (
+            "memory_fact", "derived_only", "generated_memory_utterance")
+        assert generated["payload"] == {}
+        assert generated["original"]["content"] == f"The photo shows generated claim {i}"
+        assert generated["origin"]["row_key"] == f"generated{i}"
+    assert (by_id["caption"]["kind"], by_id["caption"]["payload"]["text"]) == (
+        "message", "My blue car")
+
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(live / "whatsapp/images.jsonl", [
+        _raw("message", "message", {"chatJid": G, "messageId": f"IMAGE{i}",
+                                    "text": "[Image]" if i < 3 else "My blue car",
+                                    "timestamp": T0 // 1000})
+        for i in range(4)
+    ])
+    write_jsonl(dev / "backfill/memory.jsonl", converted)
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    rows = dict(conn.execute("SELECT native_message_id, text FROM messages"))
+    assert report["accounting_ok"] and report["outcomes"]["backfill/memory.jsonl"][
+        "skipped:generated_memory_utterance"] == 3
+    assert rows == {**{f"IMAGE{i}": None for i in range(3)}, "IMAGE3": "My blue car"}

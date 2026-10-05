@@ -42,13 +42,14 @@ def _line(node: dict[str, Any], origin: Origin) -> dict[str, Any]:
         origin=origin,
         original=node,
     )
-    if node.get("kind") != "utterance":
+    if node.get("kind") != "utterance" or node.get("source") == "auto_semantic_v2":
         return backfill_line(
             kind="memory_fact",
             provenance="derived_only",
             direction=None,
             payload={},
-            skip_reason="derived_memory_fact",
+            skip_reason=("generated_memory_utterance" if node.get("source") == "auto_semantic_v2"
+                         and node.get("kind") == "utterance" else "derived_memory_fact"),
             **common,
         )
     meta = loads_object(node.get("meta_json"))
