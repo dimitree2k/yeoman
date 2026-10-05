@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -46,3 +47,28 @@ def history_seed_attestations(
     if is_protected(out.expanduser()):
         raise typer.BadParameter("refusing to write into the protected raw archive")
     _emit({"written": str(write_seed(out.expanduser()))})
+
+
+@history_app.command("project")
+def history_project(
+    layer1: list[Path] = typer.Option(..., "--layer1", help="Layer 1 root (repeat for several)"),
+    db: Path = typer.Option(..., "--db", help="history.db to build (replaced atomically)"),
+) -> None:
+    from yeoman_gateway.history.project import project
+
+    _emit(project([path.expanduser() for path in layer1], db.expanduser()))
+
+
+@history_app.command("verify")
+def history_verify(
+    layer1: list[Path] = typer.Option(..., "--layer1", help="Layer 1 root (repeat for several)"),
+    db: Path = typer.Option(..., "--db", help="Built history.db"),
+    scratch: Path | None = typer.Option(None, "--scratch", help="On-disk folder for two rebuilds; not /tmp"),
+) -> None:
+    from yeoman_gateway.history.verify import verify
+
+    if scratch is not None:
+        scratch = scratch.expanduser()
+        if scratch.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
+            raise typer.BadParameter("--scratch must be on disk, not the temporary directory")
+    _emit(verify([path.expanduser() for path in layer1], db.expanduser(), scratch=scratch))
