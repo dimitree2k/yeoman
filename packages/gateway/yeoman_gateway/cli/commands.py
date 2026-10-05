@@ -8,6 +8,7 @@ from . import agent_commands as _agent_commands  # noqa: F401
 from . import channel_commands as _channel_commands  # noqa: F401
 from . import chat_commands as _chat_commands  # noqa: F401
 from . import config_commands as _config_commands  # noqa: F401
+from . import conversation_history_commands as _conversation_history_commands  # noqa: F401
 from . import cron_commands as _cron_commands  # noqa: F401
 from . import deploy_commands as _deploy_commands  # noqa: F401
 from . import doctor_commands as _doctor_commands  # noqa: F401
