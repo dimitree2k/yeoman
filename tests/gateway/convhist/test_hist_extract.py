@@ -1,4 +1,4 @@
-from yeoman_gateway.history.extract import extract, rank_of
+from yeoman_gateway.history.extract import EventCopy, extract, rank_of
 from yeoman_gateway.history.ids import classify
 from yeoman_gateway.history.layer1 import Layer1Line
 
@@ -87,6 +87,22 @@ def test_events_membership_and_receipts():
     assert snapshot.kind == "member_snapshot" and snapshot.payload == {"participants": [[LID, PN]], "complete": True}
     assert (LID, PN, "native_pair", "whatsapp/2026-10.jsonl#4") in ex.identity.links
     assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:receipt")] == 1
+
+
+def test_event_native_id_is_separate_from_target_and_positional_api_remains_compatible():
+    ex = extract([bf("bridge_refs", 1, "edit", {"targetMessageId": "AC1", "nativeEventId": "P2",
+                                                   "text": "neu"})])
+    (event,) = ex.events
+    assert event.target_native_id == "AC1"
+    assert event.native_event_id == "P2"
+
+    legacy = EventCopy("ref", 0, "delete", "whatsapp", G, "AC1", None, None, False,
+                       1000, "provider_timestamp", {}, "native")
+    assert legacy.native_event_id is None
+
+    (raw_event,) = extract([raw(2, "edit", "edit", {"messageId": "AC1", "text": "alt"},
+                                 native={"eventId": "yeoman-hash"})]).events
+    assert raw_event.native_event_id is None
 
 
 def test_backfill_kinds_and_identity():

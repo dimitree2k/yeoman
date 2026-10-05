@@ -141,17 +141,20 @@ def _line(name: str, path: Path, record: dict[str, Any], decoded: dict[str, Any]
         reaction = message["reactionMessage"] or {}
         emoji = reaction.get("text") or ""
         kind = "reaction"
-        payload = compact({**base, "targetMessageId": (reaction.get("key") or {}).get("id"),
+        payload = compact({**base, "nativeEventId": key.get("id"),
+                           "targetMessageId": (reaction.get("key") or {}).get("id"),
                            "emoji": emoji or None})
         payload["removed"] = emoji == ""
     elif "protocolMessage" in message:
         protocol = message["protocolMessage"] or {}
         target = (protocol.get("key") or {}).get("id")
         if protocol.get("type") == "REVOKE":
-            kind, payload = "delete", compact({**base, "targetMessageId": target})
+            kind, payload = "delete", compact({**base, "nativeEventId": key.get("id"),
+                                                "targetMessageId": target})
         elif protocol.get("type") == "MESSAGE_EDIT":
             text, _, _ = _content(protocol.get("editedMessage") or {})
-            kind, payload = "edit", compact({**base, "targetMessageId": target, "text": text})
+            kind, payload = "edit", compact({**base, "nativeEventId": key.get("id"),
+                                              "targetMessageId": target, "text": text})
         else:
             return skip(f"protocol:{protocol.get('type')}")
     else:

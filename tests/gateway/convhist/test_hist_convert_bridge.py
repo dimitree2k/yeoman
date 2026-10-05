@@ -54,11 +54,15 @@ def test_decoded_records(tmp_path):
                                "text": "Und ja, zu teuer", "replyToMessageId": "AC90"}
     assert text["occurred_ms"] == 1790527886000 and text["time_certainty"] == "provider_timestamp"
     assert text["origin"]["path"].endswith("cold/text.json")
-    assert lines["react.json"]["payload"]["targetMessageId"] == "AC91"
     assert lines["react.json"]["payload"]["emoji"] == "😂" and lines["react.json"]["payload"]["removed"] is False
+    assert lines["react.json"]["payload"]["nativeEventId"] == "R1"
+    assert lines["react.json"]["payload"]["targetMessageId"] == "AC91"
     assert lines["react.json"]["time_certainty"] == "capture_time_approx"
     assert lines["revoke.json"]["kind"] == "delete"
+    assert lines["revoke.json"]["payload"]["nativeEventId"] == "P1"
     assert lines["edit.json"]["kind"] == "edit" and lines["edit.json"]["payload"]["text"] == "teuer!"
+    assert lines["edit.json"]["payload"]["nativeEventId"] == "P2"
+    assert lines["edit.json"]["payload"]["targetMessageId"] == "AC91"
     mine = lines["mine.json"]
     assert mine["direction"] == "out" and mine["payload"]["fromAssistant"] is True
     assert mine["payload"]["text"] == "Bestes Gemälde" and mine["payload"]["mediaKind"] == "image"

@@ -77,10 +77,12 @@ CREATE TABLE message_events (
   payload_json      TEXT NOT NULL CHECK (json_valid(payload_json)),
   provenance        TEXT NOT NULL CHECK (provenance IN
                       ('native', 'recovered_text', 'verbatim_unverified', 'derived_only')),
-  source_refs       TEXT NOT NULL CHECK (json_valid(source_refs))
+  source_refs       TEXT NOT NULL CHECK (json_valid(source_refs)),
+  native_event_id  TEXT
 );
 CREATE INDEX message_events_target ON message_events(target_message_id, kind);
 CREATE INDEX message_events_chat_time ON message_events(channel, chat_id, occurred_ms);
+CREATE INDEX message_events_native_event ON message_events(native_event_id);
 CREATE TABLE projector_state (
   file              TEXT PRIMARY KEY,
   lines             INTEGER NOT NULL,

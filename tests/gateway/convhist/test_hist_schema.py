@@ -47,7 +47,9 @@ def test_messages_current_view(db):
     ]
     for eid, kind, payload, ms in events:
         db.execute(
-            "INSERT INTO message_events VALUES (?, ?, 'whatsapp', 'g@g.us', 'whatsapp:g@g.us:M1', 'M1',"
+            "INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, target_native_id,"
+            " actor_contact_id, actor_identifier, actor_basis, occurred_ms, time_certainty, payload_json,"
+            " provenance, source_refs) VALUES (?, ?, 'whatsapp', 'g@g.us', 'whatsapp:g@g.us:M1', 'M1',"
             " 'c1', '1@lid', 'native_identifier', ?, 'provider_timestamp', ?, 'native', '[]')",
             (eid, kind, ms, payload),
         )
@@ -61,3 +63,27 @@ def test_projector_state_defaults_projector_version_to_one(db):
     assert "projector_version" in columns
     db.execute("INSERT INTO projector_state (file, lines, sha256) VALUES ('messages.jsonl', 1, 'abc')")
     assert db.execute("SELECT projector_version FROM projector_state").fetchone()[0] == 1
+
+
+def test_native_event_id_is_nullable_indexed_and_non_unique(db):
+    columns = {row[1]: row[3] for row in db.execute("PRAGMA table_info(message_events)")}
+    assert columns["native_event_id"] == 0
+    indexes = {row[1]: row[2] for row in db.execute("PRAGMA index_list(message_events)")}
+    assert indexes["message_events_native_event"] == 0
+    _contact(db)
+    _message(db)
+    db.execute(
+        "INSERT INTO message_events (event_id, kind, channel, chat_id, target_message_id, target_native_id,"
+        " actor_contact_id, actor_identifier, actor_basis, occurred_ms, time_certainty, payload_json,"
+        " provenance, source_refs, native_event_id) VALUES"
+        " ('e1', 'edit', 'whatsapp', 'g@g.us', 'whatsapp:g@g.us:M1', 'M1', 'c1', '1@lid',"
+        " 'native_identifier', 2000, 'provider_timestamp', '{}', 'native', '[]', 'P1'),"
+        " ('e2', 'edit', 'whatsapp', 'g@g.us', 'whatsapp:g@g.us:M1', 'M1', 'c1', '1@lid',"
+        " 'native_identifier', 3000, 'provider_timestamp', '{}', 'native', '[]', 'P1')"
+    )
+    db.execute(
+        "INSERT INTO message_events (event_id, kind, channel, chat_id, target_native_id, actor_basis,"
+        " time_certainty, payload_json, provenance, source_refs)"
+        " VALUES ('e3', 'delete', 'whatsapp', 'g@g.us', 'M1', 'unknown', 'unknown', '{}', 'native', '[]')"
+    )
+    assert db.execute("SELECT count(*) FROM message_events WHERE native_event_id = 'P1'").fetchone()[0] == 2

@@ -74,6 +74,7 @@ class EventCopy:
     time_certainty: str
     payload: dict[str, Any]
     provenance: str
+    native_event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,8 +197,10 @@ def _event(out: Extracted, ref: str, kind: str, p: dict[str, Any], *, channel: s
     else:
         payload = {}
     target = p.get("targetMessageId") or (p.get("messageId") if kind in ("edit", "delete") else None)
+    native_event_id = p.get("nativeEventId")
     out.events.append(EventCopy(ref, rank_of(ref), kind, channel, chat, target or None, actor, actor_raw,
-                                assistant, ms, certainty, payload, provenance))
+                                assistant, ms, certainty, payload, provenance,
+                                str(native_event_id) if native_event_id else None))
     if not assistant:
         _observe(out, idents, actor, None, ms, ref, False, chat)
 
