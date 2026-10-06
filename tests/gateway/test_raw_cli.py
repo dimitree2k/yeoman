@@ -360,6 +360,48 @@ def test_capture_check_reports_duplicate_provider_id(tmp_path: Path, monkeypatch
     assert _input_bytes(inputs) == before
 
 
+def test_capture_check_reports_duplicate_result_correlation_with_distinct_provider_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("e1", "whatsapp", "secret-chat", "text")],
+        receipts=[("r1", "e1", "whatsapp", "secret-chat", SECRET_ID)],
+        raw=[("outbound_request", "whatsapp", "secret-chat", "e1", None),
+             ("outbound_result", "whatsapp", "secret-chat", "e1", SECRET_ID),
+             ("outbound_result", "whatsapp", "secret-chat", "e1", "other-provider-id")],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 1, result.output
+    _assert_aggregate_output(result.output)
+    assert "ambiguous_results=1" in result.output
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_counts_mismatched_receipt_as_one_missing_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("e1", "whatsapp", "secret-chat", "text")],
+        receipts=[("r1", "e1", "telegram", "telegram-chat", SECRET_ID)],
+        raw=[],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 1, result.output
+    _assert_aggregate_output(result.output)
+    assert "missing_results=1" in result.output
+    assert _input_bytes(inputs) == before
+
+
 def test_capture_check_matches_telegram_message_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     inputs = _capture_home(

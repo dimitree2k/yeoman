@@ -93,6 +93,7 @@ def raw_check_capture() -> None:
     result_counts: Counter[tuple[str, str, str]] = Counter()
     raw_result_pairs: Counter[tuple[str, str, str]] = Counter()
     raw_results = 0
+    ambiguous_results = 0
     try:
         db_path = get_operational_data_path() / "processing" / "processing.db"
         db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
@@ -126,9 +127,10 @@ def raw_check_capture() -> None:
                     if channel not in {"whatsapp", "telegram"}:
                         continue
                     effect_receipts[effect_id] += 1
-                    provider_id = str(row["provider_message_id"] or "")
                     if effect_meta[effect_id] != (channel, chat_id):
                         missing_results += 1
+                        continue
+                    provider_id = str(row["provider_message_id"] or "")
                     receipts[(effect_id, channel, chat_id, provider_id)] += 1
 
         for path in archive_files(root):
@@ -161,6 +163,7 @@ def raw_check_capture() -> None:
                         result_counts[(channel, chat_id, provider_id)] += 1
 
         for (channel, chat_id, correlation), count in raw_result_pairs.items():
+            ambiguous_results += count > 1
             if not correlation or request_counts[(channel, chat_id, correlation)] != 1:
                 missing_requests += count
         ambiguous_provider_ids = sum(count > 1 for count in result_counts.values())
@@ -179,14 +182,14 @@ def raw_check_capture() -> None:
 
         status = "ok" if not any((missing_receipts, missing_results, missing_requests,
                                   missing_provider_ids, ambiguous_provider_ids,
-                                  ambiguous_receipts)) else "failed"
+                                  ambiguous_receipts, ambiguous_results)) else "failed"
         typer.echo(
             f"status={status} start_marker=present effects={len(effect_meta)} "
             f"receipts={sum(effect_receipts.values())} outbound_results={raw_results} "
             f"missing_receipts={missing_receipts} missing_results={missing_results} "
             f"missing_requests={missing_requests} missing_provider_ids={missing_provider_ids} "
             f"ambiguous_provider_ids={ambiguous_provider_ids} "
-            f"ambiguous_receipts={ambiguous_receipts} "
+            f"ambiguous_receipts={ambiguous_receipts} ambiguous_results={ambiguous_results} "
             f"channels={json.dumps(dict(channel_counts), sort_keys=True)} "
             f"effect_kinds={json.dumps(dict(kind_counts), sort_keys=True)}"
         )
@@ -194,7 +197,8 @@ def raw_check_capture() -> None:
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         typer.echo("status=failed start_marker=present error=unreadable_input "
                    "missing_receipts=0 missing_results=0 missing_requests=0 "
-                   "missing_provider_ids=0 ambiguous_provider_ids=0 ambiguous_receipts=0")
+                   "missing_provider_ids=0 ambiguous_provider_ids=0 ambiguous_receipts=0 "
+                   "ambiguous_results=0")
         raise typer.Exit(1) from None
 
 
