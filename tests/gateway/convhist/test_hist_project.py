@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 from hist_fixtures import FRANK_LID, FRANK_PN, T0, _bf, _raw, sample_layer1, write_jsonl
@@ -15,7 +16,10 @@ def built(tmp_path):
     conn = sqlite3.connect(tmp_path / "out" / "history.db")
     conn.row_factory = sqlite3.Row
     arvid = conn.execute("SELECT contact_id FROM contacts WHERE role = 'assistant'").fetchone()[0]
-    return report, conn, arvid, (live, dev, tmp_path)
+    try:
+        yield report, conn, arvid, (live, dev, tmp_path)
+    finally:
+        conn.close()
 
 
 def test_frank_one_message_three_copies(built):
@@ -87,13 +91,13 @@ def test_batch_copies_merge_by_native_anchor_and_repeated_text_stays_separate(tm
     write_jsonl(dev / "backfill/memory.jsonl", [record("LAST-A")])
     write_jsonl(dev / "backfill/knowledge_memory.jsonl", [record("LAST-A"), record("LAST-B")])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    conn.row_factory = sqlite3.Row
-    repeats = conn.execute("SELECT * FROM messages WHERE text = 'same words' ORDER BY message_id").fetchall()
-    assert len(repeats) == 2 and repeats[0]["message_id"] != repeats[1]["message_id"]
-    assert sorted(len(json.loads(row["source_refs"])) for row in repeats) == [1, 2]
-    assert all(row["native_message_id"] is None and row["sender_basis"] == "derived_claim" for row in repeats)
-    assert report["messages"] == 4 and report["accounting_ok"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        repeats = conn.execute("SELECT * FROM messages WHERE text = 'same words' ORDER BY message_id").fetchall()
+        assert len(repeats) == 2 and repeats[0]["message_id"] != repeats[1]["message_id"]
+        assert sorted(len(json.loads(row["source_refs"])) for row in repeats) == [1, 2]
+        assert all(row["native_message_id"] is None and row["sender_basis"] == "derived_claim" for row in repeats)
+        assert report["messages"] == 4 and report["accounting_ok"]
 
 
 def test_unanchored_batch_segments_stay_separate_from_native_text_candidate(tmp_path):
@@ -109,13 +113,13 @@ def test_unanchored_batch_segments_stay_separate_from_native_text_candidate(tmp_
                                   "text": "repeated"})])
 
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT native_message_id, source_refs FROM messages WHERE text = 'repeated'").fetchall()
-    assert len(rows) == 3
-    assert sum(native_id == "UNRELATED" for native_id, _ in rows) == 1
-    assert {refs for _, refs in rows if "memory.jsonl" in refs} == {
-        '["backfill/memory.jsonl#1/0"]', '["backfill/memory.jsonl#1/1"]'}
-    assert report["messages"] == 3 and report["accounting_ok"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT native_message_id, source_refs FROM messages WHERE text = 'repeated'").fetchall()
+        assert len(rows) == 3
+        assert sum(native_id == "UNRELATED" for native_id, _ in rows) == 1
+        assert {refs for _, refs in rows if "memory.jsonl" in refs} == {
+            '["backfill/memory.jsonl#1/0"]', '["backfill/memory.jsonl#1/1"]'}
+        assert report["messages"] == 3 and report["accounting_ok"]
 
 
 def test_accounting(built):
@@ -135,22 +139,22 @@ def test_group_only_message_is_retained_with_unknown_sender(tmp_path):
                                      "text": "preserved", "timestamp": T0 // 1000}),
     ])
     report = project([live], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM messages WHERE native_message_id = 'AC-group'").fetchone()
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM messages WHERE native_message_id = 'AC-group'").fetchone()
 
-    assert report["messages"] == 1
-    assert row["text"] == "preserved" and row["sender_contact_id"] is None
-    assert row["sender_identifier"] is None and row["sender_basis"] == "unknown"
+        assert report["messages"] == 1
+        assert row["text"] == "preserved" and row["sender_contact_id"] is None
+        assert row["sender_identifier"] is None and row["sender_basis"] == "unknown"
 
 
 def _dump(path):
-    conn = sqlite3.connect(path)
-    tables = {t: conn.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()
-              for t in ("contacts", "messages", "message_events")}
-    tables["identifier_history"] = conn.execute(
-        "SELECT contact_id, kind, value, evidence, source_refs FROM identifier_history ORDER BY 1, 2, 3").fetchall()
-    return tables
+    with closing(sqlite3.connect(path)) as conn:
+        tables = {t: conn.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall()
+                  for t in ("contacts", "messages", "message_events")}
+        tables["identifier_history"] = conn.execute(
+            "SELECT contact_id, kind, value, evidence, source_refs FROM identifier_history ORDER BY 1, 2, 3").fetchall()
+        return tables
 
 
 def test_rebuild_identical_and_protected_refused(built, monkeypatch):
@@ -237,17 +241,17 @@ def test_producer_membership_snapshot_journal_copy_deduplicates_with_raw(tmp_pat
     write_jsonl(dev / "backfill/journal.jsonl", [journal_line])
 
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    row = conn.execute("SELECT payload_json, source_refs FROM message_events").fetchone()
-    pair = conn.execute(
-        "SELECT count(DISTINCT contact_id) FROM identifier_history WHERE value IN (?,?)",
-        (FRANK_LID, FRANK_PN),
-    ).fetchone()[0]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        row = conn.execute("SELECT payload_json, source_refs FROM message_events").fetchone()
+        pair = conn.execute(
+            "SELECT count(DISTINCT contact_id) FROM identifier_history WHERE value IN (?,?)",
+            (FRANK_LID, FRANK_PN),
+        ).fetchone()[0]
 
-    assert report["events"] == 1
-    assert json.loads(row[1]) == ["backfill/journal.jsonl#1", "whatsapp/2026-10.jsonl#1"]
-    assert json.loads(row[0])["participants"] == [[FRANK_LID, FRANK_PN]]
-    assert pair == 1
+        assert report["events"] == 1
+        assert json.loads(row[1]) == ["backfill/journal.jsonl#1", "whatsapp/2026-10.jsonl#1"]
+        assert json.loads(row[0])["participants"] == [[FRANK_LID, FRANK_PN]]
+        assert pair == 1
 
 
 def test_native_event_ids_do_not_identify_revisions(tmp_path):
@@ -259,11 +263,11 @@ def test_native_event_ids_do_not_identify_revisions(tmp_path):
                               "text": "two", "timestamp": T0 // 1000 + 1, "nativeEventId": "reused"}),
     ])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT event_id, native_event_id, payload_json FROM message_events ORDER BY occurred_ms").fetchall()
-    assert report["events"] == 2
-    assert [row[1] for row in rows] == ["reused", "reused"]
-    assert len({row[0] for row in rows}) == 2 and all(row[0] != "reused" for row in rows)
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT event_id, native_event_id, payload_json FROM message_events ORDER BY occurred_ms").fetchall()
+        assert report["events"] == 2
+        assert [row[1] for row in rows] == ["reused", "reused"]
+        assert len({row[0] for row in rows}) == 2 and all(row[0] != "reused" for row in rows)
 
 
 def test_event_native_id_uses_first_source_ranked_copy(tmp_path):
@@ -277,10 +281,10 @@ def test_event_native_id_uses_first_source_ranked_copy(tmp_path):
                                  "text": "same", "nativeEventId": "journal-id"}, ms=T0 + 1000),
     ])
     project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    (row,) = conn.execute("SELECT native_event_id, source_refs FROM message_events").fetchall()
-    assert row[0] == "raw-id"
-    assert json.loads(row[1]) == ["backfill/journal.jsonl#1", "whatsapp/events.jsonl#1"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        (row,) = conn.execute("SELECT native_event_id, source_refs FROM message_events").fetchall()
+        assert row[0] == "raw-id"
+        assert json.loads(row[1]) == ["backfill/journal.jsonl#1", "whatsapp/events.jsonl#1"]
 
 
 def test_purged_event_payload_joins_only_one_complete_candidate(tmp_path):
@@ -294,13 +298,13 @@ def test_purged_event_payload_joins_only_one_complete_candidate(tmp_path):
                               "timestamp": T0 // 1000}),
     ])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT target_native_id, payload_json, source_refs FROM message_events ORDER BY target_native_id").fetchall()
-    assert len(rows) == 2 and report["events"] == 2
-    assert rows[0][0] == "AC1" and json.loads(rows[0][1])["text"] == "complete"
-    assert json.loads(rows[0][2]) == ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"]
-    assert rows[1][0] == "AC2" and json.loads(rows[1][1])["text"] is None
-    assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT target_native_id, payload_json, source_refs FROM message_events ORDER BY target_native_id").fetchall()
+        assert len(rows) == 2 and report["events"] == 2
+        assert rows[0][0] == "AC1" and json.loads(rows[0][1])["text"] == "complete"
+        assert json.loads(rows[0][2]) == ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"]
+        assert rows[1][0] == "AC2" and json.loads(rows[1][1])["text"] is None
+        assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
 
 
 def test_ambiguous_purged_event_is_retained_for_review(tmp_path):
@@ -314,12 +318,12 @@ def test_ambiguous_purged_event_is_retained_for_review(tmp_path):
                               "timestamp": T0 // 1000 + 2}),
     ])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT payload_json, source_refs FROM message_events ORDER BY occurred_ms").fetchall()
-    assert len(rows) == 3 and report["events"] == 3
-    assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
-    assert json.loads(rows[-1][0])["text"] is None
-    assert json.loads(rows[-1][1]) == ["whatsapp/events.jsonl#3"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT payload_json, source_refs FROM message_events ORDER BY occurred_ms").fetchall()
+        assert len(rows) == 3 and report["events"] == 3
+        assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
+        assert json.loads(rows[-1][0])["text"] is None
+        assert json.loads(rows[-1][1]) == ["whatsapp/events.jsonl#3"]
 
 
 
@@ -331,12 +335,12 @@ def test_complete_event_window_is_anchored_to_first_copy(tmp_path):
         for offset in (0, 120_000, 240_000)
     ])
     project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT source_refs FROM message_events ORDER BY occurred_ms").fetchall()
-    assert [json.loads(row[0]) for row in rows] == [
-        ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"],
-        ["whatsapp/events.jsonl#3"],
-    ]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT source_refs FROM message_events ORDER BY occurred_ms").fetchall()
+        assert [json.loads(row[0]) for row in rows] == [
+            ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"],
+            ["whatsapp/events.jsonl#3"],
+        ]
 
 
 def test_purged_event_matches_only_complete_copies_within_window(tmp_path):
@@ -350,14 +354,14 @@ def test_purged_event_matches_only_complete_copies_within_window(tmp_path):
                               "timestamp": T0 // 1000 + 200}),
     ])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT payload_json, source_refs FROM message_events ORDER BY occurred_ms").fetchall()
-    assert len(rows) == 2 and report["events"] == 2
-    assert json.loads(rows[0][1]) == ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"]
-    assert json.loads(rows[0][0])["text"] == "complete"
-    assert json.loads(rows[1][1]) == ["whatsapp/events.jsonl#3"]
-    assert json.loads(rows[1][0])["text"] is None
-    assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT payload_json, source_refs FROM message_events ORDER BY occurred_ms").fetchall()
+        assert len(rows) == 2 and report["events"] == 2
+        assert json.loads(rows[0][1]) == ["whatsapp/events.jsonl#1", "whatsapp/events.jsonl#2"]
+        assert json.loads(rows[0][0])["text"] == "complete"
+        assert json.loads(rows[1][1]) == ["whatsapp/events.jsonl#3"]
+        assert json.loads(rows[1][0])["text"] is None
+        assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
 
 
 @pytest.mark.parametrize(("complete", "expected_count", "matched"), [
@@ -379,18 +383,18 @@ def test_unanchored_purged_assistant_reaction_joins_only_unique_candidate(
         "contact", 1, "assistant fixture", identifiers=["4915202777685@s.whatsapp.net"],
         role="assistant")])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT target_native_id, payload_json, source_refs FROM message_events ORDER BY target_native_id").fetchall()
-    assert len(rows) == expected_count and report["events"] == expected_count
-    incomplete_ref = f"backfill/journal.jsonl#{len(records)}"
-    if matched:
-        (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
-        assert row[0] == "AC1" and json.loads(row[1])["emoji"] == "😂"
-        assert report["review"]["unmatched_event_payloads"] == []
-    else:
-        (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
-        assert row[0] is None and json.loads(row[1])["emoji"] is None
-        assert report["review"]["unmatched_event_payloads"] == [incomplete_ref]
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT target_native_id, payload_json, source_refs FROM message_events ORDER BY target_native_id").fetchall()
+        assert len(rows) == expected_count and report["events"] == expected_count
+        incomplete_ref = f"backfill/journal.jsonl#{len(records)}"
+        if matched:
+            (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
+            assert row[0] == "AC1" and json.loads(row[1])["emoji"] == "😂"
+            assert report["review"]["unmatched_event_payloads"] == []
+        else:
+            (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
+            assert row[0] is None and json.loads(row[1])["emoji"] is None
+            assert report["review"]["unmatched_event_payloads"] == [incomplete_ref]
 
 
 def test_explicit_reaction_removal_is_not_treated_as_purged_payload(tmp_path):
@@ -402,10 +406,10 @@ def test_explicit_reaction_removal_is_not_treated_as_purged_payload(tmp_path):
                                       "emoji": None, "removed": True, "timestamp": T0 // 1000 + 1}),
     ])
     project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT payload_json FROM message_events WHERE kind = 'reaction'").fetchall()
-    assert len(rows) == 2
-    assert {json.loads(row[0])["removed"] for row in rows} == {False, True}
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT payload_json FROM message_events WHERE kind = 'reaction'").fetchall()
+        assert len(rows) == 2
+        assert {json.loads(row[0])["removed"] for row in rows} == {False, True}
 
 
 def test_events_without_times_do_not_merge_by_payload_alone(tmp_path):
@@ -416,8 +420,8 @@ def test_events_without_times_do_not_merge_by_payload_alone(tmp_path):
         _raw("edit", "edit", record, received=0),
     ])
     report = project([live, dev], tmp_path / "history.db")
-    conn = sqlite3.connect(tmp_path / "history.db")
-    rows = conn.execute("SELECT source_refs FROM message_events").fetchall()
-    assert report["events"] == 2
-    assert {tuple(json.loads(row[0])) for row in rows} == {
-        ("whatsapp/events.jsonl#1",), ("whatsapp/events.jsonl#2",)}
+    with closing(sqlite3.connect(tmp_path / "history.db")) as conn:
+        rows = conn.execute("SELECT source_refs FROM message_events").fetchall()
+        assert report["events"] == 2
+        assert {tuple(json.loads(row[0])) for row in rows} == {
+            ("whatsapp/events.jsonl#1",), ("whatsapp/events.jsonl#2",)}
