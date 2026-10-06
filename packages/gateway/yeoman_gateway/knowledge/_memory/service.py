@@ -761,7 +761,7 @@ class MemoryService:
             "inbound_reply_archive",  # kept complete by owner decision, never purged
         ]
         state_dir = resolve_session_state_dir(self.workspace, self.config.wal.state_dir)
-        if state_dir.exists():
+        if state_dir.is_dir() and any(path.is_file() for path in state_dir.glob("*.md")):
             copies.append("session_state_markdown")
         return tuple(copies)
 

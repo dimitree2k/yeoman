@@ -176,13 +176,14 @@ def test_remaining_copies_reports_frozen_session_state_files(tmp_path: Path) -> 
     workspace = tmp_path / "ws"
     state_dir = workspace / "data/memory/session-state"
     state_dir.mkdir(parents=True)
-    (state_dir / "frozen.md").write_text("legacy copy", encoding="utf-8")
     cfg = Config()
     cfg.memory.db_path = str(tmp_path / "longterm.db")
     cfg.memory.wal.state_dir = str(state_dir)
     memory_service = MemoryService(workspace=workspace, config=cfg.memory)
 
     try:
+        assert "session_state_markdown" not in memory_service.remaining_copies()
+        (state_dir / "frozen.md").write_text("legacy copy", encoding="utf-8")
         assert "session_state_markdown" in memory_service.remaining_copies()
     finally:
         memory_service.close()
