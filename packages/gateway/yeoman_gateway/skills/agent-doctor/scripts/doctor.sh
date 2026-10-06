@@ -428,10 +428,8 @@ else
     line_ok "yeoman memory status completed"
 
     mem_enabled="$(extract_field "$memory_output" "enabled")"
-    mem_wal_enabled="$(extract_field "$memory_output" "wal_enabled")"
     mem_db_path="$(extract_field "$memory_output" "db_path")"
     mem_total_active="$(extract_field "$memory_output" "total_active")"
-    mem_wal_files="$(extract_field "$memory_output" "wal_files")"
 
     if [ "$mem_enabled" = "True" ]; then
         line_ok "memory.enabled is true"
@@ -450,13 +448,6 @@ else
                 "Set memory.embedding.enabled=true in config.json if semantic recall is required."
         fi
 
-        if [ "$memory_wal_enabled" = "true" ]; then
-            line_ok "memory.wal.enabled is true"
-        else
-            add_issue "memory" "WARNING" "MEM-004" "session-state WAL is disabled" \
-                "Session-state files will not be persisted." \
-                "Set memory.wal.enabled=true in config.json."
-        fi
     fi
 
     if [ -n "$mem_db_path" ] && [ -f "$mem_db_path" ]; then
@@ -481,14 +472,6 @@ else
         add_issue "memory" "WARNING" "MEM-005" "memory has zero active entries" \
             "total_active=${mem_total_active:-0}" \
             "Check capture settings and test manual memory insertion."
-    fi
-
-    if [ "${mem_wal_files:-0}" -gt 0 ] 2>/dev/null; then
-        line_ok "session-state files exist (${mem_wal_files})"
-    elif [ "$resolved_config_loaded" = "true" ] && [ "$memory_wal_enabled" = "true" ]; then
-        add_issue "memory" "WARNING" "MEM-004" "session-state WAL files are missing" \
-            "wal_enabled is true but wal_files=${mem_wal_files:-0}" \
-            "Verify data/memory/session-state and memory.wal.state_dir."
     fi
 
     if command -v sqlite3 >/dev/null 2>&1 && [ -n "${mem_db_path:-}" ] && [ -f "${mem_db_path:-}" ]; then

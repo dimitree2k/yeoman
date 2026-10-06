@@ -32,3 +32,25 @@ def test_doctor_checks_resolved_cron_store(monkeypatch, tmp_path):
     assert captured["YEOMAN_CRON_STORE_PATH"] == str(expected)
     script = production_script.read_text(encoding="utf-8")
     assert 'cron_jobs_file="${YEOMAN_CRON_STORE_PATH:?YEOMAN_CRON_STORE_PATH is required}"' in script
+
+
+def test_doctor_does_not_treat_frozen_session_state_as_active():
+    script = (
+        Path(doctor_commands.__file__).resolve().parent.parent
+        / "skills"
+        / "agent-doctor"
+        / "scripts"
+        / "doctor.sh"
+    ).read_text(encoding="utf-8")
+    problems = (
+        Path(doctor_commands.__file__).resolve().parent.parent
+        / "skills"
+        / "agent-doctor"
+        / "references"
+        / "problems.md"
+    ).read_text(encoding="utf-8")
+
+    assert "MEM-004" not in script
+    assert "MEM-004" not in problems
+    assert "session-state WAL" not in script
+    assert "session-state WAL" not in problems

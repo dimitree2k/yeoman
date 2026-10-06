@@ -22,12 +22,6 @@ Problem: `memory.embedding.enabled` is false.
 Likely cause: vector recall disabled.
 Fix: set `memory.embedding.enabled` to `true` if semantic recall is desired.
 
-### MEM-004
-Severity: WARNING
-Problem: `memory.wal.enabled` is false.
-Likely cause: session-state WAL disabled.
-Fix: set `memory.wal.enabled` to `true` for session-state persistence.
-
 ### MEM-005
 Severity: WARNING
 Problem: memory has zero active entries.
