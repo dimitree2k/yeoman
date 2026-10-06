@@ -20,10 +20,13 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_migration_copies_all_tables_keys_and_relationships_read_only(tmp_path: Path) -> None:
+def test_migration_copies_all_tables_keys_and_relationships_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     relay_path = tmp_path / "legacy-relay.db"
     research_path = tmp_path / "legacy-research.db"
-    target = tmp_path / "ops" / "a2a.db"
+    target = get_operational_store_path("a2a")
     relay._RelayStore(relay_path)
     research = A2AResearchStore(research_path)
     invocation = {"skill": "research.deep", "input": {"idempotency_key": "key-1"}}

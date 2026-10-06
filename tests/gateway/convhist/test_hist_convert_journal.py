@@ -2,6 +2,7 @@ import json
 
 from hist_fixtures import make_db
 from yeoman_gateway.history.convert.journal import convert_journal
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 DDL = """
 CREATE TABLE events (event_id TEXT PRIMARY KEY, kind TEXT, origin TEXT, channel TEXT, chat_id TEXT,
@@ -33,7 +34,7 @@ def _effect(eid, kind, payload, state="sent", principal="4915774497527"):
 
 
 def _home(tmp_path):
-    make_db(tmp_path / "data/ops/processing.db", DDL, {
+    make_db(get_operational_store_path("processing", data_dir=tmp_path / "data"), DDL, {
         "events": [
             _event("e1", "message", principal="143855651442872", source_message_id="AC06",
                    payload_json=json.dumps({"text": "hallo", "participant_jid": "143855651442872@lid",
