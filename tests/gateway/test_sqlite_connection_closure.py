@@ -12,17 +12,20 @@ def _fd_count() -> int:
     return len(list(Path("/proc/self/fd").iterdir()))
 
 
-def _assert_rollback_and_closed(store) -> None:
+def _assert_rollback_and_closed(store, iteration: int) -> None:
     with store._connect() as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS closure_probe (value TEXT)")
+    value = f"rolled back {iteration}"
     try:
         with store._connect() as connection:
-            connection.execute("INSERT INTO closure_probe VALUES ('rolled back')")
+            connection.execute("INSERT INTO closure_probe VALUES (?)", (value,))
             raise RuntimeError("rollback probe")
     except RuntimeError as exc:
         assert str(exc) == "rollback probe"
     with store._connect() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM closure_probe").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM closure_probe WHERE value = ?", (value,)
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("store_kind", ["relay", "research", "document"])
@@ -56,8 +59,7 @@ def test_store_connections_close_without_gc(tmp_path, store_kind: str) -> None:
             assert store.get_extraction(item_id, "text") is not None
 
     baseline = _fd_count()
-    _assert_rollback_and_closed(store)
-    assert _fd_count() == baseline
     for i in range(50):
         operation(i)
-    assert _fd_count() == baseline
+        _assert_rollback_and_closed(store, i)
+        assert _fd_count() == baseline
