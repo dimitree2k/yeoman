@@ -295,10 +295,19 @@ def _events(ex: Extracted, res: Resolution, arvid: str | None, message_ids: set[
     unmatched: list[tuple[EventCopy, str | None, str]] = []
     for base, item in sorted(purged, key=lambda pair: _order(pair[1][0])):
         moment = item[0].occurred_ms
+        unanchored_assistant_reaction = (
+            item[0].kind == "reaction" and not item[0].target_native_id
+            and not item[0].payload.get("emoji") and item[1] == arvid and arvid is not None
+        )
+        window = 10_000 if unanchored_assistant_reaction else WINDOW_MS
         candidates = [members for key, members in clusters
-                      if key[:5] == base and moment is not None
-                      and any(_event_complete(c) and c.occurred_ms is not None
-                              and abs(c.occurred_ms - moment) <= WINDOW_MS for c, _, _ in members)]
+                      if (key[:5] == base or (unanchored_assistant_reaction
+                          and key[0] == "reaction" and key[1] == base[1]
+                          and key[2] == base[2] and key[4] == base[4]))
+                      and moment is not None
+                      and any(_event_complete(c) and (not unanchored_assistant_reaction
+                              or bool(c.payload.get("emoji"))) and c.occurred_ms is not None
+                              and abs(c.occurred_ms - moment) <= window for c, _, _ in members)]
         if len(candidates) == 1:
             candidates[0].append(item)
         else:

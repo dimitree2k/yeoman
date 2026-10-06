@@ -360,6 +360,39 @@ def test_purged_event_matches_only_complete_copies_within_window(tmp_path):
     assert report["review"]["unmatched_event_payloads"] == ["whatsapp/events.jsonl#3"]
 
 
+@pytest.mark.parametrize(("complete", "expected_count", "matched"), [
+    ([{"messageId": "AC1", "emoji": "😂", "at": 0}], 1, True),
+    ([{"messageId": "AC1", "emoji": "😂", "at": 20_001}], 2, False),
+    ([{"messageId": "AC1", "emoji": "😂", "at": 0},
+     {"messageId": "AC2", "emoji": "👍", "at": 20_000}], 3, False),
+])
+def test_unanchored_purged_assistant_reaction_joins_only_unique_candidate(
+        tmp_path, complete, expected_count, matched):
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    records = [_bf("journal", "reaction", {"fromAssistant": True, "targetMessageId": item["messageId"],
+                    "emoji": item["emoji"], "removed": False}, ms=T0 + item["at"])
+               for item in complete]
+    records.append(_bf("journal", "reaction", {"fromAssistant": True, "removed": False},
+                       ms=T0 + 10_000))
+    write_jsonl(dev / "backfill/journal.jsonl", records)
+    write_jsonl(live / "owner/attestations.jsonl", [make(
+        "contact", 1, "assistant fixture", identifiers=["4915202777685@s.whatsapp.net"],
+        role="assistant")])
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    rows = conn.execute("SELECT target_native_id, payload_json, source_refs FROM message_events ORDER BY target_native_id").fetchall()
+    assert len(rows) == expected_count and report["events"] == expected_count
+    incomplete_ref = f"backfill/journal.jsonl#{len(records)}"
+    if matched:
+        (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
+        assert row[0] == "AC1" and json.loads(row[1])["emoji"] == "😂"
+        assert report["review"]["unmatched_event_payloads"] == []
+    else:
+        (row,) = [row for row in rows if incomplete_ref in json.loads(row[2])]
+        assert row[0] is None and json.loads(row[1])["emoji"] is None
+        assert report["review"]["unmatched_event_payloads"] == [incomplete_ref]
+
+
 def test_explicit_reaction_removal_is_not_treated_as_purged_payload(tmp_path):
     live, dev = tmp_path / "live", tmp_path / "dev"
     write_jsonl(live / "whatsapp/events.jsonl", [
