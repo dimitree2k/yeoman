@@ -100,13 +100,16 @@ def raw_check_capture() -> None:
             connection.row_factory = sqlite3.Row
             for row in connection.execute(
                 "SELECT effect_id, payload_kind, target_json FROM effects "
-                "WHERE state = 'sent'"
+                "WHERE state = 'sent' AND created_ms >= ?",
+                (start_ms,),
             ):
                 kind = str(row["payload_kind"] or "")
                 if kind not in eligible_kinds:
                     continue
                 target = json.loads(row["target_json"] or "{}")
                 channel = str(target.get("channel") or "whatsapp")
+                if channel not in {"whatsapp", "telegram"}:
+                    continue
                 chat_id = str(target.get("chat_id") or "")
                 effect_id = str(row["effect_id"])
                 effect_meta[effect_id] = (channel, chat_id)
@@ -114,12 +117,15 @@ def raw_check_capture() -> None:
                 kind_counts[kind] += 1
             for row in connection.execute(
                 "SELECT effect_id, channel, chat_id, provider_message_id "
-                "FROM transport_receipts WHERE confirmed_ms IS NOT NULL"
+                "FROM transport_receipts WHERE confirmed_ms >= ?",
+                (start_ms,),
             ):
                 effect_id = str(row["effect_id"])
                 if effect_id in effect_meta:
-                    effect_receipts[effect_id] += 1
                     channel, chat_id = str(row["channel"]), str(row["chat_id"])
+                    if channel not in {"whatsapp", "telegram"}:
+                        continue
+                    effect_receipts[effect_id] += 1
                     provider_id = str(row["provider_message_id"] or "")
                     if effect_meta[effect_id] != (channel, chat_id):
                         missing_results += 1

@@ -57,7 +57,7 @@ def _capture_home(
     with sqlite3.connect(db_path) as connection:
         connection.executescript("""
             CREATE TABLE effects (
-                effect_id TEXT, payload_kind TEXT, state TEXT, target_json TEXT
+                effect_id TEXT, payload_kind TEXT, state TEXT, target_json TEXT, created_ms INTEGER
             );
             CREATE TABLE transport_receipts (
                 receipt_id TEXT, effect_id TEXT, channel TEXT, chat_id TEXT,
@@ -66,11 +66,12 @@ def _capture_home(
         """)
         for effect_id, channel, chat_id, payload_kind in effects:
             connection.execute(
-                "INSERT INTO effects VALUES (?, ?, 'sent', ?)",
-                (effect_id, payload_kind, json.dumps({"channel": channel, "chat_id": chat_id})),
+                "INSERT INTO effects VALUES (?, ?, 'sent', ?, ?)",
+                (effect_id, payload_kind, json.dumps({"channel": channel, "chat_id": chat_id}), NOW),
             )
         connection.executemany(
-            "INSERT INTO transport_receipts VALUES (?, ?, ?, ?, ?, 1)", receipts
+            "INSERT INTO transport_receipts VALUES (?, ?, ?, ?, ?, ?)",
+            [(*receipt, NOW) for receipt in receipts],
         )
     return [path for path in home.rglob("*") if path.is_file()]
 
@@ -335,9 +336,9 @@ def test_capture_check_reports_missing_receipt_result_request_and_provider_id(
     assert result.exit_code == 1, result.output
     _assert_aggregate_output(result.output)
     assert "missing_receipts=1" in result.output
-    for metric in ("missing_requests", "missing_results", "missing_provider_ids"):
-        value = int(result.output.split(f"{metric}=", 1)[1].split()[0])
-        assert value > 0
+    assert "missing_requests=1" in result.output
+    assert "missing_results=3" in result.output
+    assert "missing_provider_ids=1" in result.output
     assert _input_bytes(inputs) == before
 
 
@@ -401,3 +402,58 @@ def test_capture_check_is_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _assert_aggregate_output(result.output)
     assert _input_bytes(inputs) == before
     assert {path for path in tmp_path.rglob("*") if path.is_file()} == set(inputs)
+
+
+def test_capture_check_ignores_pre_start_effects_and_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("old-effect", "whatsapp", "old-chat", "text"),
+                 ("current-effect", "whatsapp", "current-chat", "text")],
+        receipts=[("old-receipt", "old-effect", "whatsapp", "old-chat", "old-id"),
+                  ("current-receipt", "current-effect", "whatsapp", "current-chat", "current-id")],
+        raw=[("outbound_request", "whatsapp", "current-chat", "current-effect", None),
+             ("outbound_result", "whatsapp", "current-chat", "current-effect", "current-id")],
+    )
+    db_path = tmp_path / "data" / "processing" / "processing.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE effects SET created_ms = 1 WHERE effect_id = 'old-effect'")
+        connection.execute("UPDATE transport_receipts SET confirmed_ms = 1 WHERE effect_id = 'old-effect'")
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 0, result.output
+    _assert_aggregate_output(result.output)
+    assert "effects=1 receipts=1 outbound_results=1" in result.output
+    assert 'channels={"whatsapp": 1}' in result.output
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_ignores_unsupported_channel_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("current-effect", "whatsapp", "current-chat", "text"),
+                 ("unsupported-effect", "email", "unsupported-chat", "text")],
+        receipts=[("current-receipt", "current-effect", "whatsapp", "current-chat", "current-id"),
+                  ("wrong-channel-receipt", "current-effect", "email", "unsupported-chat", "unsupported-id"),
+                  ("unsupported-receipt", "unsupported-effect", "email", "unsupported-chat", "unsupported-id")],
+        raw=[("outbound_request", "whatsapp", "current-chat", "current-effect", None),
+             ("outbound_result", "whatsapp", "current-chat", "current-effect", "current-id"),
+             ("outbound_request", "email", "unsupported-chat", "unsupported-effect", None),
+             ("outbound_result", "email", "unsupported-chat", "unsupported-effect", "unsupported-id")],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 0, result.output
+    _assert_aggregate_output(result.output)
+    assert "effects=1 receipts=1 outbound_results=1" in result.output
+    assert 'channels={"whatsapp": 1}' in result.output
+    assert _input_bytes(inputs) == before
