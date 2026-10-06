@@ -176,6 +176,33 @@ def test_backfill_kinds_and_identity():
     assert sum(o.values()) == 11
 
 
+def test_batch_segments_become_ordered_claim_copies_with_internal_stable_keys():
+    first = bf("memory", 4, "message", {
+        "chatJid": G, "messageId": "LAST-ID", "senderId": "4915550000003",
+        "segments": [
+            {"text": "unmarked"},
+            {"senderId": "4915550000001", "text": "first"},
+            {"senderId": "4915550000002", "text": "last", "messageId": "LAST-ID"},
+        ],
+    }, provenance="verbatim_unverified")
+    second = bf("knowledge_memory", 8, "message", {
+        "chatJid": G, "messageId": "LAST-ID", "senderId": "4915550000003",
+        "segments": first.record["payload"]["segments"],
+    }, provenance="verbatim_unverified")
+    ex = extract([first, second])
+    assert [(m.ref, m.text, m.native_id, m.sender_raw, m.batch_key) for m in ex.messages] == [
+        ("backfill/memory.jsonl#4/0", "unmarked", None, "4915550000003", f'["{G}","LAST-ID",2]'),
+        ("backfill/memory.jsonl#4/1", "first", None, "4915550000001", f'["{G}","LAST-ID",1]'),
+        ("backfill/memory.jsonl#4/2", "last", "LAST-ID", "4915550000002", None),
+        ("backfill/knowledge_memory.jsonl#8/0", "unmarked", None, "4915550000003", f'["{G}","LAST-ID",2]'),
+        ("backfill/knowledge_memory.jsonl#8/1", "first", None, "4915550000001", f'["{G}","LAST-ID",1]'),
+        ("backfill/knowledge_memory.jsonl#8/2", "last", "LAST-ID", "4915550000002", None),
+    ]
+    assert all(m.provenance == "verbatim_unverified" for m in ex.messages)
+    assert ex.outcomes[("backfill/memory.jsonl", "message")] == 1
+    assert ex.outcomes[("backfill/knowledge_memory.jsonl", "message")] == 1
+
+
 def test_malformed_attestation_types_are_counted_invalid():
     lines = [
         Layer1Line(f"owner/attestations.jsonl#{i}", {"type": value, "at_ms": 1})

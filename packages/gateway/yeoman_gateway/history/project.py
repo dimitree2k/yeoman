@@ -65,6 +65,8 @@ def _messages(ex: Extracted, res: Resolution, arvid: str | None,
     for copy in ex.messages:
         if copy.native_id:
             keyed[(copy.channel, copy.chat_id, copy.native_id)].append(copy)
+        elif copy.batch_key:
+            keyed[(copy.channel, copy.chat_id, "\0batch:" + copy.batch_key)].append(copy)
         else:
             loose.append(copy)
     for copies in keyed.values():
@@ -72,6 +74,8 @@ def _messages(ex: Extracted, res: Resolution, arvid: str | None,
     text_of = {k: next((c.text for c in v if c.text is not None), None) for k, v in keyed.items()}
     index: dict[tuple[str, str, str], tuple[list[int], list[Key]]] = {}
     for key in sorted(keyed):
+        if key[2].startswith("\0batch:"):
+            continue
         ms, _ = _best_time(keyed[key])
         if ms is not None:
             times, keys = index.setdefault((key[0], key[1], _direction(keyed[key])), ([], []))
@@ -97,7 +101,9 @@ def _messages(ex: Extracted, res: Resolution, arvid: str | None,
         else:
             standalone.append(copy)
 
-    rows = [_message_row(k[0], k[1], k[2], sorted(keyed[k], key=_order), res, arvid, authors)
+    rows = [_message_row(k[0], k[1], None if k[2].startswith("\0batch:") else k[2],
+                         sorted(keyed[k], key=_order), res, arvid, authors,
+                         stable_key=k[2][len("\0batch:"):] if k[2].startswith("\0batch:") else None)
             for k in sorted(keyed)]
     rows += [_message_row(c.channel, c.chat_id, None, [c], res, arvid, authors) for c in standalone]
     _name_fallback(rows)
@@ -153,11 +159,13 @@ def _text_and_provenance(copies: Sequence[MessageCopy]) -> tuple[str | None, str
 
 
 def _message_row(channel: str, chat: str, native_id: str | None, copies: list[MessageCopy],
-                 res: Resolution, arvid: str | None, authors: dict[str, str | None]) -> dict[str, Any]:
+                 res: Resolution, arvid: str | None, authors: dict[str, str | None],
+                 stable_key: str | None = None) -> dict[str, Any]:
     if native_id:
         message_id = f"{channel}:{chat}:{native_id}"
     else:
-        message_id = f"{channel}:{chat}:derived:{hashlib.sha256(copies[0].ref.encode()).hexdigest()[:32]}"
+        identity = stable_key or copies[0].ref
+        message_id = f"{channel}:{chat}:derived:{hashlib.sha256(identity.encode()).hexdigest()[:32]}"
     from_assistant = any(c.from_assistant for c in copies)
     sender_copy = next((c for c in copies if c.sender is not None), None)
     sender_identifier = sender_copy.sender_raw if sender_copy is not None and not from_assistant else None

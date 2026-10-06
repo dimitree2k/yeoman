@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 from hist_fixtures import FRANK_LID, FRANK_PN, T0, _bf, _raw, sample_layer1, write_jsonl
 from hist_fixtures import SAMPLE_GROUP as G
+from yeoman_gateway.history.attestations import make
 from yeoman_gateway.history.project import project
 
 
@@ -68,6 +69,31 @@ def test_description_is_media_not_text(built):
     media = json.loads(row["media_json"])
     assert row["text"] is None and media["kind"] == "image"
     assert media["description"]["text"] == "Eine Stahlbrücke" and row["sender_basis"] == "derived_claim"
+
+
+def test_batch_copies_merge_by_native_anchor_and_repeated_text_stays_separate(tmp_path):
+    def record(native_id):
+        return _bf("memory", "message", {
+            "chatJid": G, "messageId": native_id, "segments": [
+                {"senderId": "4915550000000@s.whatsapp.net", "text": "same words"},
+                {"senderId": "4915550000000@s.whatsapp.net", "text": "tail", "messageId": native_id},
+            ],
+        }, provenance="verbatim_unverified")
+
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(dev / "owner/attestations.jsonl", [make(
+        "contact", 1, "test identity", identifiers=["4915550000000@s.whatsapp.net"]
+    )])
+    write_jsonl(dev / "backfill/memory.jsonl", [record("LAST-A")])
+    write_jsonl(dev / "backfill/knowledge_memory.jsonl", [record("LAST-A"), record("LAST-B")])
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    conn.row_factory = sqlite3.Row
+    repeats = conn.execute("SELECT * FROM messages WHERE text = 'same words' ORDER BY message_id").fetchall()
+    assert len(repeats) == 2 and repeats[0]["message_id"] != repeats[1]["message_id"]
+    assert sorted(len(json.loads(row["source_refs"])) for row in repeats) == [1, 2]
+    assert all(row["native_message_id"] is None and row["sender_basis"] == "derived_claim" for row in repeats)
+    assert report["messages"] == 4 and report["accounting_ok"]
 
 
 def test_accounting(built):

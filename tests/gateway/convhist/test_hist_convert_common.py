@@ -8,8 +8,9 @@ from yeoman_gateway.history.convert.common import LOCAL_ZONE, clean_text, epoch_
  ("hallo", "hallo", None, None, False), (None, None, None, None, False),
  ("[Image] @203075365150770 wie belastbar", "@203075365150770 wie belastbar", None, "image", True),
  ("[Image]\n[image_description] This social media post", None, "This social media post", "image", True),
- ("[group_notes_batch] [4917623568044] [Image] [image_description] This image shows", None, "This image shows", "image", True),
- ("[group_notes_batch] [4917623568044] Und ja, zu teuer", "Und ja, zu teuer", None, None, True),
+ ("[group_notes_batch] [4917623568044] [Image] [image_description] This image shows",
+  "[4917623568044] [Image]", "This image shows", None, True),
+ ("[group_notes_batch] [4917623568044] Und ja, zu teuer", "[4917623568044] Und ja, zu teuer", None, None, True),
  ("[Sticker]", None, None, "sticker", True),
 ])
 def test_clean_text(raw, text, description, placeholder, changed):

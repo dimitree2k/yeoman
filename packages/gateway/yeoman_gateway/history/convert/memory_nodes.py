@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -18,6 +19,9 @@ from .common import (
     row_dict,
     table_exists,
 )
+
+_SENDER_MARKER = re.compile(r"\[(\+?\d+)\]\s*")
+_BATCH_TAG = re.compile(r"^\s*\[group_notes_batch\]\s*")
 
 
 def convert_memory_nodes(source_home: Path, db_rel: str, store: str) -> Iterator[dict[str, Any]]:
@@ -42,18 +46,31 @@ def _line(node: dict[str, Any], origin: Origin) -> dict[str, Any]:
         origin=origin,
         original=node,
     )
-    if node.get("kind") != "utterance" or node.get("source") == "auto_semantic_v2":
+    if node.get("kind") != "utterance":
         return backfill_line(
             kind="memory_fact",
             provenance="derived_only",
             direction=None,
             payload={},
-            skip_reason=("generated_memory_utterance" if node.get("source") == "auto_semantic_v2"
-                         and node.get("kind") == "utterance" else "derived_memory_fact"),
+            skip_reason="derived_memory_fact",
             **common,
         )
     meta = loads_object(node.get("meta_json"))
     outgoing = meta.get("direction") == "out" or node.get("source_role") == "assistant"
+    if node.get("source") == "auto_semantic_v2":
+        segments = _batch_segments(node.get("content"), node.get("sender_id"),
+                                   node.get("source_message_id"))
+        payload = compact({
+            "chatJid": node.get("chat_id"), "messageId": node.get("source_message_id"),
+            "senderId": None if outgoing else node.get("sender_id"),
+            "fromAssistant": True if outgoing else None, "contactRef": node.get("contact_id"),
+            "segments": segments,
+        })
+        return backfill_line(
+            kind="message", provenance="verbatim_unverified",
+            direction="out" if outgoing else "in", payload=payload,
+            skip_reason="deleted_in_source" if node.get("is_deleted") else None, **common,
+        )
     cleaned = clean_text(node.get("content"))
     sender = node.get("sender_id")
     payload = compact(
@@ -76,3 +93,31 @@ def _line(node: dict[str, Any], origin: Origin) -> dict[str, Any]:
         skip_reason="deleted_in_source" if node.get("is_deleted") else None,
         **common,
     )
+
+
+def _batch_segments(content: Any, fallback_sender: Any, last_message_id: Any) -> list[dict[str, Any]]:
+    text = _BATCH_TAG.sub("", str(content or ""), count=1)
+    markers = list(_SENDER_MARKER.finditer(text))
+    parts: list[tuple[Any, str]] = []
+    if markers:
+        leading = text[:markers[0].start()].strip()
+        if leading:
+            parts.append((fallback_sender, leading))
+        parts.extend((marker.group(1), text[marker.end():markers[i + 1].start() if i + 1 < len(markers)
+                      else len(text)].strip()) for i, marker in enumerate(markers))
+    else:
+        parts.append((fallback_sender, text.strip()))
+    result: list[dict[str, Any]] = []
+    for index, (sender, value) in enumerate(parts):
+        cleaned = clean_text(value)
+        segment = {"senderId": str(sender) if sender is not None else None, "text": cleaned.text}
+        if cleaned.description:
+            segment["description"] = cleaned.description
+        if cleaned.placeholder:
+            segment["mediaKind"] = media_kind(cleaned.placeholder)
+        if index == len(parts) - 1 and last_message_id:
+            segment["messageId"] = last_message_id
+        if cleaned.changed:
+            segment["provenance"] = "derived_only"
+        result.append(segment)
+    return result

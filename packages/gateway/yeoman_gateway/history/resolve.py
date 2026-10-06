@@ -188,7 +188,8 @@ def _value(raw: Any) -> str:
 
 def resolve(inp: IdentityInput) -> Resolution:
     review: dict[str, list[dict[str, Any]]] = {
-        "numeric_ambiguous": [], "merged_knowledge_contacts": [], "blocked_by_unmerge": []}
+        "numeric_ambiguous": [], "merged_knowledge_contacts": [], "blocked_by_unmerge": [],
+        "identifier_ended_not_applied": []}
     attested = sorted(inp.attestations, key=lambda a: (a.at_ms, a.ref))
 
     strong_known = {i for i in inp.sightings if i.strong}
@@ -235,7 +236,13 @@ def resolve(inp: IdentityInput) -> Resolution:
         uf.add(node)
     for contact_ref in inp.contact_records:
         uf.add(REF + contact_ref)
-    forbidden = [(_value(a.fields["a"]), _value(a.fields["b"])) for a in attested if a.type == "unmerge"]
+    pair_intent: dict[tuple[str, str], Attestation] = {}
+    for att in attested:
+        if att.type in ("merge", "unmerge"):
+            pair = tuple(sorted((_value(att.fields["a"]), _value(att.fields["b"]))))
+            pair_intent[pair] = att
+    active_merges = {pair for pair, att in pair_intent.items() if att.type == "merge"}
+    forbidden = [pair for pair, att in pair_intent.items() if att.type == "unmerge"]
     edges: list[tuple[int, int, str, str, str, str]] = []
     for att in attested:
         values = [_value(v) for v in _identifier_values(att)]
@@ -244,7 +251,7 @@ def resolve(inp: IdentityInput) -> Resolution:
             refs_of[value].add(att.ref)
         if att.type == "contact":
             edges += [(0, att.at_ms, att.ref, values[0], v, "owner_attested") for v in values[1:]]
-        elif att.type in ("identifier", "merge"):
+        elif att.type == "identifier" or (att.type == "merge" and tuple(sorted(values)) in active_merges):
             edges.append((0, att.at_ms, att.ref, values[0], values[1], "owner_attested"))
     for a, b, evidence, ref in inp.links:
         edges.append((_EDGE_PRIORITY[evidence], 0, ref, a, b, evidence))
@@ -270,6 +277,9 @@ def resolve(inp: IdentityInput) -> Resolution:
             name_by_root[uf.find(_value(att.fields["anchor"]))] = att.fields["name"]
         elif att.type == "identifier_ended":
             ended[_value(att.fields["identifier"])] = att.fields["ended_ms"]
+            review["identifier_ended_not_applied"].append({
+                "ref": att.ref, "identifier": _value(att.fields["identifier"]),
+                "ended_ms": att.fields["ended_ms"], "resolution": "not applied to resolution"})
 
     components: dict[str, list[str]] = defaultdict(list)
     for node in list(uf.parent):

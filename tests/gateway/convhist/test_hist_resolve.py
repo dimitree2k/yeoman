@@ -69,6 +69,33 @@ def test_wrong_binding_merges_until_owner_unmerges():
     assert split.review["blocked_by_unmerge"]
 
 
+def test_later_merge_or_unmerge_wins_for_the_same_pair():
+    a, b = FRANK_PN, "4915550000000@s.whatsapp.net"
+    for earlier, latest, should_merge in (("merge", "unmerge", False), ("unmerge", "merge", True)):
+        inp = IdentityInput()
+        inp.see(classify(a), 1, "raw#1")
+        inp.see(classify(b), 2, "raw#2")
+        inp.attestations.extend([
+            _att(make(earlier, 10, "earlier intent", a=a, b=b), 10),
+            _att(make(latest, 20, "later intent", a=a, b=b), 20),
+        ])
+        resolved = resolve(inp)
+        assert (resolved.resolve(classify(a))[0] == resolved.resolve(classify(b))[0]) is should_merge
+
+
+def test_identifier_ended_is_reported_as_metadata_not_applied():
+    inp = IdentityInput()
+    inp.see(classify(FRANK_PN), 100, "raw#1")
+    att = _att(make("identifier_ended", 200, "recorded end", identifier=FRANK_PN, ended_ms=150), 1)
+    inp.attestations.append(att)
+    resolved = resolve(inp)
+    assert resolved.identifiers[0].ended_ms == 150
+    assert resolved.review["identifier_ended_not_applied"] == [{
+        "ref": att.ref, "identifier": FRANK_PN, "ended_ms": 150,
+        "resolution": "not applied to resolution",
+    }]
+
+
 def test_seed_attestations_create_arvid_owner_matthias():
     inp = IdentityInput()
     inp.attestations.extend(_att(r, n) for n, r in enumerate(seed_records(), start=1))

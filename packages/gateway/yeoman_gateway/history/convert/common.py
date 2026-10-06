@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 LOCAL_ZONE = ZoneInfo("Europe/Berlin")
-_BATCH_PREFIX = re.compile(r"^\s*\[group_notes_batch\]\s*(?:\[\+?\d[^\]]*\]\s*)?")
+_BATCH_PREFIX = re.compile(r"^\s*\[group_notes_batch\]\s*")
 _DESCRIPTION = re.compile(r"\s*\[image_description\]\s*", re.IGNORECASE)
 _PLACEHOLDER = re.compile(
     r"^\s*\[(image|video|gif|sticker|document|audio|voice message|voice|media)\]\s*",

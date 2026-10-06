@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ class MessageCopy:
     provenance: str
     inferred_sender: bool = False
     extra_refs: tuple[str, ...] = ()
+    batch_key: str | None = None
 
 
 @dataclass
@@ -164,7 +166,7 @@ def _observe(out: Extracted, idents: list[Ident], sender: Ident | None, name: An
 def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat: str,
              native_id: Any, direction: str, ms: int | None, certainty: str, provenance: str,
              from_assistant: bool | None = None, media: Any = None, description: str | None = None,
-             mentions: Any = None, extra_refs: tuple[str, ...] = ()) -> None:
+             mentions: Any = None, extra_refs: tuple[str, ...] = (), batch_key: str | None = None) -> None:
     assistant = bool(p.get("fromAssistant")) if from_assistant is None else from_assistant
     sender, sender_raw, idents = (None, None, []) if assistant else _sender(p, allow_group=False)
     name = None if assistant else p.get("senderName")
@@ -180,6 +182,7 @@ def _message(out: Extracted, ref: str, p: dict[str, Any], *, channel: str, chat:
         description=description or cleaned.description, reply_to=p.get("replyToMessageId") or None,
         mentions=mentions if isinstance(mentions, list) and mentions else None, provenance=provenance,
         inferred_sender=bool(p.get("senderInferredFromChat")), extra_refs=extra_refs,
+        batch_key=batch_key,
     ))
     if not assistant:
         _observe(out, idents, sender, name, ms, ref,
@@ -381,6 +384,31 @@ def _backfill(line: Layer1Line, out: Extracted) -> None:
     ms, certainty = record.get("occurred_ms"), record.get("time_certainty") or "unknown"
     provenance = record.get("provenance") or "derived_only"
     if kind == "message":
+        segments = p.get("segments")
+        if isinstance(segments, list):
+            last_id = p.get("messageId")
+            parent_media = p.get("media") if isinstance(p.get("media"), dict) else (
+                {"kind": p["mediaKind"]} if p.get("mediaKind") else None)
+            for index, segment in enumerate(segments):
+                if not isinstance(segment, dict):
+                    continue
+                segment_payload = {**p, **segment}
+                segment_payload.pop("segments", None)
+                segment_payload["senderId"] = segment.get("senderId", p.get("senderId"))
+                segment_id = segment.get("messageId")
+                position = len(segments) - index - 1
+                batch_key = (json.dumps([chat, str(last_id), position], separators=(",", ":"))
+                             if position > 0 and last_id else None)
+                segment_media = ({**(parent_media or {}), "kind": segment["mediaKind"]}
+                                 if segment.get("mediaKind") else parent_media)
+                _message(out, f"{line.ref}/{index}", segment_payload, channel=channel, chat=chat,
+                         native_id=segment_id, direction=record.get("direction") or "in", ms=ms,
+                         certainty=record.get("time_certainty") or "unknown",
+                         provenance=segment.get("provenance") or provenance,
+                         media=segment_media, description=segment.get("description"),
+                         batch_key=batch_key)
+            out.count(line.ref, "message")
+            return
         media = p.get("media") if isinstance(p.get("media"), dict) else (
             {"kind": p["mediaKind"]} if p.get("mediaKind") else None)
         _message(out, line.ref, p, channel=channel, chat=chat, native_id=p.get("messageId"),
