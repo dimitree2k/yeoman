@@ -83,7 +83,9 @@ def test_verify_defers_month_seal_until_backlog_drains(
             raise OSError("temporary storage failure")
         return original_append_line(path, line, mode=mode, **append_options)
 
-    def fail_spool_append(channel: str, received_ms: int, line: str) -> bool:
+    def fail_spool_append(
+        channel: str, received_ms: int, line: str, destination: str | None
+    ) -> bool:
         return False
 
     monkeypatch.setattr(writer, "append_line", fail_month_append)
