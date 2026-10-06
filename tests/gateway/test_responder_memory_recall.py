@@ -8,6 +8,7 @@ from yeoman_gateway.adapters.responder_llm import LLMResponder
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.core.models import InboundEvent, PolicyDecision
 from yeoman_gateway.knowledge._memory.service import MemoryService
+from yeoman_gateway.knowledge._memory.session_state import resolve_session_state_dir
 from yeoman_gateway.providers.base import LLMProvider, LLMResponse
 from yeoman_shared.config.schema import Config
 from yeoman_shared.telemetry import InMemoryTelemetry
@@ -111,7 +112,7 @@ class SequenceProvider(LLMProvider):
 
 
 @pytest.mark.asyncio
-async def test_responder_injects_retrieved_memory_and_wal(tmp_path: Path) -> None:
+async def test_responder_injects_retrieved_memory_without_writing_session_state(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
@@ -130,7 +131,7 @@ async def test_responder_injects_retrieved_memory_and_wal(tmp_path: Path) -> Non
         importance=0.9,
     )
 
-    wal_file = memory_service.state_store.state_dir / "cli_test.md"
+    wal_file = resolve_session_state_dir(workspace, cfg.memory.wal.state_dir) / "cli_test.md"
     provider = CaptureMemoryProvider(wal_file=wal_file)
     telemetry = InMemoryTelemetry()
     responder = LLMResponder(
@@ -152,7 +153,7 @@ async def test_responder_injects_retrieved_memory_and_wal(tmp_path: Path) -> Non
     memory_service.close()
 
     assert out == "ok"
-    assert provider.pre_write_seen is True
+    assert provider.pre_write_seen is False
 
     sent = provider.messages_seen[-1]
     memory_system_msgs = [
@@ -164,13 +165,27 @@ async def test_responder_injects_retrieved_memory_and_wal(tmp_path: Path) -> Non
     ]
     assert memory_system_msgs
 
-    assert wal_file.exists()
-    wal_text = wal_file.read_text(encoding="utf-8")
-    assert "PRE" in wal_text
-    assert "POST" in wal_text
+    assert not wal_file.exists()
+    assert not wal_file.parent.exists()
     assert telemetry.get_counter("memory_recall_hit") == 1
     assert telemetry.get_counter("memory_prompt_chars") > 0
     assert telemetry.get_counter("memory_capture_dropped_low_conf") >= 1
+
+
+def test_remaining_copies_reports_frozen_session_state_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    state_dir = workspace / "data/memory/session-state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "frozen.md").write_text("legacy copy", encoding="utf-8")
+    cfg = Config()
+    cfg.memory.db_path = str(tmp_path / "longterm.db")
+    cfg.memory.wal.state_dir = str(state_dir)
+    memory_service = MemoryService(workspace=workspace, config=cfg.memory)
+
+    try:
+        assert "session_state_markdown" in memory_service.remaining_copies()
+    finally:
+        memory_service.close()
 
 
 @pytest.mark.asyncio

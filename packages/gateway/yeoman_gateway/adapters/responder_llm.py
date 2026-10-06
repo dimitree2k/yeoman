@@ -2714,18 +2714,6 @@ class LLMResponder(ResponderPort):
             allowed_tools=allowed_tools,
         )
 
-        if self.memory is not None:
-            try:
-                self.memory.pre_write_session_state(
-                    session_key=session_key,
-                    channel=channel,
-                    chat_id=chat_id,
-                    user_message=content,
-                    metadata=metadata,
-                )
-            except Exception as e:
-                logger.warning("memory wal pre-write failed: {}", e)
-
         if self._should_hold_back_after_social_reply(
             session_messages=session.messages,
             content=content,
@@ -2990,15 +2978,6 @@ class LLMResponder(ResponderPort):
                 self._register_turn_knowledge_sources(channel=channel, chat_id=chat_id)
             except Exception as e:
                 logger.warning("knowledge source registration failed: {}", e)
-
-            try:
-                self.memory.post_write_session_state(
-                    session_key=session_key,
-                    assistant_reply=final_content,
-                    pending_actions=[],
-                )
-            except Exception as e:
-                logger.warning("memory wal post-write failed: {}", e)
 
         # Only add messages if they weren't already added (for new sessions)
         if not _user_message_already_added:

@@ -33,7 +33,7 @@ from yeoman_gateway.knowledge._memory.models import (
     MemorySector,
 )
 from yeoman_gateway.knowledge._memory.read_gate import FactAclPredicate, FactReadGate
-from yeoman_gateway.knowledge._memory.session_state import SessionStateStore
+from yeoman_gateway.knowledge._memory.session_state import resolve_session_state_dir
 from yeoman_gateway.knowledge._memory.shared_facts import (
     FactReadContext,
     FactRetrievalResult,
@@ -110,7 +110,6 @@ class MemoryService:
         self.db_path = db_path
         self.owns_store = bool(owns_store) and store is None
         self.store = store if store is not None else MemoryStore(db_path)
-        self.state_store = SessionStateStore(workspace, state_dir=self.config.wal.state_dir)
         self._owner_ids = _load_owner_ids()
 
         self.embedding: MemoryEmbeddingService | None = None
@@ -239,40 +238,6 @@ class MemoryService:
             return 0.0
         age_days = max(0.0, (datetime.now(UTC) - dt).total_seconds() / 86400.0)
         return math.exp(-age_days / 90.0)
-
-    def pre_write_session_state(
-        self,
-        *,
-        session_key: str,
-        channel: str,
-        chat_id: str,
-        user_message: str,
-        metadata: dict[str, object],
-    ) -> None:
-        if not (self.config.enabled and self.config.wal.enabled):
-            return
-        self.state_store.pre_write(
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
-            user_message=user_message,
-            metadata=metadata,
-        )
-
-    def post_write_session_state(
-        self,
-        *,
-        session_key: str,
-        assistant_reply: str,
-        pending_actions: list[str] | None = None,
-    ) -> None:
-        if not (self.config.enabled and self.config.wal.enabled):
-            return
-        self.state_store.post_write(
-            session_key=session_key,
-            assistant_reply=assistant_reply,
-            pending_actions=pending_actions,
-        )
 
     def enqueue_background_note(
         self,
@@ -795,9 +760,7 @@ class MemoryService:
             "sqlite_backups",
             "inbound_reply_archive",  # kept complete by owner decision, never purged
         ]
-        state_dir = Path(getattr(self.config.wal, "state_dir", "data/memory/session-state"))
-        if not state_dir.is_absolute():
-            state_dir = self.workspace / state_dir
+        state_dir = resolve_session_state_dir(self.workspace, self.config.wal.state_dir)
         if state_dir.exists():
             copies.append("session_state_markdown")
         return tuple(copies)
@@ -1629,14 +1592,15 @@ class MemoryService:
     def stats(self) -> dict[str, object]:
         base = self.store.stats(workspace_id=self.workspace_id)
         wal_files = 0
-        if self.state_store.state_dir.exists():
-            wal_files = len(list(self.state_store.state_dir.glob("*.md")))
+        state_dir = resolve_session_state_dir(self.workspace, self.config.wal.state_dir)
+        if state_dir.exists():
+            wal_files = len(list(state_dir.glob("*.md")))
         return {
             "enabled": bool(self.config.enabled),
             "backend": "sqlite_semantic_v2",
             "wal_enabled": bool(self.config.wal.enabled),
             "db_path": str(self.db_path),
-            "state_dir": str(self.state_store.state_dir),
+            "state_dir": str(state_dir),
             "total_active": int(base.get("nodes", 0)),
             "total_deleted": 0,
             "wal_files": wal_files,
