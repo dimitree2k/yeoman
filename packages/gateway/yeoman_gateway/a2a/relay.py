@@ -15,10 +15,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from yeoman_gateway.a2a.contracts import (
@@ -409,10 +410,15 @@ class _RelayStore:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def claim(
         self,
