@@ -241,7 +241,7 @@ json.dump(s, open(p,'w'), indent=2); print('budget reset')
 "
 
 # Check audit trail
-tail -20 ~/.yeoman/data/ops/overseer/audit/$(date -u +%Y-%m-%d).jsonl
+tail -20 ~/.yeoman/data/ops/overseer/audit/$(date -u +%Y-%m).jsonl
 
 # Tail logs
 tail -f ~/.yeoman/var/logs/overseer.log
