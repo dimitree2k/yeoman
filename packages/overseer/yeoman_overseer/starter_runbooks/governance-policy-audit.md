@@ -24,7 +24,7 @@ Review the current policy configuration for anomalies or drift.
 2. Check recent overseer audit entries by reading the latest dated JSONL audit
    log in `~/.yeoman/data/ops/overseer/audit/`:
    ```sh
-   latest=$(ls -1 ~/.yeoman/data/ops/overseer/audit/*.jsonl 2>/dev/null | sort | tail -1)
+   latest=$(ls -1 ~/.yeoman/data/ops/overseer/audit/????-??.jsonl 2>/dev/null | sort | tail -1)
    test -n "$latest" && tail -30 "$latest" || true
    ```
    If there is no dated audit file yet, report that no audit entries are
