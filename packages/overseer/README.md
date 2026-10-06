@@ -18,7 +18,7 @@ yeoman overseer status
 yeoman overseer runbooks
 ```
 
-The overseer copies starter runbooks into `~/.yeoman/data/overseer/runbooks/` on first run. Edit or add `.md` files there to customize.
+The overseer copies starter runbooks into `~/.yeoman/data/ops/overseer/runbooks/` on first run. Edit or add `.md` files there to customize.
 
 ## How It Works
 
@@ -52,7 +52,7 @@ Every execution passes through multiple gates before any action:
 
 ## Runbooks
 
-Runbooks are Markdown files with YAML frontmatter in `~/.yeoman/data/overseer/runbooks/`.
+Runbooks are Markdown files with YAML frontmatter in `~/.yeoman/data/ops/overseer/runbooks/`.
 
 ### Minimal example (deterministic)
 
@@ -189,7 +189,7 @@ Includes units for all three services:
 
 ```
 ~/.yeoman/
-├── data/overseer/
+├── data/ops/overseer/
 │   ├── runbooks/           Active runbook .md files
 │   ├── audit/
 │   │   ├── YYYY-MM-DD.jsonl    Daily audit entries
@@ -235,13 +235,13 @@ rm ~/.yeoman/run/overseer.pid
 
 # Reset daily budget
 python3 -c "
-import json; p='$HOME/.yeoman/data/overseer/state.json'
+import json; p='$HOME/.yeoman/data/ops/overseer/state.json'
 s=json.load(open(p)); s['budget'].update(tokens_daily=0, llm_daily=0, budget_reset_date='')
 json.dump(s, open(p,'w'), indent=2); print('budget reset')
 "
 
 # Check audit trail
-tail -20 ~/.yeoman/data/overseer/audit/$(date -u +%Y-%m-%d).jsonl
+tail -20 ~/.yeoman/data/ops/overseer/audit/$(date -u +%Y-%m-%d).jsonl
 
 # Tail logs
 tail -f ~/.yeoman/var/logs/overseer.log
@@ -249,7 +249,7 @@ tail -f ~/.yeoman/var/logs/overseer.log
 
 ## Starter Runbooks
 
-Shipped with the package, copied to `~/.yeoman/data/overseer/runbooks/` on first run:
+Shipped with the package, copied to `~/.yeoman/data/ops/overseer/runbooks/` on first run:
 
 | Runbook | Domain | Trigger | LLM |
 |---------|--------|---------|-----|

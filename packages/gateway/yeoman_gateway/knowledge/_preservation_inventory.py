@@ -90,8 +90,9 @@ _LIVE_DB_NAMES = {
 def _ops_path(name: str, *parts: str) -> str:
     return (get_operational_store_path(name, data_dir=Path("data")) / Path(*parts)).as_posix()
 
-# Safe operational path references verified from the effective runtime config.
-# The config itself is intentionally never read or copied by this inventory.
+# Safe effective operational path references.  The legacy config literal
+# ``data/processing/processing.db`` is resolved through its compatibility alias
+# to ``data/ops/processing.db``; the config itself is never read or copied here.
 _CONFIGURED_REFERENCES = (
     ("memory.dbPath", "data/memory/memory.db"),
     ("memory.wal.stateDir", "data/memory/session-state"),
@@ -136,6 +137,7 @@ _EXPECTED_SOURCES = (
     (_ops_path("policy_audit"), "tree", "operational", True, "policy audit"),
     ("policy/audit", "tree", "operational", True, "policy admin audit"),
     (_ops_path("overseer"), "tree", "operational", True, "Overseer state and runbooks"),
+    (_ops_path("a2a"), "live_sqlite", "operational", True, "merged A2A store"),
     ("data/a2a/relay.db", "live_sqlite", "operational", True, "A2A relay"),
     ("data/speakups.db", "live_sqlite", "operational", True, "dead duplicate speak-up store"),
     ("data/processing/a2a-research.db", "live_sqlite", "operational", True, "A2A research"),

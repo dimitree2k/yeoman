@@ -46,7 +46,7 @@ Fix: back up the DB, then run `sqlite3 ~/.yeoman/data/memory/memory.db "VACUUM;"
 Severity: WARNING
 Problem: `yeoman cron list` failed.
 Likely cause: invalid cron store or runtime issue.
-Fix: inspect `~/.yeoman/data/cron/jobs.json` and rerun `yeoman cron list`.
+Fix: inspect `~/.yeoman/data/ops/cron-jobs.json` and rerun `yeoman cron list`.
 
 ### CRON-002
 Severity: WARNING
@@ -58,7 +58,7 @@ Fix: inspect with `yeoman cron list`, then re-enable intentionally disabled recu
 Severity: WARNING
 Problem: one or more cron jobs show failure state.
 Likely cause: bad payload, missing credentials, or downstream model/runtime errors.
-Fix: inspect `state.lastError` in `~/.yeoman/data/cron/jobs.json` and rerun the affected job.
+Fix: inspect `state.lastError` in `~/.yeoman/data/ops/cron-jobs.json` and rerun the affected job.
 
 ## Config
 

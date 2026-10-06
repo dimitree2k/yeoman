@@ -1,7 +1,7 @@
 ---
 name: ops-session-cleanup
 domain: ops
-enabled: true
+enabled: false
 version: 1
 trigger:
   kind: cron
@@ -15,8 +15,9 @@ safety:
 # Session Cleanup
 
 ## Context
-Session state files accumulate in data/memory/session-state/. Remove stale ones weekly.
+The existing files in data/memory/session-state/ are frozen legacy copies. Do not
+write, move, or delete them; deletion requires a later owner decision.
 
 ## Actions
-1. Prune session-state WAL files older than 30 days
-2. Compact session metadata snapshots older than 14 days
+No cleanup is authorized. This runbook stays disabled until an owner decides
+what to do with the frozen files.

@@ -119,7 +119,7 @@ Nothing below changes behaviour for chats that are not listed in `processing.cha
    ```bash
    python - <<'PY'
    import sqlite3
-   c = sqlite3.connect("file:" + __import__("os").path.expanduser("~/.yeoman/data/processing/processing.db") + "?mode=ro", uri=True)
+   c = sqlite3.connect("file:" + __import__("os").path.expanduser("~/.yeoman/data/ops/processing.db") + "?mode=ro", uri=True)
    for t in ("threads", "turns", "effects"):
        print(t, c.execute(f"select count(*) from {t}").fetchone()[0])
    PY
@@ -147,7 +147,7 @@ Durable evidence per effect (states: `planned/queued/executing/sent/blocked/expi
 ```bash
 python - <<'PY'
 import os, sqlite3
-path = os.path.expanduser("~/.yeoman/data/processing/processing.db")
+path = os.path.expanduser("~/.yeoman/data/ops/processing.db")
 c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 c.row_factory = sqlite3.Row
 for row in c.execute("select effect_id, state, capability, turn_id, turn_revision from effects order by rowid desc limit 10"):
@@ -180,7 +180,7 @@ python - <<'PY'
 import sqlite3, time, os
 home = os.path.expanduser("~/.yeoman/data")
 stamp = time.strftime("%Y%m%d-%H%M%S")
-for name in ("processing/processing.db", "memory/memory.db"):
+for name in ("ops/processing.db", "memory/memory.db"):
     src = sqlite3.connect(f"file:{home}/{name}?mode=ro", uri=True)
     dst = sqlite3.connect(f"{home}/{name}.walsafe-{stamp}.bak")
     src.backup(dst)
