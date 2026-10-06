@@ -365,6 +365,26 @@ def test_capture_check_reports_duplicate_request_correlation(
     assert _input_bytes(inputs) == before
 
 
+def test_capture_check_reports_duplicate_empty_request_correlation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        raw=[("outbound_request", "whatsapp", "secret-chat", "", None),
+             ("outbound_request", "whatsapp", "secret-chat", "", None)],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 1, result.output
+    _assert_aggregate_output(result.output)
+    assert "ambiguous_requests=1" in result.output
+    assert "missing_requests=0" in result.output
+    assert _input_bytes(inputs) == before
+
+
 def test_capture_check_reports_duplicate_provider_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     inputs = _capture_home(

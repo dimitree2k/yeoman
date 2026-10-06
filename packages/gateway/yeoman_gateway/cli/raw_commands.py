@@ -168,7 +168,7 @@ def raw_check_capture() -> None:
             if not correlation or request_counts[(channel, chat_id, correlation)] == 0:
                 missing_requests += count
         ambiguous_requests = sum(
-            count > 1 for (_, _, correlation), count in request_counts.items() if correlation
+            count > 1 for count in request_counts.values()
         )
         ambiguous_provider_ids = sum(count > 1 for count in result_counts.values())
         for effect_id, (channel, chat_id) in effect_meta.items():
