@@ -57,6 +57,92 @@ def test_start_bridge_does_not_spawn_beside_active_systemd_unit(tmp_path, monkey
     popen.assert_not_called()
 
 
+def test_start_bridge_replaces_blank_reference_dir_with_yeoman_home_default(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = tmp_path / "yeoman"
+    monkeypatch.setenv("YEOMAN_HOME", str(runtime))
+    monkeypatch.setenv("BRIDGE_MESSAGE_REFERENCE_DIR", " \t")
+    whatsapp = SimpleNamespace(
+        bridge_port=3001,
+        bridge_url="ws://127.0.0.1:3001",
+        bridge_host="127.0.0.1",
+        auth_dir=tmp_path / "auth",
+        read_receipts=False,
+        accept_from_me=False,
+        media=SimpleNamespace(
+            persist_incoming_audio=False,
+            persist_incoming_documents=False,
+            incoming_path=tmp_path / "media/in",
+            outgoing_path=tmp_path / "media/out",
+        ),
+    )
+    manager = WhatsAppRuntimeManager(
+        config=SimpleNamespace(channels=SimpleNamespace(whatsapp=whatsapp)),
+        user_bridge_dir=tmp_path / "bridge",
+    )
+    manager.ensure_runtime = lambda: tmp_path / "bridge"
+    manager.ensure_bridge_token = lambda **kwargs: "token"
+    manager._systemd_bridge_active = lambda: False
+    manager.status_bridge = lambda port: BridgeStatus(
+        running=False, port=port, pids=[], log_path=tmp_path / "bridge.log"
+    )
+    monkeypatch.setattr("yeoman_gateway.channels.whatsapp_runtime.shutil.which", lambda _: "node")
+    monkeypatch.setattr("yeoman_gateway.channels.whatsapp_runtime.time.sleep", lambda _: None)
+    launched = {}
+
+    class Process:
+        pid = 123
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(
+        "yeoman_gateway.channels.whatsapp_runtime.subprocess.Popen",
+        lambda *args, **kwargs: launched.update(kwargs) or Process(),
+    )
+
+    manager.start_bridge()
+
+    assert launched["env"]["BRIDGE_MESSAGE_REFERENCE_DIR"] == str(
+        runtime / "data/ops/bridge-message-references"
+    )
+
+
+def test_channels_login_replaces_blank_reference_dir_with_yeoman_home_default(
+    tmp_path, monkeypatch
+) -> None:
+    from yeoman_gateway.cli.channel_commands import channels_login
+
+    runtime = tmp_path / "yeoman"
+    monkeypatch.setenv("YEOMAN_HOME", str(runtime))
+    monkeypatch.setenv("BRIDGE_MESSAGE_REFERENCE_DIR", " \t")
+    whatsapp = SimpleNamespace(
+        bridge_port=3001,
+        resolved_bridge_port=3001,
+        bridge_host="127.0.0.1",
+        auth_dir=tmp_path / "auth",
+    )
+    config = SimpleNamespace(channels=SimpleNamespace(whatsapp=whatsapp))
+    monkeypatch.setattr("yeoman_shared.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(
+        "yeoman_gateway.cli.channel_commands._ensure_whatsapp_bridge_token",
+        lambda **kwargs: "token",
+    )
+    monkeypatch.setattr("yeoman_gateway.cli.channel_commands._get_bridge_dir", lambda: tmp_path)
+    launched = {}
+    monkeypatch.setattr(
+        "subprocess.run", lambda *args, **kwargs: launched.update(kwargs)
+    )
+
+    channels_login()
+
+    assert launched["env"]["BRIDGE_MESSAGE_REFERENCE_DIR"] == str(
+        runtime / "data/ops/bridge-message-references"
+    )
+
+
 def test_systemd_bridge_accepts_reachable_port_without_visible_pid(tmp_path, monkeypatch) -> None:
     runtime = tmp_path / "yeoman"
     monkeypatch.setenv("YEOMAN_HOME", str(runtime))

@@ -1,6 +1,7 @@
 """Utility functions for yeoman."""
 
 import os
+from collections.abc import MutableMapping
 from datetime import datetime
 from pathlib import Path
 
@@ -82,6 +83,13 @@ def get_operational_store_path(name: str, *, data_dir: Path | None = None) -> Pa
     except KeyError:
         raise ValueError(f"Unknown operational store: {name}") from None
     return (data_dir if data_dir is not None else get_operational_data_path()) / relative
+
+
+def set_bridge_message_reference_dir(env: MutableMapping[str, str]) -> None:
+    """Normalize the bridge path override or supply its YEOMAN_HOME-aware default."""
+    env["BRIDGE_MESSAGE_REFERENCE_DIR"] = env.get("BRIDGE_MESSAGE_REFERENCE_DIR", "").strip() or str(
+        get_operational_store_path("bridge_references")
+    )
 
 
 def get_cache_path() -> Path:

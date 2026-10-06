@@ -275,12 +275,9 @@ def channels_login() -> None:
         env["BRIDGE_HOST"] = wa.bridge_host
         env["BRIDGE_TOKEN"] = token
         env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
-        from yeoman_shared.utils.helpers import get_operational_store_path
+        from yeoman_shared.utils.helpers import set_bridge_message_reference_dir
 
-        env.setdefault(
-            "BRIDGE_MESSAGE_REFERENCE_DIR",
-            str(get_operational_store_path("bridge_references")),
-        )
+        set_bridge_message_reference_dir(env)
         subprocess.run(["node", "dist/index.js"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
