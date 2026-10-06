@@ -27,39 +27,52 @@ def _timestamp(value: object) -> tuple[datetime, str] | None:
 
 
 def _source_seen(data: object) -> tuple[set[str], dict[str, str]]:
-    if not isinstance(data, dict):
-        return set(), {}
-    chats = data.get("chats", [])
+    if not isinstance(data, dict) or "chats" not in data:
+        raise ValueError("seen-chat source must be an object with a chats field")
+    chats = data["chats"]
     timestamps: dict[str, str] = {}
     if isinstance(chats, list):
-        ids = {chat for chat in chats if isinstance(chat, str)}
+        if not all(isinstance(chat, str) for chat in chats):
+            raise ValueError("seen-chat list entries must be strings")
+        ids = set(chats)
     elif isinstance(chats, dict):
-        ids = {chat for chat in chats if isinstance(chat, str)}
+        if not all(isinstance(chat, str) for chat in chats):
+            raise ValueError("seen-chat mapping keys must be strings")
+        ids = set(chats)
         for chat, value in chats.items():
-            parsed = _timestamp(value)
-            if isinstance(chat, str) and parsed:
-                timestamps[chat] = parsed[1]
+            _record_timestamp(timestamps, chat, value)
     else:
-        ids = set()
+        raise ValueError("seen-chat chats field must be a list or object")
     first_seen = data.get("first_seen", {})
-    if isinstance(first_seen, dict):
-        for chat, value in first_seen.items():
-            parsed = _timestamp(value)
-            if isinstance(chat, str) and chat in ids and parsed:
-                timestamps[chat] = parsed[1]
+    if not isinstance(first_seen, dict):
+        raise ValueError("seen-chat first_seen field must be an object")
+    for chat, value in first_seen.items():
+        if not isinstance(chat, str) or chat not in ids:
+            raise ValueError("seen-chat first_seen keys must identify a known chat")
+        _record_timestamp(timestamps, chat, value)
     return ids, timestamps
+
+
+def _record_timestamp(timestamps: dict[str, str], chat: str, value: object) -> None:
+    if value is None:
+        return
+    parsed = _timestamp(value)
+    if parsed is None:
+        raise ValueError("seen-chat timestamps must be ISO formatted strings or null")
+    existing = _timestamp(timestamps.get(chat))
+    if existing is None or parsed[0] < existing[0]:
+        timestamps[chat] = parsed[1]
 
 
 def merge_seen_chat_files(sources: list[Path], destination: Path | None = None) -> Path:
     """Merge caller-selected legacy files without modifying them."""
+    if not sources:
+        raise ValueError("at least one seen-chat source is required")
     chats: set[str] = set()
     timestamps: dict[str, datetime] = {}
     timestamp_values: dict[str, str] = {}
     for source in sources:
-        try:
-            data = json.loads(source.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
+        data = json.loads(source.read_text())
         source_chats, source_timestamps = _source_seen(data)
         chats.update(source_chats)
         for chat, value in source_timestamps.items():

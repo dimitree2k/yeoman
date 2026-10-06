@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from yeoman_gateway.core.models import InboundEvent
 from yeoman_gateway.core.pipeline import PipelineContext
 from yeoman_gateway.pipeline.new_chat import NewChatNotifyMiddleware, merge_seen_chat_files
@@ -61,6 +62,45 @@ def test_merge_picks_earliest_timestamp_from_both_sources(tmp_path: Path) -> Non
     assert json.loads(output.read_text())["first_seen"] == {
         "whatsapp:one@g.us": "2026-01-01T00:00:00+00:00"
     }
+
+
+def test_merge_picks_earliest_timestamp_within_one_source(tmp_path: Path) -> None:
+    source = tmp_path / "seen.json"
+    output = tmp_path / "merged.json"
+    source.write_text(
+        json.dumps(
+            {
+                "chats": {"whatsapp:one@g.us": "2026-02-01T00:00:00+00:00"},
+                "first_seen": {"whatsapp:one@g.us": "2026-01-01T00:00:00+00:00"},
+            }
+        )
+    )
+
+    merge_seen_chat_files([source], output)
+
+    assert json.loads(output.read_text())["first_seen"] == {
+        "whatsapp:one@g.us": "2026-01-01T00:00:00+00:00"
+    }
+
+
+@pytest.mark.parametrize(
+    ("source_name", "contents"),
+    [("missing.json", None), ("malformed.json", "{"), ("wrong-shape.json", '{"chats": 1}')],
+)
+def test_merge_fails_closed_without_writing_partial_output(
+    tmp_path: Path, source_name: str, contents: str | None
+) -> None:
+    valid = tmp_path / "valid.json"
+    invalid = tmp_path / source_name
+    output = tmp_path / "ops" / "seen-chats.json"
+    valid.write_text('{"chats":["whatsapp:valid@g.us"]}')
+    if contents is not None:
+        invalid.write_text(contents)
+
+    with pytest.raises((OSError, ValueError, json.JSONDecodeError)):
+        merge_seen_chat_files([valid, invalid], output)
+
+    assert not output.exists()
 
 
 def test_fresh_turn_writes_only_canonical_seen_chats(tmp_path: Path, monkeypatch) -> None:
