@@ -509,12 +509,12 @@ cron_rc=$?
 if [ "$cron_rc" -ne 0 ]; then
     add_issue "cron" "WARNING" "CRON-001" "yeoman cron list failed" \
         "$(printf '%s' "$cron_output" | tail -n 1)" \
-        "Run 'yeoman cron list' directly and inspect ~/.yeoman/data/cron/jobs.json."
+        "Run 'yeoman cron list' directly and inspect ${YEOMAN_CRON_STORE_PATH}."
 else
     line_ok "yeoman cron list completed"
 fi
 
-cron_jobs_file="$YEOMAN_HOME/data/cron/jobs.json"
+cron_jobs_file="${YEOMAN_CRON_STORE_PATH:?YEOMAN_CRON_STORE_PATH is required}"
 if [ -f "$cron_jobs_file" ]; then
     cron_vars="$(load_cron_vars "$cron_jobs_file" 2>/dev/null || true)"
     if [ -n "$cron_vars" ]; then
@@ -528,7 +528,7 @@ if [ -f "$cron_jobs_file" ]; then
         if [ "${cron_jobs_failed:-0}" -gt 0 ] 2>/dev/null; then
             add_issue "cron" "WARNING" "CRON-003" "cron jobs show failure state" \
                 "${cron_jobs_failed} job(s) have lastError or failed lastStatus." \
-                "Inspect ~/.yeoman/data/cron/jobs.json and rerun affected jobs."
+                "Inspect ${cron_jobs_file} and rerun affected jobs."
         fi
     fi
 else

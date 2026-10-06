@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import typer
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 from .core import app, console
 
@@ -32,6 +33,7 @@ def doctor() -> None:
 
     env = dict(os.environ)
     env.setdefault("YEOMAN_BIN", "yeoman")
+    env["YEOMAN_CRON_STORE_PATH"] = str(get_operational_store_path("cron"))
 
     try:
         completed = subprocess.run(["bash", str(script)], env=env, check=False)
