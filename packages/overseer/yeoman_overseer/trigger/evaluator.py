@@ -32,9 +32,9 @@ class TriggerEvaluator:
     causal_detector: CausalChainDetector
     maintenance: MaintenanceManager
     state: OverseerState
+    persist_state: Callable[[], None] | None = None
 
     _last_poll: dict[str, float] = field(default_factory=dict)
-    _last_cron: dict[str, float] = field(default_factory=dict)
     _cooldown_until: dict[str, float] = field(default_factory=dict)
 
     async def tick(self) -> None:
@@ -72,14 +72,15 @@ class TriggerEvaluator:
                     should_fire = self._condition_met(trigger.condition, check_result)
 
             elif trigger.kind == "cron":
-                if name not in self._last_cron:
-                    self._last_cron[name] = wall
+                last_occurrence = self.state.cron_occurrences.get(name)
+                if last_occurrence is None:
+                    self.state.cron_occurrences[name] = wall
                     continue
-                last_wall = self._last_cron[name]
-                cron = croniter(trigger.expr, last_wall)
-                next_run = cron.get_next(float)
-                if wall >= next_run:
-                    self._last_cron[name] = wall
+                occurrence = croniter(trigger.expr, wall).get_prev(float)
+                if occurrence > last_occurrence:
+                    self.state.cron_occurrences[name] = occurrence
+                    if self.persist_state:
+                        self.persist_state()
                     should_fire = True
                     check_result = CheckResult(value=True, detail="cron trigger")
 

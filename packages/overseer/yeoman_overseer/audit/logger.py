@@ -42,31 +42,37 @@ class AuditLogger:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._tombstone_path = self._dir / "tombstones.jsonl"
 
-    def _today_log(self) -> Path:
-        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return self._dir / f"{date}.jsonl"
+    def _month_log(self) -> Path:
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        return self._dir / f"{month}.jsonl"
 
-    def append(self, entry: AuditEntry) -> dict[str, Any]:
+    def append(self, entry: AuditEntry) -> dict[str, Any] | None:
+        if (
+            entry.trigger == "cron"
+            and entry.action == "triggered"
+            and entry.result == "success"
+            and not entry.escalated_to_llm
+            and entry.llm_tokens_used is None
+            and entry.llm_tool_calls is None
+        ):
+            return None
         record = asdict(entry)
         record["ts"] = datetime.now(timezone.utc).isoformat()
-        path = self._today_log()
+        path = self._month_log()
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
         return record
 
     def read_recent(self, *, limit: int = 20, domain: str | None = None) -> list[dict[str, Any]]:
         all_entries: list[dict[str, Any]] = []
-        log_files = sorted(self._dir.glob("????-??-??.jsonl"), reverse=True)
-        for log_file in log_files:
-            lines = log_file.read_text(encoding="utf-8").strip().splitlines()
-            for line in reversed(lines):
-                entry = json.loads(line)
-                if domain and entry.get("domain") != domain:
-                    continue
-                all_entries.append(entry)
-                if len(all_entries) >= limit:
-                    return all_entries
-        return all_entries
+        for log_file in self._dir.glob("????-??*.jsonl"):
+            for line in log_file.read_text(encoding="utf-8").splitlines():
+                if line:
+                    entry = json.loads(line)
+                    if not domain or entry.get("domain") == domain:
+                        all_entries.append(entry)
+        all_entries.sort(key=lambda entry: entry.get("ts", ""), reverse=True)
+        return all_entries[:limit]
 
     def write_tombstone(self, entry: TombstoneEntry) -> None:
         record = asdict(entry)

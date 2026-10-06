@@ -1,7 +1,13 @@
 """Tests for JSONL audit logger and tombstones."""
 from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
 from pathlib import Path
-from yeoman_overseer.audit.logger import AuditLogger, AuditEntry, TombstoneEntry
+
+import yeoman_overseer.audit.logger as audit_module
+from yeoman_overseer.audit.logger import AuditEntry, AuditLogger, TombstoneEntry
+
 
 def test_append_and_read(tmp_path: Path) -> None:
     logger = AuditLogger(tmp_path / "audit")
@@ -38,3 +44,57 @@ def test_tombstone_write_and_query(tmp_path: Path) -> None:
 def test_tombstone_query_no_match(tmp_path: Path) -> None:
     logger = AuditLogger(tmp_path / "audit")
     assert logger.query_tombstones(name="nonexistent") == []
+
+
+def test_suppresses_only_noop_cron_success(tmp_path: Path) -> None:
+    logger = AuditLogger(tmp_path / "audit")
+    noop = AuditEntry("digest", "cron", "triggered", "", "success", 0, False)
+    assert logger.append(noop) is None
+    assert logger.read_recent() == []
+
+    meaningful = [
+        AuditEntry("digest", "cron", "send_message", "owner", "success", 1, False),
+        AuditEntry("digest", "cron", "triggered", "", "error: down", 1, False),
+        AuditEntry("digest", "cron", "triggered", "", "success", 1, True),
+        AuditEntry("health", "poll", "triggered", "gateway", "success", 1, False),
+    ]
+    for entry in meaningful:
+        assert logger.append(entry) is not None
+    assert [row["action"] for row in logger.read_recent(limit=10)] == [
+        "triggered", "triggered", "triggered", "send_message",
+    ]
+
+
+def test_monthly_logs_read_across_utc_month_boundary(tmp_path: Path, monkeypatch) -> None:
+    logger = AuditLogger(tmp_path / "audit")
+
+    class Clock:
+        current = datetime(2026, 3, 31, 23, 59, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(audit_module, "datetime", Clock)
+    logger.append(AuditEntry("march", "cron", "rotate", "", "changed", 1, False))
+    legacy = {
+        "runbook": "legacy-day", "domain": "ops", "ts": "2026-03-31T23:58:00+00:00",
+    }
+    (tmp_path / "audit" / "2026-03-31.jsonl").write_text(json.dumps(legacy) + "\n")
+    Clock.current = datetime(2026, 4, 1, 0, 1, tzinfo=timezone.utc)
+    logger.append(AuditEntry("april", "cron", "rotate", "", "changed", 1, False))
+
+    assert sorted(path.name for path in (tmp_path / "audit").glob("????-??.jsonl")) == [
+        "2026-03.jsonl", "2026-04.jsonl",
+    ]
+    assert (tmp_path / "audit" / "2026-03-31.jsonl").read_text() == json.dumps(legacy) + "\n"
+    assert [row["runbook"] for row in logger.read_recent(limit=3)] == [
+        "april", "march", "legacy-day",
+    ]
+    assert json.loads((tmp_path / "audit" / "2026-03.jsonl").read_text())["ts"].startswith("2026-03-31T23:59")
+
+
+def test_monthly_logs_keep_tombstones_independent(tmp_path: Path) -> None:
+    logger = AuditLogger(tmp_path / "audit")
+    logger.write_tombstone(TombstoneEntry("skill", "retired", "disabled", "done", "audit"))
+    assert logger.query_tombstones(name="retired")[0]["name"] == "retired"

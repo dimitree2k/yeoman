@@ -1,6 +1,8 @@
 """Tests for the trigger evaluator."""
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
 from unittest.mock import AsyncMock
@@ -122,6 +124,50 @@ async def test_cron_does_not_catch_up_on_first_tick_after_startup(tmp_path: Path
     clock["monotonic"] += 61
     await evaluator.tick()
     callback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cron_occurrence_is_not_replayed_after_clock_rollback_and_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rb = parse_runbook(_write_cron_runbook(tmp_path, expr="0 8 * * *"))
+    state_path = tmp_path / "state.json"
+
+    async def assert_occurrence_persisted(*_args) -> None:
+        saved = json.loads(state_path.read_text())
+        assert saved["cron_occurrences"]["test-cron"] == occurrence
+
+    callback = AsyncMock(side_effect=assert_occurrence_persisted)
+    baseline = datetime(2026, 4, 1, 7, 59, tzinfo=timezone.utc).timestamp()
+    occurrence = datetime(2026, 4, 1, 8, 0, tzinfo=timezone.utc).timestamp()
+    clock = {"wall": baseline, "monotonic": 1_000.0}
+    monkeypatch.setattr(evaluator_module.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(evaluator_module.time, "monotonic", lambda: clock["monotonic"])
+
+    def make_evaluator(state: OverseerState) -> TriggerEvaluator:
+        return TriggerEvaluator(
+            runbooks=[rb], on_triggered=callback, lock_manager=LockManager(),
+            circuit_breaker=CircuitBreaker(), rate_limiter=RateLimiter(),
+            causal_detector=CausalChainDetector(), maintenance=MaintenanceManager(),
+            state=state,
+            persist_state=lambda: state.save(state_path),
+        )
+
+    state = OverseerState.load(state_path)
+    evaluator = make_evaluator(state)
+    await evaluator.tick()
+    clock.update(wall=occurrence + 1, monotonic=1_001.0)
+    await evaluator.tick()
+    assert callback.call_count == 1
+
+    state.save(state_path)
+    state = OverseerState.load(state_path)
+    clock.update(wall=baseline, monotonic=1_002.0)
+    restarted = make_evaluator(state)
+    await restarted.tick()
+    clock.update(wall=occurrence + 2, monotonic=1_003.0)
+    await restarted.tick()
+    assert callback.call_count == 1
 
 @pytest.mark.asyncio
 async def test_evaluator_respects_circuit_breaker(tmp_path: Path) -> None:

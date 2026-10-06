@@ -142,6 +142,7 @@ class OverseerService:
             causal_detector=causal_detector,
             maintenance=maintenance,
             state=self._state,
+            persist_state=lambda: self._state.save(self.data_dir / "state.json"),
         )
 
         # Load .env, config, and policy

@@ -1,11 +1,13 @@
 """Integration smoke test — full overseer lifecycle."""
 from __future__ import annotations
+
 import asyncio
 import json
 from pathlib import Path
 from textwrap import dedent
+
 import pytest
-from yeoman_overseer.service import OverseerService, OverseerConfig
+from yeoman_overseer.service import OverseerConfig, OverseerService
 
 HEALTH_RUNBOOK = dedent("""\
     ---
@@ -76,7 +78,7 @@ async def test_full_lifecycle(overseer_env: Path) -> None:
     assert state["heartbeat_ts"] is not None
     audit_dir = overseer_env / "audit"
     assert audit_dir.is_dir()
-    log_files = list(audit_dir.glob("????-??-??.jsonl"))
+    log_files = list(audit_dir.glob("????-??.jsonl"))
     assert len(log_files) >= 1
     entries = log_files[0].read_text().strip().splitlines()
     assert len(entries) >= 1

@@ -26,6 +26,7 @@ class OverseerState:
     )
     action_log: list[dict[str, Any]] = field(default_factory=list)
     causal_graph: dict[str, Any] = field(default_factory=dict)
+    cron_occurrences: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> OverseerState:
@@ -43,6 +44,7 @@ class OverseerState:
                 }),
                 action_log=raw.get("action_log", []),
                 causal_graph=raw.get("causal_graph", {}),
+                cron_occurrences=raw.get("cron_occurrences", {}),
             )
         return cls()
 
@@ -57,6 +59,7 @@ class OverseerState:
             "budget": self.budget,
             "action_log": self.action_log,
             "causal_graph": self.causal_graph,
+            "cron_occurrences": self.cron_occurrences,
         }
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
