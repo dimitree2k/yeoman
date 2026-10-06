@@ -158,6 +158,7 @@ def record_identities(record: dict[str, Any]) -> set[str]:
                 ids.add(str(message.get("message_id") or ""))
     else:
         ids = {str(record.get("native_id") or "")}
+    ids.add(str(record.get("native_message_id") or ""))
     if (channel == "telegram" and kind == "media") or record.get("provenance") == "journal":
         ids.add(str(record.get("correlation_id") or ""))
     ids.discard("")
@@ -168,7 +169,7 @@ def append_is_disposed(audit_path: Path, record: dict[str, Any], line: str) -> b
     """Match a locked month append against durable owner purge dispositions."""
     channel = str(record.get("channel") or "")
     chat_id = str(record.get("chat_id") or "")
-    received_ms = int(record.get("received_ms") or 0)
+    received_ms = int(record.get("received_ms") or record.get("generated_ms") or 0)
     identities = record_identities(record)
     correlation_id = str(record.get("correlation_id") or "")
     digest = line_sha256(line)

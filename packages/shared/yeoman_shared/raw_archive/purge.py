@@ -29,11 +29,20 @@ from yeoman_shared.raw_archive.records import (
 )
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, record_closed
 from yeoman_shared.raw_archive.writer import (
+    MEDIA_DESCRIPTION_DESTINATION,
     SPOOL_REGISTRY_FILE,
     safe_channel,
     stored_media_relative,
     try_lock_media_purge,
 )
+
+
+def _channel_files(root: Path, channel: str) -> list[Path]:
+    files = archive_files(root, channel)
+    derived = root / MEDIA_DESCRIPTION_DESTINATION
+    if derived.is_file():
+        files.append(derived)
+    return sorted(files)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +65,9 @@ class PurgeSelector:
             return False
         if self.native_id and self.native_id not in record_identities(record):
             return False
-        if self.before_ms is not None and int(record.get("received_ms") or 0) >= self.before_ms:
+        if self.before_ms is not None and int(
+            record.get("received_ms") or record.get("generated_ms") or 0
+        ) >= self.before_ms:
             return False
         return True
 
@@ -88,7 +99,8 @@ class _PurgePredicate:
             return False
         if (
             self.selector.before_ms is not None
-            and int(record.get("received_ms") or 0) >= self.selector.before_ms
+            and int(record.get("received_ms") or record.get("generated_ms") or 0)
+            >= self.selector.before_ms
         ):
             return False
         if self.selector.native_id is None:
@@ -102,7 +114,7 @@ class _PurgePredicate:
 
 def _build_predicate(root: Path, selector: PurgeSelector) -> _PurgePredicate:
     matched: list[dict[str, Any]] = []
-    for path in archive_files(root, safe_channel(selector.channel)):
+    for path in _channel_files(root, safe_channel(selector.channel)):
         for _, record, _ in iter_records(path):
             if record is not None and selector.matches(record):
                 matched.append(record)
@@ -131,7 +143,7 @@ def plan_purge(root: Path, selector: PurgeSelector) -> PurgeResult:
     removed: list[str] = []
     removed_media: set[str] = set()
     kept_media: set[str] = set()
-    for path in archive_files(root, safe_channel(selector.channel)):
+    for path in _channel_files(root, safe_channel(selector.channel)):
         hit = False
         for _, record, line in iter_records(path):
             media = _media_path(record) if record else None
@@ -333,7 +345,7 @@ def purge(
         media_guard_fd = try_lock_media_purge(root)
         files = tuple(
             path.relative_to(root).as_posix()
-            for path in archive_files(root, safe_channel(effective.channel))
+            for path in _channel_files(root, safe_channel(effective.channel))
         )
         locked = _lock_files(root, files)
         predicate = _build_predicate(root, effective)

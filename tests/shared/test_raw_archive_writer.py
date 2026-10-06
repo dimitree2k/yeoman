@@ -44,6 +44,91 @@ def _lines(path: Path) -> list[dict]:
     return [record for _, record, _ in iter_records(path) if record is not None]
 
 
+def _media_description(message_id: str = "m1", *, generated_ms: int = NOW) -> dict:
+    return {
+        "derived_version": 1,
+        "kind": "image_description",
+        "channel": "whatsapp",
+        "chat_id": "chat@g.us",
+        "native_message_id": message_id,
+        "mode": "image",
+        "generator": "model",
+        "generated_ms": generated_ms,
+        "text": f"description-{message_id}",
+    }
+
+
+def test_media_description_appends_to_fixed_derived_file(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    record = _media_description()
+    assert archive.append_media_description(record) is True
+    target = tmp_path / "raw" / "derived" / "media-descriptions.jsonl"
+    assert target.is_file()
+    assert _lines(target) == [record]
+    assert not (tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl").exists()
+    with pytest.raises(TypeError):
+        archive.append_media_description(record, "elsewhere.jsonl")  # type: ignore[call-arg]
+
+
+def test_media_description_spool_retains_destination_and_fifo_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path)
+    real_append = writer_module.append_line
+
+    def fail_derived(path: Path, line: str, **kwargs: object) -> bool:
+        if path.name == "media-descriptions.jsonl":
+            raise OSError("injected derived failure")
+        return real_append(path, line, **kwargs)
+
+    monkeypatch.setattr(writer_module, "append_line", fail_derived)
+    assert archive.append_media_description(_media_description("m1")) is False
+    assert archive.append_media_description(_media_description("m2")) is False
+    [first, second] = sorted(archive.spool.glob("*.json"))
+    envelopes = [json.loads(path.read_text()) for path in (first, second)]
+    assert [entry["destination"] for entry in envelopes] == [
+        "derived/media-descriptions.jsonl",
+        "derived/media-descriptions.jsonl",
+    ]
+    monkeypatch.setattr(writer_module, "append_line", real_append)
+    assert archive.drain_spool() == 2
+    target = tmp_path / "raw" / "derived" / "media-descriptions.jsonl"
+    assert [record["native_message_id"] for record in _lines(target)] == ["m1", "m2"]
+
+
+def test_media_description_full_queue_raises_without_evicting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(writer_module, "MAX_MEMORY_PENDING", 1)
+    archive = _archive(tmp_path)
+    archive.spool.write_text("not a directory", encoding="utf-8")
+    real_append = writer_module.append_line
+
+    def fail_all(path: Path, line: str, **kwargs: object) -> bool:
+        raise OSError("injected storage failure")
+
+    monkeypatch.setattr(writer_module, "append_line", fail_all)
+    assert archive.append_media_description(_media_description("m1")) is False
+    before = list(archive._pending)
+    with pytest.raises(writer_module.RawArchiveCapacityError):
+        archive.append_media_description(_media_description("m2"))
+    assert archive._pending == before
+    assert json.loads(archive._pending[0][2])["native_message_id"] == "m1"
+    monkeypatch.setattr(writer_module, "append_line", real_append)
+
+
+def test_legacy_monthly_spool_entry_still_drains(tmp_path: Path) -> None:
+    archive = _archive(tmp_path)
+    line = json.dumps({"channel": "whatsapp", "received_ms": NOW, "native_id": "legacy"})
+    archive.spool.mkdir()
+    (archive.spool / f"{NOW:013d}-legacy.json").write_text(
+        json.dumps({"channel": "whatsapp", "received_ms": NOW, "line": line}),
+        encoding="utf-8",
+    )
+    assert archive.drain_spool() == 1
+    assert _lines(tmp_path / "raw" / "whatsapp" / f"{month_of(NOW)}.jsonl")[0]["native_id"] == "legacy"
+
+
 def test_append_writes_one_record_with_all_fields(tmp_path: Path) -> None:
     archive = _archive(tmp_path)
     assert archive.append(_event()) is True
@@ -271,7 +356,11 @@ def test_malformed_spool_line_quarantine_failure_preserves_new_event(
     assert malformed.is_file()
     assert quarantines == [malformed.with_name(malformed.name + ".corrupt")]
     spool_records = [json.loads(path.read_text()) for path in spool.glob("*.json")]
-    assert any(json.loads(record["line"])["native_id"] == "e2" for record in spool_records)
+    assert any(
+        json.loads(record["line"]).get("native_id") == "e2"
+        for record in spool_records
+        if record["line"] != '{"bad":1}\n{"bad":2}'
+    )
 
 
 def test_spool_file_and_new_month_name_are_fsynced(

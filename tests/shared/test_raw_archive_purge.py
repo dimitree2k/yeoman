@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from yeoman_shared.raw_archive.purge import PurgeSelector, plan_purge, purge
-from yeoman_shared.raw_archive.records import archive_files, iter_records
+from yeoman_shared.raw_archive.records import archive_files, iter_records, line_sha256
 from yeoman_shared.raw_archive.verify import AUDIT, latest_manifest, verify_archive
 from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
 
@@ -63,6 +63,20 @@ def _records(root: Path) -> list[dict]:
     return [record for path in archive_files(root) for _, record, _ in iter_records(path) if record]
 
 
+def _media_description(message_id: str = "m1", *, generated_ms: int = OCT) -> dict:
+    return {
+        "derived_version": 1,
+        "kind": "image_description",
+        "channel": "whatsapp",
+        "chat_id": "c1",
+        "native_message_id": message_id,
+        "mode": "image",
+        "generator": "model",
+        "generated_ms": generated_ms,
+        "text": f"description-{message_id}",
+    }
+
+
 def _pending_message(
     message_id: str, *, received_ms: int = SEPT, correlation_id: str = ""
 ) -> RawEvent:
@@ -90,6 +104,62 @@ def test_plan_is_a_dry_run(tmp_path: Path) -> None:
     assert plan.removed_lines == 1
     assert _ids(root) == ["m1"]
     assert not (root / AUDIT).exists()
+
+
+def test_raw_purge_includes_matching_media_description(tmp_path: Path) -> None:
+    root, archive = _setup(tmp_path)
+    record = _media_description()
+    archive.append_media_description(record)
+    target = root / "derived" / "media-descriptions.jsonl"
+    line = target.read_text(encoding="utf-8").rstrip("\n")
+    planned = plan_purge(root, PurgeSelector(channel="whatsapp", chat_id="c1", native_id="m1"))
+    assert planned.removed_lines == 1
+    assert planned.files == ("derived/media-descriptions.jsonl",)
+    result = purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="c1", native_id="m1"),
+        operator="dm",
+        now_ms=OCT + 1,
+    )
+    assert result.removed_lines == 1
+    assert result.removed_sha256 == (line_sha256(line),)
+    assert target.read_text(encoding="utf-8") == ""
+    [audit] = [record for _, record, _ in iter_records(root / AUDIT) if record]
+    assert audit["files"] == ["derived/media-descriptions.jsonl"]
+    assert audit["removed_sha256"] == [line_sha256(line)]
+
+
+@pytest.mark.parametrize("spooled", [False, True])
+def test_disposition_suppresses_direct_and_spooled_media_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spooled: bool
+) -> None:
+    import yeoman_shared.raw_archive.writer as writer_module
+
+    root, archive = _setup(tmp_path)
+    if spooled:
+        real_append = writer_module.append_line
+
+        def fail_derived(path: Path, line: str, **kwargs: object) -> bool:
+            if path.name == "media-descriptions.jsonl":
+                raise OSError("injected derived failure")
+            return real_append(path, line, **kwargs)
+
+        monkeypatch.setattr(writer_module, "append_line", fail_derived)
+        assert archive.append_media_description(_media_description()) is False
+
+    purge(
+        root,
+        PurgeSelector(channel="whatsapp", chat_id="c1", native_id="m1"),
+        operator="dm",
+        now_ms=OCT + 1,
+    )
+    if spooled:
+        monkeypatch.setattr(writer_module, "append_line", real_append)
+        assert archive.drain_spool() == 1
+    else:
+        assert archive.append_media_description(_media_description()) is True
+    target = root / "derived" / "media-descriptions.jsonl"
+    assert not target.exists() or target.read_text(encoding="utf-8") == ""
 
 
 def test_purge_by_message_id_removes_only_that_line_and_audits(tmp_path: Path) -> None:
@@ -335,10 +405,10 @@ def test_zero_match_disposition_drains_changed_pending_message(
     assert archive.append(_pending_message("m1")) is False
 
     if pending_kind == "memory":
-        channel, received_ms, line, lease = archive._pending[0]
+        channel, received_ms, line, destination, lease = archive._pending[0]
         record = json.loads(line)
         record["native"]["payload"]["attempt"] = "changed-frame"
-        archive._pending[0] = (channel, received_ms, json.dumps(record), lease)
+        archive._pending[0] = (channel, received_ms, json.dumps(record), destination, lease)
     else:
         [spool_line] = archive.spool.glob("*.json")
         envelope = json.loads(spool_line.read_text(encoding="utf-8"))
