@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -731,7 +732,7 @@ def test_send_poll_is_archived_as_request_and_result(tmp_path: Path) -> None:
 
 
 def test_all_side_effect_bridge_commands_are_archived() -> None:
-    assert whatsapp_module.RAW_ARCHIVED_COMMANDS == {
+    expected_content_commands = {
         "send_text",
         "send_media",
         "send_poll",
@@ -739,6 +740,27 @@ def test_all_side_effect_bridge_commands_are_archived() -> None:
         "delete_message",
         "react",
     }
+    expected_non_content_commands = {
+        "presence_update",
+        "list_groups",
+        "login_start",
+        "login_wait",
+        "logout",
+        "lookup_message",
+        "subscribe_events",
+        "ack_event",
+        "health",
+    }
+    protocol_path = Path(__file__).parents[2] / "packages/bridge/src/protocol.ts"
+    protocol_source = protocol_path.read_text()
+    command_type = re.search(
+        r"export type BridgeCommandType\s*=\s*(.*?);", protocol_source, re.DOTALL
+    )
+    assert command_type is not None
+    protocol_commands = set(re.findall(r"'([^']+)'", command_type.group(1)))
+
+    assert protocol_commands == expected_content_commands | expected_non_content_commands
+    assert whatsapp_module.RAW_ARCHIVED_COMMANDS == expected_content_commands
 
 
 def test_outbound_request_capacity_prevents_send(tmp_path: Path) -> None:
