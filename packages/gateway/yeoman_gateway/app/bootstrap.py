@@ -3105,9 +3105,7 @@ def build_gateway_runtime(
     workflow_state = WorkflowState(
         store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
     )
-    persona_evolution_state_db_path = (
-        get_operational_store_path("persona_evolution") / "persona-evolution.db"
-    )
+    persona_evolution_state_db_path = Path(workspace) / "persona-evolution" / "persona-evolution.db"
 
     async def _on_approval_expired(approval: PendingApproval) -> None:
         content = (

@@ -602,6 +602,7 @@ def test_processing_store_opens_even_when_processing_is_disabled(tmp_path, monke
     store = build_processing_store(Config())
     assert store is not None
     assert (tmp_path / "data" / "ops" / "processing.db").exists()
+    assert not (tmp_path / "data" / "processing" / "processing.db").exists()
     store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
