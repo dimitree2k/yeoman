@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from yeoman_gateway.history.convert.journal import convert_journal
 from yeoman_gateway.history.convert.media import convert_media_records
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 def test_journal_converter_reads_processing_store_under_ops(tmp_path):
-    db_path = tmp_path / "data" / "ops" / "processing.db"
+    db_path = get_operational_store_path("processing", data_dir=tmp_path / "data")
     db_path.parent.mkdir(parents=True)
     with sqlite3.connect(db_path) as db:
         db.execute(
@@ -23,11 +25,13 @@ def test_journal_converter_reads_processing_store_under_ops(tmp_path):
     lines = list(convert_journal(tmp_path))
 
     assert len(lines) == 1
-    assert lines[0]["origin"]["path"] == "data/ops/processing.db"
+    assert lines[0]["origin"]["path"] == get_operational_store_path(
+        "processing", data_dir=Path("data")
+    ).as_posix()
 
 
 def test_media_converter_reads_document_cache_under_ops(tmp_path):
-    db_path = tmp_path / "data" / "ops" / "document-cache.db"
+    db_path = get_operational_store_path("document_cache", data_dir=tmp_path / "data")
     db_path.parent.mkdir(parents=True)
     with sqlite3.connect(db_path) as db:
         db.execute(
@@ -43,4 +47,6 @@ def test_media_converter_reads_document_cache_under_ops(tmp_path):
     lines = list(convert_media_records(tmp_path))
 
     assert len(lines) == 1
-    assert lines[0]["origin"]["path"] == "data/ops/document-cache.db"
+    assert lines[0]["origin"]["path"] == get_operational_store_path(
+        "document_cache", data_dir=Path("data")
+    ).as_posix()

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from yeoman_gateway.cli import doctor_commands
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 def test_doctor_checks_resolved_cron_store(monkeypatch, tmp_path):
@@ -28,7 +28,7 @@ def test_doctor_checks_resolved_cron_store(monkeypatch, tmp_path):
 
     doctor_commands.doctor()
 
-    expected = tmp_path / "data" / "ops" / "cron-jobs.json"
+    expected = get_operational_store_path("cron", data_dir=tmp_path / "data")
     assert captured["YEOMAN_CRON_STORE_PATH"] == str(expected)
     script = production_script.read_text(encoding="utf-8")
     assert 'cron_jobs_file="${YEOMAN_CRON_STORE_PATH:?YEOMAN_CRON_STORE_PATH is required}"' in script

@@ -16,6 +16,7 @@ from yeoman_shared.config.schema import WhatsAppConfig
 from yeoman_shared.raw_archive.purge import PurgeSelector
 from yeoman_shared.raw_archive.verify import append_suppression
 from yeoman_shared.raw_archive.writer import RawArchive
+from yeoman_shared.utils.helpers import get_operational_store_path
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 NOW = 1_790_000_000_000
@@ -99,7 +100,9 @@ def test_rebuild_recreates_the_journal_events_of_one_chat(tmp_path: Path) -> Non
     )
     assert report.replayed == 2
     assert report.missing_vs_live == () and report.extra_vs_live == ()
-    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "ops" / "processing.db")
+    rebuilt = ProcessingStore(
+        get_operational_store_path("processing", data_dir=tmp_path / "rebuilt" / "data")
+    )
     assert rebuilt.get_event("e1") is not None and rebuilt.get_event("e2") is not None
     assert rebuilt.get_event("e3") is None
 
@@ -134,7 +137,9 @@ def test_delete_for_everyone_keeps_the_original_and_rebuilds_the_delete(tmp_path
     report = rebuild_chat(
         tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=tmp_path / "rebuilt"
     )
-    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "ops" / "processing.db")
+    rebuilt = ProcessingStore(
+        get_operational_store_path("processing", data_dir=tmp_path / "rebuilt" / "data")
+    )
     assert report.replayed == 2
     assert rebuilt.get_event("e2") is not None
 
@@ -177,7 +182,7 @@ def test_rebuild_refuses_the_live_home_and_an_existing_journal(
             chat_id=CHAT,
             target_home=tmp_path / "home" / "rebuild",
         )
-    existing = tmp_path / "other" / "data" / "ops"
+    existing = get_operational_store_path("processing", data_dir=tmp_path / "other" / "data").parent
     existing.mkdir(parents=True)
     (existing / "processing.db").write_text("")
     with pytest.raises(RuntimeError, match="empty"):
@@ -197,7 +202,7 @@ def test_rebuild_refuses_journal_symlink_into_live_home(
     live_redirect = live_home / "rebuild-data"
     live_redirect.mkdir()
     (target_home / "data").symlink_to(live_redirect, target_is_directory=True)
-    live_journal = live_redirect / "ops" / "processing.db"
+    live_journal = get_operational_store_path("processing", data_dir=live_redirect)
 
     with pytest.raises(RuntimeError, match="live"):
         rebuild_chat(tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=target_home)
@@ -214,7 +219,7 @@ def test_rebuild_refuses_journal_symlink_outside_target_home(
     target_home = tmp_path / "target"
     target_home.mkdir()
     (target_home / "data").symlink_to(outside, target_is_directory=True)
-    redirected_journal = outside / "ops" / "processing.db"
+    redirected_journal = get_operational_store_path("processing", data_dir=outside)
 
     with pytest.raises(RuntimeError, match="target_home"):
         rebuild_chat(tmp_path / "raw", channel="whatsapp", chat_id=CHAT, target_home=target_home)
@@ -308,7 +313,9 @@ def test_raw_rebuild_keeps_opaque_edit_separate_from_original_and_decoded_edits(
     )
     assert report.replayed == 4
     assert report.duplicates == 1
-    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "ops" / "processing.db")
+    rebuilt = ProcessingStore(
+        get_operational_store_path("processing", data_dir=tmp_path / "rebuilt" / "data")
+    )
     original_event = rebuilt.get_event("original-event")
     opaque_event = rebuilt.get_event("opaque-event")
     green_edit = rebuilt.get_event("decoded-edit-green-event")
@@ -396,7 +403,9 @@ def test_partial_encrypted_edits_are_acked_and_do_not_block_ordinary_intake(
         target_home=tmp_path / "rebuilt",
     )
     assert report.replayed == 3
-    rebuilt = ProcessingStore(tmp_path / "rebuilt" / "data" / "ops" / "processing.db")
+    rebuilt = ProcessingStore(
+        get_operational_store_path("processing", data_dir=tmp_path / "rebuilt" / "data")
+    )
     assert rebuilt.get_event("opaque-id-only-event").payload["encrypted_edit"]["targetMessageKey"] == {
         "id": "target-id-only",
         "fromMe": True,

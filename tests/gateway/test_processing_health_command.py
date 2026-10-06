@@ -4,6 +4,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 from yeoman_gateway.cli.commands import app
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 runner = CliRunner()
 
@@ -12,7 +13,7 @@ def test_last_message_ms_reads_resolved_database_without_modifying_it(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = tmp_path / "home"
-    db = home / "data" / "ops" / "processing.db"
+    db = get_operational_store_path("processing", data_dir=home / "data")
     db.parent.mkdir(parents=True)
     with sqlite3.connect(db) as connection:
         connection.execute("CREATE TABLE events (kind TEXT, created_ms INTEGER)")
@@ -37,7 +38,7 @@ def test_last_message_ms_does_not_create_missing_database(tmp_path: Path, monkey
 
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "0"
-    assert not (home / "data" / "ops" / "processing.db").exists()
+    assert not get_operational_store_path("processing", data_dir=home / "data").exists()
 
 
 def test_last_message_ms_does_not_create_absent_yeoman_home(tmp_path: Path, monkeypatch) -> None:

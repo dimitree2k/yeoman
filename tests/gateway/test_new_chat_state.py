@@ -14,7 +14,7 @@ from yeoman_shared.utils.helpers import get_operational_store_path
 def test_merge_unions_sources_and_keeps_earliest_known_timestamp(tmp_path: Path) -> None:
     root = tmp_path / "seen_chats.json"
     data = tmp_path / "data-seen_chats.json"
-    output = tmp_path / "ops" / "seen-chats.json"
+    output = get_operational_store_path("seen_chats", data_dir=tmp_path)
     root_contents = '{"chats":["whatsapp:both@g.us","whatsapp:root@g.us"]}'
     data_contents = json.dumps(
         {
@@ -92,7 +92,7 @@ def test_merge_fails_closed_without_writing_partial_output(
 ) -> None:
     valid = tmp_path / "valid.json"
     invalid = tmp_path / source_name
-    output = tmp_path / "ops" / "seen-chats.json"
+    output = get_operational_store_path("seen_chats", data_dir=tmp_path)
     valid.write_text('{"chats":["whatsapp:valid@g.us"]}')
     if contents is not None:
         invalid.write_text(contents)

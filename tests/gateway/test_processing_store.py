@@ -14,6 +14,7 @@ from yeoman_gateway.processing.models import (
 )
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import Config
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 def test_event_identity_survives_reopen(tmp_path):
@@ -36,7 +37,7 @@ def test_legacy_default_processing_path_resolves_to_operational_store(tmp_path, 
 
     path = _processing_store_path(config)
 
-    assert path == tmp_path / "data" / "ops" / "processing.db"
+    assert path == get_operational_store_path("processing", data_dir=tmp_path / "data")
     assert not (tmp_path / "data" / "processing" / "processing.db").exists()
 
     config.processing.db_path = "custom/processing.sqlite"
@@ -601,15 +602,16 @@ def test_processing_store_opens_even_when_processing_is_disabled(tmp_path, monke
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     store = build_processing_store(Config())
     assert store is not None
-    assert (tmp_path / "data" / "ops" / "processing.db").exists()
+    assert get_operational_store_path("processing", data_dir=tmp_path / "data").exists()
     assert not (tmp_path / "data" / "processing" / "processing.db").exists()
     store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
     store = build_processing_store(enabled)
     assert store is not None
-    assert (tmp_path / "data" / "ops" / "processing.db").exists()
-    assert store.path.endswith("data/ops/processing.db")
+    expected_path = get_operational_store_path("processing", data_dir=tmp_path / "data")
+    assert expected_path.exists()
+    assert store.path == str(expected_path)
     store.close()
 
 

@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 from yeoman_gateway.app.bootstrap import GatewayRuntime
 from yeoman_gateway.channels.whatsapp_runtime import BridgeStatus, WhatsAppRuntimeManager
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 def test_status_removes_pid_file_for_non_bridge_process(tmp_path, monkeypatch) -> None:
@@ -106,7 +107,7 @@ def test_start_bridge_replaces_blank_reference_dir_with_yeoman_home_default(
     manager.start_bridge()
 
     assert launched["env"]["BRIDGE_MESSAGE_REFERENCE_DIR"] == str(
-        runtime / "data/ops/bridge-message-references"
+        get_operational_store_path("bridge_references", data_dir=runtime / "data")
     )
 
 
@@ -139,7 +140,7 @@ def test_channels_login_replaces_blank_reference_dir_with_yeoman_home_default(
     channels_login()
 
     assert launched["env"]["BRIDGE_MESSAGE_REFERENCE_DIR"] == str(
-        runtime / "data/ops/bridge-message-references"
+        get_operational_store_path("bridge_references", data_dir=runtime / "data")
     )
 
 

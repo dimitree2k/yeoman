@@ -28,6 +28,7 @@ from yeoman_gateway.policy.engine import PolicyEngine
 from yeoman_gateway.policy.schema import PolicyConfig
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.config.schema import Config, WhatsAppConfig
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 
 def test_participation_knowledge_context_uses_verified_single_source_author() -> None:
@@ -253,7 +254,7 @@ async def test_persona_evolution_lazily_reads_historical_speakup_log(
             "security": {"enabled": False},
         }
     )
-    speakup_path = tmp_path / "data" / "consciousness" / "speakups.db"
+    speakup_path = get_operational_store_path("speakups", data_dir=tmp_path / "data")
     runtime = build_gateway_runtime(
         config=config,
         provider=_NeverProvider(),  # type: ignore[arg-type]
@@ -387,7 +388,7 @@ def test_processing_only_pending_data_enables_recovery_without_creating_speakup_
     from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
 
     processing_path = tmp_path / "processing.db"
-    speakup_path = tmp_path / "data" / "consciousness" / "speakups.db"
+    speakup_path = get_operational_store_path("speakups", data_dir=tmp_path / "data")
     payload = TextPayload(text="pending")
     store = ProcessingStore(processing_path)
     admission = ParticipationAdmission(
@@ -538,7 +539,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
     from yeoman_gateway.processing.participation_runtime import ParticipationAdmission
 
     processing_path = tmp_path / "processing.db"
-    speakup_path = tmp_path / "data" / "consciousness" / "speakups.db"
+    speakup_path = get_operational_store_path("speakups", data_dir=tmp_path / "data")
     config = Config.model_validate(
         {
             "processing": {
@@ -722,7 +723,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
 
     log_only_home = tmp_path / "log-only-home"
     log_only_processing = log_only_home / "missing-processing.db"
-    log_only_speakups = log_only_home / "data" / "consciousness" / "speakups.db"
+    log_only_speakups = get_operational_store_path("speakups", data_dir=log_only_home / "data")
     log_only_log = SpeakupLog(log_only_speakups)
     assert await log_only_log.reserve_delivery(
         proposal_id="orphaned-unsubmitted",
@@ -772,7 +773,7 @@ async def test_receipts_reconcile_with_learning_and_consciousness_disabled(
 
     empty_processing = tmp_path / "empty-processing.db"
     empty_home = tmp_path / "empty-home"
-    empty_speakups = empty_home / "data" / "consciousness" / "speakups.db"
+    empty_speakups = get_operational_store_path("speakups", data_dir=empty_home / "data")
     empty_config = config.model_copy(deep=True)
     empty_config.processing.db_path = str(empty_processing)
     monkeypatch.setenv("YEOMAN_HOME", str(empty_home))

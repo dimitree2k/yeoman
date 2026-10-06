@@ -12,6 +12,7 @@ from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
 from yeoman_shared.raw_archive.records import archive_files, iter_records
 from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 runner = CliRunner()
 NOW = 1_800_000_000_000
@@ -52,7 +53,7 @@ def _capture_home(
         if path.is_file():
             paths.append(path)
 
-    db_path = home / "data" / "processing" / "processing.db"
+    db_path = get_operational_store_path("processing", data_dir=home / "data")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as connection:
         connection.executescript("""
@@ -184,7 +185,7 @@ def test_purge_without_chat_or_message_is_refused(home: Path) -> None:
 
 
 def test_seed_dry_run_and_import_use_only_home_stores(home: Path) -> None:
-    processing_db = home / "data" / "processing" / "processing.db"
+    processing_db = get_operational_store_path("processing", data_dir=home / "data")
     processing_db.parent.mkdir(parents=True)
     with sqlite3.connect(processing_db) as connection:
         connection.execute(
@@ -252,7 +253,7 @@ def test_rebuild_drill_compares_with_synthetic_live_journal(
             received_ms=NOW,
         )
     )
-    live_db = home / "data" / "processing" / "processing.db"
+    live_db = get_operational_store_path("processing", data_dir=home / "data")
     sink = SignalJournalSink(ProcessingStore(live_db), clock=lambda: NOW)
     sink.capture(
         "message",
@@ -283,7 +284,7 @@ def test_rebuild_drill_compares_with_synthetic_live_journal(
     report = json.loads(result.output)
     assert report["replayed"] == 1
     assert report["missing_vs_live"] == [] and report["extra_vs_live"] == []
-    rebuilt = ProcessingStore(target / "data" / "processing" / "processing.db")
+    rebuilt = ProcessingStore(get_operational_store_path("processing", data_dir=target / "data"))
     assert rebuilt.get_event("e1") is not None
 
 
@@ -502,7 +503,7 @@ def test_capture_check_ignores_pre_start_effects_and_receipts(
         raw=[("outbound_request", "whatsapp", "current-chat", "current-effect", None),
              ("outbound_result", "whatsapp", "current-chat", "current-effect", "current-id")],
     )
-    db_path = tmp_path / "data" / "processing" / "processing.db"
+    db_path = get_operational_store_path("processing", data_dir=tmp_path / "data")
     with sqlite3.connect(db_path) as connection:
         connection.execute("UPDATE effects SET created_ms = 1 WHERE effect_id = 'old-effect'")
         connection.execute("UPDATE transport_receipts SET confirmed_ms = 1 WHERE effect_id = 'old-effect'")

@@ -133,12 +133,12 @@ def test_fresh_start_creates_only_canonical_a2a_database(tmp_path: Path, monkeyp
     config = relay.RelayConfig.from_env()
     relay._RelayStore(config.state_path)
     research_path = a2a_store_path(
-        SimpleNamespace(path=tmp_path / "data" / "ops" / "processing.db")
+        SimpleNamespace(path=get_operational_store_path("processing", data_dir=tmp_path / "data"))
     )
     assert research_path == get_operational_store_path("a2a")
     A2AResearchStore(research_path)
 
-    assert config.state_path == tmp_path / "data" / "ops" / "a2a.db"
+    assert config.state_path == get_operational_store_path("a2a", data_dir=tmp_path / "data")
     assert config.state_path.is_file()
     assert not (tmp_path / "data" / "a2a" / "relay.db").exists()
     assert not (tmp_path / "data" / "processing" / "a2a-research.db").exists()
