@@ -2186,33 +2186,7 @@ export class WhatsAppClient {
       }
     });
 
-    this.sock.ev.on('messages.reaction', (events: any[]) => {
-      for (const event of events ?? []) {
-        try {
-          const chatJid = normalizeJid(String(event?.key?.remoteJid || ''));
-          const targetMessageId = String(event?.key?.id || '').trim();
-          if (!chatJid || !targetMessageId) continue;
-          const senderJid = String(
-            event?.reaction?.key?.participant || event?.reaction?.key?.remoteJid || '',
-          ).trim();
-          const emoji = String(event?.reaction?.text || '').trim();
-          this.emitSignal(
-            'reaction',
-            `${targetMessageId}:${normalizeJid(senderJid) || senderJid}:${emoji}`,
-            {
-              chatJid,
-              targetMessageId,
-              senderId: normalizeJid(senderJid) || senderJid,
-              emoji,
-              removed: emoji.length === 0,
-            },
-          );
-        } catch (err) {
-          this.lastError = err instanceof Error ? err.message : String(err);
-          this.options.onError(`signal_reaction_failed: ${this.lastError}`);
-        }
-      }
-    });
+    this.sock.ev.on('messages.reaction', (events: any[]) => this.handleReactionEvents(events));
 
     this.sock.ev.on('message-receipt.update', (updates: any[]) => {
       for (const update of updates ?? []) {
@@ -2240,6 +2214,33 @@ export class WhatsAppClient {
     this.registerInboundMessageHandler();
 
     await closed;
+  }
+
+  private handleReactionEvents(events: any[]): void {
+    for (const event of events ?? []) {
+      try {
+        const chatJid = normalizeJid(String(event?.key?.remoteJid || ''));
+        const targetMessageId = String(event?.key?.id || '').trim();
+        if (!chatJid || !targetMessageId) continue;
+        const reactionKey = event?.reaction?.key;
+        const participant = String(reactionKey?.participant || '').trim();
+        const senderJid = participant || (reactionKey?.fromMe === true
+          ? [...this.selfJids].find((jid) => jid.endsWith('@s.whatsapp.net')) || ''
+          : chatJid.endsWith('@g.us') ? '' : String(reactionKey?.remoteJid || chatJid).trim());
+        const normalizedSender = normalizeJid(senderJid) || senderJid;
+        const emoji = String(event?.reaction?.text || '').trim();
+        this.emitSignal('reaction', `${targetMessageId}:${normalizedSender}:${emoji}`, {
+          chatJid,
+          targetMessageId,
+          senderId: normalizedSender,
+          emoji,
+          removed: emoji.length === 0,
+        });
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+        this.options.onError(`signal_reaction_failed: ${this.lastError}`);
+      }
+    }
   }
 
   async sendText(

@@ -75,6 +75,86 @@ async function membershipClient(t: any) {
   return { client: client as any, signals, messages };
 }
 
+async function reactionClient(t: any) {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-reaction-capture-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const signals: Array<{ kind: string; payload: any }> = [];
+  const client = new WhatsAppClient({
+    authDir: root,
+    messageReferenceDir: join(root, 'references'),
+    readReceipts: false,
+    onMessage: () => {},
+    onSignal: (kind, payload) => { signals.push({ kind, payload }); },
+    onQR: () => {}, onStatus: () => {}, onError: () => {},
+  });
+  return { client: client as any, signals };
+}
+
+async function capturedReaction(t: any, event: any, self?: string) {
+  const { client, signals } = await reactionClient(t);
+  client.acceptingProviderEvents = true;
+  if (self) client.updateSelfIds({ creds: { me: { id: self } } });
+  client.handleReactionEvents([event]);
+  await client.drainProviderEvents();
+  return signals[0]?.payload;
+}
+
+test('test_group_self_reaction_uses_authenticated_self_jid', async (t) => {
+  const payload = await capturedReaction(t, {
+    key: { remoteJid: 'friends@g.us', id: 'TARGET-1' },
+    reaction: { key: { remoteJid: 'friends@g.us', fromMe: true }, text: '👍' },
+  }, '4915202777685:4@s.whatsapp.net');
+  assert.deepEqual(payload, {
+    chatJid: 'friends@g.us', targetMessageId: 'TARGET-1', senderId: '4915202777685@s.whatsapp.net',
+    emoji: '👍', removed: false,
+  });
+});
+
+test('test_group_other_reaction_keeps_participant_jid', async (t) => {
+  const payload = await capturedReaction(t, {
+    key: { remoteJid: 'friends@g.us', id: 'TARGET-2' },
+    reaction: { key: { remoteJid: 'friends@g.us', participant: 'other@lid', fromMe: false }, text: '❤️' },
+  });
+  assert.deepEqual(payload, {
+    chatJid: 'friends@g.us', targetMessageId: 'TARGET-2', senderId: 'other@lid', emoji: '❤️', removed: false,
+  });
+});
+
+test('test_group_missing_participant_from_me_false_has_no_group_actor', async (t) => {
+  const payload = await capturedReaction(t, {
+    key: { remoteJid: 'friends@g.us', id: 'TARGET-3' },
+    reaction: { key: { remoteJid: 'friends@g.us', fromMe: false }, text: '🔥' },
+  }, '4915202777685@s.whatsapp.net');
+  assert.equal(payload?.senderId, '');
+  assert.notEqual(payload?.senderId, 'friends@g.us');
+  assert.equal(payload?.chatJid, 'friends@g.us');
+  assert.equal(payload?.targetMessageId, 'TARGET-3');
+  assert.equal(payload?.emoji, '🔥');
+  assert.equal(payload?.removed, false);
+});
+
+test('test_direct_reaction_keeps_direct_actor', async (t) => {
+  const payload = await capturedReaction(t, {
+    key: { remoteJid: '12345@s.whatsapp.net', id: 'TARGET-4' },
+    reaction: { key: { remoteJid: '12345@s.whatsapp.net', fromMe: false }, text: '🙂' },
+  });
+  assert.deepEqual(payload, {
+    chatJid: '12345@s.whatsapp.net', targetMessageId: 'TARGET-4', senderId: '12345@s.whatsapp.net',
+    emoji: '🙂', removed: false,
+  });
+});
+
+test('test_group_self_reaction_removal_keeps_actor', async (t) => {
+  const payload = await capturedReaction(t, {
+    key: { remoteJid: 'friends@g.us', id: 'TARGET-5' },
+    reaction: { key: { remoteJid: 'friends@g.us', fromMe: true }, text: '' },
+  }, '4915202777685@s.whatsapp.net');
+  assert.deepEqual(payload, {
+    chatJid: 'friends@g.us', targetMessageId: 'TARGET-5', senderId: '4915202777685@s.whatsapp.net',
+    emoji: '', removed: true,
+  });
+});
+
 test('test_group_membership_stub_emits_without_message_content', async (t) => {
   const { client, signals, messages } = await membershipClient(t);
   const stubs = [
