@@ -18,7 +18,7 @@ def last_message_ms() -> None:
     """Print the latest message event timestamp in milliseconds, or zero."""
     from yeoman_shared.utils.helpers import get_operational_store_path
 
-    database = get_operational_store_path("processing")
+    database = get_operational_store_path("processing", create=False)
     if not database.is_file():
         typer.echo("0")
         return

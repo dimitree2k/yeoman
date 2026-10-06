@@ -192,7 +192,7 @@ Includes units for all three services:
 ├── data/ops/overseer/
 │   ├── runbooks/           Active runbook .md files
 │   ├── audit/
-│   │   ├── YYYY-MM-DD.jsonl    Daily audit entries
+│   │   ├── YYYY-MM.jsonl       Monthly audit entries
 │   │   └── tombstones.jsonl    Policy exclusion records
 │   └── state.json          Persisted state (heartbeat, budget, locks, circuit breakers)
 ├── var/

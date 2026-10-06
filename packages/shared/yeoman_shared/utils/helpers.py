@@ -78,13 +78,23 @@ def get_session_state_path() -> Path:
     return root / "data" / "memory" / "session-state"
 
 
-def get_operational_store_path(name: str, *, data_dir: Path | None = None) -> Path:
-    """Resolve a named store under data/ops, or under an explicit snapshot data dir."""
+def get_operational_store_path(
+    name: str, *, data_dir: Path | None = None, create: bool = True
+) -> Path:
+    """Resolve a named store under data/ops, optionally without creating directories."""
     try:
         relative = OPERATIONAL_STORE_PATHS[name]
     except KeyError:
         raise ValueError(f"Unknown operational store: {name}") from None
-    return (data_dir if data_dir is not None else get_operational_data_path()) / relative
+    if data_dir is not None:
+        base = data_dir
+    elif create:
+        base = get_operational_data_path()
+    else:
+        yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+        root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+        base = root / "data"
+    return base / relative
 
 
 def set_bridge_message_reference_dir(env: MutableMapping[str, str]) -> None:

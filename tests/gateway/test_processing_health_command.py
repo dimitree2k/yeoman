@@ -3,9 +3,7 @@ import sqlite3
 from pathlib import Path
 
 from typer.testing import CliRunner
-
 from yeoman_gateway.cli.commands import app
-
 
 runner = CliRunner()
 
@@ -40,3 +38,14 @@ def test_last_message_ms_does_not_create_missing_database(tmp_path: Path, monkey
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "0"
     assert not (home / "data" / "ops" / "processing.db").exists()
+
+
+def test_last_message_ms_does_not_create_absent_yeoman_home(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "absent-home"
+    monkeypatch.setenv("YEOMAN_HOME", str(home))
+
+    result = runner.invoke(app, ["processing", "last-message-ms"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "0"
+    assert not home.exists()
