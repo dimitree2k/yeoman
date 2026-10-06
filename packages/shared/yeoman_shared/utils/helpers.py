@@ -17,6 +17,7 @@ OPERATIONAL_STORE_PATHS = {
     "policy_audit": "ops/policy-audit",
     "persona_evolution": "ops/persona-evolution",
     "bridge_references": "ops/bridge-message-references",
+    "a2a": "ops/a2a.db",
     "overseer": "ops/overseer",
 }
 

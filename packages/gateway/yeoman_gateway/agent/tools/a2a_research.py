@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from yeoman_shared.utils.helpers import get_operational_store_path
+
 
 @dataclass(frozen=True, slots=True)
 class PendingResearch:
@@ -306,13 +308,13 @@ class A2AResearchStore:
         return None
 
 
-def sibling_path(processing_store: Any) -> str | None:
-    """Derive the A2A DB beside a provided processing store, if it has a path."""
+def a2a_store_path(processing_store: Any) -> Path | None:
+    """Return the canonical A2A store unless processing uses an in-memory DB."""
 
     raw_path = getattr(processing_store, "path", None)
     if not raw_path or str(raw_path) == ":memory:":
         return None
-    return str(Path(str(raw_path)).with_name("a2a-research.db"))
+    return get_operational_store_path("a2a")
 
 
-__all__ = ["A2AResearchStore", "PendingResearch", "sibling_path"]
+__all__ = ["A2AResearchStore", "PendingResearch", "a2a_store_path"]

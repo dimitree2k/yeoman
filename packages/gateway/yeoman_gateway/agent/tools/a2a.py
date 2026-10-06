@@ -29,7 +29,7 @@ from yeoman_gateway.processing.tool_context import (
     publish_turn_signal,
 )
 
-from .a2a_research import A2AResearchStore, PendingResearch, sibling_path
+from .a2a_research import A2AResearchStore, PendingResearch, a2a_store_path
 
 DELEGATION_WINDOW_MS = 600_000
 DELEGATION_WORKER_ID = "a2a_delegate"
@@ -294,7 +294,7 @@ class A2ADelegateTool(Tool):
         if pending_store is not None:
             self._research_store = pending_store
         else:
-            path = sibling_path(store)
+            path = a2a_store_path(store)
             self._research_store = A2AResearchStore(path) if path else None
         self._background: set[asyncio.Task[None]] = set()
         self._background_task_ids: set[str] = set()

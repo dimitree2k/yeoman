@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
+from yeoman_shared.utils.helpers import get_operational_store_path
+
 from yeoman_gateway.a2a.contracts import (
     CONTRACT_RELEASE,
     PROFILE_URI,
@@ -162,9 +164,7 @@ class RelayConfig:
                     "~/.yeoman/run/gateway.sock",
                 )
             ).expanduser(),
-            state_path=Path(
-                _setting("YEOMAN_A2A_STATE_PATH", default="~/.yeoman/data/a2a/relay.db")
-            ).expanduser(),
+            state_path=get_operational_store_path("a2a"),
             public_url=_required("YEOMAN_A2A_PUBLIC_URL").rstrip("/"),
             whatsapp_enabled=_boolean("YEOMAN_A2A_WHATSAPP_ENABLED", False),
             content_types=_csv(os.environ.get("YEOMAN_A2A_CONTENT_TYPES", "text")),

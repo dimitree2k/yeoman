@@ -1952,9 +1952,9 @@ def build_a2a_research_store(
     """Build the detached research ledger only with processing features enabled."""
     if processing_store is None or not config.processing.enabled:
         return None
-    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, sibling_path
+    from yeoman_gateway.agent.tools.a2a_research import A2AResearchStore, a2a_store_path
 
-    path = sibling_path(processing_store)
+    path = a2a_store_path(processing_store)
     return A2AResearchStore(path) if path else None
 
 
