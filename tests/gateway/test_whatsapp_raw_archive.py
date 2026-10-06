@@ -592,6 +592,44 @@ def test_quoted_image_description_uses_quoted_message_key(tmp_path: Path, monkey
     }]
 
 
+def test_quoted_image_without_message_id_is_not_archived(tmp_path: Path) -> None:
+    channel, archive, _ = _setup(tmp_path)
+    path = tmp_path / "incoming" / "quoted.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"image")
+    channel.config.media.enabled = True
+    channel.config.media.describe_images = True
+
+    class Router:
+        def resolve(self, task, channel):
+            return type("Profile", (), {"model": "vision-model"})()
+
+    class Vision:
+        calls = 0
+
+        async def describe(self, path, profile):
+            self.calls += 1
+            return "quote image"
+
+    channel._model_router = Router()
+    vision = Vision()
+    channel._vision_describer = vision
+    event = InboundEvent(
+        message_id="reply-native", chat_jid=CHAT, participant_jid="sender@lid", sender_id="sender",
+        sender_phone_jid=None, is_group=True, text="reply", timestamp=NOW, mentioned_jids=[],
+        mentioned_bot=False, reply_to_bot=False, reply_to_message_id=None, reply_to_participant=None,
+        reply_to_text="[Image]", media_kind=None, media_type=None, media_file_name=None, media_path=None,
+        media_bytes=None, media_description=None, voice_transcript=None, reply_to_media_kind="image",
+        reply_to_media_type="image/jpeg", reply_to_media_path=str(path),
+    )
+
+    result = asyncio.run(channel._enrich_quoted_image_event(event))
+
+    assert result.reply_to_text == "[Image]"
+    assert vision.calls == 0
+    assert not (archive.root / "derived" / "media-descriptions.jsonl").exists()
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_failed_or_empty_description_is_not_archived(tmp_path: Path, fails: bool) -> None:
     channel, archive, _ = _setup(tmp_path)

@@ -2322,6 +2322,7 @@ class WhatsAppChannel(BaseChannel):
             not self.config.media.enabled
             or not self.config.media.describe_images
             or event.reply_to_media_kind != "image"
+            or not event.reply_to_message_id
             or not event.reply_to_media_path
             or self._vision_describer is None
             or self._model_router is None
