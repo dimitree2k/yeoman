@@ -3079,6 +3079,7 @@ def build_gateway_runtime(
         reaction_action=_build_reaction_action(config, effect_router, processing_store),
         ambient_judge=_build_ambient_judge(config),
     )
+    document_processor.raw_archive = channels.raw_archive
 
     typing_adapter = ChannelManagerTypingAdapter(channels)
 

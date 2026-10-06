@@ -22,6 +22,7 @@ from yeoman_shared.raw_archive.writer import (
     RawArchiveCapacityError,
     RawEvent,
     append_async,
+    append_media_description_async,
     append_with_media_async,
     media_kind_from_mime,
 )
@@ -1060,6 +1061,24 @@ class WhatsAppChannel(BaseChannel):
     def set_raw_archive(self, archive: RawArchive | None) -> None:
         """Attach the append-only raw archive (V1 spec §4.0)."""
         self._raw_archive = archive
+
+    async def _archive_media_description(
+        self, *, chat_id: str, message_id: str, profile: Any, mode: str, text: str
+    ) -> None:
+        await append_media_description_async(
+            self._raw_archive,
+            {
+                "derived_version": 1,
+                "kind": "media_description",
+                "channel": self.name,
+                "chat_id": chat_id,
+                "native_message_id": message_id,
+                "mode": mode,
+                "generator": profile.model,
+                "generated_ms": int(datetime.now(UTC).timestamp() * 1000),
+                "text": text,
+            },
+        )
 
     async def _raw_archive_bridge_frame(
         self, frame: dict[str, Any], kind: str, payload: dict[str, Any]
@@ -2352,6 +2371,14 @@ class WhatsAppChannel(BaseChannel):
         if not description:
             return event
 
+        await self._archive_media_description(
+            chat_id=event.chat_jid,
+            message_id=event.reply_to_message_id,
+            profile=profile,
+            mode="description",
+            text=description,
+        )
+
         base = (event.reply_to_text or "").strip()
         if not base or base == "[Image]":
             caption = "[Image]"
@@ -2410,6 +2437,13 @@ class WhatsAppChannel(BaseChannel):
 
             if not description:
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            await self._archive_media_description(
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                profile=profile,
+                mode="description",
+                text=description,
+            )
             if "[image_description]" in event.text:
                 enriched_text = event.text
             else:
@@ -2531,6 +2565,13 @@ class WhatsAppChannel(BaseChannel):
 
             if not description:
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            await self._archive_media_description(
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                profile=profile,
+                mode="description",
+                text=description,
+            )
             if "[video_description]" in event.text:
                 enriched_text = event.text
             else:
@@ -2586,6 +2627,13 @@ class WhatsAppChannel(BaseChannel):
 
             if not description:
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+            await self._archive_media_description(
+                chat_id=event.chat_jid,
+                message_id=event.message_id,
+                profile=profile,
+                mode="description",
+                text=description,
+            )
             if "[sticker_description]" in event.text:
                 enriched_text = event.text
             else:

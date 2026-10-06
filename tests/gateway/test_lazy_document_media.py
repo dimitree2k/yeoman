@@ -5,9 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
+from yeoman_gateway.bus.queue import MessageBus
+from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
+from yeoman_gateway.media.storage import MediaStorage
+from yeoman_shared.config.schema import WhatsAppConfig
+from yeoman_shared.raw_archive.records import iter_records
+from yeoman_shared.raw_archive.writer import RawArchive, RawArchiveCapacityError
 
 
 def _record(
@@ -514,6 +520,103 @@ async def test_real_resolver_cached_ocr_does_not_call_vision_again(
     assert result["mode"] == "ocr_image"
     assert result["content"] == "Invoice total: 42 EUR"
     assert vision.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lazy_ocr_archives_before_expiring_cache_save(tmp_path, monkeypatch) -> None:
+    import yeoman_gateway.media.document_processing as processing_module
+
+    path = tmp_path / "scan.png"
+    path.write_bytes(b"image")
+    cache = DocumentCache(tmp_path / "document_cache.db")
+    _record(cache, path, message_id="ocr-native", kind="image", mime_type="image/png", file_name="scan.png")
+    item = cache.lookup_by_message("whatsapp", "docs@g.us", "ocr-native")
+    assert item is not None
+    archive = RawArchive(tmp_path / "raw", spool=tmp_path / "spool", clock=lambda: 1_790_000_000_000)
+    processor = DocumentProcessor(cache=cache, model_router=_Router(), vision_describer=_Vision(" exact OCR \n"), raw_archive=archive)
+    monkeypatch.setattr(processing_module.time, "time_ns", lambda: 1_790_000_000_123_000_000)
+    save = cache.save_extraction
+
+    def assert_archived_first(**kwargs):
+        rows = [record for _, record, _ in iter_records(archive.root / "derived" / "media-descriptions.jsonl")]
+        assert rows == [{
+            "derived_version": 1, "kind": "media_description", "channel": "whatsapp",
+            "chat_id": "docs@g.us", "native_message_id": "ocr-native", "mode": "ocr",
+            "generator": "ocr-model", "generated_ms": 1_790_000_000_123, "text": " exact OCR \n",
+        }]
+        save(**kwargs)
+
+    cache.save_extraction = assert_archived_first
+    result = await processor.extract_for_question(item, "What is in this image?")
+
+    assert result is not None
+    assert result["mode"] == "ocr_image"
+
+
+@pytest.mark.asyncio
+async def test_pdf_text_and_audio_transcript_are_not_media_descriptions(tmp_path) -> None:
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"%PDF-1.4\n")
+    cache = DocumentCache(tmp_path / "document_cache.db")
+    _record(cache, path, message_id="pdf-native", kind="document", mime_type="application/pdf", file_name="report.pdf")
+    item = cache.lookup_by_message("whatsapp", "docs@g.us", "pdf-native")
+    assert item is not None
+    archive = RawArchive(tmp_path / "raw", spool=tmp_path / "spool")
+    processor = DocumentProcessor(cache=cache, raw_archive=archive)
+    processor._read_pdf_text = lambda *_: ("PDF text", 1)
+    await processor.extract_for_question(item, "Read page 1")
+    assert not (archive.root / "derived" / "media-descriptions.jsonl").exists()
+
+    audio_path = tmp_path / "incoming" / "audio.ogg"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"audio")
+    channel = WhatsAppChannel(
+        WhatsAppConfig(), MessageBus(), media_storage=MediaStorage(
+            incoming_dir=audio_path.parent, outgoing_dir=tmp_path / "outgoing"
+        )
+    )
+    channel.config.media.enabled = True
+    channel.config.media.transcribe_audio = True
+    channel.set_raw_archive(archive)
+    class _AudioRouter:
+        def resolve(self, task_key: str, channel: str):
+            assert (task_key, channel) == ("asr.transcribe_audio", "whatsapp")
+            return SimpleNamespace(kind="asr", model="asr-model")
+
+    channel._model_router = _AudioRouter()
+
+    class _Asr:
+        async def transcribe(self, path, profile):
+            return "spoken words"
+
+    channel._asr_transcriber = _Asr()
+    event = InboundEvent(
+        message_id="audio-native", chat_jid="docs@g.us", participant_jid="sender@lid", sender_id="sender",
+        sender_phone_jid=None, is_group=True, text="", timestamp=1_790_000_000_000, mentioned_jids=[],
+        mentioned_bot=False, reply_to_bot=False, reply_to_message_id=None, reply_to_participant=None,
+        reply_to_text=None, media_kind="audio", media_type="audio/ogg", media_file_name="audio.ogg",
+        media_path=str(audio_path), media_bytes=5, media_description=None, voice_transcript=None,
+    )
+    result = await channel._enrich_primary_media_event(event)
+    assert result.voice_transcript == "spoken words"
+    assert not (archive.root / "derived" / "media-descriptions.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_lazy_ocr_capacity_error_precedes_success_and_cache_save(tmp_path) -> None:
+    path = tmp_path / "scan.png"
+    path.write_bytes(b"image")
+    cache = DocumentCache(tmp_path / "document_cache.db")
+    _record(cache, path, message_id="ocr-capacity", kind="image", mime_type="image/png", file_name="scan.png")
+    item = cache.lookup_by_message("whatsapp", "docs@g.us", "ocr-capacity")
+    assert item is not None
+    archive = RawArchive(tmp_path / "raw", spool=tmp_path / "spool")
+    archive.append_media_description = lambda _: (_ for _ in ()).throw(RawArchiveCapacityError("full"))
+    processor = DocumentProcessor(cache=cache, model_router=_Router(), vision_describer=_Vision("text"), raw_archive=archive)
+    cache.save_extraction = lambda **_: pytest.fail("cache must not claim OCR success before archive")
+
+    with pytest.raises(RawArchiveCapacityError, match="full"):
+        await processor.extract_for_question(item, "What is in this image?")
 
 
 @pytest.mark.asyncio

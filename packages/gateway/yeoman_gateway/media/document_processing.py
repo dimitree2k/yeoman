@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from yeoman_shared.raw_archive.writer import RawArchive, append_media_description_async
 
 from yeoman_gateway.implicit_addressing import looks_like_question_or_request
 from yeoman_gateway.media.document_cache import DocumentCache, MediaItem
@@ -40,6 +42,7 @@ class DocumentProcessor:
         cache: DocumentCache,
         model_router: ModelRouter | None = None,
         vision_describer: VisionDescriber | None = None,
+        raw_archive: RawArchive | None = None,
         max_document_bytes: int = 12 * 1024 * 1024,
         max_image_bytes: int = 8 * 1024 * 1024,
         max_pdf_pages: int = 1,
@@ -48,6 +51,7 @@ class DocumentProcessor:
         self.cache = cache
         self.model_router = model_router
         self.vision_describer = vision_describer
+        self.raw_archive = raw_archive
         self.max_document_bytes = max(1, int(max_document_bytes))
         self.max_image_bytes = max(1, int(max_image_bytes))
         self.max_pdf_pages = min(1, max(1, int(max_pdf_pages)))
@@ -125,6 +129,20 @@ class DocumentProcessor:
         text = await self.vision_describer.ocr_image(path, profile)
         if not text:
             return None
+        await append_media_description_async(
+            self.raw_archive,
+            {
+                "derived_version": 1,
+                "kind": "media_description",
+                "channel": item.channel,
+                "chat_id": item.chat_id,
+                "native_message_id": item.message_id,
+                "mode": "ocr",
+                "generator": profile.model,
+                "generated_ms": time.time_ns() // 1_000_000,
+                "text": text,
+            },
+        )
         text = self._limit(text)
         self.cache.save_extraction(
             media_item_id=item.id,
