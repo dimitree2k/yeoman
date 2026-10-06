@@ -210,8 +210,7 @@ def _default_output_path(persona_file: str) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     name = safe_filename(persona_file.replace("/", "-").replace(".", "-"))
     return (
-        get_operational_data_path()
-        / "persona-evolution"
+        get_operational_store_path("persona_evolution")
         / "proposals"
         / f"{stamp}-{name}.md"
     )
