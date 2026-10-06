@@ -66,11 +66,11 @@ def _records(root: Path) -> list[dict]:
 def _media_description(message_id: str = "m1", *, generated_ms: int = OCT) -> dict:
     return {
         "derived_version": 1,
-        "kind": "image_description",
+        "kind": "media_description",
         "channel": "whatsapp",
         "chat_id": "c1",
         "native_message_id": message_id,
-        "mode": "image",
+        "mode": "description",
         "generator": "model",
         "generated_ms": generated_ms,
         "text": f"description-{message_id}",
