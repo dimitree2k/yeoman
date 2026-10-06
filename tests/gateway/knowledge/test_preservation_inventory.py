@@ -257,7 +257,7 @@ def test_unknown_source_class_defaults_to_restricted_metadata(tmp_path: Path) ->
 
 def test_cold_location_does_not_turn_live_sqlite_sources_into_static_triples(tmp_path: Path) -> None:
     cold = tmp_path / "backups/preservation/2026-10-03-cold"
-    path = cold / "data/processing/processing.db"
+    path = cold / "data/ops/processing.db"
     path.parent.mkdir(parents=True)
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE events (event_id TEXT)")
@@ -265,7 +265,7 @@ def test_cold_location_does_not_turn_live_sqlite_sources_into_static_triples(tmp
 
     result = inventory_sources(home=cold)
 
-    processing = next(source for source in result["sources"] if source["path"] == "data/processing/processing.db")
+    processing = next(source for source in result["sources"] if source["path"] == "data/ops/processing.db")
     assert processing["kind"] == "live_sqlite"
 
 

@@ -12,7 +12,7 @@ CREATE TABLE media_extractions (id INTEGER PRIMARY KEY, media_item_id INTEGER, m
 
 
 def test_media(tmp_path):
-    make_db(tmp_path / "data/media/document_cache.db", DDL, {
+    make_db(tmp_path / "data/ops/document-cache.db", DDL, {
         "media_items": [{"id": 65, "channel": "whatsapp", "chat_id": "1-2@g.us", "message_id": "AC06",
                          "sender_id": "x", "sender_name": "y", "kind": "image", "mime_type": "image/jpeg",
                          "file_name": None, "local_path": "/m/AC06.jpg", "size_bytes": 10,

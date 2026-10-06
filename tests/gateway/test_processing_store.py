@@ -584,14 +584,14 @@ def test_processing_store_opens_even_when_processing_is_disabled(tmp_path, monke
     monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
     store = build_processing_store(Config())
     assert store is not None
-    assert (tmp_path / "data" / "processing" / "processing.db").exists()
+    assert (tmp_path / "data" / "ops" / "processing.db").exists()
     store.close()
 
     enabled = Config.model_validate({"processing": {"enabled": True}})
     store = build_processing_store(enabled)
     assert store is not None
-    assert (tmp_path / "data" / "processing" / "processing.db").exists()
-    assert store.path.endswith("data/processing/processing.db")
+    assert (tmp_path / "data" / "ops" / "processing.db").exists()
+    assert store.path.endswith("data/ops/processing.db")
     store.close()
 
 

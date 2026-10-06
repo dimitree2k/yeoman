@@ -32,7 +32,7 @@ from yeoman_shared.raw_archive.records import (
 )
 from yeoman_shared.raw_archive.verify import record_closed
 from yeoman_shared.raw_archive.writer import ARCHIVE_VERSION, month_of, read_start_ms, safe_channel
-from yeoman_shared.utils.helpers import get_operational_data_path
+from yeoman_shared.utils.helpers import get_operational_data_path, get_operational_store_path
 
 SEED_SOURCES: tuple[str, ...] = ("journal", "reply_context", "session_jsonl", "memory2")
 
@@ -49,7 +49,7 @@ class SeedPaths:
     def default(cls) -> SeedPaths:
         data = get_operational_data_path()
         return cls(
-            processing_db=data / "processing" / "processing.db",
+            processing_db=get_operational_store_path("processing"),
             reply_context_db=data / "inbound" / "reply_context.db",
             inbound_dir=data / "inbound",
             knowledge_db=data / "knowledge" / "knowledge.db",

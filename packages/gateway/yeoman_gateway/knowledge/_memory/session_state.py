@@ -13,7 +13,7 @@ def resolve_session_state_dir(workspace: Path, state_dir: str = DEFAULT_SESSION_
     """Resolve the configured session-state directory with one canonical default."""
     relative = Path(state_dir).expanduser()
     if state_dir == DEFAULT_SESSION_STATE_DIR:
-        return get_session_state_path()
+        return ensure_dir(get_session_state_path())
     if relative.is_absolute():
         return ensure_dir(relative)
     return ensure_dir(workspace / relative)

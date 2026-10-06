@@ -1,6 +1,6 @@
 """Durable processing store: event journal, decisions, effect outbox and lineage.
 
-One purpose-built SQLite database (``data/processing/processing.db``, spec R06) next to
+One purpose-built SQLite database (``data/ops/processing.db``, spec R06) next to
 the existing archives. It does not replace the inbound archive and it is not a second
 semantic memory database.
 

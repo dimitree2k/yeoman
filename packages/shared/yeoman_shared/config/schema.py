@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings
 from yeoman_shared.config.defaults import (
     DEFAULT_KNOWLEDGE,
     DEFAULT_MEMORY,
+    DEFAULT_PROCESSING_DB_PATH,
     DEFAULT_SECURITY,
     DEFAULT_WHATSAPP_MEDIA,
     DEFAULT_WHATSAPP_REPLY_CONTEXT,
@@ -928,7 +929,7 @@ class ProcessingConfig(BaseModel):
     participation_maintenance: ProcessingParticipationMaintenanceConfig = Field(
         default_factory=ProcessingParticipationMaintenanceConfig
     )
-    db_path: str = "data/processing/processing.db"
+    db_path: str = DEFAULT_PROCESSING_DB_PATH
     budgets: ProcessingBudgetsConfig = Field(default_factory=ProcessingBudgetsConfig)
     threads: ProcessingThreadsConfig = Field(default_factory=ProcessingThreadsConfig)
     deadlines: ProcessingDeadlinesConfig = Field(default_factory=ProcessingDeadlinesConfig)

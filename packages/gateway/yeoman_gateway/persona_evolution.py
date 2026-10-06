@@ -1257,7 +1257,12 @@ async def run_persona_evolution_cron(
         collected_at = collected_at.replace(tzinfo=UTC)
     collected_at = collected_at.astimezone(UTC)
 
-    ledger_path = state_db_path or workspace / "persona-evolution" / "persona-evolution.db"
+    if state_db_path is None:
+        from yeoman_shared.utils.helpers import get_operational_store_path
+
+        ledger_path = get_operational_store_path("persona_evolution") / "persona-evolution.db"
+    else:
+        ledger_path = state_db_path
     auto_apply_results: list[PersonaEvolutionDecisionResult] = []
     if str(proposal_mode).strip() == "auto_apply":
         auto_apply_results = _auto_apply_expired_pending(

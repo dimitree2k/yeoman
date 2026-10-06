@@ -7,11 +7,13 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.utils.helpers import get_operational_store_path
+
 from ..ids import SPEAKUP
 from ..layer1 import Origin, backfill_line
 from .common import clean_text, compact, loads_object, media_kind, open_ro, row_dict, table_exists
 
-DB_REL = "data/processing/processing.db"
+DB_REL = get_operational_store_path("processing", data_dir=Path("data")).as_posix()
 _EVENT_KINDS = frozenset({"message", "reaction", "edit", "delete", "membership_snapshot",
                           "membership_change"})
 _EXTENSION_KIND = {".ogg": "audio", ".opus": "audio", ".mp3": "audio", ".m4a": "audio",
@@ -20,7 +22,7 @@ _EXTENSION_KIND = {".ogg": "audio", ".opus": "audio", ".mp3": "audio", ".m4a": "
 
 
 def convert_journal(source_home: Path) -> Iterator[dict[str, Any]]:
-    path = source_home / DB_REL
+    path = get_operational_store_path("processing", data_dir=source_home / "data")
     if not path.is_file():
         return
     with closing(open_ro(path)) as conn:

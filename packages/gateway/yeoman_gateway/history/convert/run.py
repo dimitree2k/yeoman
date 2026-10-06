@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from yeoman_shared.raw_archive.paths import is_protected
-from yeoman_shared.utils.helpers import get_data_path
+from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
 
 from ..layer1 import write_jsonl_once
 from .bridge_refs import Decoder, convert_bridge_refs
@@ -31,7 +31,10 @@ class Job:
 def jobs(source_home: Path, *, decode: Decoder | None,
          extra_bridge_dirs: Sequence[Path] = ()) -> list[Job]:
     h = source_home
-    bridge_dirs = [h / "data/bridge/whatsapp-message-references", *extra_bridge_dirs]
+    bridge_dirs = [
+        get_operational_store_path("bridge_references", data_dir=h / "data"),
+        *extra_bridge_dirs,
+    ]
     result = [
         Job("journal", "backfill", lambda: convert_journal(h)),
         Job("bridge_refs", "backfill", lambda: convert_bridge_refs(bridge_dirs, decode)),

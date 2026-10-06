@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal, override
 import websockets
 from loguru import logger
 from yeoman_shared.config.loader import load_config
-from yeoman_shared.utils.helpers import get_operational_data_path
+from yeoman_shared.utils.helpers import get_operational_store_path
 from yeoman_shared.whatsapp_protocol import PROTOCOL_VERSION
 
 from yeoman_gateway.core.admin_commands import (
@@ -314,8 +314,10 @@ class EnginePolicyAdapter(PolicyPort):
     def _resolve_pause_state_path(self) -> Path:
         if self._policy_path is not None:
             base_dir = self._policy_path.parent
-            return base_dir / "data" / "policy" / "response_pauses.json"
-        return get_operational_data_path() / "policy" / "response_pauses.json"
+            return get_operational_store_path(
+                "response_pauses", data_dir=base_dir / "data"
+            )
+        return get_operational_store_path("response_pauses")
 
     @staticmethod
     def _normalize_pause_until(value: object) -> int:

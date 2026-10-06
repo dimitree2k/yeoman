@@ -33,7 +33,7 @@ def _effect(eid, kind, payload, state="sent", principal="4915774497527"):
 
 
 def _home(tmp_path):
-    make_db(tmp_path / "data/processing/processing.db", DDL, {
+    make_db(tmp_path / "data/ops/processing.db", DDL, {
         "events": [
             _event("e1", "message", principal="143855651442872", source_message_id="AC06",
                    payload_json=json.dumps({"text": "hallo", "participant_jid": "143855651442872@lid",

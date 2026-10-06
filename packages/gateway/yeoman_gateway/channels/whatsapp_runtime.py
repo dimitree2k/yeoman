@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 from yeoman_shared.config.loader import get_config_path, load_config, save_config
+from yeoman_shared.utils.helpers import get_operational_store_path
 from yeoman_shared.utils.process import (
     is_bridge_process,
     listener_pids_for_port,
@@ -400,6 +401,10 @@ class WhatsAppRuntimeManager:
             env["BRIDGE_HOST"] = wa.bridge_host
             env["BRIDGE_TOKEN"] = token
             env["AUTH_DIR"] = str(Path(wa.auth_dir).expanduser())
+            env.setdefault(
+                "BRIDGE_MESSAGE_REFERENCE_DIR",
+                str(get_operational_store_path("bridge_references")),
+            )
             env["WHATSAPP_READ_RECEIPTS"] = "1" if wa.read_receipts else "0"
             env["WHATSAPP_ACCEPT_FROM_ME"] = "1" if wa.accept_from_me else "0"
             env["WHATSAPP_PERSIST_INBOUND_AUDIO"] = "1" if wa.media.persist_incoming_audio else "0"

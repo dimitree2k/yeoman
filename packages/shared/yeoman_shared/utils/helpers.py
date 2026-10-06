@@ -4,6 +4,22 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+OPERATIONAL_STORE_PATHS = {
+    "processing": "ops/processing.db",
+    "speakups": "ops/speakups.db",
+    "burst_state": "ops/burst-state.json",
+    "lull_state": "ops/lull-state.json",
+    "pending_approvals": "ops/pending-approvals.json",
+    "document_cache": "ops/document-cache.db",
+    "cron": "ops/cron-jobs.json",
+    "response_pauses": "ops/response-pauses.json",
+    "policy_audit": "ops/policy-audit",
+    "persona_evolution": "ops/persona-evolution",
+    "bridge_references": "ops/bridge-message-references",
+    "overseer": "ops/overseer",
+}
+
+
 
 def ensure_dir(path: Path) -> Path:
     """Ensure a directory exists, creating it if necessary."""
@@ -53,8 +69,19 @@ def get_run_path() -> Path:
 
 
 def get_session_state_path() -> Path:
-    """Get the canonical durable session-state directory (~/.yeoman/data/memory/session-state)."""
-    return ensure_dir(get_operational_data_path() / "memory" / "session-state")
+    """Return the frozen legacy session-state path without creating it."""
+    yeoman_home = os.environ.get("YEOMAN_HOME", "").strip()
+    root = Path(yeoman_home) if yeoman_home else Path.home() / ".yeoman"
+    return root / "data" / "memory" / "session-state"
+
+
+def get_operational_store_path(name: str, *, data_dir: Path | None = None) -> Path:
+    """Resolve a named store under data/ops, or under an explicit snapshot data dir."""
+    try:
+        relative = OPERATIONAL_STORE_PATHS[name]
+    except KeyError:
+        raise ValueError(f"Unknown operational store: {name}") from None
+    return (data_dir if data_dir is not None else get_operational_data_path()) / relative
 
 
 def get_cache_path() -> Path:

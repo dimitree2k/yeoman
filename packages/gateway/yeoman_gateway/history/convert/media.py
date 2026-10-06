@@ -7,14 +7,16 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.utils.helpers import get_operational_store_path
+
 from ..layer1 import Origin, backfill_line, row_sha256
 from .common import compact, epoch_or_iso_to_ms, open_ro, row_dict, table_exists
 
-DB_REL = "data/media/document_cache.db"
+DB_REL = get_operational_store_path("document_cache", data_dir=Path("data")).as_posix()
 
 
 def convert_media_records(source_home: Path) -> Iterator[dict[str, Any]]:
-    path = source_home / DB_REL
+    path = get_operational_store_path("document_cache", data_dir=source_home / "data")
     if not path.is_file():
         return
     with closing(open_ro(path)) as conn:
@@ -37,7 +39,7 @@ def convert_media_records(source_home: Path) -> Iterator[dict[str, Any]]:
 
 
 def convert_media_descriptions(source_home: Path) -> Iterator[dict[str, Any]]:
-    path = source_home / DB_REL
+    path = get_operational_store_path("document_cache", data_dir=source_home / "data")
     if not path.is_file():
         return
     with closing(open_ro(path)) as conn:

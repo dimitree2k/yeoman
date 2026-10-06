@@ -7,7 +7,12 @@ from pathlib import Path
 
 import typer
 from yeoman_shared.config.loader import load_config
-from yeoman_shared.utils.helpers import ensure_dir, get_operational_data_path, safe_filename
+from yeoman_shared.utils.helpers import (
+    ensure_dir,
+    get_operational_data_path,
+    get_operational_store_path,
+    safe_filename,
+)
 
 from yeoman_gateway.consciousness.log import SpeakupLog
 from yeoman_gateway.knowledge._memory import MemoryService
@@ -46,7 +51,7 @@ def persona_evolution_propose(
     config = load_config()
     policy = load_policy()
     memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
-    speakup_log = SpeakupLog(get_operational_data_path() / "consciousness" / "speakups.db")
+    speakup_log = SpeakupLog(get_operational_store_path("speakups"))
     inbound_archive = InboundArchive(get_operational_data_path() / "inbound" / "reply_context.db")
     try:
         evidence = _run_async(
@@ -95,7 +100,7 @@ def persona_evolution_status(
     config = load_config()
     policy = load_policy()
     memory = MemoryService(workspace=config.workspace_path, config=config.memory, root_config=config)
-    speakup_log = SpeakupLog(get_operational_data_path() / "consciousness" / "speakups.db")
+    speakup_log = SpeakupLog(get_operational_store_path("speakups"))
     try:
         status = _run_async(
             build_persona_evolution_status(
@@ -103,7 +108,7 @@ def persona_evolution_status(
                 workspace=config.workspace_path,
                 memory=memory,
                 speakup_log=speakup_log,
-                state_db_path=_state_db_path(config.workspace_path),
+                state_db_path=_state_db_path(),
                 persona_file=persona_file,
                 channel=channel,
                 chat_id=chat_id,
@@ -178,7 +183,7 @@ def persona_evolution_approve(
     config = load_config()
     result = apply_persona_evolution_proposal(
         workspace=config.workspace_path,
-        state_db_path=_state_db_path(config.workspace_path),
+        state_db_path=_state_db_path(),
         proposal_id=proposal_id,
         approved_by_channel="cli",
         approved_by_chat_id="local",
@@ -191,9 +196,8 @@ def persona_evolution_deny(
     proposal_id: str = typer.Argument(..., help="Persona evolution proposal id"),
 ) -> None:
     """Deny one pending persona-evolution proposal without changing persona files."""
-    config = load_config()
     result = deny_persona_evolution_proposal(
-        state_db_path=_state_db_path(config.workspace_path),
+        state_db_path=_state_db_path(),
         proposal_id=proposal_id,
         denied_by_channel="cli",
         denied_by_chat_id="local",
@@ -205,21 +209,20 @@ def _default_output_path(persona_file: str) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     name = safe_filename(persona_file.replace("/", "-").replace(".", "-"))
     return (
-        get_operational_data_path()
-        / "persona-evolution"
+        get_operational_store_path("persona_evolution")
         / "proposals"
         / f"{stamp}-{name}.md"
     )
 
 
-def _state_db_path(workspace: Path) -> Path:
-    return workspace / "persona-evolution" / "persona-evolution.db"
+def _state_db_path() -> Path:
+    return get_operational_store_path("persona_evolution") / "persona-evolution.db"
 
 
 def _persona_evolution_cron_status(persona_file: str) -> dict[str, object] | None:
     from yeoman_gateway.cron.service import CronService
 
-    service = CronService(store_path=get_operational_data_path() / "cron" / "jobs.json")
+    service = CronService(store_path=get_operational_store_path("cron"))
     for job in service.list_jobs(include_disabled=True):
         if job.payload.kind != "persona_evolution":
             continue

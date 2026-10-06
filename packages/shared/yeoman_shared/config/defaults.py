@@ -5,11 +5,14 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from yeoman_shared.utils.helpers import OPERATIONAL_STORE_PATHS
+
 DEFAULT_ASSISTANT_MODEL = "anthropic/claude-opus-4-5"
 DEFAULT_SUBAGENT_MODEL = "openai/gpt-4o-mini"
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_ASR_MODEL = "whisper-large-v3"
 DEFAULT_TTS_MODEL = "tts-1"
+DEFAULT_PROCESSING_DB_PATH = f"data/{OPERATIONAL_STORE_PATHS['processing']}"
 DEFAULT_SESSION_STATE_DIR = "data/memory/session-state"
 
 DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {

@@ -29,7 +29,7 @@ export function defaultMessageReferenceDir(): string {
   // means "unset", never "the working directory".
   const override = (process.env.BRIDGE_MESSAGE_REFERENCE_DIR || '').trim();
   if (override) return override;
-  return join(homedir(), '.yeoman', 'data', 'bridge', 'whatsapp-message-references');
+  return join(homedir(), '.yeoman', 'data', 'ops', 'bridge-message-references');
 }
 
 type StoredReference = {

@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from yeoman_shared.utils.helpers import get_operational_store_path
+
 _MONTHS = tuple(f"2026-{month:02d}" for month in range(1, 11))
 _RESTRICTED_CLASSES = {"operational", "curated_state", "identity", "restricted", "unknown"}
 _EXCLUDED_PARTS = {"secrets", "auth", "whatsapp-auth", ".ssh"}
@@ -84,20 +86,24 @@ _LIVE_DB_NAMES = {
     "a2a-research.db",
 }
 
+
+def _ops_path(name: str, *parts: str) -> str:
+    return (get_operational_store_path(name, data_dir=Path("data")) / Path(*parts)).as_posix()
+
 # Safe operational path references verified from the effective runtime config.
 # The config itself is intentionally never read or copied by this inventory.
 _CONFIGURED_REFERENCES = (
     ("memory.dbPath", "data/memory/memory.db"),
     ("memory.wal.stateDir", "data/memory/session-state"),
     ("knowledge.dbPath", "data/knowledge/knowledge.db"),
-    ("processing.dbPath", "data/processing/processing.db"),
+    ("processing.dbPath", _ops_path("processing")),
     ("media.incoming.whatsapp", "var/media/incoming/whatsapp"),
     ("media.outgoing.whatsapp", "var/media/outgoing/whatsapp"),
 )
 
 _EXPECTED_SOURCES = (
-    ("data/bridge/whatsapp-message-references", "tree", "native", False, "bridge TTL source"),
-    ("data/processing/processing.db", "live_sqlite", "normalized", False, "canonical journal"),
+    (_ops_path("bridge_references"), "tree", "native", False, "bridge TTL source"),
+    (_ops_path("processing"), "live_sqlite", "normalized", False, "canonical journal"),
     ("data/processing/*.bak", "file", "normalized", False, "static processing database variants"),
     ("data/inbound/reply_context.db", "live_sqlite", "normalized", False, "reply context"),
     ("data/inbound/*.jsonl", "file", "normalized", False, "session JSONL pattern"),
@@ -112,19 +118,24 @@ _EXPECTED_SOURCES = (
     ("data/raw", "reference_only", "native", False, "raw archive by reference"),
     ("data/raw-spool", "reference_only", "native", False, "not included in cold collection"),
     ("data/raw/media", "tree", "media", False, "raw media"),
-    ("data/media/document_cache.db", "live_sqlite", "media", False, "media cache database"),
+    (_ops_path("document_cache"), "live_sqlite", "media", False, "media cache database"),
+    (_ops_path("speakups"), "live_sqlite", "operational", True, "speak-up state"),
+    (_ops_path("burst_state"), "file", "operational", True, "consciousness burst state"),
+    (_ops_path("lull_state"), "file", "operational", True, "consciousness lull state"),
+    (_ops_path("pending_approvals"), "file", "operational", True, "speak-up approvals"),
+    (_ops_path("cron"), "file", "operational", True, "scheduled jobs"),
+    (_ops_path("response_pauses"), "file", "operational", True, "policy response pauses"),
+    (_ops_path("persona_evolution"), "tree", "operational", True, "persona evolution"),
     ("var/media", "tree", "media", False, "media cache"),
     ("data/bridge/whatsapp-outbox/quarantine", "tree", "operational", True, "outbound quarantine"),
     ("data/contacts/contacts.db", "live_sqlite", "identity", True, "legacy contacts"),
     ("data/inbound/chat_registry.db", "live_sqlite", "identity", True, "chat registry"),
     ("data/seen_chats.json", "file", "identity", True, "recently seen chats"),
-    ("data/policy/audit", "tree", "operational", True, "policy audit"),
+    (_ops_path("policy_audit"), "tree", "operational", True, "policy audit"),
     ("policy/audit", "tree", "operational", True, "policy admin audit"),
-    ("data/overseer/audit", "tree", "operational", True, "Overseer audit"),
-    ("data/overseer/.git", "tree", "operational", True, "Overseer repository metadata"),
+    (_ops_path("overseer"), "tree", "operational", True, "Overseer state and runbooks"),
     ("data/a2a/relay.db", "live_sqlite", "operational", True, "A2A relay"),
-    ("data/consciousness", "tree", "operational", True, "consciousness state"),
-    ("data/speakups.db", "live_sqlite", "operational", True, "speak-up state"),
+    ("data/speakups.db", "live_sqlite", "operational", True, "dead duplicate speak-up store"),
     ("data/processing/a2a-research.db", "live_sqlite", "operational", True, "A2A research"),
     ("backups", "tree", "operational", True, "root config and migration backups"),
     ("config.json", "file", "operational", True, "not included in cold collection"),
@@ -865,8 +876,12 @@ def _classify(relative: str) -> tuple[str, bool]:
         return "operational", True
     if lower.startswith(("data/raw/media/", "data/media/", "var/media/")):
         return "media", False
-    if lower.startswith("data/raw/") or lower.startswith("data/bridge/whatsapp-message-references/"):
+    if lower.startswith("data/raw/") or lower.startswith(
+        ("data/bridge/whatsapp-message-references/", "data/ops/bridge-message-references/")
+    ):
         return "native", False
+    if lower == _ops_path("processing"):
+        return "normalized", False
     if "whatsapp-outbox/quarantine" in lower or "/audit/" in f"/{lower}/":
         return "operational", True
     if lower.startswith("data/knowledge/"):
@@ -875,7 +890,7 @@ def _classify(relative: str) -> tuple[str, bool]:
         return "identity", True
     if (
         lower.startswith(
-            ("data/consciousness/", "data/overseer/", "data/policy/", "data/cron/", "data/persona-evolution/")
+            ("data/ops/", "data/consciousness/", "data/overseer/", "data/policy/", "data/cron/", "data/persona-evolution/")
         )
         or "speakups.db" in lower
         or "a2a-research.db" in lower

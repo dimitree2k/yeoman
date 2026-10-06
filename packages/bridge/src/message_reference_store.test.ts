@@ -84,7 +84,7 @@ test('default message reference directory honours BRIDGE_MESSAGE_REFERENCE_DIR',
   // earlier bridge run left six synthetic records there for the test chat.
   delete process.env.BRIDGE_MESSAGE_REFERENCE_DIR;
   const fallback = defaultMessageReferenceDir();
-  assert.equal(fallback, join(process.env.HOME ?? '', '.yeoman', 'data', 'bridge', 'whatsapp-message-references'));
+  assert.equal(fallback, join(process.env.HOME ?? '', '.yeoman', 'data', 'ops', 'bridge-message-references'));
 
   process.env.BRIDGE_MESSAGE_REFERENCE_DIR = override;
   assert.equal(defaultMessageReferenceDir(), override);

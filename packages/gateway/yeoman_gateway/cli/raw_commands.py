@@ -68,7 +68,7 @@ def raw_check_capture() -> None:
     from yeoman_shared.raw_archive.paths import raw_root
     from yeoman_shared.raw_archive.records import archive_files, iter_records
     from yeoman_shared.raw_archive.writer import read_start_ms
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     root = raw_root()
     start_ms = read_start_ms(root)
@@ -96,7 +96,7 @@ def raw_check_capture() -> None:
     raw_results = 0
     ambiguous_results = 0
     try:
-        db_path = get_operational_data_path() / "processing" / "processing.db"
+        db_path = get_operational_store_path("processing")
         db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
         with closing(sqlite3.connect(db_uri, uri=True)) as connection:
             connection.row_factory = sqlite3.Row
@@ -233,12 +233,12 @@ def raw_rebuild_drill(
 ) -> None:
     """Replay one chat from the raw archive into an empty journal."""
     from yeoman_shared.raw_archive.paths import raw_root
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.storage.raw_rebuild import rebuild_chat
 
     home = target or Path(tempfile.mkdtemp(prefix="yeoman-rebuild-"))
-    live = get_operational_data_path() / "processing" / "processing.db" if compare_live else None
+    live = get_operational_store_path("processing") if compare_live else None
     report = rebuild_chat(
         raw_root(),
         channel=channel,

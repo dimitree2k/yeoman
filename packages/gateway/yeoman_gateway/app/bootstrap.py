@@ -562,8 +562,11 @@ class ProcessingStoreUnavailableError(RuntimeError):
 
 
 def _processing_store_path(config: "Config") -> Path:
-    from yeoman_shared.utils.helpers import get_data_path
+    from yeoman_shared.config.defaults import DEFAULT_PROCESSING_DB_PATH
+    from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
 
+    if config.processing.db_path == DEFAULT_PROCESSING_DB_PATH:
+        return get_operational_store_path("processing")
     path = Path(config.processing.db_path).expanduser()
     return path if path.is_absolute() else get_data_path() / path
 
@@ -2616,10 +2619,9 @@ def build_gateway_runtime(
 ) -> GatewayRuntime:
     """Compose full gateway runtime around vNext orchestrator."""
 
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_data_path, get_operational_store_path
 
-    consciousness_data_dir = get_operational_data_path() / "consciousness"
-    speakup_path = consciousness_data_dir / "speakups.db"
+    speakup_path = get_operational_store_path("speakups")
     processing_path = _processing_store_path(config)
     pending_participation_recovery = _has_pending_participation_recovery(
         speakup_path=speakup_path, processing_path=processing_path
@@ -2652,7 +2654,7 @@ def build_gateway_runtime(
             from yeoman_gateway.consciousness.approval import SpeakupApprovalStore
 
             speakup_approval_store = SpeakupApprovalStore(
-                consciousness_data_dir / "pending_approvals.json"
+                get_operational_store_path("pending_approvals")
             )
 
     session_manager = SessionManager(workspace)
@@ -2667,7 +2669,7 @@ def build_gateway_runtime(
         outgoing_dir=config.channels.whatsapp.media.outgoing_path,
     )
     provider_factory = ProviderFactory(config=config)
-    document_cache = DocumentCache(get_operational_data_path() / "media" / "document_cache.db")
+    document_cache = DocumentCache(get_operational_store_path("document_cache"))
     lazy_vision = (
         VisionDescriber(provider_factory)
         if config.channels.whatsapp.media.ocr_images
@@ -2804,7 +2806,7 @@ def build_gateway_runtime(
     except Exception as e:
         logger.warning("memory backfill failed: {}", e)
 
-    cron_store_path = get_operational_data_path() / "cron" / "jobs.json"
+    cron_store_path = get_operational_store_path("cron")
     cron = CronService(cron_store_path, sessions_dir=get_operational_data_path() / "inbound")
     private_handoffs = PrivateHandoffStore(get_operational_data_path() / "policy" / "private_handoffs.json")
 
@@ -3100,7 +3102,9 @@ def build_gateway_runtime(
     workflow_state = WorkflowState(
         store_path=Path(workspace) / "data" / "cron" / "pending_approvals.json"
     )
-    persona_evolution_state_db_path = Path(workspace) / "persona-evolution" / "persona-evolution.db"
+    persona_evolution_state_db_path = (
+        get_operational_store_path("persona_evolution") / "persona-evolution.db"
+    )
 
     async def _on_approval_expired(approval: PendingApproval) -> None:
         content = (
@@ -4225,7 +4229,7 @@ def build_gateway_runtime(
 
         burst_observer = BurstObserver(
             config=config,
-            state_path=consciousness_data_dir / "burst_state.json",
+            state_path=get_operational_store_path("burst_state"),
             on_burst=lambda channel, chat_id: _trigger(channel, chat_id, "burst"),
             is_eligible=lambda channel, chat_id: _observer_eligible(
                 channel, chat_id, trigger="burst"
@@ -4237,7 +4241,7 @@ def build_gateway_runtime(
         if config.consciousness.lull_enabled:
             lull_observer = LullObserver(
                 config=config,
-                state_path=consciousness_data_dir / "lull_state.json",
+                state_path=get_operational_store_path("lull_state"),
                 on_lull=lambda channel, chat_id: _trigger(channel, chat_id, "lull"),
                 is_eligible=lambda channel, chat_id: _observer_eligible(
                     channel, chat_id, trigger="lull"

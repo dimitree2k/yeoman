@@ -20,11 +20,11 @@ def cron_list(
     """List scheduled jobs."""
     import time
 
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
 
     jobs = service.list_jobs(include_disabled=all)
@@ -76,7 +76,7 @@ def cron_add(
     ),
 ) -> None:
     """Add a scheduled job."""
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.cron.types import CronSchedule
@@ -94,7 +94,7 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
 
     job = service.add_job(
@@ -178,7 +178,7 @@ def cron_add_voice(
     import datetime
     from pathlib import Path
 
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
     from yeoman_gateway.cron.types import CronSchedule
@@ -218,7 +218,7 @@ def cron_add_voice(
         console.print("[red]Error: provide --group or --chat-id[/red]")
         raise typer.Exit(1)
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
     job = service.add_voice_job(
         name=name,
@@ -250,11 +250,11 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ) -> None:
     """Remove a scheduled job."""
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
 
     if service.remove_job(job_id):
@@ -269,11 +269,11 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ) -> None:
     """Enable or disable a job."""
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
 
     job = service.enable_job(job_id, enabled=not disable)
@@ -290,11 +290,11 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ) -> None:
     """Manually run a job."""
-    from yeoman_shared.utils.helpers import get_operational_data_path
+    from yeoman_shared.utils.helpers import get_operational_store_path
 
     from yeoman_gateway.cron.service import CronService
 
-    store_path = get_operational_data_path() / "cron" / "jobs.json"
+    store_path = get_operational_store_path("cron")
     service = CronService(store_path)
 
     async def run() -> bool:

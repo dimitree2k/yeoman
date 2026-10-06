@@ -11,7 +11,7 @@ import signal
 from pathlib import Path
 
 import typer
-from yeoman_shared.utils.helpers import get_logs_path, get_operational_data_path, get_run_path
+from yeoman_shared.utils.helpers import get_logs_path, get_operational_store_path, get_run_path
 
 from yeoman_gateway.cli.core import app
 
@@ -20,7 +20,7 @@ app.add_typer(overseer_app, name="overseer")
 
 
 def _data_dir() -> Path:
-    return get_operational_data_path() / "overseer"
+    return get_operational_store_path("overseer")
 
 
 def _pid_path() -> Path:

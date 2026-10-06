@@ -18,7 +18,7 @@ from pathlib import Path
 from yeoman_shared.raw_archive.records import archive_files, is_month_stem, iter_records
 from yeoman_shared.raw_archive.verify import load_suppressions
 from yeoman_shared.raw_archive.writer import read_start_ms, safe_channel
-from yeoman_shared.utils.helpers import get_data_path
+from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
 from yeoman_shared.whatsapp_protocol import REPLAYABLE_EVENT_TYPES
 
 from yeoman_gateway.processing.models import JournalConflictError
@@ -64,7 +64,9 @@ def rebuild_chat(
     target = target_home.expanduser().resolve()
     if target == live_home or live_home in target.parents:
         raise RuntimeError("refusing to rebuild into the live YEOMAN_HOME")
-    journal_path = (target / "data" / "processing" / "processing.db").resolve()
+    journal_path = get_operational_store_path(
+        "processing", data_dir=target / "data"
+    ).resolve()
     if journal_path == live_home or live_home in journal_path.parents:
         raise RuntimeError("refusing to rebuild into the live YEOMAN_HOME")
     if target not in journal_path.parents:
