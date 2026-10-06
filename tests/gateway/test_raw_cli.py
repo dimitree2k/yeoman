@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,73 @@ from yeoman_shared.raw_archive.writer import RawArchive, RawEvent
 runner = CliRunner()
 NOW = 1_800_000_000_000
 CHAT = "chat@g.us"
+SECRET_TEXT = "SECRET_PAYLOAD_should_never_print"
+SECRET_ID = "SECRET_IDENTIFIER_should_never_print"
+
+
+def _capture_home(
+    home: Path,
+    *,
+    effects: Iterable[tuple[str, str, str, str]] = (),
+    receipts: Iterable[tuple[str, str, str, str, str]] = (),
+    raw: Iterable[tuple[str, str, str, str, str | None]] = (),
+    start: bool = True,
+) -> list[Path]:
+    """Create local capture inputs: effect(id, channel, chat, kind), receipt(id, effect, channel, chat, provider)."""
+    archive = RawArchive(clock=lambda: NOW)
+    paths: list[Path] = []
+    for kind, channel, chat_id, correlation, provider_id in raw:
+        native = (
+            {"type": "send_text", "requestId": correlation, "payload": {"text": SECRET_TEXT}}
+            if kind == "outbound_request" and channel == "whatsapp"
+            else {"requestId": correlation, "result": {"providerMessageId": provider_id}}
+            if kind == "outbound_result" and channel == "whatsapp"
+            else {"content": SECRET_TEXT}
+            if kind == "outbound_request"
+            else {"message_id": provider_id}
+        )
+        archive.append(RawEvent(
+            channel=channel, kind=kind, direction="out", native=native,
+            native_id=provider_id or "", chat_id=chat_id, correlation_id=correlation,
+        ))
+    raw_root = home / "data" / "raw"
+    if not start:
+        (raw_root / "START").unlink()
+    for path in raw_root.rglob("*"):
+        if path.is_file():
+            paths.append(path)
+
+    db_path = home / "data" / "processing" / "processing.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            CREATE TABLE effects (
+                effect_id TEXT, payload_kind TEXT, state TEXT, target_json TEXT
+            );
+            CREATE TABLE transport_receipts (
+                receipt_id TEXT, effect_id TEXT, channel TEXT, chat_id TEXT,
+                provider_message_id TEXT, confirmed_ms INTEGER
+            );
+        """)
+        for effect_id, channel, chat_id, payload_kind in effects:
+            connection.execute(
+                "INSERT INTO effects VALUES (?, ?, 'sent', ?)",
+                (effect_id, payload_kind, json.dumps({"channel": channel, "chat_id": chat_id})),
+            )
+        connection.executemany(
+            "INSERT INTO transport_receipts VALUES (?, ?, ?, ?, ?, 1)", receipts
+        )
+    return [path for path in home.rglob("*") if path.is_file()]
+
+
+def _input_bytes(paths: list[Path]) -> dict[Path, bytes]:
+    return {path: path.read_bytes() for path in paths}
+
+
+def _assert_aggregate_output(output: str) -> None:
+    assert SECRET_TEXT not in output
+    assert SECRET_ID not in output
+    assert "secret-chat" not in output
 
 
 @pytest.fixture
@@ -216,3 +284,120 @@ def test_rebuild_drill_compares_with_synthetic_live_journal(
     assert report["missing_vs_live"] == [] and report["extra_vs_live"] == []
     rebuilt = ProcessingStore(target / "data" / "processing" / "processing.db")
     assert rebuilt.get_event("e1") is not None
+
+
+def test_capture_check_passes_complete_whatsapp_pairs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[(SECRET_ID, "whatsapp", "secret-chat", "text"),
+                 ("forward-effect", "whatsapp", "secret-chat", "forward"),
+                 ("delete-effect", "whatsapp", "secret-chat", "delete"),
+                 ("external-effect", "whatsapp", "secret-chat", "external_action")],
+        receipts=[("r1", SECRET_ID, "whatsapp", "secret-chat", SECRET_ID),
+                  ("r-forward", "forward-effect", "whatsapp", "secret-chat", "forward-message")],
+        raw=[("outbound_request", "whatsapp", "secret-chat", SECRET_ID, None),
+             ("outbound_result", "whatsapp", "secret-chat", SECRET_ID, SECRET_ID),
+             ("outbound_request", "whatsapp", "secret-chat", "forward-effect", None),
+             ("outbound_result", "whatsapp", "secret-chat", "forward-effect", "forward-message")],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 0, result.output
+    _assert_aggregate_output(result.output)
+    assert 'effect_kinds={"forward": 1, "text": 1}' in result.output
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_reports_missing_receipt_result_request_and_provider_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("e-receipt", "whatsapp", "secret-chat", "text"),
+                 ("e-result", "whatsapp", "secret-chat", "text"),
+                 ("e-provider", "whatsapp", "secret-chat", "text"),
+                 ("e-no-receipt", "whatsapp", "secret-chat", "text")],
+        receipts=[("r-receipt", "e-receipt", "whatsapp", "secret-chat", SECRET_ID),
+                  ("r-result", "e-result", "whatsapp", "secret-chat", "no-raw-result"),
+                  ("r-provider", "e-provider", "whatsapp", "secret-chat", SECRET_ID)],
+        raw=[("outbound_result", "whatsapp", "secret-chat", "e-result", "missing-result"),
+             ("outbound_request", "whatsapp", "secret-chat", "e-provider", None),
+             ("outbound_result", "whatsapp", "secret-chat", "e-provider", None)],
+    )
+    before = _input_bytes(inputs)
+
+    result = runner.invoke(app, ["raw", "check-capture"])
+
+    assert result.exit_code == 1, result.output
+    _assert_aggregate_output(result.output)
+    assert "missing_receipts=1" in result.output
+    for metric in ("missing_requests", "missing_results", "missing_provider_ids"):
+        value = int(result.output.split(f"{metric}=", 1)[1].split()[0])
+        assert value > 0
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_reports_duplicate_provider_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("e1", "whatsapp", "secret-chat", "text")],
+        receipts=[("r1", "e1", "whatsapp", "secret-chat", SECRET_ID)],
+        raw=[("outbound_request", "whatsapp", "secret-chat", "e1", None),
+             ("outbound_result", "whatsapp", "secret-chat", "e1", SECRET_ID),
+             ("outbound_result", "whatsapp", "secret-chat", "e-other", SECRET_ID)],
+    )
+    before = _input_bytes(inputs)
+    result = runner.invoke(app, ["raw", "check-capture"])
+    assert result.exit_code == 1, result.output
+    _assert_aggregate_output(result.output)
+    assert "ambiguous_provider_ids=1" in result.output
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_matches_telegram_message_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("tg-effect", "telegram", "telegram-chat", "text")],
+        receipts=[("tg-receipt", "tg-effect", "telegram", "telegram-chat", SECRET_ID)],
+        raw=[("outbound_request", "telegram", "telegram-chat", "tg-correlation", None),
+             ("outbound_result", "telegram", "telegram-chat", "tg-correlation", SECRET_ID)],
+    )
+    before = _input_bytes(inputs)
+    result = runner.invoke(app, ["raw", "check-capture"])
+    assert result.exit_code == 0, result.output
+    _assert_aggregate_output(result.output)
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_requires_start_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(tmp_path, start=False)
+    before = _input_bytes(inputs)
+    result = runner.invoke(app, ["raw", "check-capture"])
+    assert result.exit_code == 1
+    _assert_aggregate_output(result.output)
+    assert "start_marker=missing" in result.output
+    assert _input_bytes(inputs) == before
+
+
+def test_capture_check_is_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    inputs = _capture_home(
+        tmp_path,
+        effects=[("e1", "whatsapp", "secret-chat", "text")],
+        receipts=[("r1", "e1", "whatsapp", "secret-chat", SECRET_ID)],
+        raw=[("outbound_request", "whatsapp", "secret-chat", "e1", None),
+             ("outbound_result", "whatsapp", "secret-chat", "e1", SECRET_ID)],
+    )
+    before = _input_bytes(inputs)
+    result = runner.invoke(app, ["raw", "check-capture"])
+    assert result.exit_code == 0, result.output
+    _assert_aggregate_output(result.output)
+    assert _input_bytes(inputs) == before
+    assert {path for path in tmp_path.rglob("*") if path.is_file()} == set(inputs)

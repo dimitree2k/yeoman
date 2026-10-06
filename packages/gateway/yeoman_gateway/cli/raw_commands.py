@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import getpass
 import json
+import sqlite3
 import tempfile
+from collections import Counter
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +60,136 @@ def raw_verify() -> None:
         f"files={report.files_checked} lines={report.lines_total} closed={len(report.closed)}"
     )
     raise typer.Exit(0 if report.ok else 1)
+
+
+@raw_app.command("check-capture")
+def raw_check_capture() -> None:
+    """Compare sent effects and transport receipts with raw outbound capture."""
+    from yeoman_shared.raw_archive.paths import raw_root
+    from yeoman_shared.raw_archive.records import archive_files, iter_records
+    from yeoman_shared.raw_archive.writer import read_start_ms
+    from yeoman_shared.utils.helpers import get_operational_data_path
+
+    root = raw_root()
+    start_ms = read_start_ms(root)
+    missing_receipts = missing_results = missing_requests = 0
+    missing_provider_ids = ambiguous_provider_ids = ambiguous_receipts = 0
+    channel_counts: Counter[str] = Counter()
+    kind_counts: Counter[str] = Counter()
+    if start_ms is None:
+        typer.echo("status=failed start_marker=missing effects=0 receipts=0 outbound_results=0 "
+                   "missing_receipts=0 missing_results=0 missing_requests=0 "
+                   "missing_provider_ids=0 ambiguous_provider_ids=0 ambiguous_receipts=0 "
+                   "channels={} effect_kinds={}")
+        raise typer.Exit(1)
+
+    # Only payloads transported as addressable messages have a provider message ID.
+    # Delete and external actions have no addressable outbound message result.
+    eligible_kinds = {"text", "media", "forward", "reaction"}
+    effect_meta: dict[str, tuple[str, str]] = {}
+    effect_receipts: Counter[str] = Counter()
+    receipts: Counter[tuple[str, str, str, str]] = Counter()
+    request_counts: Counter[tuple[str, str, str]] = Counter()
+    result_counts: Counter[tuple[str, str, str]] = Counter()
+    raw_result_pairs: Counter[tuple[str, str, str]] = Counter()
+    raw_results = 0
+    try:
+        db_path = get_operational_data_path() / "processing" / "processing.db"
+        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(db_uri, uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            for row in connection.execute(
+                "SELECT effect_id, payload_kind, target_json FROM effects "
+                "WHERE state = 'sent'"
+            ):
+                kind = str(row["payload_kind"] or "")
+                if kind not in eligible_kinds:
+                    continue
+                target = json.loads(row["target_json"] or "{}")
+                channel = str(target.get("channel") or "whatsapp")
+                chat_id = str(target.get("chat_id") or "")
+                effect_id = str(row["effect_id"])
+                effect_meta[effect_id] = (channel, chat_id)
+                channel_counts[channel] += 1
+                kind_counts[kind] += 1
+            for row in connection.execute(
+                "SELECT effect_id, channel, chat_id, provider_message_id "
+                "FROM transport_receipts WHERE confirmed_ms IS NOT NULL"
+            ):
+                effect_id = str(row["effect_id"])
+                if effect_id in effect_meta:
+                    effect_receipts[effect_id] += 1
+                    channel, chat_id = str(row["channel"]), str(row["chat_id"])
+                    provider_id = str(row["provider_message_id"] or "")
+                    if effect_meta[effect_id] != (channel, chat_id):
+                        missing_results += 1
+                    receipts[(effect_id, channel, chat_id, provider_id)] += 1
+
+        for path in archive_files(root):
+            for _, record, _ in iter_records(path):
+                if record is None or int(record.get("received_ms") or 0) < start_ms:
+                    continue
+                channel = str(record.get("channel") or "")
+                if channel not in {"whatsapp", "telegram"} or record.get("direction") != "out":
+                    continue
+                kind = str(record.get("kind") or "")
+                native = record.get("native")
+                native = native if isinstance(native, dict) else {}
+                correlation = str(record.get("correlation_id") or native.get("requestId") or "")
+                chat_id = str(record.get("chat_id") or "")
+                if kind == "outbound_request":
+                    request_counts[(channel, chat_id, correlation)] += 1
+                elif kind == "outbound_result":
+                    raw_results += 1
+                    raw_result_pairs[(channel, chat_id, correlation)] += 1
+                    result_payload = native.get("result")
+                    if not isinstance(result_payload, dict):
+                        result_payload = {}
+                    if channel == "whatsapp":
+                        provider_id = str(result_payload.get("providerMessageId") or record.get("native_id") or "")
+                    else:
+                        provider_id = str(native.get("message_id") or record.get("native_id") or "")
+                    if not provider_id:
+                        missing_provider_ids += 1
+                    else:
+                        result_counts[(channel, chat_id, provider_id)] += 1
+
+        for (channel, chat_id, correlation), count in raw_result_pairs.items():
+            if not correlation or request_counts[(channel, chat_id, correlation)] != 1:
+                missing_requests += count
+        ambiguous_provider_ids = sum(count > 1 for count in result_counts.values())
+        for effect_id, (channel, chat_id) in effect_meta.items():
+            receipt_count = effect_receipts[effect_id]
+            if receipt_count != 1:
+                missing_receipts += receipt_count == 0
+                ambiguous_receipts += receipt_count > 1
+        for (effect_id, channel, chat_id, provider_id), count in receipts.items():
+            if count != 1:
+                continue
+            if not provider_id:
+                missing_provider_ids += 1
+            elif result_counts[(channel, chat_id, provider_id)] != 1:
+                missing_results += 1
+
+        status = "ok" if not any((missing_receipts, missing_results, missing_requests,
+                                  missing_provider_ids, ambiguous_provider_ids,
+                                  ambiguous_receipts)) else "failed"
+        typer.echo(
+            f"status={status} start_marker=present effects={len(effect_meta)} "
+            f"receipts={sum(effect_receipts.values())} outbound_results={raw_results} "
+            f"missing_receipts={missing_receipts} missing_results={missing_results} "
+            f"missing_requests={missing_requests} missing_provider_ids={missing_provider_ids} "
+            f"ambiguous_provider_ids={ambiguous_provider_ids} "
+            f"ambiguous_receipts={ambiguous_receipts} "
+            f"channels={json.dumps(dict(channel_counts), sort_keys=True)} "
+            f"effect_kinds={json.dumps(dict(kind_counts), sort_keys=True)}"
+        )
+        raise typer.Exit(0 if status == "ok" else 1)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
+        typer.echo("status=failed start_marker=present error=unreadable_input "
+                   "missing_receipts=0 missing_results=0 missing_requests=0 "
+                   "missing_provider_ids=0 ambiguous_provider_ids=0 ambiguous_receipts=0")
+        raise typer.Exit(1) from None
 
 
 @raw_app.command("seed")
