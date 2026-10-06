@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from yeoman_gateway.app.bootstrap import _processing_store_path
 from yeoman_gateway.processing.models import (
     CANONICAL_WHATSAPP_ORIGIN,
     DAY_MS,
@@ -12,6 +13,7 @@ from yeoman_gateway.processing.models import (
     canonical_hash,
 )
 from yeoman_gateway.processing.store import ProcessingStore
+from yeoman_shared.config.schema import Config
 
 
 def test_event_identity_survives_reopen(tmp_path):
@@ -24,6 +26,21 @@ def test_event_identity_survives_reopen(tmp_path):
     assert db.append_event(event_key="wa:event-1", event_id="e2",
                            trace_id="tr2", payload={"kind": "message"}) == "e1"
     db.close()
+
+
+def test_legacy_default_processing_path_resolves_to_operational_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("YEOMAN_HOME", str(tmp_path))
+    config = Config.model_validate(
+        {"processing": {"db_path": "data/processing/processing.db"}}
+    )
+
+    path = _processing_store_path(config)
+
+    assert path == tmp_path / "data" / "ops" / "processing.db"
+    assert not (tmp_path / "data" / "processing" / "processing.db").exists()
+
+    config.processing.db_path = "custom/processing.sqlite"
+    assert _processing_store_path(config) == tmp_path / "custom" / "processing.sqlite"
 
 
 def test_event_payload_conflict_is_rejected(tmp_path):

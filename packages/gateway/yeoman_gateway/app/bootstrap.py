@@ -565,7 +565,10 @@ def _processing_store_path(config: "Config") -> Path:
     from yeoman_shared.config.defaults import DEFAULT_PROCESSING_DB_PATH
     from yeoman_shared.utils.helpers import get_data_path, get_operational_store_path
 
-    if config.processing.db_path == DEFAULT_PROCESSING_DB_PATH:
+    if config.processing.db_path in {
+        DEFAULT_PROCESSING_DB_PATH,
+        "data/processing/processing.db",
+    }:
         return get_operational_store_path("processing")
     path = Path(config.processing.db_path).expanduser()
     return path if path.is_absolute() else get_data_path() / path
