@@ -83,6 +83,32 @@ def test_later_merge_or_unmerge_wins_for_the_same_pair():
         assert (resolved.resolve(classify(a))[0] == resolved.resolve(classify(b))[0]) is should_merge
 
 
+def test_effective_merge_edges_keep_effective_chronology_and_all_evidence():
+    a, b, c = FRANK_PN, "4915550000000@s.whatsapp.net", "4915550000001@s.whatsapp.net"
+    inp = IdentityInput()
+    for value in (a, b, c):
+        inp.see(classify(value), 1, "raw#1")
+    records = [
+        make("merge", 10, "merge AB", a=a, b=b),
+        make("unmerge", 20, "unmerge AB", a=a, b=b),
+        make("merge", 30, "merge AC", a=a, b=c),
+        make("merge", 40, "merge AB again", a=a, b=b),
+        make("unmerge", 50, "unmerge BC", a=b, b=c),
+    ]
+    inp.attestations.extend(_att(record, n) for n, record in enumerate(records, 1))
+
+    resolved = resolve(inp)
+    assert resolved.resolve(classify(a))[0] == resolved.resolve(classify(c))[0]
+    assert resolved.resolve(classify(a))[0] != resolved.resolve(classify(b))[0]
+    assert resolved.review["blocked_by_unmerge"] == [{
+        "a": a, "b": b, "evidence": "owner_attested", "ref": "owner/attestations.jsonl#4",
+    }] or resolved.review["blocked_by_unmerge"] == [{
+        "a": b, "b": a, "evidence": "owner_attested", "ref": "owner/attestations.jsonl#4",
+    }]
+    refs = {ref for identifier in resolved.identifiers for ref in identifier.source_refs}
+    assert {att.ref for att in inp.attestations} <= refs
+
+
 def test_identifier_ended_is_reported_as_metadata_not_applied():
     inp = IdentityInput()
     inp.see(classify(FRANK_PN), 100, "raw#1")

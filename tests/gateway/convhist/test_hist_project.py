@@ -96,6 +96,28 @@ def test_batch_copies_merge_by_native_anchor_and_repeated_text_stays_separate(tm
     assert report["messages"] == 4 and report["accounting_ok"]
 
 
+def test_unanchored_batch_segments_stay_separate_from_native_text_candidate(tmp_path):
+    live, dev = tmp_path / "live", tmp_path / "dev"
+    write_jsonl(dev / "backfill/memory.jsonl", [_bf("memory", "message", {
+        "chatJid": G, "segments": [
+            {"senderId": "4915550000000@s.whatsapp.net", "text": "repeated"},
+            {"senderId": "4915550000000@s.whatsapp.net", "text": "repeated"},
+        ],
+    }, provenance="verbatim_unverified")])
+    write_jsonl(live / "whatsapp/2026-10.jsonl", [_raw(
+        "message", "message", {"chatJid": G, "messageId": "UNRELATED", "senderId": "4915550000000@s.whatsapp.net",
+                                  "text": "repeated"})])
+
+    report = project([live, dev], tmp_path / "history.db")
+    conn = sqlite3.connect(tmp_path / "history.db")
+    rows = conn.execute("SELECT native_message_id, source_refs FROM messages WHERE text = 'repeated'").fetchall()
+    assert len(rows) == 3
+    assert sum(native_id == "UNRELATED" for native_id, _ in rows) == 1
+    assert {refs for _, refs in rows if "memory.jsonl" in refs} == {
+        '["backfill/memory.jsonl#1/0"]', '["backfill/memory.jsonl#1/1"]'}
+    assert report["messages"] == 3 and report["accounting_ok"]
+
+
 def test_accounting(built):
     report, _, _, _ = built
     assert report["accounting_ok"] is True

@@ -241,7 +241,7 @@ def resolve(inp: IdentityInput) -> Resolution:
         if att.type in ("merge", "unmerge"):
             pair = tuple(sorted((_value(att.fields["a"]), _value(att.fields["b"]))))
             pair_intent[pair] = att
-    active_merges = {pair for pair, att in pair_intent.items() if att.type == "merge"}
+    active_merge_refs = {att.ref for att in pair_intent.values() if att.type == "merge"}
     forbidden = [pair for pair, att in pair_intent.items() if att.type == "unmerge"]
     edges: list[tuple[int, int, str, str, str, str]] = []
     for att in attested:
@@ -251,7 +251,7 @@ def resolve(inp: IdentityInput) -> Resolution:
             refs_of[value].add(att.ref)
         if att.type == "contact":
             edges += [(0, att.at_ms, att.ref, values[0], v, "owner_attested") for v in values[1:]]
-        elif att.type == "identifier" or (att.type == "merge" and tuple(sorted(values)) in active_merges):
+        elif att.type == "identifier" or (att.type == "merge" and att.ref in active_merge_refs):
             edges.append((0, att.at_ms, att.ref, values[0], values[1], "owner_attested"))
     for a, b, evidence, ref in inp.links:
         edges.append((_EDGE_PRIORITY[evidence], 0, ref, a, b, evidence))

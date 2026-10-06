@@ -398,7 +398,9 @@ def _backfill(line: Layer1Line, out: Extracted) -> None:
                 segment_id = segment.get("messageId")
                 position = len(segments) - index - 1
                 batch_key = (json.dumps([chat, str(last_id), position], separators=(",", ":"))
-                             if position > 0 and last_id else None)
+                             if position > 0 and last_id else
+                             json.dumps(["source_ref", f"{line.ref}/{index}"], separators=(",", ":"))
+                             if not last_id else None)
                 segment_media = ({**(parent_media or {}), "kind": segment["mediaKind"]}
                                  if segment.get("mediaKind") else parent_media)
                 _message(out, f"{line.ref}/{index}", segment_payload, channel=channel, chat=chat,
