@@ -61,7 +61,7 @@ _VOLATILE_PROVIDER_FIELDS = frozenset(
 )
 
 RAW_ARCHIVED_COMMANDS = frozenset(
-    {"send_text", "send_media", "react", "delete_message", "forward_message"}
+    {"send_text", "send_media", "send_poll", "react", "delete_message", "forward_message"}
 )
 
 

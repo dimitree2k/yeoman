@@ -708,6 +708,39 @@ def test_outbound_send_is_archived_as_request_and_result(tmp_path: Path) -> None
     assert "secret-t" not in json.dumps(request) + json.dumps(result)
 
 
+def test_send_poll_is_archived_as_request_and_result(tmp_path: Path) -> None:
+    provider_id = "poll-provider-1"
+    channel, ws = _real_send(
+        tmp_path,
+        {"ok": True, "result": {"providerMessageId": provider_id}},
+    )
+    payload = {"to": CHAT, "name": "Lunch?", "options": ["Pizza", "Sushi"]}
+
+    asyncio.run(channel._send_command("send_poll", payload, timeout_seconds=2.0, token="secret-t"))
+
+    records = _records(tmp_path / "raw")
+    requests = [record for record in records if record["kind"] == "outbound_request"]
+    results = [record for record in records if record["kind"] == "outbound_result"]
+    assert len(requests) == len(results) == 1
+    request, result = requests[0], results[0]
+    assert request["native"]["type"] == "send_poll"
+    assert request["native"]["payload"] == payload
+    assert request["correlation_id"] == ws.sent[0]["requestId"]
+    assert result["correlation_id"] == request["correlation_id"]
+    assert result["native_id"] == provider_id
+
+
+def test_all_side_effect_bridge_commands_are_archived() -> None:
+    assert whatsapp_module.RAW_ARCHIVED_COMMANDS == {
+        "send_text",
+        "send_media",
+        "send_poll",
+        "forward_message",
+        "delete_message",
+        "react",
+    }
+
+
 def test_outbound_request_capacity_prevents_send(tmp_path: Path) -> None:
     channel, ws = _real_send(tmp_path, {"ok": True, "result": {"providerMessageId": "P-1"}})
     channel._running = True
@@ -840,6 +873,18 @@ def test_failed_outbound_send_is_archived_with_error(tmp_path: Path) -> None:
 
 def test_presence_and_ack_commands_are_not_archived(tmp_path: Path) -> None:
     channel, _ = _real_send(tmp_path, {"ok": True, "result": {}})
-    asyncio.run(channel._send_command("presence_update", {"to": CHAT}, 2.0, token="t"))
-    asyncio.run(channel._send_command("ack_event", {"eventId": "evt-1"}, 2.0, token="t"))
+    for command_type in (
+        "presence_update",
+        "lookup_message",
+        "list_groups",
+        "login_start",
+        "login_wait",
+        "logout",
+        "subscribe_events",
+        "ack_event",
+        "health",
+    ):
+        asyncio.run(
+            channel._send_command(command_type, {"to": CHAT}, 2.0, token="t")
+        )
     assert _records(tmp_path / "raw") == []
