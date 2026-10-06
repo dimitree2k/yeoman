@@ -4,11 +4,81 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
+
+from yeoman_shared.utils.helpers import get_operational_store_path
 
 from yeoman_gateway.core.intents import SendOutboundIntent
 from yeoman_gateway.core.models import OutboundEvent
 from yeoman_gateway.core.pipeline import NextFn, PipelineContext
+
+
+def _timestamp(value: object) -> tuple[datetime, str] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC), value
+
+
+def _source_seen(data: object) -> tuple[set[str], dict[str, str]]:
+    if not isinstance(data, dict):
+        return set(), {}
+    chats = data.get("chats", [])
+    timestamps: dict[str, str] = {}
+    if isinstance(chats, list):
+        ids = {chat for chat in chats if isinstance(chat, str)}
+    elif isinstance(chats, dict):
+        ids = {chat for chat in chats if isinstance(chat, str)}
+        for chat, value in chats.items():
+            parsed = _timestamp(value)
+            if isinstance(chat, str) and parsed:
+                timestamps[chat] = parsed[1]
+    else:
+        ids = set()
+    first_seen = data.get("first_seen", {})
+    if isinstance(first_seen, dict):
+        for chat, value in first_seen.items():
+            parsed = _timestamp(value)
+            if isinstance(chat, str) and chat in ids and parsed:
+                timestamps[chat] = parsed[1]
+    return ids, timestamps
+
+
+def merge_seen_chat_files(sources: list[Path], destination: Path | None = None) -> Path:
+    """Merge caller-selected legacy files without modifying them."""
+    chats: set[str] = set()
+    timestamps: dict[str, datetime] = {}
+    timestamp_values: dict[str, str] = {}
+    for source in sources:
+        try:
+            data = json.loads(source.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        source_chats, source_timestamps = _source_seen(data)
+        chats.update(source_chats)
+        for chat, value in source_timestamps.items():
+            parsed = _timestamp(value)
+            if parsed and (chat not in timestamps or parsed[0] < timestamps[chat]):
+                timestamps[chat] = parsed[0]
+                timestamp_values[chat] = value
+
+    target = destination or get_operational_store_path("seen_chats")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {"chats": sorted(chats), "first_seen": dict(sorted(timestamp_values.items()))},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return target
 
 
 class NewChatNotifyMiddleware:
@@ -38,14 +108,15 @@ class NewChatNotifyMiddleware:
             return
 
         # Check persistent storage.
-        seen_chats_path = Path.home() / ".yeoman" / "seen_chats.json"
+        seen_chats_path = get_operational_store_path("seen_chats")
         seen_chats: set[str] = set()
+        first_seen: dict[str, str] = {}
         try:
             if seen_chats_path.exists():
-                data = json.loads(seen_chats_path.read_text())
-                seen_chats = set(data.get("chats", []))
+                seen_chats, first_seen = _source_seen(json.loads(seen_chats_path.read_text()))
         except Exception:
             seen_chats = set()
+            first_seen = {}
 
         if full_key in seen_chats:
             self._notified.add(full_key)
@@ -54,9 +125,17 @@ class NewChatNotifyMiddleware:
         # Mark as seen immediately.
         self._notified.add(full_key)
         seen_chats.add(full_key)
+        first_seen.setdefault(full_key, event.timestamp.astimezone(UTC).isoformat())
         try:
             seen_chats_path.parent.mkdir(parents=True, exist_ok=True)
-            seen_chats_path.write_text(json.dumps({"chats": list(seen_chats)}))
+            seen_chats_path.write_text(
+                json.dumps(
+                    {"chats": sorted(seen_chats), "first_seen": dict(sorted(first_seen.items()))},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
         except Exception:
             pass
 

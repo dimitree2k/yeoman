@@ -130,7 +130,9 @@ _EXPECTED_SOURCES = (
     ("data/bridge/whatsapp-outbox/quarantine", "tree", "operational", True, "outbound quarantine"),
     ("data/contacts/contacts.db", "live_sqlite", "identity", True, "legacy contacts"),
     ("data/inbound/chat_registry.db", "live_sqlite", "identity", True, "chat registry"),
-    ("data/seen_chats.json", "file", "identity", True, "recently seen chats"),
+    ("seen_chats.json", "file", "identity", True, "frozen legacy seen chats"),
+    ("data/seen_chats.json", "file", "identity", True, "frozen legacy seen chats"),
+    (_ops_path("seen_chats"), "file", "identity", True, "recently seen chats"),
     (_ops_path("policy_audit"), "tree", "operational", True, "policy audit"),
     ("policy/audit", "tree", "operational", True, "policy admin audit"),
     (_ops_path("overseer"), "tree", "operational", True, "Overseer state and runbooks"),
@@ -886,7 +888,9 @@ def _classify(relative: str) -> tuple[str, bool]:
         return "operational", True
     if lower.startswith("data/knowledge/"):
         return "curated_state", True
-    if lower.startswith("data/contacts/") or "chat_registry.db" in lower or lower.endswith("seen_chats.json"):
+    if lower.startswith("data/contacts/") or "chat_registry.db" in lower or lower.endswith(
+        ("seen_chats.json", "seen-chats.json")
+    ):
         return "identity", True
     if (
         lower.startswith(

@@ -29,7 +29,7 @@ Review the current policy configuration for anomalies or drift.
    ```
    If there is no dated audit file yet, report that no audit entries are
    available; do not alert as an error.
-3. Check for newly detected chats by reading `~/.yeoman/data/seen_chats.json`.
+3. Check for newly detected chats by reading `~/.yeoman/data/ops/seen-chats.json`.
 4. If any chat IDs are present in seen_chats but absent from policy, flag them
    in an alert. If none are missing, report that the cross-reference is clean.
 5. Summarize governance health in your final response.
