@@ -169,6 +169,42 @@ async def test_cron_occurrence_is_not_replayed_after_clock_rollback_and_restart(
     await restarted.tick()
     assert callback.call_count == 1
 
+
+@pytest.mark.asyncio
+async def test_cron_restart_skips_occurrences_missed_before_first_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rb = parse_runbook(_write_cron_runbook(tmp_path, expr="0 8 * * *"))
+    state_path = tmp_path / "state.json"
+    yesterday = datetime(2026, 3, 31, 8, 0, tzinfo=timezone.utc).timestamp()
+    today = datetime(2026, 4, 1, 8, 0, tzinfo=timezone.utc).timestamp()
+    clock = {
+        "wall": datetime(2026, 4, 1, 9, 0, tzinfo=timezone.utc).timestamp(),
+        "monotonic": 1_000.0,
+    }
+    monkeypatch.setattr(evaluator_module.time, "time", lambda: clock["wall"])
+    monkeypatch.setattr(evaluator_module.time, "monotonic", lambda: clock["monotonic"])
+    state = OverseerState(cron_occurrences={"test-cron": yesterday})
+    state.save(state_path)
+    state = OverseerState.load(state_path)
+    callback = AsyncMock()
+    evaluator = TriggerEvaluator(
+        runbooks=[rb], on_triggered=callback, lock_manager=LockManager(),
+        circuit_breaker=CircuitBreaker(), rate_limiter=RateLimiter(),
+        causal_detector=CausalChainDetector(), maintenance=MaintenanceManager(),
+        state=state, persist_state=lambda: state.save(state_path),
+    )
+
+    await evaluator.tick()
+
+    callback.assert_not_called()
+    assert json.loads(state_path.read_text())["cron_occurrences"]["test-cron"] == today
+
+    clock["wall"] += 1
+    clock["monotonic"] += 1
+    await evaluator.tick()
+    callback.assert_not_called()
+
 @pytest.mark.asyncio
 async def test_evaluator_respects_circuit_breaker(tmp_path: Path) -> None:
     rb = parse_runbook(_write_runbook(tmp_path))

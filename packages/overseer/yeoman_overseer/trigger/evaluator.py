@@ -35,6 +35,7 @@ class TriggerEvaluator:
     persist_state: Callable[[], None] | None = None
 
     _last_poll: dict[str, float] = field(default_factory=dict)
+    _cron_initialized: set[str] = field(default_factory=set)
     _cooldown_until: dict[str, float] = field(default_factory=dict)
 
     async def tick(self) -> None:
@@ -73,10 +74,14 @@ class TriggerEvaluator:
 
             elif trigger.kind == "cron":
                 last_occurrence = self.state.cron_occurrences.get(name)
-                if last_occurrence is None:
-                    self.state.cron_occurrences[name] = wall
-                    continue
                 occurrence = croniter(trigger.expr, wall).get_prev(float)
+                if name not in self._cron_initialized:
+                    self._cron_initialized.add(name)
+                    if last_occurrence is None or occurrence > last_occurrence:
+                        self.state.cron_occurrences[name] = occurrence
+                        if self.persist_state:
+                            self.persist_state()
+                    continue
                 if occurrence > last_occurrence:
                     self.state.cron_occurrences[name] = occurrence
                     if self.persist_state:
