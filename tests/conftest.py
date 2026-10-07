@@ -65,7 +65,11 @@ _SESSION_ROOT: list[Path] = []
 
 def pytest_configure(config: pytest.Config) -> None:
     # Runs before collection: some modules resolve runtime paths at import time.
-    parent = Path(os.path.expanduser("~/.cache/yeoman-tests/session-homes"))
+    # Next to --basetemp when given (always writable for the runner, including sandboxes);
+    # pytest recreates basetemp itself, so use its parent rather than basetemp.
+    basetemp = config.option.basetemp
+    parent = (Path(basetemp).resolve().parent if basetemp
+              else Path(os.path.expanduser("~/.cache/yeoman-tests"))) / "session-homes"
     parent.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="session-", dir=parent))
     _SESSION_ROOT.append(root)
