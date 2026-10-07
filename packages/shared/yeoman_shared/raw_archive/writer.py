@@ -48,6 +48,7 @@ STATUS_FILE = "raw-archive.json"
 START_FILE = "START"
 MAX_MEMORY_PENDING = 10_000
 MEDIA_DESCRIPTION_DESTINATION = "derived/media-descriptions.jsonl"
+MEDIA_TRANSCRIPT_DESTINATION = "derived/media-transcripts.jsonl"
 DEFAULT_MAX_VIDEO_BYTES = 50 * 1024 * 1024
 _HASH_CHUNK = 1024 * 1024
 MEDIA_PURGE_LOCK = ".media-purge.lock"
@@ -275,24 +276,33 @@ class RawArchive:
 
     def append_media_description(self, record: Mapping[str, Any]) -> bool:
         """Append a generated description to the fixed derived archive file."""
+        return self._append_derived(record, MEDIA_DESCRIPTION_DESTINATION)
+
+    def append_media_transcript(self, record: dict[str, Any]) -> bool:
+        """True only after durable publication/spooling or owner disposition suppression."""
+        return self._append_derived(record, MEDIA_TRANSCRIPT_DESTINATION, report_durability=True)
+
+    def _append_derived(
+        self, record: Mapping[str, Any], destination: str, *, report_durability: bool = False
+    ) -> bool:
         with self._lock:
             line = dumps(record)
             channel = safe_channel(str(record.get("channel") or ""))
             generated_ms = int(record.get("generated_ms") or self._clock())
             self._drain_locked()
             if self._has_backlog_locked():
-                self._defer_locked(channel, generated_ms, line, MEDIA_DESCRIPTION_DESTINATION, None)
+                spooled = self._defer_locked(channel, generated_ms, line, destination, None)
                 self._publish_status_locked()
-                return False
+                return report_durability and spooled
             try:
                 self._append_archive_line(
-                    channel, generated_ms, line, dict(record), MEDIA_DESCRIPTION_DESTINATION
+                    channel, generated_ms, line, dict(record), destination
                 )
             except OSError as exc:
                 self._note_error(exc)
-                self._defer_locked(channel, generated_ms, line, MEDIA_DESCRIPTION_DESTINATION, None)
+                spooled = self._defer_locked(channel, generated_ms, line, destination, None)
                 self._publish_status_locked()
-                return False
+                return report_durability and spooled
             self._publish_status_locked()
             return True
 
@@ -710,7 +720,7 @@ class RawArchive:
                 received_ms = int(envelope["received_ms"])
                 line = envelope["line"]
                 destination = envelope.get("destination")
-                if destination not in (None, MEDIA_DESCRIPTION_DESTINATION):
+                if destination not in (None, MEDIA_DESCRIPTION_DESTINATION, MEDIA_TRANSCRIPT_DESTINATION):
                     raise ValueError("spool destination is invalid")
                 if not isinstance(channel, str) or not isinstance(line, str):
                     raise ValueError("spool channel and line must be strings")
@@ -837,6 +847,16 @@ async def append_media_description_async(
         logger.error(
             "raw archive media description append crashed error=%s", type(exc).__name__
         )
+
+
+async def append_media_transcript_async(
+    archive: RawArchive | None, record: dict[str, Any]
+) -> None:
+    """Require durable derived text before callers unlink audio or expose enrichment."""
+    if archive is None:
+        return
+    if not await asyncio.to_thread(archive.append_media_transcript, record):
+        raise OSError("raw archive transcript is only retained in memory")
 
 
 async def append_with_media_async(

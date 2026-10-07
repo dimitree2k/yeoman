@@ -25,6 +25,7 @@ from yeoman_shared.raw_archive.writer import (
     append_async,
     append_durable_async,
     append_media_description_async,
+    append_media_transcript_async,
     append_with_media_async,
     media_kind_from_mime,
 )
@@ -2410,6 +2411,7 @@ class WhatsAppChannel(BaseChannel):
     async def _enrich_media_event(self, event: InboundEvent) -> InboundEvent:
         event = await self._enrich_primary_media_event(event)
         event = await self._enrich_quoted_image_event(event)
+        event = await self._enrich_quoted_audio_event(event)
         return event
 
     def _index_approved_enrichments(self, event: InboundEvent) -> None:
@@ -2433,6 +2435,26 @@ class WhatsAppChannel(BaseChannel):
             )
         if enrichments:
             indexer(event.message_id, enrichments)
+
+    async def _enrich_quoted_audio_event(self, event: InboundEvent) -> InboundEvent:
+        if (
+            event.reply_to_media_kind != "audio"
+            or not event.reply_to_message_id
+            or not event.reply_to_media_path
+            or (event.reply_to_text and "[audio_transcript]" in event.reply_to_text)
+        ):
+            return event
+        source = replace(
+            event, message_id=event.reply_to_message_id, media_kind="audio",
+            media_path=event.reply_to_media_path, voice_transcript=None,
+        )
+        enriched = await self._enrich_primary_media_event(source)
+        if not enriched.voice_transcript:
+            return event
+        return replace(
+            event,
+            reply_to_text=f"{event.reply_to_text or ''}\n[audio_transcript] {enriched.voice_transcript}",
+        )
 
     async def _enrich_quoted_image_event(self, event: InboundEvent) -> InboundEvent:
         if (
@@ -2609,16 +2631,32 @@ class WhatsAppChannel(BaseChannel):
                 logger.warning(f"Skipping WhatsApp audio transcription due to missing route: {e}")
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
 
-            transcript = None
+            transcription = None
             try:
-                transcript = await self._asr_transcriber.transcribe(validated_path, profile)
+                transcription = await self._asr_transcriber.transcribe(validated_path, profile)
             except Exception as e:
                 logger.warning(
                     "WhatsApp audio transcription failed {}: {}", e.__class__.__name__, e
                 )
 
-            if not transcript:
+            if transcription is None or not transcription.text.strip():
                 return replace(event, media_path=str(validated_path), media_bytes=size_bytes)
+
+            transcript = transcription.text
+            await append_media_transcript_async(
+                self._raw_archive,
+                {
+                    "raw_archive_version": 1,
+                    "kind": "media_transcript",
+                    "provenance": "derived_only",
+                    "channel": self.name,
+                    "chat_id": event.chat_jid,
+                    "native_message_id": event.message_id,
+                    "generated_ms": int(datetime.now(UTC).timestamp() * 1000),
+                    "generator": transcription.model,
+                    "text": transcript,
+                },
+            )
 
             if self.config.media.delete_audio_after_transcription:
                 with contextlib.suppress(OSError):

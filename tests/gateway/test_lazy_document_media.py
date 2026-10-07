@@ -7,6 +7,7 @@ import pytest
 from yeoman_gateway.agent.tools.media_history import MediaHistoryTool
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
+from yeoman_gateway.media.asr import ASRResult
 from yeoman_gateway.media.document_cache import DocumentCache
 from yeoman_gateway.media.document_processing import DocumentProcessor
 from yeoman_gateway.media.lazy_resolver import LazyMediaResolver
@@ -587,7 +588,7 @@ async def test_pdf_text_and_audio_transcript_are_not_media_descriptions(tmp_path
 
     class _Asr:
         async def transcribe(self, path, profile):
-            return "spoken words"
+            return ASRResult(text="spoken words", model="asr-model")
 
     channel._asr_transcriber = _Asr()
     event = InboundEvent(
@@ -688,3 +689,33 @@ async def test_real_resolver_and_processor_can_be_bounded_by_caller_timeout(
             ),
             timeout=0.01,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider", "configured", "expected"), [
+    ("openai_whisper", "whisper-large-v3", "whisper-1"),
+    ("openai_whisper", None, "whisper-1"),
+    ("groq_whisper", None, "whisper-large-v3"),
+])
+async def test_asr_result_reports_executed_model(tmp_path, monkeypatch, provider, configured, expected):
+    from yeoman_gateway.media import asr
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"synthetic audio")
+    executed = []
+    class Provider:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+
+        async def transcribe(self, path):
+            assert path == audio
+            executed.append(self.model)
+            return "  spoken   words  "
+
+    monkeypatch.setattr(asr, "OpenAITranscriptionProvider", Provider)
+    monkeypatch.setattr(asr, "GroqTranscriptionProvider", Provider)
+    profile = SimpleNamespace(kind="asr", model=configured, provider=provider, timeout_ms=None)
+    result = await asr.ASRTranscriber().transcribe(audio, profile)
+    assert result.model == expected
+    assert result.text == "spoken words"
+    assert executed == [expected]

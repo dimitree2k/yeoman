@@ -1122,3 +1122,49 @@ def test_group_provider_observations_preserve_capture_basis_and_actor(tmp_path):
             else:
                 assert event["actor_basis"] == "native_identifier"
         assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+
+def test_transcript_projects_as_derived_media_not_native_text(tmp_path):
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+    from yeoman_shared.raw_archive.records import iter_records
+    from yeoman_shared.raw_archive.writer import RawArchive
+
+    root = tmp_path / "layer1"
+    native = _raw("message", "message", {
+        "chatJid": G, "messageId": "voice", "participantJid": FRANK_LID,
+        "text": "native caption", "timestamp": T0 // 1000, "media": {"kind": "audio"},
+    })
+    write_jsonl(root / "whatsapp/2026-10.jsonl", [native])
+    archive = RawArchive(root, spool=tmp_path / "spool", status_path=tmp_path / "status")
+    records = [{
+        "raw_archive_version": 1, "kind": "media_transcript", "provenance": "derived_only",
+        "channel": "whatsapp", "chat_id": G, "native_message_id": "voice",
+        "generated_ms": T0 + n, "generator": "asr-model", "text": text,
+    } for n, text in [(2, "new transcript"), (1, "old transcript"), (2, "tie transcript")]]
+    for record in records:
+        archive.append_media_transcript(record)
+    derived = root / "derived/media-transcripts.jsonl"
+    original = derived.read_bytes()
+    snapshots = []
+    for index in range(2):
+        db = tmp_path / f"history-{index}.db"
+        project([root], db)
+        with closing(sqlite3.connect(db)) as conn:
+            row = conn.execute("SELECT current_text, sender_identifier, sender_basis, media_json, source_refs "
+                               "FROM messages_current WHERE native_message_id='voice'").fetchone()
+        assert row[:3] == ("native caption", FRANK_LID, "native_identifier")
+        media = json.loads(row[3])
+        assert media["transcript"] == {
+            "text": "tie transcript", "generator": "asr-model", "generated_ms": T0 + 2,
+            "provenance": "derived_only", "source_ref": "derived/media-transcripts.jsonl#3",
+        }
+        assert set(json.loads(row[4])) >= {f"derived/media-transcripts.jsonl#{n}" for n in (1, 2, 3)}
+        snapshots.append(row)
+    assert snapshots[0] == snapshots[1] and derived.read_bytes() == original
+    assert [r for _, r, _ in iter_records(derived)] == records
+    purge(root, PurgeSelector(channel="whatsapp", native_id="voice"), operator="synthetic", now_ms=T0 + 3)
+    archive.append_media_transcript(records[0] | {"generated_ms": T0 + 4})
+    db = tmp_path / "purged.db"
+    project([root], db)
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0

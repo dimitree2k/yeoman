@@ -623,3 +623,52 @@ def test_append_durable_distinguishes_spool_memory_and_recovery(tmp_path, monkey
     assert archive.append_durable(_event("recovered")) is True
     assert [r["native"]["payload"]["text"] for r in _lines(archive._month_file("whatsapp", NOW))] == [
         "spooled", "recovered"]
+
+
+def test_transcript_spool_capacity_and_purge(tmp_path, monkeypatch):
+    from yeoman_shared.raw_archive.purge import PurgeSelector, purge
+    from yeoman_shared.raw_archive.records import TOMBSTONE
+
+    archive = _archive(tmp_path)
+    record = {
+        "raw_archive_version": 1, "kind": "media_transcript", "provenance": "derived_only",
+        "channel": "whatsapp", "chat_id": "chat@g.us", "native_message_id": "m1",
+        "generator": "asr-model", "generated_ms": NOW, "text": "synthetic transcript",
+    }
+    real_append = writer_module.append_line
+    def fail_all(*args, **kwargs):
+        raise OSError("synthetic failure")
+    monkeypatch.setattr(writer_module, "append_line", fail_all)
+    assert archive.append_media_transcript(record) is True  # Durable spool, not memory.
+    envelope = json.loads(next(archive.spool.glob("*.json")).read_text())
+    assert envelope["destination"] == "derived/media-transcripts.jsonl"
+    monkeypatch.setattr(writer_module, "append_line", real_append)
+    assert archive.drain_spool() == 1
+    target = archive.root / "derived/media-transcripts.jsonl"
+    assert _lines(target) == [record]
+    # Persist another generation before purge, then recover with a fresh writer.
+    monkeypatch.setattr(writer_module, "append_line", fail_all)
+    assert archive.append_media_transcript(record) is True
+    monkeypatch.setattr(writer_module, "append_line", real_append)
+    assert len(list(archive.spool.glob("*.json"))) == 1
+    purge(archive.root, PurgeSelector(channel="whatsapp", native_id="m1"),
+          operator="synthetic", now_ms=NOW + 1)
+    assert _lines(target) == [TOMBSTONE]
+    previous = archive
+    archive = _archive(tmp_path)
+    assert archive is not previous and archive.root == previous.root and archive.spool == previous.spool
+    assert archive.drain_spool() == 1
+    assert _lines(target) == [TOMBSTONE]
+    assert "synthetic transcript" not in target.read_text()
+    assert not list(archive.spool.glob("*.json"))
+    assert archive.append_media_transcript(record | {"generated_ms": NOW + 2}) is True
+    assert _lines(target) == [TOMBSTONE]
+    archive.spool.rmdir()
+    archive.spool.write_text("not a directory")
+    monkeypatch.setattr(writer_module, "MAX_MEMORY_PENDING", 1)
+    monkeypatch.setattr(writer_module, "append_line", fail_all)
+    assert archive.append_media_transcript(record | {"native_message_id": "m2"}) is False
+    before = list(archive._pending)
+    with pytest.raises(writer_module.RawArchiveCapacityError):
+        archive.append_media_transcript(record | {"native_message_id": "m3"})
+    assert archive._pending == before

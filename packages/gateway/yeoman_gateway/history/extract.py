@@ -580,14 +580,15 @@ def _owner(line: Layer1Line, out: Extracted) -> None:
 
 def _derived(line: Layer1Line, out: Extracted) -> None:
     record = line.record or {}
-    if record.get("kind") != "media_description" or not record.get("native_message_id") \
+    if record.get("kind") not in {"media_description", "media_transcript"} or not record.get("native_message_id") \
             or not record.get("text"):
         out.count(line.ref, "skipped:derived_incomplete")
         return
     if (record.get("channel") or "whatsapp") != "whatsapp":
         out.count(line.ref, "out_of_scope_channel")
         return
+    mode = "transcript" if record.get("kind") == "media_transcript" else record.get("mode") or "description"
     out.descriptions.append(Description(line.ref, "whatsapp", record.get("chat_id") or "",
-                                        str(record["native_message_id"]), record.get("mode") or "description",
+                                        str(record["native_message_id"]), mode,
                                         record["text"], record.get("generator"), record.get("generated_ms")))
-    out.count(line.ref, "description")
+    out.count(line.ref, "transcript" if mode == "transcript" else "description")

@@ -12,6 +12,7 @@ import pytest
 import yeoman_gateway.channels.whatsapp as whatsapp_module
 from yeoman_gateway.bus.queue import MessageBus
 from yeoman_gateway.channels.whatsapp import InboundEvent, WhatsAppChannel
+from yeoman_gateway.media.asr import ASRResult
 from yeoman_gateway.media.storage import MediaStorage
 from yeoman_gateway.processing.signals import SignalJournalSink
 from yeoman_gateway.processing.store import ProcessingStore
@@ -1426,4 +1427,96 @@ async def test_stop_settles_raw_thread_and_journals_without_ack(tmp_path, monkey
         if stop is not None:
             await stop
         await channel.stop()
+        store.close()
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "empty", "whitespace", "failed", "volatile", "capacity", "spool"])
+def test_transcript_retained_before_audio_unlink(tmp_path, monkeypatch, quoted, outcome):
+    from yeoman_shared.raw_archive import writer as writer_module
+
+    channel, archive, store = _setup(tmp_path)
+    path = tmp_path / "incoming" / "voice.ogg"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"audio")
+    channel.config.media.enabled = True
+    channel.config.media.transcribe_audio = True
+    channel.config.media.delete_audio_after_transcription = True
+    channel._model_router = type("Router", (), {
+        "resolve": lambda self, task, channel: type("Profile", (), {"model": "asr-model"})()
+    })()
+
+    async def transcribe(path, profile):
+        if outcome == "failed":
+            raise RuntimeError("synthetic ASR failure")
+        text = {"empty": "", "whitespace": "   "}.get(outcome, " exact transcript ")
+        return ASRResult(text=text, model="executed-model") if text else None
+
+    channel._asr_transcriber.transcribe = transcribe
+    monkeypatch.setattr(whatsapp_module, "datetime", _FixedDateTime)
+    event = InboundEvent(
+        message_id="current", chat_jid=CHAT, participant_jid="sender@lid", sender_id="sender",
+        sender_phone_jid=None, is_group=True, text="native caption", timestamp=NOW,
+        mentioned_jids=[], mentioned_bot=False, reply_to_bot=False,
+        reply_to_message_id="source" if quoted else None, reply_to_participant=None,
+        reply_to_text=None, media_kind=None if quoted else "audio", media_type="audio/ogg",
+        media_file_name="voice.ogg", media_path=None if quoted else str(path), media_bytes=5,
+        media_description=None, voice_transcript=None,
+        reply_to_media_kind="audio" if quoted else None,
+        reply_to_media_path=str(path) if quoted else None,
+    )
+    target = archive.root / "derived/media-transcripts.jsonl"
+    if outcome in {"volatile", "capacity", "spool"}:
+        def fail_append(*args, **kwargs):
+            raise OSError("synthetic disk failure")
+        monkeypatch.setattr(writer_module, "append_line", fail_append)
+        if outcome != "spool":
+            archive.spool.write_text("not a directory")
+        monkeypatch.setattr(writer_module, "MAX_MEMORY_PENDING", 1)
+        if outcome == "capacity":
+            assert archive.append_media_transcript({
+                "kind": "media_transcript", "channel": "whatsapp", "chat_id": CHAT,
+                "native_message_id": "older", "generated_ms": NOW, "text": "older transcript",
+            }) is False
+
+    real_unlink = Path.unlink
+    def unlink(audio, *args, **kwargs):
+        if audio == path:
+            if outcome == "spool":
+                assert list(archive.spool.glob("*.json"))
+            else:
+                assert target.exists()
+                assert list(iter_records(target))[0][1]["text"] == " exact transcript "
+        return real_unlink(audio, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    try:
+        if outcome in {"volatile", "capacity"}:
+            with pytest.raises(RawArchiveCapacityError if outcome == "capacity" else OSError):
+                asyncio.run(channel._enrich_media_event(event))
+            assert path.exists()
+            assert event.text == "native caption"
+            return
+        result = asyncio.run(channel._enrich_media_event(event))
+        if outcome in {"failed", "empty", "whitespace"}:
+            assert path.exists() and result == event
+            assert not target.exists() and not list(archive.spool.glob("*.json"))
+            return
+        assert not path.exists()
+        if quoted:
+            assert result.text == "native caption" and result.voice_transcript is None
+            assert " exact transcript " in result.reply_to_text
+        else:
+            assert result.voice_transcript == " exact transcript "
+        if outcome == "spool":
+            record = json.loads(next(archive.spool.glob("*.json")).read_text())["line"]
+            record = json.loads(record)
+        else:
+            record = list(iter_records(target))[0][1]
+        assert record == {
+            "raw_archive_version": 1, "kind": "media_transcript", "provenance": "derived_only",
+            "channel": "whatsapp", "chat_id": CHAT,
+            "native_message_id": "source" if quoted else "current",
+             "generated_ms": NOW, "generator": "executed-model", "text": " exact transcript ",
+        }
+    finally:
         store.close()

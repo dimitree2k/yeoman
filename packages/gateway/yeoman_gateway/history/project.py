@@ -273,14 +273,21 @@ def _attach_media(rows: list[dict[str, Any]], ex: Extracted) -> int:
         for key, value in record.media.items():
             row["media"].setdefault(key, value)
         row["source_refs"] = sorted(set(row["source_refs"]) | {record.ref})
-    for desc in sorted(ex.descriptions, key=lambda x: x.ref):
+    # Transcript generations choose latest time, then physical ref; retain every source line.
+    for desc in sorted(ex.descriptions, key=lambda x: (
+        x.generated_ms if x.mode == "transcript" and x.generated_ms is not None else -1, x.ref
+    )):
         row = by_key.get((desc.channel, desc.chat_id, desc.native_id))
         if row is None:
             unattached += 1
             continue
-        slot = "ocr_text" if desc.mode == "ocr" else "description"
-        row["media"].setdefault(slot, {"text": desc.text, "generator": desc.generator,
-                                       "generated_ms": desc.generated_ms, "provenance": "derived_only"})
+        slot = {"ocr": "ocr_text", "transcript": "transcript"}.get(desc.mode, "description")
+        value = {"text": desc.text, "generator": desc.generator,
+                 "generated_ms": desc.generated_ms, "provenance": "derived_only"}
+        if desc.mode == "transcript":
+            row["media"][slot] = {**value, "source_ref": desc.ref}
+        else:
+            row["media"].setdefault(slot, value)
         row["source_refs"] = sorted(set(row["source_refs"]) | {desc.ref})
     return unattached
 

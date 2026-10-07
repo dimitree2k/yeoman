@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 
 from yeoman_gateway.media.router import ResolvedProfile
@@ -10,6 +11,12 @@ from yeoman_gateway.providers.transcription import (
     GroqTranscriptionProvider,
     OpenAITranscriptionProvider,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ASRResult:
+    text: str
+    model: str
 
 
 class ASRTranscriber:
@@ -30,11 +37,11 @@ class ASRTranscriber:
         self._openai_extra_headers = openai_extra_headers
         self._semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
 
-    async def transcribe(self, audio_path: Path, profile: ResolvedProfile) -> str | None:
+    async def transcribe(self, audio_path: Path, profile: ResolvedProfile) -> ASRResult | None:
         async with self._semaphore:
             return await self._transcribe_once(audio_path, profile)
 
-    async def _transcribe_once(self, audio_path: Path, profile: ResolvedProfile) -> str | None:
+    async def _transcribe_once(self, audio_path: Path, profile: ResolvedProfile) -> ASRResult | None:
         if profile.kind != "asr":
             return None
         if not audio_path.exists() or not audio_path.is_file():
@@ -65,4 +72,4 @@ class ASRTranscriber:
         else:
             return None
         cleaned = " ".join(text.split())
-        return cleaned or None
+        return ASRResult(text=cleaned, model=model) if cleaned else None
