@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+from yeoman_shared.whatsapp_protocol import (
+    bridge_string,
+    normalize_whatsapp_jid,
+    valid_forward_content,
+    valid_poll_result,
+)
 
 from .attestations import Attestation, parse
 from .convert.common import clean_text, media_kind
@@ -20,7 +27,9 @@ _IDENTITY_KINDS = frozenset({"contact_record", "identifier_record", "name_record
 _USABLE_STATUS = frozenset({"", "active", "verified", "candidate", "observed", "confirmed"})
 _SEND_TYPES: dict[str, str | None] = {
     "send_text": None, "send_media": "unknown", "send_image": "image", "send_video": "video",
-    "send_audio": "audio", "send_voice": "audio", "send_document": "document"}
+    "send_audio": "audio", "send_voice": "audio", "send_document": "document",
+    "send_poll": "poll", "forward_message": None}
+_OUTBOUND_TYPES = {*_SEND_TYPES, "delete_message", "react"}
 _MEMBER_ACTIONS = {"add": "member_add", "remove": "member_remove", "promote": "member_promote",
                    "demote": "member_demote"}
 
@@ -79,6 +88,7 @@ class EventCopy:
     payload: dict[str, Any]
     provenance: str
     native_event_id: str | None = None
+    extra_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +121,8 @@ class Extracted:
     identity: IdentityInput = field(default_factory=IdentityInput)
     attestations: list[Attestation] = field(default_factory=list)
     outcomes: Counter[tuple[str, str]] = field(default_factory=Counter)
+    review: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {
+        "outbound_correlations": [], "outbound_content_gaps": []})
 
     def count(self, ref: str, outcome: str) -> None:
         self.outcomes[(ref.split("#", 1)[0], outcome)] += 1
@@ -118,7 +130,7 @@ class Extracted:
 
 def extract(lines: Iterable[Layer1Line]) -> Extracted:
     out = Extracted()
-    pending: dict[str, tuple[Layer1Line, dict[str, Any], str]] = {}
+    pairs: dict[tuple[str, str], list[Layer1Line]] = defaultdict(list)
     for line in lines:
         if line.record is None:
             out.count(line.ref, "invalid_json")
@@ -132,11 +144,22 @@ def extract(lines: Iterable[Layer1Line]) -> Extracted:
         elif sub == "derived":
             _derived(line, out)
         elif sub == "whatsapp":
-            _raw(line, out, pending)
+            record = line.record
+            native = record.get("native") or {}
+            if (record.get("channel", "whatsapp") == "whatsapp"
+                    and record.get("kind") in ("outbound_request", "outbound_result")
+                    and native.get("type") in _OUTBOUND_TYPES):
+                correlation = record.get("correlation_id")
+                if not correlation:
+                    out.count(line.ref, "skipped:outbound_without_correlation")
+                else:
+                    pairs[(str(record.get("account") or "default"), str(correlation))].append(line)
+            else:
+                _raw(line, out)
         else:
             _backfill(line, out)
-    for request_line, _, _ in pending.values():
-        out.count(request_line.ref, "skipped:outbound_without_result")
+    for (account, correlation), copies in sorted(pairs.items()):
+        _outbound(copies, out, account, correlation)
     out.identity.attestations.extend(out.attestations)
     return out
 
@@ -272,8 +295,7 @@ def _raw_time(p: dict[str, Any], record: dict[str, Any]) -> tuple[int | None, st
     return None, "unknown"
 
 
-def _raw(line: Layer1Line, out: Extracted,
-         pending: dict[str, tuple[Layer1Line, dict[str, Any], str]]) -> None:
+def _raw(line: Layer1Line, out: Extracted) -> None:
     record = line.record or {}
     native = record.get("native") or {}
     type_, kind = native.get("type"), record.get("kind")
@@ -297,46 +319,136 @@ def _raw(line: Layer1Line, out: Extracted,
     elif type_ in ("membership_snapshot", "membership_change"):
         out.count(line.ref, _membership(out, line.ref, type_, p, channel=channel, chat=chat, ms=ms,
                                         certainty=certainty, provenance="native"))
-    elif kind == "outbound_request" and type_ in _SEND_TYPES:
-        correlation = str(record.get("correlation_id") or line.ref)
-        previous = pending.get(correlation)
-        if previous is not None:
-            out.count(previous[0].ref, "skipped:duplicate_outbound_correlation")
-        pending[correlation] = (line, p, type_)
-    elif kind == "outbound_result" and type_ in _SEND_TYPES:
-        request = pending.pop(str(record.get("correlation_id") or ""), None)
-        sent = (native.get("result") or {}).get("sent") or {}
-        native_id = sent.get("messageId") or sent.get("providerMessageId")
-        if request is None or not native_id:
-            if request is not None:
-                out.count(request[0].ref, "skipped:outbound_not_sent")
-            out.count(line.ref, "skipped:outbound_not_sent")
-            return
-        request_line, request_p, request_type = request
-        kind_of_media = _SEND_TYPES[request_type]
-        _message(out, request_line.ref,
-                 {"text": request_p.get("text") or request_p.get("caption"),
-                  "replyToMessageId": request_p.get("replyToMessageId")},
-                 channel=channel, chat=record.get("chat_id") or request_p.get("to") or chat,
-                 native_id=native_id, direction="out", ms=record.get("received_ms"),
-                 certainty="capture_time_approx" if record.get("received_ms") else "unknown",
-                 provenance="native", from_assistant=True,
-                 media={"kind": kind_of_media} if kind_of_media else None, extra_refs=(line.ref,))
-        out.count(request_line.ref, "message")
-        out.count(line.ref, "skipped:outbound_result_paired")
-    elif kind == "outbound_request" and type_ == "react":
-        emoji = p.get("emoji") or ""
-        received = record.get("received_ms")
-        out.events.append(EventCopy(line.ref, 0, "reaction", channel, chat, p.get("messageId"), None, None,
-                                    True, received, "capture_time_approx" if received else "unknown",
-                                    {"emoji": emoji or None, "removed": emoji == ""}, "native"))
-        out.count(line.ref, "event")
-    elif kind == "outbound_result":
-        out.count(line.ref, "skipped:outbound_result_paired")
     elif type_ == "receipt" or kind == "receipt":
         out.count(line.ref, "skipped:receipt")
     else:
         out.count(line.ref, f"skipped:unhandled:{kind}:{type_}")
+
+
+def _outbound_keys(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize identifier fields on copies; preserve content and original captures."""
+    normalized = dict(payload)
+    for key, value in payload.items():
+        if key in ("to", "chatJid", "sourceChatJid", "participantJid") and isinstance(value, str):
+            normalized[key] = normalize_whatsapp_jid(value)
+        elif key in ("messageId", "sourceMessageId", "providerMessageId", "clientMessageId",
+                     "outboundMessageId", "replyToMessageId") and isinstance(value, str):
+            normalized[key] = bridge_string(value) or ""
+        elif key in ("sent", "forwarded", "deleted", "reacted", "content") and isinstance(value, dict):
+            normalized[key] = _outbound_keys(value)
+    return normalized
+
+
+def _outbound(lines: list[Layer1Line], out: Extracted, account: str, correlation: str) -> None:
+    requests = sorted((line for line in lines if line.record["kind"] == "outbound_request"), key=lambda line: line.ref)
+    results = sorted((line for line in lines if line.record["kind"] == "outbound_result"), key=lambda line: line.ref)
+
+    def signature(line: Layer1Line) -> str:
+        r = line.record or {}
+        n = r.get("native") or {}
+        return json.dumps([normalize_whatsapp_jid(r.get("chat_id") or ""), n.get("type"),
+                           _outbound_keys(n.get("payload") or {}) if r["kind"] == "outbound_request"
+                           else [_outbound_keys(n["result"]) if isinstance(n.get("result"), dict)
+                                 else n.get("result"), n.get("error")]], sort_keys=True)
+
+    incompatible_pair = bool(requests and results and (
+        requests[0].record["native"]["type"] != results[0].record["native"]["type"]
+        or (requests[0].record.get("chat_id") and results[0].record.get("chat_id")
+            and normalize_whatsapp_jid(requests[0].record["chat_id"])
+            != normalize_whatsapp_jid(results[0].record["chat_id"]))))
+    if (incompatible_pair or len({signature(line) for line in requests}) > 1
+            or len({signature(line) for line in results}) > 1):
+        out.review["outbound_correlations"].append({"account": account, "correlation_id": correlation,
+                                                  "source_refs": sorted(line.ref for line in lines),
+                                                  "reason": "conflicting_outbound_correlation"})
+        for line in lines:
+            out.count(line.ref, "skipped:conflicting_outbound_correlation")
+        return
+    if not requests or not results:
+        for line in lines:
+            out.count(line.ref, "skipped:outbound_without_result" if requests else "skipped:outbound_without_request")
+        return
+    request, result = requests[0], results[0]
+    rn, sn = request.record["native"], result.record["native"]
+    type_ = rn["type"]
+    p = _outbound_keys(rn.get("payload") or {})
+    result_data = sn.get("result") or {}
+    if not isinstance(result_data, dict):
+        result_data = {}
+    result_data = _outbound_keys(result_data)
+    wrapper = {"forward_message": "forwarded", "delete_message": "deleted", "react": "reacted"}.get(type_, "sent")
+    sent = result_data.get(wrapper) or {}
+    if not isinstance(sent, dict):
+        sent = {}
+    chat = normalize_whatsapp_jid(request.record.get("chat_id") or p.get("to") or p.get("chatJid") or "")
+    native_id = sent.get("providerMessageId")
+    # Legacy messageId is provider evidence only when it is not the caller's fallback ID.
+    if not native_id and type_ != "react" and sent.get("messageId") != sent.get("clientMessageId"):
+        native_id = sent.get("messageId")
+    success = (not sn.get("error") and result_data.get("ok") is not False
+               and sn.get("type") == type_
+               and (not result.record.get("chat_id") or normalize_whatsapp_jid(result.record["chat_id"]) == chat))
+    if type_ == "delete_message":
+        success = (success and isinstance(sent.get("messageId"), str)
+                   and sent["messageId"] == (p.get("messageId") or "")
+                   and sent.get("chatJid") == (p.get("chatJid") or chat))
+    else:
+        success = success and isinstance(native_id, str) and bool(native_id)
+        if type_ == "react":
+            success = success and sent.get("messageId") == p.get("messageId") and sent.get("chatJid") == chat
+        elif sent.get("to"):
+            success = success and sent["to"] == chat
+    if not success:
+        for line in lines:
+            out.count(line.ref, "skipped:outbound_not_sent")
+        return
+    refs = tuple(sorted(line.ref for line in lines if line.ref != request.ref))
+    ms = result.record.get("received_ms")
+    certainty = "capture_time_approx" if ms is not None else "unknown"
+    if type_ in ("delete_message", "react"):
+        emoji = p.get("emoji") or ""
+        out.events.append(EventCopy(request.ref, 0, "delete" if type_ == "delete_message" else "reaction",
+                                    "whatsapp", chat, sent["messageId"], None, None, True, ms, certainty,
+                                    {} if type_ == "delete_message" else {"emoji": emoji or None, "removed": emoji == ""},
+                                    "native", None if type_ == "delete_message" else native_id, refs))
+        outcome = "event"
+    else:
+        text = p.get("text") or p.get("caption")
+        media = {"kind": _SEND_TYPES[type_]} if _SEND_TYPES[type_] else None
+        gap = None
+        if type_ == "send_poll":
+            text = None
+            if valid_poll_result(sent.get("poll")):
+                media = {"kind": "poll", "poll": sent["poll"]}
+            else:
+                gap = "missing_normalized_poll"
+        elif type_ == "forward_message":
+            content = sent.get("content")
+            text = None
+            origin = {"forwarded": True, "sourceChatJid": p.get("sourceChatJid"),
+                      "sourceMessageId": p.get("sourceMessageId"), "provenance": "unknown"}
+            media = {"forward": origin}
+            if (valid_forward_content(content) and content["sourceChatJid"] == p.get("sourceChatJid")
+                    and content["sourceMessageId"] == p.get("sourceMessageId")):
+                text = content["text"] if content["text"] is not None else content["caption"]
+                origin["provenance"] = content["provenance"]
+                media = {**(content["media"] or {}), "forward": origin}
+                if text is None and content["media"] is None:
+                    gap = "missing_forwarded_body"
+            else:
+                gap = "missing_forwarded_body"
+        if gap:
+            out.review["outbound_content_gaps"].append({"reason": gap, "native_message_id": native_id,
+                                                       "source_refs": [request.ref, *refs]})
+        _message(out, request.ref, {"text": text, "replyToMessageId": p.get("replyToMessageId")},
+                 channel="whatsapp", chat=chat, native_id=native_id, direction="out", ms=ms,
+                 certainty=certainty, provenance="native", from_assistant=True, media=media, extra_refs=refs)
+        outcome = "message"
+    out.count(request.ref, outcome)
+    for line in requests[1:]:
+        out.count(line.ref, "skipped:duplicate_outbound_correlation")
+    for line in results:
+        out.count(line.ref, "skipped:outbound_result_paired")
 
 
 def _identity(ref: str, kind: str, record: dict[str, Any], p: dict[str, Any], out: Extracted) -> str:

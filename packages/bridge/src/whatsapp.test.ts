@@ -1642,3 +1642,79 @@ test('repeated encrypted edits are observation-only and leave the original secre
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Task 6: no provider connection; every client uses its own reference store.
+async function outboundContractClient(t: any) {
+  const root = await mkdtemp(join(tmpdir(), 'yeoman-task6-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const client = new WhatsAppClient({ authDir: join(root, 'auth'), messageReferenceDir: join(root, 'references'),
+    onMessage: () => {}, onQR: () => {}, onStatus: () => {}, onError: () => {} });
+  (client as any).connected = true;
+  return client;
+}
+
+test('poll_result_uses_normalized_question_options', async (t) => {
+  const client = await outboundContractClient(t);
+  const calls: any[] = [];
+  (client as any).sock = { sendMessage: async (...args: any[]) => {
+    calls.push(args); return { key: { id: 'POLL' } };
+  } };
+  const options = [' ', ...Array.from({ length: 14 }, (_, i) => ` option-${i} `)];
+  const result = await client.sendPoll({ to: 'target@g.us', question: 'q'.repeat(600), options,
+    maxSelections: 20, clientMessageId: 'CLIENT' });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { to: 'target@g.us', messageId: 'POLL',
+    providerMessageId: 'POLL', clientMessageId: 'CLIENT', options: 14,
+    poll: { name: 'q'.repeat(512), values: options.slice(1, 13).map(x => x.trim()), selectableCount: 12 } });
+  assert.deepEqual((result as any).poll, calls[0][1].poll);
+  assert.deepEqual(calls[0][2], { messageId: 'CLIENT' });
+  const before = calls.length;
+  await assert.rejects(client.sendPoll({ to: 'target@g.us', question: 'bad', options: [' ', 'one'] }));
+  assert.equal(calls.length, before);
+  (client as any).sock.sendMessage = async () => { throw new Error('provider failed'); };
+  await assert.rejects(client.sendPoll({ to: 'target@g.us', question: 'valid', options: ['a', 'b'] }), /provider failed/);
+});
+
+test('forward_result_preserves_sent_content', async (t) => {
+  const client = await outboundContractClient(t);
+  await (client as any).referenceStore.open();
+  const source = proto.WebMessageInfo.fromObject({ key: { remoteJid: 'source@g.us', id: 'SOURCE' },
+    message: { imageMessage: { caption: 'source caption', mimetype: 'image/jpeg', fileLength: 12,
+      mediaKey: Buffer.from('secret'), url: 'https://invalid.example/encrypted', directPath: '/encoded' } } });
+  await (client as any).referenceStore.put('source@g.us', 'SOURCE', source);
+  const input = { to: 'target@g.us', sourceChatJid: 'source@g.us', sourceMessageId: 'SOURCE', clientMessageId: 'CLIENT' };
+  const calls: any[] = [];
+  let body: any = { conversation: 'actually sent' };
+  (client as any).sock = { sendMessage: async (...args: any[]) => {
+    calls.push(args); return { key: { id: 'FORWARD' }, ...(body ? { message: body } : {}) };
+  } };
+  const sent = await client.forwardMessage(input);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), { to: input.to, messageId: 'FORWARD',
+    providerMessageId: 'FORWARD', clientMessageId: 'CLIENT', content: { text: 'actually sent', caption: null,
+      media: null, forwarded: true, sourceChatJid: input.sourceChatJid, sourceMessageId: 'SOURCE', provenance: 'sent' } });
+  assert.deepEqual(calls[0], [input.to, { forward: source }, { messageId: 'CLIENT' }]);
+  body = undefined;
+  const fallback = await client.forwardMessage(input);
+  assert.deepEqual((fallback as any).content, { text: null, caption: 'source caption',
+    media: { kind: 'image', mimeType: 'image/jpeg', bytes: 12 }, forwarded: true,
+    sourceChatJid: 'source@g.us', sourceMessageId: 'SOURCE', provenance: 'source' });
+  const serialized = JSON.stringify(fallback);
+  for (const forbidden of ['mediaKey', 'secret', 'url', 'directPath', 'encoded']) assert.ok(!serialized.includes(forbidden));
+  const before = calls.length;
+  await assert.rejects(client.forwardMessage({ ...input, sourceMessageId: 'MISSING' }));
+  assert.equal(calls.length, before);
+  (client as any).sock.sendMessage = async () => { throw new Error('provider failed'); };
+  await assert.rejects(client.forwardMessage(input), /provider failed/);
+});
+
+test('delete_result_keeps_target_not_new_message_id', async (t) => {
+  const client = await outboundContractClient(t);
+  const calls: any[] = [];
+  (client as any).sock = { sendMessage: async (...args: any[]) => {
+    calls.push(args); return { key: { id: 'DELETE-ACK' } };
+  } };
+  const result = await client.deleteMessage({ chatJid: 'target@g.us', messageId: ' TARGET ' });
+  assert.deepEqual(result, { chatJid: 'target@g.us', messageId: 'TARGET' });
+  assert.deepEqual(calls, [['target@g.us', { delete: { remoteJid: 'target@g.us', fromMe: true, id: 'TARGET' } }]]);
+  (client as any).sock.sendMessage = async () => { throw new Error('provider failed'); };
+  await assert.rejects(client.deleteMessage({ chatJid: 'target@g.us', messageId: 'TARGET' }), /provider failed/);
+});

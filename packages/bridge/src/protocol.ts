@@ -208,6 +208,67 @@ export interface BridgeSendResult {
   clientMessageId?: string;
 }
 
+/** Optional additions to v5; old results without body fields remain readable. */
+export interface BridgePollResult extends BridgeSendResult {
+  options: number;
+  poll: { name: string; values: string[]; selectableCount: number };
+}
+
+export interface BridgeForwardContent {
+  text: string | null;
+  caption: string | null;
+  media: Record<string, unknown> | null;
+  forwarded: true;
+  sourceChatJid: string;
+  sourceMessageId: string;
+  provenance: 'sent' | 'source';
+}
+
+export interface BridgeForwardResult extends BridgeSendResult {
+  content: BridgeForwardContent;
+}
+
+export const FORWARD_CONTENT_FIELDS = [
+  'text', 'caption', 'media', 'forwarded', 'sourceChatJid', 'sourceMessageId', 'provenance',
+] as const;
+export const POLL_RESULT_FIELDS = ['name', 'values', 'selectableCount'] as const;
+
+export function validateOutboundResult(type: string, result: Record<string, unknown>): boolean {
+  const wrapper = type === 'forward_message' ? 'forwarded' : type === 'delete_message' ? 'deleted' :
+    type === 'react' ? 'reacted' : type === 'send_poll' ? 'sent' : undefined;
+  if (!wrapper) return true;
+  const body = result[wrapper];
+  if (!isRecord(body)) return false;
+  if (type === 'delete_message') return Boolean(asString(body.chatJid) && asString(body.messageId));
+  if (type === 'react') return Boolean(asString(body.chatJid) && asString(body.messageId));
+  if (!asString(body.to)) return false;
+  for (const field of ['messageId', 'providerMessageId', 'clientMessageId']) {
+    if (body[field] !== undefined && !asString(body[field])) return false;
+  }
+  if (type === 'send_poll') {
+    if (!Number.isSafeInteger(body.options) || (body.options as number) < 2) return false;
+    if (body.poll === undefined) return true; // legacy v5
+    const poll = body.poll;
+    return isRecord(poll) && Object.keys(poll).length === POLL_RESULT_FIELDS.length &&
+      Object.keys(poll).every(k => (POLL_RESULT_FIELDS as readonly string[]).includes(k)) &&
+      typeof poll.name === 'string' && asString(poll.name) !== null && poll.name.length <= 512 && Array.isArray(poll.values) &&
+      poll.values.length >= 2 && poll.values.length <= 12 && poll.values.every(x => asString(x) !== null) &&
+      Number.isSafeInteger(poll.selectableCount) && (poll.selectableCount as number) >= 1 &&
+      (poll.selectableCount as number) <= 12;
+  }
+  if (body.content === undefined) return true; // legacy v5
+  const content = body.content;
+  if (!isRecord(content) || Object.keys(content).length !== FORWARD_CONTENT_FIELDS.length ||
+      !Object.keys(content).every(k => (FORWARD_CONTENT_FIELDS as readonly string[]).includes(k)) ||
+      ![content.text, content.caption].every(x => x === null || typeof x === 'string') ||
+      content.forwarded !== true || !asString(content.sourceChatJid) || !asString(content.sourceMessageId) ||
+      typeof content.provenance !== 'string' || !['sent', 'source'].includes(content.provenance)) return false;
+  const media = content.media;
+  return media === null || (isRecord(media) && ['image', 'video', 'audio', 'document', 'sticker'].includes(String(media.kind)) &&
+    Object.entries(media).every(([key, value]) => (MEDIA_METADATA_FIELDS as readonly string[]).includes(key) &&
+      (key === 'bytes' ? Number.isSafeInteger(value) && (value as number) >= 0 : typeof value === 'string')));
+}
+
 export interface ProviderEventIdentity {
   eventId: string;
   eventKey: string;

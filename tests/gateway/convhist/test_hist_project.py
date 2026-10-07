@@ -44,7 +44,8 @@ def test_reaction_echo_is_one_arvid_event(built):
     assert rows[0]["actor_contact_id"] == arvid
     assert rows[0]["actor_identifier"] == G and rows[0]["actor_basis"] == "reaction_echo"
     assert rows[0]["target_message_id"] == f"whatsapp:{G}:AC1"
-    assert json.loads(rows[0]["source_refs"]) == ["whatsapp/2026-10.jsonl#2", "whatsapp/2026-10.jsonl#4"]
+    assert json.loads(rows[0]["source_refs"]) == ["whatsapp/2026-10.jsonl#4"]
+    # The historical request/empty result is not proof of success; the provider echo is independent.
     assert json.loads(rows[0]["payload_json"])["current"] is True
 
 
@@ -128,7 +129,7 @@ def test_accounting(built):
     assert report["accounting_ok"] is True
     raw = report["outcomes"]["whatsapp/2026-10.jsonl"]
     assert raw["invalid_json"] == 1 and raw["skipped:receipt"] == 1
-    assert raw["skipped:outbound_result_paired"] == 1
+    assert raw["skipped:outbound_not_sent"] == 2
     session = report["outcomes"]["backfill/session_jsonl.jsonl"]
     assert session["out_of_scope_channel"] == 1 and session["skipped:tool_trace"] == 1
 
@@ -860,3 +861,202 @@ def test_author_purged_segment_keeps_surviving_refs_and_accounting(tmp_path):
         assert len(result['review']['author_targets']) == 1
     assert report['review']['author_targets'] == verified['review']['author_targets']
     assert report['outcomes']['owner/attestations.jsonl']['skipped:invalid_author_target'] == 1
+
+
+def test_outbound_pair_crosses_month_and_deduplicates_echo(tmp_path):
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import Layer1Line
+
+    chat = "4915550000000-1@g.us"
+    poll = {"name": "Lunch?", "values": ["One", "Two"], "selectableCount": 1}
+    request = {**_raw("outbound_request", "send_poll", {"to": chat, "question": " Lunch? ",
+                "options": [" One ", " Two "]}, direction="out", corr="month"), "chat_id": chat}
+    result = {**_raw("outbound_result", "send_poll", {}, direction="out", corr="month"), "chat_id": chat}
+    result["native"]["result"] = {"sent": {"providerMessageId": "POLL", "messageId": "POLL",
+                                             "options": 2, "poll": poll}}
+    echo = {**_raw("message", "message", {"chatJid": chat, "messageId": "POLL", "fromAssistant": True,
+                    "media": {"kind": "poll", "poll": poll}}), "chat_id": chat}
+    request["received_ms"] = 1769903999000  # 2026-01-31 23:59:59 UTC
+    result["received_ms"] = echo["received_ms"] = 1769904000000  # February first line
+    jan = [request, request]
+    feb = [result, result, echo, _raw("receipt", "receipt", {"messageId": "POLL"})]
+    # Conflicting requests and results must not choose a winner.
+    bad_request = {**request, "correlation_id": "conflict"}
+    bad_other = {**bad_request, "native": {"type": "send_poll", "payload": {
+        **request["native"]["payload"], "question": "different"}}}
+    bad_result = {**result, "correlation_id": "conflict"}
+    bad_results = [{**request, "correlation_id": "result-conflict"},
+                   {**result, "correlation_id": "result-conflict"},
+                   {**result, "correlation_id": "result-conflict", "native": {"type": "send_poll",
+                    "result": {"sent": {"messageId": "OTHER", "poll": poll}}}}]
+    feb.extend([bad_request, bad_other, bad_result, *bad_results])
+
+    def pair(type_, payload, returned, correlation):
+        req = {**_raw("outbound_request", type_, payload, direction="out", corr=correlation), "chat_id": chat}
+        ret = {**_raw("outbound_result", type_, {}, direction="out", corr=correlation), "chat_id": chat}
+        ret["native"]["result"] = returned
+        feb.extend([req, ret, ret])
+
+    forward = {"text": "sent body", "caption": None, "media": None, "forwarded": True,
+               "sourceChatJid": chat, "sourceMessageId": "SOURCE", "provenance": "sent"}
+    pair("forward_message", {"to": chat, "sourceChatJid": chat, "sourceMessageId": "SOURCE"},
+         {"forwarded": {"providerMessageId": "FORWARD", "content": forward}}, "forward")
+    pair("delete_message", {"chatJid": chat, "messageId": "FORWARD"},
+         {"deleted": {"chatJid": chat, "messageId": "FORWARD"}}, "delete")
+    pair("react", {"chatJid": chat, "messageId": "FORWARD", "emoji": "x"},
+         {"reacted": {"chatJid": chat, "messageId": "FORWARD", "providerMessageId": "REACTION"}}, "reaction")
+    pair("forward_message", {"to": chat, "sourceChatJid": chat, "sourceMessageId": "OLD"},
+         {"forwarded": {"messageId": "OLD-FORWARD"}}, "historical-forward")
+    feb.append({**_raw("reaction", "reaction", {"chatJid": chat, "targetMessageId": "FORWARD",
+               "senderId": chat, "emoji": "x", "nativeEventId": "REACTION"}), "chat_id": chat})
+    lines = [Layer1Line(f"whatsapp/{month}.jsonl#{i}", r)
+             for month, records in [("2026-01", jan), ("2026-02", feb)]
+             for i, r in enumerate(records, 1)]
+    for ordered in (lines, list(reversed(lines))):
+        ex = extract(ordered)
+        assert len([m for m in ex.messages if m.native_id == "POLL"]) == 2  # pair plus native echo
+        assert {r["correlation_id"] for r in ex.review["outbound_correlations"]} == {
+            "conflict", "result-conflict"}
+        assert sum(ex.outcomes.values()) == len(lines)
+    root = tmp_path / "layer1"
+    write_jsonl(root / "whatsapp/2026-01.jsonl", jan)
+    write_jsonl(root / "whatsapp/2026-02.jsonl", feb)
+    write_jsonl(root / "owner/attestations.jsonl", [make("contact", 1, "synthetic assistant",
+               identifiers=["4915550000009@s.whatsapp.net"], role="assistant")])
+    write_jsonl(root / "backfill/journal.jsonl", [_bf("journal", "message", {
+        "messageId": "FORWARD", "fromAssistant": True, "principal": "4915550000001",
+        "addressee": "4915550000001", "text": "sent body"}, direction="out", chat=chat)])
+    originals = {p: p.read_bytes() for p in root.rglob("*.jsonl")}
+    db = tmp_path / "history.db"
+    report = project([root], db)
+    assert report["accounting_ok"]
+    assert len(report["review"]["outbound_correlations"]) == 2
+    assert report["review"]["outbound_content_gaps"][0]["native_message_id"] == "OLD-FORWARD"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 3
+        row = conn.execute("SELECT * FROM messages WHERE native_message_id='POLL'").fetchone()
+        assert row["native_message_id"] == "POLL" and row["direction"] == "out"
+        assert json.loads(row["media_json"]) == {"kind": "poll", "poll": poll}
+        assert row["sent_ms"] == result["received_ms"]
+        assert row["sender_contact_id"] == conn.execute(
+            "SELECT contact_id FROM contacts WHERE role='assistant'").fetchone()[0]
+        assert json.loads(row["source_refs"]) == [f"whatsapp/{month}.jsonl#{i}"
+            for month, indices in [("2026-01", [1, 2]), ("2026-02", [1, 2, 3])] for i in indices]
+        events = conn.execute("SELECT * FROM message_events ORDER BY kind").fetchall()
+        assert [(e["kind"], e["target_native_id"]) for e in events] == [("delete", "FORWARD"), ("reaction", "FORWARD")]
+        assert all(e["actor_contact_id"] == row["sender_contact_id"] for e in events)
+        assert all(len(json.loads(e["source_refs"])) >= 3 for e in events)
+        assert events[1]["native_event_id"] == "REACTION"
+        forwarded = conn.execute("SELECT * FROM messages WHERE native_message_id='FORWARD'").fetchone()
+        assert forwarded["text"] == "sent body" and forwarded["sender_contact_id"] == row["sender_contact_id"]
+        assert forwarded["sender_identifier"] is None and forwarded["direction"] == "out"
+        assert json.loads(forwarded["media_json"])["forward"]["provenance"] == "sent"
+    assert all(p.read_bytes() == data for p, data in originals.items())
+
+
+@pytest.mark.parametrize("kind", ["reaction", "delete"])
+@pytest.mark.parametrize("alias", [1, 2, 3])
+def test_outbound_event_extra_refs_receive_timed_author_before_clustering(tmp_path, kind, alias):
+    from yeoman_gateway.history.attestations import resolve_author_targets
+    from yeoman_gateway.history.extract import extract
+    from yeoman_gateway.history.layer1 import iter_layer1
+
+    chat, old, new, phone = "4915550000000-1@g.us", "97001@lid", "97002@lid", "4915550000001@s.whatsapp.net"
+    command = "react" if kind == "reaction" else "delete_message"
+    payload = {"chatJid": chat, "messageId": "TARGET", **({"emoji": "x"} if kind == "reaction" else {})}
+    returned = {"chatJid": chat, "messageId": "TARGET", **({"providerMessageId": "REACTION"} if kind == "reaction" else {})}
+    request = {**_raw("outbound_request", command, payload, direction="out", received=T0+50, corr="alias"), "chat_id": chat}
+    result = {**_raw("outbound_result", command, {}, direction="out", received=T0+50, corr="alias"), "chat_id": chat}
+    result["native"]["result"] = {"reacted" if kind == "reaction" else "deleted": returned}
+    echo = {**_raw(kind, kind, {"chatJid": chat, "targetMessageId": "TARGET", "senderId": old,
+                              **({"emoji": "x", "nativeEventId": "REACTION"} if kind == "reaction" else {})},
+                  received=T0+50), "chat_id": chat}
+    root = tmp_path / "layer1"
+    source = root / "whatsapp/aliases.jsonl"
+    write_jsonl(source, [request, request, result, echo])
+    contacts = [make("contact", 1, "synthetic old", identifiers=[old]),
+                make("contact", 1, "synthetic new", identifiers=[new]),
+                make("contact", 1, "synthetic assistant", identifiers=["4915550000009@s.whatsapp.net"], role="assistant"),
+                make("identifier", 2, "synthetic old ownership", anchor=old, identifier=phone, valid_from_ms=T0, valid_until_ms=T0+100),
+                make("identifier", 3, "synthetic new ownership", anchor=new, identifier=phone, valid_from_ms=T0+100)]
+    correction = make("author", T0+500, "synthetic alias correction", source_ref=f"whatsapp/aliases.jsonl#{alias}", anchor=phone)
+    owners = root / "owner/attestations.jsonl"
+    write_jsonl(owners, contacts + [correction])
+    original = source.read_bytes()
+    ex = extract(iter_layer1([root]))
+    assert len(ex.events) == 2  # one paired copy and one independent provider echo
+    winners, review = resolve_author_targets(ex.attestations, ex.messages, ex.events)
+    assert set(winners) == {"whatsapp/aliases.jsonl#1"} and review == []
+    db = tmp_path / "history.db"
+    report = project([root], db)
+    assert report["accounting_ok"] and report["review"]["author_targets"] == []
+    with closing(sqlite3.connect(db)) as conn:
+        rows = conn.execute("SELECT actor_contact_id, actor_basis, source_refs FROM message_events").fetchall()
+        assert len(rows) == 1  # corrected actor must match echo before grouping
+        old_contact = conn.execute("SELECT contact_id FROM identifier_history WHERE value=?", (old,)).fetchone()[0]
+        assert rows[0][:2] == (old_contact, "owner_attested")  # target time, not correction time
+        assert json.loads(rows[0][2]) == ["owner/attestations.jsonl#6", *[f"whatsapp/aliases.jsonl#{i}" for i in range(1, 5)]]
+    # Contradictory alias claims meet on the same canonical event, latest wins, both remain reviewed.
+    write_jsonl(owners, contacts + [correction, make("author", T0+501, "synthetic contradictory alias",
+                source_ref=f"whatsapp/aliases.jsonl#{2 if alias == 3 else 3}", anchor=new)])
+    conflict = project([root], db)
+    (claim,) = [item for item in conflict["review"]["author_targets"] if item["reason"] == "conflicting_author_claims"]
+    assert claim["source_ref"] == "whatsapp/aliases.jsonl#1"
+    assert len(claim["claims"]) == 2 and claim["winner_ref"] == "owner/attestations.jsonl#7"
+    assert source.read_bytes() == original
+
+
+def test_outbound_identifiers_follow_bridge_normalization(tmp_path):
+    import copy
+
+    chat, device = "4915550000001@s.whatsapp.net", "4915550000001:7@s.whatsapp.net"
+    source_chat = "4915550000002@s.whatsapp.net"
+    poll = {"name": "Lunch?", "values": ["one", "two"], "selectableCount": 1}
+    content = {"text": "forwarded", "caption": None, "media": None, "forwarded": True,
+               "sourceChatJid": source_chat, "sourceMessageId": "SOURCE", "provenance": "sent"}
+    records = []
+
+    def pair(command, payload, returned, corr):
+        raw_chat = payload.get("to") or payload["chatJid"]
+        request = {**_raw("outbound_request", command, payload, direction="out", corr=corr), "chat_id": raw_chat}
+        result = {**_raw("outbound_result", command, {}, direction="out", corr=corr), "chat_id": raw_chat}
+        result["native"]["result"] = returned
+        records.extend([request, result])
+        return request
+
+    pair("send_text", {"to": f" {chat} ", "text": "text"}, {"sent": {"to": chat, "providerMessageId": "TEXT"}}, "text")
+    pair("send_poll", {"to": f" {chat} ", "question": "Lunch?", "options": ["one", "two"]},
+         {"sent": {"to": chat, "providerMessageId": "POLL", "options": 2, "poll": poll}}, "poll")
+    forward = pair("forward_message", {"to": f" {device} ", "sourceChatJid": " 4915550000002:8@s.whatsapp.net ", "sourceMessageId": " SOURCE "},
+                   {"forwarded": {"to": chat, "providerMessageId": "FORWARD", "content": content}}, "forward")
+    # Equivalent normalized duplicate must retain its ref rather than conflict.
+    records.append({**forward, "chat_id": chat, "native": {"type": "forward_message", "payload": {
+        "to": chat, "sourceChatJid": source_chat, "sourceMessageId": "SOURCE"}}})
+    pair("delete_message", {"chatJid": f" {device} ", "messageId": " FORWARD "},
+         {"deleted": {"chatJid": chat, "messageId": "FORWARD"}}, "delete")
+    pair("react", {"chatJid": f" {chat} ", "messageId": " FORWARD ", "emoji": "x"},
+         {"reacted": {"chatJid": chat, "messageId": "FORWARD", "providerMessageId": "REACTION"}}, "react")
+    different = pair("forward_message", {"to": chat, "sourceChatJid": source_chat, "sourceMessageId": "SOURCE"},
+                     {"forwarded": {"to": chat, "providerMessageId": "CONFLICT", "content": content}}, "different")
+    records.append({**different, "native": {"type": "forward_message", "payload": {
+        **different["native"]["payload"], "sourceMessageId": "ANOTHER"}}})
+    original = copy.deepcopy(records)
+    root, db = tmp_path / "layer1", tmp_path / "history.db"
+    path = write_jsonl(root / "whatsapp/normalized.jsonl", records)
+    raw_bytes = path.read_bytes()
+    report = project([root], db)
+    assert report["accounting_ok"] and report["review"]["outbound_content_gaps"] == []
+    assert [item["correlation_id"] for item in report["review"]["outbound_correlations"]] == ["different"]
+    with closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        messages = conn.execute("SELECT * FROM messages ORDER BY native_message_id").fetchall()
+        assert [row["native_message_id"] for row in messages] == ["FORWARD", "POLL", "TEXT"]
+        assert all(row["chat_id"] == chat for row in messages)
+        assert messages[0]["text"] == "forwarded"
+        assert json.loads(messages[0]["media_json"])["forward"]["sourceChatJid"] == source_chat
+        assert json.loads(messages[0]["media_json"])["forward"]["sourceMessageId"] == "SOURCE"
+        events = conn.execute("SELECT * FROM message_events ORDER BY kind").fetchall()
+        assert [(row["kind"], row["chat_id"], row["target_native_id"], row["target_message_id"]) for row in events] == [
+            (kind, chat, "FORWARD", f"whatsapp:{chat}:FORWARD") for kind in ("delete", "reaction")]
+    assert records == original and path.read_bytes() == raw_bytes

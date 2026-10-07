@@ -73,7 +73,9 @@ def test_outbound_pairing_and_leftovers():
             correlation_id="c2"),
         raw(4, "outbound_request", "react", {"chatJid": G, "messageId": "AC1", "emoji": "😂"},
             direction="out", correlation_id="c3"),
-        raw(5, "outbound_result", "react", {}, direction="out", correlation_id="c3"),
+        raw(5, "outbound_result", "react", {}, direction="out", correlation_id="c3",
+            native={"result": {"reacted": {"chatJid": G, "messageId": "AC1",
+                                            "providerMessageId": "REACTION"}}}),
     ])
     (message,) = ex.messages
     assert (message.native_id, message.text, message.from_assistant, message.direction) == ("3EB0", "Antwort", True, "out")
@@ -213,7 +215,7 @@ def test_malformed_attestation_types_are_counted_invalid():
     assert sum(ex.outcomes.values()) == len(lines)
 
 
-def test_duplicate_outbound_correlation_counts_replaced_request():
+def test_conflicting_outbound_correlation_is_reviewed():
     lines = [
         raw(1, "outbound_request", "send_text", {"text": "erste", "to": G}, direction="out",
             correlation_id="same"),
@@ -223,9 +225,98 @@ def test_duplicate_outbound_correlation_counts_replaced_request():
             native={"result": {"sent": {"messageId": "3EB0"}}}),
     ]
     ex = extract(lines)
-    (message,) = ex.messages
-    assert message.text == "zweite"
-    assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:duplicate_outbound_correlation")] == 1
-    assert ex.outcomes[("whatsapp/2026-10.jsonl", "message")] == 1
-    assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:outbound_result_paired")] == 1
+    assert ex.messages == []
+    assert ex.review["outbound_correlations"][0]["source_refs"] == [line.ref for line in lines]
+    assert ex.outcomes[("whatsapp/2026-10.jsonl", "skipped:conflicting_outbound_correlation")] == 3
     assert sum(ex.outcomes.values()) == len(lines)
+
+
+def test_outbound_content_requires_success_and_native_result():
+    import copy
+
+    lines = []
+
+    def pair(type_, payload, result=None, *, error=None):
+        corr = f"task6-{len(lines)}"
+        lines.append(raw(len(lines) + 1, "outbound_request", type_, payload,
+                         direction="out", correlation_id=corr))
+        if result is not None or error:
+            lines.append(raw(len(lines) + 1, "outbound_result", type_, {}, direction="out",
+                             correlation_id=corr, native={"error": error} if error else {"result": result}))
+
+    poll = {"name": "Question", "values": ["One", "Two"], "selectableCount": 1}
+    pair("send_poll", {"to": G, "question": "untrimmed", "options": [" One ", "Two", ""]},
+         {"sent": {"messageId": "POLL", "providerMessageId": "POLL", "options": 2, "poll": poll}})
+    content = {"text": None, "caption": "Picture", "media": {"kind": "image", "mimeType": "image/jpeg"},
+               "forwarded": True, "sourceChatJid": "4915550000001@s.whatsapp.net",
+               "sourceMessageId": "SOURCE", "provenance": "source"}
+    pair("forward_message", {"to": G, "sourceChatJid": content["sourceChatJid"], "sourceMessageId": "SOURCE"},
+         {"forwarded": {"providerMessageId": "FORWARD", "messageId": "FORWARD", "content": content}})
+    pair("delete_message", {"chatJid": G, "messageId": "TARGET"},
+         {"deleted": {"chatJid": G, "messageId": "TARGET"}})
+    pair("react", {"chatJid": G, "messageId": "TARGET", "emoji": "x"},
+         {"reacted": {"chatJid": G, "messageId": "TARGET", "providerMessageId": "REACTION"}})
+    pair("forward_message", {"to": G, "sourceChatJid": G, "sourceMessageId": "OLD"},
+         {"forwarded": {"messageId": "OLD-FORWARD"}})
+    for type_, payload in [("send_text", {"to": G, "text": "failed"}),
+                           ("send_poll", {"to": G, "question": "failed", "options": ["a", "b"]}),
+                           ("forward_message", {"to": G, "sourceChatJid": G, "sourceMessageId": "SOURCE"}),
+                           ("delete_message", {"chatJid": G, "messageId": "FAILED"}),
+                           ("react", {"chatJid": G, "messageId": "FAILED", "emoji": "x"})]:
+        pair(type_, payload, error="provider failed")
+        pair(type_, payload)  # pending
+    pair("send_text", {"to": G, "text": "client-only"},
+         {"sent": {"messageId": "CLIENT", "clientMessageId": "CLIENT"}})
+    pair("react", {"chatJid": G, "messageId": "FAILED", "emoji": "x"}, {})
+    original = copy.deepcopy(lines)
+    ex = extract(lines)
+    assert {m.native_id for m in ex.messages} == {"POLL", "FORWARD", "OLD-FORWARD"}
+    by_id = {m.native_id: m for m in ex.messages}
+    assert by_id["POLL"].text is None and by_id["POLL"].media == {"kind": "poll", "poll": poll}
+    assert by_id["FORWARD"].text == "Picture"
+    assert by_id["FORWARD"].media == {**content["media"], "forward": {
+        "forwarded": True, "sourceChatJid": content["sourceChatJid"], "sourceMessageId": "SOURCE",
+        "provenance": "source"}}
+    assert by_id["OLD-FORWARD"].text is None
+    assert all(m.direction == "out" and m.from_assistant and m.sender is None for m in ex.messages)
+    assert [(e.kind, e.target_native_id) for e in ex.events] == [("delete", "TARGET"), ("reaction", "TARGET")]
+    assert ex.events[1].native_event_id == "REACTION"
+    assert all(e.from_assistant and e.extra_refs for e in ex.events)
+    assert ex.review["outbound_content_gaps"][0]["native_message_id"] == "OLD-FORWARD"
+    assert sum(ex.outcomes.values()) == len(lines)
+    assert lines == original
+    # A single request/result with different command types is a correlation conflict too.
+    mismatched = [raw(100, "outbound_request", "send_poll", {"to": G}, correlation_id="mismatch"),
+                  raw(101, "outbound_result", "send_text", {}, correlation_id="mismatch",
+                      native={"result": {"sent": {"messageId": "WRONG"}}})]
+    mismatch = extract(mismatched)
+    assert not mismatch.messages and not mismatch.events
+    assert mismatch.review["outbound_correlations"][0]["correlation_id"] == "mismatch"
+    assert sum(mismatch.outcomes.values()) == 2
+
+
+def test_outbound_result_validator_parity():
+    from yeoman_shared.whatsapp_protocol import valid_forward_content, valid_poll_result
+
+    poll = {"name": "Lunch?", "values": ["one", "two"], "selectableCount": 1}
+    content = {"text": "sent", "caption": None, "media": None, "forwarded": True,
+               "sourceChatJid": G, "sourceMessageId": "SOURCE", "provenance": "sent"}
+    cases = [
+        ("supplementary-name", valid_poll_result, {**poll, "name": "😀" * 300}, False),
+        ("blank-source", valid_forward_content, {**content, "sourceChatJid": " "}, False),
+        ("unsafe-bytes", valid_forward_content, {**content, "media": {"kind": "image", "bytes": 9007199254740992}}, False),
+        ("array-provenance", valid_forward_content, {**content, "provenance": ["sent"]}, False),
+        ("utf16-limit", valid_poll_result, {**poll, "name": "😀" * 256}, True),
+        ("utf16-over-limit", valid_poll_result, {**poll, "name": "😀" * 257}, False),
+        ("blank-name", valid_poll_result, {**poll, "name": " \ufeff "}, False),
+        ("blank-option", valid_poll_result, {**poll, "values": ["one", "\ufeff"]}, False),
+        ("safe-bytes", valid_forward_content, {**content, "media": {"kind": "image", "bytes": 9007199254740991}}, True),
+        ("padded-source", valid_forward_content, {**content, "sourceChatJid": f" {G} "}, True),
+        ("blank-message", valid_forward_content, {**content, "sourceMessageId": "\ufeff"}, False),
+        ("js-nonwhitespace", valid_forward_content, {**content, "sourceMessageId": "\u0085"}, True),
+        ("integral-number", valid_poll_result, {**poll, "selectableCount": 1.0}, True),
+        ("fractional-number", valid_poll_result, {**poll, "selectableCount": 1.5}, False),
+        ("boolean-number", valid_poll_result, {**poll, "selectableCount": True}, False),
+    ]
+    results = [(name, validate(value), expected) for name, validate, value, expected in cases]
+    assert all(actual is expected for _, actual, expected in results), results

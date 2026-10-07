@@ -413,3 +413,50 @@ test('response envelope uses protocol v3', () => {
   assert.equal(err.version, PROTOCOL_VERSION);
   assert.equal(err.type, 'response');
 });
+
+for (const [name, type, result] of [
+  ['poll_result_uses_normalized_question_options', 'send_poll', { sent: { to: 'target@g.us', options: 2,
+    poll: { name: 'Lunch?', values: ['one', 'two'], selectableCount: 1 } } }],
+  ['forward_result_preserves_sent_content', 'forward_message', { forwarded: { to: 'target@g.us', content: {
+    text: 'sent', caption: null, media: null, forwarded: true, sourceChatJid: 'source@g.us',
+    sourceMessageId: 'SOURCE', provenance: 'sent' } } }],
+  ['delete_result_keeps_target_not_new_message_id', 'delete_message', { deleted: { chatJid: 'target@g.us', messageId: 'TARGET' } }],
+] as const) {
+  test(`${name}: protocol validates additive result fields`, async () => {
+    const protocol = await import('./protocol.js');
+    const validate = (protocol as any).validateOutboundResult;
+    assert.equal(typeof validate, 'function');
+    assert.equal(validate(type, result), true);
+    assert.equal(validate(type, { invalid: {} }), false);
+    assert.equal(validate(type, { ...result, [Object.keys(result)[0]]: { ...Object.values(result)[0],
+      ...(type === 'send_poll' ? { poll: { name: 1, values: [], selectableCount: true } } :
+         type === 'forward_message' ? { content: { ...(result as any).forwarded.content, media: { kind: 'image', mediaKey: 'secret' } } } :
+         { messageId: 17 }) } }), false);
+  });
+}
+
+test('outbound_result_validator_parity', async () => {
+  const { validateOutboundResult } = await import('./protocol.js');
+  const poll = { name: 'Lunch?', values: ['one', 'two'], selectableCount: 1 };
+  const content = { text: 'sent', caption: null, media: null, forwarded: true,
+    sourceChatJid: '4915550000000-1@g.us', sourceMessageId: 'SOURCE', provenance: 'sent' };
+  const cases: [string, string, Record<string, unknown>, boolean][] = [
+    ['supplementary-name', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, name: '😀'.repeat(300) } } }, false],
+    ['blank-source', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, sourceChatJid: ' ' } } }, false],
+    ['unsafe-bytes', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, media: { kind: 'image', bytes: 9007199254740992 } } } }, false],
+    ['array-provenance', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, provenance: ['sent'] } } }, false],
+    ['utf16-limit', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, name: '😀'.repeat(256) } } }, true],
+    ['utf16-over-limit', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, name: '😀'.repeat(257) } } }, false],
+    ['blank-name', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, name: ' \ufeff ' } } }, false],
+    ['blank-option', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, values: ['one', '\ufeff'] } } }, false],
+    ['safe-bytes', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, media: { kind: 'image', bytes: 9007199254740991 } } } }, true],
+    ['padded-source', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, sourceChatJid: ` ${content.sourceChatJid} ` } } }, true],
+    ['blank-message', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, sourceMessageId: '\ufeff' } } }, false],
+    ['js-nonwhitespace', 'forward_message', { forwarded: { to: 'target@g.us', content: { ...content, sourceMessageId: '\u0085' } } }, true],
+    ['integral-number', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, selectableCount: 1.0 } } }, true],
+    ['fractional-number', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, selectableCount: 1.5 } } }, false],
+    ['boolean-number', 'send_poll', { sent: { to: 'target@g.us', options: 2, poll: { ...poll, selectableCount: true } } }, false],
+  ];
+  const results = cases.map(([name, type, result, expected]) => [name, validateOutboundResult(type, result), expected]);
+  assert.ok(results.every(([, actual, expected]) => actual === expected), JSON.stringify(results));
+});

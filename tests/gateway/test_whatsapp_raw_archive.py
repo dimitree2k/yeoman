@@ -713,9 +713,11 @@ def test_send_poll_is_archived_as_request_and_result(tmp_path: Path) -> None:
     provider_id = "poll-provider-1"
     channel, ws = _real_send(
         tmp_path,
-        {"ok": True, "result": {"providerMessageId": provider_id}},
+        {"ok": True, "result": {"sent": {"to": CHAT, "providerMessageId": provider_id,
+          "messageId": provider_id, "options": 2,
+          "poll": {"name": "Lunch?", "values": ["Pizza", "Sushi"], "selectableCount": 1}}}},
     )
-    payload = {"to": CHAT, "name": "Lunch?", "options": ["Pizza", "Sushi"]}
+    payload = {"to": CHAT, "question": "Lunch?", "options": ["Pizza", "Sushi"]}
 
     asyncio.run(channel._send_command("send_poll", payload, timeout_seconds=2.0, token="secret-t"))
 
@@ -910,3 +912,28 @@ def test_presence_and_ack_commands_are_not_archived(tmp_path: Path) -> None:
             channel._send_command(command_type, {"to": CHAT}, 2.0, token="t")
         )
     assert _records(tmp_path / "raw") == []
+
+
+@pytest.mark.parametrize("command,payload,result,provider_id", [
+    ("send_poll", {"to": CHAT, "question": "Lunch?", "options": [" One ", "Two"]},
+     {"sent": {"to": CHAT, "messageId": "POLL", "providerMessageId": "POLL", "options": 2,
+      "poll": {"name": "Lunch?", "values": ["One", "Two"], "selectableCount": 1}}}, "POLL"),
+    ("forward_message", {"to": CHAT, "sourceChatJid": CHAT, "sourceMessageId": "SOURCE"},
+     {"forwarded": {"to": CHAT, "messageId": "FORWARD", "providerMessageId": "FORWARD", "content": {
+        "text": "forwarded text", "caption": None, "media": None, "forwarded": True,
+        "sourceChatJid": CHAT, "sourceMessageId": "SOURCE", "provenance": "sent"}}}, "FORWARD"),
+    ("delete_message", {"chatJid": CHAT, "messageId": "TARGET"},
+     {"deleted": {"chatJid": CHAT, "messageId": "TARGET"}}, ""),
+    ("react", {"chatJid": CHAT, "messageId": "TARGET", "emoji": "x"},
+     {"reacted": {"chatJid": CHAT, "messageId": "TARGET", "providerMessageId": "REACTION"}}, "REACTION"),
+])
+def test_outbound_normalized_result_fields_are_archived(tmp_path, command, payload, result, provider_id):
+    channel, ws = _real_send(tmp_path, {"ok": True, "result": result})
+    returned = asyncio.run(channel._send_command(command, payload, timeout_seconds=2.0, token="synthetic-token"))
+    request, response = _records(tmp_path / "raw")
+    assert returned == result
+    assert request["native"]["payload"] == payload
+    assert response["native"]["result"] == result
+    assert request["correlation_id"] == response["correlation_id"] == ws.sent[0]["requestId"]
+    assert response["native_id"] == provider_id  # delete target is not an outbound provider ID
+    assert "synthetic-token" not in json.dumps([request, response])

@@ -21,6 +21,7 @@ import {
   parseSendMediaPayload,
   parseSendPollPayload,
   parseSendTextPayload,
+  validateOutboundResult,
   MAX_BRIDGE_FRAME_BYTES,
   PROTOCOL_VERSION,
   type BridgeEventEnvelope,
@@ -416,6 +417,9 @@ export class BridgeServer {
 
     try {
       const result = await this.executeCommand(cmd.type, cmd.payload);
+      if (!validateOutboundResult(cmd.type, result)) {
+        throw protocolError('ERR_SCHEMA', 'Invalid outbound result', false);
+      }
       this.sendToClient(
         meta,
         createOkResponse({

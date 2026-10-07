@@ -15,7 +15,7 @@ import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
-import { createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES } from './protocol.js';
+import { createEventEnvelope, deriveEditSignalIdentity, deriveProviderEventIdentity, MAX_BRIDGE_FRAME_BYTES, MEDIA_METADATA_FIELDS, type BridgeForwardResult, type BridgePollResult } from './protocol.js';
 import {
   defaultMessageReferenceDir,
   MessageReferenceStore,
@@ -2276,12 +2276,7 @@ export class WhatsAppClient {
     return sendResult(to, sent, clientMessageId);
   }
 
-  async forwardMessage(input: ForwardMessageInput): Promise<{
-    to: string;
-    messageId?: string;
-    providerMessageId?: string;
-    clientMessageId?: string;
-  }> {
+  async forwardMessage(input: ForwardMessageInput): Promise<BridgeForwardResult> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -2306,7 +2301,20 @@ export class WhatsAppClient {
       input.clientMessageId ? { messageId: input.clientMessageId } : {},
     );
     this.rememberOutboundSelfMessage(input.to, sent);
-    return sendResult(input.to, sent, input.clientMessageId);
+    const provenance = sent?.message ? 'sent' : 'source';
+    const body = sent?.message ? sent : source;
+    const extracted = this.extractMessageTextAndMedia(body);
+    const unwrapped = this.unwrapNestedMessage(body.message);
+    const captionNode = unwrapped?.imageMessage || unwrapped?.videoMessage || unwrapped?.documentMessage;
+    const caption = typeof captionNode?.caption === 'string' ? captionNode.caption : null;
+    // Reuse the native formatter, then the wire whitelist; never include provider ciphertext/keys.
+    const media = extracted.media ? Object.fromEntries(Object.entries(extracted.media).filter(
+      ([key, value]) => (MEDIA_METADATA_FIELDS as readonly string[]).includes(key) && value !== undefined,
+    )) : null;
+    return { ...sendResult(input.to, sent, input.clientMessageId), content: {
+      text: extracted.media ? null : extracted.text, caption, media,
+      forwarded: true, sourceChatJid, sourceMessageId, provenance,
+    } };
   }
 
   async sendMedia(
@@ -2374,15 +2382,7 @@ export class WhatsAppClient {
     };
   }
 
-  async sendPoll(
-    input: SendPollInput,
-  ): Promise<{
-    to: string;
-    options: number;
-    messageId?: string;
-    providerMessageId?: string;
-    clientMessageId?: string;
-  }> {
+  async sendPoll(input: SendPollInput): Promise<BridgePollResult> {
     if (!this.sock || !this.connected) {
       throw new Error('Not connected');
     }
@@ -2392,20 +2392,18 @@ export class WhatsAppClient {
       throw new Error('Poll requires at least 2 options');
     }
 
+    const poll = {
+      name: limitText(input.question, 512),
+      values: options.slice(0, 12),
+      selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
+    };
     const sent = await this.sock.sendMessage(
-      input.to,
-      {
-        poll: {
-          name: limitText(input.question, 512),
-          values: options.slice(0, 12),
-          selectableCount: Math.max(1, Math.min(12, input.maxSelections ?? 1)),
-        },
-      },
+      input.to, { poll },
       input.clientMessageId ? { messageId: input.clientMessageId } : undefined,
     );
     this.rememberOutboundSelfMessage(input.to, sent);
 
-    return { ...sendResult(input.to, sent, input.clientMessageId), options: options.length };
+    return { ...sendResult(input.to, sent, input.clientMessageId), options: options.length, poll };
   }
 
   async react(

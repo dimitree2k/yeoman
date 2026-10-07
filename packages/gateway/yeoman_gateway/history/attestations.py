@@ -211,7 +211,8 @@ def resolve_author_targets(
             entities[("message", copy.channel, copy.chat_id, copy.native_id)].append(copy.ref)
     event_evidence: dict[str, dict[str, Any]] = {}
     for event in events:
-        refs[event.ref].add(event.ref)
+        for ref in (event.ref, *event.extra_refs):
+            refs[ref].add(event.ref)
         if event.native_event_id:
             entities[(event.kind, event.channel, event.chat_id, event.native_event_id)].append(event.ref)
             event_evidence[event.ref] = {"target_native_id": event.target_native_id,

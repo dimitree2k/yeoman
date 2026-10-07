@@ -708,3 +708,36 @@ test('encrypted edit observations survive the replayable message outbox without 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const [name, type, wrapper, payload, returned] of [
+  ['poll_result_uses_normalized_question_options', 'send_poll', 'sent',
+    { to: 'target@g.us', question: 'Lunch?', options: ['one', 'two'] },
+    { to: 'target@g.us', providerMessageId: 'POLL', options: 2,
+      poll: { name: 'Lunch?', values: ['one', 'two'], selectableCount: 1 } }],
+  ['forward_result_preserves_sent_content', 'forward_message', 'forwarded',
+    { to: 'target@g.us', sourceChatJid: 'source@g.us', sourceMessageId: 'SOURCE' },
+    { to: 'target@g.us', providerMessageId: 'FORWARD', content: { text: 'sent', caption: null, media: null,
+      forwarded: true, sourceChatJid: 'source@g.us', sourceMessageId: 'SOURCE', provenance: 'sent' } }],
+  ['delete_result_keeps_target_not_new_message_id', 'delete_message', 'deleted',
+    { chatJid: 'target@g.us', messageId: 'TARGET' }, { chatJid: 'target@g.us', messageId: 'TARGET' }],
+] as const) {
+  test(`${name}: server success wrapper and failure`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'yeoman-task6-server-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const server = makeServer(root);
+    const method = { send_poll: 'sendPoll', forward_message: 'forwardMessage', delete_message: 'deleteMessage' }[type];
+    (server as any).wa = { [method]: async () => returned };
+    const client = fakeClient();
+    const meta = clientMeta(client.ws);
+    const command = () => (server as any).handleClientMessage(meta, JSON.stringify({
+      version: PROTOCOL_VERSION, type, token: 'secret', requestId: 'REQUEST', payload }));
+    await command();
+    assert.deepEqual((client.messages[0] as any).payload, { ok: true, result: { [wrapper]: returned } });
+    (server as any).wa[method] = async () => { throw new Error('provider failed'); };
+    await command();
+    const failure = (client.messages[1] as any).payload;
+    assert.equal(failure.ok, false);
+    assert.equal(failure.result, undefined);
+    assert.equal(failure.error.code, 'ERR_INTERNAL');
+  });
+}

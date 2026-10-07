@@ -49,6 +49,7 @@ def project(roots: Sequence[Path], db_path: Path) -> dict[str, Any]:
 
 
 def _authors(ex: Extracted, res: Resolution) -> dict[str, AuthorCorrection]:
+    res.review.update(ex.review)
     winners, review = resolve_author_targets(ex.attestations, ex.messages, ex.events)
     copies = {copy.ref: copy for copy in [*ex.messages, *ex.events]}
     authors: dict[str, AuthorCorrection] = {}
@@ -406,7 +407,7 @@ def _event_row(key: tuple[str, ...], members: list[tuple[EventCopy, str | None, 
         "occurred_ms": occurred_ms, "time_certainty": certainty,
         "payload": json.loads(payload_json),
         "provenance": min((c.provenance for c in copies), key=lambda p: _PROVENANCE.get(p, 3)),
-        "source_refs": sorted({c.ref for c in copies}
+        "source_refs": sorted({r for c in copies for r in (c.ref, *c.extra_refs)}
                               | {authors[c.ref].attestation.ref for c in copies if c.ref in authors}),
         "native_event_id": native_event_id,
     }
